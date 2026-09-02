@@ -1,37 +1,63 @@
-# Diagrams
+# Engineering Diagrams Guide
 
-*Read when deciding whether to use a diagram, selecting its stages, naming its nodes, labeling its edges, or reviewing its depth and scope.*
+*Read when designing, reviewing, or labeling architecture diagrams, sequence charts, state machines, and dataflow visuals.*
 
-## Give the Diagram One Job
+## Purpose and Text Supplementation
 
-Give each flow diagram one architectural job, such as tracing a value from source to artifact, showing a request across ownership boundaries, or explaining a state transition. Include only the nodes needed to establish that point. A diagram that tries to inventory every implementation step obscures the transformation the reader needs to understand.
+Use diagrams when spatial arrangement, component hierarchy, concurrency boundaries, state machines, or data pipelines clarify architecture faster than prose alone.
 
-Limit the longest directed path to six nodes. Count nodes rather than arrows, and measure the longest route through the graph rather than the total number of nodes. When a useful flow exceeds that depth, collapse intermediate implementation steps into one named transformation or split the diagram at a meaningful ownership, representation, or lifecycle boundary.
+- Place the diagram immediately adjacent to the text that explains the flow.
+- State the architectural conclusion or invariant the reader must take away in the preceding paragraph.
+- Never make a diagram the sole carrier of an engineering constraint or contract. Provide equivalent prose, descriptive alt text, or a structured lookup table.
+- Keep copyable identifiers, configuration blocks, commands, file paths, and error codes in markdown text rather than in image graphics.
 
-Prefer node labels of one to three words, with shorter labels when they remain specific. Choose grammar by semantic role:
+## Focus on One Architectural Flow
 
-- Use noun phrases for actors, inputs, outputs, states, stores, and artifacts, such as `Source Types`, `Generated Schemas`, and `Artifact Store`.
-- Use active verb phrases for operations and transformations, such as `Generate Schemas`, `Validate Config`, and `Encode Artifacts`.
-- Mix noun and verb labels when the diagram contains both things and operations. Do not force one grammatical form across unlike roles merely to create visual symmetry.
+Design each diagram around a single architectural question:
 
-Reserve a node for an operation when the transformation matters to the architectural point. Put a verb on an edge when the action only explains the relationship between two important things. For example, `Source Types -->|generate| Schemas` emphasizes the two representations, while `Source Types --> Generate Schemas --> Schemas` emphasizes schema generation as an independently important stage.
+- **Data pipelines:** Trace a payload from ingest through transformation to durable storage.
+- **Request lifecycles:** Trace an RPC or HTTP call across client, gateway, service, and persistence layers.
+- **State machines:** Map valid states, guard conditions, transition events, and terminal states.
+- **Component ownership:** Map subsystem boundaries, managed storage, and dependency directions.
 
-Treat an unlabeled bidirectional edge as ambiguous unless the surrounding model already defines one symmetric relationship. Use one relationship label when both directions carry the same meaning, such as two peers that `synchronize`. Split the edge when each direction performs different work:
+Split diagrams when a visual attempts to depict multiple orthogonal concerns (such as deployment infrastructure and runtime dataflow) on one canvas.
 
-```mermaid
-flowchart LR
-    documents[Policy Files] -->|load| editor[Policy Editor]
-    editor -->|patch| documents
-```
+## Path Depth and Complexity Limits
 
-The two edges distinguish how authored content enters the editor from how editor actions return to source. Do not compress different operations into a label such as `reads/writes` when their direction, ownership, or representation matters to the architectural point.
+- **Maximum Path Depth:** Limit the longest directed path to six nodes or fewer. Measure the longest linear sequence through the graph rather than total node count.
+- **Boundary Splitting:** When a path exceeds six nodes, split the visual at an ownership boundary, network hop, or storage persistence step into sequential diagrams.
+- **Transformation Collapsing:** Collapse low-level internal processing steps into a single named transformation node when the intermediate steps do not alter component boundaries or state invariants.
 
-Audit every diagram with these questions:
+## Node, Edge, and Cluster Semantics
 
-- **Point:** Which relationship or transformation should the reader understand after reading it?
-- **Selection:** Does every node contribute to that point?
-- **Depth:** Does every directed path contain no more than six nodes?
-- **Role:** Does each label identify a thing or state with a noun, and an operation with an active verb?
-- **Direction:** Does every bidirectional relationship use one symmetric label or two directed labels that expose different operations?
-- **Specificity:** Can any label become shorter without becoming ambiguous?
-- **Boundary:** Should a long path collapse an implementation detail or split at a real architectural boundary?
+### Node Semantics
+- Use noun phrases for components, services, stores, actors, and state buffers (such as `IngestWorker`, `DocumentStore`, `DraftBuffer`).
+- Use active verb phrases for standalone computational stages only when the transformation itself is the primary architectural subject (such as `TokenizeInput`, `ValidateSignature`).
+- Use state adjectives or past participles for state machine nodes (such as `Draft`, `PendingSync`, `Committed`, `Failed`).
+
+### Edge Semantics
+- Label every edge with the specific data artifact, message payload, event type, or protocol method crossing the boundary (such as `SyncRequest`, `JSON Patch`, `HTTP POST /v1/events`).
+- Avoid generic edge labels such as `sends`, `calls`, `uses`, or `processes`.
+- Use solid arrows for synchronous, blocking calls or direct dataflow.
+- Use dashed arrows for asynchronous events, message queues, or background synchronization.
+- Treat unlabeled bidirectional arrows as ambiguous. Use two oppositely directed arrows with distinct payload labels when each direction performs separate work.
+
+### Subgraphs and Clusters
+- Use visual subgraphs or bounding boxes to represent hard isolation boundaries: process spaces, network trust zones, thread pools, or distinct services.
+- Label each cluster with its boundary type (such as `Worker Process`, `VPC Subnet`, `Client Runtime`).
+
+## Accessibility and Encodings
+
+- Do not rely on color alone to convey status, state, or meaning. Pair color with distinct shapes, line styles (solid, dashed, dotted), or text labels.
+- For flowchart or sequence directions, default to top-to-bottom (`TD`) for containment and hierarchy, and left-to-right (`LR`) for pipelines, lifecycles, and sequential requests.
+- Provide descriptive alt text for rendered images that explains the starting state, intermediate transformations, and final result.
+
+## Diagram Review Checklist
+
+1. Does the diagram illustrate exactly one flow or boundary relationship?
+2. Does the preceding prose state the rule or invariant shown in the diagram?
+3. Is the longest directed path six nodes or fewer?
+4. Are node labels concrete noun phrases and edge labels specific payloads or protocols?
+5. Are asynchronous or decoupled interactions visually distinct from synchronous calls?
+6. Are ownership domains, process spaces, or network zones grouped into explicit subgraphs?
+7. Is all critical copyable text (commands, paths, error strings) present in markdown prose?

@@ -1,49 +1,55 @@
-# Tables
+# Technical Tables Guide
 
-*Read when deciding whether to use a table, selecting its columns, naming its headers, or reviewing whether its rows support one comparison.*
+*Read when designing, reviewing, or structuring comparison tables, configuration matrices, parameter lists, and reference schemas.*
 
-## Give the Table One Job
+## Purpose and Selection Criteria
 
-Give each table one comparison or lookup job. State that job privately before choosing columns, then include only the dimensions required to perform it.
+Use a table when readers must compare multiple entities across two or more shared dimensions, look up values by a primary key, or evaluate a matrix of constraints.
 
-Audit every column against five checks:
+- **Use a table when:** Items share three or more attributes (such as Name, Type, Default, Description, Required).
+- **Use a bulleted list when:** Comparing only a single attribute or presenting sequential steps.
+- **Use prose when:** Explaining nuanced causality, edge-case rationale, or conditional behaviors that cannot be summarized in tabular cells.
 
-- **Contribution:** Identify the distinct reader question the column answers.
-- **Coverage:** Confirm that the question applies meaningfully to most rows.
-- **Differentiation:** Confirm that the values help readers distinguish or compare rows.
-- **Scope:** Keep the column within the table's subject, lifecycle stage, and abstraction level.
-- **Header clarity:** Use the shortest specific noun phrase that identifies the values without explanation.
+## Focus on One Comparison Dimension
 
-Remove a column when it repeats the table heading or another column, stays constant, contains mostly empty values, or brings in a relationship that belongs elsewhere. Split the table when two groups of columns perform different jobs. Replace the table with prose or a list when only one meaningful comparison dimension remains.
+Design each table around a single primary entity type and lifecycle scope. Do not mix unrelated entities (such as user accounts and database migration records) in the same table.
 
-For example, a table under `Authoring Assets` needs `Asset` and `Purpose` to identify each asset type and explain why it exists. `Authoring asset` repeats the section scope. `Conventional export or source` combines two representations, while `Runtime result` introduces a cooking relationship. If readers need that relationship, give it a separate asset-to-artifact table.
+### The Five Column Quality Checks
 
-Read the header row by itself. It should reveal the table's comparison dimensions. Then read one complete row from left to right. Its cells should form one coherent fact at a consistent level of detail.
+Audit every column against these five criteria:
 
-## Use Headers as Shared Context
+1. **Contribution:** Answers a distinct reader question (such as *"What is the fallback behavior?"*).
+2. **Coverage:** Contains populated, meaningful data across rows rather than empty cells or `N/A` placeholders.
+3. **Differentiation:** Provides distinct values that help readers distinguish one row from another.
+4. **Scope:** Remains strictly within the entity abstraction level and lifecycle phase of the table.
+5. **Header Clarity:** Uses a concise, self-explanatory domain label without requiring footnotes.
 
-Treat a column header as part of every label beneath it. Read each entry by combining the header with the cell, then remove words in the cell that merely repeat the category already supplied by the header.
+### Column Pruning and Table Splitting
 
-Audit the complete column rather than shortening entries one at a time. Sibling labels should use the same naming pattern and abstraction level. If the header makes a suffix redundant for some rows but not others, choose one of three repairs:
+- **Remove redundant columns:** Drop columns that repeat another column's information, remain constant across all rows, or are mostly empty.
+- **Split disparate lifecycles:** When subsets of columns apply to different lifecycle phases (such as Build Time vs Runtime configuration), split them into separate tables.
+- **Extract complex edge cases:** When a single cell requires multiple sentences of qualification, move that explanation to adjacent prose and link or cross-reference it.
 
-- Strengthen the header so every row can omit the suffix.
-- Retain the suffix consistently when it belongs to every canonical name.
-- Split rows that do not share one naming context into another table or category.
+## Headers as Shared Context
 
-For example, this table repeats its category and then drops it inconsistently:
+Treat column headers as the shared category prefix for all cells in that column:
 
-| Queue | Role |
-| --- | --- |
-| Work queue | Holds newly accepted jobs. |
-| Retry | Holds jobs eligible for another attempt. |
-| Dead-letter queue | Holds terminal failures. |
+- Combine the header with each cell, then remove words in the cells that merely repeat the header label.
+- Keep sibling cells grammatically parallel (all noun phrases, all imperative verbs, or all boolean values).
+- Contextual shortening within a table does not alter canonical terminology. Use the full canonical identifier in surrounding prose.
 
-The header already supplies `queue`, so use the distinguishing member names:
+## Formatting Standards
 
-| Queue | Role |
-| --- | --- |
-| Work | Holds newly accepted jobs. |
-| Retry | Holds jobs eligible for another attempt. |
-| Dead-letter | Holds terminal failures. |
+- **Alignment:** Left-align text, descriptions, and code identifiers. Right-align numeric quantities and memory/time metrics. Center short status tags or booleans.
+- **Units in Headers:** Place units of measurement directly in the header (such as `Timeout (ms)`, `Memory (MiB)`) instead of repeating units in every cell.
+- **Empty States:** Never leave a table cell blank. Use an explicit indicator: `None`, `N/A`, or `-`, and define the meaning if ambiguous.
+- **Code Formatting:** Wrap literal values, field names, environment variables, and types in backticks.
 
-Contextual shortening does not rename the underlying concept. The header and cell together still express `work queue`, `retry queue`, and `dead-letter queue`. Preserve the full canonical term in prose when readers encounter it outside that table context.
+## Table Review Checklist
+
+1. Does the table track exactly one entity type or comparison dimension?
+2. Does every column pass the five quality checks (Contribution, Coverage, Differentiation, Scope, Header Clarity)?
+3. Are numeric units declared in column headers rather than repeated in cells?
+4. Are all cells populated with explicit values or defined empty-state indicators?
+5. Are cell entries parallel in grammar and abstraction level?
+6. Does the preceding text state the takeaway or primary pattern shown in the table?

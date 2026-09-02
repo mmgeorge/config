@@ -1,29 +1,40 @@
 # Reference Profile
 
-*Read when documenting an API, schema, command set, configuration surface, file format, or another interface requiring accurate and complete lookup information.*
+*Read when authoring or revising comprehensive lookup documentation for APIs, schemas, CLI commands, configuration surfaces, protocols, or error catalogs.*
 
 ## Controlling Claim
 
-Establish that the document describes its declared interface accurately, completely, and in a structure readers can navigate while working.
+Establish that the document describes its declared interface completely, accurately, and in a predictable hierarchy that practitioners can rapidly navigate during implementation and debugging.
 
-## Reasoning Obligations
+## Structural Obligations
 
-- Define the reference scope and authoritative source.
-- Mirror the architecture or taxonomy of the interface where practical.
-- Enumerate every member inside the declared scope.
-- Use stable terminology and consistent field order.
-- Record types, constraints, defaults, ownership, errors, and lifecycle behavior that affect correct use.
-- Distinguish required, optional, deprecated, and unsupported behavior precisely.
-- Verify examples against the same source of truth as the reference.
+Reference documentation must follow the structural organization of the underlying interface:
 
-## Default Progression
+### 1. Scope, Version, and Authoritative Source
+- State the exact software version, package, schema version, or RFC standard covered.
+- State the authoritative source of truth (such as a source crate, OpenAPI spec, or protobuf definition).
 
-Organize by the interface's own hierarchy rather than a persuasive narrative. Provide orientation and navigation first, then describe members consistently at the level readers need for lookup.
+### 2. Namespace and Module Hierarchy
+- Mirror the module structure, namespaces, or command groups directly in heading levels.
+- Provide a summary table or index at the top of each major category for rapid lookup.
+
+### 3. Exhaustive Member Specification
+For every declared member (function, field, configuration key, flag, or error code):
+- **Canonical Identifier:** Full symbol path or command syntax.
+- **Type and Constraints:** Data type, accepted value range, string encoding, or regex pattern.
+- **Optionality and Defaults:** Explicitly mark as `Required`, `Optional (Default: <value>)`, or `Deprecated (Use: <alternative>)`.
+- **Behavior Contract:** Concrete description of runtime effects, side effects, and state mutations.
+- **Errors and Exit Codes:** Exhaustive enumeration of possible error returns, exceptions, or failure codes.
+
+### 4. Verified Minimal Examples
+- Provide a minimal, syntax-accurate example for each member or configuration block.
+- Verify examples against the same authoritative compiler, schema, or test suite that produces the reference.
 
 ## Exclude by Default
 
-Do not embed long tutorials, design rationale, or task-specific procedures. Link the corresponding document contract.
+- Do not include narrative tutorials, design history, or persuasive arguments. Link the relevant how-to guide, explanation, or RFC.
+- Do not omit obscure or advanced members. Reference documentation must provide exhaustive coverage within its declared scope.
 
 ## Completion Check
 
-A reader should be able to find every declared member, determine its accepted inputs and behavior, interpret its failures, and distinguish documented fact from examples or guidance.
+A practitioner should be able to locate any declared member immediately, identify its accepted inputs, return guarantees, default values, and failure modes, and distinguish documented contract facts from optional examples.

@@ -1,24 +1,42 @@
 # Technical Explanation Profile
 
-*Read when explaining why a system behaves as it does, how a mechanism works, or how several concepts fit together.*
+*Read when authoring deep dives, conceptual overviews, mechanism analyses, or mental model explanations.*
 
 ## Controlling Claim
 
-Establish that one causal or conceptual model explains the observed behavior and lets readers reason about related cases.
+Establish a causal and conceptual model that explains why a system behaves as observed, enabling readers to predict outcomes when inputs, configurations, or failure conditions change.
 
-## Reasoning Obligations
+## Structural Obligations
 
-- Begin with the question, phenomenon, or relationship the reader needs to understand.
-- Introduce concepts in dependency order and connect unfamiliar ideas to established knowledge.
-- Trace causes, transformations, constraints, and consequences explicitly.
-- Use examples, counterexamples, diagrams, or observations as evidence for the model.
-- State where the model stops applying or where another mechanism takes over.
-- Keep task instructions subordinate to the explanation and link a how-to guide for operational work.
+An explanation must progress through the following sections:
 
-## Default Progression
+### 1. Observed Behavior or Core Question
+- State the specific runtime phenomenon, system behavior, or concept interaction being explained.
+- Establish the observable symptoms, performance characteristics, or architectural invariants under discussion.
 
-Move from the phenomenon through the relevant concepts, causal mechanism, evidence, edge conditions, and implications. Circle back only when another perspective materially strengthens the model.
+### 2. Governing Concepts and Dependency Order
+- Define prerequisite concepts in strict dependency order before explaining their interactions.
+- Anchor unfamiliar abstractions to established software concepts (such as mapping a custom consensus protocol to standard Raft concepts).
+
+### 3. Execution Mechanics and Causal Tracing
+- Trace causes, transformations, state mutations, and consequences explicitly.
+- Detail the exact step-by-step mechanism (such as how a distributed transaction coordinator handles network partition recovery).
+- Connect intermediate data structures to the resulting system output.
+
+### 4. Empirical Evidence and Counterexamples
+- Provide compact code traces, log output, or benchmark measurements that validate the causal model.
+- Include a concrete counterexample showing what happens when a boundary condition is violated (such as demonstrating cache stampede behavior when lock acquisition fails).
+
+### 5. Boundary Conditions and Non-Applicability
+- Explicitly state the boundaries where the model no longer applies.
+- Identify edge conditions, scale thresholds, or alternate subsystem fallbacks that take over outside these boundaries.
+
+## Exclude by Default
+
+- Do not turn an explanation into a step-by-step operational runbook. Link a dedicated how-to guide for procedural workflows.
+- Do not list exhaustive API reference members. Link the reference documentation.
+- Do not include proposal justification or roadmap planning.
 
 ## Completion Check
 
-A reader should be able to explain the mechanism in their own terms, predict what happens when an input or condition changes, and recognize cases outside the explanation's scope.
+A reader should be able to explain the underlying mechanism in their own words, predict system behavior when inputs or environmental conditions change, and recognize boundaries where the explanation stops applying.

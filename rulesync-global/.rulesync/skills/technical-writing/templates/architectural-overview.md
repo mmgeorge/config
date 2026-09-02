@@ -1,39 +1,56 @@
 # Architectural Overview Profile
 
-*Read for an architecture overview or whenever a system or feature design request does not name another document contract.*
+*Read when authoring or revising a system architecture overview, subsystem design document, or feature architecture specification.*
 
 ## Controlling Claim
 
-Establish that one complete operating model explains how the system satisfies its goals, divides authority, represents its domain, and moves information through its lifecycle.
+Establish that one complete operating model explains how the system satisfies its requirements, divides subsystem authority, represents domain entities, and moves state through its lifecycle.
 
-Treat that operating model as the **golden design**. Describe settled architecture in present tense as fully realized behavior regardless of implementation progress. Do not qualify the model as intended, proposed, aspirational, or incomplete merely because the current repository has not reached it.
+Describe the target architecture in the present tense as fully operational behavior. Do not qualify the model with aspirational disclaimers (`intended`, `proposed`, `future`) unless describing a temporary migration boundary that directly affects current caller behavior.
 
-## Reasoning Obligations
+## Structural Obligations
 
-- State the operational goal and central design early.
-- Present every settled part of the golden design as the system's operating contract.
-- Define unfamiliar or specialized concepts when they first appear.
-- Select an orienting whole and an explanatory arc that give every detail a visible role.
-- Define owners, boundaries, identities, representations, and invariants.
-- Explain the warrants behind major architectural decisions.
-- Keep every declared architectural inventory internally complete.
-- Trace the interactions, transformations, lifecycle, and failure behavior needed to understand the model.
-- Demonstrate non-obvious representations with compact examples.
-- Organize evidence so the intended hidden conclusions become justified.
-- Reconstruct any whole the document decomposes, showing how its established parts produce the intended behavior.
+An architectural overview progresses through the following sections:
 
-## Default Progression
+### 1. System Scope and Public Boundary
+- State what capability the system provides at its user or caller boundary.
+- Enumerate the participating primary subsystems and external dependencies.
+- Define unfamiliar domain concepts immediately when introduced.
 
-Open with the complete system at an operational scale so readers understand what it enables, why it matters, and which major parts participate. Define every unfamiliar term used in that orientation, but defer internal mechanics until the detailed explanation requires them.
+### 2. Domain Model and Entity Ownership
+- Define core domain entities, their persistent identifiers, and state invariants.
+- Explicitly define ownership boundaries: which subsystem creates, mutates, and deletes each entity.
+- Detail data representations, serialization formats, and durability guarantees.
 
-Use whole-part-whole when readers can recognize that system before learning its internals, the whole gives several parts their purpose, and a later synthesis can reveal how those parts produce its behavior. Otherwise select the bottom-up, top-down, linear, or causal arc that matches the subject. Explain detailed concepts in dependency order and define the complete domain model before editors, compilers, cookers, APIs, or other projections that consume it.
+### 3. Subsystem Architecture and Storage
+- Describe each subsystem by its primary role, public interface, and internal storage.
+- Document storage engines, database schemas, in-memory caches, and isolation mechanisms.
+- Explain the warrants behind core storage and boundary decisions.
 
-Adapt headings to the architecture. Do not expose this progression as a generic sequence of `Goal`, `Model`, or `Mechanism` headings.
+### 4. Runtime Lifecycles and Data Pipelines
+- Trace end-to-end dataflow from ingestion or caller request through transformations to persistence and response.
+- Document state machine transitions, event notifications, and background worker queues.
+- Detail synchronization protocols, cache invalidation rules, and consistency guarantees.
+
+### 5. Failure Modes and Concurrency Boundaries
+- Define the concurrency model (such as actor isolation, thread pools, async event loops, or mutex hierarchies).
+- Document partial failure handling, network timeouts, retry policies, and automated recovery paths.
+- Define resource limits, queue capacity bounds, and backpressure mechanisms.
+
+### 6. End-to-End Workflow Synthesis
+- Show how the individual subsystems and pipelines compose to fulfill the overarching system contract.
+
+## Organizational Patterns
+
+- **Component-Synthesis:** Open with the complete system boundary, decompose into participating subsystems, and synthesize their interactions.
+- **Bottom-Up:** Define primitive entities, storage models, and protocols before detailing higher-level APIs and workflows.
+- **Pipeline:** Sequence sections to follow the physical or logical dataflow from ingest to output.
 
 ## Exclude by Default
 
-Do not add implementation-status disclaimers, rejected alternatives, feasibility studies, generic open questions, implementation phases, rollout checklists, or backlog. Those belong in an RFC or implementation plan unless the architecture cannot be understood without a local qualification.
+- Do not include proposal history, rejected alternatives, feasibility discussions, implementation roadmaps, rollout checklists, or backlog items. Those belong in an RFC or implementation plan.
+- Do not expose low-level function signatures or variable names unless they define a public architectural boundary.
 
 ## Completion Check
 
-A reader should be able to describe what the system must accomplish, which subsystem owns each responsibility, how the central objects relate, how those parts produce the complete operating model, how inputs become outputs or runtime state, and why the major boundaries satisfy their pressures.
+A reader should understand what the system accomplishes, which subsystem owns each responsibility, how central entities relate, how inputs become durable runtime state, how failures are contained, and why the boundaries satisfy system requirements.
