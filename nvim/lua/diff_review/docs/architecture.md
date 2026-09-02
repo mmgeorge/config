@@ -163,7 +163,7 @@ diff_review/
 │   └── datetime.lua           Relative/absolute date formatting + date highlight ranges
 │
 ├── harness/                 Thin Neovim client for the Rust Harness broker
-│   ├── builder.lua            Shared Rust-sidecar builder instance; launches versioned cache deployments, never Cargo output
+│   ├── builder.lua            Shared Rust-sidecar builder instance (launches versioned cache deployments, never Cargo output)
 │   ├── client.lua             Long-lived JSONL process, request correlation, events, generation guards
 │   ├── protocol.lua           JSONL request/message codec
 │   └── backends/              Lua launch descriptors only: Codex app-server, Copilot SDK, and test mock
@@ -191,7 +191,7 @@ diff_review/
 ```
 
 Contributor-facing assistant rules live at the repo root in
-`.rulesync/rules/diff_review.md`; keep that rule focused on working practices and keep
+`.rulesync/rules/diff_review.md`. Keep that rule focused on working practices and keep
 this document focused on architecture.
 
 ### Harness timeline ownership
@@ -596,7 +596,7 @@ continuation would show an unpainted notch under the gutter on `+`/`-` rows. The
 window edge with `hl_eol` on a char-range span at priority 60 — *below* the inline word-diff
 highlights — instead of padding the buffer line with trailing spaces. Padding (the old
 `_diff_pad_highlighted_line` to ~160 cols) would spill a blank highlighted tail onto every
-wrapped continuation row and leak into yanks; `hl_eol` keeps the band full-width on each
+wrapped continuation row and leak into yanks, whereas `hl_eol` keeps the band full-width on each
 display row while the buffer line stays pure code. Emitted in `status_render`'s ephemeral
 decoration provider (status views) and `diff_render`'s extmark pass (standalone diff buffers).
 
@@ -639,7 +639,7 @@ keep the cursor from stepping into that virtual gutter.
   operation id.
 - **`decoration.lua`** — a `nvim_set_decoration_provider` cache for **ephemeral** per-row
   highlights computed at draw time (the alternative to baking every highlight into static
-  extmarks; see the repo-root `architecture.md` for the full design).
+  extmarks — see the repo-root `architecture.md` for the full design).
 
 ### 6.8 The pipeline, end to end
 
@@ -973,7 +973,7 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
   conventional-commit prompt, and caches results per `(cwd, ref)` with a **fingerprint**
   so it does not regenerate when nothing changed. `populate_commit_buffer_when_ready`
   fills the commit buffer once the message is ready.
-- **`commit.lua`** — the **fake-editor commit bridge**. `git commit` needs an editor;
+- **`commit.lua`** — the **fake-editor commit bridge**. Because `git commit` needs an editor,
   this spawns a headless `nvim --clean` as `GIT_EDITOR`, which connects back to the parent
   over RPC (`$NVIM`) and asks it to open the real `COMMIT_EDITMSG` in a borrowed
   diff-preview window. `<C-c><C-c>` commits, `<C-q>` aborts, and pre-commit hook output
@@ -1138,7 +1138,7 @@ press the commit key
        │     └─ client connects back over RPC → commit.editor
        │           ├─ open COMMIT_EDITMSG in the borrowed preview window
        │           └─ ai_commit.populate_commit_buffer_when_ready (AI prefill)
-       ├─ <C-c><C-c> writes + commits;  <C-q> aborts
+       ├─ <C-c><C-c> writes + commits, <C-q> aborts
        └─ pre-commit hook output streams into the console buffer
 ```
 
@@ -1551,7 +1551,7 @@ requires every entity change to belong to one subtask and every dependency manif
 one task file. Workspace references at entity, root-flow, edge-expansion, and branch depths must
 resolve to readable files, in-range declaration lines, and lines containing their semantic names.
 A workspace reference cannot duplicate a construct already
-owned by `entity_changes`; that construct must use `planned_entity`. Test subtasks validate supplied
+owned by `entity_changes`, requiring that construct to use `planned_entity`. Test subtasks validate supplied
 `covers_entities` references, but test count and inferred task or flow coverage never gate submission.
 Planning guidance requires every dependency justification to map to concrete plan content. Direct API
 dependencies belong in typed external flow edges, while runtime, derive, build, and test support
@@ -2083,5 +2083,5 @@ never shows them). See `.rulesync/rules/diff_review.md` -> Linting for the full 
 - **Changing git behavior?** Start at `git/git_data.lua` over `git/git_backend.lua`.
 - **Changing Harness behavior?** Start at `harness/client.lua` and the matching `views/`
   directory, then follow the JSONL method into `nvim/rust/diff-review-harness/src/broker`.
-- **Anything cross-cutting?** Shared state lives in `session.lua`; a module's own caches
-  live in that module; `init.lua` only re-exports functions reached through the `dr()` seam.
+- **Anything cross-cutting?** Shared state lives in `session.lua`. A module's own caches
+  live in that module, and `init.lua` only re-exports functions reached through the `dr()` seam.

@@ -9,7 +9,7 @@ globs:
 
 # DiffReview Plugin Rules
 
-Keep `nvim/lua/diff_review/docs/architecture.md` up to date when changing DiffReview subsystem boundaries, data flow, buffer types, render pipelines, state ownership, or cross-module invariants. The Rulesync rule should tell agents what to do; the architecture document should explain how the system works and why the boundaries exist.
+Keep `nvim/lua/diff_review/docs/architecture.md` up to date when changing DiffReview subsystem boundaries, data flow, buffer types, render pipelines, state ownership, or cross-module invariants. The Rulesync rule directs agent workflows, while the architecture document explains system structure and ownership boundaries.
 
 DiffReview is a standalone local Neovim plugin. Trouble must not own this
 feature: do not place DiffReview code under `trouble/sources`, do not register a
@@ -98,10 +98,8 @@ buffer name carries the short sha of the underlying commit (HEAD's sha for the
 index, which is not a commit). The buffer is `nowrite` (not `nofile`, so
 buffer pickers list it), persists when hidden, closes on `q`, and shows a red
 winbar header while displayed. If the base content cannot be fetched, the
-jump falls back to the working-tree file.
-
-Tests must not trigger the `o` status key via `maparg().callback()` — the
-user's mini.clue config registers `o` as a prefix trigger whose callback
+operation notifies the Git failure and leaves the view unchanged. Do not ask for
+confirmation before opening. Avoid using `vim.fn.confirm` on open because it
 blocks on a key query (hangs headless). Trigger open via `<CR>` instead.
 
 In the PR view (`ogp`), the PR title and description are editable in place
@@ -109,7 +107,7 @@ In the PR view (`ogp`), the PR title and description are editable in place
 — unlocked exactly while the cursor sits on the title line or inside the
 description block (regions tracked with extmarks), locked everywhere else,
 so every native editing command works in the regions. Unsynced fields show
-an inline `*` before their label; `:w` clears the markers immediately and
+an inline `*` before their label. `:w` clears the markers immediately and
 syncs via `gh pr edit` through a sequential queue (`M._pr_edit.enqueue`, not
 the repository-root Git index mutation coordinator, whose snapshot contract
 belongs only to stage and unstage). Failures notify and restore the markers.
@@ -136,7 +134,7 @@ Pressing `or` in the status or PR view starts PR review mode
 an editable review summary, and the changed files split into Unviewed/Viewed
 sections (files start expanded). This is the **normal batched review flow** —
 comments are drafted locally, synced deliberately, and submitted together:
-- `S`/`U` move the hunk/file under the cursor between the sections; on
+- `S`/`U` move the hunk/file under the cursor between the sections, while on
   Unviewed/Viewed section headers they move the whole section.
 - `C` on a changed (diff body) line creates an empty inline editable comment
   body and focuses it. `C` only creates comments. Entering an existing compact
@@ -160,7 +158,7 @@ comments are drafted locally, synced deliberately, and submitted together:
   Size header/footer rules to the window text area so they never overflow or
   soft-wrap, and refresh those rule rows from shared display/resize handling
   (`WinResized`/`VimResized` plus `BufWinEnter`). The review window enables soft
-  word wrap; do not hard-wrap, reflow, prefix, or draw box sides into editable
+  word wrap. Do not hard-wrap, reflow, prefix, or draw box sides into editable
   body text. Measure box width in display cells, split unbroken text, preserve
   same-anchor box order, and re-render compact rows on resize.
 - Inline replies in the PR overview (`view_kind = "pr"`) render inside their
@@ -183,18 +181,18 @@ comments are drafted locally, synced deliberately, and submitted together:
   annotation focus or auto-collapse lifecycle.
 - `J` deletes the editable draft or viewer-authored inline comment under the
   cursor. Remote deletions sync on `<C-s>` and remove the
-  identity from both flattened and submitted-review comment projections.
+  identity from both flattened and submitted-review comment views.
   `y`/`z` jump between full-width comments and compact box rows.
 - `b` on actual comment rows (header/body/footer) opens the GitHub comment
-  anchor; adjacent diff rows keep their code-line anchors instead of borrowing
+  anchor, while adjacent diff rows keep their code-line anchors instead of borrowing
   the nearby comment.
 - Unsynced comment creates/edits show `*` before the username in the comment
   header. `<C-s>` clears the marker immediately and syncs dirty comments to the
-  pending GitHub review; failures restore the marker.
-- `b` browses the PR changes tab; the submit key (`cc`) picks a verdict
+  pending GitHub review, and failures restore the marker.
+- `b` browses the PR changes tab. The submit key (`cc`) picks a verdict
   (`vim.ui.select` → APPROVE/COMMENT/REQUEST_CHANGES) and posts the summary,
   verdict, and every draft comment in ONE `gh api .../reviews` request
-  (`gh.submit_pr_review_async`, `commit_id` = head SHA, `comments[]`); on
+  (`gh.submit_pr_review_async`, `commit_id` = head SHA, `comments[]`), and on
   success the drafts clear.
 
 The review summary is edited in place with the same cursor-follows-modifiable
@@ -205,14 +203,14 @@ rows). Tests drive the comment body and verdict through the
 region's end extmark uses right gravity (a left-gravity boundary mark gets
 pulled into an edit of the adjacent line). Review-specific key defaults live in
 `config.keymaps.review`, but the hint bar, `?` help, and installed mappings must
-come through the shared status command specs in `init.lua`; pin only the compact
+come through the shared status command specs in `init.lua`. Pin only the compact
 high-value subset in the winbar and keep the full command list in `?`. The
 verdict chooser is a plain popup window (`M._review.pick_verdict`,
 `c`/`a`/`r`/`q`), not `vim.ui.select`/snacks.
 
 `bc` in the status view creates a branch (`M._create_branch`): it prompts for
-a name via a centered popup (`M._prompt_branch_name`, not vim.ui.input/snacks;
-prefilled with the branch prefix), then `git switch -c` and refreshes.
+a name via a centered popup (`M._prompt_branch_name`, not vim.ui.input/snacks,
+prefilled with the branch prefix), then runs `git switch -c` and refreshes.
 The prefix comes from per-repository config — `<repo root>/.diffreview.json`
 (`{ "branch_prefix": "..." }`, read by `M._repo_config`, test seam
 `set_reader`) — falling back to `config.branch_prefix` (default `matt9222/`).
@@ -220,7 +218,7 @@ The prefix comes from per-repository config — `<repo root>/.diffreview.json`
 init.lua is at Lua's hard limit of 200 local variables per chunk: new
 file-scope helpers must hang off the module table (see `M._branch_diff` and
 `M._review`) instead of being declared `local`. (luals's syntax check can
-over-count this; the ground truth is whether real nvim loads the file.)
+over-count this, but the ground truth is whether real nvim loads the file.)
 
 The diff gutter (old/new line numbers and the `+`/`-` sign) is rendered as
 inline virtual text (`hunk_add_gutter`), not buffer text: buffer lines for
@@ -271,7 +269,7 @@ Diff rendering uses two layers:
   builds render plans from raw hunks, injects bounded Tree-sitter-aware context,
   and merges adjacent or overlapping display windows so the user does not see
   duplicate `@@` headers or repeated context. A displayed hunk may therefore
-  contain multiple raw hunks; carry them in `raw_hunks` and expand them again
+  contain multiple raw hunks. Carry them in `raw_hunks` and expand them again
   before any action that writes state or talks to git.
 
 GitStatus has an additional status-level grouping step before each hunk is
@@ -329,20 +327,11 @@ Notes:
   `workspace.checkThirdParty = false`). It silences `undefined-global vim`. In the editor,
   **lazydev** additionally supplies the real `vim` runtime types.
 
-Triage — most of the raw count is NOT real bugs:
+Known non-defect diagnostic patterns:
 
-- `undefined-global` (`vim`) — config noise; the `.luarc.json` / lazydev handle it.
-- `undefined-field` / `inject-field` — mostly the dynamic `dr()` seam pattern. `init.lua` injects
-  hundreds of `M._x` fields via `for _, fn in pairs(module) do M[name] = fn end` loops that lua-ls
-  cannot see statically, so reads of those fields look "undefined". This is a false positive for the
-  architecture, not a bug. (`init`'s `M` is annotated `---@class DiffReviewModule`, not `---@type`,
-  so the explicit `M._x = mod.fn` seam lines ARE seen and assignment is allowed; only the
-  `for pairs` loop injections are invisible.)
-- Genuinely fixable, and worth keeping clean: `redundant-return-value` (usually
-  `return s:gsub(pat, rep)` returning string + replacement-count — wrap the expression in parens to
-  return one value), `undefined-doc-param` (a `---@param` that names a parameter the function does not
-  have — delete the stale line), `duplicate-doc-param`, `redundant-parameter`, `*-type-mismatch`,
-  `missing-fields` / `missing-return-value`.
+- `undefined-global` (`vim`) — configuration noise handled by `.luarc.json` and lazydev.
+- `undefined-field` / `inject-field` — primarily the dynamic `dr()` seam pattern. `init.lua` injects `M._x` fields via `for _, fn in pairs(module) do M[name] = fn end` loops that lua-ls cannot analyze statically. (`init`'s `M` is annotated `---@class DiffReviewModule`, so explicit `M._x = mod.fn` seam lines are recognized, while only loop injections trigger warnings.)
+- Fixable issues worth maintaining: `redundant-return-value` (wrap expressions like `(s:gsub(pat, rep))` to return one value), `undefined-doc-param` (remove annotations naming non-existent parameters), `duplicate-doc-param`, `redundant-parameter`, `*-type-mismatch`, and `missing-fields` / `missing-return-value`.
 
 After a large refactor that moves files with `git mv`, the in-editor lua-ls can hold a STALE index of
 BOTH the old and new paths, producing spurious `duplicate-set-field` and duplicate-`---@class`
@@ -468,7 +457,7 @@ Run the whitespace check:
 git diff --check -- nvim/lua/diff_review nvim/lua/plugins/diff_review.lua nvim/lua/plugins/trouble.lua nvim/tests/diff_review
 ```
 
-Headless Neovim may create `nvim.log`; remove it before finishing a task.
+Headless Neovim may create `nvim.log`, which must be removed before finishing a task.
 
 ## Git Backend Seam
 
@@ -497,8 +486,8 @@ races.
 
 `diff_review.walkthrough` drives the `ow` review walkthrough from
 `.walkthrough.json` at the repo root (schema: `walkthrough.schema.json` next to
-the module; generated by the `walkthrough` skill). It never touches init
-internals - init hands it a `DiffReviewWalkthroughHost` of closures via
+the module, generated by the `walkthrough` skill). It never accesses `init.lua`
+internals directly, as `init` injects a `DiffReviewWalkthroughHost` of closures via
 `M._walkthrough_host(buf)`. Tests inject the JSON with:
 
 ```lua
@@ -506,7 +495,7 @@ require("diff_review.views.walkthrough").set_reader(function(path) return fixtur
 require("diff_review.views.walkthrough").reset_reader()
 ```
 
-HEAD-sha staleness lookups ride the git backend seam (`rev-parse HEAD`).
+HEAD SHA staleness lookups execute through the git backend seam (`rev-parse HEAD`).
 
 ## GitHub CLI Seam
 
@@ -517,21 +506,18 @@ from status, PRView, keymaps, renderers, or tests. The wrapper owns nonblocking
 so they never depend on a real `gh` installation, auth state, network, or
 repository remote.
 
-All GitHub/Git request consumers must notify request failures. Nonzero exits,
+All GitHub and Git request consumers must notify request failures. Nonzero exits,
 API errors, invalid JSON, missing required repo/PR context, and failed background
 lookups should reach the user via `notify_error`, `vim.notify`, or the owning
-notification helper with the underlying stderr/API/decode message. Do not treat
-failed requests as empty comments, empty completion lists, unchanged status, or
-generic loading state. Empty-but-successful results are fine, but they must be
-distinguishable in code and tests from request failures.
+notification helper with the underlying stderr, API, or decode error text. Distinguish
+empty successful results from request failures in code and test assertions.
 
-DiffReview error handling should be loud by default. If a caught error affects
-rendering, syncing, completion, cursor behavior, or user action handling, report
-it with a notification rather than only logging it or silently falling back.
+Report all caught rendering, synchronization, completion, cursor behavior, or user
+action handling errors via notifications rather than silently falling back.
 
 GitStatus, PR overview, PR review, issue, and notification buffers share GitHub
 repo metadata and issue completion through `github.repo_cache` and
-`github.issue_index`; keep that ownership centralized. Repo-scoped durable data
+`github.issue_index`. Keep that ownership centralized. Repo-scoped durable data
 lives under `vim.fn.stdpath("data")/gitstatus/repos/<owner>/<repo>/`, not inside
 DiffReview module state or ad hoc temp paths. The issue index specifically uses
 `issues/issues.redb` plus `issues/open-snapshot.json`, populated by background
@@ -555,18 +541,17 @@ Unviewed/Viewed, branch diffs, walkthroughs, or future grouped review flows),
 reuse the same concepts instead of inventing a separate interaction model:
 
 - Group content into named sections that can be toggled with `<Tab>` via
-  `status_toggle()`; section, file, and hunk folds should all flow through the
+  `status_toggle()`. Section, file, and hunk folds should all flow through the
   shared fold state (`status_folded` / `set_status_folded`).
 - Use movement actions like GitStatus stage/unstage: update the in-memory
   section model immediately, preserve fold intent, then synchronize
   asynchronously. GitStatus stage/unstage must never restore or explicitly
   move the cursor. For review mode, `S`/`U` moving hunks or files between
-  Unviewed/Viewed should feel like GitStatus `S`/`U` moving items between
-  Unstaged/Staged. Header actions matter too: pressing `S`/`U` on a section
-  header should apply to all actionable items in that section, matching
-  GitStatus staged/unstaged header behavior.
+  Unviewed/Viewed must behave identically to GitStatus `S`/`U` moving items between
+  Unstaged/Staged. Pressing `S`/`U` on a section header applies to all actionable
+  items in that section, matching GitStatus staged/unstaged header behavior.
 - Keep the same command model for mappings, hint bars, and `?` help. The winbar
-  should show only a compact pinned subset; the full command palette stays in
+  should show only a compact pinned subset, while the full command palette stays in
   `?`.
 
 Status-buffer mappings must be defined from `config.defaults.keymaps.status` and
@@ -603,7 +588,7 @@ request generation and confirms that no index mutation is pending. Only then rep
 the session diff, staged-flag, and untracked caches. A stale full load must not mutate
 those caches even when its status model never renders.
 
-When Git truth semantically matches the optimistic projection, retire the
+When Git truth semantically matches the optimistic UI state, retire the
 resolved journal layers without rendering the status buffer or writing an open
 diff buffer. On a mismatch, replace only the affected paths and perform one
 corrective render. Replay later optimistic layers over the new confirmed
@@ -618,7 +603,7 @@ as a Git failure.
 
 On the first Git mutation failure in a burst, notify immediately and cancel its
 queued tasks. Preserve completed Git writes, path-resync actual truth, and force
-one recovery render. If both snapshot attempts fail, retain only the projections
+one recovery render. If both snapshot attempts fail, retain only the optimistic models
 for targets Git reported complete, reverse failed and cancelled cache layers, mark
 verification stale, and render once. Keep discard outside this index-mutation pipeline because
 its destructive worktree semantics require an explicit action target.

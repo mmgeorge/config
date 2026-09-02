@@ -22,9 +22,9 @@ The table below shows how each placeholder is translated for the supported tools
 | Pi                | pass-through           | pass-through (literal)[^pi] |
 | Other tools[^1]   | pass-through (literal) | pass-through (literal)      |
 
-[^1]: Tools not listed do not have a documented translation; their command body is emitted as-is.
+[^1]: Tools not listed do not have a documented translation, so their command body is emitted as-is.
 
-[^codex]: Codex CLI prompt files are forwarded to the LLM verbatim; the placeholders are passed to the model as literal text rather than being substituted by the engine.
+[^codex]: Codex CLI prompt files are forwarded to the LLM verbatim. The placeholders are passed to the model as literal text rather than being substituted by the engine.
 
 [^pi]: Pi natively expands `$ARGUMENTS` (along with `$1`, `$2`, `$@`), so `$ARGUMENTS` is a real pass-through there. rulesync still emits `` !`cmd` `` verbatim for Pi, but does not assume Pi expands inline shell snippets — treat that placeholder as literal text on Pi's side.
 

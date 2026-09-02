@@ -1,13 +1,13 @@
 <!--
 COPY THIS to <new-skill>/SKILL.md and fill it in. Delete this comment and every
-<placeholder>. Keep the body under ~500 lines; push depth into references/*.md.
+<placeholder>. Keep the body under ~500 lines, pushing depth into references/*.md.
 This template is itself a minimal example of the structure in ../SKILL.md.
 -->
 ---
 name: <gerund-name>            # lowercase-hyphen, ≤64 chars, matches the directory, no "anthropic"/"claude"
 description: >-
   <What it does, third person, with concrete trigger terms.> Use when <the specific
-  situations/keywords that should activate this skill>; not for <look-alike cases, if any>.
+  situations or keywords that should activate this skill>, not for <look-alike cases, if any>.
 ---
 # <Skill Title>
 
@@ -21,8 +21,8 @@ Match detail to fragility: exact commands where a misstep is costly, prose where
 paths work. For a long multi-step process, give a copyable checklist:>
 
 - [ ] 1. <step>
-- [ ] 2. <step — if it forks, say "If X → …; otherwise → …">
-- [ ] 3. <validation/verify step; on failure, return to step N>
+- [ ] 2. <step — if it forks, say "If X → …, otherwise → …">
+- [ ] 3. <validation/verify step, returning to step N on failure>
 
 ## <Key rules / gotchas>
 

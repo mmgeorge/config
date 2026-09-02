@@ -1,95 +1,62 @@
-# Evaluation & Iteration
+# Skill Evaluation and Iteration
 
-*When to read this:* before writing prose (to build evals first) and after a draft exists
-(to adversarially validate it and iterate). This is the step that separates a skill that
-*looks* good from one that *works*.
+*When to read this:* When creating evaluation test cases, performing multi-phase validation on draft skills, and refining instructions based on execution observations.
 
-## Evals first — build them before the documentation
+## Evaluation-Driven Development
 
-Create evaluations **before** writing extensive instructions, so the skill solves a real
-problem instead of an imagined one. Evaluation-driven development:
+Establish functional evaluations before drafting extensive documentation:
 
-1. **Identify gaps.** Run the agent on representative tasks **without** the skill. Record the
-   *specific* failures or context you had to supply by hand.
-2. **Create ~3 scenarios** that test those gaps.
-3. **Establish a baseline** — measure performance with no skill.
-4. **Write minimal instructions** — just enough to address the gaps and pass the evals.
-5. **Iterate** — run evals, compare to baseline, refine.
+1. **Record Baseline Gaps:** Execute representative tasks without the skill. Log missing context, unvalidated parameters, and manual interventions.
+2. **Define Test Scenarios:** Create 1–3 concrete test cases covering the recorded failure modes.
+3. **Measure Baseline Performance:** Evaluate model execution with no skill loaded.
+4. **Draft Minimal Guidance:** Author targeted instructions to resolve the recorded failures.
+5. **Re-evaluate:** Verify that the skill enables consistent, error-free execution.
 
-An evaluation is a task + a behavioral rubric (see `assets/evaluation.example.json`):
+### Evaluation Schema Structure
 
 ```json
 {
   "skills": ["processing-pdfs"],
-  "query": "Extract all text from this PDF and save it to output.txt",
+  "query": "Extract text from test-files/document.pdf and write output to output.txt",
   "files": ["test-files/document.pdf"],
   "expected_behavior": [
-    "Reads the PDF with an appropriate library or CLI tool",
-    "Extracts text from ALL pages without skipping any",
-    "Saves readable text to a file named output.txt"
+    "Invokes pdfplumber to extract text across all pages",
+    "Writes normalized UTF-8 text to output.txt",
+    "Reports zero extraction errors on valid inputs"
   ]
 }
 ```
 
-There is no built-in runner — the evals are *your* source of truth; run them by hand or with
-a small harness. If a gap disappears without the skill, the skill isn't needed.
+## Multi-Phase Validation
 
-## The four-pass adversarial validation
+Validate the draft in a clean execution context across four sequential phases:
 
-After a draft exists, stress it in a **fresh context** (no authoring history) — paste the
-frontmatter / SKILL.md / file tree into a clean conversation and run these passes. Gather
-problems first; fix after.
+### Phase 1: Trigger and Discovery Validation
+Provide only `name` and `description` to the model. Evaluate:
+- 3 test queries that must trigger the skill.
+- 3 syntactically similar queries that must not trigger the skill.
+- Refine the description until trigger accuracy reaches 100%.
 
-**Pass 1 — Discovery (does it trigger correctly?).** Give the agent only the
-`name` + `description` and ask it to produce:
-- 3 realistic prompts that **should** trigger this skill, and
-- 3 prompts that sound similar but should **NOT** trigger it.
-Then: "Is this description too broad or too narrow? Rewrite it optimally." If the
-should-NOT prompts trigger, or real prompts don't, the description is wrong — fix it first;
-nothing else matters if the skill never fires.
+### Phase 2: Logic and Determinism Verification
+Evaluate full `SKILL.md` and reference files by simulating execution on representative tasks:
+- Trace each step and inspect intermediate inputs and outputs.
+- Identify missing argument schemas, ambiguous decision branches, or unstated prerequisite dependencies.
 
-**Pass 2 — Logic (where is the agent forced to guess?).** Give it the full SKILL.md + tree
-and ask it to **simulate execution step-by-step** on a realistic request, narrating an
-internal monologue for each step — what it's doing, which file it reads or runs. Then:
-"Flag the exact line where you are forced to guess, hallucinate, or invent a value." Every
-flagged line is a missing instruction, an undefined term, or a dangling reference.
+### Phase 3: Edge Cases and Failure States
+Evaluate behavior against edge cases:
+- Missing dependencies or uninstalled binaries.
+- Malformed inputs, empty responses, or network timeouts.
+- File permission errors and corrupted assets.
 
-**Pass 3 — Edge cases (try to break it).** "Act as a ruthless QA tester whose goal is to
-break this skill. Ask 3–5 specific questions about edge cases, failure states, and missing
-fallbacks." Push on: unsupported configs, legacy/missing dependencies, ambiguous inputs,
-implicit assumptions, what happens when a script or API fails.
+### Phase 4: Refinement and Structural Factoring
+- Extract oversized sections or detailed schemas into `references/`.
+- Ensure all reference files are linked directly from `SKILL.md`.
+- Document required error recovery steps.
 
-**Pass 4 — Refine.** Rewrite from the answers: tighten the description, add the missing
-steps, add an **error-handling section**, and *enforce progressive disclosure* — move any
-dense rules, long templates, or schemas that crept into the body out to `references/` /
-`assets/`, replaced by a "read this file when X" pointer.
+## Iteration on Production Workflows
 
-## Iterate A/B on real usage
-
-The best refinement loop uses two agent roles. **Author A** helps design and tighten the
-skill; **Tester B** is a *fresh* session with the skill loaded, doing **real** tasks (not
-test prompts). The loop:
-
-1. Tester B performs an actual task with the skill.
-2. **Observe B's navigation**, not just its answer — watch for:
-   - **Unexpected read order** → your structure isn't as intuitive as you thought.
-   - **Missed reference links** → links need to be more explicit/prominent.
-   - **Overreliance on one file** → that content probably belongs in the SKILL.md body.
-   - **Ignored files** → unnecessary, or poorly signposted.
-   - **A skipped rule** → make it more prominent or use stronger wording ("MUST", not
-     "always").
-3. Bring the specific observation to Author A ("B forgot to filter test accounts even though
-   the skill mentions it — is it prominent enough?") and apply the fix.
-4. Repeat on new scenarios. Refine from observed behavior, not assumptions.
-
-Test with **every model** you'll run the skill on — Haiku may need more guidance than Opus;
-aim for instructions that work across all of them.
-
-## Tooling
-
-- **skillgrade** (`github.com/mgechev/skillgrade`, install `npm i -g skillgrade`; needs an
-  LLM API key) — scores skill quality and guards against regressions; run it before shipping
-  or in CI.
-- **SkillsBench** (arXiv 2602.12670) — a benchmark to borrow evaluation ideas from.
-
-Final gate: `references/checklist-and-anti-patterns.md`.
+Evaluate the skill during real tasks across all supported model families:
+1. Observe navigation paths, referenced file reads, and tool invocations.
+2. If reference files are frequently skipped or misapplied: promote key invariants directly into `SKILL.md`.
+3. If specific reference files remain unused across multiple runs: prune unnecessary files.
+4. Verify execution across all target model tiers.

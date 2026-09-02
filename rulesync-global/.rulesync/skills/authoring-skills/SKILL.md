@@ -1,124 +1,77 @@
 ---
 name: authoring-skills
 description: >-
-  Author and refactor Agent Skills (a SKILL.md plus its bundled
-  references/scripts/assets) that an AI agent can reliably discover and use. Use
-  when creating a new skill, restructuring an existing one, writing or fixing a
-  SKILL.md description or frontmatter, splitting a skill into progressive-disclosure
-  reference files, or evaluating a skill's quality. Encodes the official Anthropic
-  Agent Skills best practices plus a concrete draft → disclose → adversarially
-  validate → iterate workflow.
+  Author and refactor Agent Skills (a SKILL.md plus bundled references, scripts, and
+  assets) for reliable discovery and execution. Use when creating a new skill,
+  restructuring an existing skill, defining frontmatter descriptions, organizing
+  progressive-disclosure reference files, or evaluating skill quality.
 targets:
   - '*'
 ---
+
 # Authoring Agent Skills
 
-A skill teaches an agent a *reusable procedure* — it is written **for an agent, not a
-human**. The agent model already knows the SKILL.md format and is already smart; this
-skill's value is the **discipline**: build from a real gap (not an imagined one), keep
-the body lean via progressive disclosure, and **adversarially validate** before shipping.
-Most failed skills fail on two things — a vague `description` (so it never triggers) and
-a bloated body (so the agent can't extract what matters). The workflow below fixes both.
+An agent skill defines a reusable procedure and domain context. High-quality skills provide precise discovery triggers, minimize context overhead through progressive disclosure, and validate deterministic execution before deployment.
 
-Read the matching `references/` file before the step that needs it (see the map). The
-references are themselves a worked example of one-topic-per-file progressive disclosure.
+Read the corresponding reference file before performing each workflow step.
 
 ---
 
-## The workflow
+## Workflow
 
-Follow these in order. Do not skip step 1 — skills written to document imagined problems
-are the most common waste.
+Follow these steps in sequential order:
 
-**1. Find the real gap (evals before prose).**
-Run the agent on 1–3 representative tasks **without** the skill. Write down the *specific*
-failures or context you had to supply by hand. Those failures are the skill's reason to
-exist and its first evaluations. If the agent already succeeds unaided, **don't write the
-skill** — delete the instinct. (See `evaluation-and-iteration.md` → "Evals first".)
+1. **Identify Functional Gaps with Baselines:**
+   Execute 1–3 representative tasks without the skill. Record specific failures, unverified assumptions, or domain context that required manual intervention. These recorded gaps define the scope and evaluation criteria for the skill. If baseline execution succeeds consistently without guidance, do not create the skill.
 
-**2. Draft the minimal SKILL.md.**
-Write the frontmatter (`name`, `description`) and the *smallest* set of instructions that
-closes the gaps from step 1. Challenge every sentence: "would the agent get this wrong
-without it?" If no, cut it. Nail the `description` now — it is the only thing the agent
-sees before triggering, and it must say **what** the skill does **and when** to use it,
-in the third person. (See `structure-and-frontmatter.md`.)
+2. **Draft Minimal `SKILL.md`:**
+   Define frontmatter (`name`, `description`) and the minimal instructions necessary to resolve the recorded gaps. State **what** capability the skill provides and **when** to trigger it using third-person declarative prose. Verify that every instruction addresses a specific operational failure mode.
 
-**3. Apply progressive disclosure.**
-Keep the SKILL.md body a lean table of contents (**under ~500 lines**). Move bulky rules,
-long examples, schemas, and domain detail into `references/*.md` linked **one level deep**
-from SKILL.md, with a *when to read this* trigger on each. Put copyable output templates
-and data in `assets/`; put deterministic, reusable code in `scripts/`. (See
-`structure-and-frontmatter.md` and, for code skills, `executable-scripts.md`.)
+3. **Apply Progressive Disclosure Based on Conditional Access:**
+   Keep the `SKILL.md` body under 500 lines as a structural overview. Extract content into `references/*.md` only when an agent can execute a distinct subset of tasks without loading the other parts (such as specialized data schemas, alternative format decoders, or rare error codes). If all rules and guidelines form an essential baseline required on every invocation, keep them unified in `SKILL.md` rather than fragmenting them across reference files. Place output templates in `assets/` and deterministic executables in `scripts/`.
 
-**4. Adversarially validate (the part everyone skips).**
-Stress the draft in a fresh context, in three passes — discovery (does it trigger on the
-right prompts and *not* on look-alikes?), logic (simulate execution step-by-step; where is
-the agent forced to guess?), and edge cases (act as a ruthless QA tester trying to break
-it). Then refine. The exact prompts are in `evaluation-and-iteration.md` → "The four-pass
-validation". Run `skillgrade` if available.
+4. **Validate Skill Execution:**
+   Evaluate the draft in an isolated session across three dimensions:
+   - **Discovery:** Verify the skill triggers on intended requests and remains inactive on related but distinct tasks.
+   - **Deterministic Logic:** Trace execution step by step to identify ambiguous branching, missing parameters, or unspecified dependencies.
+   - **Edge Cases:** Test boundary conditions, malformed inputs, missing tools, and execution failures.
 
-**5. Iterate A/B on real usage.**
-Use the skill in a **fresh session** on real tasks. Watch how the agent navigates it —
-unexpected read order, missed reference links, ignored files, a rule it skipped. Bring
-each observation back and tighten the SKILL.md (often: make a rule more prominent or move
-it into the body). Repeat. Test with every model you'll run it on.
-
-**Refactoring an existing skill** (splitting a bloated body, fixing a description) instead
-of authoring fresh? Same workflow, but the baseline in step 1 is the *current* skill plus
-any evals you have — the job is to split/prune the body and sharpen the description
-**without regressing**. Run step 4's validation **before and after** so you can prove the
-refactor didn't lose behavior, then remove any now-stale generated copies (rulesync section
-below).
+5. **Iterate on Real Workflows:**
+   Test the skill on production tasks across all targeted models. Monitor navigation behavior, referenced file loading order, and command execution. Promote frequently needed reference rules into `SKILL.md` and prune unused reference files.
 
 ---
 
-## Core principles (always apply)
+## Core Authoring Principles
 
-- **Concise is key — the agent is already smart.** Add only what the model lacks: your
-  conventions, non-obvious gotchas, which tool to default to. Don't explain what a PDF is.
-- **The `description` is the product.** Third person — "Extract…" or "Extracts…", never
-  "I can…"/"you can…" — specific, with key terms and concrete *when-to-use* triggers. It's
-  how the agent picks this skill out of 100+. Vague descriptions are the #1 reason a good
-  skill never fires.
-- **Progressive disclosure, one hop from SKILL.md.** Every reference is linked *directly*
-  from SKILL.md, so no file is reachable *only* by chaining through another (SKILL.md →
-  a.md → b.md, where b.md is linked nowhere else — the agent previews such buried files
-  with `head` and reads them incompletely). A short "see also" between two references that
-  are both linked from SKILL.md is fine.
-- **Provide a default, not a menu.** "Use pdfplumber. For scanned PDFs, use pdf2image."
-  Not "you can use pypdf, or pdfplumber, or PyMuPDF, or…". Match freedom to fragility (see
-  `writing-and-content.md` → "Degrees of freedom").
-- **One term per concept; no time-sensitive facts.** Pick "field" (not field/box/element);
-  put deprecated guidance in an "old patterns" `<details>` block, not inline.
-- **Forward slashes always** (`references/x.md`), even on Windows. Name files by content
-  (`form-validation.md`, not `doc2.md`).
-- **Ground in reality.** Write the skill against the actual code/API/tool it covers and
-  verify the claims; never document a remembered or assumed interface.
-- **Eat your own dog food.** A skill-authoring output should itself pass this skill's
-  checklist.
+- **Minimize Context Window Overhead:** Document only non-standard project conventions, domain invariants, edge cases, and preferred tool configurations. Do not explain standard programming languages or well-known file formats.
+- **Conditional Reference Partitioning:** Extract material to `references/` only when tasks require a fraction of the total guidance. Avoid artificial fragmentation of cohesive baseline standards that must apply universally across every skill invocation.
+- **Precise Frontmatter Discovery:** Use third-person declarative phrasing in the `description` field with an imperative or infinitive opening verb. Include concrete keywords, file extensions, and explicit trigger conditions.
+- **Direct Single-Hop Reference Linking:** Link every reference file directly from `SKILL.md`. Do not create deep reference dependency chains (such as `SKILL.md -> a.md -> b.md` where `b.md` is unlinked in `SKILL.md`).
+- **Deterministic Defaults:** Provide a single recommended tool or command path by default. Document secondary alternatives only when required by specific technical constraints.
+- **Consistent Domain Terminology:** Use one unambiguous term per concept across all files in the skill. Place historical or deprecated patterns in explicit collapsed blocks.
+- **Cross-Platform Paths:** Use forward slashes (`/`) for all file paths, including Windows environments.
+- **Verified Technical Interfaces:** Validate all documented CLI commands, API endpoints, schema structures, and parameters against live implementations.
 
 ---
 
-## Reference map
+## Reference Map
 
-Read the file that matches the step you're on:
-
-| Read this… | …when you are |
+| Reference File | Purpose |
 | --- | --- |
-| **`references/structure-and-frontmatter.md`** | Choosing the name/description, the directory layout (SKILL.md / references / scripts / assets), the progressive-disclosure pattern, MCP tool names, or declaring dependencies. |
-| **`references/writing-and-content.md`** | Writing the body: tone, degrees of freedom, workflows + checklists + feedback loops, templates, examples, terminology, avoiding time-sensitive content. |
-| **`references/evaluation-and-iteration.md`** | Validating the skill: evals-first, the four-pass adversarial validation prompts, the Claude-A/Claude-B iteration loop, skillgrade/SkillsBench. |
-| **`references/executable-scripts.md`** | The skill bundles `scripts/`: solve-don't-punt error handling, no voodoo constants, execute-vs-read intent, plan-validate-execute. |
-| **`references/checklist-and-anti-patterns.md`** | About to ship — the final scan: the "ready" checklist and the anti-patterns to delete. |
+| **`references/structure-and-frontmatter.md`** | Directory structure, frontmatter schemas, description triggers, progressive disclosure hierarchy, and tool dependencies. |
+| **`references/writing-and-content.md`** | Instructional phrasing, specification levels, sequential workflows, verification checkpoints, templates, and domain terminology. |
+| **`references/evaluation-and-iteration.md`** | Baseline evaluations, multi-phase validation, execution tracing, and iterative refinement across models. |
+| **`references/executable-scripts.md`** | Bundled scripts, execution vs reading semantics, explicit parameter justification, and plan-validate-execute workflows. |
+| **`references/checklist-and-anti-patterns.md`** | Pre-deployment checklist and non-functional anti-patterns to remove. |
 
-Templates to copy, not describe: **`assets/SKILL.template.md`** (a skeleton skill) and
-**`assets/evaluation.example.json`** (the eval rubric shape).
+Templates:
+- `assets/SKILL.template.md` (structural skill template)
+- `assets/evaluation.example.json` (evaluation schema template)
 
-## Syncing skills in this repo (rulesync)
+## Synchronizing Skills
 
-Skills here are **rulesync-managed**: author under `.rulesync/skills/<name>/` (locally) or
-`rulesync-global/.rulesync/skills/<name>/` (global), then run `rulesync generate`
-(dry-run first). Never hand-edit the generated `.claude/`, `.codex/`, `.agents/`, etc.
-copies — rulesync overwrites them. `rulesync generate` does **not** prune deleted files,
-so remove stale generated copies by hand after deleting a source reference. See the
-`rulesync` skill for the commands.
+Skills in this repository are managed by Rulesync:
+- Local skills: `.rulesync/skills/<name>/`
+- Global skills: `rulesync-global/.rulesync/skills/<name>/`
+
+Synchronize with `rulesync generate` (run with `--dry-run` first). When deleting reference files, manually remove obsolete generated copies from target provider directories.

@@ -127,12 +127,12 @@ because another backend supports it.
 ## Mode activation and transitions
 
 Use a typed live provider setting when one exists. Otherwise, wait for a safe turn boundary, restart the provider with
-the new launch projection, and resume the session when the provider supports resumption.
+the new launch configuration, and resume the session when the provider supports resumption.
 
 The transition follows this order:
 
 1. Resolve the requested mode against provider, version, operating system, and managed-policy capabilities.
-2. Build the complete native sandbox, permission, and approval projection.
+2. Build the complete native sandbox, permission, and approval configuration.
 3. Apply it live or restart the provider process.
 4. Read back effective settings when the provider exposes them.
 5. Run or consult the backend's capability proof.
@@ -196,9 +196,9 @@ Codex provides the strongest typed mode integration among the evaluated backends
 approval settings on `turn/start`, including `readOnly`, `workspaceWrite`, and `dangerFullAccess`. Turn overrides become
 sticky defaults, and queued thread-setting updates can target the next turn.
 
-Recommended projection:
+Recommended mapping:
 
-| Harness mode | Codex projection |
+| Harness mode | Codex mapping |
 | --- | --- |
 | Read | `readOnly` with network enabled, approval policy retained |
 | Write | `workspaceWrite` with workspace roots and network enabled, approval policy retained |
@@ -237,9 +237,9 @@ preview-grade. Native Windows support requires an eligible Windows Insider build
 reliability limits on macOS and Linux, so Harness should request unrestricted network rather than claim precise host
 filtering.
 
-Recommended projection:
+Recommended mapping:
 
-| Harness mode | Copilot projection |
+| Harness mode | Copilot mapping |
 | --- | --- |
 | Read | Sandbox enabled, workspace read-only, network enabled, write tools excluded or denied |
 | Write | Sandbox enabled, workspace read-write, outside paths read-only or denied, network enabled |
@@ -247,7 +247,7 @@ Recommended projection:
 | YOLO | Sandbox disabled plus native `--yolo` |
 
 User, repository, and managed Copilot denials may still narrow YOLO. Persistent allow rules may also broaden ordinary
-modes if startup overrides do not replace them completely. Harness needs an isolated or fully projected launch
+modes if startup overrides do not replace them completely. Harness needs an isolated or fully mapped launch
 configuration and an effective-policy probe before it claims strict Read or Write.
 
 ### Copilot over ACP
@@ -257,7 +257,7 @@ chat, streaming, tool activity, permission requests, MCP configuration, slash co
 `session/new` carries only a limited configuration set. Tool filters and effort are fixed when the ACP server starts and
 apply to every session in that process.
 
-Harness already controls one provider process per Harness session, so initial mode projection remains feasible. A live
+Harness already controls one provider process per Harness session, so initial mode mapping remains feasible. A live
 change to effort, tool availability, or a startup-only sandbox control requires restart and resume. Some model and mode
 changes may work through advertised slash commands, but those commands provide weaker typed acknowledgement than a
 native RPC.
@@ -286,7 +286,7 @@ and Write tools use the permission system rather than the Bash sandbox.
 
 Strict modes therefore require both layers:
 
-| Harness mode | Claude projection |
+| Harness mode | Claude mapping |
 | --- | --- |
 | Read | `plan` or `dontAsk`, deny Edit and Write, sandbox Bash without writes, allow network |
 | Write | `acceptEdits`, permit workspace file tools, sandbox Bash to workspace writes, allow network |
@@ -318,12 +318,12 @@ and writes may start auto-allowed, so Read must explicitly replace that default 
 
 [The CLI reference](https://antigravity.google/docs/cli-reference) exposes `toolPermission` modes such as
 `request-review`, `proceed-in-sandbox`, `always-proceed`, and `strict`, plus non-workspace access and terminal-sandbox
-settings. Command-line overrides remain active for the launched process, which makes per-session startup projection
+settings. Command-line overrides remain active for the launched process, which makes per-session startup configuration
 preferable to mutating shared user settings.
 
-Recommended projection:
+Recommended mapping:
 
-| Harness mode | Antigravity projection |
+| Harness mode | Antigravity mapping |
 | --- | --- |
 | Read | Strict file-write denial, terminal sandbox enabled, network actions allowed |
 | Write | Workspace file writes allowed, non-workspace writes denied, sandbox enabled, network allowed |
@@ -343,7 +343,7 @@ native dangerous-skip behavior for YOLO. Approval routing can govern only reques
 
 | Capability | Codex app-server | Copilot ACP | Copilot SDK | Claude Code | Antigravity CLI |
 | --- | --- | --- | --- | --- | --- |
-| Typed sandbox policy | Yes | Startup/config projection | Native SDK/config | Split sandbox and permissions | Native config/flags |
+| Typed sandbox policy | Yes | Startup/config mapping | Native SDK/config | Split sandbox and permissions | Native config/flags |
 | Typed per-turn security update | Strong | Limited | Partial | Mode-dependent | Not established |
 | Structured approval requests | Yes | ACP request | Hook and events | Native prompt integration needed | Transport-dependent |
 | Native YOLO | `dangerFullAccess` + `never` | `--yolo` plus sandbox off | CLI/runtime equivalent | `bypassPermissions` | always-proceed/dangerous skip |
@@ -360,62 +360,22 @@ mode should claim network enabled rather than claim an exact domain firewall unl
 
 ### Linux
 
-Bubblewrap and nsjail depend on kernel namespaces, installed helpers, mount behavior, and local security policy. Some
-AppArmor configurations disable unprivileged user namespaces. Containers and nested sandboxes may block setup or alter
-the resulting boundary. Read and Write must fail closed when setup cannot complete.
+Bubblewrap and nsjail provide robust unprivileged user namespace sandboxing. Requirements include kernel unprivileged
+user namespaces, matching AppArmor/SELinux profile configuration, and local helper installation.
 
-### WSL
+Harness should probe the binary before advertising Read or Write:
 
-WSL2 can use Linux sandbox primitives when its kernel and distribution permit them. WSL1 cannot. A WSL2 sandbox may
-block launching Windows binaries through `/mnt/c`, so strict containment can trade away host-tool interoperability.
+```sh
+bwrap --ro-bind / / --tmpfs /tmp --proc /proc --dev /dev true
+```
 
 ### Windows
 
-No common mechanism spans the evaluated providers. Codex ships a native Windows sandbox. Copilot requires preview
-Windows builds for its local sandbox. Claude supports WSL2 rather than native Windows sandboxing. Antigravity's current
-documentation conflicts about AppContainer availability.
+Native AppContainer or Restricted Tokens can restrict Windows processes, but official provider documentation remains
+contradictory or marks Windows support as in-development. When running natively on Windows, Harness should advertise
+sandboxed modes only when the backend proves runtime isolation.
 
-A Harness-level command allow list cannot fill that gap. Process names do not describe filesystem effects, shell
-commands can invoke arbitrary programs, and PowerShell pipelines compound multiple operations. Without a provider or
-OS sandbox, Harness can offer approval mediation but cannot promise strict Read or Write.
-
-## Limits of the approach
-
-### Approval visibility
-
-Harness controls only approval requests the provider sends. Native built-in tools, preapproved commands, provider
-automation, hooks, and background work may execute without a request. A permission document cannot govern invisible
-operations.
-
-### Persistent and managed configuration
-
-Provider-global, repository-local, enterprise, and managed policies may change effective behavior. Hard denials safely
-narrow a mode. Persistent allows can weaken Read or Write if the provider does not let Harness replace them. Harness
-should use isolated config roots or complete startup overrides where supported, then verify effective behavior.
-
-Managed policy always wins. Harness cannot turn an administrator-denied operation into an allowed one, including in
-YOLO.
-
-### Network side effects
-
-Read prevents local writes, not remote writes. Full network can create issues, push API mutations, send messages, alter
-cloud resources, or exfiltrate readable credentials. Host allow lists cannot classify whether an HTTP request reads or
-mutates state.
-
-### MCP and external services
-
-MCP servers run as separate processes or remote services and may hold authority beyond the provider sandbox. A provider
-may sandbox its MCP children, pass them through an external host, or leave them outside the boundary. Harness permissions
-can deny a surfaced MCP request, but strict containment requires a verified provider guarantee or a Harness-owned MCP
-process sandbox. See `mcp.md` for the separate MCP profile design.
-
-### Browser, computer-use, and GUI tools
-
-Browser automation and computer-use tools can mutate remote services or local applications outside a shell sandbox.
-They require their own permission categories and capability declarations. Filesystem Read alone does not constrain
-them.
-
-### Paths and process escape
+### Lexical path matching is not containment
 
 Symlinks, junctions, mount points, device paths, Unix sockets, Docker sockets, inherited handles, daemons, and external
 terminals can cross a lexical workspace boundary. Harness string matching cannot provide canonical containment. The
@@ -430,7 +390,7 @@ themselves define a separate Git-history policy.
 ### Version drift
 
 Several relevant controls remain previews. Flags, config fields, defaults, and event coverage can change between CLI
-versions. Every backend adapter must declare a supported version range and reject unknown security projections until
+versions. Every backend adapter must declare a supported version range and reject unknown security configurations until
 tests prove them.
 
 ## Subagent inheritance
@@ -457,7 +417,7 @@ report the limitation explicitly. The orchestration tradeoffs remain documented 
 
 ## Verification contract
 
-Unit tests should isolate mode resolution, provider projection, permission compilation, precedence, approval routing,
+Unit tests should isolate mode resolution, provider mapping, permission compilation, precedence, approval routing,
 audit classification, and child-mode narrowing. Mocked providers should cover missing capabilities, failed restarts,
 unknown versions, managed denials, and events that arrive without approval requests.
 

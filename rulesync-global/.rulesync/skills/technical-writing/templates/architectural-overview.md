@@ -33,7 +33,7 @@ An architectural overview progresses through the following sections:
 - Detail synchronization protocols, cache invalidation rules, and consistency guarantees.
 
 ### 5. Failure Modes and Concurrency Boundaries
-- Define the concurrency model (such as actor isolation, thread pools, async event loops, or mutex hierarchies).
+- Define the concurrency model (such as isolated message-passing workers, thread pools, async event loops, or mutex hierarchies).
 - Document partial failure handling, network timeouts, retry policies, and automated recovery paths.
 - Define resource limits, queue capacity bounds, and backpressure mechanisms.
 

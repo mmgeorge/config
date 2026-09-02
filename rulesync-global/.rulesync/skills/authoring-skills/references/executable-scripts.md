@@ -1,87 +1,60 @@
-# Skills That Bundle Executable Code
+# Executable Scripts in Agent Skills
 
-*When to read this:* only if the skill ships a `scripts/` directory. Markdown-only skills can
-skip this entirely.
+*When to read this:* When authoring skills that bundle deterministic Python, Shell, or CLI scripts under `scripts/`.
 
-## Why bundle a script at all
+## Purpose of Bundled Scripts
 
-Even when the agent *could* write the code, a pre-made, tested script is **more reliable**
-(no generation variance), **cheaper** (its source never enters context — only its output),
-**faster**, and **consistent** across runs. Bundle a script for any deterministic, repeated,
-or fragile operation where variation is a bug (validation, packing/unpacking, migrations,
-transforms). Do **not** dump general library code in `scripts/` — keep each one a tiny,
-single-purpose CLI.
+Bundle executable scripts for operations requiring deterministic execution, schema validation, data migration, or repeatable parsing. Pre-tested scripts eliminate generation variance, reduce context token consumption, and enforce invariant validation. Keep scripts structured as single-purpose command-line utilities.
 
-## Make the execution intent explicit
+## Execution vs Reading Intent
 
-For every script, say whether the agent should **run** it or **read** it — the default is run:
+Explicitly define whether a script is intended for execution or reference inspection:
 
-- Run (most common): "Run `analyze_form.py` to extract fields."
-- Read as reference (only for complex logic the agent must understand): "See
-  `analyze_form.py` for the extraction algorithm."
+- **Execute (Standard):** "Execute `analyze_form.py` to extract form field coordinates."
+- **Reference Inspection:** "Inspect `analyze_form.py` for the coordinate normalization algorithm."
 
-Running keeps the code out of context; reading pulls it in. Pick deliberately.
+## Structured Error Handling
 
-## Solve, don't punt
-
-A script must handle its own error conditions, not fail and leave the agent to improvise.
-Return a useful message and a sane fallback:
+Scripts must handle internal exceptions and output actionable diagnostic text rather than terminating with unhandled stack traces:
 
 ```python
-def process_file(path):
+def process_file(path: str) -> str:
     try:
-        with open(path) as f:
-            return f.read()
+        with open(path, "r", encoding="utf-8") as file_handle:
+            return file_handle.read()
     except FileNotFoundError:
-        print(f"File {path} not found, creating default")
-        with open(path, "w") as f:
-            f.write("")
-        return ""
+        sys.stderr.write(f"Error: Target file {path} does not exist.\n")
+        sys.exit(1)
     except PermissionError:
-        print(f"Cannot access {path}, using default")
-        return ""
+        sys.stderr.write(f"Error: Insufficient read permissions for {path}.\n")
+        sys.exit(1)
 ```
 
-Make validators **verbose and specific** so the agent can fix the input:
-`"Field 'signature_date' not found. Available: customer_name, order_total, signature_date_signed"`
-beats `"invalid field"`.
+Ensure validation utilities output the expected field schema and list missing or invalid keys explicitly.
 
-## No voodoo constants
+## Justified Configuration Constants
 
-Every magic value must justify itself (Ousterhout's law: if you don't know the right value,
-how will the agent?):
+Document the technical justification for operational constants and numeric thresholds:
 
 ```python
-# HTTP requests usually finish within 30s; longer covers slow links
-REQUEST_TIMEOUT = 30
-# 3 retries balances reliability vs latency; most blips clear by retry 2
-MAX_RETRIES = 3
+# HTTP request timeout: allows slow upstream API responses while bounding stalled connections
+REQUEST_TIMEOUT_SECONDS = 30
+
+# Maximum retry count: handles transient network blips without unbounded loop execution
+MAX_RETRY_ATTEMPTS = 3
 ```
 
-Not `TIMEOUT = 47  # why 47?`.
+## Plan-Validate-Execute Sequence
 
-## Plan → validate → execute (verifiable intermediate outputs)
+For batch, destructive, or complex multi-file mutations, use an intermediate structured plan:
 
-For batch, destructive, or high-stakes operations, don't let the agent act in one shot. Have
-it write a structured **plan file**, validate the plan with a script, *then* execute:
+1. **Analyze:** Parse input state and generate a proposed change manifest (`changes.json`).
+2. **Validate:** Execute a validation script against `changes.json` to verify references, schemas, and permissions before mutating state.
+3. **Execute:** Apply changes from the validated manifest.
+4. **Verify:** Run verification assertions on the resulting state.
 
-```
-analyze → write changes.json → validate changes.json → apply → verify
-```
+## Runtime Dependencies and Environment
 
-Validation catches bad references and conflicts before anything is written, the plan is
-reversible/iterable without touching originals, and errors point to a specific line. Use this
-for: batch edits, destructive changes, complex validation rules, high-stakes runs.
-
-## Dependencies and environment
-
-- **List required packages** in the SKILL.md and show the install before use; never assume a
-  binary is on PATH. To check a tool, prefer a no-spawn check (e.g. an `executable`/`which`
-  API your runtime provides) over shelling out.
-- **Know the runtime limits.** Some execution environments have **no network and no runtime
-  install** (e.g. the Claude API code tool); others can install from npm/PyPI. State your
-  skill's requirement so it isn't run where it can't work.
-- **Forward-slash paths only** in scripts and instructions (`scripts/x.py`), even on Windows.
-
-For the validate→fix→repeat loop pattern in prose, see `references/writing-and-content.md`. Ship gate:
-`references/checklist-and-anti-patterns.md`.
+- **Document Prerequisites:** Declare required language runtimes and package dependencies in `SKILL.md`.
+- **Environment Constraints:** State network and filesystem requirements explicitly.
+- **Cross-Platform Compatibility:** Use POSIX path conventions (`scripts/validate.py`) across all scripts and instructions.

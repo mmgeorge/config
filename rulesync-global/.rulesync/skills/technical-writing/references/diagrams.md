@@ -31,7 +31,7 @@ Split diagrams when a visual attempts to depict multiple orthogonal concerns (su
 ## Node, Edge, and Cluster Semantics
 
 ### Node Semantics
-- Use noun phrases for components, services, stores, actors, and state buffers (such as `IngestWorker`, `DocumentStore`, `DraftBuffer`).
+- Use noun phrases for components, services, stores, workers, and state buffers (such as `IngestWorker`, `DocumentStore`, `DraftBuffer`).
 - Use active verb phrases for standalone computational stages only when the transformation itself is the primary architectural subject (such as `TokenizeInput`, `ValidateSignature`).
 - Use state adjectives or past participles for state machine nodes (such as `Draft`, `PendingSync`, `Committed`, `Failed`).
 

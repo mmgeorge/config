@@ -1,26 +1,31 @@
 ---
 name: nushell
-description: Use when Codex works with Nushell scripts, modules, one-liners, commands, configuration, nu-check validation, or source-backed Nushell behavior. Reference nushell/nushell and nushell/nushell.github.io through GitHub MCP for current source, command signatures, internals, user-facing docs, cookbook examples, migration guides, and language reference.
+description: >-
+  Author, inspect, validate, and debug Nushell scripts, modules, pipelines, commands,
+  configuration, and nu-check syntax assertions. Use when working with Nushell code,
+  converting shell scripts to Nushell, or validating script syntax.
+targets:
+  - '*'
 ---
 
 # Nushell
 
-Use this skill for Nushell scripts, modules, one-liners, commands, configuration, and syntax-sensitive guidance.
+Use this skill for authoring and validating Nushell scripts, modules, pipelines, commands, and configuration.
 
 ## Source Reference
 
-- Use GitHub MCP for `nushell/nushell` when checking source code, builtins, command signatures, or internals.
-- Use GitHub MCP for `nushell/nushell.github.io` when checking user-facing docs, cookbook examples, migration guides, or language reference.
-- Prefer source-backed answers when syntax, command signatures, parsing behavior, or current behavior matters.
+- Consult `nushell/nushell` via GitHub MCP for source implementations, builtin command signatures, and language internals.
+- Consult `nushell/nushell.github.io` via GitHub MCP for official documentation, cookbook patterns, and migration guides.
+- Rely on verified command signatures and language grammar when resolving parsing ambiguities.
 
 ## Script Validation
 
-Before returning any Nushell script:
+Validate all Nushell scripts before presenting or executing them:
 
-1. Ensure `nu` is installed.
-2. Run `nu -c 'nu-check script.nu'` for standalone scripts.
-3. Run `nu -c 'nu-check --as-module module.nu'` for module files.
-4. For one-liners, validate with `"your code here" | nu-check`.
-5. Fix every parse error before presenting the script.
+1. Verify `nu` binary is accessible in the environment.
+2. For standalone scripts: run `nu -c 'nu-check path/to/script.nu'`.
+3. For module definitions: run `nu -c 'nu-check --as-module path/to/module.nu'`.
+4. For pipeline expressions: run `"<pipeline-string>" | nu-check`.
+5. Resolve all parse errors identified by `nu-check` before deployment.
 
-If validation cannot run, say exactly why and include the command that failed.
+If validation is blocked by missing runtime dependencies, report the exact missing command and diagnostic output.

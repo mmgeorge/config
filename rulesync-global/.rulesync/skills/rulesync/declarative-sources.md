@@ -52,7 +52,7 @@ Each entry in `sources` accepts:
 | `ref`       | `string`   | Branch, tag, or ref to fetch from. Defaults to the remote's default branch. For GitHub transport, use the `@ref` source syntax.                                                                                       |
 | `path`      | `string`   | Path to the skills directory within the repository. Defaults to `"skills"`. Set to `""`, `"."`, or `"./"` to target the entire repository root (see note below). For GitHub transport, use the `:path` source syntax. |
 
-> **Repository-root paths (`path: "."`):** When `path` is `""`, `"."`, or `"./"` (with the `git` transport), rulesync disables sparse-checkout and fetches the **entire** repository tree, then groups each top-level directory as a skill. This is useful for single-skill repositories whose `SKILL.md` lives at the repo root (`<repo>/SKILL.md`) rather than under a `skills/` container. Because the whole tree is fetched, prefer a narrower `path` for large repositories; the fetch is still bounded by rulesync's file-count, total-size, and depth limits.
+> **Repository-root paths (`path: "."`):** When `path` is `""`, `"."`, or `"./"` (with the `git` transport), rulesync disables sparse-checkout and fetches the **entire** repository tree, then groups each top-level directory as a skill. This is useful for single-skill repositories whose `SKILL.md` lives at the repo root (`<repo>/SKILL.md`) rather than under a `skills/` container. Because the whole tree is fetched, prefer a narrower `path` for large repositories. The fetch is still bounded by rulesync's file-count, total-size, and depth limits.
 
 ## How It Works
 
@@ -62,7 +62,7 @@ When `rulesync install` runs and `sources` is configured:
 2. **Remote skill listing** — The `skills/` directory (or the path specified in the source URL) is listed from the remote repository.
 3. **Filtering** — If `skills` is specified, only matching skill directories are fetched.
 4. **Precedence rules**:
-   - **Local skills always win** — Skills in `.rulesync/skills/` (not in `.curated/`) take precedence; a remote skill with the same name is skipped.
+   - **Local skills always win** — Skills in `.rulesync/skills/` (not in `.curated/`) take precedence, and a remote skill with the same name is skipped.
    - **First-declared source wins** — If two sources provide a skill with the same name, the one declared first in the `sources` array is used.
 5. **Output** — Fetched skills are written to `.rulesync/skills/.curated/<skill-name>/`. This directory is automatically added to `.gitignore` by `rulesync gitignore`.
 
@@ -85,7 +85,7 @@ When `--mode` is omitted, rulesync defaults to `rulesync` mode. If `apm.yml` is 
 | Property | Type     | Default          | Description                                                                               |
 | -------- | -------- | ---------------- | ----------------------------------------------------------------------------------------- |
 | `agent`  | `string` | `github-copilot` | One of `github-copilot`, `claude-code`, `cursor`, `codex`, `gemini`, `antigravity`.       |
-| `scope`  | `string` | `project`        | `project` writes inside the project root; `user` writes inside the user's home directory. |
+| `scope`  | `string` | `project`        | `project` writes inside the project root, while `user` writes inside the user's home directory. |
 
 Agent → install directory mapping:
 
@@ -105,7 +105,7 @@ Per-source field support in `--mode gh`:
 | Field       | Status                                                                                                                                       |
 | ----------- | -------------------------------------------------------------------------------------------------------------------------------------------- |
 | `source`    | Required. Must resolve to a GitHub repository (`owner/repo`, `owner/repo@ref`, or an `https://github.com/...` URL).                          |
-| `skills`    | Optional. When set, only the listed skill names are installed; remote skills not in the list are skipped, and missing names log a warning.   |
+| `skills`    | Optional. When set, only the listed skill names are installed. Remote skills not in the list are skipped, and missing names log a warning.   |
 | `ref`       | Optional. Pins a tag, branch, or commit SHA. When omitted, gh mode resolves to the latest release's tag, falling back to the default branch. |
 | `agent`     | Optional. Defaults to `github-copilot`. See the agent table above.                                                                           |
 | `scope`     | Optional. Defaults to `project`.                                                                                                             |

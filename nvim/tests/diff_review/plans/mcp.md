@@ -112,7 +112,7 @@ URLs, arguments, environment references, headers, and transport settings.
 
 ## Candidate ownership model
 
-Rust should own catalog parsing, profile compilation, persistence, backend projection, and capability checks.
+Rust should own catalog parsing, profile compilation, persistence, backend translation, and capability checks.
 Lua should own commands, completion, the profile editor, the picker, and winbar presentation.
 
 ```text
@@ -406,7 +406,7 @@ native discovery or report an effective inventory that Harness can verify.
 The likely choices are:
 
 - implement an SDK-backed Antigravity adapter with explicit session configuration,
-- materialize a provider-native profile before launch and restore it afterward, or
+- generate a provider-native profile before launch and restore it afterward, or
 - report MCP profiles as unsupported for Agy.
 
 Mutating the user's native configuration around every Harness session introduces races across terminals and

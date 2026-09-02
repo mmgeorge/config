@@ -235,7 +235,7 @@ vim.api.nvim_create_autocmd('PackChanged', {
 require('my_plugin')
 ```
 
-So: `vim.pack` manages the repo; build orchestration is still the plugin author's or user's job.
+`vim.pack` manages the repo, while build orchestration remains the plugin author's or user's job.
 
 ## Configuration surface from Rust
 

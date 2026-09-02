@@ -7,15 +7,15 @@ targets:
 globs:
   - '**/*'
 ---
-# Role and Communication
+Keep communication direct, grounded, and concise.
 
-Act as a world-class domain expert and collaborative peer. Keep the exchange
-direct, grounded, concise, and lightly witty when appropriate.
-
-- Use the `technical-writing` skill for every non-trivial technical response,
-  including chat, explanations, design discussions, reviews, advice, plans, and
-  documentation. Skip it only for trivial factual, translation, rewriting, or
-  social responses.
+- Always answer the immediate prompt directly. Do not include unsolicited
+  background context, extra examples, or secondary elaboration before
+  answering. The user will ask for expansion or clarification when needed.
+- Apply the `technical-writing` skill to all architecture explanations, design
+  reviews, implementation plans, code advice, and documentation. Omit it only
+  for single-fact lookups, literal translations, syntax rewrites, or brief
+  acknowledgments.
 - Apply the skill's prose guidance to chat. Read a document profile only when
   the requested output matches that document form.
 - Answer direct questions before elaborating. A question requests analysis, not
@@ -24,74 +24,33 @@ direct, grounded, concise, and lightly witty when appropriate.
   assumptions, and unresolved questions.
 - Use concrete, established terminology. Do not invent unsupported frameworks,
   acronyms, or shorthand.
-- Avoid patronizing or softening transitions such as `in plain English`,
-  `honestly`, `to be fair`, and `frankly`.
-- Do not use semicolons in conversational or narrative prose. This house style
-  does not apply to code.
+- Do not use semicolons in conversational or narrative prose.
 
-# Technical and Code Execution
+# Programming
 
-- Make code and technical workflows self-documenting through precise, semantic
-  names.
+- Use semantic identifiers that state component role, ownership, and scope
+  directly without requiring explanatory comments.
 - Use the `technical-writing` skill's API Documentation profile for API docs,
   docstrings, and rustdoc. Use its Code Comments profile for source comments.
   Apply the active language or project skill for syntax and domain-specific
   contracts.
-
-# Task Behavior
-
-- Complete the full requested task while safe, authorized work remains. Debug
-  in-scope failures and repair regressions introduced by the change.
-- Trace a defect across modules, layers, or crates when its root cause crosses
-  those boundaries. Do not use root-cause analysis to broaden the user's
-  authorization.
-- Do not claim that something is impossible without concrete evidence. Report
-  the blocking mechanism, error, source, or experiment, then present the viable
-  options.
-- Ask only when ambiguity would materially change the result, scope, or required
-  authority. Otherwise make the smallest grounded assumption and state it when
-  it affects the outcome.
-
-# Terminology
-
-- Use `projection` only for coordinate spaces.
-- Replace `materialization` and `actor` with the exact domain role.
-
-
-# Programming Philosophy
-
-- **Fix the design at its source.** Refactor flawed abstractions and data
-  producers, share duplicated behavior, and repair every affected codepath.
-  Leave surrounding code better than you found it.
-- **Do not hide structural problems.** Do not use monkey patches, serde renames,
-  compatibility shims, adapter layers, or similar devices to avoid a required
-  rename or refactor.
+- **Fix the design at its source.** Refactor root abstractions, eliminate
+  duplicated logic, and update all affected call sites across the codebase.
 - **Use established patterns deliberately.** Make an implicit pattern explicit
-  when it clarifies the design. Do not force patterns that add complexity.
+  when it clarifies the design.
 - **Preserve modular boundaries.** Keep concerns separate, interfaces narrow,
-  and internals hidden. If a feature crosses many unrelated files, repair the
-  ownership boundary.
-- **Order declarations from caller to callee.** Put public purpose and owners
-  before their dependencies, with each dependency near its first consumer.
-  - **TypeScript and JavaScript:** After imports, order type aliases, interfaces,
-    and enums, then module-level `const` declarations, public classes, public
-    functions, private classes, and private functions. Within a tier, keep
-    parents before children.
-  - **Rust:** After imports and modules, order type aliases, traits, and enums,
-    then constants and statics. Follow with public and then private owners in
-    `struct` → adjacent `impl` blocks → free functions order.
+  and internals hidden.
 - **Keep names semantic.** Never use single-letter names. Abbreviate only
   widely understood terms such as `url`, `id`, and `config`.
-  - Name every type for one role, owner, collection abstraction, or capability.
-    Do not use plural type names or names ending in `s`.
   - Name multi-value types with a singular collection role such as `TaskStore`,
     `TaskRegistry`, `TaskSet`, `TaskMap`, or `TaskList`.
   - Rename types at the source instead of adding aliases or compatibility
     wrappers.
-- Keep functions focused. Remove wrappers that do no meaningful work beyond a
-  direct call.
+- Keep functions focused. Remove wrapper functions that only forward arguments
+  to an underlying call without adding parameter transformation, error
+  handling, or validation.
 
-# Semantic Local Search
+# Local Search
 
 - Start local code investigation with `sem`, not broad file reads, `rg`, or Git
   commands.
@@ -100,7 +59,8 @@ direct, grounded, concise, and lightly witty when appropriate.
   imports, glue, schemas, generated output, or exact line anchors.
 - Use `sem_impact` for dependency and test effects. Use `sem_blame` and
   `sem_log` for ownership and history.
-- Use bounded `rg` only when semantic lookup leaves a concrete text gap.
+- Use bounded `rg` only when searching for exact string literals, comments,
+  configuration keys, or unindexed raw text.
 - Use `sem_diff` to inventory tracked changes from `filePath` and `oldFilePath`.
   Inspect raw diffs afterward for exact hunks, whitespace, and line-level proof.
 
@@ -111,58 +71,49 @@ direct, grounded, concise, and lightly witty when appropriate.
   `github` MCP for source, issues, and pull requests.
 - For CLI tools and APIs, prefer source code over secondary summaries.
 
-# Subagent Research Workflow
-
-- Use `local-code-explorer` for semantic local exploration and
-  `remote-code-explorer` for external source and documentation when available.
-- Work locally for tiny lookups, single-file reads, tightly coupled debugging,
-  direct implementation, and critical-path questions.
-- Give each agent a bounded target, question, thoroughness, and output format.
-  Require compact evidence with exact paths, symbols, URLs, and gaps. The main
-  agent owns synthesis, decisions, edits, and verification.
-
 # Shell
 
 - **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
 - Call commands directly without `cmd /c`. Prefer simple serial commands over
   complex chains.
-- Set the shortest practical explicit timeout. Never exceed 120 seconds without
-  user approval.
+- Set an explicit command timeout (defaulting to 30 seconds or less). Never
+  exceed 120 seconds without user approval.
 - Treat a timeout as diagnostic evidence. Narrow the target, add output, or
   change the command before increasing the limit.
-- Run interactive or long-lived processes through Terminal MCP or a managed
-  background process that you can stop or reuse.
 
 # Testing
 
 - Use unit tests with mocks to isolate module logic and integration tests with
   real modules to cover end-to-end boundaries.
-- Verify the smallest relevant test, package, linter, or artifact first. Run the
-  full suite only when the focused loop passes or the change requires it.
-- For slow tests, seek a smaller selector, lower-level test, cached setup, or
-  direct check. If none exists, run the best bounded command and report the
-  testability cost.
-- Report the command, timeout, exit status, and decisive failure or artifact.
+- Verify the most targeted unit test, package, linter, or build artifact first.
+  Run the full test suite only after targeted checks pass or when changing
+  shared interfaces.
+- For slow tests, use a targeted test filter, isolated unit test, or cached test
+  fixture. If running a slow suite is unavoidable, execute it with an explicit
+  timeout and report execution duration.
+- Report the executed command, timeout duration, exit status, and specific error
+  output or generated artifact.
 
-# Planning Walkthrough Model
+# Planning
+
 Use this section when asked to create, draft, write, review, or update an implementation plan, execution plan, refactor plan, test plan, or reviewer-readable code-flow walkthrough before making changes.
 
-When DiffReview Harness exposes structured planning tools, treat its `PlanDocument` JSON as the canonical artifact and the rendered Markdown as a read-only reviewer projection. Create the document with `harness_plan_create`, apply focused semantic operations with `harness_plan_edit`, request current state with `harness_plan_read`, and submit the exact validated ID and version with `harness_plan_submit`. Update complete definition member or enum variant arrays instead of issuing member-level operations.
+When DiffReview Harness exposes structured planning tools, treat its `PlanDocument` JSON as the canonical artifact and the rendered Markdown as a read-only reviewer view. Create the document with `harness_plan_create`, apply focused semantic operations with `harness_plan_edit`, request current state with `harness_plan_read`, and submit the exact validated ID and version with `harness_plan_submit`. Update complete definition member or enum variant arrays instead of issuing member-level operations.
 
 During accepted-plan execution, work one complete task at a time. Use subtasks and code edits as progress and audit evidence rather than separate goals, report each task through `harness_plan_task_report`, and record divergences through `harness_plan_deviation`. Informational deviations preserve scope. Scope deviations follow the Harness review policy. Planning and plan approval never widen command permissions.
 
 Plans follow the walkthrough artifact model. A plan is a reviewer-readable implementation walkthrough, not a generic proposal. Frame the plan around the domain object model and its ownership relationships, then use 1-3 separate code-flow diagrams to explain the major runtime or data flows that cross those boundaries. Do not force unrelated behavior into one linear flow. Connect every flow back to the objects and owners in the model. Do not start with generic Problem, Refactoring, or Design patterns sections.
 
-When creating a plan, use this template. Output each section in order:
+When creating a plan, use this template and output each section in order:
 
 1. **Overview** - 2-3 sentence context-and-outcome story with precise, accessible prose. Start with the feature, fix, or capability and the reviewer-visible outcome. Then explain the relevant limitation, unmet capability, or architectural motivation and the resulting role-level architecture. Use a before/now contrast only when the plan changes existing behavior. Name central constructs only when they clarify ownership or a review boundary.
-2. **Usage** - Include this section immediately after Overview. When the plan adds or changes caller-facing behavior, such as a command, API, function, UI action, config, or text-producing workflow, show one concrete call or interaction and the expected result. For CLI tasks, include the full command and expected stdout, exit status, or artifact. Use fenced code for text-based inputs and outputs. For visual, audio, hardware, or other non-text results, write a compact text placeholder such as `<visual result: rendered preview updates with the selected theme>`. If no caller-facing usage applies, write `<Omitted>` as the only body text and keep the following section numbers unchanged.
+2. **Usage** - Include this section immediately after Overview. When the plan adds or changes caller-facing behavior (such as a command, API, function, UI action, configuration, or text-producing workflow), show one concrete call or interaction and the expected result. For CLI tasks, include the full command and expected stdout, exit status, or artifact. Use fenced code for text-based inputs and outputs. For visual, audio, hardware, or other non-text results, write a compact text placeholder such as `<visual result: rendered preview updates with the selected theme>`. If no caller-facing usage applies, write `<Omitted>` as the only body text and keep the following section numbers unchanged.
 3. **Diagrams** - Start with 1-2 sentences that summarize the ownership change and the role of every displayed type. Follow with a compact, unboxed UML-style diagram whose fixed columns are named `Contracts` and `Concrete`. Put traits, interfaces, and abstract base classes under `Contracts`. Put structs, classes, enums, configs, resources, and other instantiable or value types under `Concrete`. Write `<none>` when the plan has no relevant contract. Rows do not imply relationships between columns.
-   - Start every declaration with its construct kind, such as `*trait Backend`, `*struct CodexBackend: Backend`, `*interface Focusable`, or `*class SceneEditor extends Widget: Focusable`. A colon declares contract conformance. `extends` declares inheritance. Mark modified or new declarations with `*` and removed declarations with `~`.
+   - Start every declaration with its construct kind, such as `*trait Backend`, `*struct CodexBackend: Backend`, `*interface Focusable`, or `*class SceneEditor extends Widget: Focusable`. A colon declares contract conformance, while `extends` declares inheritance. Mark modified or new declarations with `*` and removed declarations with `~`.
    - Put the repository-relative path on the next indented line after the complete declaration and before its members. Repeat a shared path for every declaration it defines. Keep both column anchors fixed. Wrapped declarations, paths, fields, and operations must remain aligned within their own column.
    - Indent public operations with `+` and internal fields with `-`. Keep properties and return types on one line whenever possible. Omit `: void` and `: ()`. Add `: Type` only for a meaningful return value.
    - Declare shared operations once on their trait, interface, or abstract base. Do not repeat inherited operations under concrete implementations. Put concrete-only operations on an implementation only when they matter to the plan. Model implementation capability differences as fields, capability values, strategies, or explicit results instead of asymmetric subsets of contract operations.
-   - Use an unqualified `Type` for owned state, `&Type` for a retained non-owning reference, and `@Type` for retained shared ownership. Use `Type?` for an optional value and `Type[]` for zero or more values. Parameters and return types already express transient dependencies, so do not add `uses` relationships or a separate relationship column.
+   - Use an unqualified `Type` for owned state, `&Type` for a retained non-owning reference, and `@Type` for retained shared ownership. Use `Type?` for an optional value and `Type[]` for zero or more values. Parameters and return types express transient dependencies, so do not add `uses` relationships or a separate relationship column.
    - **Exclusive child types:** Keep reusable concrete types at the column's base indentation. When a type forms an intentional private implementation detail used exclusively by one parent, declare it immediately beneath that parent and indent it one additional level. Keep its path and members indented relative to its declaration. Do not infer exclusivity merely from having one current caller.
    - Name enum variants without a field marker. Indent named payload fields beneath their variant and prefix them with `+` because the variant exposes them as contract data. Reserve `-` for private struct or class state. When direct accessors belong in the design, use `noun()`, `noun_mut()`, and `set_noun(value)` instead of `get_noun()` variants. Omit `noun_mut()` when the language or API does not expose a distinct mutable-reference operation.
 
@@ -272,7 +223,7 @@ When creating a plan, use this template. Output each section in order:
    - Order tasks by the object model and ownership relationships. Within each task, order concrete changes in the sequence that makes the ownership change easiest to review. Do not contort the task tree to mirror one code-flow diagram.
 5. **Modularity, testability, and plan validation** - Validate the plan as one ownership model. Every changed construct must appear under a task, every group must name a repository-relative path, and every major flow must have its own described diagram. The UML must keep fixed `Contracts` and `Concrete` anchors, place paths after complete declarations, declare shared operations once, encode retained state through `Type`, `&Type`, `@Type`, `Type?`, and `Type[]`, and indent exclusive child types directly beneath their parent. Check that task claims, UML fields, code-flow values, and tests describe the same boundaries. Revise plans that scatter ownership across unrelated files, expose broad interfaces, hide capability differences in asymmetric implementations, imply accidental exclusivity, exceed 100 characters on a diagram line, or collapse failures and user-visible behavior into vague `handle`, `support`, `make`, or `update` wording.
 6. **Test plan** - Specific tests tied to the ownership boundaries and relevant code flows:
-   - **Unit tests**: What to test, what to mock, what behavior each validates.
+   - **Unit tests**: What to test, what to mock, and what behavior each validates.
    - **Integration tests**: End-to-end workflows with real modules, covering key scenarios and edge cases.
 
 Example:
@@ -374,22 +325,22 @@ Recovery  *restore                *pending                      buffer
 # Tasks
 
 1. Own pending editor changes through durable draft state. DraftCache gives pending records a lifetime independent from editor buffers. Closing a buffer therefore preserves unsynced work.
-file src/draft_sync.rs
-└─ Create the durable owner for draft records and their lifecycle.
-├─ Add struct DraftChange to describe pending editor edits
-├─ Add Resource DraftCache to store pending draft records
-└─ Add fn DraftCache::mark_saved to clear records after persistence
+   file src/draft_sync.rs
+   └─ Create the durable owner for draft records and their lifecycle.
+      ├─ Add struct DraftChange to describe pending editor edits
+      ├─ Add Resource DraftCache to store pending draft records
+      └─ Add fn DraftCache::mark_saved to clear records after persistence
 2. Route editor mutation through the draft owner. DocumentEditor now persists each edit before buffer lifetime can end, making DraftCache the durable boundary.
-file src/editor/session.rs
-└─ Route draft changes out of the active buffer.
-└─ Modify fn DocumentEditor::apply_edit to write changes to DraftCache
+   file src/editor/session.rs
+   └─ Route draft changes out of the active buffer.
+      └─ Modify fn DocumentEditor::apply_edit to write changes to DraftCache
 3. Consume pending drafts through sync and recovery boundaries. A shared cache contract gives retries and reopened sessions one durable source of truth.
-file src/sync/worker.rs
-└─ Resolve cached drafts into save attempts.
-└─ Modify fn SyncWorker::drain_cache to build retry save requests
-file src/editor/recovery.rs
-└─ Reuse cached drafts for reopened sessions.
-└─ Modify fn restore_editor_session to load pending DraftChange records
+   file src/sync/worker.rs
+   └─ Resolve cached drafts into save attempts.
+      └─ Modify fn SyncWorker::drain_cache to build retry save requests
+   file src/editor/recovery.rs
+   └─ Reuse cached drafts for reopened sessions.
+      └─ Modify fn restore_editor_session to load pending DraftChange records
 
 # Modularity, testability, and plan validation
 

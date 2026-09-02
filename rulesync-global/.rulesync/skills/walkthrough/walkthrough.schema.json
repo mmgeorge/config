@@ -29,7 +29,7 @@
     "commit": {
       "type": "string",
       "pattern": "^[0-9a-fA-F]{40}$",
-      "description": "Full sha of HEAD at generation time (git rev-parse HEAD). Used for staleness detection; positions describe the working tree as it existed on top of this commit."
+      "description": "Full sha of HEAD at generation time (git rev-parse HEAD). Used for staleness detection, where positions describe the working tree as it existed on top of this commit."
     },
     "tasks": {
       "type": "array",
@@ -86,7 +86,7 @@
         "title": {
           "type": "string",
           "minLength": 1,
-          "description": "Prose intent row under a task; explains the local purpose served by the concrete changes."
+          "description": "Prose intent row under a task, explaining the local purpose served by the concrete changes."
         },
         "justification": {
           "type": "string",
@@ -120,7 +120,7 @@
         "role": {
           "type": "string",
           "minLength": 1,
-          "description": "Optional code-proven role label such as Adapter or Middleware. Use only when an implemented trait/interface, base class, framework registration, or strong repo convention proves a role that the kind and target do not already state; the summary renders this instead of the broad kind keyword."
+          "description": "Optional code-proven role label such as Adapter or Middleware. Use only when an implemented trait/interface, base class, framework registration, or strong repo convention proves a role that the kind and target do not already state, and the summary renders this instead of the broad kind keyword."
         },
         "target": {
           "type": "string",

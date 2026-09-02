@@ -1,128 +1,98 @@
-# Writing & Content
+# Writing and Content Guidelines
 
-*When to read this:* while writing the SKILL.md body or a reference — choosing tone, how
-much to spell out, how to structure a multi-step procedure, and which patterns (template,
-examples, workflow, feedback loop) to use.
+*When to read this:* When authoring the `SKILL.md` body or reference files to choose instructional phrasing, levels of instruction specificity, sequential workflows, verification checkpoints, templates, and domain terminology.
 
 ## Contents
-- Concise — the agent is already smart
-- Tone: third-person imperative
-- Degrees of freedom (match specificity to fragility)
-- Default, not a menu
-- Consistent terminology, no time-sensitive facts
-- Structure multi-step work as a workflow
-- Feedback loops (validator → fix → repeat)
-- Templates and examples
+- Context Budget and Information Density
+- Instructional Tone and Phrasing
+- Instruction Specificity by Operational Fragility
+- Default Tool Selection
+- Consistent Domain Terminology
+- Sequential Workflows
+- Verification Loops
+- Templates and Concrete Examples
 
-## Concise — the agent is already smart
+## Context Budget and Information Density
 
-The context window is a shared public good. Add only what the model **doesn't already
-know**: your project's conventions, non-obvious gotchas, the specific tool to default to,
-the field-name mismatch that bites. Challenge every line: *"would the agent get this wrong
-without it?"* If no, delete it.
+The context window is a constrained shared resource. Document only domain-specific conventions, non-obvious operational constraints, concrete defaults, and exact tool interfaces.
 
-````markdown
-<!-- Good (~50 tokens): assumes the model knows what a PDF is -->
+```markdown
+<!-- Functional: specifies tool and exact usage -->
 ## Extract PDF text
-Use pdfplumber:
+Use `pdfplumber`:
 ```python
 import pdfplumber
 with pdfplumber.open("file.pdf") as pdf:
     text = pdf.pages[0].extract_text()
 ```
 
-<!-- Bad (~150 tokens): explains PDFs, libraries, pip — all known -->
+<!-- Non-functional: generic background and tutorial prose -->
 ## Extract PDF text
-PDF (Portable Document Format) files are a common format that contains text… there are
-many libraries… pdfplumber is recommended because… first install it with pip…
-````
-
-## Tone: third-person imperative
-
-Write the body as instructions to the agent: "**Extract** the table. **Check** for empty
-pages. **If** the form is scanned, **run** OCR." Avoid "I will…" and "you should…" and avoid
-narrating *why* at length — state the rule and move on. (The `description` is third-person
-declarative; the body is third-person imperative.)
-
-## Degrees of freedom — match specificity to fragility
-
-Think of the agent as a robot on a path. Give exact guardrails only where a misstep is
-costly; give direction and trust it where many paths succeed.
-
-- **High freedom (prose steps)** — many valid approaches, context decides. *e.g.* "Review
-  the code for bugs, readability, and adherence to project conventions." Open field.
-- **Medium freedom (parameterized pattern/pseudocode)** — a preferred pattern exists, some
-  variation is fine. *e.g.* a `generate_report(data, format="markdown")` template to adapt.
-- **Low freedom (exact command, no deviation)** — fragile, consistency-critical, must run in
-  sequence. *e.g.* "Run exactly `python scripts/migrate.py --verify --backup`. Do not add
-  flags." Narrow bridge with cliffs.
-
-Over-constraining an open task wastes tokens and brittle-fails; under-constraining a fragile
-one invites the agent to improvise into a wall.
-
-## Default, not a menu
-
-Presenting many options makes the agent try them all. Give one default plus an escape hatch:
-
-```markdown
-Use pdfplumber for text extraction. For scanned PDFs requiring OCR, use pdf2image + pytesseract.
+PDF (Portable Document Format) files are a common format that contains text... there are
+many libraries... pdfplumber is recommended because... first install it with pip...
 ```
 
-Not: "you can use pypdf, or pdfplumber, or PyMuPDF, or pdf2image, or…".
+## Instructional Tone and Phrasing
 
-## Consistent terminology, no time-sensitive facts
+Write the body as imperative instructions: "**Extract** table schema. **Verify** page boundaries. **If** the document contains scanned images, **run** OCR." Avoid conversational commentary and personal pronouns.
 
-- Pick **one** term per concept and use it everywhere: always "field" (never field / box /
-  element / control), always "extract" (never pull / get / retrieve). Drift confuses the
-  agent.
-- Don't write "before August 2025 use the old API". Put deprecated guidance in a collapsed
-  **old-patterns** block so the main flow stays current:
+## Instruction Specificity by Operational Fragility
+
+Match instruction specificity to the operational risk and variability of the task:
+
+- **Open Guidelines (High Freedom):** For exploratory tasks with multiple valid solutions (such as code review or design analysis), provide evaluation criteria and architectural constraints.
+- **Parameterized Patterns (Medium Freedom):** For structured operations with variable inputs, provide standard schemas and adaptable script templates.
+- **Exact Deterministic Commands (Low Freedom):** For state-mutating, destructive, or sequence-sensitive operations, provide exact commands and explicit argument constraints.
+
+## Default Tool Selection
+
+Specify a single primary tool and define explicit fallback conditions:
+
+```markdown
+Use `pdfplumber` for text extraction. When encountering scanned documents, use `pdf2image` and `pytesseract`.
+```
+
+Do not list unstructured alternatives without decision criteria.
+
+## Consistent Domain Terminology
+
+- Use one stable term per concept across the entire skill (such as consistently using `field` rather than alternating between `box`, `element`, or `control`).
+- Do not write time-sensitive instructions. Place deprecated APIs or legacy migration notes in explicit collapsed blocks:
+
   ```markdown
-  ## Current method
+  ## Current API
   Use the v2 endpoint: `api.example.com/v2/messages`
-  <details><summary>Legacy v1 (deprecated 2025-08)</summary>
-  v1 used `api.example.com/v1/messages` — no longer supported.
+
+  <details><summary>Legacy v1 (deprecated)</summary>
+  v1 endpoint `api.example.com/v1/messages` is obsolete.
   </details>
   ```
 
-## Structure multi-step work as a workflow
+## Sequential Workflows
 
-Break complex operations into numbered, chronological steps. For long procedures, give a
-**copyable checklist** the agent ticks off — it prevents skipped validation:
-
-```markdown
-## Form-filling workflow
-Copy this and check off as you go:
-- [ ] 1. Analyze the form (run analyze_form.py)
-- [ ] 2. Create field mapping (edit fields.json)
-- [ ] 3. Validate mapping (run validate_fields.py)
-- [ ] 4. Fill the form (run fill_form.py)
-- [ ] 5. Verify output — if it fails, return to step 2
-```
-
-Use **conditional/decision-tree** steps when the path forks ("Creating new content? → …;
-Editing existing? → …"). If a workflow grows large, push it into its own reference file.
-
-## Feedback loops — validator → fix → repeat
-
-For quality-critical output, build the check into the procedure. The "validator" can be a
-script *or* a reference doc the agent compares against:
+Structure multi-step operations as ordered, numbered procedures. For complex sequences, provide a structured checklist:
 
 ```markdown
-1. Draft content per STYLE_GUIDE.md
-2. Review against the checklist (terminology, example format, required sections)
-3. If issues: note each with a section reference, revise, re-review
-4. Only proceed when all requirements are met
+## Form Processing Workflow
+1. Analyze form fields (`analyze_form.py`)
+2. Define field mappings (`fields.json`)
+3. Validate mappings against schema (`validate_fields.py`)
+4. Populate form data (`fill_form.py`)
+5. Verify output artifact
 ```
 
-## Templates and examples
+## Verification Loops
 
-- **Template pattern** — give the exact output shape. Mark strictness: "ALWAYS use this exact
-  template" for data formats vs "a sensible default; adapt as needed" for flexible output.
-  Prefer a copyable template in `assets/` over prose describing the format.
-- **Examples pattern** — when quality depends on style, show input→output pairs (just like
-  few-shot prompting). Three concrete commit-message examples teach the format better than a
-  paragraph describing it. **Concrete beats abstract** every time.
+Build validation steps directly into procedural workflows:
 
-Before shipping, scan `references/checklist-and-anti-patterns.md`. For code-bearing skills, see
-`references/executable-scripts.md`.
+```markdown
+1. Draft output artifact.
+2. Validate against schema and style rules.
+3. If errors are detected: record error messages, repair output, and re-validate.
+4. Proceed only after validation passes.
+```
+
+## Templates and Concrete Examples
+
+- **Templates:** Provide exact output schemas in `assets/` and specify whether adherence is strict or adaptable.
+- **Concrete Input/Output Pairs:** Provide verified input/output examples to illustrate formatting rules and domain constraints.

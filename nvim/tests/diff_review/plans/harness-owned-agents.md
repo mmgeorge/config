@@ -43,7 +43,7 @@ AgentCoordinator ──owns──▶ child registry, lifecycle, event stream, an
 ```
 
 The provider backend would execute children, but `AgentCoordinator` would remain the authoritative owner of
-their IDs, status, execution mode, cancellation, steering, and timeline projection.
+their IDs, status, execution mode, cancellation, steering, and timeline rendering.
 
 ## Why execution modes motivate Harness ownership
 

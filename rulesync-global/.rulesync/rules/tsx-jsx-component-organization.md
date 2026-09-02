@@ -29,11 +29,11 @@ Prefer one consistent component declaration form within a component tree. When t
 ## Component tree
 
 - Keep the exported root component focused on composing the feature's major visual regions.
-- Extract a section when it has a distinct visual role, owns a meaningful behavior, or makes the parent's JSX materially easier to scan.
+- Extract a section when it has a distinct visual role, owns an isolated behavior, or simplifies parent JSX structure.
 - Name extracted components after the user-visible role they render, such as `DatasetSelectionPanel`, `MapPanelHeader`, or `ColumnFacts`.
 - Declare private child components beneath the first parent component that renders them. Order siblings by their rendered order.
 - Continue recursively from each child into its own dependencies so the module reads top-down as `Foo -> FooHeader -> FooHeaderAction`.
-- Do not extract tiny wrappers that only rename one element, forward unchanged props, or hide a map mount node without adding ownership or behavior.
+- Do not extract wrapper components that only rename one element, forward unchanged props, or hide a mount node without adding ownership or behavior.
 - Split components before their render logic combines multiple independently understandable regions, state machines, or interaction lifecycles.
 
 ## Props and domain objects
@@ -56,7 +56,7 @@ Prefer one consistent component declaration form within a component tree. When t
 
 - The root component should reveal the page or panel's major parts without forcing a reader through implementation details.
 - Keep conditional rendering close to the visual region it controls. Extract repeated or multi-state branches into a named component.
-- Replace deeply nested ternaries with a small state-routing component when each state renders a meaningful UI.
+- Replace deeply nested ternaries with an explicit state-routing component when branches render distinct UI layouts.
 - Prefer direct composition over layers of forwarding components.
 - Remove obsolete feature flags, permanently enabled branches, and redundant wrappers while refactoring.
 
@@ -69,4 +69,4 @@ Prefer one consistent component declaration form within a component tree. When t
 - Does each extracted component or hook own a coherent responsibility?
 - Do props expose domain boundaries rather than flattened implementation fields?
 - Do state, effects, and imperative resources remain with their lifecycle owner?
-- Did the refactor reduce total code or meaningful complexity rather than merely move lines?
+- Did the refactor reduce unnecessary structural complexity rather than merely move lines?

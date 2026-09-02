@@ -83,7 +83,7 @@ Do not copy the planning labels or private sentences into the artifact.
 
 - Make `flow` and `tasks` describe the same code-proven path. Every task must produce an output used later, consume an earlier output, or branch visibly from a shared producer. Regroup or reorder a task when its handoff cannot be named.
 - Show each representation change as an explicit transformation. Use one stable name for one representation, and do not imply that one input produces an unrelated output.
-- Give each flow node one semantic role. Use nouns for actors, inputs, outputs, states, stores, and artifacts. Use active verb phrases for operations and transformations.
+- Give each flow node one semantic role. Use nouns for components, workers, inputs, outputs, states, stores, and artifacts. Use active verb phrases for operations and transformations.
 - Use one primary flow root when the evidence supports one. Show separate producers or consumer branches when the path genuinely splits or converges. Keep labels short, concrete, and free of file paths.
 - Encode convergence within the schema's tree shape by repeating the shared downstream stage at the end of each producer branch. Use the overview or task handoff to explain that the repeated labels name one shared stage.
 

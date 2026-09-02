@@ -1,13 +1,12 @@
 ---
 name: remote-code-explorer
 description: >-
-  Use when exploring a remote codebase: GitHub repositories, external source
+  Explore remote codebases: GitHub repositories, external source
   trees, open source projects, library internals, examples, issues, PRs, or API
   docs needed to understand how code works. For Rust crates and libraries,
   always start with docs-mcp before falling back to GitHub. Strictly read-only.
-  NOT for local file searches; use the built-in explorer for the current
-  workspace. NOT for general web/current-facts research; use search-explorer for
-  that.
+  Do not use for local file searches (use the built-in explorer for the current
+  workspace) or general web/current-facts research (use search-explorer instead).
 claudecode:
   model: claude-opus-4-8
   effort: low

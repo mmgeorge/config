@@ -53,7 +53,7 @@ Apply these composition rules to keep technical explanations direct, scannable, 
 
 - **Direct Openings:** Begin with the behavior, problem, decision, or result that gives the subject meaning. Sustain attention through technical consequences, concrete mechanisms, verifiable examples, and visible progress. Omit conversational filler, marketing adjectives, contrived anecdotes, and delayed conclusions.
 - **Paragraph Unity and Transitions:** Make each paragraph establish one point. Open each expository paragraph with that point, use the body to define or support it, and end on its strongest consequence or required transition. Connect sequential paragraphs with explicit transitions: continuation, qualification, contrast, or causal consequence.
-- **Active Voice and Agency:** Prefer active voice for operations, with the responsible subsystem or actor as the subject. Use passive voice when the receiver, result, or unknown actor carries the topic. State claims directly and concretely. Remove filler words, nominalizations, passive abstractions, and introductory wind-ups.
+- **Active Voice and Agency:** Prefer active voice for operations, with the responsible subsystem or component as the subject. Use passive voice when the receiver, result, or unknown entity carries the topic. State claims directly and concretely. Remove filler words, nominalizations, passive abstractions, and introductory wind-ups.
 - **Coordinate Parallelism and Modifier Placement:** Vary sentence form to expose real relationships instead of repeating loose chains joined by `and`, `but`, or `so`. Express coordinate ideas in parallel grammatical form. Keep subjects near their verbs, modifiers beside what they modify, and pronouns near clear antecedents. Make every introductory phrase modify the grammatical subject that follows.
 - **Tense and Emphatic Endings:** Keep a summary in one governing tense. Put new or emphatic information near the end of the sentence, paragraph, or section unless the beginning needs deliberate emphasis.
 - **Punctuation Standards:**
@@ -68,6 +68,10 @@ Apply these composition rules to keep technical explanations direct, scannable, 
 Technical documentation must remain concrete, actionable, and free of literary decoration. Apply these rules across all sections:
 
 - **Ban literary and mechanical metaphors:** Use software architecture constructs (pipelines, state machines, lifecycles, and contracts) instead of storytelling or structural metaphors (arcs, spines, load-bearing relationships, or machinery).
+- **Ban anthropomorphism and theatrical personas:** Do not attribute cognitive traits to models (*"the agent is already smart"*), assign theatrical roleplay personas (*"act as a ruthless QA tester"*), or use physical journey metaphors (*"robot on a path"*, *"narrow bridge with cliffs"*). Frame instructions around operation fragility, context budgets, and input/output contracts.
+- **Ban developer slang and informal shorthand:** Eliminate colloquial idioms (*"loud and obvious"*, *"gotchas"*, *"hand-roll"*, *"voodoo constants"*, *"scripts that punt"*, *"eat your own dog food"*). Use formal systems architecture terms: explicit error notification routing, unvalidated edge cases, unexplained magic constants, and unhandled process failures.
+- **Ban provider and interface leakage in shared skills:** Do not hardcode specific provider brand names (*"when Codex works with..."*) or chat UI slash commands (`/gpu-debug`) in portable skills. Write third-person functional triggers (`"Use when authoring, modifying, or debugging..."`) and reference underlying skills by name.
+- **Ban promotional marketing and decorative styling:** Do not use marketing qualifiers (*"20+ supported tools"*, *"battle-tested"*, *"lightning-fast"*, *"Why [Product]?"*) or emoji decorations (`✅`, `🚀`, `⚠️`) in technical checklists and headings. Present capabilities as factual, third-person technical inventories.
 - **Replace aphorisms with mapping rules:** State explicit conditions and consequences rather than high-level slogans.
 - **Eliminate subjective thresholds:** Replace vague sufficiency words (`enough`, `materially`, `meaningful`, `practical`) and soft hedges (`mostly`, `usually`, `several`, `likely`) with explicit bounds, triggers, or verification environments.
 - **Ban subjective difficulty tiers:** Do not classify tasks or audiences with labels like `basic`, `advanced`, `trivial`, or `complex`. State the exact prerequisite tools, environment versions, and permissions instead.
@@ -81,6 +85,12 @@ Technical documentation must remain concrete, actionable, and free of literary d
 | Category | Non-Functional Phrasing | Clear and Functional Replacement |
 | --- | --- | --- |
 | **Metaphors** | *"Build a claim spine along the dominant arc."* | *"Outline the argument using a pipeline, state machine, or component-synthesis structure."* |
+| **Anthropomorphism** | *"The agent model is already smart, so act as a ruthless QA tester."* | *"Define explicit input schemas and evaluate edge cases with malformed payloads."* |
+| **Physical journey metaphor** | *"Think of the agent as a robot on a path with cliffs."* | *"Match instruction specificity to operation fragility (open guidelines vs exact commands)."* |
+| **Developer slang** | *"Make error handling loud and obvious without voodoo constants."* | *"Report caught errors via user notifications and document numeric parameter derivations."* |
+| **Restricted domain term** | *"Identify every concurrent actor and the state each actor modifies."* | *"Identify every concurrent thread or worker and the state each modifies."* |
+| **Provider / UI leakage** | *"Use when Codex needs to debug, then escalate to /gpu-debug."* | *"Use when debugging running engine sessions (use the gpu-debug skill for shader capture)."* |
+| **Promotional marketing** | *"Generates configs across 20+ tools — battle-tested and lightning-fast."* | *"Generate configurations across supported target assistants from a single .rulesync/ source."* |
 | **Aphorisms** | *"Scale the work to the output."* | *"Match document depth to format: multi-section designs require a domain model, API docs require caller contracts."* |
 | **Subjective thresholds** | *"Keep the flow short, usually no more than a few nodes when practical."* | *"Limit the longest directed path to six nodes or fewer."* |
 | **Difficulty tiers** | *"This advanced tutorial is not for trivial tasks."* | *"Prerequisites: Node.js 20+, Docker daemon running, and write access to the deployment registry."* |
@@ -107,6 +117,8 @@ Do not assert qualitative claims (such as simplicity, reliability, or maintainab
 ## Control Terminology and Domain Models
 
 Introduce a specialized term only when its exact meaning carries an architectural claim or the reader must use it. Ground controlled vocabulary in code, a schema, an API, an established industry concept, or an explicit design decision. Keep descriptive phrases in ordinary prose.
+
+Reserve `projection` strictly for coordinate spaces. Replace `materialization` and `actor` with the exact domain role (`thread`, `task`, `worker`, `system`, `process`, or `pipeline`).
 
 Define an unfamiliar term at first use through its kind, role, and distinguishing boundary. Give each concept one stable name and one canonical definition location. Place the definition before the first claim that depends on it. Define critical system relationships by specifying their participating components, interaction protocol, output state, and failure modes.
 
@@ -168,11 +180,14 @@ Read [Technical Tables Guide](references/tables.md) when deciding whether to use
 Verify the promised result before polishing the prose. Check factual claims, terms, definitions, inventories, transformations, identifiers, qualifications, examples, links, and cross-references.
 
 Then run a clear-and-functional review pass:
-1. Strip out lingering metaphors, slogans, and conversational idioms.
-2. Replace subjective thresholds (`enough`, `materially`, `practical`) and difficulty tiers (`basic`, `advanced`, `trivial`) with concrete triggers, tool versions, or bounds.
-3. Eliminate announcement prose preceding tables, code blocks, and diagrams.
-4. Ground generic nouns (`things`, `details`) and importance modifiers (`important`, `critical`, `major`) in specific domain constructs.
-5. Repair paragraph openings, adjacency, endings, sentence emphasis, parallelism, modifier attachment, pronoun reference, tense, punctuation, and needless words.
+1. Strip out lingering metaphors, slogans, conversational idioms, and developer slang.
+2. Remove anthropomorphic cognitive claims, theatrical roleplay, and physical terrain metaphors.
+3. Replace subjective thresholds (`enough`, `materially`, `practical`) and difficulty tiers (`basic`, `advanced`, `trivial`) with concrete triggers, tool versions, or bounds.
+4. Eliminate promotional marketing claims, superlatives, and decorative emojis in checklists.
+5. Eliminate announcement prose preceding tables, code blocks, and diagrams.
+6. Replace restricted domain words (`actor`/`materialization`) with concrete system roles (`thread`, `task`, `worker`, `system`, `process`, or `pipeline`).
+7. Ground generic nouns (`things`, `details`) and importance modifiers (`important`, `critical`, `major`) in specific domain constructs.
+8. Repair paragraph openings, adjacency, endings, sentence emphasis, parallelism, modifier attachment, pronoun reference, tense, punctuation, and needless words.
 
 A polished document still fails when readers cannot achieve its promised result. Preserve the author's intentional tone and the repository's house style. If the user asked for an edit, make it. If the user asked for review or advice, remain read-only.
 

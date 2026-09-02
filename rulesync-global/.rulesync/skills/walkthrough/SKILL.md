@@ -1,22 +1,27 @@
 ---
 name: walkthrough
-description: Use when Codex needs to generate, regenerate, validate, or repair a DiffReview `.walkthrough.json` artifact directly from the current repository changes. Trigger when the user asks for a walkthrough, review walkthrough, DiffReview walkthrough, guided review artifact, or `.walkthrough.json` after local code changes.
+description: >-
+  Generate, regenerate, validate, or repair a DiffReview `.walkthrough.json` artifact
+  directly from repository changes. Use when creating review walkthroughs, guided
+  code review artifacts, or `.walkthrough.json` files after local modifications.
+targets:
+  - '*'
 ---
 
 # Walkthrough
 
-Dispatch the complete DiffReview walkthrough workflow to the `walkthrough-writer` custom agent so semantic discovery, raw patch evidence, artifact construction, and validation stay outside the parent context.
+Dispatch the complete DiffReview walkthrough generation workflow to the `walkthrough-writer` subagent to isolate semantic discovery, raw patch extraction, artifact construction, and schema validation from the parent context.
 
-## Dispatch
+## Dispatch Workflow
 
-1. Resolve the target repository or working directory from the request and current session.
-2. Resolve the absolute path to `walkthrough.schema.json` beside this `SKILL.md` without reading the schema into the parent context.
-3. Spawn exactly one `walkthrough-writer` custom agent. Give it:
-   - the target repository or working directory
-   - the original user request
-   - the absolute schema path
-   - ownership of semantic discovery, `.walkthrough.json` writing, validation, repair, and final verification
-4. Wait for the writer to finish. If it reports a repairable failure, send the repair request back to the same writer so its accumulated repository context remains reusable.
-5. Report the writer's compact completion status to the user.
+1. Resolve the target repository path and working directory from the request.
+2. Locate `walkthrough.schema.json` adjacent to this `SKILL.md` without loading schema contents into the parent context.
+3. Spawn one `walkthrough-writer` subagent with:
+   - Target repository or working directory path
+   - User review request
+   - Absolute path to `walkthrough.schema.json`
+   - Complete ownership of semantic discovery, artifact creation, schema validation, and error repair
+4. Await subagent completion. If validation reports repairable schema errors, route the repair request back to the existing subagent instance to preserve cached repository context.
+5. Report the completion status to the user.
 
-Do not run `sem_diff`, inspect repository files, read raw patches, draft walkthrough content, or validate the artifact in the parent context. If the `walkthrough-writer` custom agent cannot be spawned, report that exact blocker instead of silently running the generation workflow in the parent.
+Do not run `sem_diff`, inspect raw diffs, draft JSON artifacts, or run schema validation in the parent conversation context. If subagent invocation fails, report the blocking failure explicitly.
