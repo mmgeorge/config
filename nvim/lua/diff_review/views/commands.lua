@@ -35,16 +35,18 @@ local status_helpers = require("diff_review.views.status.status_helpers")
 local inventory = require("diff_review.infra.inventory")
 local session = require("diff_review.session")
 
+--- Emits an error notification with title through the notifications system.
+---@param message string Error description message string.
+---@param title? string Optional notification title string.
 local function notify_error(message, title)
   return notifications.error(message, title)
 end
 
 local repo_relative = paths.repo_relative
 
----Open a read-only buffer with `file` as it exists at git revision `rev`.
----Entry point for :GitFileRevision.
----@param file string
----@param rev string
+--- Opens a read-only buffer with `file` as it exists at git revision `rev`.
+---@param file string Repository file path string.
+---@param rev string Git revision or commit hash string.
 function M.open_file_revision(file, rev)
   file = vim.trim(tostring(file or ""))
   rev = vim.trim(tostring(rev or ""))
@@ -72,10 +74,10 @@ function M.open_file_revision(file, rev)
     })
   end)
 end
---- Narrow interface handed to diff_review.walkthrough so the module never
---- reaches into init internals.
----@param buf integer
----@return DiffReviewWalkthroughHost
+
+--- Constructs the host adapter interface for the walkthrough subsystem.
+---@param buf integer Target status buffer handle.
+---@return DiffReviewWalkthroughHost host Walkthrough host adapter interface.
 function M._walkthrough_host(buf)
   local resolved_root
 
@@ -181,9 +183,10 @@ end
 ---@field cwd? string
 ---@field repo? string
 
----@param pr DiffReviewGhPR
----@param opts? DiffReviewOpenPROptions
----@return DiffReviewGhPR
+--- Resolves the repository name string on a pull request descriptor.
+---@param pr DiffReviewGhPR Pull request descriptor.
+---@param opts? DiffReviewOpenPROptions Open PR options table.
+---@return DiffReviewGhPR pr Updated pull request descriptor.
 local function pr_with_resolved_repo(pr, opts)
   if pr.repo and pr.repo ~= "" then return pr end
   opts = opts or {}
@@ -193,9 +196,10 @@ local function pr_with_resolved_repo(pr, opts)
   return pr
 end
 
----@param pr DiffReviewGhPR
----@param opts? DiffReviewOpenPROptions
----@return integer? buf
+--- Opens a GitHub pull request overview buffer and initiates background fetches.
+---@param pr DiffReviewGhPR Pull request descriptor.
+---@param opts? DiffReviewOpenPROptions Open PR options table.
+---@return integer? buf Created buffer handle or nil on failure.
 function M.open_pr(pr, opts)
   opts = opts or {}
   if not pr then return nil end
@@ -256,8 +260,9 @@ function M.open_pr(pr, opts)
   return buf
 end
 
----@param number integer|string
----@param opts? DiffReviewOpenPROptions
+--- Fetches pull request metadata by number and opens the PR overview buffer.
+---@param number integer|string Pull request number or identifier.
+---@param opts? DiffReviewOpenPROptions Open PR options table.
 function M.open_pr_number(number, opts)
   opts = opts or {}
   local cwd = opts.cwd or vim.fn.getcwd()
@@ -270,12 +275,10 @@ function M.open_pr_number(number, opts)
   end)
 end
 
-
---- Open a PR review buffer (":or"): the PR title, an editable review summary,
---- and the changed files split into Unviewed/Viewed sections.
----@param pr DiffReviewGhPR
----@param opts? DiffReviewOpenPROptions
----@return integer? buf
+--- Opens a GitHub pull request review buffer with summary and viewed sections.
+---@param pr DiffReviewGhPR Pull request descriptor.
+---@param opts? DiffReviewOpenPROptions Open PR options table.
+---@return integer? buf Created buffer handle or nil on failure.
 function M.open_review(pr, opts)
   opts = opts or {}
   if not pr then return nil end
@@ -341,17 +344,13 @@ function M.open_review(pr, opts)
   return buf
 end
 
-
-
 ---@class DiffReviewBranchDiffOptions
 ---@field cwd? string
 ---@field file? string limit the diff to one repo-relative file
 
---- Open a read-only diff of the working tree against a branch or revision
---- (":GitBranchDiff <branch>", ":GitBranchDiffFile <file> <branch>"): the
---- diff part of the status view without staging, commit, or remote actions.
----@param branch string
----@param opts? DiffReviewBranchDiffOptions
+--- Opens a read-only diff comparison view between a branch and the working tree.
+---@param branch string Comparison branch name or revision string.
+---@param opts? DiffReviewBranchDiffOptions Options table with optional cwd or file filter.
 function M.open_branch_diff(branch, opts)
   opts = opts or {}
   branch = vim.trim(branch or "")
@@ -423,7 +422,8 @@ end
 ---@field cwd? string
 ---@field staged? boolean
 
----@param opts? DiffReviewCompactPreviewOptions
+--- Opens a compact or full unified diff preview buffer for staged or unstaged changes.
+---@param opts? DiffReviewCompactPreviewOptions Compact preview options table.
 function M.open_compact_preview(opts)
   opts = opts or {}
   local function open_for_root(root, err)
@@ -479,7 +479,7 @@ function M.open_compact_preview(opts)
   end
 end
 
---- Open a standalone, Neogit-style DiffReview status buffer.
+--- Opens or focuses the primary Git status review buffer and triggers rendering.
 function M.open()
   local trace = require("diff_review.infra.perf_trace")
   trace.event("gitstatus.open.start", nil, { cwd = vim.fn.getcwd() })

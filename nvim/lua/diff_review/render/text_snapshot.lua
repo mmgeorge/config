@@ -12,17 +12,19 @@
 ---@class DiffReviewTextSnapshotModule
 local M = {}
 
----@param text string
----@param end_offset integer
----@return integer
+--- Strips the trailing carriage return byte offset from a line end if present.
+---@param text string Source string.
+---@param end_offset integer Byte offset pointing to the end of a line.
+---@return integer offset Adjusted end offset excluding `\r`.
 function M.line_end_without_cr(text, end_offset)
   if end_offset >= 1 and text:sub(end_offset, end_offset) == "\r" then return end_offset - 1 end
   return end_offset
 end
 
----Build a byte-indexed text snapshot from a file body so diff rows can store offsets instead of copied lines.
----@param text string?
----@return DiffReviewTextSnapshot
+--- Creates an immutable, byte-indexed text snapshot from a file content string.
+--- Computes line span byte intervals to allow zero-copy slice and lookup operations.
+---@param text string? Raw file content string.
+---@return DiffReviewTextSnapshot snapshot Indexed text snapshot structure.
 function M.from_text(text)
   text = text or ""
   local span = {}
@@ -55,9 +57,10 @@ function M.from_text(text)
   }
 end
 
----@param snapshot DiffReviewTextSnapshot
----@param line_number integer
----@return string?
+--- Extracts line text from a snapshot by one-based line number without allocations when empty.
+---@param snapshot DiffReviewTextSnapshot Target text snapshot.
+---@param line_number integer One-based line index.
+---@return string? text Line content string, or nil if out of bounds.
 function M.line_text(snapshot, line_number)
   local span = snapshot and snapshot.line_span and snapshot.line_span[line_number] or nil
   if not span then return nil end
@@ -65,10 +68,12 @@ function M.line_text(snapshot, line_number)
   return snapshot.text:sub(span.start_offset, span.end_offset)
 end
 
----@param snapshot DiffReviewTextSnapshot
----@param first_line integer
----@param last_line integer
----@return string[]
+--- Extracts an array of line strings for a range of line numbers.
+--- Clamps line bounds to the snapshot limits.
+---@param snapshot DiffReviewTextSnapshot Target text snapshot.
+---@param first_line integer One-based starting line number.
+---@param last_line integer One-based ending line number.
+---@return string[] lines Array of line text strings.
 function M.line_slice(snapshot, first_line, last_line)
   local line = {}
   if not snapshot then return line end
@@ -80,9 +85,10 @@ function M.line_slice(snapshot, first_line, last_line)
   return line
 end
 
----@param snapshot DiffReviewTextSnapshot
----@param line_number integer
----@return DiffReviewTextLineSpan?
+--- Retrieves byte offset span boundaries for a given one-based line number.
+---@param snapshot DiffReviewTextSnapshot Target text snapshot.
+---@param line_number integer One-based line index.
+---@return DiffReviewTextLineSpan? span Span record containing byte offsets, or nil.
 function M.line_span(snapshot, line_number)
   if not (snapshot and snapshot.line_span) then return nil end
   return snapshot.line_span[line_number]

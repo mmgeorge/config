@@ -8,18 +8,21 @@ local M = { current = nil, debug_request_id = 0 }
 
 local trace = require("diff_review.infra.perf_trace")
 
----@param backend DiffReviewGitBackend?
+--- Injects a custom or mock Git command execution backend.
+---@param backend DiffReviewGitBackend? Mock backend implementation, or nil to use default process runner.
 function M.set_backend(backend)
   M.current = backend
 end
 
+--- Resets the active Git execution backend to the default process runner.
 function M.reset_backend()
   M.current = nil
 end
 
----@param cwd string
----@param extra_args? string[]
----@return string[]
+--- Constructs the command arguments array for generating a standard unified diff.
+---@param cwd string Working directory path.
+---@param extra_args? string[] Optional additional CLI arguments passed to `git diff`.
+---@return string[] command Full argument array for command execution.
 function M.git_diff_command(cwd, extra_args)
   local command = {
     "git", "-C", cwd,
@@ -32,9 +35,10 @@ function M.git_diff_command(cwd, extra_args)
   return command
 end
 
----@param cwd string
----@param commit_oid string
----@return string[]
+--- Constructs the command arguments array for displaying a commit's unified diff.
+---@param cwd string Working directory path.
+---@param commit_oid string Target Git commit object ID.
+---@return string[] command Full argument array for `git show`.
 function M.git_show_diff_command(cwd, commit_oid)
   return {
     "git", "-C", cwd,
@@ -42,9 +46,10 @@ function M.git_show_diff_command(cwd, commit_oid)
   }
 end
 
----@param stdout string?
----@param stderr string?
----@return string
+--- Combines standard output and error output into a single unified text string.
+---@param stdout string? Standard output content.
+---@param stderr string? Standard error content.
+---@return string output Combined output string.
 function M.system_output(stdout, stderr)
   stdout = tostring(stdout or "")
   stderr = tostring(stderr or "")
@@ -54,9 +59,11 @@ function M.system_output(stdout, stderr)
   return stdout .. separator .. stderr
 end
 
----@param command DiffReviewGitCommand
----@param input? string
----@param cb DiffReviewGitTextCallback
+--- Executes an asynchronous process command, capturing stdout, stderr, and exit code.
+--- Invokes `cb` on the Neovim event loop once the process exits.
+---@param command DiffReviewGitCommand Command arguments array.
+---@param input? string Optional standard input text passed to the process.
+---@param cb DiffReviewGitTextCallback Callback receiving the command result table.
 function M.system_text_async(command, input, cb)
   M.debug_request_id = M.debug_request_id + 1
   local request_id = M.debug_request_id
@@ -123,10 +130,12 @@ local function normalize_system_chunk(data)
   return tostring(data or "")
 end
 
----@param command DiffReviewGitCommand
----@param input? string
----@param on_line fun(line: string)
----@param cb DiffReviewGitTextCallback
+--- Executes an asynchronous process, streaming completed lines incrementally to `on_line`.
+--- Invokes `cb` with complete aggregated output once the process exits.
+---@param command DiffReviewGitCommand Command arguments array.
+---@param input? string Optional standard input text passed to the process.
+---@param on_line fun(line: string) Callback receiving trimmed lines as they arrive.
+---@param cb DiffReviewGitTextCallback Final callback receiving the full command result table.
 function M.system_text_stream_async(command, input, on_line, cb)
   local backend = M.current
   if backend and backend.system_stream_async then
@@ -218,8 +227,9 @@ local function text_to_lines(text)
 end
 M.text_to_lines = text_to_lines
 
----@param command DiffReviewGitCommand
----@param cb DiffReviewGitListCallback
+--- Executes an asynchronous command, parsing standard output into a list of lines.
+---@param command DiffReviewGitCommand Command arguments array.
+---@param cb DiffReviewGitListCallback Callback receiving lines array, exit code, and combined output.
 function M.systemlist_async(command, cb)
   local backend = M.current
   if backend and backend.systemlist_async then
@@ -242,8 +252,9 @@ function M.systemlist_async(command, cb)
   end)
 end
 
----@param path string
----@return integer code
+--- Removes a file or directory path through the active backend.
+---@param path string File or directory path to remove.
+---@return integer code 0 on success or nonzero error code.
 function M.delete_path(path)
   local backend = M.current
   if backend and backend.delete then
@@ -252,9 +263,9 @@ function M.delete_path(path)
   return vim.fn.delete(path)
 end
 
---- Resolve the repository root from `cwd` so callers do not depend on Neovim's launch directory.
----@param cwd? string
----@param cb fun(root?: string, err?: string)
+--- Resolves the Git repository root directory asynchronously from a target directory path.
+---@param cwd? string Working directory to inspect, or nil for Neovim current directory.
+---@param cb fun(root?: string, err?: string) Callback receiving resolved root path or error.
 function M.git_root_at_async(cwd, cb)
   local command = { "git" }
   if cwd and cwd ~= "" then
@@ -272,13 +283,15 @@ function M.git_root_at_async(cwd, cb)
   end)
 end
 
----@param cb fun(root?: string, err?: string)
+--- Resolves the Git repository root directory asynchronously for the current working directory.
+---@param cb fun(root?: string, err?: string) Callback receiving resolved root path or error.
 function M.git_root_async(cb)
   M.git_root_at_async(nil, cb)
 end
 
----@return string? root
----@return string? err
+--- Synchronously resolves the Git repository root when running with a test backend.
+---@return string? root Repository root path, or nil.
+---@return string? err Error message when resolution fails or backend is not active.
 function M.git_root_sync_for_test_backend()
   local backend = M.current
   if not (backend and backend.systemlist) then
@@ -293,10 +306,11 @@ function M.git_root_sync_for_test_backend()
   return vim.trim(root), nil
 end
 
----@param root string
----@param args string[]
----@param input? string
----@param cb fun(result: DiffReviewGitCommandResult)
+--- Executes a Git command asynchronously rooted at a specific repository root directory.
+---@param root string Git repository root path.
+---@param args string[] Git command arguments (e.g. `{"add", "file.txt"}`).
+---@param input? string Optional standard input passed to Git.
+---@param cb fun(result: DiffReviewGitCommandResult) Callback receiving structured execution result.
 function M.run_git_at_root_async(root, args, input, cb)
   local command = { "git", "-C", root }
   vim.list_extend(command, args)
@@ -313,9 +327,10 @@ function M.run_git_at_root_async(root, args, input, cb)
   end)
 end
 
----@param args string[]
----@param input? string
----@param cb fun(result: DiffReviewGitCommandResult)
+--- Resolves the Git root directory and executes a Git command asynchronously.
+---@param args string[] Git command arguments.
+---@param input? string Optional standard input text.
+---@param cb fun(result: DiffReviewGitCommandResult) Callback receiving execution result.
 function M.run_git_async(args, input, cb)
   M.git_root_async(function(root, root_err)
     if not root then
@@ -331,9 +346,10 @@ function M.run_git_async(args, input, cb)
   end)
 end
 
----@param args string[]
----@param input? string
----@return DiffReviewGitCommandResult
+--- Synchronously executes a Git command when running under a test backend.
+---@param args string[] Git command arguments.
+---@param input? string Optional standard input text.
+---@return DiffReviewGitCommandResult result Command execution result table.
 function M.run_git_sync_for_test_backend(args, input)
   local root, root_err = M.git_root_sync_for_test_backend()
   if not root then

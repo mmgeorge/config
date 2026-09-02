@@ -21,6 +21,10 @@ local session = require("diff_review.session")
 
 local M = {}
 
+--- Executes an asynchronous Git command and passes the trimmed first output line to a callback.
+---@param cwd string Working directory path.
+---@param args string[] Array of Git command line arguments.
+---@param cb fun(line: string?) Callback receiving the trimmed line or nil on failure.
 local function status_git_line_async(cwd, args, cb)
   local command = { "git", "-C", cwd }
   vim.list_extend(command, args)
@@ -33,6 +37,17 @@ local function status_git_line_async(cwd, args, cb)
   end)
 end
 
+--- Formats styled segments and subject column indices for a status head commit row.
+---@param name string Label name (e.g. `"Head"`, `"Merge"`, `"Push"`).
+---@param oid string Commit object identifier.
+---@param ref string Reference branch or remote name.
+---@param ref_hl string Highlight group name for the ref segment.
+---@param subject string Commit subject text.
+---@param date_text string? Optional formatted relative date string.
+---@param ref_width integer? Column width padding for alignment.
+---@return table[] segments Array of `[text, hl_group?]` tuples.
+---@return integer subject_start_col Zero-based byte offset where subject starts.
+---@return integer subject_end_col Zero-based byte offset where subject ends.
 local function status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_width)
   local segments = {}
   local byte_col = 0
@@ -67,6 +82,12 @@ local function status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_w
   return segments, subject_start_col, subject_end_col
 end
 
+--- Constructs a commit message status entry descriptor for an interactive subject line.
+---@param commit table? Commit record table.
+---@param source string Label source identifier.
+---@param start_col integer Zero-based byte column start of subject.
+---@param end_col integer Zero-based byte column end of subject.
+---@return DiffReviewStatusEntry? entry Status entry descriptor or nil.
 function M._status_commit_message_entry(commit, source, start_col, end_col)
   if type(commit) ~= "table" then return nil end
   local oid = vim.trim(tostring(commit.oid or commit.sha or commit.id or ""))
@@ -81,6 +102,16 @@ function M._status_commit_message_entry(commit, source, start_col, end_col)
   }
 end
 
+--- Builds a structured status head commit line with formatted segments and interactive entry.
+---@param name string Label name.
+---@param oid string Commit object identifier.
+---@param ref string Reference branch or remote name.
+---@param ref_hl string Highlight group name for the ref segment.
+---@param subject string Commit subject text.
+---@param date_text string? Optional formatted relative date string.
+---@param ref_width integer? Column width padding for alignment.
+---@param commit table? Commit record table.
+---@return DiffReviewStatusHeadLine line Structured status head line descriptor.
 function M._status_head_commit_line(name, oid, ref, ref_hl, subject, date_text, ref_width, commit)
   local segments, subject_start_col, subject_end_col = status_head_row(name, oid, ref, ref_hl, subject, date_text, ref_width)
   return {
@@ -89,8 +120,9 @@ function M._status_head_commit_line(name, oid, ref, ref_hl, subject, date_text, 
   }
 end
 
----@param pr_state DiffReviewStatusPRState?
----@return DiffReviewStatusHeadLine
+--- Formats the interactive PR summary line for the status header.
+---@param pr_state DiffReviewStatusPRState? PR status state record.
+---@return DiffReviewStatusHeadLine line Structured PR head line descriptor.
 local function status_pr_head_line(pr_state)
   local segments = {
     { ("%-8s"):format("PR:"), "DiffReviewStatusLabel" },
@@ -115,8 +147,9 @@ local function status_pr_head_line(pr_state)
   return { segments = segments, entry = entry }
 end
 
----@param about_state DiffReviewAICommitState?
----@return DiffReviewStatusHeadLine
+--- Formats the interactive AI commit summary line for the status header.
+---@param about_state DiffReviewAICommitState? AI commit generator state.
+---@return DiffReviewStatusHeadLine line Structured About head line descriptor.
 local function status_about_head_line(about_state)
   local segments = {
     { ("%-8s"):format("About:"), "DiffReviewStatusLabel" },
@@ -139,19 +172,21 @@ local function status_about_head_line(about_state)
   return { segments = segments, entry = entry }
 end
 
----@param buf integer
----@return boolean
+--- Updates the rendered About line in-place within an active status buffer.
+---@param buf integer Status buffer handle.
+---@return boolean patched True if line was successfully replaced.
 function M._status_patch_about_line(buf)
   local status = session.states and session.states[buf] or session.status
   if not status then return false end
   return status_helpers.status_patch_head_line(buf, "about", status_about_head_line(status.about))
 end
 
----@param values table
----@param pr_state DiffReviewStatusPRState?
----@param about_state DiffReviewAICommitState?
----@param issues_state table?
----@return DiffReviewStatusHeadLine[]
+--- Assembles all status header lines including branch refs, remote tracking, PR, and AI commit state.
+---@param values table Git ref values gathered from background queries.
+---@param pr_state DiffReviewStatusPRState? PR status state record.
+---@param about_state DiffReviewAICommitState? AI commit generator state.
+---@param issues_state table? Issue integration state.
+---@return DiffReviewStatusHeadLine[] lines Array of structured status head lines.
 local function status_build_head_lines(values, pr_state, about_state, issues_state)
   local remote_action = session.status and session.status.remote_action
   local ref_width = vim.fn.strdisplaywidth(values.branch or "(detached)")
@@ -220,31 +255,35 @@ local function status_build_head_lines(values, pr_state, about_state, issues_sta
   return lines
 end
 
----@param text string
----@return string[]
+--- Splits markdown text into line arrays with fallback placeholder for empty strings.
+---@param text string Source markdown text.
+---@return string[] lines Array of markdown line strings.
 local function status_markdown_lines(text)
   text = tostring(text or ""):gsub("\r\n", "\n")
   if text == "" then return { "_No description._" } end
   return vim.split(text, "\n", { plain = true })
 end
 
----@param title string
----@param count integer
----@return string
+--- Formats a section header label with item count string.
+---@param title string Section title string.
+---@param count integer Number of items in section.
+---@return string text Formatted header text.
 function M._status_section_heading_text(title, count)
   title = tostring(title or ""):gsub("%s*:%s*$", "")
   return ("%s (%d):"):format(title, math.max(0, math.floor(tonumber(count) or 0)))
 end
 
----@param title string
----@param count integer
----@return table[]
+--- Builds formatted highlight segment for a section header row.
+---@param title string Section title string.
+---@param count integer Number of items in section.
+---@return table[] segments Highlight segment tuple array.
 function M._status_section_heading_segments(title, count)
   return { { M._status_section_heading_text(title, count), "DiffReviewStatusHeader" } }
 end
 
----@param section DiffReviewStatusSection
----@return integer
+--- Calculates total item count within a status section across files, reviews, or commits.
+---@param section DiffReviewStatusSection Status section descriptor.
+---@return integer count Total count of elements.
 function M._status_section_count(section)
   if type(section.reviews) == "table" then return #section.reviews end
   if type(section.issue_comments) == "table" then return #section.issue_comments end
@@ -252,30 +291,20 @@ function M._status_section_count(section)
   return #(section.files or {})
 end
 
-
-
-
-
-
-
-
-
-
-
-
-
----@param oid string?
----@return string
+--- Returns a 7-character abbreviated object identifier with fallback for empty strings.
+---@param oid string? Target object identifier string.
+---@return string short_oid Abbreviated 7-character OID.
 local function status_short_oid(oid)
   oid = tostring(oid or "")
   if oid == "" then return "0000000" end
   return oid:sub(1, 7)
 end
 
----@param pr DiffReviewGhPR
----@return string
----@return string date_text
----@return table? commit
+--- Extracts headline subject, relative date string, and commit record for a PR's head commit.
+---@param pr DiffReviewGhPR Pull request descriptor table.
+---@return string subject Headline message or subject.
+---@return string date_text Formatted relative date string.
+---@return table? commit Matched commit record or nil.
 local function status_pr_head_subject(pr)
   local commits = pr.commits or {}
   if type(commits) ~= "table" then return "", "", nil end
@@ -302,22 +331,10 @@ local function status_pr_head_subject(pr)
   return tostring(commit.messageHeadline or commit.subject or commit.message or ""), date_text, commit
 end
 
-
-
-
-
-
-
-
-
-
-
-
-
-
----@param pr DiffReviewGhPR
----@param status table?
----@return DiffReviewStatusHeadLine[]
+--- Builds multi-line header display for PR detail views including metadata and description.
+---@param pr DiffReviewGhPR Pull request descriptor table.
+---@param status table? Active status session state table.
+---@return DiffReviewStatusHeadLine[] lines Array of structured header line descriptors.
 local function status_pr_detail_head_lines(pr, status)
   local description_section_id = "pr-head-section:description"
   local title = pr.title ~= "" and pr.title or ("PR #" .. tostring(pr.number))
@@ -394,8 +411,9 @@ local function status_pr_detail_head_lines(pr, status)
   return lines
 end
 
----@param cwd string?
----@param repo string?
+--- Enables repository issue and user omnicompletion across active status buffers.
+---@param cwd string? Repository working directory path.
+---@param repo string? Repository identifier string (`"owner/repo"`).
 function M._status_enable_repo_completion(cwd, repo)
   if not (cwd and repo and repo ~= "") then return end
   local cache = require("github.repo_cache")
@@ -406,8 +424,9 @@ function M._status_enable_repo_completion(cwd, repo)
   end
 end
 
----@param cwd string?
----@param repo string?
+--- Asynchronously loads GitHub repository contributors, metadata, and issue cache.
+---@param cwd string? Repository working directory path.
+---@param repo string? Optional explicit repository name (`"owner/repo"`).
 function M.github_load_repo_metadata(cwd, repo)
   local cache = require("github.repo_cache")
   local issue_index_ok, issue_index = pcall(require, "github.issue_index")
@@ -433,8 +452,9 @@ function M.github_load_repo_metadata(cwd, repo)
   if issue_index_ok then issue_index.ensure_current(cwd, { manual = false }) end
 end
 
----@param cwd string
----@param cb fun(lines: DiffReviewStatusHeadLine[], values: table)
+--- Gathers Git refs and status values concurrently and constructs status header lines.
+---@param cwd string Repository working directory path.
+---@param cb fun(lines: DiffReviewStatusHeadLine[], values: table) Callback receiving formatted lines and raw values.
 local function status_head_lines_async(cwd, cb)
   local values = {}
   local pending = 9

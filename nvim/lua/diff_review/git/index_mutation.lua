@@ -68,10 +68,11 @@ local function command_for_target(root, direction, target)
   return args, nil, nil
 end
 
---- Execute ordered index targets and stop at the first Git failure.
----@param root string
----@param spec DiffReviewIndexMutationSpec
----@param callback fun(result: DiffReviewIndexMutationResult)
+--- Executes ordered index stage or unstage target operations asynchronously.
+--- Stops execution on the first Git failure and invokes `callback` with result details.
+---@param root string Git repository root path.
+---@param spec DiffReviewIndexMutationSpec Stage/unstage mutation specification.
+---@param callback fun(result: DiffReviewIndexMutationResult) Completion callback.
 function M.execute_async(root, spec, callback)
   local completed_target_list = {}
   local hunk_count = 0

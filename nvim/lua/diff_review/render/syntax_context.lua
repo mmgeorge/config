@@ -27,8 +27,9 @@ local text_snapshot = require("diff_review.render.text_snapshot")
 ---@class DiffReviewSyntaxContextModule
 local M = {}
 
----@param file_key string
----@return DiffReviewFileSyntaxContext
+--- Constructs an initialized file syntax context holding Tree-sitter parse state for old and new sides.
+---@param file_key string Unique composite file identifier.
+---@return DiffReviewFileSyntaxContext context Initialized syntax context structure.
 function M.new(file_key)
   return {
     file_key = tostring(file_key or ""),
@@ -40,18 +41,20 @@ function M.new(file_key)
   }
 end
 
----@param context DiffReviewFileSyntaxContext?
----@param file_key string
----@return DiffReviewFileSyntaxContext
+--- Retrieves the existing context or constructs a new syntax context structure.
+---@param context DiffReviewFileSyntaxContext? Existing context instance or nil.
+---@param file_key string Unique composite file identifier.
+---@return DiffReviewFileSyntaxContext context Existing or newly initialized syntax context.
 function M.ensure_context(context, file_key)
   if context then return context end
   return M.new(file_key)
 end
 
----@param context DiffReviewFileSyntaxContext
----@param side DiffReviewSyntaxSide
----@param snapshot DiffReviewTextSnapshot?
----@param revision string?
+--- Updates the text snapshot for a syntax side and clears any obsolete parsed trees.
+---@param context DiffReviewFileSyntaxContext Target syntax context.
+---@param side DiffReviewSyntaxSide Side descriptor (`"old"` or `"new"`).
+---@param snapshot DiffReviewTextSnapshot? New text snapshot.
+---@param revision string? Content revision identifier.
 function M.set_snapshot(context, side, snapshot, revision)
   local state = context.side_by_name[side]
   if not state then return end
@@ -64,26 +67,29 @@ function M.set_snapshot(context, side, snapshot, revision)
   context.revision = (context.revision or 0) + 1
 end
 
----@param context DiffReviewFileSyntaxContext
----@param side DiffReviewSyntaxSide
----@return boolean
+--- Reports whether a parsed Tree-sitter tree is available for the given diff side.
+---@param context DiffReviewFileSyntaxContext Target syntax context.
+---@param side DiffReviewSyntaxSide Side descriptor (`"old"` or `"new"`).
+---@return boolean has_tree True if parsed tree is available.
 function M.has_tree(context, side)
   local state = context and context.side_by_name and context.side_by_name[side] or nil
   return state and state.tree ~= nil or false
 end
 
----@param context DiffReviewFileSyntaxContext
----@param side DiffReviewSyntaxSide
----@return any?
+--- Retrieves the parsed Tree-sitter tree for a diff side if present.
+---@param context DiffReviewFileSyntaxContext Target syntax context.
+---@param side DiffReviewSyntaxSide Side descriptor (`"old"` or `"new"`).
+---@return any? tree Parsed Tree-sitter tree instance, or nil.
 function M.tree(context, side)
   local state = context and context.side_by_name and context.side_by_name[side] or nil
   return state and state.tree or nil
 end
 
----@param context DiffReviewFileSyntaxContext
----@param side DiffReviewSyntaxSide
----@param parser any
----@param done? fun(ok: boolean, tree?: any, err?: string)
+--- Initiates asynchronous Tree-sitter parsing for a specific syntax side.
+---@param context DiffReviewFileSyntaxContext Target syntax context.
+---@param side DiffReviewSyntaxSide Side descriptor (`"old"` or `"new"`).
+---@param parser any Tree-sitter parser instance.
+---@param done? fun(ok: boolean, tree?: any, err?: string) Optional completion callback.
 function M.parse_async(context, side, parser, done)
   local state = context.side_by_name[side]
   if not state then
@@ -123,13 +129,12 @@ function M.parse_async(context, side, parser, done)
   end
 end
 
---- Attach a parsed tree plus the highlight query and the source it was parsed from.
---- The decoration provider needs the source (bufnr or text) to resolve captures.
----@param context DiffReviewFileSyntaxContext
----@param side DiffReviewSyntaxSide
----@param tree any
----@param query vim.treesitter.Query?
----@param source integer|string
+--- Attaches a parsed Tree-sitter tree, highlight query, and source buffer or text to a syntax side.
+---@param context DiffReviewFileSyntaxContext Target syntax context.
+---@param side DiffReviewSyntaxSide Side descriptor (`"old"` or `"new"`).
+---@param tree any Parsed Tree-sitter tree instance.
+---@param query vim.treesitter.Query? Highlight query instance.
+---@param source integer|string Buffer handle or raw text source.
 function M.set_tree(context, side, tree, query, source)
   local state = context and context.side_by_name and context.side_by_name[side] or nil
   if not state then return end
@@ -168,13 +173,13 @@ local function row_highlight_ranges(query, root, source, row, line_len)
   return ranges
 end
 
---- Resolve highlight spans for a 0-based inclusive source row range, for the decoration provider.
---- Return nil when the side's tree, query, or source is not ready so the caller emits a fallback and retries.
----@param context DiffReviewFileSyntaxContext
----@param side DiffReviewSyntaxSide
----@param first_row integer 0-based inclusive
----@param last_row integer 0-based inclusive
----@return table<integer, { highlights: table[] }>?
+--- Resolves syntax highlight spans across an inclusive zero-based line range for decoration providers.
+--- Returns nil if the side's tree, query, or source is not ready.
+---@param context DiffReviewFileSyntaxContext Target syntax context.
+---@param side DiffReviewSyntaxSide Side descriptor (`"old"` or `"new"`).
+---@param first_row integer Zero-based starting line number.
+---@param last_row integer Zero-based ending line number.
+---@return table<integer, { highlights: table[] }>? highlights Mapping of row index to highlight spans, or nil.
 function M.highlights(context, side, first_row, last_row)
   local state = context and context.side_by_name and context.side_by_name[side] or nil
   if not (state and state.tree and state.query and state.source ~= nil) then return nil end

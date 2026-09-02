@@ -25,10 +25,20 @@ local session = require("diff_review.session")
 
 local M = {}
 
+--- Checks whether an entry is recorded as folded in session state or fallback default.
+---@param key string Entry key string.
+---@param default? boolean Default fold state boolean.
+---@param state? table Optional status session state table.
+---@return boolean folded True if entry is folded.
 local function status_folded(key, default, state)
   return status_buffer.folded(state or session.status or {}, key, default)
 end
 
+--- Updates the persistent fold state for an entry key.
+---@param key string Entry key string.
+---@param folded boolean Next fold state boolean.
+---@param state? table Optional status session state table.
+---@return boolean folded New fold state boolean.
 local function set_status_folded(key, folded, state)
   if not state then
     session.status = session.status or {}
@@ -37,17 +47,19 @@ local function set_status_folded(key, folded, state)
   return status_buffer.set_folded(state, key, folded)
 end
 
----@param value any
----@return any
+--- Resolves the formatted fold text string for a folded header line.
+---@param value any Raw fold text or generator value.
+---@return any resolved Evaluated fold text string or structure.
 function M._status_fold_text(value)
   return fold_presentation.resolve(value)
 end
 
----@param fold_id string?
----@param start_line integer?
----@param end_line integer?
----@param default_folded boolean?
----@param fold_text any
+--- Registers a buffer line range as a collapsible native fold region.
+---@param fold_id string? Target entry identifier string.
+---@param start_line integer? One-based starting buffer line index.
+---@param end_line integer? One-based ending buffer line index.
+---@param default_folded boolean? Default collapsed state boolean.
+---@param fold_text any Custom fold text string or format descriptor.
 function M._status_register_fold_range(fold_id, start_line, end_line, default_folded, fold_text)
   if not (fold_id and start_line and end_line and end_line > start_line) then return end
   local status = session.status
@@ -74,9 +86,10 @@ function M._status_register_fold_range(fold_id, start_line, end_line, default_fo
   status.fold_text_by_start_line[start_line] = fold_text
 end
 
----@param state table?
----@param fold_id string?
----@return table[]
+--- Retrieves all registered fold ranges associated with an entry identifier.
+---@param state table? Status session state table.
+---@param fold_id string? Target entry identifier string.
+---@return table[] ranges Array of fold range descriptor tables.
 function M._status_fold_ranges_for_id(state, fold_id)
   local value = state and state.fold_ranges_by_id and fold_id and state.fold_ranges_by_id[fold_id] or nil
   if not value then return {} end
@@ -84,16 +97,18 @@ function M._status_fold_ranges_for_id(state, fold_id)
   return value
 end
 
----@param range table
----@return integer
+--- Computes the line span distance for a fold range.
+---@param range table Fold range descriptor table.
+---@return integer span Number of lines enclosed by the range.
 function M._status_fold_range_span(range)
   return (tonumber(range.end_line) or 0) - (tonumber(range.start_line) or 0)
 end
 
----@param view table
----@param ranges table[]
----@param state table?
----@return table
+--- Adjusts saved window view cursor position to fold header lines when closed.
+---@param view table Saved window view dictionary (`winsaveview()`).
+---@param ranges table[] Array of fold range descriptor tables.
+---@param state table? Optional status session state table.
+---@return table view Adjusted window view dictionary.
 function M._status_view_for_fold_restore(view, ranges, state)
   local line = view and tonumber(view.lnum) or nil
   if not line then return view end
@@ -111,10 +126,11 @@ function M._status_view_for_fold_restore(view, ranges, state)
   return adjusted or view
 end
 
----@param buf integer
----@param fold_id string
----@param _folded boolean
----@return boolean
+--- Updates native Vim fold states for an entry's registered line ranges.
+---@param buf integer Status buffer handle.
+---@param fold_id string Target entry identifier string.
+---@param _folded boolean New fold state boolean.
+---@return boolean applied True if native fold ranges were found and applied.
 function M._status_set_native_fold_state(buf, fold_id, _folded)
   local state = session.states and session.states[buf] or session.status
   local ranges = M._status_fold_ranges_for_id(state, fold_id)
@@ -131,24 +147,27 @@ function M._status_set_native_fold_state(buf, fold_id, _folded)
   return true
 end
 
----@param state table?
----@param fold_id string
----@return boolean
+--- Checks if an entry's child content has been expanded and populated.
+---@param state table? Status session state table.
+---@param fold_id string Target entry identifier string.
+---@return boolean materialized True if entry content has been generated.
 function M._status_entry_materialized(state, fold_id)
   return state ~= nil and state.materialized_entry_by_id ~= nil and state.materialized_entry_by_id[fold_id] == true
 end
 
----@param state table?
----@param fold_id string
+--- Records that an entry's child content has been generated.
+---@param state table? Status session state table.
+---@param fold_id string Target entry identifier string.
 function M._status_set_entry_materialized(state, fold_id)
   if not state then return end
   state.materialized_entry_by_id = state.materialized_entry_by_id or {}
   state.materialized_entry_by_id[fold_id] = true
 end
 
----@param state table?
----@param fold_id string
----@return boolean
+--- Checks whether an entry has at least one valid native fold range.
+---@param state table? Status session state table.
+---@param fold_id string Target entry identifier string.
+---@return boolean has_range True if at least one multi-line fold range exists.
 function M._status_has_native_fold_range(state, fold_id)
   for _, range in ipairs(M._status_fold_ranges_for_id(state, fold_id)) do
     if M._status_fold_range_span(range) > 0 then return true end
@@ -156,10 +175,11 @@ function M._status_has_native_fold_range(state, fold_id)
   return false
 end
 
----@param buf integer?
----@param ranges table[]
----@param win integer?
----@return boolean?
+--- Checks live Neovim native fold state for a range using `foldclosed`.
+---@param buf integer? Status buffer handle.
+---@param ranges table[] Array of fold range descriptor tables.
+---@param win integer? Window handle displaying the buffer.
+---@return boolean? folded True if the first range is closed, or nil if invalid.
 function M._status_native_folded(buf, ranges, win)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and ranges and ranges[1]) then return nil end
   if not (win and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf) then
@@ -173,7 +193,8 @@ function M._status_native_folded(buf, ranges, win)
   end)
 end
 
----@param buf integer
+--- Applies registered native folds, foldtext formatting, and window options to the buffer.
+---@param buf integer Status buffer handle.
 function M._status_apply_native_folds(buf)
   local state = session.states and session.states[buf] or session.status
   if not (state and state.fold_range_order and vim.api.nvim_buf_is_valid(buf)) then return end
@@ -219,7 +240,8 @@ function M._status_apply_native_folds(buf)
   end)
 end
 
----@param buf integer
+--- Synchronizes buffer modifiable and issue state across PR, review, and status views.
+---@param buf integer Status buffer handle.
 function M._status_sync_after_native_folds(buf)
   local state = session.states and session.states[buf] or session.status
   if not state then return end
@@ -240,7 +262,8 @@ function M._status_sync_after_native_folds(buf)
   end)
 end
 
----@param buf integer
+--- Debounces and schedules asynchronous native fold application.
+---@param buf integer Status buffer handle.
 function M._status_schedule_native_folds(buf)
   local state = session.states and session.states[buf] or session.status
   if not (state and vim.api.nvim_buf_is_valid(buf)) then return end
@@ -257,6 +280,7 @@ function M._status_schedule_native_folds(buf)
   end, 20)
 end
 
+--- Re-applies layout widths, comment rules, and native folds across status windows on resize.
 function M._refresh_status_windows_after_resize()
   if not session.states then return end
   local refreshed_buffers = {}
@@ -294,6 +318,7 @@ function M._refresh_status_windows_after_resize()
   end
 end
 
+--- Ensures the global window resize autocommands are registered.
 function M._ensure_status_resize_autocmd()
   if resize_autocmd then return end
   local group = vim.api.nvim_create_augroup("DiffReviewStatusResize", { clear = true })

@@ -9,6 +9,9 @@ local plan_execution = require("diff_review.render.harness.plan_execution")
 local plan_resolution = require("diff_review.render.harness.plan_resolution")
 local timeline_status = require("diff_review.render.harness.timeline_status")
 
+--- Appends a formatted session lifecycle event line with highlight records.
+---@param result table Target render collection table.
+---@param entry table Session event entry record.
 local function append_session_event(result, entry)
   local event = entry.event or {}
   local name = event.name or ""
@@ -40,8 +43,9 @@ local markdown_text = require("diff_review.render.harness.markdown_text")
 local task_tree = require("diff_review.render.harness.task_tree")
 local tool_render = require("diff_review.render.harness.tool")
 
----@param line? string
----@return string|table
+--- Computes fold display text string or highlight chunk tuples for folded harness lines.
+---@param line? string Line text under fold.
+---@return string|table text Fold display string or chunk array.
 function M.foldtext(line)
   local text = line or vim.fn.getline(vim.v.foldstart)
   if text:match("^▸ Thought for ") then return { { text, "DiffReviewHarnessThought" } } end
@@ -55,12 +59,20 @@ function M.foldtext(line)
   return text
 end
 
+--- Formats a numeric token count as an abbreviated string.
+---@param value number? Numeric token count.
+---@return string? formatted Formatted token count string, or nil.
 local function format_token_count(value)
   if type(value) ~= "number" then return nil end
   if value >= 1000 then return ("%.1fk"):format(value / 1000) end
   return tostring(value)
 end
 
+--- Formats a concise summary of tool execution counts and failure metrics.
+---@param verb string Action verb prefix (`"Ran"` or `"Running"`).
+---@param count integer Total tool invocation count.
+---@param failed integer Failed tool count.
+---@return string? summary Formatted tool count string, or nil if zero.
 local function tool_count_text(verb, count, failed)
   if count == 0 then return nil end
   local text = ("%s %d %s"):format(verb, count, count == 1 and "tool" or "tools")
@@ -68,6 +80,10 @@ local function tool_count_text(verb, count, failed)
   return text
 end
 
+--- Computes total tool invocations and failures across an interaction's thoughts.
+---@param interaction table Interaction descriptor table.
+---@return integer count Total count of tools executed.
+---@return integer failed Count of failed tool executions.
 local function interaction_counts(interaction)
   local count, failed = 0, 0
   for _, thought in ipairs(interaction.thought or {}) do
@@ -83,6 +99,13 @@ local function interaction_counts(interaction)
   return count, failed
 end
 
+--- Wraps text and appends resulting lines and optional highlight records to the target collection.
+---@param result table Target render collection table.
+---@param text string Content text string to wrap.
+---@param first_prefix string Prefix for first line.
+---@param continuation_prefix string Prefix for subsequent wrapped lines.
+---@param group string? Optional highlight group name.
+---@param width integer Maximum column width.
 local function append_wrapped(result, text, first_prefix, continuation_prefix, group, width)
   local line_list = display_text.wrap(text, width, first_prefix, continuation_prefix)
   for _, line in ipairs(line_list) do
@@ -98,6 +121,11 @@ local function append_wrapped(result, text, first_prefix, continuation_prefix, g
   end
 end
 
+--- Normalizes math and formats assistant response lines with optional prefix overlay extmarks.
+---@param result table Target render collection table.
+---@param text string? Response content text string.
+---@param first_prefix string? Leading prefix string for first line.
+---@param first_prefix_group string? Highlight group for prefix virtual text.
 local function append_response(result, text, first_prefix, first_prefix_group)
   local line_list = vim.split(markdown_text.normalize_math(tostring(text or "")), "\n", { plain = true })
   if #line_list == 0 then line_list = { "" } end
@@ -122,10 +150,17 @@ local function append_response(result, text, first_prefix, first_prefix_group)
   end
 end
 
+--- Appends a timeline response text block with a prompt arrow prefix.
+---@param result table Target render collection table.
+---@param text string? Response content text string.
 local function append_timeline_response(result, text)
   append_response(result, text, "▸ ", "DiffReviewHarnessResponse")
 end
 
+--- Appends lines, rows, highlights, extmarks, spans, and folds from a prebuilt diff tree.
+---@param result table Target render collection table.
+---@param tree table Prebuilt diff tree structure.
+---@return table tree Input tree structure.
 local function append_prebuilt_diff(result, tree)
   local offset = #result.lines
   for _, line in ipairs(tree.lines) do result.lines[#result.lines + 1] = line end
@@ -165,6 +200,12 @@ local function append_prebuilt_diff(result, tree)
   return tree
 end
 
+--- Appends tool invocation header lines and expandable command output rows.
+---@param result table Target render collection table.
+---@param tool table Tool descriptor table.
+---@param thought_key string Base cache key for thought.
+---@param tool_index integer One-based index of tool within thought.
+---@param content_width integer Maximum column width.
 local function append_tool(result, tool, thought_key, tool_index, content_width)
   local tool_key = ("%s:tool:%d"):format(thought_key, tool_index)
   local first = #result.lines + 1
@@ -205,6 +246,10 @@ local function append_tool(result, tool, thought_key, tool_index, content_width)
   end
 end
 
+--- Formats and truncates output preview lines for an active running tool.
+---@param output string? Raw tool output text.
+---@param content_width integer? Maximum column width.
+---@return string[] lines Array of formatted preview line strings.
 local function active_tool_output_lines(output, content_width)
   local output_line_list = tool_render.output_lines(output)
   local preview_line_list = {}
@@ -226,6 +271,10 @@ local function active_tool_output_lines(output, content_width)
   return preview_line_list
 end
 
+--- Appends active tool execution headings and output preview lines.
+---@param result table Target render collection table.
+---@param tool table Active tool descriptor table.
+---@param content_width integer? Maximum column width.
 local function append_active_tool_preview(result, tool, content_width)
   local first = #result.lines + 1
   local heading_line_list = tool_render.heading_lines(tool, content_width, "  ")
@@ -261,10 +310,11 @@ local function append_active_tool_preview(result, tool, content_width)
   end
 end
 
----@param result table
----@param tree table
----@param options { indent: string, label: string, suffix?: string, kind: string, interaction: table, expand_key: string }
----@return integer
+--- Appends a file change count and addition/deletion summary line with an expandable diff tree.
+---@param result table Target render collection table.
+---@param tree table Prebuilt diff tree structure.
+---@param options { indent: string, label: string, suffix?: string, kind: string, unit?: string, interaction: table, expand_key: string } Change summary options.
+---@return integer summary_line Line index of summary header.
 local function append_change_summary(result, tree, options)
   local unit = options.unit or "file"
   local count_text = ("%d %s"):format(tree.file_count, tree.file_count == 1 and unit or (unit .. "s"))
@@ -302,6 +352,11 @@ local function append_change_summary(result, tree, options)
   return summary_line
 end
 
+--- Appends resolved plan comments within a bordered comment box.
+---@param result table Target render collection table.
+---@param interaction table Interaction descriptor table.
+---@param resolution table Plan comment resolution descriptor.
+---@param options table Render options table.
 local function append_plan_comment_resolution(result, interaction, resolution, options)
   local annotation_list = resolution.annotation or {}
   local count = #annotation_list
@@ -350,6 +405,12 @@ local function append_plan_comment_resolution(result, interaction, resolution, o
   end
 end
 
+--- Appends a completed reasoning thought with expandable tool invocations and diffs.
+---@param result table Target render collection table.
+---@param interaction table Interaction descriptor table.
+---@param thought table Thought descriptor table.
+---@param thought_index integer One-based index of thought.
+---@param options table Render options table.
 local function append_completed_thought(result, interaction, thought, thought_index, options)
   local thought_key = ("interaction:%s:thought:%s"):format(interaction.id or interaction.ordinal, thought.id or thought_index)
   local first = #result.lines + 1
@@ -402,6 +463,11 @@ local function append_completed_thought(result, interaction, thought, thought_in
   end
 end
 
+--- Appends active in-progress thought text and running tool indicators.
+---@param result table Target render collection table.
+---@param interaction table Interaction descriptor table.
+---@param active table Active thought descriptor.
+---@param options table Render options table.
 local function append_active_thought(result, interaction, active, options)
   local active_first = #result.lines + 1
   append_wrapped(result, active.text, "↳ ", "  ", "DiffReviewHarnessCommentary", options.content_width)
@@ -418,6 +484,12 @@ local function append_active_thought(result, interaction, active, options)
   end
 end
 
+--- Appends an interaction segment including thought summaries, tasks, and responses.
+---@param result table Target render collection table.
+---@param interaction table Interaction descriptor table.
+---@param segment table Segment descriptor table.
+---@param options table Render options table.
+---@param defer_response? boolean True to defer rendering response line until after diff summaries.
 local function append_segment(result, interaction, segment, options, defer_response)
   local segment_first = #result.lines + 1
   local segment_interaction = {
@@ -515,6 +587,11 @@ local function append_segment(result, interaction, segment, options, defer_respo
   end
 end
 
+--- Appends prompt, segment list, diff summaries, and response blocks for an interaction.
+---@param result table Target render collection table.
+---@param interaction table Interaction descriptor table.
+---@param options table Render options table.
+---@param agent_by_id? table<string, table> Lookup map of child agent runs by identifier.
 local function append_interaction(result, interaction, options, agent_by_id)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
   if not interaction.hide_prompt and interaction.kind ~= "plan_execution" then
@@ -660,9 +737,10 @@ local function append_interaction(result, interaction, options, agent_by_id)
   end
 end
 
----@param interactions table[]
----@param options? { working_seconds?: integer, cwd?: string, on_diff_update?: function, expanded?: table<string, boolean> }
----@return table
+--- Builds the complete harness timeline render tree with lines, highlights, extmarks, and row mappings.
+---@param interactions table[] Array of interaction or lifecycle event records.
+---@param options? { working_seconds?: integer, cwd?: string, on_diff_update?: function, expanded?: table<string, boolean>, timeline_status?: table } Render configuration options.
+---@return table tree Rendered tree model structure.
 function M.build(interactions, options)
   options = options or {}
   local expanded = options.expanded

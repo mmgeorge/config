@@ -1,5 +1,8 @@
 local M = {}
 
+--- Maps a task status string to a visual status bullet glyph.
+---@param status string? Task status string (`"completed"`, `"in_progress"`, `"superseded"`).
+---@return string glyph Display status symbol.
 local function marker(status)
   if status == "completed" then return "●" end
   if status == "in_progress" or status == "inProgress" then return "◐" end
@@ -7,6 +10,9 @@ local function marker(status)
   return "○"
 end
 
+--- Identifies the unique task identifier currently marked in-progress.
+---@param snapshot table Task snapshot state table.
+---@return string? task_id Active task identifier if exactly one is running, or nil.
 local function active_task_id(snapshot)
   local matching = nil
   for _, task in ipairs(snapshot.current or {}) do
@@ -22,13 +28,13 @@ end
 ---@field append_completed_thought fun(result: table, interaction: table, thought: table, thought_index: integer, options: table)
 ---@field append_active_thought fun(result: table, interaction: table, active: table, options: table)
 
---- Render one provider replacement inside its owning interaction.
----@param result table
----@param interaction table
----@param options table
----@param complete boolean
----@param host DiffReviewHarnessTaskTreeHost
----@return boolean active_owned
+--- Renders task checklist entries for an interaction with nested thoughts and active status.
+---@param result table Target render collection table.
+---@param interaction table Interaction descriptor table.
+---@param options table Render options table.
+---@param complete boolean True if interaction has concluded.
+---@param host DiffReviewHarnessTaskTreeHost Host callbacks for appending thoughts.
+---@return boolean active_owned True if an active thought was assigned to a task row.
 function M.append(result, interaction, options, complete, host)
   local snapshot = interaction.task
   if type(snapshot) ~= "table" or #(snapshot.current or {}) == 0 then return false end
@@ -53,9 +59,9 @@ function M.append(result, interaction, options, complete, host)
   return assigned_active ~= nil
 end
 
---- Render removed attributed tasks only when their owner expands.
----@param result table
----@param interaction table
+--- Renders superseded tasks when an interaction is expanded.
+---@param result table Target render collection table.
+---@param interaction table Interaction descriptor table.
 function M.append_superseded(result, interaction)
   for _, task in ipairs(interaction.task and interaction.task.superseded or {}) do
     result.lines[#result.lines + 1] = ("%s %s"):format(marker("superseded"), task.title or "")

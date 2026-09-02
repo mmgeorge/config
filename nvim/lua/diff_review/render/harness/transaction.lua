@@ -2,6 +2,10 @@ local M = {}
 
 local row_emitter = require("diff_review.render.row_emitter")
 
+--- Compares two string arrays for exact element-by-element equality.
+---@param left string[] First line array.
+---@param right string[] Second line array.
+---@return boolean same True if both arrays contain identical line strings.
 local function same_lines(left, right)
   if #left ~= #right then return false end
   for index = 1, #left do
@@ -10,6 +14,12 @@ local function same_lines(left, right)
   return true
 end
 
+--- Calculates minimal replacement line slice operations between previous and next block arrays.
+---@param previous table[]? Array of previous block descriptors.
+---@param next_blocks table[] Array of new block descriptors.
+---@param reset boolean True to force full replacement.
+---@param previous_line_count integer Total lines in previous buffer state.
+---@return { first0: integer, old_after0: integer, replacement: string[] }[] operations Array of buffer replacement operations.
 local function block_operation_list(previous, next_blocks, reset, previous_line_count)
   if reset or not previous or #previous == 0 then
     local replacement = {}
@@ -85,6 +95,11 @@ local function block_operation_list(previous, next_blocks, reset, previous_line_
   return operation_list
 end
 
+--- Computes a node-relative cursor anchor to preserve viewport positioning during updates.
+---@param rows table[]? Array of rendered row descriptors.
+---@param cursor_row integer Cursor line number (1-based).
+---@param cursor_col integer Cursor column offset (0-based).
+---@return { node_id: string, offset: integer, col: integer }? anchor Viewport anchor record, or nil.
 local function cursor_anchor(rows, cursor_row, cursor_col)
   local row = rows and rows[cursor_row]
   if not row then return nil end
@@ -95,6 +110,11 @@ local function cursor_anchor(rows, cursor_row, cursor_col)
   return { node_id = node_id, offset = cursor_row - first, col = cursor_col }
 end
 
+--- Restores window viewport and cursor coordinates relative to a saved node anchor.
+---@param win integer? Target window handle.
+---@param rows table[] Array of rendered row descriptors.
+---@param anchor { node_id: string, offset: integer, col: integer }? Relative anchor record.
+---@param saved_view table? Saved window view dictionary from `winsaveview()`.
 local function restore_cursor(win, rows, anchor, saved_view)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   vim.api.nvim_win_call(win, function()
@@ -128,6 +148,9 @@ local function restore_cursor(win, rows, anchor, saved_view)
   end)
 end
 
+--- Installs manual folds on a window and closes designated folded ranges.
+---@param win integer? Target window handle.
+---@param fold_list table[] Array of fold interval descriptor tables.
 local function install_folds(win, fold_list)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   vim.api.nvim_win_call(win, function()
@@ -154,6 +177,9 @@ local function install_folds(win, fold_list)
   end)
 end
 
+--- Generates a compact signature string representing current fold interval states.
+---@param fold_list table[]? Array of fold interval descriptors.
+---@return string signature Pipe-separated fold state signature string.
 local function fold_signature(fold_list)
   local part_list = {}
   for _, fold in ipairs(fold_list or {}) do
@@ -167,10 +193,11 @@ local function fold_signature(fold_list)
   return table.concat(part_list, "|")
 end
 
----@param state DiffReviewHarnessPresentationState
----@param render table
----@param options? { reset?: boolean, follow_tail?: boolean }
----@return table
+--- Applies an incremental timeline render update transaction to buffer lines, extmarks, highlights, and folds.
+---@param state DiffReviewHarnessPresentationState Presentation state table.
+---@param render table Rendered output model from builder.
+---@param options? { reset?: boolean, follow_tail?: boolean } Optional transaction settings.
+---@return { replaced: integer, first0: integer, block_count: integer } summary Transaction application summary.
 function M.apply(state, render, options)
   options = options or {}
   local buf = state.transcript_buf

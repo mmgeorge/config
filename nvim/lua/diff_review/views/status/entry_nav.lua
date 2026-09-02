@@ -29,6 +29,9 @@ local M = {}
 
 local status_cursor_prewarm_delta_limit = 100
 
+--- Resolves the status entry descriptor at the current cursor line.
+---@param state? table Optional status session state table.
+---@return DiffReviewStatusEntry? entry Matching status entry descriptor, or nil.
 local function status_entry_under_cursor(state)
   local status = state or session.status
   if not status then return nil end
@@ -36,9 +39,9 @@ local function status_entry_under_cursor(state)
   return status.entries[line]
 end
 
-
----@return integer? line
----@return DiffReviewStatusEntry? entry
+--- Scans upwards from cursor line to find the nearest defined status entry and line index.
+---@return integer? line One-based buffer line index.
+---@return DiffReviewStatusEntry? entry Matching status entry descriptor.
 function M._status_entry_line_under_cursor()
   local status = session.status
   if not (status and status.entries and status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return nil, nil end
@@ -52,9 +55,10 @@ function M._status_entry_line_under_cursor()
   return nil, nil
 end
 
----@param status table?
----@param entry DiffReviewStatusEntry?
----@return table?
+--- Resolves the action capability policy for an entry's underlying diff source.
+---@param status table? Status session state table.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@return table? policy Action capability policy map, or nil.
 function M._status_source_policy_for_entry(status, entry)
   if not (status and status.diff_source_registry and entry) then return nil end
   local file = entry.file
@@ -66,9 +70,10 @@ function M._status_source_policy_for_entry(status, entry)
   return source.policy(status.diff_source_registry, source_id)
 end
 
----@param status table?
----@param command string
----@return boolean
+--- Checks whether diff source policy permits the specified command for the cursor entry.
+---@param status table? Status session state table.
+---@param command string Command identifier string.
+---@return boolean allowed True if command is permitted by source policy.
 function M._status_source_policy_allows_cursor(status, command)
   if not (status and status.entries) then return true end
   local _, entry = M._status_entry_line_under_cursor()
@@ -77,17 +82,17 @@ function M._status_source_policy_allows_cursor(status, command)
   return policy[command] == true
 end
 
----@param entry DiffReviewStatusEntry?
----@return boolean
+--- Checks whether an entry represents a file or file header row.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@return boolean is_file True if entry represents a file item.
 function M._status_entry_is_file_like(entry)
   return entry ~= nil
     and (entry.kind == "file" or entry.kind == "commit_file" or entry.kind == "pr_file" or entry.kind == "pr_review_file")
 end
 
---- Decide whether cursor hover may prewarm a non-deleted file without an explicit expansion.
---- Require known sub-100-line stats until the file expands.
----@param entry DiffReviewStatusEntry
----@return boolean
+--- Determines whether cursor hover may prewarm file diff syntax based on delta thresholds.
+---@param entry DiffReviewStatusEntry Status entry descriptor.
+---@return boolean allowed True if syntax prewarming is allowed.
 local function status_file_cursor_prewarm_allowed(entry)
   local file = entry.file
   if not file then return false end
@@ -101,16 +106,18 @@ local function status_file_cursor_prewarm_allowed(entry)
   return delta < status_cursor_prewarm_delta_limit
 end
 
----@param entry DiffReviewStatusEntry?
----@return boolean
+--- Checks whether an entry represents a diff hunk row.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@return boolean is_hunk True if entry represents a diff hunk.
 function M._status_entry_is_hunk_like(entry)
   return entry ~= nil
     and (entry.kind == "hunk" or entry.kind == "commit_hunk" or entry.kind == "pr_hunk" or entry.kind == "pr_review_hunk")
 end
 
----@param current_line integer
----@param entry DiffReviewStatusEntry
----@return DiffReviewStatusEntry?
+--- Searches upward to find the parent file, section, or commit containing current entry.
+---@param current_line integer One-based line index of current entry.
+---@param entry DiffReviewStatusEntry Current status entry descriptor.
+---@return DiffReviewStatusEntry? parent Parent entry descriptor, or nil.
 function M._status_parent_entry(current_line, entry)
   local status = session.status
   if not (status and status.entries) then return nil end
@@ -130,7 +137,8 @@ function M._status_parent_entry(current_line, entry)
   return nil
 end
 
----@param entry DiffReviewStatusEntry?
+--- Prewarms Tree-sitter syntax highlighting for an entry's diff contents.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
 local function status_prewarm_entry_syntax(entry)
   return trace.span("status.prewarm_entry_syntax", session.status and session.status.buf or nil, {
     entry_id = entry and entry.id or nil,
@@ -165,10 +173,10 @@ local function status_prewarm_entry_syntax(entry)
   end)
 end
 
---- Map a 1-based status buffer row to a decoration request, or nil for chrome rows.
----@param buf integer
----@param row integer 1-based buffer line
----@return DiffReviewRowDecorationRequest?
+--- Maps a one-based buffer row to a row decoration request record.
+---@param buf integer Buffer handle.
+---@param row integer One-based buffer line index.
+---@return DiffReviewRowDecorationRequest? request Decoration request table, or nil.
 function M._status_resolve_decoration_row(buf, row)
   local status = session.states and session.states[buf] or nil
   if not (status and status.entries) then return nil end
@@ -187,13 +195,10 @@ function M._status_resolve_decoration_row(buf, row)
   }
 end
 
---- Prewarm Tree-sitter syntax for the file and hunk entries visible in a row range.
---- Scope syntax work to the viewport so off-screen hunks of a large diff stay cheap.
-
---- Debounce a visible-window syntax prewarm so the redraw callback never works inline.
----@param buf integer
----@param first_row integer 1-based
----@param last_row integer 1-based
+--- Debounces a visible window syntax decoration request across a row range.
+---@param buf integer Buffer handle.
+---@param first_row integer One-based starting buffer line index.
+---@param last_row integer One-based ending buffer line index.
 function M._status_schedule_decorate_visible(buf, first_row, last_row)
   local status = session.states and session.states[buf] or nil
   if not status then return end
@@ -210,19 +215,8 @@ function M._status_schedule_decorate_visible(buf, first_row, last_row)
   end, 30)
 end
 
---- Place one diff row's cached decoration spans into a namespace.
---- Pass ephemeral=true for the decoration provider's on_line; omit it (persistent)
---- for the test seam so headless tests can read the marks back.
-
---- Apply a buffer row range's diff decoration into the decorate namespace as
---- persistent marks, for the test seam and non-redraw refreshes.
---- Returns the spans it applied so callers can assert per-row decoration.
-
---- Register the global diff decoration provider once so diff-body decoration
---- (syntax/gutter/intraline/bg) is emitted ephemerally for visible rows only.
---- Skip non-status windows so unrelated redraws stay cheap.
-
----@param buf integer
+--- Schedules deferred syntax prewarming for the entry currently under cursor.
+---@param buf integer Buffer handle.
 local function status_defer_prewarm_under_cursor(buf)
   local status = session.states and session.states[buf] or session.status
   if not status then return end
@@ -256,9 +250,10 @@ end
 local status_files_from_set
 
 
----@param start_line integer
----@param end_line integer
----@return DiffReviewStatusEntry[]
+--- Collects unique status entries across a line range in the status buffer.
+---@param start_line integer Starting buffer line number.
+---@param end_line integer Ending buffer line number.
+---@return DiffReviewStatusEntry[] entries Array of unique status entries.
 local function status_entries_for_lines(start_line, end_line)
   local status = session.status
   if not status then return {} end
@@ -280,7 +275,8 @@ local function status_entries_for_lines(start_line, end_line)
   return entries
 end
 
----@return DiffReviewVisualSelection
+--- Captures the active visual selection line range and associated status entries.
+---@return DiffReviewVisualSelection selection Visual selection record.
 local function status_visual_selection()
   local mode = vim.fn.mode()
   local in_visual_mode = mode == "v" or mode == "V" or mode:byte() == 22
@@ -304,6 +300,7 @@ local function status_visual_selection()
   }
 end
 
+--- Exits Neovim visual mode and clears selection marks.
 local function status_leave_visual_mode()
   local mode = vim.api.nvim_get_mode().mode
   if mode == "v" or mode == "V" or mode:byte() == 22 then
@@ -312,8 +309,9 @@ local function status_leave_visual_mode()
   end
 end
 
----@param entry DiffReviewStatusEntry?
----@return DiffReviewStatusEntry[]
+--- Expands a section entry into individual file entries, or returns the entry as a single-element list.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@return DiffReviewStatusEntry[] entries Array of status file entries.
 local function status_file_entries_for_entry(entry)
   if not entry then return {} end
   if entry.kind == "section" then
@@ -326,18 +324,18 @@ local function status_file_entries_for_entry(entry)
   return { entry }
 end
 
----@param entry DiffReviewStatusEntry
----@return string?
+--- Resolves the unique file scoping identifier for an entry.
+---@param entry DiffReviewStatusEntry Status entry descriptor.
+---@return string? scope Unique file scope string, or nil.
 local function status_file_scope(entry)
   local file = entry.file
   if not (file and file.filename and file.section_name) then return nil end
   return status_keys.file_key(file.section_name, file.filename)
 end
 
---- Build non-overlapping action entries from selected rows, expanding sections to files.
---- Preserve hunk targets only when the same selection does not contain their file target.
----@param entries DiffReviewStatusEntry[]
----@return DiffReviewStatusEntry[]
+--- Builds a de-duplicated action entry list from selected rows, expanding sections and filtering covered hunks.
+---@param entries DiffReviewStatusEntry[] Raw selected entry array.
+---@return DiffReviewStatusEntry[] action_entries Normalized action entries array.
 local function status_action_entries(entries)
   local expanded_entries = {}
   local seen = {}
@@ -365,8 +363,9 @@ local function status_action_entries(entries)
   return action_entries
 end
 
----@param file_set table<string, boolean>
----@return string[]
+--- Extracts a sorted array of filenames from a set dictionary table.
+---@param file_set table<string, boolean> Dictionary of filename keys.
+---@return string[] files Sorted array of filename strings.
 function status_files_from_set(file_set)
   local files = {}
   for filename in pairs(file_set) do
@@ -376,8 +375,9 @@ function status_files_from_set(file_set)
   return files
 end
 
----@param items table<any, any>
----@return integer
+--- Counts total key-value pairs in a table.
+---@param items table<any, any> Hash table.
+---@return integer count Number of entries.
 local function status_count_set(items)
   local count = 0
   for _ in pairs(items) do
@@ -386,9 +386,10 @@ local function status_count_set(items)
   return count
 end
 
----@param action string
----@param hunk_count integer
----@param file_count integer
+--- Emits a debug notification summarizing the number of affected hunks and files.
+---@param action string Action label prefix.
+---@param hunk_count integer Number of hunks modified.
+---@param file_count integer Number of files modified.
 local function status_notify_action(action, hunk_count, file_count)
   if hunk_count <= 0 and file_count <= 0 then return end
   local parts = {}
@@ -401,24 +402,26 @@ local function status_notify_action(action, hunk_count, file_count)
   notifications.debug(("%s %s"):format(action, table.concat(parts, ", ")), vim.log.levels.INFO, { title = "DiffReview" })
 end
 
----@param entry DiffReviewStatusEntry?
----@return "file"|"hunk"?
+--- Identifies whether an entry acts at the file or hunk granularity level.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@return "file"|"hunk"|nil granularity Action granularity category.
 local function status_entry_granularity(entry)
   if M._status_entry_is_file_like(entry) then return "file" end
   if M._status_entry_is_hunk_like(entry) then return "hunk" end
   return nil
 end
 
----@param entry DiffReviewStatusEntry?
----@return string?
+--- Extracts the section category name from a file or section entry.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@return string? section_name Section name string, or nil.
 local function status_entry_section_name(entry)
   return entry and ((entry.file and entry.file.section_name) or (entry.section and entry.section.name)) or nil
 end
 
---- Resolve the next surviving semantic sibling for one visual list mutation.
----@param selection DiffReviewVisualSelection
----@param action_entries DiffReviewStatusEntry[]
----@return DiffReviewListCursorTarget?
+--- Resolves the next surviving semantic sibling entry after a visual selection action.
+---@param selection DiffReviewVisualSelection Visual selection record.
+---@param action_entries DiffReviewStatusEntry[] Array of entries targeted by action.
+---@return DiffReviewListCursorTarget? target Next cursor target descriptor, or nil.
 local function status_visual_action_cursor_target(selection, action_entries)
   local status = session.status
   if not (status and status.entries and status.buf == selection.buf) then return nil end
@@ -481,8 +484,9 @@ local function status_visual_action_cursor_target(selection, action_entries)
   return nil
 end
 
----@param entries DiffReviewStatusEntry[]
----@return boolean
+--- Checks whether all entries in the given array represent headers or file rows.
+---@param entries DiffReviewStatusEntry[] Array of status entries.
+---@return boolean is_headers True if all entries are header-like.
 local function status_entries_are_headers(entries)
   if #entries == 0 then return false end
   for _, entry in ipairs(entries) do
@@ -500,16 +504,18 @@ local function status_entries_are_headers(entries)
   return true
 end
 
----@param selected_entries DiffReviewStatusEntry[]
----@param action_entries DiffReviewStatusEntry[]
----@return string?
+--- Resolves the post-action target anchor entry identifier.
+---@param selected_entries DiffReviewStatusEntry[] Selected entries array.
+---@param action_entries DiffReviewStatusEntry[] Action entries array.
+---@return string? id Target entry identifier string, or nil.
 local function status_action_target_id(selected_entries, action_entries)
   if status_entries_are_headers(selected_entries) then return nil end
   return action_entries[1] and action_entries[1].id or nil
 end
 
----@param target_id? string
----@return boolean
+--- Determines whether an entry identifier prefix matches a section or file header.
+---@param target_id? string Entry identifier string.
+---@return boolean is_header True if target represents a header row.
 local function status_target_is_header(target_id)
   return type(target_id) == "string"
     and (
@@ -523,8 +529,9 @@ local function status_target_is_header(target_id)
     )
 end
 
----@param fallback_line integer
----@return integer?
+--- Locates the nearest section or file header line relative to a fallback line.
+---@param fallback_line integer Target baseline line number.
+---@return integer? line Line index of nearest header, or nil.
 local function status_nearest_header_line(fallback_line)
   local status = session.status
   local viewport = status and status.diff_viewport or nil
@@ -580,11 +587,11 @@ local function status_nearest_header_line(fallback_line)
   return nil
 end
 
---- Find the buffer line of a status entry by id, preferring the fallback line.
----@param entries table<integer, DiffReviewStatusEntry>?
----@param entry_id string?
----@param fallback_line integer?
----@return integer?
+--- Resolves the buffer line number for a status entry identifier, falling back to a default line.
+---@param entries table<integer, DiffReviewStatusEntry>? Status entries dictionary by line.
+---@param entry_id string? Target entry identifier string.
+---@param fallback_line integer? Fallback line number.
+---@return integer? line Resolved line number.
 function M._status_find_entry_line(entries, entry_id, fallback_line)
   if not entries then return fallback_line end
   if entry_id and fallback_line then
@@ -599,6 +606,10 @@ function M._status_find_entry_line(entries, entry_id, fallback_line)
   return fallback_line
 end
 
+--- Positions the window cursor on the specified entry identifier or fallback line.
+---@param buf integer Status buffer handle.
+---@param target_id? string Target entry identifier string.
+---@param fallback_line? integer Fallback buffer line number.
 local function status_restore_cursor(buf, target_id, fallback_line)
   local target_line = nil
   local entries = session.status and session.status.entries
@@ -614,8 +625,9 @@ local function status_restore_cursor(buf, target_id, fallback_line)
   pcall(vim.api.nvim_win_set_cursor, 0, { math.max(target_line, 1), 0 })
 end
 
----@param buf integer
----@param lines string[]
+--- Replaces status buffer content with plain text lines and applies keymap hint bars.
+---@param buf integer Status buffer handle.
+---@param lines string[] Array of content lines.
 local function status_set_plain_lines(buf, lines)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if session.diff_line_content_lengths then session.diff_line_content_lengths[buf] = nil end

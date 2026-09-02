@@ -4,10 +4,11 @@ local M = {}
 ---@field prefix string
 ---@field remainder string
 
----Split the largest display-width prefix without breaking a character.
----@param value string
----@param width integer
----@return DiffReviewDisplayTextSplit
+--- Extracts the longest substring prefix fitting within a maximum display column width.
+--- Avoids breaking multibyte Unicode characters across display boundaries.
+---@param value string Source text string to split.
+---@param width integer Maximum allowable display width in columns.
+---@return DiffReviewDisplayTextSplit split Structure containing `prefix` and `remainder`.
 function M.take_prefix(value, width)
   if width <= 0 or value == "" then return { prefix = "", remainder = value } end
   local prefix = ""
@@ -22,12 +23,13 @@ function M.take_prefix(value, width)
   return { prefix = prefix, remainder = "" }
 end
 
----Wrap text into display-width rows with semantic first and continuation prefixes.
----@param text string
----@param width integer?
----@param first_prefix string?
----@param continuation_prefix string?
----@return string[]
+--- Wraps text into lines fitting within a column width budget.
+--- Applies custom prefix strings to the initial and continuation lines.
+---@param text string Source text to wrap.
+---@param width integer? Optional column width limit (defaults to unlimited).
+---@param first_prefix string? Optional indentation prefix for the first line.
+---@param continuation_prefix string? Optional indentation prefix for wrapped continuation lines.
+---@return string[] lines Array of wrapped text line strings.
 function M.wrap(text, width, first_prefix, continuation_prefix)
   local maximum_width = width or math.huge
   local initial_prefix = first_prefix or ""

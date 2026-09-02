@@ -30,8 +30,8 @@ local M = {}
 ---@type table<integer, DiffReviewWindowOptionState>
 M.saved_by_win = {}
 
---- Hide line numbers and signs for the window, saving the prior values once so restore is exact.
----@param win integer?
+--- Hides line numbers, sign columns, and fold columns while saving prior options for later restoration.
+---@param win integer? Target window handle.
 function M.hide_line_numbers(win)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   if not M.saved_by_win[win] then
@@ -61,9 +61,9 @@ function M.hide_line_numbers(win)
   vim.wo[win].virtualedit = "all"
 end
 
---- Apply the full status-window option set (hidden numbers, manual folds, soft word wrap, no conceal).
----@param win integer?
----@param _state? table
+--- Applies the full status window option set including word wrapping and manual folding.
+---@param win integer? Target window handle.
+---@param _state? table Unused state descriptor parameter.
 function M.apply(win, _state)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   M.hide_line_numbers(win)
@@ -83,8 +83,8 @@ function M.apply(win, _state)
   fold_presentation.apply_window(win)
 end
 
---- Restore the window's saved options and drop its record.
----@param win integer?
+--- Restores saved window options and clears the cached record for the window.
+---@param win integer? Target window handle.
 function M.restore(win)
   if not (win and vim.api.nvim_win_is_valid(win) and M.saved_by_win[win]) then return end
   local saved = M.saved_by_win[win]
@@ -107,7 +107,7 @@ function M.restore(win)
   M.saved_by_win[win] = nil
 end
 
---- Drop every saved record without restoring (cleanup path that wipes the windows anyway).
+--- Drops all saved window option records during teardown.
 function M.reset()
   M.saved_by_win = {}
 end

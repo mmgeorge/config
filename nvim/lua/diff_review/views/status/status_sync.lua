@@ -42,15 +42,17 @@ local root_state_by_key = {}
 local snapshot_attempt_limit = 2
 local snapshot_retry_delay_ms = 120
 
----@param root string
----@return string
+--- Normalizes a repository root directory path into a case-safe lookup key.
+---@param root string Repository root path string.
+---@return string key Normalized lookup key string.
 local function root_key(root)
   local normalized = paths.normalize_path(root)
   return vim.fn.has("win32") == 1 and normalized:lower() or normalized
 end
 
----@param root string
----@return DiffReviewStatusSyncRootState
+--- Retrieves or initializes status synchronization state for a repository root.
+---@param root string Repository root path string.
+---@return DiffReviewStatusSyncRootState state Root sync state descriptor.
 local function root_state(root)
   local key = root_key(root)
   local state = root_state_by_key[key]
@@ -65,8 +67,9 @@ local function root_state(root)
   return state
 end
 
----@param root string
----@return table[]
+--- Collects active status session states matching a repository root.
+---@param root string Repository root path string.
+---@return table[] state_list Array of matching status state descriptors.
 local function status_state_list(root)
   local target_root = root_key(root)
   local state_list = {}
@@ -94,24 +97,28 @@ local function status_state_list(root)
   return state_list
 end
 
----@param status table
----@return DiffReviewOperationJournal
+--- Resolves or initializes the operation journal for a status state.
+---@param status table Status session state table.
+---@return DiffReviewOperationJournal journal Operation journal instance.
 local function ensure_journal(status)
   status.operation_journal = status.operation_journal or operation_journal.new(status.sections or {})
   return status.operation_journal
 end
 
----@param status table
----@param journal? DiffReviewOperationJournal
----@return DiffReviewStatusSection[], DiffReviewStatusSection[]
+--- Applies pending journal operations and ignored path overlays to status sections.
+---@param status table Status session state table.
+---@param journal? DiffReviewOperationJournal Optional explicit journal instance.
+---@return DiffReviewStatusSection[] sections Projected section list with ignored overlay.
+---@return DiffReviewStatusSection[] git_sections Raw Git projected section list.
 local function project_status(status, journal)
   local git_section_list = operation_journal.project(journal or ensure_journal(status))
   if not status.cwd then return git_section_list, git_section_list end
   return ignored_path_store.project(status.cwd, git_section_list), git_section_list
 end
 
----@param status table
----@param cursor_target? DiffReviewListCursorTarget
+--- Re-renders status buffer from active projected sections with optional cursor positioning.
+---@param status table Status session state table.
+---@param cursor_target? DiffReviewListCursorTarget Optional cursor restoration target descriptor.
 local function render_current_projection(status, cursor_target)
   if not (status.buf and vim.api.nvim_buf_is_valid(status.buf)) then return end
   local previous_status = session.status
@@ -124,10 +131,11 @@ local function render_current_projection(status, cursor_target)
   session.status = previous_status
 end
 
----@param root string
----@param entries DiffReviewStatusEntry[]
----@param target_section DiffReviewStatusStageSectionName
----@return DiffReviewStatusCacheLayer
+--- Captures a diff cache mutation layer for optimistic staging updates.
+---@param root string Repository root path string.
+---@param entries DiffReviewStatusEntry[] Array of mutated status entries.
+---@param target_section DiffReviewStatusStageSectionName Target stage section name.
+---@return DiffReviewStatusCacheLayer layer Captured cache layer descriptor.
 local function capture_cache_layer(root, entries, target_section)
   local path_set = {}
   local selection_list = {}
@@ -154,7 +162,8 @@ local function capture_cache_layer(root, entries, target_section)
   }
 end
 
----@param layer DiffReviewStatusCacheLayer
+--- Applies staged flag overrides from a cache layer to global session diffs.
+---@param layer DiffReviewStatusCacheLayer Cache layer to apply.
 local function apply_cache_layer(layer)
   session.file_diffs = session.file_diffs or {}
   session.file_hunk_staged = session.file_hunk_staged or {}
@@ -182,8 +191,9 @@ local function apply_cache_layer(layer)
   end
 end
 
----@param file_list string[]
----@return table<string, { diff: string|boolean|nil, flag_list: boolean[]? }>
+--- Captures a snapshot of diff text and staged flags for specified files.
+---@param file_list string[] Array of file paths to record.
+---@return table<string, { diff: string|boolean|nil, flag_list: boolean[]? }> cache Recorded cache table.
 local function capture_cache(file_list)
   local cache = {}
   for _, filename in ipairs(file_list or {}) do
@@ -195,9 +205,10 @@ local function capture_cache(file_list)
   return cache
 end
 
----@param before table<string, { diff: string|boolean|nil, flag_list: boolean[]? }>
----@param file_list string[]
----@return string[]
+--- Identifies files whose cached diff text or staged flags changed between states.
+---@param before table<string, { diff: string|boolean|nil, flag_list: boolean[]? }> Previous cache snapshot.
+---@param file_list string[] Array of file paths to inspect.
+---@return string[] changed_file_list Array of modified file paths.
 local function changed_cache_file_list(before, file_list)
   local changed_file_list = {}
   for _, filename in ipairs(file_list or {}) do
@@ -211,7 +222,8 @@ local function changed_cache_file_list(before, file_list)
   return changed_file_list
 end
 
----@param snapshot DiffReviewPathStatusSnapshot
+--- Merges authoritative Git snapshot file diffs and untracked records into session.
+---@param snapshot DiffReviewPathStatusSnapshot Git path status snapshot.
 local function apply_snapshot_cache(snapshot)
   session.file_diffs = session.file_diffs or {}
   session.file_hunk_staged = session.file_hunk_staged or {}
@@ -230,8 +242,9 @@ local function apply_snapshot_cache(snapshot)
   end
 end
 
----@param state DiffReviewStatusSyncRootState
----@param resolved_burst_id_set table<integer, boolean>
+--- Removes cache layers corresponding to completed mutation bursts.
+---@param state DiffReviewStatusSyncRootState Root synchronization state.
+---@param resolved_burst_id_set table<integer, boolean> Set of completed burst IDs.
 local function retire_cache_layers(state, resolved_burst_id_set)
   local remaining_layer_list = {}
   for _, layer in ipairs(state.cache_layer_list) do
@@ -242,13 +255,15 @@ local function retire_cache_layers(state, resolved_burst_id_set)
   state.cache_layer_list = remaining_layer_list
 end
 
----@param state DiffReviewStatusSyncRootState
+--- Replays active unconfirmed cache layers against current session diffs.
+---@param state DiffReviewStatusSyncRootState Root synchronization state.
 local function replay_cache_layers(state)
   for _, layer in ipairs(state.cache_layer_list) do apply_cache_layer(layer) end
 end
 
----@param state DiffReviewStatusSyncRootState
----@param burst_id integer
+--- Inverts staged flag mutations for a failed mutation burst.
+---@param state DiffReviewStatusSyncRootState Root synchronization state.
+---@param burst_id integer Burst identifier to roll back.
 local function reverse_cache_layers_for_burst(state, burst_id)
   for layer_index = #state.cache_layer_list, 1, -1 do
     local layer = state.cache_layer_list[layer_index]
@@ -267,8 +282,9 @@ end
 ---@field target_section DiffReviewStatusStageSectionName
 ---@field entry_list DiffReviewStatusEntry[]
 
----@param burst DiffReviewMutationBurst
----@return DiffReviewCompletedMutationGroup[]
+--- Groups completed mutations from a partially successful mutation burst.
+---@param burst DiffReviewMutationBurst Mutation burst descriptor.
+---@return DiffReviewCompletedMutationGroup[] group_list Array of completed mutation groups.
 local function completed_mutation_group_list(burst)
   local group_list = {}
   for _, task in ipairs(burst.tasks or {}) do
@@ -293,10 +309,11 @@ local function completed_mutation_group_list(burst)
   return group_list
 end
 
----@param state DiffReviewStatusSyncRootState
----@param burst DiffReviewMutationBurst
----@return string[] path_list
----@return table<integer, boolean> resolved_burst_id_set
+--- Computes the union of affected paths and burst IDs for synchronization.
+---@param state DiffReviewStatusSyncRootState Root synchronization state.
+---@param burst DiffReviewMutationBurst Active mutation burst.
+---@return string[] path_list Array of repository-relative path strings.
+---@return table<integer, boolean> resolved_burst_id_set Set of resolved burst IDs.
 local function synchronization_scope(state, burst)
   local path_set = {}
   local resolved_burst_id_set = {}
@@ -314,9 +331,10 @@ local function synchronization_scope(state, burst)
   return path_list, resolved_burst_id_set
 end
 
----@param section_list DiffReviewStatusSection[]
----@param name string
----@return DiffReviewStatusSection?
+--- Finds a section matching the specified section name string.
+---@param section_list DiffReviewStatusSection[] Array of status sections.
+---@param name string Section name identifier.
+---@return DiffReviewStatusSection? section Matching section descriptor or nil.
 local function section_named(section_list, name)
   for _, section in ipairs(section_list or {}) do
     if section.name == name then return section end
@@ -324,9 +342,10 @@ local function section_named(section_list, name)
   return nil
 end
 
----@param status table
----@param projected_section_list DiffReviewStatusSection[]
----@param snapshot DiffReviewPathStatusSnapshot
+--- Reloads affected source file buffers and invalidates pending mutation paths.
+---@param status table Status session state table.
+---@param projected_section_list DiffReviewStatusSection[] Array of projected sections.
+---@param snapshot DiffReviewPathStatusSnapshot Authoritative Git path status snapshot.
 local function apply_snapshot_sources(status, projected_section_list, snapshot)
   local registry = status.diff_source_registry
   if not registry then return end
@@ -365,12 +384,13 @@ local function apply_snapshot_sources(status, projected_section_list, snapshot)
   if #later_path_list > 0 then source_loader.invalidate(registry, source_id_list, later_path_list) end
 end
 
----@param status table
----@param snapshot DiffReviewPathStatusSnapshot
----@param snapshot_section_list DiffReviewStatusSection[]
----@param resolved_burst_id_set table<integer, boolean>
----@param force_render boolean
----@return boolean corrected
+--- Merges authoritative Git snapshot into status journal and projected sections.
+---@param status table Status session state table.
+---@param snapshot DiffReviewPathStatusSnapshot Git path status snapshot.
+---@param snapshot_section_list DiffReviewStatusSection[] Status sections built from snapshot.
+---@param resolved_burst_id_set table<integer, boolean> Set of resolved burst IDs.
+---@param force_render boolean True to force immediate re-render.
+---@return boolean corrected True if projected sections changed.
 local function commit_status_snapshot(status, snapshot, snapshot_section_list, resolved_burst_id_set, force_render)
   local journal = ensure_journal(status)
   local authoritative_section_list
@@ -402,10 +422,11 @@ local function commit_status_snapshot(status, snapshot, snapshot_section_list, r
   return corrected
 end
 
----@param state DiffReviewStatusSyncRootState
----@param snapshot DiffReviewPathStatusSnapshot
----@param resolved_burst_id_set table<integer, boolean>
----@param force_render boolean
+--- Applies authoritative snapshot to cache layers, journals, and status buffers.
+---@param state DiffReviewStatusSyncRootState Root synchronization state.
+---@param snapshot DiffReviewPathStatusSnapshot Git path status snapshot.
+---@param resolved_burst_id_set table<integer, boolean> Set of resolved burst IDs.
+---@param force_render boolean True to force immediate re-render.
 local function commit_snapshot(state, snapshot, resolved_burst_id_set, force_render)
   local affected_file_list = vim.deepcopy(snapshot.affected_file_list or {})
   local before_cache = capture_cache(affected_file_list)
@@ -427,7 +448,8 @@ local function commit_snapshot(state, snapshot, resolved_burst_id_set, force_ren
   state.verification_stale = false
 end
 
----@param burst DiffReviewMutationBurst
+--- Formats and emits an error notification for a failed mutation burst.
+---@param burst DiffReviewMutationBurst Failed mutation burst descriptor.
 local function notify_burst_failure(burst)
   local task = burst.failed_task
   local result = burst.failure or { ok = false, error = "unknown Git failure" }
@@ -445,9 +467,10 @@ local function notify_burst_failure(burst)
   ))
 end
 
----@param root string
----@param path_list string[]
----@param done fun(snapshot: DiffReviewPathStatusSnapshot?, snapshot_error: DiffReviewPathStatusSnapshotError?)
+--- Collects Git status snapshot for paths with retry on transient failure.
+---@param root string Repository root path string.
+---@param path_list string[] Array of repository-relative path strings.
+---@param done fun(snapshot: DiffReviewPathStatusSnapshot?, snapshot_error: DiffReviewPathStatusSnapshotError?) Completion callback.
 local function collect_snapshot_with_retry(root, path_list, done)
   local attempt_count = 0
   local completed = false
@@ -476,10 +499,11 @@ local function collect_snapshot_with_retry(root, path_list, done)
   collect()
 end
 
----@param state DiffReviewStatusSyncRootState
----@param burst DiffReviewMutationBurst
----@param force_render boolean
----@param done fun(ok: boolean)
+--- Collects path snapshot and commits state updates for a completed mutation burst.
+---@param state DiffReviewStatusSyncRootState Root synchronization state.
+---@param burst DiffReviewMutationBurst Completed mutation burst descriptor.
+---@param force_render boolean True to force immediate re-render.
+---@param done fun(ok: boolean) Completion callback receiving success status.
 local function synchronize_burst(state, burst, force_render, done)
   local path_list, resolved_burst_id_set = synchronization_scope(state, burst)
   collect_snapshot_with_retry(state.root, path_list, function(snapshot, snapshot_error)
@@ -495,9 +519,10 @@ local function synchronize_burst(state, burst, force_render, done)
   end)
 end
 
----@param state DiffReviewStatusSyncRootState
----@param burst DiffReviewMutationBurst
----@param done fun(ok: boolean)
+--- Re-synchronizes or rolls back optimistic state after a mutation burst failure.
+---@param state DiffReviewStatusSyncRootState Root synchronization state.
+---@param burst DiffReviewMutationBurst Failed mutation burst descriptor.
+---@param done fun(ok: boolean) Completion callback receiving success status.
 local function recover_burst(state, burst, done)
   notify_burst_failure(burst)
   local path_list, resolved_burst_id_set = synchronization_scope(state, burst)
@@ -553,8 +578,8 @@ local function recover_burst(state, burst, done)
   end)
 end
 
---- Configure one repository's quiet-sync and failure-recovery lifecycle.
----@param root string
+--- Configures quiet-sync and failure-recovery lifecycle handlers for a repository.
+---@param root string Repository root path string.
 function M.configure_root(root)
   local state = root_state(root)
   if state.configured then return end
@@ -572,12 +597,12 @@ function M.configure_root(root)
   })
 end
 
---- Apply one optimistic action before its Git process starts.
----@param root string
----@param burst_id integer
----@param entries DiffReviewStatusEntry[]
----@param target_section DiffReviewStatusStageSectionName
----@param cursor_target? DiffReviewListCursorTarget
+--- Applies optimistic stage or unstage mutations and updates status buffers immediately.
+---@param root string Repository root path string.
+---@param burst_id integer Unique mutation burst identifier.
+---@param entries DiffReviewStatusEntry[] Array of mutated status entries.
+---@param target_section DiffReviewStatusStageSectionName Target stage section name.
+---@param cursor_target? DiffReviewListCursorTarget Optional cursor restoration target.
 function M.apply_optimistic(root, burst_id, entries, target_section, cursor_target)
   local state = root_state(root)
   local layer = capture_cache_layer(root, entries, target_section)
@@ -601,9 +626,9 @@ function M.apply_optimistic(root, burst_id, entries, target_section, cursor_targ
   end
 end
 
---- Reset one status journal after a full authoritative load.
----@param status table
----@param authoritative_section_list DiffReviewStatusSection[]
+--- Resets status operation journal to authoritative baseline after a full reload.
+---@param status table Status session state table.
+---@param authoritative_section_list DiffReviewStatusSection[] Authoritative status sections.
 function M.reset_status(status, authoritative_section_list)
   status.operation_journal = operation_journal.reset(ensure_journal(status), authoritative_section_list)
   status.sections = project_status(status, status.operation_journal)
@@ -615,10 +640,9 @@ function M.reset_status(status, authoritative_section_list)
   end
 end
 
-
---- Reapply the virtual Ignored overlay and consume an originating visual-action target once.
----@param root string
----@param cursor_target? DiffReviewListCursorTarget
+--- Re-projects ignored path overlays across active status buffers for a repository.
+---@param root string Repository root path string.
+---@param cursor_target? DiffReviewListCursorTarget Optional cursor restoration target.
 function M.reproject_ignored(root, cursor_target)
   for _, status in ipairs(status_state_list(root)) do
     status.request_id = (status.request_id or 0) + 1
@@ -628,7 +652,7 @@ function M.reproject_ignored(root, cursor_target)
   end
 end
 
---- Reset private synchronization state for deterministic tests.
+--- Resets private synchronization state tables for deterministic tests.
 function M.reset_for_test()
   root_state_by_key = {}
   ignored_path_store.reset_for_test()

@@ -1,3 +1,5 @@
+--- Manages harness permissions document buffer and asynchronous RPC persistence.
+---@class DiffReviewPermissionsViewModule
 local M = {}
 
 local client = require("diff_review.harness.client")
@@ -7,7 +9,8 @@ local notifications = require("diff_review.infra.notifications")
 ---@field path string
 ---@field source string
 
----@param result DiffReviewPermissionDocument
+--- Opens an editable buffer populated with permissions JSON document and attaches write autocommand.
+---@param result DiffReviewPermissionDocument Permission document descriptor from harness.
 local function edit(result)
   local buf = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_name(buf, result.path)
@@ -34,6 +37,7 @@ local function edit(result)
   vim.api.nvim_set_current_buf(buf)
 end
 
+--- Connects to harness RPC client, requests permissions document, and opens editor buffer.
 function M.open()
   client.start(function(_, start_error)
     if start_error then

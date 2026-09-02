@@ -20,9 +20,10 @@ local diff_parse = require("diff_review.render.diff_parse")
 
 local M = {}
 
----@param hunk DiffReviewHunk
----@return integer? first_line
----@return integer? last_line
+--- Finds the 1-based start and end line range of modifications in a diff hunk.
+---@param hunk DiffReviewHunk Diff hunk descriptor table.
+---@return integer? first_line Starting 1-based line index of modifications.
+---@return integer? last_line Ending 1-based line index of modifications.
 function M._status_hunk_changed_current_range(hunk)
   local first_line = nil
   local last_line = nil
@@ -46,9 +47,10 @@ function M._status_hunk_changed_current_range(hunk)
   return nil, nil
 end
 
----@param hunk DiffReviewHunk
----@return integer? first_line
----@return integer? last_line
+--- Calculates full virtual display line bounds for a hunk including context padding.
+---@param hunk DiffReviewHunk Diff hunk descriptor table.
+---@return integer? first_line Starting display line number with padding.
+---@return integer? last_line Ending display line number with padding.
 function M._status_hunk_virtual_display_range(hunk)
   local first_line, last_line = M._status_hunk_changed_current_range(hunk)
   if not (first_line and last_line) then return nil, nil end
@@ -56,9 +58,10 @@ function M._status_hunk_virtual_display_range(hunk)
   return math.max(1, first_line - padding_limit), last_line + padding_limit
 end
 
----@param diff_text string?
----@return string[] header_lines
----@return string[][] hunk_sections
+--- Separates diff header lines from individual `@@` hunk section blocks.
+---@param diff_text string? Raw unified diff text string.
+---@return string[] header_lines Array of diff header lines preceding first hunk.
+---@return string[][] hunk_sections Array of line arrays for each hunk section.
 function M._status_hunk_diff_parts(diff_text)
   local header_lines = {}
   local hunk_sections = {}
@@ -76,9 +79,10 @@ function M._status_hunk_diff_parts(diff_text)
   return header_lines, hunk_sections
 end
 
----@param left DiffReviewHunk?
----@param right DiffReviewHunk?
----@return boolean
+--- Determines whether two adjacent hunks overlap in display range and should merge.
+---@param left DiffReviewHunk? Preceding diff hunk.
+---@param right DiffReviewHunk? Following diff hunk.
+---@return boolean should_combine True if hunks should be merged into one display block.
 function M._status_hunks_should_display_together(left, right)
   if not (left and right) then return false end
   if left.file ~= right.file then return false end
@@ -90,8 +94,9 @@ function M._status_hunks_should_display_together(left, right)
   return right_display_start <= left_display_end + 1
 end
 
----@param hunks DiffReviewHunk[]
----@return DiffReviewHunk
+--- Merges multiple overlapping diff hunks into a single unified display hunk.
+---@param hunks DiffReviewHunk[] Array of adjacent overlapping hunks.
+---@return DiffReviewHunk combined Combined display hunk descriptor.
 function M._status_combine_display_hunks(hunks)
   if #hunks == 1 then return hunks[1] end
   local header_lines = M._status_hunk_diff_parts(hunks[1].diff)
@@ -114,8 +119,9 @@ function M._status_combine_display_hunks(hunks)
   return combined_hunk
 end
 
----@param hunks DiffReviewHunk[]
----@return DiffReviewHunk[]
+--- Groups and merges all adjacent overlapping diff hunks across a file.
+---@param hunks DiffReviewHunk[] Array of raw diff hunks.
+---@return DiffReviewHunk[] display_hunks Array of grouped display hunks.
 function M._status_display_hunks(hunks)
   return trace.span("status.display_hunks", session.status and session.status.buf or nil, {
     hunk_count = #(hunks or {}),
@@ -140,22 +146,25 @@ function M._status_display_hunks(hunks)
     return display_hunks
   end)
 end
----@param diff_line string?
----@return boolean
+--- Validates whether a diff line is a valid unified diff body line.
+---@param diff_line string? Raw diff line string.
+---@return boolean is_body True if line is a hunk content line.
 function M._status_lazy_diff_body_line(diff_line)
   return source.diff_body_line(diff_line)
 end
 
----@param lines string[]
----@return integer added
----@return integer removed
+--- Calculates added and removed line counts from diff lines.
+---@param lines string[] Array of diff line strings.
+---@return integer added Count of added lines.
+---@return integer removed Count of removed lines.
 function M._status_lazy_diff_stats(lines)
   return source.diff_stats(lines)
 end
 
----@param file DiffReviewStatusFile
----@param comment table
----@return boolean
+--- Checks whether a review comment belongs to a status file descriptor.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@param comment table Review comment descriptor table.
+---@return boolean matches True if comment targets the file.
 function M._status_lazy_comment_matches_file(file, comment)
   if not (file and comment) then return false end
   local targets = {
@@ -172,8 +181,9 @@ function M._status_lazy_comment_matches_file(file, comment)
   return false
 end
 
----@param comment table
----@return integer
+--- Estimates total rendered buffer rows required for a review comment and replies.
+---@param comment table Review comment descriptor table.
+---@return integer rows Estimated buffer line count.
 function M._status_lazy_comment_row_estimate(comment)
   if not comment or comment.local_state == "deleted" then return 0 end
   if comment.review_folded == true then return 1 end
@@ -185,9 +195,10 @@ function M._status_lazy_comment_row_estimate(comment)
   return 2 + body_count + reply_count
 end
 
----@param file DiffReviewStatusFile
----@param hunk DiffReviewHunk
----@return integer
+--- Calculates estimated total comment rows attached within a diff hunk.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@param hunk DiffReviewHunk Diff hunk descriptor.
+---@return integer rows Estimated comment row count.
 function M._status_lazy_hunk_comment_estimate(file, hunk)
   local total = 0
   local seen = {}
@@ -210,9 +221,10 @@ function M._status_lazy_hunk_comment_estimate(file, hunk)
   return total
 end
 
----@param file DiffReviewStatusFile
----@param hunk DiffReviewHunk
----@return integer
+--- Estimates total buffer line count required to render a diff hunk and its attached comments.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@param hunk DiffReviewHunk Diff hunk descriptor.
+---@return integer rows Total estimated row count.
 function M._status_lazy_hunk_estimate(file, hunk)
   local lazy_estimate = tonumber(hunk and hunk.lazy_estimate)
   if lazy_estimate then return math.max(1, lazy_estimate + M._status_lazy_hunk_comment_estimate(file, hunk)) end
@@ -229,11 +241,8 @@ function M._status_lazy_hunk_estimate(file, hunk)
   return math.max(1, count + M._status_lazy_hunk_comment_estimate(file, hunk))
 end
 
-
---- Resolve the per-file diff-body row budget for the size gate, or nil when disabled.
---- Bounds how many real rows a single file body renders up front so a huge diff does
---- not freeze the render; the rest loads on demand through its load-more row.
----@return integer?
+--- Resolves the per-file diff-body row budget for the size gate, or nil when disabled.
+---@return integer? budget Maximum allowed initial rows, or nil.
 function M._status_file_render_row_budget()
   local options = config.options or config.options or config.defaults
   local base = tonumber(options.status_diff_viewport_threshold) or 0
@@ -241,10 +250,10 @@ function M._status_file_render_row_budget()
   return base
 end
 
---- Resolve the whole-file line count and limit when its preview must be omitted.
----@param file DiffReviewStatusFile
----@return integer? line_count
----@return integer? limit
+--- Resolves the whole-file line count and limit when its preview must be omitted.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@return integer? line_count Total file line count if omitted.
+---@return integer? limit Maximum line threshold limit if omitted.
 function M._status_file_preview_omission(file)
   local options = config.options or config.defaults
   local limit = math.max(0, math.floor(tonumber(options.status_file_preview_line_limit) or 1000))
@@ -256,24 +265,20 @@ function M._status_file_preview_omission(file)
   return line_count, limit
 end
 
---- Count the leading display hunks a file body must render regardless of the row
---- budget, so activating its load-more row always reveals more of a huge diff.
----@param file_key string
----@return integer
+--- Counts leading display hunks a file body must render regardless of the row budget.
+---@param file_key string Unique file entry key string.
+---@return integer count Forced hunk count.
 function M._status_file_forced_hunk_count(file_key)
   return (session.status and session.status.file_render_limits and session.status.file_render_limits[file_key]) or 0
 end
 
---- Decide whether the size gate should defer the next hunk behind a load-more row.
---- Always render the first hunk and any force-loaded hunks, then stop once the budget
---- is reached or the next hunk would overshoot it, so one giant hunk cannot freeze the
---- render while load-more still guarantees progress.
----@param rendered_rows integer rows already emitted for this file body
----@param next_estimate integer estimated rendered rows of the next hunk
----@param hunk_index integer 1-based index of the next hunk
----@param forced_hunks integer leading hunks to render regardless of the budget
----@param budget integer? row budget, or nil when the gate is disabled
----@return boolean
+--- Decides whether the size gate should defer the next hunk behind a load-more interactive row.
+---@param rendered_rows integer Rows already emitted for this file body.
+---@param next_estimate integer Estimated rendered rows of the next hunk.
+---@param hunk_index integer One-based index of the next hunk.
+---@param forced_hunks integer Leading hunks to render regardless of budget.
+---@param budget integer? Row budget threshold, or nil when disabled.
+---@return boolean should_defer True if next hunk exceeds budget and should be deferred.
 function M._status_size_gate_should_defer(rendered_rows, next_estimate, hunk_index, forced_hunks, budget)
   if not budget then return false end
   if hunk_index <= 1 or hunk_index <= forced_hunks then return false end

@@ -25,10 +25,10 @@ local session = require("diff_review.session")
 -- Forward-declare so status_start_pr_lookup can capture the open action as an upvalue.
 local status_open_pr
 
---- Select the newest active PR and newest closed fallback for one branch.
----@param prs DiffReviewGhPR[]?
----@return DiffReviewGhPR? active
----@return DiffReviewGhPR? closed
+--- Filters and selects the newest open and closed pull requests for a branch.
+---@param prs DiffReviewGhPR[]? Array of pull request descriptors.
+---@return DiffReviewGhPR? active Newest active open pull request, or nil.
+---@return DiffReviewGhPR? closed Newest closed pull request fallback, or nil.
 function M.select_branch_pr(prs)
   local ordered = vim.deepcopy(prs or {})
   table.sort(ordered, function(left, right)
@@ -44,6 +44,10 @@ function M.select_branch_pr(prs)
   return active, closed
 end
 
+--- Initiates asynchronous GitHub pull request lookup with race guards and status header patching.
+---@param cwd string Git repository root path.
+---@param buf integer Status buffer handle.
+---@param request_id integer Monotonic lookup request ID.
 local function status_start_pr_lookup(cwd, buf, request_id)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   local status = session.states and session.states[buf] or session.status
@@ -139,10 +143,11 @@ local function status_start_pr_lookup(cwd, buf, request_id)
   end)
 end
 
----@param cwd string
----@param buf integer
----@param force? boolean
----@return integer? request_id
+--- Initializes or resets pull request fetch state for a repository root and increments the request ID.
+---@param cwd string Git repository root path.
+---@param buf integer Status buffer handle.
+---@param force? boolean True to force a new fetch request.
+---@return integer? request_id Monotonic request identifier if started, or nil.
 local function status_ensure_pr_state(cwd, buf, force)
   session.status = session.status or {}
   local status = session.status
@@ -154,8 +159,9 @@ local function status_ensure_pr_state(cwd, buf, force)
   return status.pr_request_id
 end
 
----@param sections DiffReviewStatusSection[]?
----@return boolean
+--- Checks whether any status sections contain modified files.
+---@param sections DiffReviewStatusSection[]? Array of status sections.
+---@return boolean has_changes True if any section contains modified or staged files.
 local function status_has_changes(sections)
   for _, section in ipairs(sections or {}) do
     if #(section.files or {}) > 0 then return true end
@@ -163,11 +169,12 @@ local function status_has_changes(sections)
   return false
 end
 
----@param cwd string
----@param buf integer
----@param has_changes boolean
----@param force? boolean
----@param allow_generation? boolean
+--- Manages AI commit message summary state lifecycle and debounced generation requests.
+---@param cwd string Git repository root path.
+---@param buf integer Status buffer handle.
+---@param has_changes boolean True if repository contains uncommitted changes.
+---@param force? boolean True to force new summary generation.
+---@param allow_generation? boolean True to immediately trigger generation without debounce.
 local function status_ensure_about_state(cwd, buf, has_changes, force, allow_generation)
   session.status = session.status or {}
   local status = session.status
@@ -232,6 +239,8 @@ local function status_ensure_about_state(cwd, buf, has_changes, force, allow_gen
   start_generation()
 end
 
+--- Opens active GitHub PR review or prompts to open/create closed or missing PRs.
+---@param entry DiffReviewStatusEntry? Optional status entry descriptor.
 status_open_pr = function(entry)
   local current_pr_state = session.status and session.status.pr or nil
   if current_pr_state

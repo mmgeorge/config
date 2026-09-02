@@ -77,9 +77,10 @@ local function git_status_is_renamed(status)
   return type(status) == "string" and status:sub(1, 1) == "R"
 end
 
----@param file DiffReviewStatusFile
----@return string label
----@return string hl_group
+--- Resolves the file status label and highlight group for a status file record.
+---@param file DiffReviewStatusFile Status file record.
+---@return string label Human-readable change label (`"New"`, `"Removed"`, or `"Modified"`).
+---@return string hl_group Highlight group name for the badge.
 function M._status_file_change_label(file)
   local status = type(file.git_status) == "string" and file.git_status or file.status
   status = type(status) == "string" and status:lower() or ""
@@ -97,9 +98,10 @@ end
 ---@field end_col integer
 ---@field hl_group string
 
----@param file DiffReviewStatusFile
----@return string
----@return DiffReviewStatusFileStatSegment[]
+--- Formats added and removed line count text and highlight column intervals for a file header.
+---@param file DiffReviewStatusFile Status file record.
+---@return string text Formatted stats string (e.g. `"+10 -5"` or `"new"`).
+---@return DiffReviewStatusFileStatSegment[] segments Highlight spans mapping columns to groups.
 function M._status_file_stat_text_and_segments(file)
   if file.untracked then
     return "new", {
@@ -337,10 +339,11 @@ local function collect_status_snapshot_async(cwd, callback)
   end)
 end
 
---- Compute Tree-sitter scope context for a hunk without blocking UI render.
----@param filename string absolute path
----@param line number 1-based line number
----@param cb fun(context?: DiffReviewHunkTreeSitterContext|string)
+--- Asynchronously computes Tree-sitter scope context for a diff hunk without blocking UI rendering.
+--- Invokes `cb` with the resolved context string/descriptor or nil on failure.
+---@param filename string Absolute filesystem path to the target source file.
+---@param line number One-based line number inside the target file.
+---@param cb fun(context?: DiffReviewHunkTreeSitterContext|string) Callback receiving computed scope context.
 function M.compute_hunk_context_async(filename, line, cb)
   local buf = syntax_engine.treesitter_source_buffer(filename)
   if not buf then
@@ -395,8 +398,9 @@ function M.compute_hunk_context_async(filename, line, cb)
   end
 end
 
----@param filename string
----@param cb fun(syntax?: DiffReviewTreeSitterSyntax)
+--- Asynchronously parses and resolves Tree-sitter syntax highlighting data for a source file.
+---@param filename string Absolute path to the source file.
+---@param cb fun(syntax?: DiffReviewTreeSitterSyntax) Callback receiving parsed Tree-sitter syntax tree.
 function M.compute_file_syntax_async(filename, cb)
   return trace.span("treesitter.compute_file_syntax_async", session.status and session.status.buf or nil, {
     file = filename,
@@ -469,9 +473,10 @@ function M.compute_file_syntax_async(filename, cb)
   end)
 end
 
----@param filename string
----@param lines string[]
----@param cb fun(syntax?: DiffReviewTreeSitterSyntax)
+--- Asynchronously computes Tree-sitter syntax highlighting information for diff content lines.
+---@param filename string File path used for filetype detection.
+---@param lines string[] Array of code lines to highlight.
+---@param cb fun(syntax?: DiffReviewTreeSitterSyntax) Callback receiving parsed Tree-sitter syntax data.
 function M.compute_diff_syntax_async(filename, lines, cb)
   return trace.span("treesitter.compute_diff_syntax_async", session.status and session.status.buf or nil, {
     file = filename,
@@ -729,9 +734,10 @@ notify_snapshot_error = function(snapshot_error)
   notifications.error(snapshot_error.message, "Git status refresh failed")
 end
 
----@param cwd string
----@param callback fun(item_list?: table[], error?: DiffReviewPathStatusSnapshotError, snapshot?: DiffReviewPathStatusSnapshot)
----@param context? { skip_pre_render?: boolean, skip_ts_context?: boolean }
+--- Asynchronously gathers status snapshot items and opens required diff preview buffers.
+---@param cwd string Working directory root path.
+---@param callback fun(item_list?: table[], error?: DiffReviewPathStatusSnapshotError, snapshot?: DiffReviewPathStatusSnapshot) Completion callback.
+---@param context? { skip_pre_render?: boolean, skip_ts_context?: boolean } Optional collection context flags.
 local function collect_items_from_git(cwd, callback, context)
   collect_status_snapshot_async(cwd, function(snapshot, snapshot_error)
     if not snapshot then callback(nil, snapshot_error) return end

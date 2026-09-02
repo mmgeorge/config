@@ -25,6 +25,11 @@ local session = require("diff_review.session")
 
 local M = {}
 
+--- Determines the diff source category kind for a status file entry.
+---@param file DiffReviewStatusFile? Status file entry descriptor.
+---@param entry_kind? string Entry type string.
+---@param hunk_entry_kind? string Hunk entry type string.
+---@return DiffReviewDiffSourceKind kind Diff source category name.
 function M._status_diff_source_kind(file, entry_kind, hunk_entry_kind)
   if entry_kind == "commit_file" or hunk_entry_kind == "commit_hunk" then return "commit" end
   if entry_kind == "pr_review_file" or hunk_entry_kind == "pr_review_hunk" then return "review" end
@@ -34,10 +39,11 @@ function M._status_diff_source_kind(file, entry_kind, hunk_entry_kind)
   return "unstaged"
 end
 
----@param file DiffReviewStatusFile
----@param entry_kind? string
----@param hunk_entry_kind? string
----@return string
+--- Resolves the canonical diff source identifier string for a status file entry.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param entry_kind? string Optional entry kind string.
+---@param hunk_entry_kind? string Optional hunk entry kind string.
+---@return string source_id Canonical source identifier string.
 function M._status_diff_source_id(file, entry_kind, hunk_entry_kind)
   if file and file.diff_source_id then return file.diff_source_id end
   local section_name = file and file.section_name or nil
@@ -45,14 +51,16 @@ function M._status_diff_source_id(file, entry_kind, hunk_entry_kind)
   return M._status_diff_source_kind(file, entry_kind, hunk_entry_kind)
 end
 
----@param status table
----@return DiffReviewDiffSourceRegistry
+--- Obtains or initializes the diff source registry for a status session.
+---@param status table Status session state table.
+---@return DiffReviewDiffSourceRegistry registry Registry instance.
 function M._status_diff_source_registry(status)
   status.diff_source_registry = status.diff_source_registry or source.new_registry()
   return status.diff_source_registry
 end
 
----@param registry DiffReviewDiffSourceRegistry
+--- Configures action capabilities across diff source kinds in the registry.
+---@param registry DiffReviewDiffSourceRegistry Target diff source registry.
 function M._status_configure_diff_source_policies(registry)
   if not registry then return end
   source.set_kind_policy(registry, "unstaged", {
@@ -86,16 +94,18 @@ function M._status_configure_diff_source_policies(registry)
   })
 end
 
----@param commit DiffReviewStatusCommit
----@return string?
+--- Computes the unique diff source identifier for a commit descriptor.
+---@param commit DiffReviewStatusCommit Commit descriptor table.
+---@return string? source_id Source identifier string, or nil.
 function M._status_commit_source_id(commit)
   if not (commit and commit.oid) then return nil end
   return "commit:" .. tostring(commit.oid)
 end
 
----@param commit DiffReviewStatusCommit
----@param status table
----@return DiffReviewDiffSourceHandle?
+--- Constructs a diff source handle descriptor for loading commit diffs.
+---@param commit DiffReviewStatusCommit Commit descriptor table.
+---@param status table Status session state table.
+---@return DiffReviewDiffSourceHandle? handle Source handle descriptor, or nil.
 function M._status_commit_source_handle(commit, status)
   local source_id = M._status_commit_source_id(commit)
   if not (source_id and status and status.cwd) then return nil end
@@ -143,7 +153,8 @@ function M._status_commit_source_handle(commit, status)
   }
 end
 
----@param commit DiffReviewStatusCommit
+--- Registers a commit diff source handle in the active status registry.
+---@param commit DiffReviewStatusCommit Commit descriptor table.
 function M._status_register_commit_source_handle(commit)
   local status = session.status
   if not (status and status.diff_source_registry and commit and commit.oid) then return end
@@ -153,8 +164,9 @@ function M._status_register_commit_source_handle(commit)
   commit.diff_source_id = handle.id
 end
 
----@param commit DiffReviewStatusCommit
----@return DiffReviewDiffSourceState?
+--- Ensures a diff source state exists in the registry for a commit descriptor.
+---@param commit DiffReviewStatusCommit Commit descriptor table.
+---@return DiffReviewDiffSourceState? source_state Diff source state table, or nil.
 function M._status_ensure_commit_source_state(commit)
   local status = session.status
   if not (status and status.diff_source_registry and commit and commit.oid) then return nil end
@@ -165,8 +177,9 @@ function M._status_ensure_commit_source_state(commit)
   return loader.source
 end
 
----@param comment table
----@return string?
+--- Extracts the canonical comment identifier from a comment descriptor.
+---@param comment table? Comment descriptor table.
+---@return string? id Extracted comment identifier string.
 function M._status_annotation_id(comment)
   if not comment then return nil end
   local id = comment.local_id or comment.remote_node_id or comment.remote_id or comment.id
@@ -174,8 +187,9 @@ function M._status_annotation_id(comment)
   return nil
 end
 
----@param comment table
----@return DiffReviewAnnotationState
+--- Maps comment synchronization state flags to a typed annotation state.
+---@param comment table? Comment descriptor table.
+---@return DiffReviewAnnotationState state Typed annotation state string.
 function M._status_annotation_state(comment)
   if not comment then return "clean" end
   if comment.local_state == "deleted" then return "deleted" end
@@ -187,9 +201,10 @@ function M._status_annotation_state(comment)
   return "clean"
 end
 
----@param file_state DiffReviewDiffFileState
----@param comment table
----@param kind string
+--- Inserts or updates an annotation in a file diff state.
+---@param file_state DiffReviewDiffFileState File diff state table.
+---@param comment table Comment descriptor table.
+---@param kind string Annotation renderer kind.
 function M._status_add_diff_file_annotation(file_state, comment, kind)
   local id = M._status_annotation_id(comment)
   if not id then return end
@@ -217,9 +232,10 @@ function M._status_add_diff_file_annotation(file_state, comment, kind)
   source.add_annotation(file_state, annotation)
 end
 
----@param file DiffReviewStatusFile
----@param source_kind DiffReviewDiffSourceKind
----@return DiffReviewDiffFileStageState
+--- Resolves the staging stage state descriptor for a diff file.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param source_kind DiffReviewDiffSourceKind Diff source kind.
+---@return DiffReviewDiffFileStageState stage_state Stage state string.
 function M._status_diff_stage_state(file, source_kind)
   if source_kind == "review" then return "unviewed" end
   if source_kind == "commit" or source_kind == "pr" or source_kind == "branch" then return "readonly" end
@@ -227,9 +243,10 @@ function M._status_diff_stage_state(file, source_kind)
   return "unstaged"
 end
 
----@param file DiffReviewStatusFile
----@param status table?
----@return string
+--- Resolves the repository-relative file path for diff source tracking.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param status table? Status session state table.
+---@return string path Normalized repository-relative file path.
 function M._status_diff_file_path(file, status)
   if file and status and status.cwd and file.filename then
     local relative = paths.repo_relative(file.filename, status.cwd)
@@ -242,10 +259,11 @@ function M._status_diff_file_path(file, status)
   return (tostring((file and (file.filename or file.relpath)) or ""):gsub("\\", "/"))
 end
 
----@param file_state DiffReviewDiffFileState
----@param file DiffReviewStatusFile
----@param status table
----@param source_kind string
+--- Attaches asynchronous text loaders for old and new file revisions.
+---@param file_state DiffReviewDiffFileState Target file diff state table.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param status table Status session state table.
+---@param source_kind string Diff source category kind.
 function M._status_set_diff_file_text_loaders(file_state, file, status, source_kind)
   if not (file_state and file and status and status.cwd) then return end
   local relpath = M._status_diff_file_path(file, status)
@@ -301,11 +319,12 @@ function M._status_set_diff_file_text_loaders(file_state, file, status, source_k
   end)
 end
 
----@param file DiffReviewStatusFile
----@param entry_kind? string
----@param hunk_entry_kind? string
----@param file_key string
----@return DiffReviewDiffFileState?
+--- Ensures a diff file state descriptor exists in the registry with loaders and syntax contexts configured.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param entry_kind? string Optional entry kind string.
+---@param hunk_entry_kind? string Optional hunk entry kind string.
+---@param file_key string Unique cache key for the file state.
+---@return DiffReviewDiffFileState? file_state Populated file diff state table.
 function M._status_ensure_diff_file_state(file, entry_kind, hunk_entry_kind, file_key)
   local status = session.status
   if not (status and file) then return nil end
@@ -359,9 +378,10 @@ function M._status_ensure_diff_file_state(file, entry_kind, hunk_entry_kind, fil
   return file_state
 end
 
----@param file_state DiffReviewDiffFileState
----@param file DiffReviewStatusFile
----@param hunks DiffReviewHunk[]
+--- Populates raw diff hunk objects into a file diff state.
+---@param file_state DiffReviewDiffFileState Target file diff state table.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param hunks DiffReviewHunk[] Array of parsed diff hunks.
 function M._status_populate_diff_file_hunks(file_state, file, hunks)
   local file_path = M._status_diff_file_path(file, session.status)
   for hunk_index, hunk in ipairs(hunks or {}) do
@@ -382,10 +402,11 @@ function M._status_populate_diff_file_hunks(file_state, file, hunks)
   end
 end
 
----@param source_state DiffReviewDiffSourceState
----@param commit DiffReviewStatusCommit
----@param files DiffReviewStatusFile[]
----@param status table
+--- Populates parsed files and diff hunks into a commit diff source state.
+---@param source_state DiffReviewDiffSourceState Target diff source state table.
+---@param commit DiffReviewStatusCommit Commit descriptor table.
+---@param files DiffReviewStatusFile[] Array of commit file descriptors.
+---@param status table Status session state table.
 function M._status_populate_commit_source_files(source_state, commit, files, status)
   if not (source_state and commit and status) then return end
   source_state.file_by_key = {}
@@ -435,11 +456,12 @@ function M._status_populate_commit_source_files(source_state, commit, files, sta
   end
 end
 
----@param source_state DiffReviewDiffSourceState
----@param files DiffReviewStatusFile[]
----@param status table
----@param source_kind DiffReviewDiffSourceKind
----@param source_id string
+--- Updates reloaded files and diff hunks in a diff source state.
+---@param source_state DiffReviewDiffSourceState Target diff source state table.
+---@param files DiffReviewStatusFile[] Array of reloaded file descriptors.
+---@param status table Status session state table.
+---@param source_kind DiffReviewDiffSourceKind Diff source kind.
+---@param source_id string Diff source identifier string.
 function M._status_populate_reloaded_source_files(source_state, files, status, source_kind, source_id)
   if not (source_state and status and source_kind and source_id) then return end
   for _, file in ipairs(files or {}) do
@@ -486,10 +508,11 @@ function M._status_populate_reloaded_source_files(source_state, files, status, s
   end
 end
 
----@param source_kind DiffReviewDiffSourceKind
----@param source_id string
----@param status table
----@return fun(source_state: DiffReviewDiffSourceState, paths: string[], done: fun(ok: boolean, err?: string))
+--- Returns an asynchronous path-reload closure for staged or unstaged diff sources.
+---@param source_kind DiffReviewDiffSourceKind Diff source kind.
+---@param source_id string Diff source identifier string.
+---@param status table Status session state table.
+---@return fun(source_state: DiffReviewDiffSourceState, paths: string[], done: fun(ok: boolean, err?: string)) loader Path reload function.
 function M._status_source_reload_paths_loader(source_kind, source_id, status)
   return function(source_state, paths, done)
     local cwd = status and status.cwd
@@ -538,8 +561,9 @@ function M._status_source_reload_paths_loader(source_kind, source_id, status)
   end
 end
 
----@param file_state DiffReviewDiffFileState
----@param file DiffReviewStatusFile
+--- Populates PR comments, review comments, and draft annotations into a file diff state.
+---@param file_state DiffReviewDiffFileState Target file diff state table.
+---@param file DiffReviewStatusFile Status file entry descriptor.
 function M._status_populate_diff_file_annotations(file_state, file)
   local status = session.status
   for _, comment in ipairs(type(file.pr_comments) == "table" and file.pr_comments or {}) do
@@ -555,10 +579,11 @@ function M._status_populate_diff_file_annotations(file_state, file)
   end
 end
 
----@param file_state DiffReviewDiffFileState
----@param file DiffReviewStatusFile
----@param hunk DiffReviewHunk
----@return string[]
+--- Resolves annotation identifiers overlapping an individual diff hunk.
+---@param file_state DiffReviewDiffFileState File diff state table.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param hunk DiffReviewHunk Diff hunk descriptor.
+---@return string[] ids Array of matching annotation identifier strings.
 function M._status_diff_hunk_annotation_ids(file_state, file, hunk)
   local ids = {}
   for _, annotation in ipairs(file_state.annotations or {}) do
@@ -570,9 +595,10 @@ function M._status_diff_hunk_annotation_ids(file_state, file, hunk)
   return ids
 end
 
----@param file_state DiffReviewDiffFileState
----@param file DiffReviewStatusFile
----@param display_hunks DiffReviewHunk[]
+--- Builds visual block layout rows and span mappings for rendered diff hunks.
+---@param file_state DiffReviewDiffFileState Target file diff state table.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param display_hunks DiffReviewHunk[] Array of display hunk descriptors.
 function M._status_build_diff_file_layout(file_state, file, display_hunks)
   local key_by_item = {}
   local body_blocks = {}
@@ -607,11 +633,12 @@ function M._status_build_diff_file_layout(file_state, file, display_hunks)
   file_state.layout_revision = (file_state.layout_revision or 0) + 1
 end
 
----@param file DiffReviewStatusFile
----@param entry_kind? string
----@param hunk_entry_kind? string
----@param file_key string
----@return DiffReviewDiffFileState?
+--- Initializes file header state and resets dirty layout flags for a collapsed file.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param entry_kind? string Optional entry kind string.
+---@param hunk_entry_kind? string Optional hunk entry kind string.
+---@param file_key string Unique cache key for the file state.
+---@return DiffReviewDiffFileState? file_state Populated file diff state table.
 function M._status_record_diff_file_header_state(file, entry_kind, hunk_entry_kind, file_key)
   local file_state = M._status_ensure_diff_file_state(file, entry_kind, hunk_entry_kind, file_key)
   if not file_state then return nil end
@@ -626,13 +653,14 @@ function M._status_record_diff_file_header_state(file, entry_kind, hunk_entry_ki
   return file_state
 end
 
----@param file DiffReviewStatusFile
----@param hunks DiffReviewHunk[]
----@param display_hunks DiffReviewHunk[]
----@param entry_kind? string
----@param hunk_entry_kind? string
----@param file_key string
----@return DiffReviewDiffFileState?
+--- Records full file diff state including hunks, annotations, and visual layouts for an expanded file.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param hunks DiffReviewHunk[] Array of parsed diff hunks.
+---@param display_hunks DiffReviewHunk[] Array of display hunk descriptors.
+---@param entry_kind? string Optional entry kind string.
+---@param hunk_entry_kind? string Optional hunk entry kind string.
+---@param file_key string Unique cache key for the file state.
+---@return DiffReviewDiffFileState? file_state Populated file diff state table.
 function M._status_record_diff_file_state(file, hunks, display_hunks, entry_kind, hunk_entry_kind, file_key)
   local file_state = M._status_ensure_diff_file_state(file, entry_kind, hunk_entry_kind, file_key)
   if not file_state then return nil end

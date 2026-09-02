@@ -3,7 +3,8 @@ local M = {}
 local failed = false
 local language_registered = false
 
----@return boolean
+--- Registers markdown Tree-sitter parser support for the Harness filetype.
+---@return boolean registered True if registration succeeded.
 local function ensure_language()
   if language_registered then return true end
   local ok, register_error = pcall(vim.treesitter.language.register, "markdown", "Harness")
@@ -22,9 +23,10 @@ local function ensure_language()
   return false
 end
 
----@param row integer
----@param range_list { first0: integer, after0: integer }[]
----@return boolean
+--- Tests whether a zero-based row index is enclosed by any range in the list.
+---@param row integer Zero-based row index.
+---@param range_list { first0: integer, after0: integer }[] Array of range boundaries.
+---@return boolean in_range True if row falls inside any range.
 local function row_in_range(row, range_list)
   for _, range in ipairs(range_list) do
     if row >= range.first0 and row < range.after0 then return true end
@@ -32,8 +34,9 @@ local function row_in_range(row, range_list)
   return false
 end
 
----@param range_list { first0: integer, after0: integer }[]
----@return table[]
+--- Formats line ranges into Tree-sitter parser region bounding rectangles.
+---@param range_list { first0: integer, after0: integer }[] Array of range boundaries.
+---@return table[] regions Nested parser region coordinates.
 local function parser_region_list(range_list)
   local region_list = {}
   for _, range in ipairs(range_list) do
@@ -44,8 +47,9 @@ local function parser_region_list(range_list)
   return #region_list > 0 and { region_list } or {}
 end
 
----@param buf integer
----@param range_list { first0: integer, after0: integer }[]
+--- Removes render-markdown extmarks that fall outside designated markdown ranges.
+---@param buf integer Target buffer number.
+---@param range_list { first0: integer, after0: integer }[] Array of range boundaries.
 local function prune_extmarks(buf, range_list)
   local ok, ui = pcall(require, "render-markdown.core.ui")
   if not ok or not ui.ns then return end
@@ -54,7 +58,8 @@ local function prune_extmarks(buf, range_list)
   end
 end
 
----@param buf integer
+--- Clears markdown parser regions and rendered extmarks from a buffer.
+---@param buf integer Target buffer number.
 local function clear(buf)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
@@ -66,9 +71,10 @@ local function clear(buf)
   if ui_ok and ui.ns then pcall(vim.api.nvim_buf_clear_namespace, buf, ui.ns, 0, -1) end
 end
 
----@param buf integer
----@param win integer?
----@param range_list { first0: integer, after0: integer }[]
+--- Configures Tree-sitter regions and triggers markdown rendering for specified buffer ranges.
+---@param buf integer Target buffer number.
+---@param win integer? Target window handle.
+---@param range_list { first0: integer, after0: integer }[] Array of zero-based line ranges.
 function M.render(buf, win, range_list)
   if not ensure_language() then return end
   if #range_list == 0 then

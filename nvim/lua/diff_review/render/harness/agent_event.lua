@@ -3,6 +3,12 @@ local M = {}
 local agent_summary = require("diff_review.render.harness.agent_summary")
 local display_text = require("diff_review.render.display_text")
 
+--- Wraps text lines with prefixes and appends them with highlight records to the render target.
+---@param result table Target render collection table.
+---@param text string Content text string to wrap.
+---@param first_prefix string Prefix for first line.
+---@param continuation_prefix string Prefix for subsequent wrapped lines.
+---@param width integer Maximum column width.
 local function append_wrapped(result, text, first_prefix, continuation_prefix, width)
   for _, line in ipairs(display_text.wrap(text, width, first_prefix, continuation_prefix)) do
     result.lines[#result.lines + 1] = line
@@ -15,6 +21,11 @@ local function append_wrapped(result, text, first_prefix, continuation_prefix, w
   end
 end
 
+--- Appends formatted thoughts, tool counts, and response lines for an interaction node.
+---@param result table Target render collection table.
+---@param interaction table Interaction node data structure.
+---@param width integer Maximum column width.
+---@param indent integer Indentation space count.
 local function append_interaction_detail(result, interaction, width, indent)
   local thought_prefix = string.rep(" ", indent) .. "↳ "
   local continuation_prefix = string.rep(" ", indent + 2)
@@ -48,12 +59,12 @@ local function append_interaction_detail(result, interaction, width, indent)
   end
 end
 
----Render one durable child-agent lifecycle node in the parent timeline.
----@param result table
----@param entry table
----@param options? table
----@param indent? integer
----@param node_id? string
+--- Appends a child agent lifecycle entry row, highlights, and expandable interaction subtrees into timeline output.
+---@param result table Target render collection table.
+---@param entry table Agent lifecycle entry record.
+---@param options? table Optional render configuration table.
+---@param indent? integer Base indentation column offset.
+---@param node_id? string Optional override node identifier.
 function M.append(result, entry, options, indent, node_id)
   options = options or {}
   indent = indent or 0

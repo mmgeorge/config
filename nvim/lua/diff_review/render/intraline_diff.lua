@@ -15,10 +15,11 @@ local function option_value(opts, key)
   return defaults[key]
 end
 
----@param old_code string
----@param new_code string
----@return integer prefix_len
----@return integer suffix_len
+--- Calculates the matching common prefix and suffix byte lengths between two strings.
+---@param old_code string Original line string.
+---@param new_code string Replacement line string.
+---@return integer prefix_len Number of identical leading bytes.
+---@return integer suffix_len Number of identical trailing bytes.
 function M.common_affix(old_code, new_code)
   old_code = tostring(old_code or "")
   new_code = tostring(new_code or "")
@@ -40,10 +41,12 @@ function M.common_affix(old_code, new_code)
   return prefix_len, suffix_len
 end
 
----@param old_line DiffReviewParsedHunkLine
----@param new_line DiffReviewParsedHunkLine
----@param opts? table
----@return table?
+--- Attempts to compact a deleted/added line pair into a single replacement row item with inline highlight spans.
+--- Returns nil if the pair is too disparate or exceeds configured length limits.
+---@param old_line DiffReviewParsedHunkLine Deleted line record (`"-"`).
+---@param new_line DiffReviewParsedHunkLine Added line record (`"+"`).
+---@param opts? table Configuration options overriding max line length or group size.
+---@return table? item Compact replacement render item, or nil.
 function M.compact_pair(old_line, new_line, opts)
   if not (old_line and new_line and old_line.prefix == "-" and new_line.prefix == "+") then return nil end
   local old_code = tostring(old_line.code or "")
@@ -108,9 +111,10 @@ local function append_line_items(items, lines, start_index, end_index)
   end
 end
 
----@param lines DiffReviewParsedHunkLine[]
----@param opts? table
----@return table[]
+--- Iterates through hunk lines and compacts adjacent balanced deletion/addition groups.
+---@param lines DiffReviewParsedHunkLine[] Array of parsed diff hunk lines.
+---@param opts? table Optional configuration options.
+---@return table[] items Array of line and replacement render item tables.
 function M.compact_hunk_lines(lines, opts)
   local items = {}
   local index = 1

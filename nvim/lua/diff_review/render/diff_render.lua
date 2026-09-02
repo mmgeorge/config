@@ -24,10 +24,21 @@ local detect_filetype = util.detect_filetype
 local parse_hunk_body = diff_parse.parse_hunk_body
 local parse_unified_diff = diff_parse.parse_unified_diff
 
+--- Constructs a default 3-digit width gutter specification table.
+---@return DiffReviewGutterSpec spec Default gutter layout descriptor.
 local function default_hunk_gutter_spec()
   return { width = 12, old_width = 3, new_width = 3 }
 end
 
+--- Builds virtual text chunk tuples formatting old and new line numbers and change signs.
+---@param gutter DiffReviewGutterSpec? Gutter layout configuration.
+---@param old_line integer? Old revision line number.
+---@param new_line integer? New revision line number.
+---@param sign string? Diff sign symbol (`"+"`, `"-"`, `"~"`, or `" "`).
+---@param sign_hl string? Highlight group for the sign symbol.
+---@param line_hl string? Base background highlight group.
+---@param changed_line_hl string? Highlight group for changed line numbers.
+---@return table[] chunks Array of `[text, hl_group]` chunk tuples.
 local function hunk_gutter_chunks(gutter, old_line, new_line, sign, sign_hl, line_hl, changed_line_hl)
   gutter = gutter or default_hunk_gutter_spec()
   local old_text = old_line and ("%" .. tostring(gutter.old_width) .. "d"):format(old_line) or string.rep(" ", gutter.old_width)
@@ -62,6 +73,15 @@ local function hunk_gutter_chunks(gutter, old_line, new_line, sign, sign_hl, lin
   return chunks
 end
 
+--- Appends inline virtual text gutter chunks to a rendered row chunk array.
+---@param row table Target row chunk array.
+---@param gutter DiffReviewGutterSpec? Gutter layout configuration.
+---@param old_line integer? Old revision line number.
+---@param new_line integer? New revision line number.
+---@param sign string? Diff sign symbol.
+---@param sign_hl string? Highlight group for sign symbol.
+---@param line_hl string? Base background highlight group.
+---@param changed_line_hl string? Highlight group for changed line numbers.
 local function hunk_add_gutter(row, gutter, old_line, new_line, sign, sign_hl, line_hl, changed_line_hl)
   -- Inline virtual text, not buffer text: visual selection, yank, and search
   -- then operate on the code content only. The default hl_mode "replace"
@@ -74,6 +94,15 @@ local function hunk_add_gutter(row, gutter, old_line, new_line, sign, sign_hl, l
   }
 end
 
+--- Builds a rendered row representing an enclosing scope boundary header.
+---@param text string Boundary header text.
+---@param segments table[]? Syntax highlighted segments.
+---@param line_number integer? Source line number.
+---@param gutter DiffReviewGutterSpec? Gutter layout configuration.
+---@param file string? Optional file path.
+---@param old_line integer? Optional old revision line number.
+---@param new_line integer? Optional new revision line number.
+---@return table row Formatted row chunk array.
 local function hunk_boundary_row(text, segments, line_number, gutter, file, old_line, new_line)
   local row = { diff_review_boundary = true }
   gutter = gutter or default_hunk_gutter_spec()
@@ -104,10 +133,17 @@ local function hunk_boundary_row(text, segments, line_number, gutter, file, old_
   return row
 end
 
+--- Builds an indented ellipsis row representing omitted scope lines.
+---@param reference_text string Reference line for indentation calculation.
+---@param gutter DiffReviewGutterSpec? Gutter layout configuration.
+---@return table row Formatted ellipsis row.
 local function hunk_boundary_ellipsis_row(reference_text, gutter)
   return hunk_boundary_row(syntax_engine().line_indent(reference_text) .. "...", nil, nil, gutter)
 end
 
+--- Builds a rendered row representing virtual hunk header information.
+---@param header_parts table[] Array of header tokens with highlight groups.
+---@return table row Formatted header row.
 local function hunk_header_row(header_parts)
   local row = { diff_review_hunk_header = true }
   for _, part in ipairs(header_parts) do
@@ -116,6 +152,13 @@ local function hunk_header_row(header_parts)
   return row
 end
 
+--- Builds a rendered row for a standard unified diff body line.
+---@param parsed_line DiffReviewParsedHunkLine Parsed hunk line record.
+---@param gutter DiffReviewGutterSpec? Gutter layout configuration.
+---@param file string? Optional file path identifier.
+---@param syntax? DiffReviewTreeSitterSyntax Optional syntax highlight state.
+---@param syntax_row? integer Zero-based syntax row index.
+---@return table row Formatted row chunk array.
 local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
   local sign_hl = nil
   local line_hl = nil
@@ -147,6 +190,10 @@ local function hunk_body_row(parsed_line, gutter, file, syntax, syntax_row)
   return row
 end
 
+--- Merges two gutter layout configurations taking the maximum column widths.
+---@param left DiffReviewGutterSpec? First gutter specification.
+---@param right DiffReviewGutterSpec? Second gutter specification.
+---@return DiffReviewGutterSpec spec Combined gutter specification.
 local function merge_hunk_gutter_specs(left, right)
   left = left or default_hunk_gutter_spec()
   right = right or default_hunk_gutter_spec()
@@ -159,6 +206,9 @@ local function merge_hunk_gutter_specs(left, right)
   }
 end
 
+--- Incorporates a render plan into an accumulating display group and merges gutter dimensions.
+---@param group DiffReviewHunkDisplayGroup Target display group structure.
+---@param plan DiffReviewHunkRenderPlan Render plan to append.
 local function add_plan_to_hunk_display_group(group, plan)
   group.plans[#group.plans + 1] = plan
   group.gutter = merge_hunk_gutter_specs(group.gutter, plan.gutter)
@@ -171,6 +221,9 @@ local function add_plan_to_hunk_display_group(group, plan)
   end
 end
 
+--- Groups render plans into merged display blocks based on scope continuity and proximity.
+---@param plans DiffReviewHunkRenderPlan[] Array of render plans.
+---@return DiffReviewHunkDisplayGroup[] groups Array of display group tables.
 local function merge_hunk_render_plans(plans)
   local groups = {}
   local current_group = nil ---@type DiffReviewHunkDisplayGroup?
@@ -191,6 +244,14 @@ local function merge_hunk_render_plans(plans)
   return groups
 end
 
+--- Builds the full array of formatted fancy-diff render rows with gutter, syntax, and intraline highlights.
+---@param diff_text string Unified diff text string.
+---@param hunk_staged boolean? True if hunks are staged.
+---@param filename string? File path identifier.
+---@param context_callback_key fun(line: integer): string Callback generating unique cache keys.
+---@param on_context_update fun()? Async update callback when syntax parses settle.
+---@param opts? table Optional rendering configuration.
+---@return table[] rows Array of rendered row descriptor tables.
 local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_callback_key, on_context_update, opts)
   opts = opts or {}
 
@@ -688,6 +749,10 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
   return ret
 end
 
+--- Emits text lines and applies extmarks and syntax highlights to a Neovim buffer.
+---@param buf integer Target buffer number.
+---@param ns integer Target namespace ID for extmarks.
+---@param rows table[] Array of rendered row descriptor tables.
 local function render_highlight_rows(buf, ns, rows)
   local lines = {}
   local highlights = {}
@@ -784,6 +849,11 @@ local function render_highlight_rows(buf, ns, rows)
   end
 end
 
+--- Parses diff text and populates a buffer with formatted fancy diff rendering.
+---@param buf integer Target buffer number.
+---@param diff_text string Unified diff text string.
+---@param hunk_staged boolean? True if hunks are staged.
+---@param filename string? File path identifier.
 local function render_fancy_diff(buf, diff_text, hunk_staged, filename)
   local ft = filename and detect_filetype(filename) or ""
   if ft ~= "" and vim.bo[buf].filetype ~= ft then

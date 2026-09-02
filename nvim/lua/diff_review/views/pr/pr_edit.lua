@@ -47,16 +47,20 @@ local session = require("diff_review.session")
 
 ---@param buf integer
 ---@param id integer?
----@return integer? row0
+--- Resolves the zero-based buffer row for an extmark ID in the pr_edit namespace.
+---@param buf integer Target buffer handle.
+---@param id integer? Optional extmark identifier.
+---@return integer? row0 Zero-based line number or nil.
 function M.mark_row(buf, id)
   if not id then return nil end
   local pos = vim.api.nvim_buf_get_extmark_by_id(buf, M.ns, id, {})
   return pos and pos[1] or nil
 end
 
----@param buf integer
----@param label_pattern string
----@return integer? row0
+--- Finds the zero-based row matching a label regular expression.
+---@param buf integer Target buffer handle.
+---@param label_pattern string Lua pattern string to match.
+---@return integer? row0 Zero-based line number or nil.
 function M.label_row(buf, label_pattern)
   if not vim.api.nvim_buf_is_valid(buf) then return nil end
   for index, line in ipairs(vim.api.nvim_buf_get_lines(buf, 0, -1, false)) do
@@ -65,15 +69,17 @@ function M.label_row(buf, label_pattern)
   return nil
 end
 
----@param buf integer
----@param id integer?
----@param label_pattern string
----@return integer? row0
+--- Resolves the zero-based field row by label pattern with extmark ID fallback.
+---@param buf integer Target buffer handle.
+---@param id integer? Optional extmark identifier.
+---@param label_pattern string Lua pattern string to match.
+---@return integer? row0 Zero-based line number or nil.
 function M.field_row(buf, id, label_pattern)
   return M.label_row(buf, label_pattern) or M.mark_row(buf, id)
 end
 
----@return integer namespace
+--- Resolves or creates the namespace used for Markdown rendering.
+---@return integer namespace Markdown extmark namespace identifier.
 function M.markdown_namespace()
   if M.render_markdown_ns then return M.render_markdown_ns end
   local ok, ui = pcall(require, "render-markdown.core.ui")
@@ -81,9 +87,10 @@ function M.markdown_namespace()
   return M.render_markdown_ns
 end
 
----@param buf integer
----@return integer? first0
----@return integer? after0
+--- Returns the zero-based line range for the PR description region.
+---@param buf integer Target buffer handle.
+---@return integer? first0 Zero-based starting line number or nil.
+---@return integer? after0 Zero-based ending line number (exclusive) or nil.
 function M.description_range0(buf)
   local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
@@ -91,8 +98,9 @@ function M.description_range0(buf)
   return region.bounds(state.desc_region)
 end
 
----@param buf integer
----@param ranges table[]
+--- Removes Markdown extmarks located outside specified line ranges.
+---@param buf integer Target buffer handle.
+---@param ranges table[] Array of allowed range tables with first0 and after0.
 function M.prune_markdown_ranges(buf, ranges)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   local namespace = M.markdown_namespace()
@@ -112,9 +120,10 @@ function M.prune_markdown_ranges(buf, ranges)
   end
 end
 
----@param row0 integer
----@param ranges table[]
----@return boolean
+--- Checks if a zero-based row falls within any specified Markdown range.
+---@param row0 integer Zero-based line number.
+---@param ranges table[] Array of range tables with first0 and after0.
+---@return boolean in_range True if row falls within at least one range.
 function M.row_in_markdown_range(row0, ranges)
   for _, range in ipairs(ranges or {}) do
     if row0 >= range.first0 and row0 < range.after0 then return true end
@@ -122,8 +131,9 @@ function M.row_in_markdown_range(row0, ranges)
   return false
 end
 
----@param ranges table[]
----@return table[]
+--- Converts line ranges into Tree-sitter parser region tuples.
+---@param ranges table[] Array of range tables with first0 and after0.
+---@return table[] regions Array of Tree-sitter region coordinate tuples.
 function M.markdown_parser_regions(ranges)
   local region = {}
   for _, range in ipairs(ranges or {}) do
@@ -134,8 +144,9 @@ function M.markdown_parser_regions(ranges)
   return #region > 0 and { region } or {}
 end
 
----@param parser table
----@param ranges table[]
+--- Applies region constraints to Tree-sitter Markdown parser.
+---@param parser table Tree-sitter LanguageTree instance.
+---@param ranges table[] Array of range tables with first0 and after0.
 function M.apply_markdown_parser_regions(parser, ranges)
   if type(parser) ~= "table" or type(parser.set_included_regions) ~= "function" then return end
   pcall(parser.set_included_regions, parser, M.markdown_parser_regions(ranges))
@@ -149,11 +160,10 @@ end
 --- Namespace for embedded code-fence syntax highlights, separate from render-markdown's chrome.
 M.code_block_ns = vim.api.nvim_create_namespace("diff_review.pr.code_block_syntax")
 
---- Apply one injected code-language tree's highlights as extmarks, clipped to its own node
---- ranges so only the fence content is colored.
----@param buf integer
----@param lang string
----@param tree TSTree
+--- Applies syntax highlights for an injected code language tree.
+---@param buf integer Target buffer handle.
+---@param lang string Code language identifier.
+---@param tree TSTree Tree-sitter parsed syntax tree.
 local function apply_code_tree_highlights(buf, lang, tree)
   local query = vim.treesitter.query.get(lang, "highlights")
   if not query then return end
@@ -172,13 +182,9 @@ local function apply_code_tree_highlights(buf, lang, tree)
   end
 end
 
---- Color embedded code-fence languages with treesitter, clipped to each fence's contiguous
---- content so diff rows outside the markdown regions stay untouched. render-markdown owns the
---- prose and chrome, so only the injected code languages are highlighted -- never the markdown or
---- markdown_inline layers, whose nodes span the gaps between regions and bleed onto the diff.
---- Parse asynchronously off the render path, then repaint the dedicated namespace.
----@param buf integer
----@param ranges table[] markdown regions (description + comment bodies)
+--- Highlights embedded code blocks within PR Markdown regions.
+---@param buf integer Target buffer handle.
+---@param ranges table[] Array of range tables with first0 and after0.
 function M.highlight_code_blocks(buf, ranges)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
@@ -199,11 +205,10 @@ function M.highlight_code_blocks(buf, ranges)
   end)
 end
 
---- True when a 1-based line sits inside an embedded code fence, identified by an injected
---- code-language tree covering it, so the treesitter indentexpr applies only to fence content.
----@param parser table markdown LanguageTree, already parsed
----@param lnum integer
----@return boolean
+--- Checks if a one-based line falls within an embedded code fence.
+---@param parser table Tree-sitter LanguageTree instance.
+---@param lnum integer One-based line number.
+---@return boolean in_fence True if line is inside a code fence.
 function M.line_in_code_fence(parser, lnum)
   for lang, child in pairs(parser:children()) do
     if lang ~= "markdown_inline" then
@@ -216,15 +221,10 @@ function M.line_in_code_fence(parser, lnum)
   return false
 end
 
---- Compute the indent for a code-fence line by referencing nvim-treesitter's indent engine.
---- The main-branch get_indent reads vim.treesitter.get_parser(bufnr) directly, so opening the
---- markdown parser scope points that lookup at the region-scoped markdown parser (injection-aware
---- via for_each_tree) without registering GitStatus as markdown or touching plugin internals.
---- Requires the nvim-treesitter main branch; on the legacy master path get_indent reads
---- nvim-treesitter.parsers instead and this returns -1 (default indenting).
----@param buf integer
----@param lnum integer 1-based
----@return integer indent -1 falls back to default indenting
+--- Computes indentation for a line within an embedded code fence.
+---@param buf integer Target buffer handle.
+---@param lnum integer One-based line number.
+---@return integer indent Indentation column or -1 for default.
 function M.compute_code_fence_indent(buf, lnum)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and lnum) then return -1 end
   local ok_indent, nt_indent = pcall(require, "nvim-treesitter.indent")
@@ -242,17 +242,16 @@ function M.compute_code_fence_indent(buf, lnum)
   return (ok and type(indent) == "number") and indent or -1
 end
 
---- Buffer indentexpr: treesitter-indent embedded code fences, default indenting everywhere else.
----@return integer
+--- Evaluates indentation expression for code fences in the current buffer.
+---@return integer indent Indentation column.
 function M.code_fence_indentexpr()
   return M.compute_code_fence_indent(vim.api.nvim_get_current_buf(), vim.v.lnum)
 end
 
 M.code_fence_indentexpr_string = "v:lua.require'diff_review.views.pr.pr_edit'.code_fence_indentexpr()"
 
---- Point the buffer's indentexpr at the scoped code-fence indenter so editing embedded code
---- auto-indents through treesitter while prose, headers, and diff rows keep default indenting.
----@param buf integer
+--- Configures buffer indent expression to use code fence indenter.
+---@param buf integer Target buffer handle.
 function M.enable_code_fence_indent(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if vim.bo[buf].indentexpr ~= M.code_fence_indentexpr_string then
@@ -260,7 +259,8 @@ function M.enable_code_fence_indent(buf)
   end
 end
 
----@param buf integer
+--- Cleans up Markdown extmarks outside the description region.
+---@param buf integer Target buffer handle.
 function M.prune_description_markdown(buf)
   local first0, after0 = M.description_range0(buf)
   if first0 == nil or after0 == nil or after0 <= first0 then
@@ -270,8 +270,9 @@ function M.prune_description_markdown(buf)
   M.prune_markdown_ranges(buf, { { first0 = first0, after0 = after0 } })
 end
 
----@param ranges table[]?
----@return table[]
+--- Sorts and merges overlapping Markdown line ranges.
+---@param ranges table[]? Array of range tables with first0 and after0.
+---@return table[] merged Normalized non-overlapping range tables.
 function M.normalized_markdown_ranges(ranges)
   local normalized = {}
   for _, range in ipairs(ranges or {}) do
@@ -297,8 +298,9 @@ function M.normalized_markdown_ranges(ranges)
   return merged
 end
 
----@param buf integer
----@return table[]
+--- Computes all zero-based Markdown ranges for description and comments.
+---@param buf integer Target buffer handle.
+---@return table[] ranges Array of normalized zero-based range tables.
 function M.markdown_ranges0(buf)
   local ranges = {}
   local function add_range(first0, after0)
@@ -324,9 +326,10 @@ function M.markdown_ranges0(buf)
   return M.normalized_markdown_ranges(ranges)
 end
 
----@param buf integer
----@param ranges table[]
----@return fun()
+--- Enters a scoped extmark interceptor that filters marks outside valid Markdown ranges.
+---@param buf integer Target buffer handle.
+---@param ranges table[] Array of allowed range tables.
+---@return fun() restore Scope restoration callback.
 function M.begin_markdown_extmark_scope(buf, ranges)
   M.markdown_extmark_scopes = M.markdown_extmark_scopes or {}
   local scope = M.markdown_extmark_scopes[buf] or { count = 0, ranges = {} }
@@ -371,10 +374,11 @@ function M.begin_markdown_extmark_scope(buf, ranges)
   end
 end
 
----@param buf integer
----@param win integer
----@param ranges table[]
----@return table
+--- Builds render-markdown configuration table scoped to active Markdown regions.
+---@param buf integer Target buffer handle.
+---@param win integer Target window handle.
+---@param ranges table[] Array of allowed range tables with first0 and after0.
+---@return table config Render-markdown configuration table.
 function M.markdown_region_config(buf, win, ranges)
   local conceallevel = vim.api.nvim_get_option_value("conceallevel", { scope = "local", win = win })
   local concealcursor = vim.api.nvim_get_option_value("concealcursor", { scope = "local", win = win })
@@ -405,7 +409,8 @@ function M.markdown_region_config(buf, win, ranges)
   }
 end
 
----@param buf integer
+--- Invalidates render-markdown cache for the specified buffer.
+---@param buf integer Target buffer handle.
 function M.reset_render_markdown_config(buf)
   local ok, state = pcall(require, "render-markdown.state")
   if ok and type(state) == "table" and type(state.cache) == "table" then
@@ -413,9 +418,10 @@ function M.reset_render_markdown_config(buf)
   end
 end
 
----@param buf integer
----@param ranges table[]
----@return fun()
+--- Enters a scoped Tree-sitter parser override for Markdown regions.
+---@param buf integer Target buffer handle.
+---@param ranges table[] Array of allowed range tables.
+---@return fun() restore Scope restoration callback.
 function M.begin_markdown_parser_scope(buf, ranges)
   M.markdown_parser_scopes = M.markdown_parser_scopes or {}
   M.markdown_parser_ranges = M.markdown_parser_ranges or {}
@@ -456,9 +462,10 @@ function M.begin_markdown_parser_scope(buf, ranges)
   end
 end
 
----@param buf integer
----@param win integer
----@return table
+--- Builds render-markdown configuration specifically for the PR description region.
+---@param buf integer Target buffer handle.
+---@param win integer Target window handle.
+---@return table config Render-markdown configuration table.
 function M.description_markdown_config(buf, win)
   local first0, after0 = M.description_range0(buf)
   return M.markdown_region_config(buf, win, M.normalized_markdown_ranges({
@@ -466,8 +473,9 @@ function M.description_markdown_config(buf, win)
   }))
 end
 
----@param buf integer
----@return integer?
+--- Resolves valid window handle displaying the target buffer.
+---@param buf integer Target buffer handle.
+---@return integer? win Window handle or nil if buffer not visible.
 function M.markdown_window(buf)
   if vim.api.nvim_get_current_buf() == buf then return vim.api.nvim_get_current_win() end
   local wins = vim.fn.win_findbuf(buf)
@@ -477,7 +485,8 @@ function M.markdown_window(buf)
   return nil
 end
 
----@param buf integer
+--- Renders Markdown styling and Tree-sitter code highlights across PR regions.
+---@param buf integer Target buffer handle.
 function M.render_markdown_regions(buf)
   return trace.span("markdown.render_regions", buf, nil, function()
     if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
@@ -558,17 +567,19 @@ function M.render_markdown_regions(buf)
   end)
 end
 
----@param buf integer
+--- Renders Markdown styling specifically for the description region.
+---@param buf integer Target buffer handle.
 function M.render_description_markdown(buf)
   M.render_markdown_regions(buf)
 end
 
----@param buf integer
----@param status table
----@return string? title without the "Title:" label
----@return string? desc description block joined with newlines
----@return string? review reviewer-request field without the "Review:" label
----@return string? milestone milestone field without the "Release:" label or marker icon
+--- Reads current edited buffer text for title, description, reviewers, and milestone fields.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
+---@return string? title Extracted title text without prefix.
+---@return string? desc Extracted description body text.
+---@return string? review Extracted reviewer field text.
+---@return string? milestone Extracted milestone title text.
 function M.current_values(buf, status)
   local state = status.pr_edit
   if not state then return nil end
@@ -587,12 +598,13 @@ function M.current_values(buf, status)
   return title, desc, review, milestone
 end
 
----@param buf integer
----@param status table
----@return boolean title_dirty
----@return boolean desc_dirty
----@return boolean review_dirty
----@return boolean milestone_dirty
+--- Computes dirty modification flags comparing buffer text against baseline PR state.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
+---@return boolean title_dirty True if title has changed.
+---@return boolean desc_dirty True if description has changed.
+---@return boolean review_dirty True if reviewer requests have changed.
+---@return boolean milestone_dirty True if milestone has changed.
 function M.dirty_flags(buf, status)
   local title, desc, review, milestone = M.current_values(buf, status)
   if title == nil or not status.pr then return false, false, false, false end
@@ -603,9 +615,10 @@ function M.dirty_flags(buf, status)
     M.milestone_change(status, milestone).changed
 end
 
----@param buf integer
----@param row integer 1-based cursor row
----@return "title"|"review"|"milestone"|"desc"|nil
+--- Identifies editable field region kind under the cursor line.
+---@param buf integer Target buffer handle.
+---@param row integer One-based line number.
+---@return "title"|"review"|"milestone"|"desc"|nil kind Region kind identifier or nil.
 function M.region_kind_at(buf, row)
   local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
@@ -621,8 +634,9 @@ function M.region_kind_at(buf, row)
   return nil
 end
 
----@param buf integer
----@param state DiffReviewPrEditState
+--- Removes dirty indicator extmarks from buffer and clears state tracking IDs.
+---@param buf integer Target buffer handle.
+---@param state DiffReviewPrEditState PR edit state table.
 function M.clear_markers(buf, state)
   for _, key in ipairs({ "title_marker_id", "review_marker_id", "milestone_marker_id", "desc_marker_id" }) do
     if state[key] then
@@ -632,8 +646,8 @@ function M.clear_markers(buf, state)
   end
 end
 
----Show/hide the "*" out-of-sync markers on the Title/Description labels.
----@param buf integer
+--- Updates dirty asterisk indicator markers across editable PR header fields.
+---@param buf integer Target buffer handle.
 function M.refresh_markers(buf)
   local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
@@ -663,10 +677,9 @@ function M.refresh_markers(buf)
   set_marker("desc_marker_id", desc_dirty, first0 and first0 - 1 or nil)
 end
 
----Re-renders are blocked while the buffer holds unsynced PR edits; they
----would clobber them.
----@param buf integer
----@return boolean
+--- Checks whether unsynced buffer edits prevent triggering a full re-render.
+---@param buf integer Target buffer handle.
+---@return boolean blocked True if re-render should be blocked.
 function M.blocks_render(buf)
   local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
@@ -677,10 +690,8 @@ function M.blocks_render(buf)
   return true
 end
 
----Locate the title/description regions after a render and re-anchor the
----tracking extmarks. Rendering wipes the buffer, so this runs on every
----PR-view render.
----@param buf integer
+--- Re-anchors tracking extmarks and description region bounds following a buffer re-render.
+---@param buf integer Target buffer handle.
 function M.on_render(buf)
   local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
@@ -722,17 +733,19 @@ function M.on_render(buf)
   if vim.api.nvim_get_current_buf() ~= buf then M.render_description_markdown(buf) end
 end
 
----@param line string?
----@return string
+--- Extracts milestone title string from formatted line text.
+---@param line string? Raw line string containing milestone label.
+---@return string title Extracted milestone title string.
 function M.milestone_value(line)
   local value = vim.trim(tostring(line or ""):gsub("^Release:%s*", ""):gsub("^Milestone:%s*", ""))
   value = vim.trim(value:gsub("^" .. vim.pesc(ui.milestone_icon) .. "%s*", ""))
   return value
 end
 
----@param status table
----@param milestone string?
----@return { current: string, desired: string, changed: boolean }
+--- Computes difference between active and desired milestone titles.
+---@param status table Review status state table.
+---@param milestone string? Desired milestone title string.
+---@return { current: string, desired: string, changed: boolean } diff Milestone change descriptor.
 function M.milestone_change(status, milestone)
   local current = pr_overview().milestone_title(status and status.pr or nil)
   local desired = vim.trim(tostring(milestone or ""))
@@ -743,9 +756,10 @@ function M.milestone_change(status, milestone)
   }
 end
 
----@param milestones DiffReviewGhMilestone[]?
----@param title string
----@return DiffReviewGhMilestone?
+--- Finds milestone record matching title case-insensitively.
+---@param milestones DiffReviewGhMilestone[]? Array of milestone descriptors.
+---@param title string Desired milestone title string.
+---@return DiffReviewGhMilestone? milestone Matching milestone descriptor or nil.
 function M.find_milestone(milestones, title)
   local desired = vim.trim(tostring(title or ""))
   if desired == "" then return nil end
@@ -756,8 +770,9 @@ function M.find_milestone(milestones, title)
   return nil
 end
 
----@param text string?
----@return string[]
+--- Extracts unique reviewer username strings from raw text tokens.
+---@param text string? Raw reviewer list text string.
+---@return string[] usernames Array of normalized username strings.
 function M.reviewer_usernames(text)
   local usernames = {}
   local seen = {}
@@ -772,8 +787,9 @@ function M.reviewer_usernames(text)
   return usernames
 end
 
----@param reviewers any[]?
----@return table<string, boolean>
+--- Builds case-insensitive lookup set of reviewer logins.
+---@param reviewers any[]? Array of reviewer descriptors or strings.
+---@return table<string, boolean> set Lookup set mapping lowercase username to true.
 function M.reviewer_set(reviewers)
   local set = {}
   for _, reviewer in ipairs(reviewers or {}) do
@@ -783,9 +799,10 @@ function M.reviewer_set(reviewers)
   return set
 end
 
----@param status table
----@param review string?
----@return { current: DiffReviewGhRequestedReviewer[], desired: string[], add: string[], remove: string[], changed: boolean }
+--- Computes additions and removals between current and desired reviewers.
+---@param status table Review status state table.
+---@param review string? Desired reviewer input text string.
+---@return { current: DiffReviewGhRequestedReviewer[], desired: string[], add: string[], remove: string[], changed: boolean } diff Reviewer change descriptor.
 function M.reviewer_change(status, review)
   local current = status and status.pr and pr_overview().pending_reviewers(status.pr, status) or {}
   local desired = M.reviewer_usernames(review)
@@ -809,12 +826,13 @@ function M.reviewer_change(status, review)
   }
 end
 
----@param buf integer
----@param status table
----@param mark_id integer?
----@param segments table[]
----@param label_pattern string?
----@return integer? row0
+--- In-place updates a specific header field row with formatted segment text.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
+---@param mark_id integer? Optional extmark identifier.
+---@param segments table[] Array of text segment tuples.
+---@param label_pattern string? Optional label pattern string to match.
+---@return integer? row0 Updated zero-based line number or nil.
 function M.patch_head_field_row(buf, status, mark_id, segments, label_pattern)
   local state = status and status.pr_edit or nil
   local row0 = state and M.mark_row(buf, mark_id) or nil
@@ -847,8 +865,9 @@ function M.patch_head_field_row(buf, status, mark_id, segments, label_pattern)
   return row0
 end
 
----@param buf integer
----@param status table
+--- Updates reviewer request field row and re-anchors tracking extmark.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
 function M.patch_review_row(buf, status)
   local state = status and status.pr_edit or nil
   local row0 = M.patch_head_field_row(buf, status, state and state.review_mark, {
@@ -861,8 +880,9 @@ function M.patch_review_row(buf, status)
   end
 end
 
----@param buf integer
----@param status table
+--- Updates release milestone field row and re-anchors tracking extmark.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
 function M.patch_milestone_row(buf, status)
   local state = status and status.pr_edit or nil
   local row0 = M.patch_head_field_row(buf, status, state and state.milestone_mark, {
@@ -875,8 +895,9 @@ function M.patch_milestone_row(buf, status)
   end
 end
 
----@param buf integer
----@param status table
+--- Updates PR status field row and re-anchors tracking extmark.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
 function M.patch_status_row(buf, status)
   local state = status and status.pr_edit or nil
   local pr = status and status.pr or nil
@@ -890,16 +911,18 @@ function M.patch_status_row(buf, status)
   end
 end
 
----@param buf integer
----@param status table?
----@return integer? row0
+--- Resolves the zero-based line number for the PR status header row.
+---@param buf integer Target buffer handle.
+---@param status table? Optional review status state table.
+---@return integer? row0 Zero-based line number or nil.
 function M.status_row(buf, status)
   local state = status and status.pr_edit or nil
   return M.field_row(buf, state and state.status_mark, "^Status:")
 end
 
----@param buf integer
----@return boolean
+--- Checks if cursor is positioned on the editable PR status value text.
+---@param buf integer Target buffer handle.
+---@return boolean on_value True if cursor rests on the status value.
 function M.cursor_on_status_value(buf)
   local status = session.states and session.states[buf] or session.status
   local row0 = M.status_row(buf, status)
@@ -911,8 +934,9 @@ function M.cursor_on_status_value(buf)
   return value_start ~= nil and cursor[2] >= value_start - 1
 end
 
----@param change { add: string[], remove: string[] }
----@return string[]
+--- Extracts unique reviewer username strings from addition and removal lists.
+---@param change { add: string[], remove: string[] } Reviewer change descriptor.
+---@return string[] usernames Array of unique username strings.
 function M.reviewer_change_usernames(change)
   local usernames = {}
   local seen = {}
@@ -929,9 +953,10 @@ function M.reviewer_change_usernames(change)
   return usernames
 end
 
----@param username string
----@param users? table<string, DiffReviewGhUser>
----@return string
+--- Formats reviewer login and optional display name for confirmation dialogs.
+---@param username string Reviewer GitHub username string.
+---@param users? table<string, DiffReviewGhUser> Optional user details cache table.
+---@return string display Formatted reviewer label string.
 function M.reviewer_display(username, users)
   local user = users and users[username:lower()] or nil
   local name = user and vim.trim(user.name or "") or ""
@@ -941,9 +966,10 @@ function M.reviewer_display(username, users)
   return "@" .. username
 end
 
----@param change { add: string[], remove: string[] }
----@param users? table<string, DiffReviewGhUser>
----@return string[]
+--- Generates confirmation dialog prompt lines for reviewer changes.
+---@param change { add: string[], remove: string[] } Reviewer change descriptor.
+---@param users? table<string, DiffReviewGhUser> Optional user details cache table.
+---@return string[] lines Array of formatted prompt message lines.
 function M.review_change_confirmation_lines(change, users)
   local lines = { "Confirm review request changes:" }
   if #(change.remove or {}) > 0 then
@@ -961,15 +987,17 @@ function M.review_change_confirmation_lines(change, users)
   return lines
 end
 
----@param buf integer
+--- Restores buffer modified status and repaints dirty indicators.
+---@param buf integer Target buffer handle.
 function M.restore_dirty(buf)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   vim.bo[buf].modified = true
   M.refresh_markers(buf)
 end
 
----@param change { desired: string[], add: string[], remove: string[] }
----@return string
+--- Formats a concise summary of requested and removed reviewers.
+---@param change { desired: string[], add: string[], remove: string[] } Reviewer change descriptor.
+---@return string summary Formatted summary string.
 function M.review_change_summary(change)
   local parts = {}
   if #(change.remove or {}) > 0 then
@@ -981,8 +1009,9 @@ function M.review_change_summary(change)
   return table.concat(parts, "; ")
 end
 
----@param buf integer
----@param status table
+--- Restores reviewer field row to match baseline PR state.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
 function M.revert_review_row(buf, status)
   if not (status and status.pr) then return end
   M.patch_review_row(buf, status)
@@ -991,8 +1020,9 @@ function M.revert_review_row(buf, status)
   vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty
 end
 
----@param status table
----@param reviewers any[]?
+--- Updates pending reviewer list on active PR model state.
+---@param status table Review status state table.
+---@param reviewers any[]? Array of reviewer logins or descriptors.
 function M.set_pending_reviewers(status, reviewers)
   if not (status and status.pr) then return end
   local desired = {}
@@ -1002,8 +1032,9 @@ function M.set_pending_reviewers(status, reviewers)
   if status.pr_edit then status.pr_edit.pending_reviewers = nil end
 end
 
----@param buf integer
----@param status table
+--- Restores release milestone field row to match baseline PR state.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
 function M.revert_milestone_row(buf, status)
   if not (status and status.pr) then return end
   M.patch_milestone_row(buf, status)
@@ -1012,17 +1043,19 @@ function M.revert_milestone_row(buf, status)
   vim.bo[buf].modified = title_dirty or desc_dirty or review_dirty or milestone_dirty
 end
 
----@param status table
----@param milestone DiffReviewGhMilestone?
+--- Updates milestone descriptor on active PR model state.
+---@param status table Review status state table.
+---@param milestone DiffReviewGhMilestone? Milestone descriptor or nil.
 function M.set_pr_milestone(status, milestone)
   if not (status and status.pr) then return end
   status.pr.milestone = milestone
 end
 
----@param buf integer
----@param status table
----@param change { desired: string[], add: string[], remove: string[] }
----@param done fun(ok: boolean)
+--- Executes asynchronous GitHub reviewer mutations and updates buffer display.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
+---@param change { desired: string[], add: string[], remove: string[] } Reviewer change descriptor.
+---@param done fun(ok: boolean) Completion callback.
 function M.apply_reviewer_change(buf, status, change, done)
   local latest = session.states and session.states[buf] or status
   if not (latest and latest.pr) then
@@ -1081,8 +1114,11 @@ function M.apply_reviewer_change(buf, status, change, done)
   end)
 end
 
----@param change { desired: string[], add: string[], remove: string[] }
----@param done fun(ok: boolean)
+--- Prompts user confirmation for reviewer changes after resolving full names and applies changes.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
+---@param change { current: DiffReviewGhRequestedReviewer[], desired: string[], add: string[], remove: string[], changed: boolean } Reviewer change descriptor.
+---@param done fun(ok: boolean) Completion callback.
 function M.confirm_and_apply_reviewer_change(buf, status, change, done)
   if not change.changed then
     done(false)
@@ -1106,8 +1142,9 @@ function M.confirm_and_apply_reviewer_change(buf, status, change, done)
   end)
 end
 
----@param change { desired: string }
----@return string[]
+--- Builds prompt message lines for creating a missing milestone.
+---@param change { desired: string } Milestone change descriptor.
+---@return string[] lines Array of prompt message lines.
 function M.milestone_create_confirmation_lines(change)
   return {
     "Release not found:",
@@ -1117,17 +1154,19 @@ function M.milestone_create_confirmation_lines(change)
   }
 end
 
----@param change { desired: string }
----@return string
+--- Formats a concise milestone change description.
+---@param change { desired: string } Milestone change descriptor.
+---@return string summary Formatted summary string.
 function M.milestone_change_summary(change)
   if change.desired == "" then return "cleared" end
   return ui.milestone_icon .. " " .. change.desired
 end
 
----@param buf integer
----@param status table
----@param milestone DiffReviewGhMilestone?
----@param done fun(ok: boolean)
+--- Updates PR milestone on GitHub and refreshes buffer row.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
+---@param milestone DiffReviewGhMilestone? Target milestone descriptor or nil to clear.
+---@param done fun(ok: boolean) Completion callback.
 function M.apply_milestone(buf, status, milestone, done)
   local latest = session.states and session.states[buf] or status
   if not (latest and latest.pr) then
@@ -1165,10 +1204,11 @@ function M.apply_milestone(buf, status, milestone, done)
   end)
 end
 
----@param buf integer
----@param status table
----@param change { current: string, desired: string, changed: boolean }
----@param done fun(ok: boolean)
+--- Verifies milestone existence on GitHub and prompts creation if missing before applying.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
+---@param change { current: string, desired: string, changed: boolean } Milestone change descriptor.
+---@param done fun(ok: boolean) Completion callback.
 function M.confirm_and_apply_milestone_change(buf, status, change, done)
   if not change.changed then
     done(false)
@@ -1225,8 +1265,9 @@ function M.confirm_and_apply_milestone_change(buf, status, change, done)
   end)
 end
 
----@param pr DiffReviewGhPR
----@return DiffReviewChoicePopupOption[]
+--- Generates selectable PR state transition options.
+---@param pr DiffReviewGhPR Pull request descriptor.
+---@return DiffReviewChoicePopupOption[] options Array of choice popup options.
 function M.pr_state_options(pr)
   local current = pr_overview().status_text(pr)
   local options = {}
@@ -1240,17 +1281,19 @@ function M.pr_state_options(pr)
   return options
 end
 
----@param status table
----@return string
+--- Extracts GraphQL node ID from active PR descriptor.
+---@param status table Review status state table.
+---@return string node_id GraphQL node ID string.
 function M.pr_node_id(status)
   local pr = status and status.pr or nil
   return type(pr and pr.id) == "string" and pr.id or ""
 end
 
----@param buf integer
----@param status table
----@param desired_state "DRAFT"|"OPEN"|"CLOSED"
----@param done fun(ok: boolean)
+--- Updates PR open, draft, or closed state on GitHub and refreshes status row.
+---@param buf integer Target buffer handle.
+---@param status table Review status state table.
+---@param desired_state "DRAFT"|"OPEN"|"CLOSED" Target state string.
+---@param done fun(ok: boolean) Completion callback.
 function M.apply_pr_state(buf, status, desired_state, done)
   local latest = session.states and session.states[buf] or status
   if not (latest and latest.pr) then
@@ -1287,8 +1330,9 @@ function M.apply_pr_state(buf, status, desired_state, done)
   end)
 end
 
----@param buf integer
----@return boolean
+--- Opens choice menu to select a new PR state when cursor rests on status value.
+---@param buf integer Target buffer handle.
+---@return boolean handled True if cursor was on status value and popup opened.
 function M.choose_pr_state_under_cursor(buf)
   if not M.cursor_on_status_value(buf) then return false end
   local status = session.states and session.states[buf] or session.status
@@ -1307,11 +1351,9 @@ function M.choose_pr_state_under_cursor(buf)
   return true
 end
 
----Sequential sync queue, mirroring status_enqueue_operation without its
----status-view reconcile tail (which would rebuild the PR buffer as a
----status view).
----@param state DiffReviewPrEditState
----@param operation fun(done: fun())
+--- Adds an asynchronous mutation task to the sequential PR edit queue.
+---@param state DiffReviewPrEditState PR edit state table.
+---@param operation fun(done: fun()) Task function accepting done callback.
 function M.enqueue(state, operation)
   state.queue[#state.queue + 1] = operation
   local function run_next()
@@ -1327,9 +1369,8 @@ function M.enqueue(state, operation)
   run_next()
 end
 
----BufWriteCmd handler: clear the "*" markers immediately, then sync the
----dirty fields to GitHub through the queue.
----@param buf integer
+--- Persists dirty PR header fields and description back to GitHub on buffer write.
+---@param buf integer Target buffer handle.
 function M.sync(buf)
   local status = session.states and session.states[buf] or nil
   local state = status and status.pr_edit or nil
@@ -1403,9 +1444,8 @@ function M.sync(buf)
   end
 end
 
----Unlock the buffer exactly when the cursor sits in an editable region, so
----every native editing command works there and nowhere else.
----@param buf integer
+--- Toggles buffer modifiable option dynamically based on cursor position in editable regions.
+---@param buf integer Target buffer handle.
 function M.sync_modifiable(buf)
   if not vim.api.nvim_buf_is_valid(buf) then return end
   if vim.api.nvim_get_current_buf() ~= buf then return end
@@ -1444,9 +1484,8 @@ function M.sync_modifiable(buf)
   end)
 end
 
----Wire editing into a freshly created PR-view buffer: acwrite, the
----cursor-follows-modifiable lock, and lifecycle autocmds.
----@param buf integer
+--- Attaches PR editing handlers, autocommands, and keymaps to the PR buffer.
+---@param buf integer Target buffer handle.
 function M.attach(buf)
   local status = session.states and session.states[buf] or nil
   if not status then return end

@@ -1,8 +1,8 @@
 local M = {}
 
---- Render one terminal accepted-plan outcome with nested deviations and audit evidence.
----@param result table
----@param entry table
+--- Appends a terminal plan resolution outcome row and expandable deviations/audit details.
+---@param result table Target render collection table.
+---@param entry table Plan resolution entry record.
 function M.append(result, entry)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
   local resolution = entry.resolution or {}

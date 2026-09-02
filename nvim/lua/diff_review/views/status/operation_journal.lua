@@ -18,8 +18,9 @@ local M = {}
 ---@field layer_list DiffReviewOperationLayer[]
 ---@field next_sequence integer
 
----@param journal DiffReviewOperationJournal
----@return DiffReviewOperationLayer[]
+--- Creates a shallow clone of the journal's operation layer list.
+---@param journal DiffReviewOperationJournal Source journal record.
+---@return DiffReviewOperationLayer[] layer_list Cloned layer list.
 local function copy_layer_list(journal)
   local layer_list = {} ---@type DiffReviewOperationLayer[]
   for _, layer in ipairs(journal.layer_list) do
@@ -28,10 +29,11 @@ local function copy_layer_list(journal)
   return layer_list
 end
 
----@param confirmed_section_list DiffReviewStatusSection[]
----@param layer_list DiffReviewOperationLayer[]
----@param next_sequence integer
----@return DiffReviewOperationJournal
+--- Instantiates an immutable journal record from confirmed sections and operation layers.
+---@param confirmed_section_list DiffReviewStatusSection[] Authoritative baseline sections.
+---@param layer_list DiffReviewOperationLayer[] Ordered operation layers.
+---@param next_sequence integer Monotonic sequence counter.
+---@return DiffReviewOperationJournal journal Instantiated journal record.
 local function journal_from_parts(confirmed_section_list, layer_list, next_sequence)
   return {
     confirmed_section_list = confirmed_section_list,
@@ -40,19 +42,19 @@ local function journal_from_parts(confirmed_section_list, layer_list, next_seque
   }
 end
 
---- Build a journal from an authoritative section snapshot.
----@param confirmed_section_list DiffReviewStatusSection[]
----@return DiffReviewOperationJournal
+--- Initializes a new operation journal from an authoritative section snapshot.
+---@param confirmed_section_list DiffReviewStatusSection[] Baseline status section array.
+---@return DiffReviewOperationJournal journal New operation journal instance.
 function M.new(confirmed_section_list)
   return journal_from_parts(vim.deepcopy(confirmed_section_list or {}), {}, 1)
 end
 
---- Build a journal with one appended semantic layer without changing the prior journal.
----@param journal DiffReviewOperationJournal
----@param burst_id DiffReviewOperationBurstId
----@param entries DiffReviewStatusEntry[]
----@param target_section DiffReviewStatusStageSectionName
----@return DiffReviewOperationJournal
+--- Appends an optimistic status move layer to the journal without modifying the input journal.
+---@param journal DiffReviewOperationJournal Source operation journal.
+---@param burst_id DiffReviewOperationBurstId Unique burst transaction identifier.
+---@param entries DiffReviewStatusEntry[] Target status entries being moved.
+---@param target_section DiffReviewStatusStageSectionName Destination section name (`"staged"` or `"unstaged"`).
+---@return DiffReviewOperationJournal journal Updated operation journal instance.
 function M.append(journal, burst_id, entries, target_section)
   assert(burst_id ~= nil, "operation burst id is required")
   local move = section_map.capture_move(entries, target_section)
@@ -67,10 +69,10 @@ function M.append(journal, burst_id, entries, target_section)
   return journal_from_parts(journal.confirmed_section_list, layer_list, journal.next_sequence + 1)
 end
 
---- Build a journal with a completed burst retained until snapshot commit.
----@param journal DiffReviewOperationJournal
----@param burst_id DiffReviewOperationBurstId
----@return DiffReviewOperationJournal
+--- Marks an operation burst as succeeded while retaining it until snapshot commit.
+---@param journal DiffReviewOperationJournal Source operation journal.
+---@param burst_id DiffReviewOperationBurstId Target burst identifier.
+---@return DiffReviewOperationJournal journal Updated operation journal instance.
 function M.mark_succeeded(journal, burst_id)
   local layer_list = {} ---@type DiffReviewOperationLayer[]
   for _, layer in ipairs(journal.layer_list) do
@@ -88,10 +90,10 @@ function M.mark_succeeded(journal, burst_id)
   return journal_from_parts(journal.confirmed_section_list, layer_list, journal.next_sequence)
 end
 
---- Build a journal without one failed or cancelled burst, preserving survivor order.
----@param journal DiffReviewOperationJournal
----@param burst_id DiffReviewOperationBurstId
----@return DiffReviewOperationJournal
+--- Removes a failed or cancelled operation burst from the journal layers.
+---@param journal DiffReviewOperationJournal Source operation journal.
+---@param burst_id DiffReviewOperationBurstId Burst identifier to remove.
+---@return DiffReviewOperationJournal journal Updated operation journal instance.
 function M.remove_burst(journal, burst_id)
   local layer_list = {} ---@type DiffReviewOperationLayer[]
   for _, layer in ipairs(journal.layer_list) do
@@ -100,11 +102,11 @@ function M.remove_burst(journal, burst_id)
   return journal_from_parts(journal.confirmed_section_list, layer_list, journal.next_sequence)
 end
 
---- Merge an authoritative baseline and retire only its resolved burst.
----@param journal DiffReviewOperationJournal
----@param authoritative_section_list DiffReviewStatusSection[]
----@param resolved_burst_id? DiffReviewOperationBurstId
----@return DiffReviewOperationJournal
+--- Merges an authoritative baseline snapshot and retires the resolved operation burst.
+---@param journal DiffReviewOperationJournal Source operation journal.
+---@param authoritative_section_list DiffReviewStatusSection[] Authoritative status sections.
+---@param resolved_burst_id? DiffReviewOperationBurstId Optional completed burst identifier.
+---@return DiffReviewOperationJournal journal Updated operation journal instance.
 function M.commit(journal, authoritative_section_list, resolved_burst_id)
   local layer_list = {} ---@type DiffReviewOperationLayer[]
   for _, layer in ipairs(journal.layer_list) do
@@ -115,17 +117,17 @@ function M.commit(journal, authoritative_section_list, resolved_burst_id)
   return journal_from_parts(vim.deepcopy(authoritative_section_list or {}), layer_list, journal.next_sequence)
 end
 
---- Build a clean journal from a full snapshot after coordinator work drains.
----@param journal DiffReviewOperationJournal
----@param authoritative_section_list DiffReviewStatusSection[]
----@return DiffReviewOperationJournal
+--- Resets the journal with a clean authoritative section snapshot and empty operation layers.
+---@param journal DiffReviewOperationJournal Source operation journal.
+---@param authoritative_section_list DiffReviewStatusSection[] Authoritative status sections.
+---@return DiffReviewOperationJournal journal Reset operation journal instance.
 function M.reset(journal, authoritative_section_list)
   return journal_from_parts(vim.deepcopy(authoritative_section_list or {}), {}, journal.next_sequence)
 end
 
---- Build the visible section model by replaying every surviving layer in order.
----@param journal DiffReviewOperationJournal
----@return DiffReviewStatusSection[]
+--- Replays all surviving optimistic operation layers in sequence over the confirmed baseline.
+---@param journal DiffReviewOperationJournal Source operation journal.
+---@return DiffReviewStatusSection[] sections Renderable status sections array.
 function M.project(journal)
   local projected_section_list = vim.deepcopy(journal.confirmed_section_list)
   for _, layer in ipairs(journal.layer_list) do
@@ -134,16 +136,16 @@ function M.project(journal)
   return projected_section_list
 end
 
---- Build a detached copy of the confirmed baseline for path-authoritative replacement.
----@param journal DiffReviewOperationJournal
----@return DiffReviewStatusSection[]
+--- Returns a detached clone of the confirmed baseline section array.
+---@param journal DiffReviewOperationJournal Source operation journal.
+---@return DiffReviewStatusSection[] sections Detached baseline status sections.
 function M.confirmed(journal)
   return vim.deepcopy(journal.confirmed_section_list)
 end
 
---- Build a path set from every unresolved optimistic layer.
----@param journal DiffReviewOperationJournal
----@return DiffReviewAffectedPathSet
+--- Collects the set of affected file paths across all pending operation layers.
+---@param journal DiffReviewOperationJournal Source operation journal.
+---@return DiffReviewAffectedPathSet path_set Set of affected relative file paths.
 function M.pending_path_set(journal)
   local path_set = {} ---@type DiffReviewAffectedPathSet
   for _, layer in ipairs(journal.layer_list) do
@@ -154,9 +156,9 @@ function M.pending_path_set(journal)
   return path_set
 end
 
---- Resolve whether any optimistic layer still requires resolution.
----@param journal DiffReviewOperationJournal
----@return boolean
+--- Determines whether any optimistic operation layers remain active in the journal.
+---@param journal DiffReviewOperationJournal Source operation journal.
+---@return boolean has_layers True if one or more layers exist.
 function M.has_layers(journal)
   return #journal.layer_list > 0
 end

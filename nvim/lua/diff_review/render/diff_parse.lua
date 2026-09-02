@@ -34,11 +34,14 @@ end
 
 ---@class DiffReviewParsedBlock
 ---@field file string
+---@field old_file? string
+---@field new_file? string
 ---@field hunks DiffReviewParsedHunk[]
 
----@param range string
----@return integer start
----@return integer count
+--- Parses a unified diff range descriptor (`"start,count"`) into start line and line count.
+---@param range string Range string from a hunk header (e.g. `"12,5"` or `"42"`).
+---@return integer start One-based starting line number.
+---@return integer count Number of lines in the range.
 local function parse_hunk_range(range)
   local start_text, count_text = range:match("^(%d+),?(%d*)$")
   local start = tonumber(start_text) or 0
@@ -46,12 +49,13 @@ local function parse_hunk_range(range)
   return start, count or 1
 end
 
----@param header string
----@return integer old_start
----@return integer old_count
----@return integer new_start
----@return integer new_count
----@return string context
+--- Parses a unified diff hunk header (`@@ -old,count +new,count @@ context`).
+---@param header string Raw diff hunk header line.
+---@return integer old_start Starting line in old revision.
+---@return integer old_count Line count in old revision.
+---@return integer new_start Starting line in new revision.
+---@return integer new_count Line count in new revision.
+---@return string context Trailing hunk function/scope context text.
 local function parse_hunk_header(header)
   local old_range, new_range, context = header:match("^@@ %-(%d+,?%d*) %+(%d+,?%d*) @@%s?(.*)$")
   local old_start, old_count = parse_hunk_range(old_range or "0,0")
@@ -59,15 +63,18 @@ local function parse_hunk_header(header)
   return old_start, old_count, new_start, new_count, context or ""
 end
 
----@param path string
----@return string
+--- Strips standard git diff `"a/"` and `"b/"` path prefixes.
+--- Preserves `"/dev/null"`.
+---@param path string Raw path string from diff headers.
+---@return string path Normalized repository relative path.
 local function diff_path_without_prefix(path)
   if path == "/dev/null" then return path end
   return (path:gsub("^[ab]/", ""))
 end
 
----@param diff_text string
----@return DiffReviewParsedBlock[]
+--- Parses unified diff text into structured file blocks and hunk models.
+---@param diff_text string Unified diff text to parse.
+---@return DiffReviewParsedBlock[] blocks Array of parsed file blocks containing hunks.
 local function parse_unified_diff(diff_text)
   local blocks = {} ---@type DiffReviewParsedBlock[]
   local current_block = nil ---@type DiffReviewParsedBlock?
@@ -99,10 +106,6 @@ local function parse_unified_diff(diff_text)
         end
       end
     elseif line:match("^@@ ") then
-      if not current_block then
-        current_block = { file = "", hunks = {} }
-        blocks[#blocks + 1] = current_block
-      end
       local old_start, old_count, new_start, new_count, context = parse_hunk_header(line)
       current_hunk = {
         header = line,
@@ -118,6 +121,10 @@ local function parse_unified_diff(diff_text)
         removed = 0,
         gutter = default_gutter(),
       }
+      if not current_block then
+        current_block = { file = "", hunks = {} }
+        blocks[#blocks + 1] = current_block
+      end
       current_block.hunks[#current_block.hunks + 1] = current_hunk
     elseif current_hunk then
       current_hunk.diff[#current_hunk.diff + 1] = line
@@ -125,18 +132,27 @@ local function parse_unified_diff(diff_text)
     end
   end
 
+  for _, block in ipairs(blocks) do
+    for _, hunk in ipairs(block.hunks) do
+      M.parse_hunk_body(hunk)
+    end
+  end
+
   return blocks
 end
 
----@param value? integer
----@return integer
+--- Calculates the minimum gutter character width needed to display a line number.
+---@param value? integer Maximum line number to display.
+---@return integer width Gutter column character count (at least 3).
 local function line_number_width(value)
   return math.max(3, #tostring(value or 0))
 end
 
----@param hunk DiffReviewParsedHunk
----@param opts? { preserve_trailing_blank?: boolean }
----@return DiffReviewParsedHunk
+--- Parses hunk body lines into structured lines with old and new line numbers.
+--- Computes gutter width metrics based on maximum line numbers.
+---@param hunk DiffReviewParsedHunk Target parsed hunk structure.
+---@param opts? { preserve_trailing_blank?: boolean } Optional parsing options.
+---@return DiffReviewParsedHunk hunk Mutated hunk with populated `lines` and `gutter`.
 local function parse_hunk_body(hunk, opts)
   opts = opts or {}
   if not opts.preserve_trailing_blank then
@@ -180,8 +196,10 @@ local function parse_hunk_body(hunk, opts)
   return hunk
 end
 
----@param hunk DiffReviewParsedHunk
----@return integer
+--- Resolves the one-based line number of the first modified or added line in a hunk.
+--- Falls back to the hunk's new starting line if only deletions or context exist.
+---@param hunk DiffReviewParsedHunk Target parsed hunk.
+---@return integer line One-based line number in working tree file.
 local function hunk_first_changed_current_line(hunk)
   local current_line = hunk.new_start
   for _, parsed_line in ipairs(hunk.lines) do

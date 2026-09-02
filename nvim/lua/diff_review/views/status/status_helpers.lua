@@ -22,41 +22,46 @@ local repo_config = require("diff_review.git.repo_config")
 local ui = require("diff_review.infra.ui")
 local session = require("diff_review.session")
 
+--- Initializes status highlight groups and background colors.
 local function setup_bg_highlights()
   highlights.setup()
 end
 
----@param message string
----@param title? string
+--- Displays an error notification through the notifications subsystem.
+---@param message string Error message content.
+---@param title? string Optional notification title string.
 local function notify_error(message, title)
   notifications.error(message, title)
 end
 
----@return boolean
+--- Checks whether verbose debug notifications are enabled in user configuration.
+---@return boolean enabled True if debug notifications are enabled.
 local function debug_notifications_enabled()
   local options = config.options or config.options or config.defaults
   return options.debug_notifications == true
 end
 
----@param message string
----@param level? integer
----@param opts? table
+--- Emits a diagnostic notification when debug notifications are enabled.
+---@param message string Diagnostic notification message.
+---@param level? integer Optional log level integer.
+---@param opts? table Optional notification options dictionary.
 local function notify_debug(message, level, opts)
   if not debug_notifications_enabled() then return end
   vim.notify(message, level or vim.log.levels.INFO, opts)
 end
 
----@param title string
----@param failures DiffReviewGitFailure[]
+--- Displays formatted Git mutation failure notifications.
+---@param title string Failure notification title.
+---@param failures DiffReviewGitFailure[] Array of Git failure descriptors.
 local function notify_git_failures(title, failures)
   notifications.git_failures(title, failures)
 end
 
-
----@param buf integer
----@param entry_id string
----@param head_line DiffReviewStatusHeadLine
----@return boolean
+--- Patches an individual header line in-place within an active status buffer.
+---@param buf integer Status buffer handle.
+---@param entry_id string Target entry identifier string.
+---@param head_line DiffReviewStatusHeadLine Structured replacement head line descriptor.
+---@return boolean patched True if line was found and replaced.
 local function status_patch_head_line(buf, entry_id, head_line)
   local status = session.states and session.states[buf] or session.status
   if not (
@@ -94,8 +99,9 @@ local function status_patch_head_line(buf, entry_id, head_line)
   return true
 end
 
----@param commit DiffReviewStatusCommit
----@return string?
+--- Formats a commit's timestamp as a human-readable relative date string.
+---@param commit DiffReviewStatusCommit Commit record table.
+---@return string? relative Relative date string or nil.
 local function status_commit_relative_date(commit)
   local value = commit.committed_at or commit.authored_at
   local relative = datetime.relative(value, { yesterday = false })
@@ -103,7 +109,8 @@ local function status_commit_relative_date(commit)
   return relative
 end
 
----@param commit DiffReviewStatusCommit
+--- Loads and caches file diff list for a commit asynchronously, triggering a status re-render.
+---@param commit DiffReviewStatusCommit Commit record table.
 local function status_load_commit_files(commit)
   local status = session.status
   local cwd = status and status.cwd
@@ -172,6 +179,10 @@ local function status_load_commit_files(commit)
   end)
 end
 
+--- Renders a centered modal popup prompt asking the user for confirmation.
+---@param lines string[] Array of message lines to display.
+---@param on_yes fun() Callback invoked on positive confirmation.
+---@param on_no? fun() Callback invoked on cancellation.
 local function confirm(lines, on_yes, on_no)
   local body = vim.list_extend({}, lines)
   body[#body + 1] = ""
@@ -205,10 +216,9 @@ local function confirm(lines, on_yes, on_no)
   end
 end
 
---- Centered single-line input popup (not vim.ui.input / snacks). `<CR>`
---- submits, `<Esc>`/`q` cancels (calling back with nil).
----@param prefix string prefilled text
----@param on_submit fun(name: string?)
+--- Opens a centered single-line popup input prompt for branch naming.
+---@param prefix string Prefilled input prefix text string.
+---@param on_submit fun(name: string?) Callback receiving submitted name or nil on cancel.
 local function prompt_branch_name(prefix, on_submit)
   local width = math.min(60, math.max(30, math.floor(vim.o.columns * 0.4)))
   local buf, win = popup_window.open({
@@ -236,9 +246,8 @@ local function prompt_branch_name(prefix, on_submit)
   vim.api.nvim_create_autocmd("BufLeave", { buffer = buf, once = true, callback = function() finish(nil) end })
 end
 
---- `bc`: prompt for a name (prefilled with the repo's branch prefix) and
---- create + switch to the new branch, then refresh the status view.
----@param buf integer
+--- Prompts for a new branch name and asynchronously creates and switches to it.
+---@param buf integer Status buffer handle.
 local function create_branch(buf)
   local status = session.states and session.states[buf] or session.status
   local cwd = status and status.cwd
@@ -270,9 +279,10 @@ local function create_branch(buf)
   end)
 end
 
----@param diff_text string
----@param old_target_line integer
----@return integer?
+--- Finds the nearest valid current buffer line index corresponding to a deleted diff line.
+---@param diff_text string Unified diff text content string.
+---@param old_target_line integer Deleted 1-based old line number.
+---@return integer? current_line Matched current line index or nil.
 local function closest_current_line_for_deleted_diff_line(diff_text, old_target_line)
   local old_line
   local new_line

@@ -58,7 +58,8 @@ local function sync_block_span(tree)
   end
 end
 
----@param tree DiffReviewRowTree
+--- Rebuilds the layout index and row height tree for all nodes in the row tree.
+---@param tree DiffReviewRowTree Target row tree structure.
 function M.rebuild(tree)
   local key_by_item = {}
   local height_by_item = {}
@@ -77,8 +78,9 @@ function M.rebuild(tree)
   tree.revision = (tree.revision or 0) + 1
 end
 
----@param opts? table
----@return DiffReviewRowTree
+--- Constructs a new logical row tree structure from an options table.
+---@param opts? table Optional tree initial state options.
+---@return DiffReviewRowTree tree Initialized row tree structure.
 function M.new(opts)
   opts = opts or {}
   local tree = {
@@ -98,8 +100,9 @@ function M.new(opts)
   return tree
 end
 
----@param opts table
----@return DiffReviewRowTree
+--- Constructs a row tree model from status buffer render state by aggregating lazy hunk blocks and lines.
+---@param opts table Status view render output state.
+---@return DiffReviewRowTree tree Constructed row tree instance.
 function M.from_status_state(opts)
   opts = opts or {}
   local line_list = opts.lines or {}
@@ -154,16 +157,18 @@ function M.from_status_state(opts)
   })
 end
 
----@param tree DiffReviewRowTree
----@param key string
----@return DiffReviewLayoutSpan?
+--- Resolves the layout span matching a unique node key string.
+---@param tree DiffReviewRowTree Target row tree structure.
+---@param key string Unique node key string.
+---@return DiffReviewLayoutSpan? span Matching layout span, or nil.
 function M.span(tree, key)
   return tree and tree.layout and tree.layout.span_by_key[tostring(key)] or nil
 end
 
----@param tree DiffReviewRowTree
----@param key string
----@param node_list DiffReviewRowTreeNode[]
+--- Replaces a single node in the tree with an array of replacement nodes and triggers layout rebuild.
+---@param tree DiffReviewRowTree Target row tree structure.
+---@param key string Unique node key to replace.
+---@param node_list DiffReviewRowTreeNode[] Array of replacement nodes.
 function M.replace_node(tree, key, node_list)
   if not tree then return end
   key = tostring(key)
@@ -180,9 +185,10 @@ function M.replace_node(tree, key, node_list)
   end
 end
 
----@param tree DiffReviewRowTree
----@param key string
----@param row_count_value integer
+--- Updates the height row count of a keyed node and propagates shifts through the layout index.
+---@param tree DiffReviewRowTree Target row tree structure.
+---@param key string Unique node key.
+---@param row_count_value integer New non-negative line count.
 function M.set_row_count(tree, key, row_count_value)
   if not tree then return end
   key = tostring(key)
@@ -204,19 +210,21 @@ function M.set_row_count(tree, key, row_count_value)
   tree.revision = (tree.revision or 0) + 1
 end
 
----@param tree DiffReviewRowTree
----@param first_row integer
----@param last_row integer
----@return DiffReviewLayoutSpan[]
+--- Resolves all layout spans intersecting an inclusive buffer row range.
+---@param tree DiffReviewRowTree Target row tree structure.
+---@param first_row integer One-based starting buffer row.
+---@param last_row integer One-based ending buffer row.
+---@return DiffReviewLayoutSpan[] spans Array of intersecting layout spans.
 function M.spans_in_range(tree, first_row, last_row)
   if not (tree and tree.layout) then return {} end
   return layout.spans_in_row_range(tree.layout, first_row, last_row)
 end
 
----@param tree DiffReviewRowTree
----@param row integer
----@return DiffReviewLayoutSpan?
----@return DiffReviewRowTreeNode?
+--- Resolves the layout span and node located at a specific 1-based buffer row index.
+---@param tree DiffReviewRowTree Target row tree structure.
+---@param row integer One-based buffer row number.
+---@return DiffReviewLayoutSpan? span Matching layout span, or nil.
+---@return DiffReviewRowTreeNode? node Matching row tree node, or nil.
 function M.span_at_row(tree, row)
   if not (tree and tree.layout and tree.layout.row_index) then return nil, nil end
   local item_index = layout.item_at_row(tree.layout.row_index, row)
@@ -226,8 +234,9 @@ function M.span_at_row(tree, row)
   return span, node
 end
 
----@param tree DiffReviewRowTree
----@return table<string, integer>
+--- Constructs a lookup table from entry IDs and hunk keys to their 1-based buffer starting line numbers.
+---@param tree DiffReviewRowTree Target row tree structure.
+---@return table<string, integer> line_by_id Map of entry and hunk IDs to start row line numbers.
 function M.entry_line_index(tree)
   local line_by_id = {}
   if not (tree and tree.layout) then return line_by_id end

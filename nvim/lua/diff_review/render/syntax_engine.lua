@@ -40,31 +40,39 @@ local ts_syntax_cache = {}
 local ts_diff_syntax_cache = {}
 local ts_source_bufs = {}
 
---- Clear the per-line hunk-context cache before a status refresh re-resolves scopes.
+--- Clears the per-line hunk context cache.
 function M.clear_context_cache()
   ts_context_cache = {}
 end
 
---- Clear the per-diff-side syntax cache, forcing a re-parse.
+--- Clears the per-diff-side syntax cache, forcing reparsing.
 function M.clear_diff_syntax_cache()
   ts_diff_syntax_cache = {}
 end
 
---- Read a cached hunk-context entry by "<file>:<line>" key, or nil when unresolved.
+--- Retrieves a cached hunk context descriptor by `"<file>:<line>"` lookup key.
+---@param key string Composite file and line lookup key.
+---@return DiffReviewHunkTreeSitterContext|string|table? context Cached context record or pending table.
 function M.context_cache_entry(key)
   return ts_context_cache[key]
 end
 
---- Expose the live hunk-context cache for inspection by the debug dump and tests.
+--- Returns the live hunk context cache table for debugging and inspection.
+---@return table cache Live hunk context cache table.
 function M.context_cache()
   return ts_context_cache
 end
 
---- Read the cached file-syntax entry for a filename, or nil when absent.
+--- Retrieves the cached file syntax state table for a given filename.
+---@param filename string Target file path.
+---@return DiffReviewTreeSitterSyntax|table? syntax Cached syntax state record or pending table.
 function M.file_syntax_cache_entry(filename)
   return ts_syntax_cache[filename]
 end
 
+--- Reads the source text lines for a file from loaded buffers or disk.
+---@param filename string Target file path.
+---@return string[]? lines Array of file line strings, or nil on binary/read error.
 local function file_source_lines(filename)
   return trace.span("source.file_lines", session.status and session.status.buf or nil, {
     file = filename,
@@ -82,18 +90,18 @@ local function file_source_lines(filename)
   end)
 end
 
---- Mark a scratch buffer as a syntax-only parser source without firing FileType autocmds.
----@param buf integer
----@param filetype string
+--- Marks a scratch buffer as a syntax-only parser source without triggering autocmds.
+---@param buf integer Target buffer number.
+---@param filetype string Buffer filetype string.
 local function mark_syntax_scratch_buffer(buf, filetype)
   vim.b[buf].diff_review_syntax_scratch = true
   vim.b[buf].diff_review_syntax_filetype = filetype or ""
 end
 
---- Resolve the parser filetype for a syntax buffer without relying on FileType autocmd state.
----@param buf integer
----@param filename string
----@return string
+--- Resolves the syntax filetype for a buffer without relying on FileType autocmd state.
+---@param buf integer Target buffer number.
+---@param filename string Fallback filename for filetype detection.
+---@return string filetype Detected filetype string.
 local function syntax_buffer_filetype(buf, filename)
   local filetype = vim.b[buf].diff_review_syntax_filetype
   if type(filetype) == "string" and filetype ~= "" then return filetype end
@@ -104,6 +112,9 @@ local function syntax_buffer_filetype(buf, filename)
   return detect_filetype(filename)
 end
 
+--- Creates or retrieves a hidden scratch buffer populated with a file's content for Tree-sitter parsing.
+---@param filename string Target file path.
+---@return integer? buf Valid buffer handle, or nil if unreadable.
 local function treesitter_source_buffer(filename)
   return trace.span("treesitter.source_buffer", session.status and session.status.buf or nil, {
     file = filename,
@@ -138,6 +149,7 @@ local function treesitter_source_buffer(filename)
   end)
 end
 
+--- Wipes all temporary scratch source buffers and clears active Tree-sitter syntax caches.
 local function clear_treesitter_source_buffers()
   for _, buf in pairs(ts_source_bufs or {}) do
     if vim.api.nvim_buf_is_valid(buf) then
@@ -154,6 +166,13 @@ local function clear_treesitter_source_buffers()
   ts_diff_syntax_cache = {}
 end
 
+--- Splits a line of code into contiguous highlight text segments using Tree-sitter query captures.
+---@param buf integer Source buffer number.
+---@param tree any Parsed Tree-sitter tree instance.
+---@param query vim.treesitter.Query? Highlight query instance.
+---@param row integer Zero-based row index.
+---@param text string Line text string.
+---@return table[] segments Array of `{ text = string, hl_group = string? }` segment tables.
 local function treesitter_line_segments(buf, tree, query, row, text)
   local segments = {}
   if text == "" then return segments end
@@ -216,6 +235,13 @@ local function treesitter_line_segments(buf, tree, query, row, text)
   return segments
 end
 
+--- Resolves enclosing Tree-sitter scope hierarchies, sibling rows, and ancestor boundaries around a target line.
+---@param buf integer Source buffer number.
+---@param query vim.treesitter.Query Scope query instance.
+---@param highlight_query vim.treesitter.Query? Syntax highlight query instance.
+---@param trees any[] Array of parsed Tree-sitter trees.
+---@param target integer Zero-based target line number.
+---@return DiffReviewHunkTreeSitterContext? context Enclosing scope context structure, or nil.
 local function hunk_context_from_trees(buf, query, highlight_query, trees, target)
   if not trees or #trees == 0 then return nil end
 
@@ -388,6 +414,12 @@ local function hunk_context_from_trees(buf, query, highlight_query, trees, targe
   }
 end
 
+--- Retrieves or initiates asynchronous calculation of Tree-sitter context for a file line.
+---@param filename string Target file path.
+---@param line integer One-based target line number.
+---@param callback_key string Unique cache key for listener callback registration.
+---@param on_update fun(context: DiffReviewHunkTreeSitterContext?)? Async callback triggered upon computation completion.
+---@return DiffReviewHunkTreeSitterContext|string? context Cached context if ready, or nil if pending.
 local function cached_hunk_context(filename, line, callback_key, on_update)
   ts_context_cache = ts_context_cache or {}
   local cache_key = filename .. ":" .. line
@@ -416,6 +448,12 @@ local function cached_hunk_context(filename, line, callback_key, on_update)
   return nil
 end
 
+--- Retrieves or asynchronously computes whole-file Tree-sitter syntax highlighting state.
+---@param filename string Target file path.
+---@param callback_key string Unique cache key for listener callback registration.
+---@param on_update fun(syntax: DiffReviewTreeSitterSyntax?)? Async callback triggered upon computation completion.
+---@return DiffReviewTreeSitterSyntax? syntax Cached syntax state if ready, or nil if pending.
+---@return boolean pending True if async computation is in progress.
 local function cached_file_syntax(filename, callback_key, on_update)
   local status_buf = session.status and session.status.buf or nil
   return trace.span("syntax.cached_file_syntax", status_buf, {
@@ -453,31 +491,51 @@ local function cached_file_syntax(filename, callback_key, on_update)
   end)
 end
 
+--- Formats a display label string from a context descriptor.
+---@param context DiffReviewHunkTreeSitterContext|string? Context descriptor or string.
+---@return string? label Formatted context label string, or nil.
 local function hunk_context_label(context)
   if type(context) == "string" then return context end
   if type(context) == "table" then return context.label end
   return nil
 end
 
+--- Builds a unique string identifier for a context scope interval.
+---@param context DiffReviewHunkTreeSitterContext|string? Context descriptor.
+---@return string? key Unique scope interval key, or nil.
 local function hunk_context_scope_key(context)
   if type(context) ~= "table" then return nil end
   return ("%s:%d:%d"):format(context.label, context.start_row, context.end_row)
 end
 
+--- Compares two contexts for identical scope key equality.
+---@param left DiffReviewHunkTreeSitterContext|string? First context descriptor.
+---@param right DiffReviewHunkTreeSitterContext|string? Second context descriptor.
+---@return boolean same True if context scopes are identical.
 local function same_hunk_context_scope(left, right)
   local left_key = hunk_context_scope_key(left)
   return left_key ~= nil and left_key == hunk_context_scope_key(right)
 end
 
+--- Compares two contexts for identical ancestor scope key equality.
+---@param left DiffReviewHunkTreeSitterContext|string? First context descriptor.
+---@param right DiffReviewHunkTreeSitterContext|string? Second context descriptor.
+---@return boolean same True if ancestor scopes are identical.
 local function same_hunk_ancestor_scope(left, right)
   local left_key = hunk_model.context_ancestor_key(left)
   return left_key ~= nil and left_key == hunk_model.context_ancestor_key(right)
 end
 
+--- Extracts leading whitespace indentation from a text line.
+---@param text string? Line text string.
+---@return string indent Leading whitespace string.
 local function line_indent(text)
   return tostring(text or ""):match("^%s*") or ""
 end
 
+--- Collects un-prefixed source code line strings visible within diff hunks.
+---@param diff_lines string[]|string Diff lines array or text string.
+---@return table<string, boolean> visible Set of visible source line strings.
 local function hunk_visible_source_lines(diff_lines)
   local lines = type(diff_lines) == "table" and diff_lines
     or vim.split(tostring(diff_lines or ""), "\n", { plain = true })
@@ -496,6 +554,9 @@ local function hunk_visible_source_lines(diff_lines)
   return visible
 end
 
+--- Computes the representative anchor line number for a status view hunk.
+---@param hunk table Status hunk descriptor table.
+---@return integer? line Representative context line number.
 local function status_hunk_context_line(hunk)
   if not hunk then return nil end
   local diff = tostring(hunk.diff or "")
@@ -505,6 +566,10 @@ local function status_hunk_context_line(hunk)
   return hunk_first_changed_current_line(parse_hunk_body(parsed_hunk))
 end
 
+--- Checks if a diff line falls within the visible row span of an enclosing context scope.
+---@param parsed_line DiffReviewParsedHunkLine Parsed hunk line record.
+---@param context DiffReviewHunkTreeSitterContext|string? Syntax context descriptor.
+---@return boolean visible True if line is inside the context scope bounds.
 local function hunk_line_visible_in_context_scope(parsed_line, context)
   if parsed_line.prefix ~= " " or type(context) ~= "table" then return true end
   if not parsed_line.new_line then return true end
@@ -513,6 +578,10 @@ local function hunk_line_visible_in_context_scope(parsed_line, context)
   return parsed_line.new_line >= scope_start and parsed_line.new_line <= scope_end
 end
 
+--- Extracts old or new revision source lines from diff text for patch syntax highlighting.
+---@param diff_text string Unified diff text string.
+---@param side "old"|"new" Side descriptor.
+---@return string[] lines Array of extracted source lines.
 local function diff_syntax_source_lines(diff_text, side)
   return trace.span("syntax.diff_source_lines", session.status and session.status.buf or nil, {
     side = side,
@@ -535,6 +604,14 @@ local function diff_syntax_source_lines(diff_text, side)
   end)
 end
 
+--- Retrieves or asynchronously computes Tree-sitter syntax highlighting state for a single diff side.
+---@param filename string Target file path.
+---@param diff_text string Unified diff text string.
+---@param side "old"|"new" Diff side descriptor.
+---@param callback_key string Unique listener registration key.
+---@param on_update fun(syntax: DiffReviewTreeSitterSyntax?)? Async completion callback.
+---@return DiffReviewTreeSitterSyntax? syntax Cached syntax state if ready, or nil if pending.
+---@return boolean pending True if asynchronous computation is in progress.
 local function cached_diff_syntax(filename, diff_text, side, callback_key, on_update)
   local status_buf = session.status and session.status.buf or nil
   return trace.span("syntax.cached_diff_syntax", status_buf, {
@@ -595,6 +672,10 @@ local function cached_diff_syntax(filename, diff_text, side, callback_key, on_up
   end)
 end
 
+--- Reconstructs old file source lines by reversing diff changes against working tree lines.
+---@param filename string Target file path.
+---@param diff_text string Unified diff text string.
+---@return string[]? lines Array of reconstructed old source lines, or nil if patches fail to apply.
 local function old_file_syntax_source_lines(filename, diff_text)
   return trace.span("syntax.old_file_source_lines", session.status and session.status.buf or nil, {
     file = filename,
@@ -652,6 +733,10 @@ local function old_file_syntax_source_lines(filename, diff_text)
   end)
 end
 
+--- Verifies whether added and context diff lines match current working tree file contents.
+---@param filename string Target file path.
+---@param diff_text string Unified diff text string.
+---@return boolean matches True if current file content matches the diff's new side.
 local function diff_new_side_matches_file(filename, diff_text)
   return trace.span("syntax.diff_new_side_matches_file", session.status and session.status.buf or nil, {
     file = filename,
@@ -682,6 +767,13 @@ local function diff_new_side_matches_file(filename, diff_text)
   end)
 end
 
+--- Computes or retrieves syntax highlighting state for reconstructed old-side file text.
+---@param filename string Target file path.
+---@param diff_text string Unified diff text string.
+---@param callback_key string Unique listener registration key.
+---@param on_update fun(syntax: DiffReviewTreeSitterSyntax?)? Async completion callback.
+---@return DiffReviewTreeSitterSyntax? syntax Cached syntax state if ready, or nil if pending.
+---@return boolean pending True if asynchronous computation is in progress.
 local function cached_old_file_syntax(filename, diff_text, callback_key, on_update)
   local status_buf = session.status and session.status.buf or nil
   return trace.span("syntax.cached_old_file_syntax", status_buf, {
@@ -738,6 +830,10 @@ local function cached_old_file_syntax(filename, diff_text, callback_key, on_upda
   end)
 end
 
+--- Determines whether diff syntax highlighting should parse against full file sources.
+---@param hunk_staged boolean[]? Array of staged flags per hunk.
+---@param opts? table Optional rendering options.
+---@return boolean use_file True if file-level syntax should be utilized.
 local function diff_uses_file_syntax(hunk_staged, opts)
   opts = opts or {}
   if opts.syntax_source == "file" then return true end
@@ -748,6 +844,13 @@ local function diff_uses_file_syntax(hunk_staged, opts)
   return true
 end
 
+--- Proactively initiates Tree-sitter parsing for old and new sides of a diff hunk.
+---@param filename string Target file path.
+---@param diff_text string Unified diff text string.
+---@param hunk_staged boolean[]? Array of staged flags per hunk.
+---@param callback_key string Unique listener registration key.
+---@param on_update fun()? Async completion callback.
+---@param opts? table Optional syntax routing options.
 local function prewarm_diff_syntax(filename, diff_text, hunk_staged, callback_key, on_update, opts)
   local status_buf = session.status and session.status.buf or nil
   return trace.span("syntax.prewarm_diff_syntax", status_buf, {
@@ -836,6 +939,9 @@ local function prewarm_diff_syntax(filename, diff_text, hunk_staged, callback_ke
   end)
 end
 
+--- Combines all hunk diff texts for a file into a single composite unified diff string.
+---@param file table Status file entry descriptor.
+---@return string? diff_text Combined unified diff text, or nil if empty.
 local function status_file_syntax_diff_text(file)
   return trace.span("syntax.status_file_syntax_diff_text", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
@@ -862,6 +968,10 @@ local function status_file_syntax_diff_text(file)
   end)
 end
 
+--- Computes the maximum number of hunks to proactively prewarm for a file under the cursor.
+---@param hunk_count integer Total count of hunks in the file.
+---@param options? table Optional configuration options table.
+---@return integer budget Maximum number of hunks to prewarm.
 local function status_prewarm_hunk_budget(hunk_count, options)
   options = options or config.options or config.options or config.defaults
   hunk_count = math.max(0, math.floor(tonumber(hunk_count) or 0))
@@ -872,6 +982,11 @@ local function status_prewarm_hunk_budget(hunk_count, options)
   return math.min(hunk_count, math.floor(max_hunks))
 end
 
+--- Proactively initiates Tree-sitter parses for hunks belonging to a file within budget limits.
+---@param file table Status file entry descriptor.
+---@param callback_key_prefix string Prefix for callback listener keys.
+---@param on_update fun()? Async completion callback.
+---@param opts? table Optional syntax options.
 local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update, opts)
   return trace.span("syntax.prewarm_file_diff_syntax", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
@@ -921,6 +1036,9 @@ local function prewarm_file_diff_syntax(file, callback_key_prefix, on_update, op
   end)
 end
 
+--- Resolves the preferred syntax source (`"file"` or `"diff"`) for a status view entry kind.
+---@param entry_kind string? Status view entry kind string.
+---@return "file"|"diff" source Preferred syntax source.
 local function status_syntax_source_for_entry_kind(entry_kind)
   if entry_kind == nil
     or entry_kind == "file"

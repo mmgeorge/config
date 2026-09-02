@@ -30,6 +30,8 @@ local session = require("diff_review.session")
 
 local M = {}
 
+--- Displays a confirmation popup prompting whether to create a draft pull request.
+---@param on_yes fun() Callback function invoked when user confirms with 'y'.
 function M._status_confirm_create_pr(on_yes)
   local body = {
     "No GitHub PR found for this branch.",
@@ -67,7 +69,9 @@ function M._status_confirm_create_pr(on_yes)
     vim.keymap.set("n", key, close, { buffer = buf, nowait = true, silent = true, desc = "Cancel pull request creation" })
   end
 end
----@param entry DiffReviewStatusEntry?
+
+--- Opens the AI-generated commit message in a dedicated buffer.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
 local function status_open_about(entry)
   local about = entry and entry.about
   if not about and session.status then about = session.status.about end
@@ -107,6 +111,10 @@ local function status_open_about(entry)
   vim.api.nvim_win_set_buf(vim.api.nvim_get_current_win(), buf)
 end
 
+--- Resolves the commit object target if cursor is within the commit subject column span.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@param cursor_col integer? Zero-based cursor column index.
+---@return DiffReviewStatusCommit? commit Commit object, or nil if not matching.
 function M._status_commit_message_target(entry, cursor_col)
   if not (entry and (entry.kind == "commit" or entry.kind == "commit_message") and entry.commit) then return nil end
   local start_col = entry.commit_subject_start_col
@@ -118,6 +126,9 @@ function M._status_commit_message_target(entry, cursor_col)
   return entry.commit
 end
 
+--- Extracts fallback message lines from commit descriptor fields.
+---@param commit table? Commit descriptor table.
+---@return string[] lines Array of commit message text lines.
 function M._status_commit_message_fallback_lines(commit)
   local message = tostring(commit and (commit.full_message or commit.messageBody or commit.message_body or commit.body or commit.message) or "")
   if message == "" then message = tostring(commit and (commit.subject or commit.messageHeadline) or "") end
@@ -125,6 +136,10 @@ function M._status_commit_message_fallback_lines(commit)
   return vim.split(message:gsub("\r\n", "\n"), "\n", { plain = true })
 end
 
+--- Opens a dedicated buffer and asynchronously loads complete Git commit message text.
+---@param commit table Commit descriptor table.
+---@param cwd string? Git repository root working directory path.
+---@return boolean opened True if buffer creation succeeded.
 function M._status_open_commit_message(commit, cwd)
   if type(commit) ~= "table" then return false end
   local oid = vim.trim(tostring(commit.oid or commit.sha or commit.id or ""))
@@ -174,6 +189,9 @@ function M._status_open_commit_message(commit, cwd)
   return true
 end
 
+--- Opens commit message buffer for the commit entry under current cursor position.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@return boolean opened True if commit message buffer was opened.
 function M._status_open_commit_message_under_cursor(entry)
   local cursor = vim.api.nvim_win_get_cursor(0)
   local commit = M._status_commit_message_target(entry, cursor and cursor[2])
@@ -181,8 +199,9 @@ function M._status_open_commit_message_under_cursor(entry)
   return M._status_open_commit_message(commit, session.status and session.status.cwd)
 end
 
----@param span table
----@return "add"|"delete"|nil
+--- Identifies whether an inline diff span represents an addition or deletion.
+---@param span table? Inline span descriptor table.
+---@return "add"|"delete"|nil kind Span change kind, or nil.
 function M._status_inline_span_kind(span)
   if not span then return nil end
   if span.kind == "add" or span.hl_group == "DiffReviewInlineAddBg" then return "add" end
@@ -190,9 +209,10 @@ function M._status_inline_span_kind(span)
   return nil
 end
 
----@param entry DiffReviewStatusEntry?
----@param prefix string
----@return table?
+--- Finds the diff line matching an addition or deletion prefix character.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@param prefix string Prefix character (`"+"` or `"-"`).
+---@return table? diff_line Matching diff line record, or nil.
 function M._status_diff_line_with_prefix(entry, prefix)
   for _, diff_line in ipairs(entry and entry.diff_lines or {}) do
     if diff_line.prefix == prefix then return diff_line end
@@ -201,9 +221,10 @@ function M._status_diff_line_with_prefix(entry, prefix)
   return nil
 end
 
----@param entry DiffReviewStatusEntry?
----@param cursor_col integer?
----@return table?
+--- Resolves the target diff line for navigation based on cursor position and inline spans.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@param cursor_col integer? Zero-based cursor column offset.
+---@return table? diff_line Resolved target diff line descriptor.
 function M._status_jump_diff_line(entry, cursor_col)
   if not entry then return nil end
   local spans = entry.inline_jump_spans
@@ -233,9 +254,10 @@ function M._status_jump_diff_line(entry, cursor_col)
   return entry.diff_line
 end
 
----@param entry DiffReviewStatusEntry?
----@param skip_revision boolean? open the working-tree file even for deleted lines
----@param selected_diff_line? table already resolved jump target for async fallbacks
+--- Navigates to source file location or historical revision for a status entry.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@param skip_revision boolean? True to open worktree file even for deleted lines.
+---@param selected_diff_line? table Pre-resolved jump target line for async fallback.
 local function status_jump(entry, skip_revision, selected_diff_line)
   if not (entry and entry.file and entry.file.filename) then return end
   local cursor = vim.api.nvim_win_get_cursor(0)
@@ -275,8 +297,9 @@ local function status_jump(entry, skip_revision, selected_diff_line)
   end
 end
 
----@param entry_id string?
----@return DiffReviewStatusEntry?
+--- Looks up a status entry by identifier across active viewport and logical entry lists.
+---@param entry_id string? Entry identifier string.
+---@return DiffReviewStatusEntry? entry Matching status entry descriptor, or nil.
 function M._status_entry_by_id(entry_id)
   if not (entry_id and session.status and session.status.entries) then return nil end
   local viewport = session.status.diff_viewport
@@ -291,8 +314,9 @@ function M._status_entry_by_id(entry_id)
   return nil
 end
 
----@param entry DiffReviewStatusEntry?
----@return boolean
+--- Determines the default collapsed or expanded state for a status entry.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@return boolean folded True if entry defaults to folded.
 function M._status_entry_default_folded(entry)
   if not entry then return false end
   if entry.default_folded ~= nil then return entry.default_folded == true end
@@ -317,8 +341,9 @@ function M._status_entry_default_folded(entry)
   return false
 end
 
----@param entry DiffReviewStatusEntry?
----@param state? table
+--- Toggles fold expansion state for a status entry and applies prewarming or asynchronous loads.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
+---@param state? table Status session state table.
 local function status_toggle(entry, state)
   state = state or session.status
   if not state then return end
@@ -363,6 +388,7 @@ local function status_toggle(entry, state)
   apply_fold_toggle()
 end
 
+--- Collapses the parent section or file fold containing the cursor position.
 function M._status_collapse_parent()
   local line, entry = entry_nav()._status_entry_line_under_cursor()
   if not (line and entry) then return end
@@ -378,9 +404,10 @@ function M._status_collapse_parent()
   end
 end
 
----@param title string
----@param lines string[]
----@return integer
+--- Opens a centered modal popup window with command help and highlighted keybindings.
+---@param title string Window title text.
+---@param lines string[] Array of formatted content lines.
+---@return integer buf Popup buffer handle.
 local function status_open_popup(title, lines)
   local width = #title + 4
   for _, line in ipairs(lines) do
@@ -437,6 +464,7 @@ local function status_open_popup(title, lines)
   return buf
 end
 
+--- Displays an interactive modal dialog listing status view keybindings and descriptions.
 local function status_show_help()
   local key_width = 0
   for _, spec in ipairs(status_command_specs) do
@@ -457,8 +485,9 @@ local function status_show_help()
   status_open_popup("DiffReview Commands", lines)
 end
 
----@param buf integer
----@param action "push"|"pull"
+--- Runs an asynchronous Git push or pull operation with progress updates in status header.
+---@param buf integer Status buffer handle.
+---@param action "push"|"pull" Remote operation name.
 local function status_remote_action(buf, action)
   git_backend.git_root_async(function(cwd, root_err)
     if not cwd then

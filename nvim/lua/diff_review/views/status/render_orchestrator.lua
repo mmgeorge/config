@@ -32,9 +32,10 @@ local session = require("diff_review.session")
 
 local M = {}
 
----@param buf integer?
----@return string? target_id
----@return integer? fallback_line
+--- Resolves the active status entry identifier and buffer line number at the current window cursor.
+---@param buf integer? Status buffer handle.
+---@return string? target_id Selected entry identifier string.
+---@return integer? fallback_line Current buffer line number.
 local function cursor_target(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return nil, nil end
   local ok_current_buf, current_buf = pcall(vim.api.nvim_get_current_buf)
@@ -48,8 +49,9 @@ local function cursor_target(buf)
   return entry and entry.id or nil, line
 end
 
----@param file DiffReviewStatusFile
----@return DiffReviewHunk[]
+--- Retrieves or lazily parses diff hunks for a status file entry.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@return DiffReviewHunk[] hunks Array of diff hunk descriptors.
 local function diff_hunks_for_file(file)
   return trace.span("status.diff_hunks_for_file", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
@@ -80,7 +82,8 @@ local function diff_hunks_for_file(file)
   end)
 end
 
----@param buf integer
+--- Stops the Tree-sitter markdown parser on GitStatus buffers to prevent syntax conflicts.
+---@param buf integer Status buffer handle.
 local function stop_markdown_highlighter(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if vim.bo[buf].filetype ~= "GitStatus" then return end
@@ -89,8 +92,8 @@ local function stop_markdown_highlighter(buf)
   end
 end
 
---- Run the PR overview view's after-render work (its view controller's after_render hook).
----@param buf integer
+--- Executes post-render tasks for pull request overview buffers.
+---@param buf integer Status buffer handle.
 local function after_render_pr(buf)
   trace.span("status.after_render.pr_edit_on_render", buf, nil, function() pr_edit.on_render(buf) end)
   trace.span("status.after_render.review_on_render", buf, nil, function() review().on_render(buf) end)
@@ -100,8 +103,8 @@ local function after_render_pr(buf)
   trace.span("status.after_render.schedule_native_folds", buf, nil, function() fold_state._status_schedule_native_folds(buf) end)
 end
 
---- Run the PR review view's after-render work.
----@param buf integer
+--- Executes post-render tasks for pull request review buffers.
+---@param buf integer Status buffer handle.
 local function after_render_review(buf)
   trace.span("status.after_render.review_on_render", buf, nil, function() review().on_render(buf) end)
   trace.span("status.after_render.markdown", buf, nil, function() pr_edit.render_markdown_regions(buf) end)
@@ -110,20 +113,25 @@ local function after_render_review(buf)
   trace.span("status.after_render.schedule_native_folds", buf, nil, function() fold_state._status_schedule_native_folds(buf) end)
 end
 
---- Run the GitStatus view's after-render work.
----@param buf integer
+--- Executes post-render tasks for GitStatus buffers.
+---@param buf integer Status buffer handle.
 local function after_render_status(buf)
   trace.span("status.after_render.stop_markdown", buf, nil, function() stop_markdown_highlighter(buf) end)
   trace.span("status.after_render.native_folds", buf, nil, function() fold_state._status_apply_native_folds(buf) end)
   trace.span("status.after_render.issues_sync_modifiable", buf, nil, function() status_issues.sync_modifiable(buf) end)
 end
 
---- Run the after-render work for branch diff and any other status-like view.
----@param buf integer
+--- Executes generic post-render tasks for branch diff buffers.
+---@param buf integer Status buffer handle.
 local function after_render_default(buf)
   trace.span("status.after_render.native_folds", buf, nil, function() fold_state._status_apply_native_folds(buf) end)
 end
 
+--- Orchestrates asynchronous Git status collection, section building, and buffer rendering.
+---@param buf integer Status buffer handle.
+---@param target_id? string Optional entry identifier for post-render cursor placement.
+---@param fallback_line? integer Optional fallback line index for cursor placement.
+---@param opts? { restore_cursor?: boolean, reuse_sections?: boolean, refresh_pr?: boolean, refresh_about?: boolean, restore_initial_folds?: boolean } Optional render options table.
 function M.render_status(buf, target_id, fallback_line, opts)
   opts = opts or {}
   if opts.restore_cursor == false then
@@ -267,10 +275,11 @@ function M.render_status(buf, target_id, fallback_line, opts)
   end)
 end
 
----@param buf integer
----@param target_id? string
----@param fallback_line? integer
----@param opts? { reuse_sections?: boolean, refresh_pr?: boolean, refresh_about?: boolean, restore_initial_folds?: boolean }
+--- Executes status rendering wrapped in an error-handling boundary.
+---@param buf integer Status buffer handle.
+---@param target_id? string Optional entry identifier for cursor placement.
+---@param fallback_line? integer Optional fallback line index for cursor placement.
+---@param opts? { reuse_sections?: boolean, refresh_pr?: boolean, refresh_about?: boolean, restore_initial_folds?: boolean } Optional render options table.
 local function render_status_or_notify(buf, target_id, fallback_line, opts)
   local ok, err = xpcall(function()
     M.render_status(buf, target_id, fallback_line, opts)
@@ -280,10 +289,11 @@ local function render_status_or_notify(buf, target_id, fallback_line, opts)
   end
 end
 
----@param pr DiffReviewGhPR
----@param cwd string
----@param buf integer
----@param diff_text? string
+--- Builds section models and renders pull request diff status buffers with anchored code comments.
+---@param pr DiffReviewGhPR Pull request descriptor.
+---@param cwd string Git repository root path.
+---@param buf integer Status buffer handle.
+---@param diff_text? string Optional raw diff text.
 local function render_pr_status(pr, cwd, buf, diff_text)
   local status = session.status
   if not (status and status.buf == buf) then return end
@@ -323,9 +333,10 @@ local function render_pr_status(pr, cwd, buf, diff_text)
   status_render().status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
 end
 
----@param pr DiffReviewGhPR
----@param cwd string
----@param buf integer
+--- Asynchronously fetches pull request diff text via GitHub CLI integration and triggers rendering.
+---@param pr DiffReviewGhPR Pull request descriptor.
+---@param cwd string Git repository root path.
+---@param buf integer Status buffer handle.
 local function load_pr_diff(pr, cwd, buf)
   local status = session.status
   if not (status and status.buf == buf) then return end

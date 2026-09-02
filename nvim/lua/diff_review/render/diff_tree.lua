@@ -36,9 +36,10 @@ end
 ---@field added integer
 ---@field removed integer
 
----@param diff_text string?
----@param options? { indent?: integer, key_prefix?: string, interaction?: table, cwd?: string, on_update?: function, expanded?: table<string, boolean> }
----@return DiffReviewRenderedTree
+--- Builds a rendered tree data structure containing lines, highlights, extmarks, and row mappings from unified diff text.
+---@param diff_text string? Raw unified diff text string.
+---@param options? { indent?: integer, key_prefix?: string, interaction?: table, cwd?: string, on_update?: function, expanded?: table<string, boolean> } Rendering options table.
+---@return DiffReviewRenderedTree tree Rendered tree data structure.
 function M.build(diff_text, options)
   options = options or {}
   local indent = options.indent or 0

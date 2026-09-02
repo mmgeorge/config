@@ -11,13 +11,11 @@ local M = { buffers = {} }
 local paths = require("diff_review.infra.paths")
 local git_backend = require("diff_review.git.git_backend")
 
----Resolve the revision holding the pre-change content for a deleted diff
----line: the base of the diff the entry was rendered from, which is the only
----revision where the old line number is exact.
----@param entry DiffReviewStatusEntry
----@param status table?
----@return string? rev revision for `git show <rev>:<path>`
----@return string? path repo-relative path in that revision
+--- Resolves the Git revision and relative path containing pre-change file content for a diff entry.
+---@param entry DiffReviewStatusEntry Diff status entry descriptor.
+---@param status table? Active review state table.
+---@return string? rev Git revision string or nil.
+---@return string? path Repository-relative file path string or nil.
 function M.target(entry, status)
   if not (entry.hunk and entry.file and status and status.cwd) then return nil end
   local relpath = paths.repo_relative(entry.file.filename, status.cwd)
@@ -35,10 +33,8 @@ function M.target(entry, status)
   return nil
 end
 
----Open (or refresh) the read-only buffer for `path` as it exists at `rev`.
----The buffer is named with the short sha of the underlying commit (HEAD for
----the index revision `:0`, since the index is not a commit).
----@param opts { rev: string, path: string, cwd: string, line: integer?, on_error: fun(message: string) }
+--- Resolves revision short SHA and opens historical file revision buffer.
+---@param opts { rev: string, path: string, cwd: string, line: integer?, on_error: fun(message: string) } Revision open options table.
 function M.open(opts)
   local label_rev = opts.rev == ":0" and "HEAD" or opts.rev
   git_backend.systemlist_async({ "git", "-C", opts.cwd, "rev-parse", "--short", label_rev }, function(label_lines, label_code)
@@ -48,8 +44,9 @@ function M.open(opts)
   end)
 end
 
----@param opts { rev: string, path: string, cwd: string, line: integer?, on_error: fun(message: string) }
----@param label string short sha (or raw revision when it cannot be resolved)
+--- Fetches file text via git show and populates a read-only revision buffer.
+---@param opts { rev: string, path: string, cwd: string, line: integer?, on_error: fun(message: string) } Revision show options table.
+---@param label string Short SHA label string for buffer naming.
 function M.show(opts, label)
   local command = { "git", "-C", opts.cwd, "show", ("%s:%s"):format(opts.rev, opts.path) }
   git_backend.systemlist_async(command, function(lines, code, output)

@@ -27,9 +27,10 @@ local function option_with_pair(value, key, replacement)
   return table.concat(option_list, ",")
 end
 
----Resolve one fold label into text accepted by Neovim's foldtext callback.
----@param value any
----@return any
+--- Resolves a fold label value into text or segment tables consumable by Neovim's `foldtext`.
+--- Falls back to the line text at `foldstart` when unresolved.
+---@param value any String, table of segments, function, or nil.
+---@return any text Resolved fold label string or segments table.
 function M.resolve(value)
   if type(value) == "function" then
     local ok, text = pcall(value)
@@ -43,21 +44,21 @@ function M.resolve(value)
   return vim.fn.getline(fold_start)
 end
 
----Replace the fold labels owned by one rendered buffer.
----@param buf integer
----@param text_by_start_line table<integer, any>?
+--- Replaces the starting-line fold text lookup table for a buffer.
+---@param buf integer Target buffer handle.
+---@param text_by_start_line table<integer, any>? Mapping from 1-based start line to fold text or resolver.
 function M.replace(buf, text_by_start_line)
   fold_text_by_buf[buf] = text_by_start_line or {}
 end
 
----Release fold labels owned by one rendered buffer.
----@param buf integer
+--- Clears the registered fold text lookup table for a buffer.
+---@param buf integer Target buffer handle.
 function M.clear(buf)
   fold_text_by_buf[buf] = nil
 end
 
----Apply the shared status-style fold chrome to one window.
----@param win integer?
+--- Configures window-local options to apply clean fold rendering and highlight styles.
+---@param win integer? Target window handle.
 function M.apply_window(win)
   if not (win and vim.api.nvim_win_is_valid(win)) then return end
   vim.wo[win].foldtext = "v:lua.diff_review_foldtext()"

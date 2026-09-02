@@ -9,12 +9,13 @@ local M = {}
 
 local session = require("diff_review.session")
 
----@param state DiffReviewStatusState
----@param line integer
----@param start_col integer
----@param end_col integer
----@param hl_group string
----@param priority integer?
+--- Appends a highlight range specification to the status state accumulator.
+---@param state DiffReviewStatusState Status session accumulator state.
+---@param line integer One-based buffer line index.
+---@param start_col integer Zero-based starting byte column index.
+---@param end_col integer Zero-based ending byte column index.
+---@param hl_group string Highlight group name string.
+---@param priority integer? Optional highlight priority integer.
 function M.add_highlight(state, line, start_col, end_col, hl_group, priority)
   state.highlights[#state.highlights + 1] = {
     line = line,
@@ -25,11 +26,12 @@ function M.add_highlight(state, line, start_col, end_col, hl_group, priority)
   }
 end
 
----@param state DiffReviewStatusState
----@param line integer
----@param col integer
----@param opts table
----@return table extmark
+--- Appends a virtual text extmark descriptor to the status state accumulator.
+---@param state DiffReviewStatusState Status session accumulator state.
+---@param line integer One-based buffer line index.
+---@param col integer Zero-based byte column index.
+---@param opts table Neovim extmark configuration options table.
+---@return table extmark Registered extmark descriptor.
 function M.add_extmark(state, line, col, opts)
   local extmark = {
     line = line,
@@ -40,13 +42,9 @@ function M.add_extmark(state, line, col, opts)
   return extmark
 end
 
---- Run a status-buffer mutation with the buffer made writable, restoring modifiable and the
---- render guard afterward even on error so a failed write cannot strand the buffer editable.
---- Every programmatic write to a status buffer routes through here so the single in-place
---- update strategies (full-render reconcile, header-line patch, plain-line reset) keep the
---- diff_review render guard set instead of each re-implementing the toggle.
----@param buf integer
----@param mutate fun()
+--- Executes a buffer mutation callback with modifiable enabled and render guard set.
+---@param buf integer Status buffer handle.
+---@param mutate fun() Mutation callback function.
 function M.with_writable(buf, mutate)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   local was_rendering = vim.b[buf].diff_review_status_rendering
@@ -58,11 +56,12 @@ function M.with_writable(buf, mutate)
   if not ok then error(err, 0) end
 end
 
----@param state DiffReviewStatusState
----@param text string
----@param entry table?
----@param line_hl_group string?
----@return integer line
+--- Appends a text line, optional entry mapping, and optional full-line highlight to status state.
+---@param state DiffReviewStatusState Status session accumulator state.
+---@param text string Line content string.
+---@param entry table? Optional associated status entry descriptor.
+---@param line_hl_group string? Optional full-line background highlight group name.
+---@return integer line One-based index of the newly added line.
 function M.add_line(state, text, entry, line_hl_group)
   state.lines[#state.lines + 1] = text
   local line = #state.lines
@@ -76,10 +75,10 @@ function M.add_line(state, text, entry, line_hl_group)
   return line
 end
 
---- Split a segmented head line into plain text and per-segment highlight spans.
----@param segments table[]
----@return string text
----@return table[] segment_highlights
+--- Splits a segmented line into plain concatenated text and highlight interval spans.
+---@param segments table[] Array of `[text, hl_group]` tuples.
+---@return string text Concatenated plain text string.
+---@return table[] segment_highlights Array of byte column highlight descriptors.
 function M.segment_line_parts(segments)
   local parts = {}
   local col = 0
@@ -99,10 +98,10 @@ function M.segment_line_parts(segments)
   return table.concat(parts), segment_highlights
 end
 
---- Build display segments from byte-indexed highlight spans.
----@param text string
----@param highlights table[]
----@return table[] segments
+--- Builds styled text display segments from byte-indexed highlight spans.
+---@param text string Source text string.
+---@param highlights table[] Array of highlight span descriptors.
+---@return table[] segments Array of `[text, hl_group?]` segment tuples.
 function M.highlighted_text_segments(text, highlights)
   text = tostring(text or "")
   local ordered_highlights = {}
@@ -134,10 +133,11 @@ function M.highlighted_text_segments(text, highlights)
   return segments
 end
 
----@param state DiffReviewStatusState
----@param segments table[]
----@param entry table?
----@return integer line
+--- Appends a segmented text line and registers all embedded highlight spans.
+---@param state DiffReviewStatusState Status session accumulator state.
+---@param segments table[] Array of `[text, hl_group?]` segment tuples.
+---@param entry table? Optional associated status entry descriptor.
+---@return integer line One-based line index of the newly added line.
 function M.add_segment_line(state, segments, entry)
   local text, segment_highlights = M.segment_line_parts(segments)
   local line = M.add_line(state, text, entry)
@@ -147,10 +147,11 @@ function M.add_segment_line(state, segments, entry)
   return line
 end
 
----@param state DiffReviewStatusState
----@param key string
----@param default boolean?
----@return boolean?
+--- Looks up fold state for an entry key with fallback default.
+---@param state DiffReviewStatusState Status session accumulator state.
+---@param key string Entry key string.
+---@param default boolean? Fallback fold state boolean.
+---@return boolean? folded True if folded, false if unfolded, or nil.
 function M.folded(state, key, default)
   state = state or {}
   state.folds = state.folds or {}
@@ -159,9 +160,10 @@ function M.folded(state, key, default)
   return folded
 end
 
----@param state DiffReviewStatusState
----@param key string
----@param folded boolean
+--- Updates the recorded fold state for an entry key and increments revision.
+---@param state DiffReviewStatusState Status session accumulator state.
+---@param key string Entry key string.
+---@param folded boolean Next fold state boolean.
 function M.set_folded(state, key, folded)
   state.folds = state.folds or {}
   if state.folds[key] == folded then return end
@@ -169,15 +171,12 @@ function M.set_folded(state, key, folded)
   state.fold_revision = (state.fold_revision or 0) + 1
 end
 
---- Render one fancy-diff row into `state`: plain text plus its highlight, extmark, and
---- per-line span decoration, routing diff-body decoration into the ephemeral span store
---- and keeping the gutter as a persistent inline extmark.
---- Emit anchored comments below the row when `state.comment_after_row` is set.
----@param state DiffReviewStatusState
----@param row table
----@param entry table?
----@param indent integer?
----@return integer line
+--- Renders a formatted diff row with extmarks, ephemeral spans, and anchored comments.
+---@param state DiffReviewStatusState Status session accumulator state.
+---@param row table Formatted row chunk array.
+---@param entry table? Associated status entry descriptor.
+---@param indent integer? Column indentation count.
+---@return integer line One-based line index of the added row.
 function M.add_fancy_row(state, row, entry, indent)
   indent = indent or 0
   local text_parts = {}

@@ -11,9 +11,10 @@ local source = require("diff_review.render.source")
 ---@class DiffReviewSourceLoaderModule
 local M = {}
 
----@param registry DiffReviewDiffSourceRegistry
----@param handle DiffReviewDiffSourceHandle
----@return DiffReviewSourceLoader
+--- Ensures source handle registration and returns a bundled loader structure.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param handle DiffReviewDiffSourceHandle Source handle configuration.
+---@return DiffReviewSourceLoader loader Bundled registry and source state structure.
 function M.ensure(registry, handle)
   local source_state = source.ensure_source(registry, handle)
   return {
@@ -22,19 +23,21 @@ function M.ensure(registry, handle)
   }
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param handle DiffReviewDiffSourceHandle
----@param path string
----@param opts? table
----@return DiffReviewDiffFileState
+--- Ensures both the source and file diff state records are created in the registry.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param handle DiffReviewDiffSourceHandle Source handle configuration.
+---@param path string Relative file path.
+---@param opts? table Optional initial file options.
+---@return DiffReviewDiffFileState file File diff state record.
 function M.ensure_file(registry, handle, path, opts)
   local loader = M.ensure(registry, handle)
   return source.ensure_file(loader.source, path, opts or {})
 end
 
----@param file DiffReviewDiffFileState
----@param diff_text string
----@param opts? table
+--- Parses fresh diff text and replaces all hunk descriptors on a file state record.
+---@param file DiffReviewDiffFileState Target file diff state.
+---@param diff_text string Unified diff text.
+---@param opts? table Optional hunk parsing options.
 function M.replace_file_hunks(file, diff_text, opts)
   opts = opts or {}
   file.hunks = {}
@@ -51,9 +54,10 @@ function M.replace_file_hunks(file, diff_text, opts)
   end
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param source_ids string[]
----@param paths string[]
+--- Invalidates specific file paths across target sources.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param source_ids string[] Array of source identifiers to invalidate.
+---@param paths string[] Array of relative file paths to invalidate.
 function M.invalidate(registry, source_ids, paths)
   source.invalidate_paths(registry, source_ids or {}, paths or {})
 end

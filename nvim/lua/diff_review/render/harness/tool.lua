@@ -1,8 +1,9 @@
 local M = {}
 
----@param text string
----@param width integer
----@return string[]
+--- Splits text into wrapped substrings based on display column width.
+---@param text string Content text string to wrap.
+---@param width integer Maximum column width.
+---@return string[] lines Array of wrapped text line fragments.
 local function split_display_width(text, width)
   local line_list = {}
   local fragment = ""
@@ -20,9 +21,10 @@ local function split_display_width(text, width)
   return line_list
 end
 
----@param command string
----@param expects_command? boolean
----@return table[]
+--- Tokenizes a command string into commands, options, and arguments with highlight categories.
+---@param command string Shell command string.
+---@param expects_command? boolean True if first token is expected to be a command name.
+---@return table[] tokens Array of `{ first: integer, last: integer, text: string, group: string }` token tables.
 local function command_token_list(command, expects_command)
   local token_list = {}
   local next_is_command = expects_command ~= false
@@ -49,8 +51,9 @@ local function command_token_list(command, expects_command)
   return token_list
 end
 
----@param tool table
----@return string
+--- Returns the action verb string corresponding to tool kind and execution state.
+---@param tool table Tool descriptor table.
+---@return string verb Action verb string (`"Ran"`, `"Edited"`, `"Calling"`, or `"Called"`).
 local function tool_verb(tool)
   local kind = tool.kind or "tool_call"
   if kind == "command" then return "Ran" end
@@ -59,17 +62,20 @@ local function tool_verb(tool)
   return (status == "inprogress" or status == "in_progress") and "Calling" or "Called"
 end
 
----@param title string
----@return string, string?
+--- Extracts tool name and argument substrings from an MCP call signature.
+---@param title string Full MCP invocation string.
+---@return string name Tool function name.
+---@return string? arguments Argument payload string, or nil.
 local function mcp_title_parts(title)
   local name, arguments = title:match("^(.-)%((.*)%)$")
   return name or title, arguments
 end
 
----@param tool table
----@param width? integer
----@param indent? string
----@return table[]
+--- Generates formatted heading lines for a tool invocation with optional column wrapping.
+---@param tool table Tool descriptor table.
+---@param width? integer Maximum display column width.
+---@param indent? string Leading indentation string.
+---@return table[] lines Array of `{ text: string, command?: string, command_offset?: integer, title_fragment?: string }` line records.
 function M.heading_lines(tool, width, indent)
   local leading = indent or ""
   if tool.kind ~= "command" then
@@ -125,8 +131,9 @@ function M.heading_lines(tool, width, indent)
   return line_list
 end
 
----@param title string
----@return string
+--- Strips outer PowerShell command-line wrappers to display the underlying command.
+---@param title string Raw command line string.
+---@return string command Cleaned display command.
 function M.display_command(title)
   local command = title:match("[Pp][Oo][Ww][Ee][Rr][Ss][Hh][Ee][Ll][^%s]*.-%s%-Command%s+(.+)$")
     or title:match("[Pp][Ww][Ss][Hh][^%s]*.-%s%-Command%s+(.+)$")
@@ -136,8 +143,9 @@ function M.display_command(title)
   return (command:gsub('\\"', '"'))
 end
 
----@param tool table
----@return boolean
+--- Checks if a tool descriptor represents a failed or cancelled execution state.
+---@param tool table Tool descriptor table.
+---@return boolean failed True if tool execution failed or was denied/cancelled.
 function M.failed(tool)
   if tool.failed ~= nil then return tool.failed == true end
   local status = tostring(tool.status or ""):lower()
@@ -145,8 +153,9 @@ function M.failed(tool)
     or status == "cancelled" or status == "canceled"
 end
 
----@param tool table
----@return string
+--- Formats a single-line summary heading string for a tool call.
+---@param tool table Tool descriptor table.
+---@return string heading Formatted heading string.
 function M.heading(tool)
   local kind = tool.kind or "tool_call"
   local verb = tool_verb(tool)
@@ -154,10 +163,11 @@ function M.heading(tool)
   return ("• %s %s"):format(verb, title)
 end
 
----@param result table
----@param line integer
----@param command string
----@param offset integer
+--- Applies command token highlight records for a single command line.
+---@param result table Target render collection table.
+---@param line integer One-based buffer line index.
+---@param command string Command line string.
+---@param offset integer Column offset of command text on the line.
 function M.highlight_command(result, line, command, offset)
   for _, token in ipairs(command_token_list(command)) do
     result.highlights[#result.highlights + 1] = {
@@ -169,8 +179,9 @@ function M.highlight_command(result, line, command, offset)
   end
 end
 
----@param result table
----@param heading_line_list table[]
+--- Highlights multiple wrapped lines of a shell command invocation.
+---@param result table Target render collection table.
+---@param heading_line_list table[] Array of heading line records.
 function M.highlight_command_lines(result, heading_line_list)
   local expects_command = true
   for _, heading_line in ipairs(heading_line_list) do
@@ -190,9 +201,10 @@ function M.highlight_command_lines(result, heading_line_list)
   end
 end
 
----@param result table
----@param tool table
----@param heading_line_list table[]
+--- Highlights MCP tool name and arguments across wrapped tool call heading lines.
+---@param result table Target render collection table.
+---@param tool table Tool descriptor table.
+---@param heading_line_list table[] Array of heading line records.
 function M.highlight_tool_call_lines(result, tool, heading_line_list)
   local name, arguments = mcp_title_parts(tool.title or "tool")
   local title_offset = 0
@@ -229,10 +241,11 @@ function M.highlight_tool_call_lines(result, tool, heading_line_list)
   end
 end
 
----@param tool table
----@param indent? string
----@param visible_text? string
----@return table[]
+--- Builds syntax-highlighted chunk tuples for collapsed tool calls.
+---@param tool table Tool descriptor table.
+---@param indent? string Indentation prefix string.
+---@param visible_text? string Visible fold text string.
+---@return table[] chunks Array of `[text, hl_group]` chunk tuples.
 function M.foldtext_chunks(tool, indent, visible_text)
   local prefix = (indent or "") .. "• "
   local bullet_group = M.failed(tool) and "DiffReviewHarnessToolFailure" or "DiffReviewHarnessToolSuccess"
@@ -291,8 +304,9 @@ function M.foldtext_chunks(tool, indent, visible_text)
   return chunk_list
 end
 
----@param output string?
----@return string[]
+--- Strips ANSI escape sequences and splits tool output text into clean lines.
+---@param output string? Raw output text string.
+---@return string[] lines Array of sanitized output line strings.
 function M.output_lines(output)
   local normalized = tostring(output or ""):gsub("\r\n", "\n"):gsub("\r", "")
   normalized = vim.fn.substitute(normalized, "\\%x1b\\[[0-?]*[ -/]*[@-~]", "", "g")

@@ -27,15 +27,16 @@ local trace = require("diff_review.infra.perf_trace")
 local session = require("diff_review.session")
 local status_sync = require("diff_review.views.status.status_sync")
 
+--- Displays an error notification through the notification subsystem.
+---@param message string Error message text.
+---@param title? string Notification title.
 local function notify_error(message, title)
   return notifications.error(message, title)
 end
 
---- Block index-mutating actions while a commit is composing: `git commit` holds
---- `.git/index.lock` for the whole time the commit screen is open (commit.lua sets
---- session.suspend_preview), so a stage/unstage/discard would collide with the lock.
----@param action string
----@return boolean blocked
+--- Checks whether index mutation is blocked because a commit screen is currently open.
+---@param action string Action name string.
+---@return boolean blocked True if index mutation is blocked.
 local function blocked_by_active_commit(action)
   if not session.suspend_preview then return false end
   notify_error(action .. " is unavailable while a commit is in progress", "DiffReview")
@@ -44,9 +45,10 @@ end
 
 local repo_relative = paths.repo_relative
 
----@param buf integer?
----@param target_id? string
----@param restore_cursor? boolean
+--- Refreshes the status buffer display after a discard operation.
+---@param buf integer? Status buffer handle.
+---@param target_id? string Optional entry ID to refocus.
+---@param restore_cursor? boolean True to restore cursor position.
 local function refresh_status_after_discard(buf, target_id, restore_cursor)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if restore_cursor == false then
@@ -58,21 +60,26 @@ local function refresh_status_after_discard(buf, target_id, restore_cursor)
   end
 end
 
+--- Checks whether background index mutation operations are currently pending.
+---@return boolean pending True if index operations are running.
 local function status_operations_pending()
   local status = session.status
   return status ~= nil and status.cwd ~= nil and mutation_coordinator.pending(status.cwd)
 end
----@param root string
----@param entry DiffReviewStatusEntry
----@return string?
+
+--- Resolves the repository-relative file path for a status entry.
+---@param root string Git repository root path.
+---@param entry DiffReviewStatusEntry Status entry descriptor.
+---@return string? relpath Relative file path, or nil.
 local function status_entry_relative_path(root, entry)
   if not (entry and entry.file) then return nil end
   local relpath = entry.file.relpath or repo_relative(entry.file.filename, root)
   return relpath and relpath:gsub("\\", "/") or nil
 end
 
----@param entry DiffReviewStatusEntry
----@return DiffReviewStatusEntry
+--- Converts an ignored status entry into an unstaged file descriptor for staging.
+---@param entry DiffReviewStatusEntry Ignored status entry.
+---@return DiffReviewStatusEntry entry Staging file entry.
 local function status_ignored_file_stage_entry(entry)
   local file = vim.deepcopy(entry.file)
   file.section_name = "unstaged"
@@ -86,10 +93,11 @@ local function status_ignored_file_stage_entry(entry)
   }
 end
 
---- Preserve normal hunk staging while coercing every Ignored selection to one whole-file target.
----@param root string
----@param entries DiffReviewStatusEntry[]
----@return DiffReviewStatusEntry[], string[]
+--- Filters entries for staging and separates virtual ignored file paths.
+---@param root string Git repository root path.
+---@param entries DiffReviewStatusEntry[] Array of selected status entries.
+---@return DiffReviewStatusEntry[] action_entries Filtered staging entries.
+---@return string[] ignored_path_list Array of staged ignored relative paths.
 local function status_stage_action_entries(root, entries)
   local action_entry_list = {}
   local ignored_entry_by_filename = {}
@@ -116,10 +124,11 @@ local function status_stage_action_entries(root, entries)
   return action_entry_list, ignored_path_list
 end
 
----@param root string
----@param entries DiffReviewStatusEntry[]
----@param source_section "unstaged"|"ignored"
----@return string[]
+--- Extracts relative repository paths for entries belonging to a given section.
+---@param root string Git repository root path.
+---@param entries DiffReviewStatusEntry[] Array of status entries.
+---@param source_section "unstaged"|"ignored" Section filter name.
+---@return string[] paths Array of relative file paths.
 local function status_virtual_path_list(root, entries, source_section)
   local path_set = {}
   for _, entry in ipairs(entry_nav._status_action_entries(entries)) do
@@ -131,16 +140,18 @@ local function status_virtual_path_list(root, entries, source_section)
   return entry_nav._status_files_from_set(path_set)
 end
 
----@param entry DiffReviewStatusEntry
----@return string?
+--- Resolves the diff source lookup path for a status entry.
+---@param entry DiffReviewStatusEntry Status entry descriptor.
+---@return string? source_path Source lookup path, or nil.
 local function status_entry_source_path(entry)
   local status = session.status
   if not (entry and entry.file and status) then return nil end
   return diff_source_state._status_diff_file_path(entry.file, status)
 end
 
----@param entries DiffReviewStatusEntry[]
----@param source_ids string[]
+--- Invalidates cached diff sources for modified status entries.
+---@param entries DiffReviewStatusEntry[] Status entry array.
+---@param source_ids string[] Array of diff source identifier keys.
 local function status_mark_diff_paths_pending(entries, source_ids)
   local status = session.status
   if not (status and status.diff_source_registry) then return end
@@ -158,14 +169,16 @@ local function status_mark_diff_paths_pending(entries, source_ids)
   source_loader.invalidate(status.diff_source_registry, source_ids, paths)
 end
 
----@param entry DiffReviewStatusEntry
----@return boolean
+--- Checks if a status entry represents an added file.
+---@param entry DiffReviewStatusEntry Status entry descriptor.
+---@return boolean added True if the file or hunk represents an addition.
 local function status_entry_is_added(entry)
   return git_data._git_status_is_added((entry.file and entry.file.git_status) or (entry.hunk and entry.hunk.git_status))
 end
 
----@param entries DiffReviewStatusEntry[]
----@return DiffReviewStatusEntry[]
+--- Filters status entries to staged files and hunks for unstage actions.
+---@param entries DiffReviewStatusEntry[] Selected status entry array.
+---@return DiffReviewStatusEntry[] action_entries Staged entries ready for unstaging.
 local function status_unstage_action_entries(entries)
   local action_entries = {}
   for _, entry in ipairs(entries) do
@@ -178,11 +191,12 @@ local function status_unstage_action_entries(entries)
   return action_entries
 end
 
----@param root string
----@param entries DiffReviewStatusEntry[]
----@param direction DiffReviewIndexMutationDirection
----@return DiffReviewIndexMutationTarget[]
----@return DiffReviewStatusEntry[]
+--- Builds index mutation target descriptors from status entries.
+---@param root string Git repository root path.
+---@param entries DiffReviewStatusEntry[] Status entry array.
+---@param direction DiffReviewIndexMutationDirection Mutation direction (`"stage"` or `"unstage"`).
+---@return DiffReviewIndexMutationTarget[] target_list Mutation target array.
+---@return DiffReviewStatusEntry[] target_entry_list Corresponding status entry array.
 local function status_mutation_target_list(root, entries, direction)
   local target_list = {}
   local target_entry_list = {}
@@ -219,9 +233,10 @@ local function status_mutation_target_list(root, entries, direction)
   return target_list, target_entry_list
 end
 
----@param root string
----@param entries DiffReviewStatusEntry[]
----@return string[]
+--- Extracts unique repository-relative paths for affected status entries.
+---@param root string Git repository root path.
+---@param entries DiffReviewStatusEntry[] Status entry array.
+---@return string[] paths Array of affected relative file paths.
 local function status_mutation_path_list(root, entries)
   local path_set = {}
   for _, entry in ipairs(entries) do
@@ -237,13 +252,14 @@ local function status_mutation_path_list(root, entries)
   return entry_nav._status_files_from_set(path_set)
 end
 
----@param label "Stage"|"Unstage"
----@param completed_label "Staged"|"Unstaged"
----@param direction DiffReviewIndexMutationDirection
----@param entries DiffReviewStatusEntry[]
----@param target_section DiffReviewStatusStageSectionName
----@param root_override? string
----@param opts? DiffReviewStatusIndexActionOptions
+--- Enqueues an asynchronous index mutation action with optimistic UI updates and completion handling.
+---@param label "Stage"|"Unstage" User-facing action verb.
+---@param completed_label "Staged"|"Unstaged" User-facing completion verb.
+---@param direction DiffReviewIndexMutationDirection Index mutation direction (`"stage"` or `"unstage"`).
+---@param entries DiffReviewStatusEntry[] Target status entries array.
+---@param target_section DiffReviewStatusStageSectionName Optimistic destination section name.
+---@param root_override? string Explicit repository root path.
+---@param opts? DiffReviewStatusIndexActionOptions Optional index action options.
 local function status_enqueue_index_action(label, completed_label, direction, entries, target_section, root_override, opts)
   opts = opts or {}
   opts.ignored_path_list = opts.ignored_path_list or {}
@@ -320,8 +336,9 @@ end
 ---@class DiffReviewStatusDiscardOpts
 ---@field visual_selection? DiffReviewVisualSelection
 
----@param entries DiffReviewStatusEntry[]
----@param opts? DiffReviewStatusListActionOptions
+--- Stages selected status entries including unstaged files, hunks, and ignored files.
+---@param entries DiffReviewStatusEntry[] Array of selected status entries.
+---@param opts? DiffReviewStatusListActionOptions Optional action parameters.
 local function status_stage_entries(entries, opts)
   if #entries == 0 then return end
   if blocked_by_active_commit("Stage") then return end
@@ -344,14 +361,16 @@ local function status_stage_entries(entries, opts)
   })
 end
 
----@param entry DiffReviewStatusEntry?
+--- Stages a single status entry.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
 local function status_stage(entry)
   if not entry then return end
   status_stage_entries({ entry })
 end
 
----@param entries DiffReviewStatusEntry[]
----@param opts? DiffReviewStatusListActionOptions
+--- Unstages selected status entries or unignores virtual entries.
+---@param entries DiffReviewStatusEntry[] Array of selected status entries.
+---@param opts? DiffReviewStatusListActionOptions Optional action parameters.
 local function status_unstage_entries(entries, opts)
   if #entries == 0 then return end
   local action_selection = entry_nav._status_action_entries(entries)
@@ -383,14 +402,16 @@ local function status_unstage_entries(entries, opts)
   })
 end
 
----@param entry DiffReviewStatusEntry?
+--- Unstages a single status entry.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
 local function status_unstage(entry)
   if not entry then return end
   status_unstage_entries({ entry })
 end
 
----@param entries DiffReviewStatusEntry[]
----@param opts? DiffReviewStatusListActionOptions
+--- Adds selected unstaged files to the session ignored path registry.
+---@param entries DiffReviewStatusEntry[] Array of selected status entries.
+---@param opts? DiffReviewStatusListActionOptions Optional action parameters.
 local function status_ignore_entries(entries, opts)
   local status = session.status
   local root = status and status.cwd or nil
@@ -409,13 +430,15 @@ local function status_ignore_entries(entries, opts)
   end
 end
 
----@param entry DiffReviewStatusEntry?
+--- Adds a single unstaged entry to the session ignored path registry.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
 local function status_ignore(entry)
   if entry then status_ignore_entries({ entry }) end
 end
 
----@param filename string
----@return string?
+--- Resolves the repository root path containing the specified filename.
+---@param filename string Absolute or relative filename path.
+---@return string? root Owning repository root path, or nil.
 local function status_root_for_filename(filename)
   local seen_status = {}
   local candidate_list = {}
@@ -432,11 +455,12 @@ local function status_root_for_filename(filename)
   return nil
 end
 
----@param root string
----@param filename string
----@param diff string
----@param staged boolean
----@return DiffReviewStatusEntry
+--- Locates an existing hunk status entry in session state or constructs a synthetic hunk entry.
+---@param root string Git repository root path.
+---@param filename string Absolute file path.
+---@param diff string Raw diff hunk patch string.
+---@param staged boolean True if hunk is currently staged.
+---@return DiffReviewStatusEntry entry Located or synthetic status entry.
 local function status_hunk_entry(root, filename, diff, staged)
   for _, status in pairs(session.states or {}) do
     if status.cwd and paths.normalize_path(status.cwd) == paths.normalize_path(root) then
@@ -482,9 +506,10 @@ local function status_hunk_entry(root, filename, diff, staged)
   return { kind = "hunk", id = "", file = file, hunk = hunk }
 end
 
----@param filename string
----@param diff string
----@param direction DiffReviewIndexMutationDirection
+--- Enqueues an index mutation action for an individual diff hunk patch.
+---@param filename string Absolute file path.
+---@param diff string Raw diff hunk patch string.
+---@param direction DiffReviewIndexMutationDirection Mutation direction (`"stage"` or `"unstage"`).
 local function status_mutate_diff_hunk(filename, diff, direction)
   local label = direction == "stage" and "Stage" or "Unstage"
   if blocked_by_active_commit(label) then return end
@@ -510,21 +535,24 @@ local function status_mutate_diff_hunk(filename, diff, direction)
   end)
 end
 
----@param filename string
----@param diff string
+--- Stages an individual diff hunk patch into the Git index.
+---@param filename string Absolute file path.
+---@param diff string Raw diff hunk patch string.
 local function status_stage_diff_hunk(filename, diff)
   status_mutate_diff_hunk(filename, diff, "stage")
 end
 
----@param filename string
----@param diff string
+--- Unstages an individual diff hunk patch from the Git index.
+---@param filename string Absolute file path.
+---@param diff string Raw diff hunk patch string.
 local function status_unstage_diff_hunk(filename, diff)
   status_mutate_diff_hunk(filename, diff, "unstage")
 end
 
----@param entries DiffReviewStatusEntry[]
----@param target_id? string
----@param fallback_line? integer
+--- Discards uncommitted changes for a list of status entries asynchronously.
+---@param entries DiffReviewStatusEntry[] Target status entries array.
+---@param target_id? string Optional post-discard selection anchor ID.
+---@param fallback_line? integer Optional fallback line number for cursor focus.
 local function status_discard_entries(entries, target_id, fallback_line)
   if blocked_by_active_commit("Discard") then return end
   local status_buf = session.status and session.status.buf
@@ -685,9 +713,10 @@ local function status_discard_entries(entries, target_id, fallback_line)
   end)
 end
 
----@param entries DiffReviewStatusEntry[]
----@param target_id? string
----@param opts? DiffReviewStatusDiscardOpts
+--- Prompts for user confirmation and initiates discard operations for selected entries.
+---@param entries DiffReviewStatusEntry[] Target status entries array.
+---@param target_id? string Optional post-discard entry anchor ID.
+---@param opts? DiffReviewStatusDiscardOpts Optional discard action options.
 local function status_discard_entry_list(entries, target_id, opts)
   opts = opts or {}
   local discard_entries = {}
@@ -721,7 +750,8 @@ local function status_discard_entry_list(entries, target_id, opts)
   end)
 end
 
----@param entry DiffReviewStatusEntry?
+--- Prompts for confirmation and discards changes for a single status entry.
+---@param entry DiffReviewStatusEntry? Status entry descriptor.
 local function status_discard(entry)
   if not entry then return end
   status_discard_entry_list({ entry }, entry.id)

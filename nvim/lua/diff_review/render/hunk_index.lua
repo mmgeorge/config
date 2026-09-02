@@ -24,12 +24,13 @@
 ---@class DiffReviewHunkIndexModule
 local M = {}
 
----@param header string
----@return integer old_start
----@return integer old_count
----@return integer new_start
----@return integer new_count
----@return string? context
+--- Parses a unified diff hunk header line into its numeric bounds and trailing context.
+---@param header string Raw hunk header string.
+---@return integer old_start Starting line in old revision.
+---@return integer old_count Line count in old revision.
+---@return integer new_start Starting line in new revision.
+---@return integer new_count Line count in new revision.
+---@return string? context Trailing function or scope context string, if present.
 function M.parse_hunk_header(header)
   local old_start, old_count, new_start, new_count, context =
     tostring(header or ""):match("^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@%s*(.*)$")
@@ -40,8 +41,9 @@ function M.parse_hunk_header(header)
     context ~= "" and context or nil
 end
 
----@param diff_line string?
----@return boolean
+--- Checks if a diff line is a valid content line starting with `" "`, `"+"`, or `"-"`.
+---@param diff_line string? Line string to check.
+---@return boolean is_body True if line starts with valid diff prefix.
 function M.is_body_line(diff_line)
   local prefix = tostring(diff_line or ""):sub(1, 1)
   return prefix == " " or prefix == "+" or prefix == "-"
@@ -101,8 +103,10 @@ local function diff_line_count(line_list)
   return old_count, new_count
 end
 
----@param hunk table
----@return DiffReviewHunkIndex
+--- Constructs a structured hunk index table from a raw diff hunk descriptor.
+--- Pre-calculates line number mappings and syntax highlight row offsets.
+---@param hunk table Raw diff hunk descriptor table.
+---@return DiffReviewHunkIndex index Initialized hunk index table.
 function M.from_hunk(hunk)
   local index = {
     hunk = hunk,
@@ -156,8 +160,9 @@ function M.from_hunk(hunk)
   return index
 end
 
----@param hunk table
----@return DiffReviewHunkIndex
+--- Retrieves an existing cached hunk index or instantiates and attaches one.
+---@param hunk table Raw diff hunk descriptor table.
+---@return DiffReviewHunkIndex index Existing or newly attached hunk index.
 function M.ensure(hunk)
   if hunk and hunk.diff_review_hunk_index then return hunk.diff_review_hunk_index end
   local index = M.from_hunk(hunk)
@@ -165,14 +170,15 @@ function M.ensure(hunk)
   return index
 end
 
----@param index DiffReviewHunkIndex
----@param hunk_key string
----@param body_start_line integer
----@param body_count integer
----@param chunk_index integer
----@return table? chunk
----@return string? render_key
----@return table? syntax_offset
+--- Extracts a windowed chunk of lines from the indexed hunk, formatting a valid sub-hunk.
+---@param index DiffReviewHunkIndex Target hunk index.
+---@param hunk_key string Parent hunk unique identifier key.
+---@param body_start_line integer One-based starting body line within the indexed hunk.
+---@param body_count integer Number of body lines to include in the chunk.
+---@param chunk_index integer One-based sequential chunk index.
+---@return table? chunk Formatted sub-hunk chunk descriptor, or nil.
+---@return string? render_key Unique render key for the chunk, or nil.
+---@return table? syntax_offset Syntax highlight offsets for old and new sides, or nil.
 function M.chunk(index, hunk_key, body_start_line, body_count, chunk_index)
   body_start_line = math.max(1, math.floor(tonumber(body_start_line) or 1))
   body_count = math.max(1, math.floor(tonumber(body_count) or 1))

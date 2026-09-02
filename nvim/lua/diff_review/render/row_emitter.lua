@@ -1,9 +1,10 @@
 local M = {}
 
----@param row0 integer
----@param spans table
----@param ephemeral? boolean
----@return table[]
+--- Constructs an array of extmark parameter tables for a row's background and inline highlight spans.
+---@param row0 integer Zero-based buffer row index.
+---@param spans table Span definition table containing optional `bg` and `highlights` list.
+---@param ephemeral? boolean Optional flag marking extmarks as ephemeral decoration provider marks.
+---@return table[] extmark_list Array of extmark descriptor tables.
 function M.extmark_list(row0, spans, ephemeral)
   local extmark_list = {}
   if spans.bg then
@@ -35,11 +36,12 @@ function M.extmark_list(row0, spans, ephemeral)
   return extmark_list
 end
 
----@param buf integer
----@param namespace integer
----@param row0 integer
----@param spans table
----@param ephemeral? boolean
+--- Emits background and highlight extmarks onto a buffer row.
+---@param buf integer Target buffer handle.
+---@param namespace integer Neovim highlight namespace ID.
+---@param row0 integer Zero-based buffer row index.
+---@param spans table Span definition table with background and highlight entries.
+---@param ephemeral? boolean Optional flag creating ephemeral marks inside a decoration callback.
 function M.emit(buf, namespace, row0, spans, ephemeral)
   for _, extmark in ipairs(M.extmark_list(row0, spans, ephemeral)) do
     pcall(vim.api.nvim_buf_set_extmark, buf, namespace, extmark.row, extmark.col, extmark.options)

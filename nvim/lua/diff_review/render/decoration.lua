@@ -30,17 +30,18 @@
 ---@class DiffReviewDecorationModule
 local M = {}
 
----@return DiffReviewDecorationCache
+--- Constructs an empty row decoration spans cache table with performance counters.
+---@return DiffReviewDecorationCache cache Newly initialized decoration cache.
 function M.new_cache()
   return { spans_by_line = {}, hits = 0, misses = 0 }
 end
 
---- Read cached spans for a source line, counting the lookup as a hit or miss.
----@param cache DiffReviewDecorationCache
----@param file_key string
----@param revision integer
----@param line integer
----@return DiffReviewRowSpans?
+--- Retrieves cached decoration spans for a source line, tracking cache hits and misses.
+---@param cache DiffReviewDecorationCache Target decoration cache.
+---@param file_key string Unique file identifier key.
+---@param revision integer Content render revision number.
+---@param line integer One-based source line number.
+---@return DiffReviewRowSpans? spans Cached decoration spans, or nil if miss.
 function M.cache_get(cache, file_key, revision, line)
   local by_revision = cache.spans_by_line[file_key]
   local by_line = by_revision and by_revision[revision] or nil
@@ -53,13 +54,12 @@ function M.cache_get(cache, file_key, revision, line)
   return spans
 end
 
---- Memoize computed spans for a source line.
---- Drop other revisions so a file never caches stale highlight state.
----@param cache DiffReviewDecorationCache
----@param file_key string
----@param revision integer
----@param line integer
----@param spans DiffReviewRowSpans
+--- Memoizes computed decoration spans for a source line and evicts outdated revisions.
+---@param cache DiffReviewDecorationCache Target decoration cache.
+---@param file_key string Unique file identifier key.
+---@param revision integer Content render revision number.
+---@param line integer One-based source line number.
+---@param spans DiffReviewRowSpans Computed decoration spans to store.
 function M.cache_put(cache, file_key, revision, line, spans)
   local by_revision = cache.spans_by_line[file_key]
   if not by_revision then
@@ -77,23 +77,25 @@ function M.cache_put(cache, file_key, revision, line, spans)
   by_line[line] = spans
 end
 
---- Drop a file's cached spans after a reload, mutation, or annotation change.
----@param cache DiffReviewDecorationCache
----@param file_key string
+--- Evicts all cached spans for a file following mutations or reloads.
+---@param cache DiffReviewDecorationCache Target decoration cache.
+---@param file_key string Unique file identifier key.
 function M.cache_invalidate(cache, file_key)
   cache.spans_by_line[file_key] = nil
 end
 
----@param cache DiffReviewDecorationCache
----@return { hits: integer, misses: integer }
+--- Returns lookup statistics for cache hits and misses.
+---@param cache DiffReviewDecorationCache Target decoration cache.
+---@return { hits: integer, misses: integer } stats Cache hit and miss counts.
 function M.cache_stats(cache)
   return { hits = cache.hits, misses = cache.misses }
 end
 
----@param buf integer
----@param namespace integer
----@param cache DiffReviewDecorationCache?
----@return DiffReviewDecorationProvider
+--- Constructs a decoration provider instance bound to a target buffer and namespace.
+---@param buf integer Target buffer handle.
+---@param namespace integer Neovim highlight namespace ID.
+---@param cache DiffReviewDecorationCache? Optional shared decoration cache.
+---@return DiffReviewDecorationProvider provider Initialized decoration provider.
 function M.new_provider(buf, namespace, cache)
   return {
     buf = buf,
@@ -104,22 +106,22 @@ function M.new_provider(buf, namespace, cache)
   }
 end
 
---- Record the visible row window reported by a redraw's on_win callback.
----@param provider DiffReviewDecorationProvider
----@param top integer
----@param bottom integer
+--- Records the visible row range boundaries reported during a window redraw callback.
+---@param provider DiffReviewDecorationProvider Target decoration provider.
+---@param top integer Zero-based visible top row.
+---@param bottom integer Zero-based visible bottom row.
 function M.set_visible_window(provider, top, bottom)
   provider.visible_top = math.max(0, math.floor(tonumber(top) or 0))
   provider.visible_bottom = math.max(provider.visible_top, math.floor(tonumber(bottom) or provider.visible_top))
 end
 
---- Resolve the decoration spans for one visible row, from cache or a fresh compute.
---- Return nil when the row owns no diff content or the compute defers (parse pending).
----@param provider DiffReviewDecorationProvider
----@param row integer 0-based buffer row
----@param resolve fun(row: integer): DiffReviewRowDecorationRequest?
----@param compute fun(request: DiffReviewRowDecorationRequest): DiffReviewRowSpans?
----@return DiffReviewRowSpans?
+--- Resolves decoration spans for a visible row from cache or fresh calculation.
+--- Returns nil when the row has no diff content or calculation is deferred.
+---@param provider DiffReviewDecorationProvider Target decoration provider.
+---@param row integer Zero-based buffer row index.
+---@param resolve fun(row: integer): DiffReviewRowDecorationRequest? Mapper resolving row to descriptor.
+---@param compute fun(request: DiffReviewRowDecorationRequest): DiffReviewRowSpans? Calculator computing spans.
+---@return DiffReviewRowSpans? spans Resolved decoration spans, or nil.
 function M.decorate_row(provider, row, resolve, compute)
   local request = resolve(row)
   if not request then return nil end
@@ -132,10 +134,10 @@ function M.decorate_row(provider, row, resolve, compute)
   return computed
 end
 
---- Register the buffer's decoration provider so per-row work runs only for visible rows.
---- Keep on_line cheap; it reads the cache or defers, never parses synchronously.
----@param provider DiffReviewDecorationProvider
----@param hooks DiffReviewDecorationHooks
+--- Registers the decoration provider callbacks with Neovim's decoration subsystem.
+--- Scopes work to visible rows only.
+---@param provider DiffReviewDecorationProvider Target decoration provider.
+---@param hooks DiffReviewDecorationHooks Provider callbacks for resolution, calculation, and emission.
 function M.register(provider, hooks)
   vim.api.nvim_set_decoration_provider(provider.namespace, {
     on_win = function(_, _, buf, toprow, botrow)

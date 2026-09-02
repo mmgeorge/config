@@ -96,24 +96,27 @@ local untracked_read_limit = 16
 ---@class DiffReviewPathStatusSnapshotModule
 local M = {}
 
----@param value string
----@return boolean
+--- Tests whether a file path string is an absolute filesystem path.
+---@param value string Path string to evaluate.
+---@return boolean absolute True if path starts with root slash or Windows drive prefix.
 local function is_absolute_path(value)
   return value:sub(1, 1) == "/"
     or value:sub(1, 1) == "\\"
     or value:match("^%a:[/\\]") ~= nil
 end
 
----@param value string
----@return string
+--- Normalizes path separators to forward slashes and removes leading relative `./` prefixes.
+---@param value string Input path string.
+---@return string normalized Normalized relative path string.
 local function normalize_relative_path(value)
   return (tostring(vim.fs.normalize(value)):gsub("\\", "/"):gsub("^%./", ""))
 end
 
----@param root string
----@param path_list string[]
----@return string[]? normalized_path_list
----@return DiffReviewPathStatusSnapshotError? error
+--- Validates, deduplicates, and converts requested file paths relative to the repository root.
+---@param root string Git repository root path.
+---@param path_list string[] Array of requested path strings.
+---@return string[]? normalized_path_list Validated relative path array, or nil on error.
+---@return DiffReviewPathStatusSnapshotError? error Validation error descriptor, or nil.
 local function normalize_requested_path_list(root, path_list)
   if type(root) ~= "string" or root == "" then
     return nil, { kind = "input", message = "Git status snapshot requires a repository root" }
@@ -164,8 +167,9 @@ local function normalize_requested_path_list(root, path_list)
   return normalized_path_list, nil
 end
 
----@param input string
----@return string[]
+--- Splits a NUL-delimited byte string into an array of string tokens.
+---@param input string NUL-delimited input string.
+---@return string[] parts Array of parsed token strings.
 local function split_nul(input)
   local part_list = {}
   local part_start = 1
@@ -181,10 +185,11 @@ local function split_nul(input)
   return part_list
 end
 
----@param body string
----@param field_count integer
----@return string[]? field_list
----@return string? tail
+--- Extracts a fixed number of space-delimited fields from a porcelain record line.
+---@param body string Porcelain record text.
+---@param field_count integer Number of fields to extract.
+---@return string[]? field_list Array of extracted field strings, or nil if insufficient fields.
+---@return string? tail Remaining unparsed tail string.
 local function take_fields(body, field_count)
   local field_list = {}
   local field_start = 1
@@ -197,13 +202,15 @@ local function take_fields(body, field_count)
   return field_list, body:sub(field_start)
 end
 
----@param kind DiffReviewPathStatusKind
----@param path string
----@param xy string
----@param submodule? string
----@param original_path? string
----@param score? string
----@return DiffReviewPathStatusRecord
+--- Constructs a typed path status record from porcelain v2 tokens and metadata.
+---@param kind DiffReviewPathStatusKind Record category descriptor.
+---@param path string Current relative file path.
+---@param xy string Two-character index and worktree status code.
+---@param submodule? string Submodule status state.
+---@param original_path? string Source path for renames or copies.
+---@param score? string Rename or copy similarity score.
+---@param metadata? table Mode and OID metadata.
+---@return DiffReviewPathStatusRecord record Populated path status descriptor table.
 local function status_record(kind, path, xy, submodule, original_path, score, metadata)
   metadata = metadata or {}
   local index_status = xy:sub(1, 1)
@@ -236,10 +243,10 @@ local function status_record(kind, path, xy, submodule, original_path, score, me
   }
 end
 
---- Parse NUL-delimited porcelain v2 output into typed path records.
----@param output string
----@return DiffReviewPathStatusRecord[]? record_list
----@return string? error
+--- Parses NUL-delimited porcelain v2 output into typed path status records.
+---@param output string Raw `git status --porcelain=v2 -z` output string.
+---@return DiffReviewPathStatusRecord[]? record_list Array of parsed path records, or nil on error.
+---@return string? error Error description string, or nil.
 function M.parse_status(output)
   local part_list = split_nul(tostring(output or ""))
   local record_list = {}
@@ -304,17 +311,19 @@ function M.parse_status(output)
   return record_list, nil
 end
 
----@param command DiffReviewGitCommand
----@param path_list string[]
+--- Appends path arguments after a `--` pathspec separator to a command array.
+---@param command DiffReviewGitCommand Command arguments array.
+---@param path_list string[] Path list array.
 local function append_path_list(command, path_list)
   if #path_list == 0 then return end
   command[#command + 1] = "--"
   vim.list_extend(command, path_list)
 end
 
----@param root string
----@param path_list string[]
----@return table<DiffReviewPathStatusSnapshotSource, DiffReviewGitCommand>
+--- Builds the 5 Git command argument arrays used to collect an atomic status snapshot.
+---@param root string Git repository root path.
+---@param path_list string[] Target relative path filter list.
+---@return table<DiffReviewPathStatusSnapshotSource, DiffReviewGitCommand> commands Map of commands by source key.
 local function snapshot_command_by_source(root, path_list)
   local status_command = {
     "git", "--no-optional-locks", "-C", root,
@@ -351,8 +360,9 @@ local function snapshot_command_by_source(root, path_list)
   }
 end
 
----@param hunk_list DiffReviewHunk[]
----@return string|false
+--- Concatenates individual hunk diff patches into a unified diff text string.
+---@param hunk_list DiffReviewHunk[] Array of parsed diff hunks.
+---@return string|false diff Concatenated diff patch string, or false if empty.
 local function hunk_diff(hunk_list)
   local diff_list = {}
   for _, hunk in ipairs(hunk_list) do
@@ -361,18 +371,20 @@ local function hunk_diff(hunk_list)
   return #diff_list > 0 and table.concat(diff_list, "\n") or false
 end
 
----@param staged boolean
----@param unstaged boolean
----@param path string
----@return DiffReviewPathStatusRecord
+--- Incurs an ordinary modified status record when diff hunks exist without porcelain records.
+---@param staged boolean True if staged hunks exist.
+---@param unstaged boolean True if unstaged hunks exist.
+---@param path string Relative file path string.
+---@return DiffReviewPathStatusRecord record Inferred path status record.
 local function inferred_status_record(staged, unstaged, path)
   local xy = (staged and "M" or ".") .. (unstaged and "M" or ".")
   return status_record("ordinary", path, xy, "N...")
 end
 
----@param relpath string
----@param content string
----@return string? diff
+--- Builds a synthetic unified diff patch from raw untracked file bytes.
+---@param relpath string Relative file path string.
+---@param content string Raw file content string.
+---@return string? diff Synthetic unified diff patch, or nil for binary/empty files.
 local function build_untracked_diff_from_bytes(relpath, content)
   if content == "" or content:find("\0", 1, true) then return nil end
 
@@ -404,8 +416,9 @@ local function build_untracked_diff_from_bytes(relpath, content)
   return table.concat(diff_line_list, "\n")
 end
 
----@param filename string
----@param callback fun(content?: string)
+--- Reads untracked file content asynchronously using non-blocking LibUV file system calls.
+---@param filename string Absolute file path.
+---@param callback fun(content?: string) Completion callback invoked with file content or nil.
 local function read_untracked_file_async(filename, callback)
   local uv = vim.uv or vim.loop
   local callback_finished = false
@@ -448,10 +461,10 @@ end
 M._build_untracked_diff_from_bytes = build_untracked_diff_from_bytes
 M._read_untracked_file_async = read_untracked_file_async
 
---- Read one untracked file without blocking and build its exact synthetic patch.
----@param filename string
----@param relpath string
----@param callback fun(diff?: string)
+--- Reads an untracked file asynchronously and generates its synthetic diff patch.
+---@param filename string Absolute file path.
+---@param relpath string Relative repository file path.
+---@param callback fun(diff?: string) Callback receiving generated unified diff patch or nil.
 function M.read_untracked_diff_async(filename, relpath, callback)
   M._read_untracked_file_async(filename, function(content)
     callback(content and build_untracked_diff_from_bytes(relpath, content) or nil)
@@ -464,10 +477,10 @@ end
 ---@field line_stats_complete boolean
 ---@field binary boolean
 
---- Parse NUL-delimited numstat output into exact per-path line metadata.
----@param output string
----@return table<string, DiffReviewNumstat>? stat_by_path
----@return string? error
+--- Parses NUL-delimited numstat output into exact per-path line addition/deletion statistics.
+---@param output string Raw `git diff --numstat -z` output string.
+---@return table<string, DiffReviewNumstat>? stat_by_path Map of line statistics by relative path, or nil on error.
+---@return string? error Parse error message, or nil.
 function M.parse_numstat(output)
   local stat_by_path = {}
   for part_index, part in ipairs(split_nul(tostring(output or ""))) do
@@ -497,8 +510,9 @@ function M.parse_numstat(output)
   return stat_by_path, nil
 end
 
----@param content string
----@return DiffReviewNumstat
+--- Calculates line additions and binary status directly from raw file bytes.
+---@param content string Raw file content string.
+---@return DiffReviewNumstat stat Calculated line addition and binary flags.
 local function added_file_stat_from_bytes(content)
   if content:find("\0", 1, true) then
     return { added = 0, removed = 0, line_stats_complete = false, binary = true }
@@ -511,9 +525,10 @@ local function added_file_stat_from_bytes(content)
   return { added = line_count, removed = 0, line_stats_complete = true, binary = false }
 end
 
----@param root string
----@param status_output string
----@param callback fun(stat_by_path?: table<string, DiffReviewNumstat>, error?: DiffReviewPathStatusSnapshotError)
+--- Reads and calculates line statistics across all untracked files asynchronously in parallel batches.
+---@param root string Git repository root path.
+---@param status_output string Raw porcelain v2 status output string.
+---@param callback fun(stat_by_path?: table<string, DiffReviewNumstat>, error?: DiffReviewPathStatusSnapshotError) Completion callback function.
 local function collect_untracked_stat_async(root, status_output, callback)
   local status_record_list, status_error = M.parse_status(status_output)
   if not status_record_list then
@@ -558,13 +573,17 @@ local function collect_untracked_stat_async(root, status_output, callback)
   launch_read()
 end
 
----@param root string
----@param requested_path_list string[]
----@param status_output string
----@param unstaged_output string
----@param staged_output string
----@return DiffReviewPathStatusSnapshot? snapshot
----@return DiffReviewPathStatusSnapshotError? error
+--- Compiles an immutable path status snapshot from status records, diff outputs, and numstats.
+---@param root string Git repository root path.
+---@param requested_path_list string[] Normalized relative paths requested.
+---@param status_output string Raw porcelain v2 status output string.
+---@param unstaged_output string Raw unstaged diff output string.
+---@param staged_output string Raw staged diff output string.
+---@param unstaged_added_numstat_output string Raw unstaged added numstat output string.
+---@param staged_added_numstat_output string Raw staged added numstat output string.
+---@param untracked_stat_by_path table<string, DiffReviewNumstat> Untracked line statistics map.
+---@return DiffReviewPathStatusSnapshot? snapshot Compiled path status snapshot, or nil on error.
+---@return DiffReviewPathStatusSnapshotError? error Parse error descriptor, or nil.
 local function build_snapshot(
   root,
   requested_path_list,
@@ -815,16 +834,16 @@ local function build_snapshot(
   }, nil
 end
 
---- Build one authoritative snapshot from Git status, filtered patches, and added-file stats.
----@param root string
----@param path_list string[]
----@param status_output string
----@param unstaged_output string
----@param staged_output string
----@param unstaged_added_numstat_output? string
----@param staged_added_numstat_output? string
----@return DiffReviewPathStatusSnapshot? snapshot
----@return DiffReviewPathStatusSnapshotError? error
+--- Builds an authoritative path status snapshot from status, filtered diff patches, and numstat outputs.
+---@param root string Git repository root path.
+---@param path_list string[] Target pathspec filter array.
+---@param status_output string Raw porcelain v2 status output string.
+---@param unstaged_output string Raw unstaged diff output string.
+---@param staged_output string Raw staged diff output string.
+---@param unstaged_added_numstat_output? string Raw unstaged added numstat output string.
+---@param staged_added_numstat_output? string Raw staged added numstat output string.
+---@return DiffReviewPathStatusSnapshot? snapshot Compiled path status snapshot, or nil on error.
+---@return DiffReviewPathStatusSnapshotError? error Snapshot construction error descriptor, or nil.
 function M.build(root, path_list, status_output, unstaged_output, staged_output, unstaged_added_numstat_output, staged_added_numstat_output)
   local requested_path_list, input_error = normalize_requested_path_list(root, path_list)
   if not requested_path_list then return nil, input_error end
@@ -840,10 +859,11 @@ function M.build(root, path_list, status_output, unstaged_output, staged_output,
   )
 end
 
----@param source DiffReviewPathStatusSnapshotSource
----@param command DiffReviewGitCommand
----@param result DiffReviewGitAsyncResult
----@return DiffReviewPathStatusCommandFailure
+--- Formats a Git process failure record from process return code and output streams.
+---@param source DiffReviewPathStatusSnapshotSource Snapshot phase key.
+---@param command DiffReviewGitCommand Command arguments array.
+---@param result DiffReviewGitAsyncResult Process result table.
+---@return DiffReviewPathStatusCommandFailure failure Formatted failure descriptor.
 local function command_failure(source, command, result)
   local stdout = tostring(result.stdout or "")
   local stderr = tostring(result.stderr or "")
@@ -863,10 +883,10 @@ local function command_failure(source, command, result)
   }
 end
 
---- Collect one atomic snapshot with status, filtered patches, and added-file stats.
----@param root string
----@param path_list string[] empty collects the full repository without a pathspec
----@param callback fun(snapshot?: DiffReviewPathStatusSnapshot, error?: DiffReviewPathStatusSnapshotError)
+--- Asynchronously collects an atomic path status snapshot covering porcelain status, diffs, and numstats.
+---@param root string Git repository root path.
+---@param path_list string[] Target relative path list (empty list captures full repository).
+---@param callback fun(snapshot?: DiffReviewPathStatusSnapshot, error?: DiffReviewPathStatusSnapshotError) Completion callback function.
 function M.collect_async(root, path_list, callback)
   local requested_path_list, input_error = normalize_requested_path_list(root, path_list)
   if not requested_path_list then

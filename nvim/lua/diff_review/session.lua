@@ -115,8 +115,8 @@ M.empty_diff_rows = {}
 ---@field agent table
 ---@field selected_agent_run_id string?
 
---- Build one Neovim presentation owner for one concurrently resident Harness session.
----@return DiffReviewHarnessPresentationState
+--- Constructs an initialized Harness presentation state record for a session.
+---@return DiffReviewHarnessPresentationState state Initialized Harness presentation state table.
 local function new_harness_state()
   return {
   client = nil,
@@ -177,13 +177,17 @@ M.harness_by_id = {}
 ---@type DiffReviewHarnessPresentationState
 M.harness = new_harness_state()
 
+--- Constructs a fresh Harness presentation state container.
+---@return DiffReviewHarnessPresentationState state Newly initialized presentation state.
 function M.new_harness_state() return new_harness_state() end
 
----@param state DiffReviewHarnessPresentationState
+--- Sets the active Harness presentation state used by the current window or tab.
+---@param state DiffReviewHarnessPresentationState Target presentation state.
 function M.activate_harness(state) M.harness = state end
 
----@param session_id string
----@param state DiffReviewHarnessPresentationState
+--- Registers a Harness presentation state record keyed by durable session ID.
+---@param session_id string Unique session identifier.
+---@param state DiffReviewHarnessPresentationState Presentation state record.
 function M.register_harness(session_id, state)
   M.harness_by_id[session_id] = state
 end

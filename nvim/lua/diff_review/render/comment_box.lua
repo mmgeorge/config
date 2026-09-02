@@ -52,11 +52,12 @@ end
 
 M.wrap_text = display_text.wrap
 
---- Build segmented display rows for a compact comment box.
----@param desc DiffReviewCommentBoxContent
----@param win_width integer
----@param style DiffReviewCommentBoxStyle?
----@return table[] box_lines
+--- Builds styled row segment lists representing a framed comment box.
+--- Wraps content text to the computed inner column budget.
+---@param desc DiffReviewCommentBoxContent Comment heading, body, and reply metadata.
+---@param win_width integer Total available window column width.
+---@param style DiffReviewCommentBoxStyle? Optional custom highlight group styling.
+---@return table[] box_lines Array of row segment arrays for status buffer rendering.
 function M.build_box_lines(desc, win_width, style)
   style = style or M.default_style
   local inner_width = math.max(4, math.min(M.box_max_inner_width, (tonumber(win_width) or 80) - 8))
@@ -119,10 +120,10 @@ function M.build_box_lines(desc, win_width, style)
   return box_lines
 end
 
---- Build stacked compact boxes at one diff anchor in stable descriptor order.
----@param items { desc: DiffReviewCommentDescriptor, style: DiffReviewCommentBoxStyle? }[]
----@param win_width integer
----@return table[] box_lines
+--- Builds stacked compact comment box rows for multiple descriptors anchored to the same diff line.
+---@param items { desc: DiffReviewCommentDescriptor, style: DiffReviewCommentBoxStyle? }[] Array of comment descriptors and optional styles.
+---@param win_width integer Total available window column width.
+---@return table[] box_lines Combined array of row segment arrays.
 function M.build_box_group_lines(items, win_width)
   local box_lines = {}
   for _, item in ipairs(items or {}) do

@@ -61,10 +61,10 @@ local function highlight_entity_references(segment_list, entity_name_set)
   return result
 end
 
----Overlay canonical entity references on an existing row style.
----@param segments_for_line? fun(line: string, line_index: integer): table[]
----@param entity_name_set table<string, boolean>
----@return fun(line: string, line_index: integer): table[]
+--- Overlays `@type` highlight groups on matching entity reference names in existing styled segments.
+---@param segments_for_line? fun(line: string, line_index: integer): table[] Existing segment formatter.
+---@param entity_name_set table<string, boolean> Set of known entity identifier strings.
+---@return fun(line: string, line_index: integer): table[] formatter Segment formatting callback.
 function M.entity_references(segments_for_line, entity_name_set)
   return function(line, line_index)
     local segment_list = segments_for_line and segments_for_line(line, line_index) or { { line } }
@@ -72,9 +72,9 @@ function M.entity_references(segments_for_line, entity_name_set)
   end
 end
 
----Build status-compatible segments for a task heading.
----@param title string
----@return fun(line: string, line_index: integer): table[]
+--- Builds a row segment formatter highlighting the task title on the first rendered line.
+---@param title string Task title string.
+---@return fun(line: string, line_index: integer): table[] formatter Segment formatting callback.
 function M.task(title)
   return function(line, line_index)
     if line_index ~= 1 then return { { line } } end
@@ -84,13 +84,13 @@ function M.task(title)
   end
 end
 
----Build semantic segments for one Add, Modify, or Remove row.
----@param action string
----@param kind string
----@param target string
----@param kind_highlight? string
----@param target_highlight? string
----@return fun(line: string, line_index: integer): table[]
+--- Builds a row segment formatter highlighting the action, construct kind, and target symbol.
+---@param action string Mutation action string (`"Add"`, `"Modify"`, `"Remove"`).
+---@param kind string Construct kind (`"struct"`, `"fn"`, `"trait"`, etc.).
+---@param target string Identifier or symbol name.
+---@param kind_highlight? string Optional custom highlight group for the construct kind.
+---@param target_highlight? string Optional custom highlight group for the target symbol.
+---@return fun(line: string, line_index: integer): table[] formatter Segment formatting callback.
 function M.change(action, kind, target, kind_highlight, target_highlight)
   local action_highlight = action_highlight_by_name[action]
   return function(line, line_index)
@@ -103,11 +103,11 @@ function M.change(action, kind, target, kind_highlight, target_highlight)
   end
 end
 
----Build semantic segments for one rename row.
----@param renamed_from string
----@param name string
----@param target_highlight? string
----@return fun(line: string, line_index: integer): table[]
+--- Builds a row segment formatter highlighting old name, arrow glyph, and new name on rename rows.
+---@param renamed_from string Previous symbol or identifier name.
+---@param name string New symbol or identifier name.
+---@param target_highlight? string Optional custom highlight group for the target symbol.
+---@return fun(line: string, line_index: integer): table[] formatter Segment formatting callback.
 function M.rename(renamed_from, name, target_highlight)
   return function(line, line_index)
     if line_index ~= 1 then return { { line } } end
@@ -119,9 +119,9 @@ function M.rename(renamed_from, name, target_highlight)
   end
 end
 
----Build status-compatible segments for a repository file boundary.
----@param path string
----@return fun(line: string, line_index: integer): table[]
+--- Builds a row segment formatter highlighting the `file` keyword and repository relative path.
+---@param path string Repository-relative file path.
+---@return fun(line: string, line_index: integer): table[] formatter Segment formatting callback.
 function M.file(path)
   return function(line, line_index)
     if line_index ~= 1 then return { { line } } end

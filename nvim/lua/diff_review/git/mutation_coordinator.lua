@@ -214,19 +214,20 @@ end
 
 run_next = run_next_impl
 
---- Register lifecycle handlers for one repository root.
----@param root string
----@param handler DiffReviewMutationHandler
+--- Registers lifecycle settlement and recovery handlers for a repository root.
+---@param root string Git repository root path.
+---@param handler DiffReviewMutationHandler Handler callbacks for settling and recovering mutations.
 function M.set_handler(root, handler)
   state_for_root(root).handler = handler
 end
 
---- Enqueue one Git index mutation in repository FIFO order.
----@param root string
----@param task DiffReviewMutationTask
----@return integer? task_id
----@return integer? burst_id
----@return string? error
+--- Enqueues a Git index mutation task in repository FIFO order.
+--- Returns monotonic task and burst identifiers, or an error message if queueing fails.
+---@param root string Git repository root path.
+---@param task DiffReviewMutationTask Task specification table.
+---@return integer? task_id Monotonic task identifier.
+---@return integer? burst_id Batch burst identifier.
+---@return string? error Error message if enqueueing is rejected.
 function M.enqueue(root, task)
   if not root or root == "" then return nil, nil, "Missing repository root" end
   local state = state_for_root(root)
@@ -253,9 +254,9 @@ function M.enqueue(root, task)
   return task.id, burst.id, nil
 end
 
---- Report whether a repository still owns mutation or synchronization work.
----@param root string
----@return boolean
+--- Reports whether a repository root has active, queued, or synchronizing mutation tasks.
+---@param root string Git repository root path.
+---@return boolean pending True if tasks or synchronization are in progress.
 function M.pending(root)
   local state = state_by_root[root_key(root)]
   if not state then return false end
@@ -266,38 +267,38 @@ function M.pending(root)
     or state.recovering_burst ~= nil
 end
 
---- Report whether a repository currently recovers from a failed mutation.
----@param root string
----@return boolean
+--- Reports whether a repository root is currently rolling back a failed mutation.
+---@param root string Git repository root path.
+---@return boolean recovering True if recovery is active.
 function M.recovering(root)
   local state = state_by_root[root_key(root)]
   return state ~= nil and state.recovering_burst ~= nil
 end
 
---- Return the sorted path set touched by a burst.
----@param burst DiffReviewMutationBurst
----@return string[]
+--- Returns the sorted list of relative file paths affected by a mutation burst.
+---@param burst DiffReviewMutationBurst Target mutation burst table.
+---@return string[] paths Sorted unique file path strings.
 function M.paths(burst)
   return burst_paths(burst)
 end
 
---- Return paths owned by a later burst while an earlier snapshot synchronizes.
----@param root string
----@return string[]
+--- Returns relative file paths in an active uncommitted burst while earlier work synchronizes.
+---@param root string Git repository root path.
+---@return string[] paths Array of affected path strings.
 function M.pending_paths(root)
   local state = state_by_root[root_key(root)]
   if not (state and state.accepting_burst) then return {} end
   return burst_paths(state.accepting_burst)
 end
 
---- Override the quiet delay for deterministic tests.
----@param root string
----@param delay_ms integer
+--- Overrides the quiet debounce interval in milliseconds for test environments.
+---@param root string Git repository root path.
+---@param delay_ms integer Debounce delay duration in milliseconds.
 function M.set_quiet_delay_for_test(root, delay_ms)
   state_for_root(root).quiet_delay_ms = delay_ms
 end
 
---- Clear coordinator state for deterministic tests.
+--- Resets all coordinator state across repository roots for test cleanup.
 function M.reset_for_test()
   state_by_root = {}
 end

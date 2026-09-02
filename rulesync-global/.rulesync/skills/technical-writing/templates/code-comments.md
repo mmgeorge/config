@@ -8,13 +8,17 @@ Establish why a non-obvious local constraint, algorithmic invariant, or safety p
 
 ## Triggering Criteria: When to Comment
 
-Prefer semantic types, clear variable names, and explicit control flow over comments. Add a source comment only when correctness depends on context the syntax cannot convey:
+Prefer semantic types, clear variable names, and explicit control flow over comments. Add a source comment only when correctness depends on context the syntax cannot convey, or when phase labels delimit lifecycle boundaries in a long, multipart function:
 
 - **Non-Obvious Domain Rules:** Business logic, tax calculations, or domain invariants not evident from the algorithm.
 - **Safety and Memory Bounds:** Explicit preconditions, alignment assumptions, unsafe blocks, or pointer arithmetic constraints.
 - **Concurrency Protocols:** Lock ordering, memory barrier requirements, atomic ordering invariants, or thread ownership transfers.
 - **Hardware and External API Quirks:** Workarounds for vendor bugs, non-standard HTTP responses, or platform-specific driver behaviors.
 - **Performance Tradeoffs:** Non-intuitive data structures or bitwise manipulations chosen to satisfy critical latency or memory bounds.
+- **Multipart Long Functions:** When a function spans 40 or more nonblank source lines and
+  contains at least two of validation, state publication or mutation, and reconciliation or
+  cleanup, place a concise inline comment before each phase. Name the phase and its state boundary
+  directly instead of repeating formulaic causal clauses such as `so ...`.
 
 ## Composition Rules
 

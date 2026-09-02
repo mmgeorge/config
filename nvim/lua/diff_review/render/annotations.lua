@@ -46,15 +46,17 @@ local source = require("diff_review.render.source")
 ---@class DiffReviewAnnotationModule
 local M = {}
 
----@param path string
----@param side DiffReviewAnnotationSide
----@param line integer
----@return string
+--- Generates a composite anchor lookup key from a file path, diff side, and line number.
+---@param path string Relative or absolute file path.
+---@param side DiffReviewAnnotationSide Side of the diff anchor (`"LEFT"`, `"RIGHT"`, `"BOTH"`).
+---@param line integer One-based line number inside the file or diff.
+---@return string key Composite null-delimited anchor index key.
 function M.anchor_key(path, side, line)
   return source.normalize_path(path) .. "\0" .. tostring(M.normalize_side(side)) .. "\0" .. tostring(tonumber(line) or 0)
 end
 
----@return DiffReviewAnnotationIndex
+--- Constructs an empty diff annotation index table.
+---@return DiffReviewAnnotationIndex index Empty annotation index structure.
 function M.new_index()
   return {
     by_id = {},
@@ -71,8 +73,9 @@ local function remove_from_bucket(bucket, id)
   end
 end
 
----@param side any
----@return DiffReviewAnnotationSide
+--- Normalizes a diff side descriptor into canonical `"LEFT"`, `"RIGHT"`, or `"BOTH"`.
+---@param side any Raw input side string (e.g. `"old"`, `"new"`, `"both"`, `"file"`).
+---@return DiffReviewAnnotationSide side Canonical annotation side.
 function M.normalize_side(side)
   local normalized = tostring(side or "RIGHT")
   if normalized == "new" then return "RIGHT" end
@@ -82,8 +85,9 @@ function M.normalize_side(side)
   return "RIGHT"
 end
 
----@param state any
----@return DiffReviewAnnotationState
+--- Normalizes a synchronization state identifier into a canonical status string.
+---@param state any Raw state descriptor.
+---@return DiffReviewAnnotationState state Normalized status string (`"clean"`, `"new"`, `"dirty"`, `"syncing"`, `"failed"`, `"error"`, `"deleted"`).
 function M.normalize_state(state)
   local normalized = tostring(state or "clean")
   if normalized == "new"
@@ -97,15 +101,17 @@ function M.normalize_state(state)
   return "clean"
 end
 
----@param state DiffReviewAnnotationState
----@return boolean
+--- Determines whether an annotation's status requires remote synchronization.
+---@param state DiffReviewAnnotationState Annotation sync status.
+---@return boolean requires_sync True if annotation needs remote sync.
 function M.state_requires_sync(state)
   return state == "new" or state == "dirty" or state == "failed" or state == "error" or state == "deleted"
 end
 
----@param index DiffReviewAnnotationIndex
----@param annotation DiffReviewDiffAnnotation
----@return DiffReviewDiffAnnotation
+--- Inserts or updates an annotation record in the index, indexing it by ID and anchor location.
+---@param index DiffReviewAnnotationIndex Target annotation index.
+---@param annotation DiffReviewDiffAnnotation Annotation record to insert or update.
+---@return DiffReviewDiffAnnotation annotation Normalized inserted annotation record.
 function M.upsert(index, annotation)
   local previous = index.by_id[annotation.id]
   if previous then
@@ -137,8 +143,9 @@ function M.upsert(index, annotation)
   return annotation
 end
 
----@param index DiffReviewAnnotationIndex
----@param id string
+--- Removes an annotation from the index by its unique identifier.
+---@param index DiffReviewAnnotationIndex Target annotation index.
+---@param id string Unique annotation identifier.
 function M.remove(index, id)
   local annotation = index.by_id[id]
   if not annotation then return end
@@ -149,18 +156,20 @@ function M.remove(index, id)
   index.dirty_by_id[id] = nil
 end
 
----@param index DiffReviewAnnotationIndex
----@param path string
----@param side DiffReviewAnnotationSide
----@param line integer
----@return DiffReviewDiffAnnotation[]
+--- Retrieves all annotations matching a given file anchor position.
+---@param index DiffReviewAnnotationIndex Target annotation index.
+---@param path string File path.
+---@param side DiffReviewAnnotationSide Anchor diff side.
+---@param line integer One-based line number.
+---@return DiffReviewDiffAnnotation[] annotations Array of matching annotations.
 function M.by_anchor(index, path, side, line)
   return index.by_anchor[M.anchor_key(path, side, line)] or {}
 end
 
----@param index DiffReviewAnnotationIndex
----@param id string
----@param body string?
+--- Marks an existing annotation as dirty with an optional updated comment body.
+---@param index DiffReviewAnnotationIndex Target annotation index.
+---@param id string Unique annotation identifier.
+---@param body string? Optional new comment body text.
 function M.mark_dirty(index, id, body)
   local annotation = index.by_id[id]
   if not annotation then return end
@@ -169,9 +178,10 @@ function M.mark_dirty(index, id, body)
   index.dirty_by_id[id] = true
 end
 
----@param index DiffReviewAnnotationIndex
----@param id string
----@param body string|string[]
+--- Updates the text content of an annotation and marks it dirty when changes occur.
+---@param index DiffReviewAnnotationIndex Target annotation index.
+---@param id string Unique annotation identifier.
+---@param body string|string[] Replacement text or lines array.
 function M.replace_body(index, id, body)
   local annotation = index.by_id[id]
   if not annotation then return end
@@ -183,10 +193,11 @@ function M.replace_body(index, id, body)
   index.dirty_by_id[id] = true
 end
 
----@param index DiffReviewAnnotationIndex
----@param id string
----@param state DiffReviewAnnotationState
----@param err? string
+--- Updates the sync state and error details for an annotation.
+---@param index DiffReviewAnnotationIndex Target annotation index.
+---@param id string Unique annotation identifier.
+---@param state DiffReviewAnnotationState Next synchronization state.
+---@param err? string Optional error message description.
 function M.set_sync_state(index, id, state, err)
   local annotation = index.by_id[id]
   if not annotation then return end
@@ -201,8 +212,9 @@ function M.set_sync_state(index, id, state, err)
   end
 end
 
----@param index DiffReviewAnnotationIndex
----@param id string
+--- Marks an annotation as clean, removing it from the dirty set.
+---@param index DiffReviewAnnotationIndex Target annotation index.
+---@param id string Unique annotation identifier.
 function M.mark_clean(index, id)
   local annotation = index.by_id[id]
   if not annotation then return end
@@ -210,8 +222,9 @@ function M.mark_clean(index, id)
   index.dirty_by_id[id] = nil
 end
 
----@param index DiffReviewAnnotationIndex
----@return DiffReviewDiffAnnotation[]
+--- Returns all dirty annotations sorted alphabetically by ID.
+---@param index DiffReviewAnnotationIndex Target annotation index.
+---@return DiffReviewDiffAnnotation[] annotations Array of dirty annotation records.
 function M.dirty(index)
   local annotation = {}
   for id in pairs(index.dirty_by_id or {}) do
@@ -223,21 +236,19 @@ function M.dirty(index)
   return annotation
 end
 
----@param line string[]
----@return string
+--- Converts buffer lines into a single newline-separated body string.
+---@param line string[] Array of buffer lines.
+---@return string body Normalized multi-line string.
 function M.body_from_buffer_lines(line)
   local text = table.concat(line or {}, "\n")
   text = text:gsub("\r\n", "\n"):gsub("\r", "\n")
   return text
 end
 
---- Build a serial sync queue with op-id stale rejection. By default it applies results via
---- on_sync_success/on_sync_failure (the DiffAnnotation model); pass opts.on_success/on_failure
---- to apply a different annotation model in place, opts.on_idle to react when the queue drains
---- empty, and opts.stop_on_failure to halt the drain after a failed item.
----@param handler fun(annotation: table, done: fun(ok: boolean, remote_payload?: table, err?: string))
----@param opts? { on_success?: fun(annotation: table, remote_payload?: table), on_failure?: fun(annotation: table, err?: string), on_idle?: fun(), stop_on_failure?: boolean }
----@return DiffReviewAnnotationSyncQueue
+--- Constructs a serial synchronization queue with operation-ID race protection.
+---@param handler fun(annotation: table, done: fun(ok: boolean, remote_payload?: table, err?: string)) Handler invoked for each item.
+---@param opts? { on_success?: fun(annotation: table, remote_payload?: table), on_failure?: fun(annotation: table, err?: string), on_idle?: fun(), stop_on_failure?: boolean } Queue configuration options.
+---@return DiffReviewAnnotationSyncQueue queue Initialized synchronization queue.
 function M.new_sync_queue(handler, opts)
   opts = opts or {}
   return {
@@ -253,9 +264,9 @@ function M.new_sync_queue(handler, opts)
   }
 end
 
---- Apply a successful remote sync: adopt the synced body as the saved and remote baseline.
----@param annotation DiffReviewDiffAnnotation
----@param remote_payload table?
+--- Updates an annotation record following successful remote synchronization.
+---@param annotation DiffReviewDiffAnnotation Target annotation record.
+---@param remote_payload table? Response payload containing remote identifiers.
 function M.on_sync_success(annotation, remote_payload)
   remote_payload = remote_payload or {}
   annotation.base_body = annotation.body
@@ -267,16 +278,17 @@ function M.on_sync_success(annotation, remote_payload)
   if remote_payload.url ~= nil then annotation.remote_url = remote_payload.url end
 end
 
---- Record a failed remote sync so the annotation keeps its dirty body and surfaces the error.
----@param annotation DiffReviewDiffAnnotation
----@param err string?
+--- Updates an annotation record following failed remote synchronization.
+---@param annotation DiffReviewDiffAnnotation Target annotation record.
+---@param err string? Error message describing the sync failure.
 function M.on_sync_failure(annotation, err)
   annotation.state = "failed"
   annotation.sync_error = err and tostring(err) or "annotation sync failed"
   annotation.sync_operation_id = nil
 end
 
----@param queue DiffReviewAnnotationSyncQueue
+--- Drains pending items from the sync queue serially.
+---@param queue DiffReviewAnnotationSyncQueue Target sync queue.
 function M.drain_sync_queue(queue)
   if queue.running then return end
   local annotation = table.remove(queue.pending, 1)
@@ -309,8 +321,9 @@ function M.drain_sync_queue(queue)
   end)
 end
 
----@param queue DiffReviewAnnotationSyncQueue
----@param annotation DiffReviewDiffAnnotation
+--- Enqueues an annotation for synchronization and starts queue draining if idle.
+---@param queue DiffReviewAnnotationSyncQueue Target sync queue.
+---@param annotation DiffReviewDiffAnnotation Target annotation to sync.
 function M.enqueue_sync(queue, annotation)
   if queue.queued_by_id[annotation.id] then return end
   queue.queued_by_id[annotation.id] = true

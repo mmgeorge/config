@@ -9,8 +9,9 @@ local function review_mod() return require("diff_review.views.pr.review") end
 ---@class DiffReviewSectionBuilderModule
 local M = {}
 
----@param files DiffReviewStatusFile[]
----@return table<string, DiffReviewStatusFile>
+--- Indexes an array of status file descriptors by their filename string.
+---@param files DiffReviewStatusFile[] Array of status file descriptors.
+---@return table<string, DiffReviewStatusFile> map Dictionary mapping filename to file descriptor.
 function M.files_by_name(files)
   local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
   for _, file in ipairs(files or {}) do
@@ -19,10 +20,11 @@ function M.files_by_name(files)
   return files_by_name
 end
 
----@param cwd string
----@param spec { section_name: string, default_status?: string, files?: DiffReviewGhPRFile[] }
----@param diff_text? string
----@return DiffReviewStatusFile[]
+--- Parses status file descriptors with diff hunks from raw diff text.
+---@param cwd string Git repository root path.
+---@param spec { section_name: string, default_status?: string, files?: DiffReviewGhPRFile[] } Section specification table.
+---@param diff_text? string Raw unified diff text string.
+---@return DiffReviewStatusFile[] files Array of parsed status file descriptors.
 function M.files_from_diff(cwd, spec, diff_text)
   return require("diff_review.views.status.section_map")._status_files_from_diff_provider(cwd, {
     section_name = spec.section_name,
@@ -31,10 +33,11 @@ function M.files_from_diff(cwd, spec, diff_text)
   }, diff_text)
 end
 
----@param title string
----@param files DiffReviewStatusFile[]
----@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean }
----@return DiffReviewStatusSection?
+--- Constructs a status section table from an array of file entries.
+---@param title string Section display title.
+---@param files DiffReviewStatusFile[] Array of file descriptors.
+---@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean } Configuration options.
+---@return DiffReviewStatusSection? section Constructed section table, or nil if empty and keep_empty is false.
 function M.section_from_files(title, files, opts)
   opts = opts or {}
   files = files or {}
@@ -51,29 +54,32 @@ function M.section_from_files(title, files, opts)
   }
 end
 
----@param title string
----@param files DiffReviewStatusFile[]
----@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean }
----@return DiffReviewStatusSection[]
+--- Constructs a single-element array containing the section constructed from files.
+---@param title string Section display title.
+---@param files DiffReviewStatusFile[] Array of file descriptors.
+---@param opts? { name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean } Configuration options.
+---@return DiffReviewStatusSection[] sections Array containing the section or empty if omitted.
 function M.sections_from_files(title, files, opts)
   local section = M.section_from_files(title, files, opts)
   return section and { section } or {}
 end
 
----@param cwd string
----@param spec { title: string, section_name: string, default_status?: string, files?: DiffReviewGhPRFile[], name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean }
----@param diff_text? string
----@return DiffReviewStatusSection[]
----@return DiffReviewStatusFile[]
+--- Builds both section array and file list from raw diff text.
+---@param cwd string Git repository root path.
+---@param spec { title: string, section_name: string, default_status?: string, files?: DiffReviewGhPRFile[], name?: string, default_folded?: boolean, file_key_prefix?: string, file_entry_kind?: "file"|"commit_file"|"pr_file"|"pr_review_file", hunk_entry_kind?: "hunk"|"commit_hunk"|"pr_hunk"|"pr_review_hunk", keep_empty?: boolean } Section specification table.
+---@param diff_text? string Raw unified diff text.
+---@return DiffReviewStatusSection[] sections Array of constructed sections.
+---@return DiffReviewStatusFile[] files Array of parsed file descriptors.
 function M.sections_from_diff(cwd, spec, diff_text)
   local files = M.files_from_diff(cwd, spec, diff_text)
   return M.sections_from_files(spec.title, files, spec), files
 end
 
----@param file DiffReviewStatusFile
----@param hunks DiffReviewHunk[]
----@param section_name string
----@return DiffReviewStatusFile
+--- Clones a file descriptor with a replacement hunk array and recalculated line statistics.
+---@param file DiffReviewStatusFile Source status file descriptor.
+---@param hunks DiffReviewHunk[] Replacement hunk array.
+---@param section_name string Target section name.
+---@return DiffReviewStatusFile file Cloned and updated file descriptor.
 function M.file_with_hunks(file, hunks, section_name)
   local clone = vim.deepcopy(file)
   clone.hunks = {}
@@ -90,15 +96,17 @@ function M.file_with_hunks(file, hunks, section_name)
   return clone
 end
 
----@param comment table
----@return "LEFT"|"RIGHT"
+--- Resolves normalized comment diff side string.
+---@param comment table Raw comment descriptor table.
+---@return "LEFT"|"RIGHT" side Normalized side string.
 function M.comment_side(comment)
   return tostring(comment and comment.side or "RIGHT") == "LEFT" and "LEFT" or "RIGHT"
 end
 
----@param cwd string
----@param comments table[]
----@return table<string, table[]>
+--- Groups and sorts review comments by relative and absolute file paths.
+---@param cwd string Git repository root path.
+---@param comments table[] Array of review comment descriptors.
+---@return table<string, table[]> by_path Map from path to array of comments.
 function M.comments_by_path(cwd, comments)
   local by_path = {}
   for _, comment in ipairs(type(comments) == "table" and comments or {}) do
@@ -123,11 +131,12 @@ function M.comments_by_path(cwd, comments)
   return by_path
 end
 
----@param cwd string
----@param files DiffReviewStatusFile[]
----@param comments table[]
----@param opts? { field?: string }
----@return table<string, table[]>
+--- Attaches review comments to matching status file descriptors.
+---@param cwd string Git repository root path.
+---@param files DiffReviewStatusFile[] Array of status file descriptors.
+---@param comments table[] Array of review comment descriptors.
+---@param opts? { field?: string } Optional field name override (defaults to `"comments"`).
+---@return table<string, table[]> by_path Map from path to attached comments.
 function M.attach_comments(cwd, files, comments, opts)
   opts = opts or {}
   local field = opts.field or "comments"
@@ -138,10 +147,11 @@ function M.attach_comments(cwd, files, comments, opts)
   return by_path
 end
 
----@param file string?
----@param side string?
----@param line integer|string?
----@return string?
+--- Computes a composite lookup key string for comments anchored to a file, side, and line number.
+---@param file string? Relative or absolute file path string.
+---@param side string? Side string (`"LEFT"` or `"RIGHT"`).
+---@param line integer|string? One-based diff line number.
+---@return string? key Composite anchor key, or nil if invalid.
 function M.comment_anchor_key(file, side, line)
   local line_number = tonumber(line)
   if not (file and file ~= "" and line_number) then return nil end
@@ -150,12 +160,12 @@ function M.comment_anchor_key(file, side, line)
   return ("%s\0%s\0%d"):format(normalized_file, normalized_side, math.floor(line_number))
 end
 
---- Emit prebuilt comment descriptors anchored on one diff line.
----@param state table
----@param diff_line table
----@param entry table?
----@param index table<string, { descriptor: DiffReviewCommentDescriptor, section_name?: string }[]>
----@param style? DiffReviewCommentBoxStyle
+--- Emits prebuilt comment box descriptors on a diff line.
+---@param state table Status session state table.
+---@param diff_line table Diff line descriptor table.
+---@param entry table? Optional status entry descriptor.
+---@param index table<string, { descriptor: DiffReviewCommentDescriptor, section_name?: string }[]> Comment descriptor index.
+---@param style? DiffReviewCommentBoxStyle Visual box style descriptor.
 function M.emit_anchored_descriptors(state, diff_line, entry, index, style)
   local key = M.comment_anchor_key(diff_line.file, diff_line.side, diff_line.line)
   local descriptors = key and index and index[key] or nil
@@ -170,8 +180,9 @@ function M.emit_anchored_descriptors(state, diff_line, entry, index, style)
   end
 end
 
----@param comments table[]
----@return table<string, { comment: table, index: integer }[]>
+--- Builds an anchor lookup index mapping anchor keys to arrays of comments with indices.
+---@param comments table[] Array of review comment tables.
+---@return table<string, { comment: table, index: integer }[]> index Anchor key dictionary.
 function M.comment_anchor_index(comments)
   local by_anchor = {}
   for index, comment in ipairs(type(comments) == "table" and comments or {}) do
@@ -184,9 +195,10 @@ function M.comment_anchor_index(comments)
   return by_anchor
 end
 
----@param sections DiffReviewStatusSection[]
----@param opts? { field?: string }
----@return table<string, { comment: table, index: integer }[]>
+--- Builds an anchor lookup index across all files in a status section list.
+---@param sections DiffReviewStatusSection[] Array of status sections.
+---@param opts? { field?: string } Optional comment field name override.
+---@return table<string, { comment: table, index: integer }[]> index Anchor key dictionary.
 function M.comment_anchor_index_from_sections(sections, opts)
   opts = opts or {}
   local field = opts.field or "comments"
@@ -205,13 +217,11 @@ function M.comment_anchor_index_from_sections(sections, opts)
   return by_anchor
 end
 
---- Emit comments anchored on `diff_line` below it. Each unfocused interactive comment renders
---- as compact real rows, while the focused comment or reply draft renders as a full-width editor.
---- Readonly providers reuse the box builder without gaining a parent-comment editing path.
----@param state table
----@param diff_line table
----@param indent integer
----@param opts { index?: table<string, { comment: table, index: integer }[]>, index_field?: string, count_field?: string, readonly?: boolean, skip?: fun(comment: table): boolean }
+--- Emits anchored comment boxes beneath a diff line row.
+---@param state table Status session state table.
+---@param diff_line table Diff line descriptor table.
+---@param indent integer Column indentation count.
+---@param opts { index?: table<string, { comment: table, index: integer }[]>, index_field?: string, count_field?: string, readonly?: boolean, skip?: fun(comment: table): boolean } Emission options table.
 function M.emit_anchored_comments(state, diff_line, indent, opts)
   local review = review_mod()
   local key = M.comment_anchor_key(diff_line.file, review.side_of(diff_line), diff_line.line)

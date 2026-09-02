@@ -16,6 +16,8 @@ local syntax_engine = require("diff_review.render.syntax_engine")
 
 local M = {}
 
+--- Returns true if GitStatus debug logging is active via options or global flags.
+---@return boolean enabled True if debug mode is active.
 function M.enabled()
   local global_enabled = vim.g.diff_review_gitstatus_debug
   return dr()._gitstatus_debug_force == true
@@ -24,20 +26,23 @@ function M.enabled()
     or global_enabled == 1
 end
 
----@param value any
----@return string
+--- Formats a Lua value as a single-line inspected string with escaped newlines.
+---@param value any Target Lua value.
+---@return string inspected Single-line representation.
 function M.one_line(value)
   return vim.inspect(value):gsub("\r", "\\r"):gsub("\n", "\\n")
 end
 
----@param value any
----@return string
+--- Normalizes newlines in a value to escaped string representations.
+---@param value any Target value.
+---@return string text Single-line string representation.
 function M.text(value)
   return (tostring(value or ""):gsub("\r", "\\r"):gsub("\n", "\\n"))
 end
 
----@param event string
----@param payload? table
+--- Appends a timestamped structured event entry to the debug log file.
+---@param event string Event name string.
+---@param payload? table Optional event metadata dictionary.
 function M.event(event, payload)
   if not M.enabled() then return end
   local line = ("GitStatus debug event time=%s event=%s payload=%s"):format(
@@ -51,6 +56,9 @@ function M.event(event, payload)
   end
 end
 
+--- Flattens a formatted row chunk structure into plain text.
+---@param row table|string Row chunk array or string.
+---@return string text Flattened text content.
 function M.row_text(row)
   if type(row) ~= "table" then return M.text(row) end
   local parts = {}
@@ -73,9 +81,10 @@ function M.row_text(row)
   return table.concat(parts, "")
 end
 
----@param rows table?
----@param limit integer
----@return table[]
+--- Generates a preview summary array for rows up to a specified count limit.
+---@param rows table? Array of formatted rows.
+---@param limit integer Maximum number of rows to preview.
+---@return table[] preview Array of row preview descriptors.
 function M.row_preview(rows, limit)
   local preview = {}
   if type(rows) ~= "table" then return preview end
@@ -91,8 +100,9 @@ function M.row_preview(rows, limit)
   return preview
 end
 
----@param cache any
----@return string
+--- Returns a human-readable string describing a cache state entry.
+---@param cache any Cache entry table or boolean/nil.
+---@return string state Human-readable status string.
 function M.cache_state(cache)
   if cache == nil then return "nil" end
   if cache == false then return "false" end
@@ -107,8 +117,9 @@ function M.cache_state(cache)
   return type(cache)
 end
 
----@param details table
----@return string
+--- Serializes an extmark details dictionary into a compact key-value descriptor string.
+---@param details table Neovim extmark details dictionary.
+---@return string summary Formatted summary string.
 function M.extmark_details(details)
   local parts = {}
   if details.hl_group ~= nil then parts[#parts + 1] = "hl=" .. M.one_line(details.hl_group) end
@@ -122,9 +133,10 @@ function M.extmark_details(details)
   return table.concat(parts, " ")
 end
 
----@param buf integer
----@param row integer 1-based
----@return string[]
+--- Formats all extmarks on a specific buffer row across all active namespaces.
+---@param buf integer Status buffer handle.
+---@param row integer One-based buffer row index.
+---@return string[] lines Array of formatted extmark diagnostic lines.
 function M.extmarks_for_row(buf, row)
   local lines = {}
   local namespaces = vim.api.nvim_get_namespaces()
@@ -160,10 +172,11 @@ function M.extmarks_for_row(buf, row)
   return lines
 end
 
----@param win integer
----@param row integer 1-based
----@param line string
----@return string
+--- Inspects the screen grid cell for the first alphanumeric token on a line.
+---@param win integer Target window handle.
+---@param row integer One-based buffer line index.
+---@param line string Buffer line content string.
+---@return string diagnostic Diagnostic token and screen cell string.
 function M.first_token_cell(win, row, line)
   local start_col, end_col = line:find("[%a_][%w_]*")
   if not start_col then return "token=<none>" end
@@ -187,8 +200,9 @@ function M.first_token_cell(win, row, line)
   )
 end
 
----@param entry DiffReviewStatusEntry?
----@return string
+--- Serializes a status entry descriptor into a compact diagnostic string.
+---@param entry DiffReviewStatusEntry? Target status entry descriptor.
+---@return string diagnostic Formatted entry representation string.
 function M.entry(entry)
   if not entry then return "entry=nil" end
   local parts = {
@@ -210,9 +224,10 @@ function M.entry(entry)
   return table.concat(parts, " ")
 end
 
----@param state table
----@param filename string
----@return string[]
+--- Generates diagnostic lines for a file's syntax cache and Tree-sitter parser status.
+---@param state table Status session state table.
+---@param filename string Absolute file path string.
+---@return string[] lines Array of syntax diagnostic lines.
 function M.file_syntax(state, filename)
   local lines = {}
   if not filename or filename == "" then return lines end
@@ -243,8 +258,9 @@ function M.file_syntax(state, filename)
   return lines
 end
 
----@param buf integer
----@param reason string
+--- Debounces and writes an exhaustive debug state dump to the debug log file.
+---@param buf integer Status buffer handle.
+---@param reason string Diagnostic trigger reason string.
 function M.dump(buf, reason)
   if not M.enabled() then return end
   local state = session.states and session.states[buf] or (session.status and session.status.buf == buf and session.status) or nil

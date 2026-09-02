@@ -82,15 +82,19 @@ local status_section_order = {
   { name = "ignored", title = "Ignored changes", default_folded = true },
 }
 
+--- Resolves target status section name for a collected Git item.
+---@param item table Collected Git item descriptor.
+---@return "staged"|"unstaged" section_name Target section name string.
 local function status_section_for_item(item)
   local data = item.item or {}
   if data.staged then return "staged" end
   return "unstaged"
 end
 
----@param buf integer?
----@param file DiffReviewStatusFile
----@return integer?
+--- Retrieves sorting priority rank for a file from active walkthrough plan state.
+---@param buf integer? Status buffer handle.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@return integer? rank Walkthrough sort priority rank, or nil.
 function M._status_walkthrough_file_rank(buf, file)
   if not buf then return nil end
   local walkthrough = package.loaded["diff_review.views.walkthrough"]
@@ -100,14 +104,16 @@ function M._status_walkthrough_file_rank(buf, file)
   return nil
 end
 
----@param file DiffReviewStatusFile
----@return string
+--- Resolves string path sort key for ordering status file entries.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@return string key Path string sort key.
 function M._status_file_path_sort_key(file)
   return tostring((file and (file.relpath or file.filename)) or "")
 end
 
----@param buf integer?
----@param section DiffReviewStatusSection
+--- Sorts files within a section by walkthrough priority rank and alphabetical path.
+---@param buf integer? Status buffer handle.
+---@param section DiffReviewStatusSection Status section table.
 function M._status_sort_section_files(buf, section)
   if not (section and type(section.files) == "table") then return end
   local ranks = {}
@@ -122,16 +128,18 @@ function M._status_sort_section_files(buf, section)
   end)
 end
 
----@param buf integer?
----@param sections DiffReviewStatusSection[]
+--- Sorts files across all sections in a section array before rendering.
+---@param buf integer? Status buffer handle.
+---@param sections DiffReviewStatusSection[] Array of status sections.
 function M._status_sort_sections_for_render(buf, sections)
   for _, section in ipairs(sections or {}) do
     M._status_sort_section_files(buf, section)
   end
 end
 
----@param collected_items table[]
----@return DiffReviewStatusSection[]
+--- Assembles status sections, files, and hunks from collected Git items.
+---@param collected_items table[] Array of raw collected Git items.
+---@return DiffReviewStatusSection[] sections Array of populated and sorted sections.
 local function status_sections_from_items(collected_items)
   local sections = {} ---@type table<string, DiffReviewStatusSection>
   for _, section_config in ipairs(status_section_order) do
@@ -225,8 +233,9 @@ end
 ---@field default_status string
 ---@field files? DiffReviewStatusDiffProviderFile[]
 
----@param diff_text string
----@return table<string, DiffReviewDiffFileStatus>
+--- Parses git status flags and original path renames from unified diff headers.
+---@param diff_text string Unified diff text string.
+---@return table<string, DiffReviewDiffFileStatus> statuses Map from relative path to diff file status.
 function M._diff_file_statuses(diff_text)
   local statuses = {} ---@type table<string, DiffReviewDiffFileStatus>
   local current = nil ---@type { old_path?: string, new_path?: string, status?: string }?
@@ -302,10 +311,11 @@ function M._diff_file_statuses(diff_text)
   return statuses
 end
 
----@param cwd string
----@param provider DiffReviewStatusDiffProvider
----@param diff_text? string
----@return DiffReviewStatusFile[]
+--- Constructs status file descriptors and hunks for a diff provider.
+---@param cwd string Git repository root path.
+---@param provider DiffReviewStatusDiffProvider Diff provider configuration table.
+---@param diff_text? string Raw unified diff text.
+---@return DiffReviewStatusFile[] files Array of parsed status file descriptors.
 local function status_files_from_diff_provider(cwd, provider, diff_text)
   local files_by_name = {} ---@type table<string, DiffReviewStatusFile>
   local files_with_provider_stats = {} ---@type table<string, boolean>
@@ -385,10 +395,11 @@ local function status_files_from_diff_provider(cwd, provider, diff_text)
   return files
 end
 
----@param cwd string
----@param commit DiffReviewStatusCommit
----@param diff_text string
----@return DiffReviewStatusFile[]
+--- Parses status file descriptors for a specific commit diff.
+---@param cwd string Git repository root path.
+---@param commit DiffReviewStatusCommit Commit descriptor table.
+---@param diff_text string Unified diff text string.
+---@return DiffReviewStatusFile[] files Array of parsed status file descriptors.
 local function status_commit_files_from_diff(cwd, commit, diff_text)
   return status_files_from_diff_provider(cwd, {
     section_name = status_keys.commit_key(commit.oid),
@@ -396,33 +407,14 @@ local function status_commit_files_from_diff(cwd, commit, diff_text)
   }, diff_text)
 end
 
----@class DiffReviewReviewContextRecord
----@field raw string
----@field prefix string
----@field old_before integer
----@field new_before integer
----@field old_line? integer
----@field new_line? integer
----@field position integer
-
----@class DiffReviewReviewContextHunk
----@field context string
----@field records DiffReviewReviewContextRecord[]
-
-
-
-
-
-
-
-
-
----@param cwd string
----@param pr DiffReviewGhPR
----@param diff_text? string
----@param comments? DiffReviewGhPRCommentsResult
----@param local_comments? table[]
----@return DiffReviewStatusSection[]
+--- Builds full PR section list including reviews, issue comments, changes, and commits.
+---@param cwd string Git repository root path.
+---@param pr DiffReviewGhPR Pull request descriptor.
+---@param diff_text? string Raw unified diff text.
+---@param comments? DiffReviewGhPRCommentsResult Remote PR comments payload.
+---@param local_comments? table[] Array of local review comments.
+---@param local_issue_comments? table[] Array of local issue comments.
+---@return DiffReviewStatusSection[] sections Array of constructed PR sections.
 local function status_pr_sections(cwd, pr, diff_text, comments, local_comments, local_issue_comments)
   local provider_key = "pr:" .. tostring(pr.number)
   local change_sections, files = section_builder.sections_from_diff(cwd, {
@@ -467,9 +459,10 @@ end
 ---@field default_folded boolean
 ---@field limit? integer
 
----@param spec DiffReviewCommitLogSectionSpec
----@param output string[]
----@return DiffReviewStatusCommit[]
+--- Parses git log tabular output into status commit descriptors.
+---@param spec DiffReviewCommitLogSectionSpec Commit log specification table.
+---@param output string[] Output lines from git log command.
+---@return DiffReviewStatusCommit[] commits Array of parsed commit descriptor tables.
 local function status_commits_from_log_output(spec, output)
   local commits = {} ---@type DiffReviewStatusCommit[]
   for index, line in ipairs(output or {}) do
@@ -498,9 +491,10 @@ local function status_commits_from_log_output(spec, output)
   return commits
 end
 
----@param cwd string
----@param spec DiffReviewCommitLogSectionSpec
----@param cb fun(section?: DiffReviewStatusSection)
+--- Asynchronously executes git log and builds a commit log status section.
+---@param cwd string Git repository root path.
+---@param spec DiffReviewCommitLogSectionSpec Section specification table.
+---@param cb fun(section?: DiffReviewStatusSection) Completion callback receiving section or nil.
 local function status_commit_log_section_async(cwd, spec, cb)
   if #spec.args == 0 then
     cb(nil)
@@ -533,10 +527,11 @@ local function status_commit_log_section_async(cwd, spec, cb)
   end)
 end
 
----@param cwd string
----@param upstream string?
----@param branch string?
----@param cb fun(section?: DiffReviewStatusSection)
+--- Asynchronously builds the unmerged commits status section for upstream comparisons.
+---@param cwd string Git repository root path.
+---@param upstream string? Upstream branch reference string.
+---@param branch string? Current branch name string.
+---@param cb fun(section?: DiffReviewStatusSection) Completion callback receiving section or nil.
 local function status_unmerged_section_async(cwd, upstream, branch, cb)
   if not upstream or upstream == "" then
     cb(nil)
@@ -552,10 +547,11 @@ local function status_unmerged_section_async(cwd, upstream, branch, cb)
   }, cb)
 end
 
----@param cwd string
----@param upstream string?
----@param branch string?
----@param cb fun(section?: DiffReviewStatusSection)
+--- Asynchronously builds the recent commits status section.
+---@param cwd string Git repository root path.
+---@param upstream string? Optional upstream branch reference string.
+---@param branch string? Current branch name string.
+---@param cb fun(section?: DiffReviewStatusSection) Completion callback receiving section or nil.
 local function status_recent_commits_section_async(cwd, upstream, branch, cb)
   local args = { "-30" }
   if upstream and upstream ~= "" then
@@ -571,7 +567,8 @@ local function status_recent_commits_section_async(cwd, upstream, branch, cb)
   }, cb)
 end
 
----@return table<DiffReviewStatusSectionName, DiffReviewStatusSection>
+--- Constructs an empty section map table for standard status sections.
+---@return table<DiffReviewStatusSectionName, DiffReviewStatusSection> map Empty section map dictionary.
 local function status_empty_section_map()
   local sections = {}
   for _, section_config in ipairs(status_section_order) do
@@ -586,8 +583,9 @@ local function status_empty_section_map()
   return sections
 end
 
----@param sections DiffReviewStatusSection[]?
----@return table<DiffReviewStatusSectionName, DiffReviewStatusSection>
+--- Converts an array of status sections into a section map dictionary keyed by section name.
+---@param sections DiffReviewStatusSection[]? Array of status sections.
+---@return table<DiffReviewStatusSectionName, DiffReviewStatusSection> map Populated section map dictionary.
 local function status_section_map(sections)
   local section_map = status_empty_section_map()
   for _, section in ipairs(sections or {}) do
@@ -600,7 +598,8 @@ local function status_section_map(sections)
   return section_map
 end
 
----@param section DiffReviewStatusSection
+--- Rebuilds the `files_by_name` lookup index for a section.
+---@param section DiffReviewStatusSection Target status section table.
 local function status_reindex_section(section)
   section.files_by_name = {}
   for _, file in ipairs(section.files or {}) do
@@ -608,10 +607,11 @@ local function status_reindex_section(section)
   end
 end
 
----@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
----@param section_name DiffReviewStatusSectionName
----@param filename string
----@return DiffReviewStatusFile?
+--- Removes a file from a section in a section map.
+---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection> Section map dictionary.
+---@param section_name DiffReviewStatusSectionName Target section name.
+---@param filename string Absolute file path string.
+---@return DiffReviewStatusFile? file Removed file descriptor, or nil if not found.
 local function status_remove_file_from_section(section_map, section_name, filename)
   local section = section_map[section_name]
   if not section then return nil end
@@ -627,10 +627,11 @@ local function status_remove_file_from_section(section_map, section_name, filena
   return removed_file
 end
 
----@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
----@param source_sections DiffReviewStatusSection[]
----@param buf integer?
----@return DiffReviewStatusSection[]
+--- Sorts and flattens a section map into an ordered status section array.
+---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection> Section map dictionary.
+---@param source_sections DiffReviewStatusSection[] Original source section array.
+---@param buf integer? Status buffer handle.
+---@return DiffReviewStatusSection[] sections Ordered status section array.
 local function status_order_section_map(section_map, source_sections, buf)
   local ordered = {}
   local included_section = {}
@@ -668,8 +669,9 @@ local function status_order_section_map(section_map, source_sections, buf)
   return ordered
 end
 
----@param hunk DiffReviewHunk
----@return string
+--- Generates a stable deterministic fingerprint string for a diff hunk.
+---@param hunk DiffReviewHunk Diff hunk descriptor table.
+---@return string identity Deterministic hunk identity string.
 local function status_hunk_identity(hunk)
   if type(hunk.diff) == "string" and hunk.diff ~= "" then
     return "diff:" .. vim.fn.sha256(hunk.diff)
@@ -684,15 +686,17 @@ local function status_hunk_identity(hunk)
   }, "\31")
 end
 
----@param file DiffReviewStatusFile
----@return boolean
+--- Checks whether a status file represents an untracked or newly added file.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@return boolean is_added True if file is untracked or newly created.
 local function status_file_is_added(file)
   return file.untracked == true or git_data._git_status_is_added(file.git_status)
 end
 
----@param file DiffReviewStatusFile
----@param section_name DiffReviewStatusDisplaySectionName
----@return DiffReviewStatusFile
+--- Deep copies a status file descriptor and adapts its state for a new target section.
+---@param file DiffReviewStatusFile Source status file descriptor.
+---@param section_name DiffReviewStatusDisplaySectionName Destination section name.
+---@return DiffReviewStatusFile file Adapted clone of status file descriptor.
 local function status_copy_file_for_section(file, section_name)
   local copied_file = vim.deepcopy(file)
   copied_file.section_name = section_name
@@ -711,10 +715,11 @@ local function status_copy_file_for_section(file, section_name)
   return copied_file
 end
 
----@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
----@param section_name DiffReviewStatusStageSectionName
----@param file DiffReviewStatusFile
----@return DiffReviewStatusFile
+--- Retrieves or initializes a status file descriptor within a section in a section map.
+---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection> Section map dictionary.
+---@param section_name DiffReviewStatusStageSectionName Destination stage section name.
+---@param file DiffReviewStatusFile Source status file descriptor.
+---@return DiffReviewStatusFile file Created or updated file descriptor.
 local function status_ensure_file(section_map, section_name, file)
   local section = section_map[section_name]
   local existing_file = section.files_by_name[file.filename]
@@ -752,9 +757,10 @@ local function status_ensure_file(section_map, section_name, file)
   return existing_file
 end
 
----@param file DiffReviewStatusFile
----@param hunk DiffReviewHunk
----@return boolean
+--- Appends a diff hunk to a file if not already present and updates line count statistics.
+---@param file DiffReviewStatusFile Target status file descriptor.
+---@param hunk DiffReviewHunk Diff hunk descriptor table.
+---@return boolean appended True if hunk was appended.
 local function status_append_hunk_to_file(file, hunk)
   for _, existing_hunk in ipairs(file.hunks or {}) do
     if status_hunk_identity(existing_hunk) == status_hunk_identity(hunk) then return false end
@@ -766,9 +772,10 @@ local function status_append_hunk_to_file(file, hunk)
   return true
 end
 
----@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection>
----@param section_name DiffReviewStatusSectionName
----@param file DiffReviewStatusFile
+--- Merges a file descriptor and its hunks into a designated section within a section map.
+---@param section_map table<DiffReviewStatusSectionName, DiffReviewStatusSection> Section map dictionary.
+---@param section_name DiffReviewStatusSectionName Destination section name.
+---@param file DiffReviewStatusFile Status file descriptor to merge.
 local function status_merge_file_into_section(section_map, section_name, file)
   local section = section_map[section_name]
   local existing_file = section.files_by_name[file.filename]
@@ -796,10 +803,10 @@ local function status_merge_file_into_section(section_map, section_name, file)
   end
 end
 
---- Build a semantic status move from rendered entries before their tables can change.
----@param entries DiffReviewStatusEntry[]
----@param target_section DiffReviewStatusStageSectionName
----@return DiffReviewStatusMove
+--- Constructs a semantic status move descriptor from visual or cursor selection entries.
+---@param entries DiffReviewStatusEntry[] Selected status entries.
+---@param target_section DiffReviewStatusStageSectionName Destination stage section (`"staged"` or `"unstaged"`).
+---@return DiffReviewStatusMove move Captured semantic move descriptor.
 function M.capture_move(entries, target_section)
   assert(target_section == "unstaged" or target_section == "staged", "status move target must be staged or unstaged")
   local selection_list = {} ---@type DiffReviewStatusMoveSelection[]
@@ -835,11 +842,11 @@ function M.capture_move(entries, target_section)
   return { target_section = target_section, selection_list = selection_list }
 end
 
---- Build a projected section model from one semantic move, preserving the input baseline.
----@param sections DiffReviewStatusSection[]
----@param move DiffReviewStatusMove
----@param buf? integer
----@return DiffReviewStatusSection[]
+--- Replays a semantic move across section models, generating an optimistic projection.
+---@param sections DiffReviewStatusSection[] Source baseline sections.
+---@param move DiffReviewStatusMove Semantic move descriptor.
+---@param buf? integer Optional status buffer handle.
+---@return DiffReviewStatusSection[] sections Projected status section array.
 function M.apply_move(sections, move, buf)
   local source_sections = vim.deepcopy(sections or {})
   local mapped_section = status_section_map(source_sections)
@@ -878,14 +885,16 @@ function M.apply_move(sections, move, buf)
   return status_order_section_map(mapped_section, source_sections, buf)
 end
 
----@param path string
----@return string
+--- Normalizes a filesystem path string to use standard forward slashes.
+---@param path string File path string.
+---@return string path Normalized path string.
 local function status_normalized_path(path)
   return vim.fs.normalize(path):gsub("\\", "/")
 end
 
----@param affected_path_set DiffReviewAffectedPathSet
----@return DiffReviewAffectedPathSet
+--- Builds a dual-indexed normalized path dictionary from an affected path set.
+---@param affected_path_set DiffReviewAffectedPathSet Set of affected relative or absolute paths.
+---@return DiffReviewAffectedPathSet normalized Normalized affected path set.
 local function status_normalized_path_set(affected_path_set)
   local normalized_path_set = {} ---@type DiffReviewAffectedPathSet
   for path, affected in pairs(affected_path_set or {}) do
@@ -897,18 +906,19 @@ local function status_normalized_path_set(affected_path_set)
   return normalized_path_set
 end
 
----@param file DiffReviewStatusFile
----@param normalized_path_set DiffReviewAffectedPathSet
----@return boolean
+--- Checks whether a file matches any entry in a normalized affected path set.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@param normalized_path_set DiffReviewAffectedPathSet Normalized path set.
+---@return boolean affected True if file path is present in the set.
 local function status_file_path_is_affected(file, normalized_path_set)
   return normalized_path_set[file.filename] == true or normalized_path_set[status_normalized_path(file.filename)] == true
 end
 
---- Merge authoritative files for selected paths while preserving every unrelated section entry.
----@param confirmed_sections DiffReviewStatusSection[]
----@param snapshot_sections DiffReviewStatusSection[]
----@param affected_path_set DiffReviewAffectedPathSet
----@return DiffReviewStatusSection[]
+--- Merges authoritative files for selected paths while preserving every unrelated section entry.
+---@param confirmed_sections DiffReviewStatusSection[] Existing confirmed baseline sections.
+---@param snapshot_sections DiffReviewStatusSection[] Fresh authoritative snapshot sections.
+---@param affected_path_set DiffReviewAffectedPathSet Set of affected paths to replace.
+---@return DiffReviewStatusSection[] sections Updated status sections array.
 function M.replace_paths(confirmed_sections, snapshot_sections, affected_path_set)
   local source_sections = vim.deepcopy(confirmed_sections or {})
   local mapped_section = status_section_map(source_sections)
@@ -934,16 +944,17 @@ function M.replace_paths(confirmed_sections, snapshot_sections, affected_path_se
   return status_order_section_map(mapped_section, source_sections, nil)
 end
 
----@param path string
----@return string
+--- Normalizes a relative file path string by replacing backslashes and removing leading `./`.
+---@param path string File path string.
+---@return string normalized Normalized relative path string.
 local function status_normalized_relative_path(path)
   return (tostring(path or ""):gsub("\\", "/"):gsub("^%./", ""))
 end
 
---- Move complete unstaged files into the virtual Ignored section by repository-relative path.
----@param section_list DiffReviewStatusSection[]
----@param ignored_path_set table<string, boolean>
----@return DiffReviewStatusSection[]
+--- Moves matching unstaged files into the virtual Ignored section by repository-relative path.
+---@param section_list DiffReviewStatusSection[] Array of status sections.
+---@param ignored_path_set table<string, boolean> Set of relative paths to ignore.
+---@return DiffReviewStatusSection[] sections Updated array of status sections.
 function M.apply_ignored_paths(section_list, ignored_path_set)
   local source_sections = vim.deepcopy(section_list or {})
   local mapped_section = status_section_map(source_sections)
@@ -963,10 +974,11 @@ function M.apply_ignored_paths(section_list, ignored_path_set)
   return status_order_section_map(mapped_section, source_sections, nil)
 end
 
----@param file_snapshot DiffReviewPathStatusFileSnapshot
----@param section_name DiffReviewStatusStageSectionName
----@param hunk_list DiffReviewHunk[]
----@return DiffReviewStatusFile
+--- Converts a path status file snapshot into a renderable status file descriptor.
+---@param file_snapshot DiffReviewPathStatusFileSnapshot File snapshot record.
+---@param section_name DiffReviewStatusStageSectionName Target stage section name.
+---@param hunk_list DiffReviewHunk[] Array of diff hunks.
+---@return DiffReviewStatusFile file Renderable status file descriptor.
 local function status_file_from_snapshot(file_snapshot, section_name, hunk_list)
   local status_record = file_snapshot.status_record or {}
   local preview_provided = (section_name == "staged" and file_snapshot.staged_preview or file_snapshot.unstaged_preview) ~= nil
@@ -1017,9 +1029,9 @@ local function status_file_from_snapshot(file_snapshot, section_name, hunk_list)
   return file
 end
 
---- Build authoritative stage and unstage sections from a path status snapshot.
----@param snapshot DiffReviewPathStatusSnapshot
----@return DiffReviewStatusSection[]
+--- Builds authoritative stage and unstage sections from a path status snapshot.
+---@param snapshot DiffReviewPathStatusSnapshot Snapshot record from Git collector.
+---@return DiffReviewStatusSection[] sections Populated stage and unstage sections.
 function M.sections_from_snapshot(snapshot)
   local mapped_section = status_empty_section_map()
   for _, file_snapshot in ipairs(snapshot.file_list or {}) do
@@ -1038,8 +1050,9 @@ function M.sections_from_snapshot(snapshot)
   return status_order_section_map(mapped_section, {}, nil)
 end
 
----@param hunk DiffReviewHunk
----@return DiffReviewStatusSemanticHunk
+--- Converts a diff hunk into a normalized semantic hunk record for structural comparisons.
+---@param hunk DiffReviewHunk Diff hunk descriptor.
+---@return DiffReviewStatusSemanticHunk record Normalized semantic hunk record.
 local function status_semantic_hunk(hunk)
   return {
     identity = status_hunk_identity(hunk),
@@ -1054,8 +1067,9 @@ local function status_semantic_hunk(hunk)
   }
 end
 
----@param file DiffReviewStatusFile
----@return DiffReviewStatusSemanticFile
+--- Converts a status file into a normalized semantic file record for structural comparisons.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@return DiffReviewStatusSemanticFile record Normalized semantic file record.
 local function status_semantic_file(file)
   local semantic_hunk_list = {} ---@type DiffReviewStatusSemanticHunk[]
   for _, hunk in ipairs(file.hunks or {}) do
@@ -1078,8 +1092,9 @@ local function status_semantic_file(file)
   }
 end
 
----@param sections DiffReviewStatusSection[]
----@return DiffReviewStatusSemanticSectionMap
+--- Builds a normalized semantic section map for verifying data equivalence between models.
+---@param sections DiffReviewStatusSection[] Array of status sections.
+---@return DiffReviewStatusSemanticSectionMap map Dictionary of semantic file records by section.
 local function status_semantic_section_map(sections)
   local semantic_section_map = { unstaged = {}, staged = {}, ignored = {} } ---@type DiffReviewStatusSemanticSectionMap
   for _, section in ipairs(sections or {}) do
@@ -1096,25 +1111,27 @@ local function status_semantic_section_map(sections)
   return semantic_section_map
 end
 
---- Validate equivalent staged, unstaged, and ignored data while ignoring render-owned metadata.
----@param left_sections DiffReviewStatusSection[]
----@param right_sections DiffReviewStatusSection[]
----@return boolean
+--- Validates data equivalence between two status section models while ignoring presentation state.
+---@param left_sections DiffReviewStatusSection[] First section model array.
+---@param right_sections DiffReviewStatusSection[] Second section model array.
+---@return boolean equivalent True if both models hold identical file and hunk data.
 function M.equivalent(left_sections, right_sections)
   return vim.deep_equal(status_semantic_section_map(left_sections), status_semantic_section_map(right_sections))
 end
 
----@param sections DiffReviewStatusSection[]?
----@param entries DiffReviewStatusEntry[]
----@param target_section DiffReviewStatusStageSectionName
----@return DiffReviewStatusSection[]?
+--- Helper capturing and applying an optimistic status move across section models.
+---@param sections DiffReviewStatusSection[]? Baseline status sections.
+---@param entries DiffReviewStatusEntry[] Selected entries being moved.
+---@param target_section DiffReviewStatusStageSectionName Destination stage section (`"staged"` or `"unstaged"`).
+---@return DiffReviewStatusSection[]? sections Projected status sections, or nil.
 local function status_apply_optimistic_move(sections, entries, target_section)
   if not sections then return nil end
   return M.apply_move(sections, M.capture_move(entries, target_section), session.status and session.status.buf or nil)
 end
 
----@param cwd string
----@param cb fun(result: DiffReviewStatusLoadResult)
+--- Asynchronously coordinates Git status snapshot collection, head information, and section building.
+---@param cwd string Git repository root path.
+---@param cb fun(result: DiffReviewStatusLoadResult) Callback receiving success result or failure error.
 local function status_load_async(cwd, cb)
   local head_lines = nil
   local head_values = nil

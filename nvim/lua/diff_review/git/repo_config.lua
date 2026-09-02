@@ -7,17 +7,20 @@ local config = require("diff_review.infra.config")
 ---@field reader? fun(path: string): string? test seam returning file contents
 local M = { reader = nil }
 
----@param fn fun(path: string): string? test seam returning file contents
+--- Installs a custom file reading function for test isolation.
+---@param fn (fun(path: string): string?)? Custom file reader function.
 function M.set_reader(fn)
   M.reader = fn
 end
 
+--- Clears the custom file reader override and restores direct filesystem access.
 function M.reset_reader()
   M.reader = nil
 end
 
----@param cwd string repo root
----@return DiffReviewRepoConfig
+--- Reads and parses the `.diffreview.json` repository configuration file.
+---@param cwd string Repository root directory path.
+---@return DiffReviewRepoConfig config Decoded repository configuration table.
 function M.read(cwd)
   local path = (cwd:gsub("[/\\]+$", "")) .. "/.diffreview.json"
   local content
@@ -36,8 +39,9 @@ function M.read(cwd)
   return {}
 end
 
----@param cwd string repo root
----@return string
+--- Resolves the branch name prefix for a repository, falling back to global options.
+---@param cwd string Repository root directory path.
+---@return string prefix Branch name prefix string.
 function M.branch_prefix(cwd)
   local repo = M.read(cwd)
   if type(repo.branch_prefix) == "string" and repo.branch_prefix ~= "" then

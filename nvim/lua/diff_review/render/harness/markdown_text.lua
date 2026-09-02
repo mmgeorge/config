@@ -2,9 +2,9 @@ local blocks = require("markdown_math.blocks")
 
 local M = {}
 
----Normalize generated Markdown math into nodes recognized by the Markdown parser.
----@param text string
----@return string
+--- Normalizes generated Markdown math delimiters into standard blocks parsed by Tree-sitter.
+---@param text string Raw Markdown text string.
+---@return string normalized Normalized Markdown text string.
 function M.normalize_math(text)
   return blocks.normalize(text)
 end

@@ -35,15 +35,17 @@ local state_by_key = {}
 local data_dir_for_test = nil ---@type string?
 local io_for_test = nil ---@type DiffReviewIgnoredPathIo?
 
----@param root string
----@return string
+--- Normalizes a repository root path into a canonical cache key.
+---@param root string Git repository root path.
+---@return string key Canonical root key string.
 local function root_key(root)
   local normalized = paths.normalize_path(root):gsub("\\", "/")
   return vim.fn.has("win32") == 1 and normalized:lower() or normalized
 end
 
----@param path string
----@return string?
+--- Normalizes and validates a relative repository file path.
+---@param path string Relative file path string.
+---@return string? normalized Clean relative path, or nil if invalid.
 local function normalize_relative_path(path)
   if type(path) ~= "string" or path == "" or path:find("\0", 1, true) then return nil end
   local normalized = path:gsub("\\", "/"):gsub("^%./", "")
@@ -52,8 +54,9 @@ local function normalize_relative_path(path)
   return normalized
 end
 
----@param path_list string[]
----@return string[]
+--- Sorts and removes duplicates from a list of relative repository paths.
+---@param path_list string[] Array of relative path strings.
+---@return string[] normalized_list Sorted and de-duplicated path array.
 local function normalize_path_list(path_list)
   local normalized_list = {}
   local seen_path = {}
@@ -68,8 +71,9 @@ local function normalize_path_list(path_list)
   return normalized_list
 end
 
----@param root string
----@return DiffReviewIgnoredPathState
+--- Obtains or initializes the in-memory ignored path state record for a repository root.
+---@param root string Git repository root path.
+---@return DiffReviewIgnoredPathState state Store state record.
 local function state_for_root(root)
   local key = root_key(root)
   local state = state_by_key[key]
@@ -90,21 +94,26 @@ local function state_for_root(root)
   return state
 end
 
----@param root string
----@return string
+--- Resolves the JSON persistence file path for a repository root.
+---@param root string Git repository root path.
+---@return string path Absolute JSON file path.
 local function store_path(root)
   local directory = data_dir_for_test
     or vim.fs.joinpath(vim.fn.stdpath("data"), "diff-review", "status-ignored")
   return vim.fs.joinpath(directory, vim.fn.sha256(root_key(root)) .. ".json")
 end
 
----@param callback fun(content?: string, error?: string)
+--- Dispatches asynchronous read callback to the Neovim main event loop.
+---@param callback fun(content?: string, error?: string) Read completion callback.
+---@param content? string File content string.
+---@param error? string Error message string.
 local function schedule_read_result(callback, content, error)
   vim.schedule(function() callback(content, error) end)
 end
 
----@param path string
----@param callback fun(content?: string, error?: string)
+--- Asynchronously reads file contents via libuv filesystem APIs.
+---@param path string Target file path.
+---@param callback fun(content?: string, error?: string) Completion callback.
 local function read_async(path, callback)
   vim.uv.fs_open(path, "r", 438, function(open_error, descriptor)
     if open_error then
@@ -136,14 +145,17 @@ local function read_async(path, callback)
   end)
 end
 
----@param callback fun(error?: string)
+--- Dispatches asynchronous write callback to the Neovim main event loop.
+---@param callback fun(error?: string) Write completion callback.
+---@param error? string Error message string.
 local function schedule_write_result(callback, error)
   vim.schedule(function() callback(error) end)
 end
 
----@param path string
----@param content string
----@param callback fun(error?: string)
+--- Writes file contents atomically via temporary file creation, fsync, and atomic rename.
+---@param path string Target destination path.
+---@param content string File content string.
+---@param callback fun(error?: string) Completion callback.
 local function write_atomic_async(path, content, callback)
   local directory = vim.fs.dirname(path)
   local directory_ok, directory_error = pcall(vim.fn.mkdir, directory, "p")
@@ -195,7 +207,8 @@ local function write_atomic_async(path, content, callback)
   end)
 end
 
----@return DiffReviewIgnoredPathIo
+--- Returns the active or test-injected I/O backend adapter.
+---@return DiffReviewIgnoredPathIo io Active I/O backend table.
 local function io_backend()
   return io_for_test or {
     read_async = read_async,
@@ -203,8 +216,9 @@ local function io_backend()
   }
 end
 
----@param state DiffReviewIgnoredPathState
----@return string
+--- Serializes in-memory ignored path state to a JSON string payload.
+---@param state DiffReviewIgnoredPathState In-memory state record.
+---@return string json Serialized JSON string.
 local function encode_state(state)
   local ignored_path_list = {}
   for path in pairs(state.ignored_path_set) do ignored_path_list[#ignored_path_list + 1] = path end
@@ -216,7 +230,8 @@ local function encode_state(state)
   } --[[@as DiffReviewIgnoredPathPayload]])
 end
 
----@param state DiffReviewIgnoredPathState
+--- Debounces and triggers atomic asynchronous disk persistence for dirty state.
+---@param state DiffReviewIgnoredPathState Target store state record.
 local function request_write(state)
   state.write_generation = state.write_generation + 1
   state.write_pending = true
@@ -248,9 +263,11 @@ local function request_write(state)
   start_write()
 end
 
----@param state DiffReviewIgnoredPathState
----@param content? string
----@return boolean, string?
+--- Parses and validates JSON payload into in-memory ignored path state.
+---@param state DiffReviewIgnoredPathState Target store state record.
+---@param content? string Raw JSON string content.
+---@return boolean ok True if payload was successfully parsed.
+---@return string? error Error message string if validation failed.
 local function decode_state(state, content)
   if content == nil or content == "" then return true, nil end
   local decode_ok, payload = pcall(vim.json.decode, content)
@@ -267,8 +284,9 @@ local function decode_state(state, content)
   return true, nil
 end
 
----@param state DiffReviewIgnoredPathState
----@param ok boolean
+--- Resolves all queued asynchronous load waiters with the completion status.
+---@param state DiffReviewIgnoredPathState Target store state record.
+---@param ok boolean True if load succeeded.
 local function finish_load(state, ok)
   state.loading = false
   state.loaded = true
@@ -277,9 +295,9 @@ local function finish_load(state, ok)
   for _, waiter in ipairs(waiter_list) do waiter(ok) end
 end
 
---- Load one worktree's ignored paths without blocking the first status render.
----@param root string
----@param callback fun(ok: boolean)
+--- Loads a worktree's persistent ignored paths asynchronously without blocking the initial status render.
+---@param root string Git repository root path.
+---@param callback fun(ok: boolean) Callback invoked when load finishes.
 function M.load_async(root, callback)
   local state = state_for_root(root)
   if state.loaded then
@@ -303,8 +321,9 @@ function M.load_async(root, callback)
   end)
 end
 
----@param state DiffReviewIgnoredPathState
----@return table<string, boolean>
+--- Returns the set of effective ignored paths after filtering out active stage suppressions.
+---@param state DiffReviewIgnoredPathState Target store state record.
+---@return table<string, boolean> set Effective ignored paths dictionary.
 local function effective_path_set(state)
   local effective = vim.deepcopy(state.ignored_path_set)
   for _, suppressed_path_set in pairs(state.suppression_by_token) do
@@ -313,17 +332,18 @@ local function effective_path_set(state)
   return effective
 end
 
---- Project durable ignored paths over the Git and optimistic section model.
----@param root string
----@param section_list DiffReviewStatusSection[]
----@return DiffReviewStatusSection[]
+--- Projects durable ignored paths into the status section model, creating the virtual Ignored section.
+---@param root string Git repository root path.
+---@param section_list DiffReviewStatusSection[] Array of status sections.
+---@return DiffReviewStatusSection[] sections Updated array of status sections.
 function M.project(root, section_list)
   return section_map.apply_ignored_paths(section_list, effective_path_set(state_for_root(root)))
 end
 
----@param root string
----@param path_list string[]
----@return boolean changed
+--- Adds relative file paths to the persistent ignored set and triggers persistence.
+---@param root string Git repository root path.
+---@param path_list string[] Array of relative paths to ignore.
+---@return boolean changed True if the set of ignored paths was modified.
 function M.ignore_paths(root, path_list)
   local state = state_for_root(root)
   local changed = false
@@ -337,9 +357,10 @@ function M.ignore_paths(root, path_list)
   return changed
 end
 
----@param root string
----@param path_list string[]
----@return boolean changed
+--- Removes relative file paths from the persistent ignored set and triggers persistence.
+---@param root string Git repository root path.
+---@param path_list string[] Array of relative paths to unignore.
+---@return boolean changed True if any path was removed from the set.
 function M.unignore_paths(root, path_list)
   local state = state_for_root(root)
   local changed = false
@@ -353,20 +374,20 @@ function M.unignore_paths(root, path_list)
   return changed
 end
 
---- Suppress ignored markers while their whole-file stage mutations remain unresolved.
----@param root string
----@param token string|integer
----@param path_list string[]
+--- Suppresses ignored markers while their whole-file stage mutations remain pending.
+---@param root string Git repository root path.
+---@param token string|integer Unique stage transaction token.
+---@param path_list string[] Array of relative paths being staged.
 function M.begin_stage(root, token, path_list)
   local suppressed_path_set = {}
   for _, path in ipairs(normalize_path_list(path_list)) do suppressed_path_set[path] = true end
   state_for_root(root).suppression_by_token[tostring(token)] = suppressed_path_set
 end
 
---- Retire one stage suppression and delete markers only for targets Git completed.
----@param root string
----@param token string|integer
----@param completed_path_list string[]
+--- Retires one stage suppression and removes markers only for targets Git completed.
+---@param root string Git repository root path.
+---@param token string|integer Stage transaction token.
+---@param completed_path_list string[] Array of successfully staged paths.
 function M.finish_stage(root, token, completed_path_list)
   local state = state_for_root(root)
   state.suppression_by_token[tostring(token)] = nil
@@ -380,23 +401,25 @@ function M.finish_stage(root, token, completed_path_list)
   if changed then request_write(state) end
 end
 
----@param root string
----@param token string|integer
+--- Cancels a stage suppression token and restores ignored status for pending paths.
+---@param root string Git repository root path.
+---@param token string|integer Stage transaction token.
 function M.cancel_stage(root, token)
   state_for_root(root).suppression_by_token[tostring(token)] = nil
 end
 
----@param root string
----@param path string
----@return boolean
+--- Checks whether a relative path is present in the persistent ignored set.
+---@param root string Git repository root path.
+---@param path string Relative file path string.
+---@return boolean exists True if the path is ignored.
 function M.contains(root, path)
   local normalized = normalize_relative_path(path)
   return normalized ~= nil and state_for_root(root).ignored_path_set[normalized] == true
 end
 
---- Load and return the effective ignored path list for repository consumers.
----@param root string
----@param callback fun(path_list: string[]?)
+--- Asynchronously retrieves the sorted list of effective ignored paths.
+---@param root string Git repository root path.
+---@param callback fun(path_list: string[]?) Callback receiving the path list or nil on error.
 function M.paths_async(root, callback)
   M.load_async(root, function(loaded)
     if not loaded then
@@ -409,16 +432,19 @@ function M.paths_async(root, callback)
   end)
 end
 
----@param path? string
+--- Overrides data directory path for unit test isolation.
+---@param path? string Custom data directory path.
 function M.set_data_dir_for_test(path)
   data_dir_for_test = path
 end
 
----@param backend? DiffReviewIgnoredPathIo
+--- Injects a custom I/O backend for testing filesystem failures.
+---@param backend? DiffReviewIgnoredPathIo Custom I/O adapter.
 function M.set_io_for_test(backend)
   io_for_test = backend
 end
 
+--- Resets all in-memory store states and test overrides.
 function M.reset_for_test()
   state_by_key = {}
   data_dir_for_test = nil

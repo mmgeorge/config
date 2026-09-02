@@ -16,19 +16,24 @@ local status_helpers = require("diff_review.views.status.status_helpers")
 --- current singleton, so issue edits target the right buffer's state.
 ---@param buf integer
 ---@return table?
+--- Resolves the status session state for a buffer handle from session registry or singleton.
+---@param buf integer Status buffer handle.
+---@return table? status Status session state table or nil.
 local function status_for_buf(buf)
   return session.states and session.states[buf] or session.status
 end
 
----@param cwd string?
----@return string?
+--- Computes the absolute `.gitstatus` file path for a repository working directory.
+---@param cwd string? Repository working directory path.
+---@return string? path Full file path or nil.
 function M.path(cwd)
   if not cwd or cwd == "" then return nil end
   return vim.fs.joinpath(cwd, ".gitstatus")
 end
 
----@param values any
----@return integer[]
+--- Deduplicates, sorts, and filters positive integer issue numbers.
+---@param values any Raw value or array of issue numbers.
+---@return integer[] numbers Sorted array of unique positive issue numbers.
 function M.normalize_numbers(values)
   local numbers = {}
   local seen = {}
@@ -44,8 +49,9 @@ function M.normalize_numbers(values)
   return numbers
 end
 
----@param line string?
----@return integer[]
+--- Parses issue numbers from an edited "Issues:" line string.
+---@param line string? Raw line content string.
+---@return integer[] numbers Normalized array of extracted issue numbers.
 function M.parse_line(line)
   local body = tostring(line or ""):gsub("^%s*Issues:%s*", "")
   body = vim.trim(body)
@@ -67,8 +73,9 @@ function M.parse_line(line)
   return M.normalize_numbers(values)
 end
 
----@param numbers integer[]?
----@return string
+--- Formats a sorted list of issue numbers into a display string.
+---@param numbers integer[]? Array of issue numbers.
+---@return string text Formatted display string.
 function M.text(numbers)
   numbers = M.normalize_numbers(numbers)
   if #numbers == 0 then return "none" end
@@ -79,9 +86,10 @@ function M.text(numbers)
   return table.concat(parts, " ")
 end
 
----@param left integer[]?
----@param right integer[]?
----@return boolean
+--- Compares two issue number lists for exact equality.
+---@param left integer[]? First array of issue numbers.
+---@param right integer[]? Second array of issue numbers.
+---@return boolean equal True if both lists normalize to identical numbers.
 function M.equal(left, right)
   left = M.normalize_numbers(left)
   right = M.normalize_numbers(right)
@@ -92,8 +100,9 @@ function M.equal(left, right)
   return true
 end
 
----@param cwd string
----@return table
+--- Reads and decodes issue numbers from the `.gitstatus` persistence file.
+---@param cwd string Repository working directory path.
+---@return table state Issues state descriptor table.
 function M.read_state(cwd)
   local path = M.path(cwd)
   if not path or vim.fn.filereadable(path) ~= 1 then
@@ -117,9 +126,10 @@ function M.read_state(cwd)
   return { cwd = cwd, numbers = numbers, saved_numbers = vim.deepcopy(numbers), data = decoded }
 end
 
----@param status table?
----@param cwd string?
----@return table?
+--- Retrieves or initializes the issues state cache on a status session.
+---@param status table? Status session state table.
+---@param cwd string? Repository working directory path.
+---@return table? state Issues state descriptor table or nil.
 function M.ensure_state(status, cwd)
   if not (status and cwd and cwd ~= "") then return nil end
   if status.issues and status.issues.cwd == cwd then return status.issues end
@@ -127,11 +137,12 @@ function M.ensure_state(status, cwd)
   return status.issues
 end
 
----@param cwd string
----@param numbers integer[]
----@param existing table?
----@return boolean
----@return string?
+--- Writes updated issue numbers back to the `.gitstatus` persistence file.
+---@param cwd string Repository working directory path.
+---@param numbers integer[] Array of issue numbers to persist.
+---@param existing table? Optional existing decoded JSON table to preserve extra keys.
+---@return boolean ok True on successful write.
+---@return string? error Error message string on failure.
 function M.write(cwd, numbers, existing)
   local path = M.path(cwd)
   if not path then return false, "missing git root" end
@@ -153,8 +164,9 @@ function M.write(cwd, numbers, existing)
   return true, nil
 end
 
----@param issues_state table?
----@return DiffReviewStatusHeadLine
+--- Constructs a structured "Issues:" head line descriptor with interactive entry.
+---@param issues_state table? Active issues state table.
+---@return DiffReviewStatusHeadLine line Structured Issues head line descriptor.
 function M.head_line(issues_state)
   local numbers = issues_state and issues_state.numbers or {}
   local text = M.text(numbers)
@@ -167,8 +179,9 @@ function M.head_line(issues_state)
   }
 end
 
----@param status table
----@param head_line DiffReviewStatusHeadLine
+--- Replaces the cached "Issues:" line descriptor in status session.
+---@param status table Status session state table.
+---@param head_line DiffReviewStatusHeadLine New structured Issues head line descriptor.
 function M.replace_head_line(status, head_line)
   if not (status and status.head_lines) then return end
   for index, line in ipairs(status.head_lines) do
@@ -179,8 +192,9 @@ function M.replace_head_line(status, head_line)
   end
 end
 
----@param buf integer
----@return boolean
+--- Patches the "Issues:" line in-place within an active status buffer.
+---@param buf integer Status buffer handle.
+---@return boolean patched True if line was replaced successfully.
 function M.patch_line(buf)
   local status = status_for_buf(buf)
   if not status then return false end
@@ -189,8 +203,9 @@ function M.patch_line(buf)
   return status_helpers.status_patch_head_line(buf, "issues", head_line)
 end
 
----@param buf integer
----@return integer?
+--- Finds the 1-based buffer row index containing the "Issues:" line.
+---@param buf integer Status buffer handle.
+---@return integer? row One-based line index or nil.
 function M.row(buf)
   local status = status_for_buf(buf)
   if status and status.entries then
@@ -206,29 +221,33 @@ function M.row(buf)
   return nil
 end
 
----@param buf integer
----@return string
+--- Retrieves raw text content of the "Issues:" line in a buffer.
+---@param buf integer Status buffer handle.
+---@return string text Current line text string.
 function M.current_line(buf)
   local row = M.row(buf)
   if not row then return "" end
   return vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1] or ""
 end
 
----@param buf integer
----@return integer[]
+--- Parses issue numbers currently written in a status buffer.
+---@param buf integer Status buffer handle.
+---@return integer[] numbers Normalized array of extracted issue numbers.
 function M.current_numbers(buf)
   return M.parse_line(M.current_line(buf))
 end
 
----@param buf integer
----@return boolean
+--- Checks whether the window cursor is currently situated on the issues row.
+---@param buf integer Status buffer handle.
+---@return boolean on_row True if active cursor is on the issues line.
 function M.cursor_on_row(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
   local row = M.row(buf)
   return row ~= nil and vim.api.nvim_win_get_cursor(0)[1] == row
 end
 
----@param buf integer
+--- Updates buffer modified flag based on unsaved changes to the issues line.
+---@param buf integer Status buffer handle.
 function M.refresh_modified(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if vim.b[buf].diff_review_status_rendering then return end
@@ -239,7 +258,8 @@ function M.refresh_modified(buf)
   vim.bo[buf].modified = not M.equal(M.current_numbers(buf), saved_numbers)
 end
 
----@param buf integer
+--- Sets buffer modifiable property dynamically when cursor rests on the issues row.
+---@param buf integer Status buffer handle.
 function M.sync_modifiable(buf)
   return trace.span("status_issues.sync_modifiable", buf, nil, function()
     if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
@@ -250,7 +270,8 @@ function M.sync_modifiable(buf)
   end)
 end
 
----@param buf integer
+--- Persists edited issue numbers to disk and synchronizes buffer modifiable state.
+---@param buf integer Status buffer handle.
 function M.save(buf)
   local status = status_for_buf(buf)
   if not (status and status.view_kind == "status" and status.cwd) then
@@ -277,7 +298,8 @@ function M.save(buf)
   M.sync_modifiable(buf)
 end
 
----@param buf integer
+--- Attaches autocommands and buffer options for editable issues head line behavior.
+---@param buf integer Status buffer handle.
 function M.attach(buf)
   if vim.b[buf].diff_review_status_issues_attached then return end
   vim.b[buf].diff_review_status_issues_attached = true

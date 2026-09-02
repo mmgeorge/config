@@ -18,8 +18,9 @@ local status_snapshot = require("diff_review.git.status_snapshot")
 
 local M = {}
 
----@param content string
----@return string[]
+--- Splits raw content text into an array of lines.
+---@param content string Raw text content string.
+---@return string[] lines Array of line strings.
 local function content_line_list(content)
   if content == "" then return {} end
   local line_list = {}
@@ -36,11 +37,12 @@ local function content_line_list(content)
   return line_list
 end
 
----@param path string
----@param content string
----@param added boolean
----@param mode? string
----@return string|false
+--- Generates a synthetic unified diff patch for an added or deleted file.
+---@param path string Relative file path string.
+---@param content string File body content string.
+---@param added boolean True if file was added, false if deleted.
+---@param mode? string File mode string.
+---@return string|false patch Synthetic diff text string, or false if content was empty.
 local function synthetic_file_patch(path, content, added, mode)
   local line_list = content_line_list(content)
   if #line_list == 0 then return false end
@@ -62,8 +64,9 @@ local function synthetic_file_patch(path, content, added, mode)
   return table.concat(diff_line_list, "\n")
 end
 
----@param message string
----@return DiffReviewFileBodyResult
+--- Constructs an error result descriptor for failed body resolution.
+---@param message string Error description string.
+---@return DiffReviewFileBodyResult result Formatted error outcome table.
 local function error_result(message)
   return {
     state = "error",
@@ -77,9 +80,10 @@ local function error_result(message)
   }
 end
 
----@param file DiffReviewStatusFile
----@param content string
----@return DiffReviewFileBodyResult
+--- Converts raw file text into a parsed preview result structure.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param content string Raw file content string.
+---@return DiffReviewFileBodyResult result Populated file body result table.
 local function content_result(file, content)
   if content:find("\0", 1, true) then
     return {
@@ -125,9 +129,10 @@ local function content_result(file, content)
   }
 end
 
----@param root string
----@param file DiffReviewStatusFile
----@param callback fun(result: DiffReviewFileBodyResult)
+--- Reads immutable Git object blob text asynchronously.
+---@param root string Git repository root path.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param callback fun(result: DiffReviewFileBodyResult) Completion callback function.
 local function read_blob_async(root, file, callback)
   local oid = file.preview_oid
   if type(oid) ~= "string" or oid == "" or oid:match("^0+$") then
@@ -144,9 +149,10 @@ local function read_blob_async(root, file, callback)
   end)
 end
 
----@param root string
----@param file DiffReviewStatusFile
----@param callback fun(result: DiffReviewFileBodyResult)
+--- Reads file content asynchronously from worktree disk or Git blob storage.
+---@param root string Git repository root path.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param callback fun(result: DiffReviewFileBodyResult) Completion callback function.
 local function read_content_async(root, file, callback)
   if file.preview_source == "worktree_added" then
     status_snapshot._read_untracked_file_async(file.filename, function(content)
@@ -161,9 +167,10 @@ local function read_content_async(root, file, callback)
   read_blob_async(root, file, callback)
 end
 
----@param root string
----@param file DiffReviewStatusFile
----@param callback fun(result: DiffReviewFileBodyResult)
+--- Queries deletion numstats and loads deleted file content asynchronously.
+---@param root string Git repository root path.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param callback fun(result: DiffReviewFileBodyResult) Completion callback function.
 local function load_deleted_async(root, file, callback)
   local command = {
     "git", "--no-optional-locks", "-C", root,
@@ -213,10 +220,10 @@ local function load_deleted_async(root, file, callback)
   end)
 end
 
---- Load one deferred added or deleted body from its authoritative content source.
----@param root string
----@param file DiffReviewStatusFile
----@param callback fun(result: DiffReviewFileBodyResult)
+--- Asynchronously loads deferred file bodies and hunks for added or deleted files.
+---@param root string Git repository root path.
+---@param file DiffReviewStatusFile Status file entry descriptor.
+---@param callback fun(result: DiffReviewFileBodyResult) Completion callback function.
 function M.load_async(root, file, callback)
   if file.preview_binary then
     callback({

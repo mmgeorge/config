@@ -12,17 +12,13 @@
 ---@class DiffReviewRegionModule
 local M = {}
 
---- Track a buffer line range by extmarks so edits and splices move the region with its text.
---- Inclusive mode (default) anchors the last content row with right gravity, so appending to
---- it stays inside the region. Exclusive mode anchors the row one past the content with left
---- gravity, so inserting at the boundary stays outside — matching a "beyond-the-last-line"
---- end marker.
----@param buf integer
----@param namespace integer
----@param first_row integer 0-based inclusive
----@param end_row integer 0-based; last content row (inclusive mode) or one-past row (exclusive mode)
----@param opts? { region_kind?: string, owner_id?: string, editable?: boolean, end_exclusive?: boolean, end_right_gravity?: boolean }
----@return DiffReviewRenderedRegion
+--- Creates an extmark-anchored buffer region that tracks row shifts across buffer edits.
+---@param buf integer Target buffer handle.
+---@param namespace integer Highlight namespace ID for extmark placement.
+---@param first_row integer Zero-based inclusive start row.
+---@param end_row integer Zero-based anchor end row (last content row or boundary).
+---@param opts? { region_kind?: string, owner_id?: string, editable?: boolean, end_exclusive?: boolean, end_right_gravity?: boolean } Region options.
+---@return DiffReviewRenderedRegion region Initialized region tracker table.
 function M.new(buf, namespace, first_row, end_row, opts)
   opts = opts or {}
   local end_exclusive = opts.end_exclusive == true
@@ -47,11 +43,10 @@ function M.new(buf, namespace, first_row, end_row, opts)
   return region
 end
 
---- Resolve the region's raw 0-based anchor rows: the first row and the end-anchor row
---- (the last content row in inclusive mode, or the one-past row in exclusive mode).
----@param region DiffReviewRenderedRegion
----@return integer? first_row
----@return integer? end_row
+--- Resolves the region's raw zero-based anchor row positions.
+---@param region DiffReviewRenderedRegion Target region record.
+---@return integer? first_row Zero-based start row index, or nil.
+---@return integer? end_row Zero-based anchor end row index, or nil.
 function M.bounds(region)
   local start_pos = vim.api.nvim_buf_get_extmark_by_id(region.buf, region.namespace, region.start_anchor, {})
   local end_pos = vim.api.nvim_buf_get_extmark_by_id(region.buf, region.namespace, region.end_anchor, {})
@@ -60,10 +55,11 @@ function M.bounds(region)
   return first_row, math.max(end_pos[1], first_row)
 end
 
---- Resolve the region's current 0-based inclusive content row range from its anchors.
----@param region DiffReviewRenderedRegion
----@return integer? first_row
----@return integer? last_row inclusive last content row, or nil when the region is empty
+--- Resolves the region's zero-based inclusive content row range.
+--- Returns nil for `last_row` if an exclusive region has collapsed to empty.
+---@param region DiffReviewRenderedRegion Target region record.
+---@return integer? first_row Zero-based starting content row, or nil.
+---@return integer? last_row Zero-based inclusive ending content row, or nil.
 function M.range(region)
   local first_row, end_row = M.bounds(region)
   if not first_row then return nil, nil end
@@ -74,9 +70,9 @@ function M.range(region)
   return first_row, end_row
 end
 
---- Read the region's current buffer lines as a single newline-joined string.
----@param region DiffReviewRenderedRegion
----@return string
+--- Reads the buffer lines bounded by the region and joins them into a single string.
+---@param region DiffReviewRenderedRegion Target region record.
+---@return string text Newline-joined buffer text content.
 function M.read_text(region)
   local first_row, end_row = M.bounds(region)
   if not first_row then return "" end
@@ -86,29 +82,28 @@ function M.read_text(region)
   return table.concat(lines, "\n")
 end
 
---- Report whether the region's current text differs from its last saved baseline.
----@param region DiffReviewRenderedRegion
----@return boolean
+--- Reports whether current region text differs from the saved baseline string.
+---@param region DiffReviewRenderedRegion Target region record.
+---@return boolean dirty True if modified.
 function M.is_dirty(region)
   return M.read_text(region) ~= (region.base_text or "")
 end
 
---- Adopt the region's current text as the saved baseline after a successful save.
----@param region DiffReviewRenderedRegion
+--- Adopts current buffer content as the saved baseline after successful persistence.
+---@param region DiffReviewRenderedRegion Target region record.
 function M.mark_saved(region)
   region.base_text = M.read_text(region)
 end
 
---- Overwrite the saved baseline with an explicit value (e.g. the server-side body) so dirty
---- tracking compares against the source of truth rather than the freshly rendered buffer.
----@param region DiffReviewRenderedRegion
----@param text string
+--- Explicitly overrides the saved baseline comparison text.
+---@param region DiffReviewRenderedRegion Target region record.
+---@param text string New baseline string to compare against.
 function M.set_baseline(region, text)
   region.base_text = text
 end
 
---- Remove the region's anchor extmarks.
----@param region DiffReviewRenderedRegion
+--- Deletes the start and end extmarks tracking the region.
+---@param region DiffReviewRenderedRegion Target region record.
 function M.clear(region)
   pcall(vim.api.nvim_buf_del_extmark, region.buf, region.namespace, region.start_anchor)
   pcall(vim.api.nvim_buf_del_extmark, region.buf, region.namespace, region.end_anchor)

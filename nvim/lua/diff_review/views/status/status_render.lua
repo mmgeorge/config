@@ -69,8 +69,9 @@ local function status_operations_pending() return actions._status_operations_pen
 local status_render_current_model
 local status_current_model_render_delay_ms = 20
 
----@param entry_kind string?
----@return string
+--- Maps a file-level entry kind to its corresponding hunk-level entry kind string.
+---@param entry_kind string? File entry kind string.
+---@return string hunk_kind Hunk entry kind string.
 local function status_hunk_entry_kind_for_file_entry(entry_kind)
   if entry_kind == "commit_file" then return "commit_hunk" end
   if entry_kind == "pr_file" then return "pr_hunk" end
@@ -78,7 +79,8 @@ local function status_hunk_entry_kind_for_file_entry(entry_kind)
   return "hunk"
 end
 
----@param opts? { clear_fancy_rows?: boolean, skip_operations?: boolean }
+--- Debounces and schedules an optimistic re-render of current status model.
+---@param opts? { clear_fancy_rows?: boolean, skip_operations?: boolean } Render options table.
 local function status_request_current_model_render(opts)
   opts = opts or {}
   local status = session.status
@@ -109,14 +111,21 @@ local function status_request_current_model_render(opts)
   end, status_current_model_render_delay_ms)
 end
 
---- Cancel pending context-driven renders before the status model changes.
----@param status table
+--- Cancels pending context-driven renders before the status model changes.
+---@param status table Status session state table.
 local function status_cancel_pending_enrichment(status)
   status.current_model_render_generation = (status.current_model_render_generation or 0) + 1
   status.current_model_render_pending = false
   status.file_expansion_context_generations = {}
 end
 
+--- Renders an individual diff hunk into the status buffer state accumulator.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@param hunk DiffReviewHunk Diff hunk descriptor.
+---@param previous_hunk? DiffReviewHunk Preceding sibling hunk.
+---@param next_hunk? DiffReviewHunk Following sibling hunk.
+---@param entry_kind? string Hunk entry kind override.
+---@param hunk_key_override? string Explicit hunk identity key.
 local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key_override)
   return trace.span("status_render.render_hunk", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
@@ -392,12 +401,13 @@ local function status_render_hunk(file, hunk, previous_hunk, next_hunk, entry_ki
   end)
 end
 
----@param filename string?
----@param line integer?
----@param callback_key string
----@param on_update fun(context: table|string|nil)?
----@return table|string|nil context
----@return boolean pending
+--- Retrieves cached semantic syntax context for a file line and checks pending status.
+---@param filename string? Target absolute or relative file path string.
+---@param line integer? One-based target line number.
+---@param callback_key string Unique cache notification key.
+---@param on_update fun(context: table|string|nil)? Callback invoked when asynchronous context resolves.
+---@return table|string|nil context Resolved syntax context object or string.
+---@return boolean pending True if asynchronous retrieval is pending.
 local function status_context_pending(filename, line, callback_key, on_update)
   if not (filename and line) then return nil, false end
   local context = syntax_engine.cached_hunk_context(filename, line, callback_key, on_update)
@@ -405,14 +415,15 @@ local function status_context_pending(filename, line, callback_key, on_update)
   return context, type(cached_context) == "table" and cached_context.pending == true
 end
 
----@param file DiffReviewStatusFile?
----@param hunk table?
----@param previous_hunk table?
----@param next_hunk table?
----@param entry_kind string?
----@param hunk_key string
----@param on_update fun(context: table|string|nil)?
----@return boolean
+--- Determines whether asynchronous semantic context queries are pending for a diff hunk.
+---@param file DiffReviewStatusFile? Status file descriptor.
+---@param hunk table? Diff hunk descriptor.
+---@param previous_hunk table? Preceding sibling hunk.
+---@param next_hunk table? Following sibling hunk.
+---@param entry_kind string? Hunk entry kind override.
+---@param hunk_key string Unique hunk identifier key.
+---@param on_update fun(context: table|string|nil)? Callback invoked when background queries complete.
+---@return boolean pending True if context computation is pending.
 local function status_hunk_expansion_context_pending(file, hunk, previous_hunk, next_hunk, entry_kind, hunk_key, on_update)
   if not (file and file.filename and hunk) then return false end
   local context_line = syntax_engine.status_hunk_context_line(hunk) or hunk.pos
@@ -493,9 +504,10 @@ local function status_hunk_expansion_context_pending(file, hunk, previous_hunk, 
   return context_pending or (ok and type(rows) == "table" and rawget(rows, "diff_review_context_pending") == true)
 end
 
----@param entry DiffReviewStatusEntry?
----@param on_update fun(context: table|string|nil)?
----@return boolean
+--- Checks whether any hunks in a file entry have pending context lookups.
+---@param entry DiffReviewStatusEntry? Target file entry descriptor.
+---@param on_update fun(context: table|string|nil)? Callback invoked when background lookups complete.
+---@return boolean pending True if any hunks are pending context.
 local function status_file_expansion_context_pending(entry, on_update)
   if not (entry and entry.file and entry.file.filename) then return false end
   if not entry_nav._status_entry_is_file_like(entry) then return false end
@@ -535,9 +547,10 @@ local function status_file_expansion_context_pending(entry, on_update)
   return pending
 end
 
----@param state table
----@param file DiffReviewStatusFile
----@param result DiffReviewFileBodyResult
+--- Applies loaded file body preview diff data and hunks to a status file descriptor.
+---@param state table Status session state table.
+---@param file DiffReviewStatusFile Target status file descriptor.
+---@param result DiffReviewFileBodyResult File body load result table.
 local function status_apply_file_body_result(state, file, result)
   file.preview_state = result.state
   file.preview_error = result.error
@@ -565,10 +578,11 @@ local function status_apply_file_body_result(state, file, result)
   session.file_hunk_staged[file.filename] = #staged_flag_list > 0 and staged_flag_list or nil
 end
 
----@param entry DiffReviewStatusEntry?
----@param state table?
----@param on_ready fun()
----@return boolean deferred
+--- Coordinates asynchronous loading of file bodies and syntax contexts before expanding.
+---@param entry DiffReviewStatusEntry? File entry descriptor.
+---@param state table? Status session state table.
+---@param on_ready fun() Callback invoked when all required data has loaded.
+---@return boolean deferred True if loading was deferred asynchronously.
 local function status_prepare_file_expansion_context(entry, state, on_ready)
   state = state or session.status
   if not (state and entry and entry.file and entry_nav._status_entry_is_file_like(entry)) then return false end
@@ -672,6 +686,13 @@ local function status_prepare_file_expansion_context(entry, state, on_ready)
   return false
 end
 
+--- Renders a status file header, fold descriptor, and constituent diff hunks.
+---@param file DiffReviewStatusFile Status file descriptor.
+---@param entry_kind? string File entry kind override.
+---@param hunk_entry_kind? string Hunk entry kind override.
+---@param file_key_override? string Explicit file identity key.
+---@param hunk_key_builder? fun(hunk: DiffReviewHunk): string Custom hunk identity key callback.
+---@param opts? { force_open?: boolean, default_open?: boolean } Rendering configuration options.
 local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_override, hunk_key_builder, opts)
   return trace.span("status_render.render_file", session.status and session.status.buf or nil, {
     file = file and file.filename or nil,
@@ -787,6 +808,9 @@ local function status_render_file(file, entry_kind, hunk_entry_kind, file_key_ov
   end)
 end
 
+--- Renders a commit row, log metadata, and constituent changed files.
+---@param commit DiffReviewStatusCommit Commit record descriptor.
+---@param date_width integer Column width for date string alignment.
 local function status_render_commit(commit, date_width)
   local commit_key = status_commit_key(commit.oid)
   local line = commit.short_oid
@@ -863,6 +887,8 @@ local function status_render_commit(commit, date_width)
   fold_state._status_register_fold_range(commit_key, line_number, #session.status.lines, true, session.status.lines[line_number])
 end
 
+--- Renders a status section heading, fold registration, and section contents.
+---@param section DiffReviewStatusSection Status section descriptor table.
 local function status_render_section(section)
   return trace.span("status_render.render_section", session.status and session.status.buf or nil, {
     section = section and section.name or nil,
@@ -927,6 +953,10 @@ local function status_render_section(section)
   end)
 end
 
+--- Prewarms syntax highlighting for hunk-like entries visible in the current viewport.
+---@param buf integer Status buffer handle.
+---@param first_row integer One-based starting row index.
+---@param last_row integer One-based ending row index.
 local function status_decorate_visible(buf, first_row, last_row)
   local status = session.states and session.states[buf] or nil
   if not (status and status.entries) then return end
@@ -949,10 +979,21 @@ local function status_decorate_visible(buf, first_row, last_row)
   session.status = saved
 end
 
+--- Emits row-level highlights and virtual texts into the specified buffer namespace.
+---@param buf integer Target buffer handle.
+---@param namespace integer Target namespace identifier.
+---@param row integer Zero-based buffer row index.
+---@param spans table Diff row span descriptors table.
+---@param ephemeral boolean True if emitting ephemeral virtual text decoration.
 local function status_emit_row_spans(buf, namespace, row, spans, ephemeral)
   if spans then row_emitter.emit(buf, namespace, row, spans, ephemeral) end
 end
 
+--- Renders decoration provider spans across a line range in a status buffer.
+---@param buf integer Status buffer handle.
+---@param first_row integer One-based starting line number.
+---@param last_row integer One-based ending line number.
+---@return table applied Dictionary of applied row span descriptors.
 local function status_decorate_rows(buf, first_row, last_row)
   local status = session.states and session.states[buf] or session.status
   local applied = {}
@@ -971,6 +1012,7 @@ local function status_decorate_rows(buf, first_row, last_row)
   return applied
 end
 
+--- Registers the buffer decoration provider callback once per editor session.
 local function status_register_decoration_provider()
   if decoration_registered then return end
   decoration_registered = true
@@ -993,11 +1035,10 @@ end
 
 ---@alias DiffReviewLineDiffHunk [integer, integer, integer, integer]
 
---- Preserve unchanged head and tail rows when native line diffing fails, replacing the
---- conservative middle span.
----@param buf integer
----@param old_lines string[]
----@param new_lines string[]
+--- Preserves unchanged head and tail rows when native line diffing fails, replacing the middle span.
+---@param buf integer Status buffer handle.
+---@param old_lines string[] Existing buffer line strings.
+---@param new_lines string[] Replacement line strings.
 local function status_reconcile_buffer_lines_fallback(buf, old_lines, new_lines)
   local old_count = #old_lines
   local new_count = #new_lines
@@ -1022,14 +1063,9 @@ local function status_reconcile_buffer_lines_fallback(buf, old_lines, new_lines)
   vim.api.nvim_buf_set_lines(buf, prefix, old_count - suffix, false, replacement)
 end
 
---- Apply native line-diff hunks from bottom to top so disjoint edits preserve unchanged
---- rows and their extmarks without translating later hunk coordinates.
----
---- This edits the buffer in place, so a treesitter parser kept on it across renders holds
---- stale trees afterward. pr_edit.apply_markdown_parser_regions invalidates the markdown
---- parser for that reason -- without it, re-parsing reused nodes segfaults treesitter.
----@param buf integer
----@param new_lines string[]
+--- Applies native line-diff hunks bottom-to-top to update buffer in place while preserving extmarks.
+---@param buf integer Status buffer handle.
+---@param new_lines string[] Replacement line strings.
 local function status_reconcile_buffer_lines(buf, new_lines)
   local old_lines = vim.api.nvim_buf_get_lines(buf, 0, -1, false)
   local old_text = table.concat(old_lines, "\n") .. "\n"
@@ -1064,6 +1100,8 @@ local function status_reconcile_buffer_lines(buf, new_lines)
   end
 end
 
+--- Writes accumulated lines to the status buffer using in-place line reconciliation.
+---@param buf integer Status buffer handle.
 local function status_write_rendered_buffer(buf)
   status_buffer.with_writable(buf, function()
     vim.api.nvim_buf_clear_namespace(buf, ui.status_ns, 0, -1)
@@ -1075,6 +1113,8 @@ local function status_write_rendered_buffer(buf)
   end)
 end
 
+--- Applies accumulated line highlights, text highlights, and virtual text extmarks.
+---@param buf integer Status buffer handle.
 local function status_apply_rendered_extmarks(buf)
   for _, line_hl in ipairs(session.status.line_highlights or {}) do
     pcall(vim.api.nvim_buf_set_extmark, buf, ui.status_ns, line_hl.line - 1, 0, {
@@ -1096,6 +1136,9 @@ local function status_apply_rendered_extmarks(buf)
   end
 end
 
+--- Coordinates post-render lifecycle hooks, keymap hint bar, and diagnostics dump.
+---@param buf integer Status buffer handle.
+---@param walkthrough? table Optional walkthrough integration module.
 local function status_after_buffer_render(buf, walkthrough)
   return trace.span("status_render.after_buffer_render", buf, nil, function()
     status_register_decoration_provider()
@@ -1118,6 +1161,13 @@ local function status_after_buffer_render(buf, walkthrough)
   end)
 end
 
+--- Performs full rendering of head lines, sections, files, hunks, and extmarks into buffer.
+---@param buf integer Status buffer handle.
+---@param target_id? string Optional target entry ID for cursor restoration.
+---@param fallback_line? integer Optional fallback line number for cursor restoration.
+---@param opts? { reuse_sections?: boolean, restore_cursor?: boolean } Render options.
+---@param head_lines DiffReviewStatusHeadLine[] Array of structured head lines.
+---@param sections DiffReviewStatusSection[] Array of status sections.
 local function status_render_loaded(buf, target_id, fallback_line, opts, head_lines, sections)
   return trace.span("status_render.render_loaded", buf, {
     target_id = target_id,
@@ -1254,8 +1304,9 @@ local function status_render_loaded(buf, target_id, fallback_line, opts, head_li
   end)
 end
 
----@param target_id? string
----@param opts? { clear_fancy_rows?: boolean, restore_cursor?: boolean, fallback_line?: integer }
+--- Re-renders the current status model from session state without re-querying Git.
+---@param target_id? string Optional target entry ID for cursor preservation.
+---@param opts? { clear_fancy_rows?: boolean, restore_cursor?: boolean, fallback_line?: integer } Options table.
 status_render_current_model = function(target_id, opts)
   local status = session.status
   if not (status and status.buf and vim.api.nvim_buf_is_valid(status.buf) and status.head_lines and status.sections) then

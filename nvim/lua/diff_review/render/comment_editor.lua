@@ -1,13 +1,16 @@
 local M = {}
 
----@param value any
----@return string
+--- Normalizes carriage returns and line endings in comment body text into standard LF.
+---@param value any Raw string or convertible input value.
+---@return string text Normalized newline-separated string.
 function M.normalize_body_text(value)
   return (tostring(value or ""):gsub("\r\n", "\n"):gsub("\r", "\n"))
 end
 
----@param body string
----@return string[]
+--- Splits a normalized comment body into individual lines.
+--- Ensures at least one empty string is returned for blank bodies.
+---@param body string Comment body text.
+---@return string[] lines Array of individual lines.
 function M.body_lines(body)
   local lines = vim.split(M.normalize_body_text(body), "\n", { plain = true })
   if #lines == 0 then lines = { "" } end
@@ -34,9 +37,10 @@ local function truncate_display(text, width)
   return result
 end
 
----@param win integer?
----@param buf integer?
----@return integer
+--- Calculates the usable display column width for an editor window excluding gutters.
+---@param win integer? Target window handle.
+---@param buf integer? Target buffer handle.
+---@return integer width Usable character column width.
 function M.display_width(win, buf)
   local width = tonumber(vim.o.columns) or 80
   local displayed_win = win
@@ -51,10 +55,11 @@ function M.display_width(win, buf)
   return math.max(40, width - 1)
 end
 
----@param left_text string?
----@param right_text string?
----@param width integer
----@return string
+--- Formats a horizontal rule line filled with dashes between left and right labels.
+---@param left_text string? Left-aligned label prefix.
+---@param right_text string? Right-aligned label suffix.
+---@param width integer Total target character width.
+---@return string rule Formatted horizontal boundary line.
 function M.rule_line(left_text, right_text, width)
   left_text = tostring(left_text or "")
   right_text = tostring(right_text or "")
@@ -71,8 +76,9 @@ function M.rule_line(left_text, right_text, width)
   return left_text .. ("-"):rep(math.max(width - fixed_width, 0)) .. right_text
 end
 
----@param width integer
----@return string
+--- Constructs a horizontal footer rule line of dashes.
+---@param width integer Total character width.
+---@return string footer Dashed footer line.
 function M.footer_line(width)
   return ("-"):rep(width)
 end

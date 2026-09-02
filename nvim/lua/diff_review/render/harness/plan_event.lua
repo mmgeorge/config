@@ -3,10 +3,10 @@ local M = {}
 ---@class DiffReviewHarnessPlanEventHost
 ---@field append_response fun(result: table, text: string)
 
---- Render one durable plan lifecycle event with semantic content expansion.
----@param result table
----@param entry table
----@param host DiffReviewHarnessPlanEventHost
+--- Appends a durable plan lifecycle event row and expandable questions/annotations.
+---@param result table Target render collection table.
+---@param entry table Plan lifecycle event entry record.
+---@param host DiffReviewHarnessPlanEventHost Host adapter providing response formatting callbacks.
 function M.append(result, entry, host)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
   local lifecycle = entry.lifecycle or {}

@@ -105,20 +105,23 @@ local text_snapshot = require("diff_review.render.text_snapshot")
 ---@class DiffReviewSourceModule
 local M = {}
 
----@param path string?
----@return string
+--- Normalizes backslashes in a file path to forward slashes.
+---@param path string? Raw path string.
+---@return string path Normalized path string with forward slashes.
 function M.normalize_path(path)
   return (tostring(path or ""):gsub("\\", "/"))
 end
 
----@param source_id string
----@param path string
----@return string
+--- Generates a composite unique lookup key for a file within a source.
+---@param source_id string Unique source identifier.
+---@param path string Relative file path.
+---@return string key Composite null-delimited file key.
 function M.file_key(source_id, path)
   return tostring(source_id) .. "\0" .. M.normalize_path(path)
 end
 
----@return DiffReviewDiffSourceRegistry
+--- Constructs an empty diff source registry table.
+---@return DiffReviewDiffSourceRegistry registry Initialized source registry structure.
 function M.new_registry()
   return {
     handle_by_id = {},
@@ -130,9 +133,10 @@ function M.new_registry()
   }
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param handle DiffReviewDiffSourceHandle
----@return DiffReviewDiffSourceHandle
+--- Inserts or merges a source handle descriptor into the registry.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param handle DiffReviewDiffSourceHandle Source handle configuration.
+---@return DiffReviewDiffSourceHandle handle Registered source handle descriptor.
 function M.ensure_handle(registry, handle)
   local existing = registry.handle_by_id[handle.id]
   if existing then
@@ -146,8 +150,9 @@ function M.ensure_handle(registry, handle)
   return copy
 end
 
----@param handle DiffReviewDiffSourceHandle
----@return DiffReviewDiffSourceState
+--- Instantiates a new diff source state table from a handle descriptor.
+---@param handle DiffReviewDiffSourceHandle Source handle configuration.
+---@return DiffReviewDiffSourceState source Initialized diff source state structure.
 function M.new_source(handle)
   return {
     handle = vim.deepcopy(handle),
@@ -163,9 +168,10 @@ function M.new_source(handle)
   }
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param handle DiffReviewDiffSourceHandle
----@return DiffReviewDiffSourceState
+--- Retrieves or instantiates a source state record in the registry.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param handle DiffReviewDiffSourceHandle Source handle configuration.
+---@return DiffReviewDiffSourceState source Existing or newly created source state record.
 function M.ensure_source(registry, handle)
   handle = M.ensure_handle(registry, handle)
   local source = registry.source_by_id[handle.id]
@@ -180,10 +186,11 @@ function M.ensure_source(registry, handle)
   return source
 end
 
----@param source DiffReviewDiffSourceState
----@param path string
----@param opts? table
----@return DiffReviewDiffFileState
+--- Retrieves or instantiates a file diff state record under a source.
+---@param source DiffReviewDiffSourceState Target diff source state.
+---@param path string Relative file path.
+---@param opts? table Optional initial file options.
+---@return DiffReviewDiffFileState file File state structure.
 function M.ensure_file(source, path, opts)
   opts = opts or {}
   path = M.normalize_path(path)
@@ -227,10 +234,11 @@ function M.ensure_file(source, path, opts)
   return file
 end
 
----@param file DiffReviewDiffFileState
----@param side "old"|"new"
----@param text string
----@param revision string?
+--- Updates the text snapshot and revision for either the old or new side of a file diff.
+---@param file DiffReviewDiffFileState Target file diff state.
+---@param side "old"|"new" Diff side descriptor.
+---@param text string Full buffer content string.
+---@param revision string? Optional revision hash or timestamp.
 function M.set_text(file, side, text, revision)
   local snapshot = text_snapshot.from_text(text or "")
   file.syntax_context = syntax_context.ensure_context(file.syntax_context, file.key)
@@ -244,9 +252,10 @@ function M.set_text(file, side, text, revision)
   end
 end
 
----@param file DiffReviewDiffFileState
----@param side "old"|"new"
----@param loader fun(done: fun(ok: boolean, text?: string, revision?: string, err?: string))
+--- Registers an asynchronous content loader for a specific side of a file diff.
+---@param file DiffReviewDiffFileState Target file diff state.
+---@param side "old"|"new" Diff side descriptor.
+---@param loader fun(done: fun(ok: boolean, text?: string, revision?: string, err?: string)) Async content loading function.
 function M.set_text_loader(file, side, loader)
   file.text_loader = file.text_loader or {}
   file.text_loader[side] = loader
@@ -260,9 +269,11 @@ local function cached_text(file, side)
   return file.new_text
 end
 
----@param file DiffReviewDiffFileState
----@param side "old"|"new"
----@param done fun(ok: boolean, snapshot?: DiffReviewTextSnapshot, err?: string)
+--- Ensures the text snapshot for a file diff side is loaded asynchronously.
+--- Invokes `done` with the snapshot or error details.
+---@param file DiffReviewDiffFileState Target file diff state.
+---@param side "old"|"new" Diff side descriptor.
+---@param done fun(ok: boolean, snapshot?: DiffReviewTextSnapshot, err?: string) Completion callback.
 function M.ensure_text(file, side, done)
   local snapshot = cached_text(file, side)
   if snapshot then
@@ -301,8 +312,9 @@ function M.ensure_text(file, side, done)
   end)
 end
 
----@param file DiffReviewDiffFileState
----@param hunk DiffReviewRawHunk
+--- Appends a raw diff hunk descriptor to a file state record and creates its hunk index.
+---@param file DiffReviewDiffFileState Target file diff state.
+---@param hunk DiffReviewRawHunk Raw hunk descriptor table.
 function M.add_raw_hunk(file, hunk)
   local copy = vim.deepcopy(hunk)
   copy.source_id = copy.source_id or file.source_id
@@ -314,21 +326,24 @@ function M.add_raw_hunk(file, hunk)
   file.layout_dirty = true
 end
 
----@param file DiffReviewDiffFileState
----@param expanded boolean
+--- Sets the expanded/collapsed view state of a file diff.
+---@param file DiffReviewDiffFileState Target file diff state.
+---@param expanded boolean True to expand diff hunks, false to collapse.
 function M.set_expanded(file, expanded)
   file.expanded = expanded == true
 end
 
----@param file DiffReviewDiffFileState
----@param annotation table
+--- Attaches an annotation metadata record to a file diff state.
+---@param file DiffReviewDiffFileState Target file diff state.
+---@param annotation table Annotation descriptor table.
 function M.add_annotation(file, annotation)
   file.annotations[#file.annotations + 1] = annotation
   file.layout_dirty = true
 end
 
----@param source DiffReviewDiffSourceState
----@param path string
+--- Removes a file diff record from a source by relative path.
+---@param source DiffReviewDiffSourceState Target source state.
+---@param path string Relative file path to remove.
 function M.remove_file(source, path)
   local key = M.file_key(source.handle.id, path)
   if not source.file_by_key[key] then return end
@@ -341,7 +356,8 @@ function M.remove_file(source, path)
   source.revision = (source.revision or 0) + 1
 end
 
----@param source DiffReviewDiffSourceState
+--- Clears all file diff state records under a source.
+---@param source DiffReviewDiffSourceState Target source state.
 function M.clear_files(source)
   source.file_by_key = {}
   source.file_order = {}
@@ -367,9 +383,10 @@ local function invalidate_one_path(registry, source_id, path)
   end
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param source_ids string|string[]
----@param paths string|string[]
+--- Marks specific file paths as invalidated and stale across selected sources.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param source_ids string|string[] One or more source IDs to invalidate paths in.
+---@param paths string|string[] One or more relative file paths to invalidate.
 function M.invalidate_paths(registry, source_ids, paths)
   if type(source_ids) == "string" then source_ids = { source_ids } end
   if type(paths) == "string" then paths = { paths } end
@@ -380,9 +397,10 @@ function M.invalidate_paths(registry, source_ids, paths)
   end
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param source_id string
----@return string[]
+--- Returns a sorted list of invalidated paths registered under a source ID.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param source_id string Target source identifier.
+---@return string[] paths Sorted array of invalidated file path strings.
 function M.invalidated_paths(registry, source_id)
   local invalidated = registry.invalidation_by_source[source_id] or {}
   local path_list = {}
@@ -393,18 +411,19 @@ function M.invalidated_paths(registry, source_id)
   return path_list
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param source_id string
+--- Clears all invalidated path tracking records for a given source ID.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param source_id string Target source identifier.
 function M.clear_invalidated_paths(registry, source_id)
   registry.invalidation_by_source[source_id] = nil
   local source = registry.source_by_id[source_id]
   if source then source.invalidated_path = {} end
 end
 
---- Clear resolved invalidations while preserving paths owned by later mutations.
----@param registry DiffReviewDiffSourceRegistry
----@param source_ids string|string[]
----@param paths string|string[]
+--- Clears specific resolved paths from the invalidation sets while preserving outstanding paths.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param source_ids string|string[] Target source identifier or identifiers.
+---@param paths string|string[] Resolved file paths to clear from the invalidation set.
 function M.clear_invalidated_path_list(registry, source_ids, paths)
   if type(source_ids) == "string" then source_ids = { source_ids } end
   if type(paths) == "string" then paths = { paths } end
@@ -422,23 +441,26 @@ function M.clear_invalidated_path_list(registry, source_ids, paths)
   end
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param kind DiffReviewDiffSourceKind|string
----@param policy table
+--- Associates a layout/render policy table with a diff source kind.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param kind DiffReviewDiffSourceKind|string Target source kind.
+---@param policy table Policy options table.
 function M.set_kind_policy(registry, kind, policy)
   registry.policy_by_kind[kind] = policy
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param source_id string
----@param policy table
+--- Associates a layout/render policy table with a specific source ID.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param source_id string Target source identifier.
+---@param policy table Policy options table.
 function M.set_source_policy(registry, source_id, policy)
   registry.policy_by_source[source_id] = policy
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param source_id string
----@return table?
+--- Resolves the effective layout/render policy for a source ID from source or kind overrides.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param source_id string Target source identifier.
+---@return table? policy Resolved policy table, or nil if no policy matched.
 function M.policy(registry, source_id)
   local source_policy = registry.policy_by_source[source_id]
   if source_policy then return source_policy end
@@ -447,10 +469,12 @@ function M.policy(registry, source_id)
   return handle and registry.policy_by_kind[handle.kind] or nil
 end
 
----@param registry DiffReviewDiffSourceRegistry
----@param source_ids string|string[]
----@param paths string|string[]
----@param done fun(ok: boolean, err?: string)?
+--- Reloads diff state asynchronously for invalidated paths across target sources.
+--- Invokes `done` once all source reload handlers settle.
+---@param registry DiffReviewDiffSourceRegistry Target source registry.
+---@param source_ids string|string[] One or more source IDs to reload.
+---@param paths string|string[] Relative file paths that were modified.
+---@param done fun(ok: boolean, err?: string)? Optional completion callback.
 function M.reload_paths(registry, source_ids, paths, done)
   if type(source_ids) == "string" then source_ids = { source_ids } end
   if type(paths) == "string" then paths = { paths } end
@@ -510,8 +534,9 @@ function M.reload_paths(registry, source_ids, paths, done)
   end
 end
 
----@param source DiffReviewDiffSourceState
----@param done fun(ok: boolean, err?: string)
+--- Ensures a lazy diff source has completed its asynchronous load handler.
+---@param source DiffReviewDiffSourceState Target diff source state.
+---@param done fun(ok: boolean, err?: string) Completion callback.
 function M.ensure_loaded(source, done)
   if source.loaded then
     done(true)
@@ -541,12 +566,13 @@ function M.ensure_loaded(source, done)
   end)
 end
 
----@param header string?
----@return integer old_start
----@return integer old_count
----@return integer new_start
----@return integer new_count
----@return string? context
+--- Parses unified diff hunk header line components (`@@ -old,count +new,count @@ context`).
+---@param header string? Raw hunk header string.
+---@return integer old_start Starting line in old revision.
+---@return integer old_count Line count in old revision.
+---@return integer new_start Starting line in new revision.
+---@return integer new_count Line count in new revision.
+---@return string? context Trailing function or scope context string, if present.
 function M.parse_hunk_header(header)
   local old_start, old_count, new_start, new_count, context = tostring(header or ""):match(
     "^@@ %-(%d+),?(%d*) %+(%d+),?(%d*) @@%s?(.*)$"
@@ -559,9 +585,10 @@ function M.parse_hunk_header(header)
   return old_start, old_count, new_start, new_count, context
 end
 
----@param diff_text string?
----@return string[] header_lines
----@return string[][] hunk_sections
+--- Splits a unified diff text string into file header lines and per-hunk section arrays.
+---@param diff_text string? Full diff text string.
+---@return string[] header_lines Array of leading file header lines preceding the first hunk.
+---@return string[][] hunk_sections Array of hunk section line arrays.
 function M.hunk_diff_parts(diff_text)
   local header_lines = {}
   local hunk_sections = {}
@@ -579,16 +606,18 @@ function M.hunk_diff_parts(diff_text)
   return header_lines, hunk_sections
 end
 
----@param diff_line string?
----@return boolean
+--- Tests whether a line string is a diff body line starting with `" "`, `"+"`, `"-"`, or `"\"`.
+---@param diff_line string? Line string to inspect.
+---@return boolean is_body True if line starts with a diff line prefix.
 function M.diff_body_line(diff_line)
   local prefix = tostring(diff_line or ""):sub(1, 1)
   return prefix == " " or prefix == "+" or prefix == "-" or prefix == "\\"
 end
 
----@param lines string[]
----@return integer added
----@return integer removed
+--- Counts added (`+`) and removed (`-`) lines in a list of diff lines.
+---@param lines string[] Array of diff line strings.
+---@return integer added Count of lines with `+` prefix.
+---@return integer removed Count of lines with `-` prefix.
 function M.diff_stats(lines)
   local added = 0
   local removed = 0
@@ -603,9 +632,10 @@ function M.diff_stats(lines)
   return added, removed
 end
 
----@param lines string[]
----@return integer old_count
----@return integer new_count
+--- Computes old and new revision line counts from a list of diff lines.
+---@param lines string[] Array of diff line strings.
+---@return integer old_count Total context and deleted lines.
+---@return integer new_count Total context and added lines.
 function M.diff_line_counts(lines)
   local old_count = 0
   local new_count = 0
@@ -623,17 +653,18 @@ function M.diff_line_counts(lines)
   return old_count, new_count
 end
 
----@param hunk table
----@param header_lines string[]
----@param body_lines string[]
----@param old_start integer
----@param new_start integer
----@param context string?
----@param hunk_key string
----@param section_index integer
----@param chunk_index integer
----@return table
----@return string
+--- Constructs a sub-hunk chunk from header and body lines, calculating stats and render keys.
+---@param hunk table Parent raw hunk table.
+---@param header_lines string[] Leading file header lines.
+---@param body_lines string[] Chunk body lines.
+---@param old_start integer Starting line in old revision.
+---@param new_start integer Starting line in new revision.
+---@param context string? Optional function/scope context text.
+---@param hunk_key string Parent hunk unique key.
+---@param section_index integer One-based hunk section index.
+---@param chunk_index integer One-based chunk index within section.
+---@return table chunk Formatted sub-hunk chunk descriptor.
+---@return string render_key Unique render key for the chunk.
 function M.chunk_hunk(hunk, header_lines, body_lines, old_start, new_start, context, hunk_key, section_index, chunk_index)
   local added, removed = M.diff_stats(body_lines)
   local old_count, new_count = M.diff_line_counts(body_lines)
@@ -652,11 +683,12 @@ function M.chunk_hunk(hunk, header_lines, body_lines, old_start, new_start, cont
   return chunk, render_key
 end
 
----@param diff_line string?
----@param old_line integer
----@param new_line integer
----@return integer
----@return integer
+--- Advances old and new line numbers based on the leading character prefix of a diff line.
+---@param diff_line string? Diff line string to parse.
+---@param old_line integer Current old line number.
+---@param new_line integer Current new line number.
+---@return integer next_old_line Updated old line number.
+---@return integer next_new_line Updated new line number.
 function M.advance_diff_line(diff_line, old_line, new_line)
   local prefix = tostring(diff_line or ""):sub(1, 1)
   if prefix == " " then
@@ -669,14 +701,15 @@ function M.advance_diff_line(diff_line, old_line, new_line)
   return old_line, new_line
 end
 
----@param hunk table
----@param hunk_key string
----@param body_start_line integer
----@param body_count integer
----@param chunk_index integer
----@return table?
----@return string?
----@return table?
+--- Extracts a window of body lines from a hunk for lazy rendering.
+---@param hunk table Target hunk structure.
+---@param hunk_key string Unique hunk key string.
+---@param body_start_line integer One-based starting body line within the hunk.
+---@param body_count integer Number of body lines to extract.
+---@param chunk_index integer One-based chunk index.
+---@return table? chunk Rendered hunk chunk descriptor, or nil.
+---@return string? render_key Unique render key for the chunk, or nil.
+---@return table? syntax_offset Syntax highlight line offsets for old and new sides, or nil.
 function M.deferred_hunk_chunk(hunk, hunk_key, body_start_line, body_count, chunk_index)
   local indexed_chunk, indexed_render_key, indexed_syntax_offset = hunk_index.chunk(
     hunk_index.ensure(hunk),
@@ -756,10 +789,12 @@ function M.deferred_hunk_chunk(hunk, hunk_key, body_start_line, body_count, chun
   }
 end
 
----@param hunk table
----@param hunk_key string
----@param chunk_size integer
----@return table[]
+--- Divides large diff hunks into smaller chunk blocks bounded by `chunk_size`.
+--- Preserves replacement pairs across chunk boundaries.
+---@param hunk table Target hunk structure.
+---@param hunk_key string Unique hunk key string.
+---@param chunk_size integer Maximum body lines allowed per chunk.
+---@return table[] blocks Array of chunk block descriptors.
 function M.hunk_chunks(hunk, hunk_key, chunk_size)
   local header_lines, hunk_sections = M.hunk_diff_parts(hunk and hunk.diff or "")
   local block_list = {}
@@ -839,9 +874,10 @@ function M.hunk_chunks(hunk, hunk_key, chunk_size)
   return block_list
 end
 
----@param diff_text string
----@param opts? { id_prefix?: string, source_id?: string, file_key?: string, staged?: boolean, metadata?: table }
----@return DiffReviewRawHunk[]
+--- Parses unified diff text into an array of raw diff hunk descriptors.
+---@param diff_text string Raw unified diff text.
+---@param opts? { id_prefix?: string, source_id?: string, file_key?: string, staged?: boolean, metadata?: table } Raw hunk options.
+---@return DiffReviewRawHunk[] hunks Array of raw hunk descriptors.
 function M.raw_hunks_from_diff(diff_text, opts)
   opts = opts or {}
   local header_lines, sections = M.hunk_diff_parts(diff_text)
@@ -875,11 +911,10 @@ end
 ---@field step_annotations table[]
 ---@field navigation_index table<string, integer>
 
---- Build a walkthrough source that layers step annotations and ordering over base Git sources.
---- Reference base source ids instead of duplicating their file text.
----@param handle DiffReviewDiffSourceHandle?
----@param opts? { base_source_ids?: string[], file_order?: string[], step_annotations?: table[] }
----@return DiffReviewWalkthroughDiffSource
+--- Constructs a walkthrough diff source layering step annotations over base Git sources.
+---@param handle DiffReviewDiffSourceHandle? Optional source handle descriptor.
+---@param opts? { base_source_ids?: string[], file_order?: string[], step_annotations?: table[] } Walkthrough source options.
+---@return DiffReviewWalkthroughDiffSource source Initialized walkthrough diff source structure.
 function M.new_walkthrough_source(handle, opts)
   opts = opts or {}
   handle = vim.deepcopy(handle or { id = "walkthrough", kind = "walkthrough" })
@@ -895,9 +930,9 @@ function M.new_walkthrough_source(handle, opts)
   return source
 end
 
---- Append a walkthrough step annotation and index it by id for navigation.
----@param source DiffReviewWalkthroughDiffSource
----@param step { id: string }
+--- Appends a walkthrough step annotation record and updates its navigation index entry.
+---@param source DiffReviewWalkthroughDiffSource Target walkthrough source state.
+---@param step { id: string } Step annotation table containing a unique ID.
 function M.add_walkthrough_step(source, step)
   source.step_annotations[#source.step_annotations + 1] = step
   if step.id then source.navigation_index[step.id] = #source.step_annotations end

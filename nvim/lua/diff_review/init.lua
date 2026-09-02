@@ -222,7 +222,8 @@ highlights.setup()
 ---@field pinned boolean
 ---@field views? table<DiffReviewStatusViewKind, boolean>
 
----@param opts? DiffReviewConfig
+--- Initializes plugin configuration, highlights, performance options, and view controllers.
+---@param opts? DiffReviewConfig User configuration overrides merged into defaults.
 function M.setup(opts)
   M.config = config.setup(opts)
   perf.configure_from_diff_review_options(M.config)
@@ -230,8 +231,10 @@ function M.setup(opts)
   require("diff_review.views.status.state").register_view_controllers()
 end
 
----@param cb fun(items: table[])
----@param _ctx table?
+--- Asynchronously collects Git status items for external consumer integrations.
+--- Invokes `cb` with an array of structured status items once collection completes.
+---@param cb fun(items: table[]) Callback invoked with collected status items.
+---@param _ctx table? Optional collection context.
 function M.get(cb, _ctx)
   git_backend.git_root_async(function(cwd)
     if not cwd then
@@ -255,11 +258,9 @@ M.new_harness_session = function() require("diff_review.views.harness").new_sess
 M.set_git_backend = git_backend.set_backend
 M.reset_git_backend = git_backend.reset_backend
 
---- Resolve the GitStatus debug log path. Kept on init as a dev/test override seam: tests swap
---- M._gitstatus_debug_log_path to redirect the log file, and views/status/status_debug.lua reads
---- the debug flags (_gitstatus_debug_force / _gitstatus_debug_enabled) that also live on M. This
---- is the one intentional require("diff_review") seam left in the tree.
----@return string
+--- Resolves the filesystem path for the GitStatus debug log.
+--- Creates parent directories in `stdpath("state")` if they do not exist.
+---@return string path Absolute filepath to the debug log file.
 function M._gitstatus_debug_log_path()
   if M._gitstatus_debug_log_file then return M._gitstatus_debug_log_file end
   local dir = (vim.fn.stdpath("state") or ".") .. "/diff_review"

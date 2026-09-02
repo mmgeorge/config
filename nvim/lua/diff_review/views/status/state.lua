@@ -25,8 +25,7 @@ local M = {}
 
 -- Perf tracing (payload/event/span) now lives in infra/perf_trace.lua (trace.*).
 
---- Register a view controller per status-like view kind so command vocabulary and
---- render hooks resolve through a narrow per-view boundary instead of inline branches.
+--- Registers a view controller per status-like view kind for per-view command sets and render hooks.
 local function register_view_controllers()
   local controllers = view_controller
   local command_sets = view_command_set
@@ -52,7 +51,7 @@ local function register_view_controllers()
   end
 end
 
---- Close and wipe all diff buffers
+--- Closes and wipes all active diff buffers and resets window options.
 local function cleanup_diff_buffers()
   window_options.restore(session.main_win)
   window_options.reset()
@@ -62,8 +61,9 @@ local function cleanup_diff_buffers()
   session.main_win = nil
 end
 
----@param buf integer
----@param state table
+--- Binds buffer autocommands to manage status session state, window options, and keymaps.
+---@param buf integer Status buffer handle.
+---@param state table Status session state table.
 local function attach_status_state(buf, state)
   fold_state._ensure_status_resize_autocmd()
   session.states = session.states or {}
@@ -140,14 +140,16 @@ local function attach_status_state(buf, state)
   })
 end
 
----@param sections DiffReviewStatusSection[]?
+--- Resets session fold states to initial configuration defaults.
+---@param sections DiffReviewStatusSection[]? Optional status section array.
 local function restore_initial_folds(sections)
   session.status = session.status or {}
   session.status.folds = {}
 end
 
----@param sections DiffReviewStatusSection[]?
----@return string?
+--- Retrieves entry identifier for the first section grouping.
+---@param sections DiffReviewStatusSection[]? Array of status sections.
+---@return string? id Section entry identifier string, or nil.
 local function first_grouping_id(sections)
   local section = sections and sections[1] or nil
   return section and status_keys.section_key(section.name) or nil

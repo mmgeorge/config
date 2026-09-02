@@ -40,8 +40,7 @@ local untracked_diff_generation = 0
 
 local M = {}
 
---- Delete every open diff:// buffer and clear the per-buffer caches, called by the
---- status state teardown when a review session ends.
+--- Deletes all open diff preview buffers and resets per-buffer view caches during teardown.
 function M.cleanup_diff_buffers()
   for _, buf in pairs(diff_bufs) do
     if vim.api.nvim_buf_is_valid(buf) then
@@ -56,8 +55,9 @@ function M.cleanup_diff_buffers()
   untracked_diff_generation = untracked_diff_generation + 1
 end
 
----@param virt_text table[]?
----@return integer
+--- Computes cumulative display column width for an array of virtual text chunks.
+---@param virt_text table[]? Array of virtual text chunk tuples.
+---@return integer width Total display column width.
 function M._inline_virtual_text_width(virt_text)
   local width = 0
   for _, chunk in ipairs(virt_text or {}) do
@@ -73,10 +73,11 @@ end
 ---@field content_length integer real buffer text length before visual highlight padding
 ---@field virt_text table[]
 
----@param buf integer
----@param row integer 1-based
----@param namespace integer
----@return DiffReviewGutterCursorBounds?
+--- Locates inline gutter virtual text extmark on a row and computes its column bounds.
+---@param buf integer Target buffer handle.
+---@param row integer One-based line number.
+---@param namespace integer Extmark namespace identifier.
+---@return DiffReviewGutterCursorBounds? bounds Extmark boundary descriptor or nil.
 function M._diff_gutter_cursor_bounds(buf, row, namespace)
   local line = vim.api.nvim_buf_get_lines(buf, row - 1, row, false)[1]
   if line == nil then return nil end
@@ -102,8 +103,9 @@ function M._diff_gutter_cursor_bounds(buf, row, namespace)
   return nil
 end
 
----@param chunks table[]?
----@return table[]
+--- Clones virtual text chunks and sets their highlight group to Visual.
+---@param chunks table[]? Array of virtual text chunk tuples.
+---@return table[] visual_chunks Array of styled chunk tuples.
 function M._diff_gutter_visual_chunks(chunks)
   local visual_chunks = {}
   for _, chunk in ipairs(chunks or {}) do
@@ -112,8 +114,9 @@ function M._diff_gutter_visual_chunks(chunks)
   return visual_chunks
 end
 
----@param chunks table[]?
----@return string
+--- Concatenates raw text chunks from a virtual text structure.
+---@param chunks table[]? Array of virtual text chunk tuples.
+---@return string text Concatenated string.
 function M._diff_gutter_text(chunks)
   local parts = {}
   for _, chunk in ipairs(chunks or {}) do
@@ -122,20 +125,23 @@ function M._diff_gutter_text(chunks)
   return table.concat(parts)
 end
 
----@param mode? string
----@return boolean
+--- Checks whether the current editor mode is visual or visual-line.
+---@param mode? string Optional mode string to test.
+---@return boolean is_visual True if mode is visual.
 function M._is_visual_mode(mode)
   mode = mode or vim.api.nvim_get_mode().mode
   return mode == "v" or mode == "V" or mode:byte() == 22
 end
 
----@param buf integer
+--- Clears gutter visual overlay extmarks from the target buffer.
+---@param buf integer Target buffer handle.
 function M._clear_diff_gutter_visual_overlay(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   pcall(vim.api.nvim_buf_clear_namespace, buf, ui.gutter_visual_ns, 0, -1)
 end
 
----@param buf integer
+--- Clears gutter visual line extmarks and removes temporary visual-line keymaps.
+---@param buf integer Target buffer handle.
 function M._clear_diff_gutter_visual_line(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if gutter_visual_yank_maps and gutter_visual_yank_maps[buf] then
@@ -145,7 +151,8 @@ function M._clear_diff_gutter_visual_line(buf)
   M._clear_diff_gutter_visual_overlay(buf)
 end
 
----@param buf integer
+--- Installs buffer keymaps for yanking gutter visual line selections.
+---@param buf integer Target buffer handle.
 function M._install_diff_gutter_visual_line_yank_maps(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   gutter_visual_yank_maps = gutter_visual_yank_maps or {}
@@ -158,8 +165,9 @@ function M._install_diff_gutter_visual_line_yank_maps(buf)
   end, { buffer = buf, nowait = true, silent = true, desc = "Yank selection to clipboard" })
 end
 
----@param buf integer
----@return boolean
+--- Checks if gutter visual-line mode is active for the specified buffer.
+---@param buf integer Target buffer handle.
+---@return boolean active True if gutter visual-line mode is active.
 function M._diff_gutter_visual_line_active(buf)
   local selections = gutter_visual_selections
   if not (selections and selections[buf]) then return false end
@@ -170,14 +178,16 @@ function M._diff_gutter_visual_line_active(buf)
   return false
 end
 
----@param buf integer
----@return integer
+--- Resolves the appropriate diff extmark namespace for a buffer.
+---@param buf integer Target buffer handle.
+---@return integer namespace Namespace identifier.
 function M._diff_gutter_namespace(buf)
   local status = session.states and session.states[buf] or nil
   return status and ui.status_ns or ui.preview_ns
 end
 
----@param buf integer
+--- Updates visual overlay extmarks spanning the active visual-line range.
+---@param buf integer Target buffer handle.
 function M._refresh_diff_gutter_visual_line(buf)
   if not M._diff_gutter_visual_line_active(buf) then return end
   M._clear_diff_gutter_visual_overlay(buf)
@@ -202,7 +212,8 @@ function M._refresh_diff_gutter_visual_line(buf)
   end
 end
 
----@param buf integer
+--- Enters visual-line selection mode with gutter overlay decorations.
+---@param buf integer Target buffer handle.
 function M._start_diff_gutter_visual_line(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return end
   gutter_visual_selections = gutter_visual_selections or {}
@@ -215,8 +226,9 @@ function M._start_diff_gutter_visual_line(buf)
   M._refresh_diff_gutter_visual_line(buf)
 end
 
----@param buf integer
----@return string[]
+--- Extracts combined gutter and line text across the active visual-line selection.
+---@param buf integer Target buffer handle.
+---@return string[] lines Array of concatenated line text strings.
 function M._diff_gutter_visual_line_text(buf)
   local cursor_row = vim.api.nvim_win_get_cursor(0)[1]
   local start_pos = vim.fn.getpos("v")
@@ -238,9 +250,10 @@ function M._diff_gutter_visual_line_text(buf)
   return lines
 end
 
----@param buf integer
----@param register? string
----@return boolean handled
+--- Yanks selected visual lines including gutter markers into the target register.
+---@param buf integer Target buffer handle.
+---@param register? string Target register character or string.
+---@return boolean handled True if yank operation succeeded.
 function M._yank_diff_gutter_visual_line(buf, register)
   if not M._diff_gutter_visual_line_active(buf) then return false end
   local lines = M._diff_gutter_visual_line_text(buf)
@@ -259,9 +272,10 @@ function M._yank_diff_gutter_visual_line(buf, register)
   return true
 end
 
----@param buf integer
----@param namespace integer
----@return boolean handled
+--- Clamps cursor position to prevent landing inside inline gutter virtual text.
+---@param buf integer Target buffer handle.
+---@param namespace integer Extmark namespace identifier.
+---@return boolean handled True if cursor was adjusted.
 function M._normalize_diff_gutter_cursor(buf, namespace)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return false end
   local row = vim.api.nvim_win_get_cursor(0)[1]
@@ -298,8 +312,9 @@ function M._normalize_diff_gutter_cursor(buf, namespace)
   return true
 end
 
----@param buf integer
----@return boolean handled
+--- Normalizes cursor column for diff preview or status buffers.
+---@param buf integer Target buffer handle.
+---@return boolean handled True if cursor normalization was performed.
 function M._align_diff_cursor(buf)
   local status = session.states and session.states[buf] or nil
   if status then
@@ -308,8 +323,9 @@ function M._align_diff_cursor(buf)
   return M._normalize_diff_gutter_cursor(buf, ui.preview_ns)
 end
 
----@param buf integer
----@return integer? row
+--- Clamps cursor column to valid line content width.
+---@param buf integer Target buffer handle.
+---@return integer? row Active buffer row index.
 function M._clamp_buffer_text_cursor(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return nil end
   local row = vim.api.nvim_win_get_cursor(0)[1]
@@ -327,8 +343,9 @@ function M._clamp_buffer_text_cursor(buf)
   return row
 end
 
----@param buf integer
----@return integer? row
+--- Normalizes cursor positioning across diff and status view buffers.
+---@param buf integer Target buffer handle.
+---@return integer? row Normalized buffer row index.
 function M._normalize_status_cursor(buf)
   if not (buf and vim.api.nvim_buf_is_valid(buf) and vim.api.nvim_get_current_buf() == buf) then return nil end
   cursor_normalizing = cursor_normalizing or {}
@@ -345,15 +362,16 @@ function M._normalize_status_cursor(buf)
   return vim.api.nvim_win_get_cursor(0)[1]
 end
 
----@param buf integer
+--- Normalizes cursor positioning in empty diff buffers.
+---@param buf integer Target buffer handle.
 function M._align_empty_diff_cursor(buf)
   M._normalize_status_cursor(buf)
 end
---- Find which hunk the cursor is in within a diff buffer.
---- Returns the hunk's complete diff patch (with file header) or nil.
----@param buf number
----@return string? diff_patch
----@return number? hunk_start_line
+
+--- Identifies the diff hunk containing the active window cursor.
+---@param buf integer Target buffer handle.
+---@return string? diff_patch Hunk unified diff patch string or nil.
+---@return integer? hunk_start_line One-based starting line number or nil.
 local function get_hunk_at_cursor(buf)
   local hunks = buf_hunks[buf]
   if not hunks then return end
@@ -365,10 +383,9 @@ local function get_hunk_at_cursor(buf)
   end
 end
 
---- Create (or reuse) a real diff buffer with keymaps.
---- Call _refresh_diff_buffer after setting the buffer on a window.
----@param filename string
----@return number buf
+--- Creates or focuses a standalone diff buffer for a specific file.
+---@param filename string Target file path string.
+---@return integer buf Created or existing buffer handle.
 function M.open_diff_buffer(filename)
   local key = "diff:" .. filename
   diff_bufs = diff_bufs or {}
@@ -732,12 +749,9 @@ function M.open_diff_buffer(filename)
   return buf
 end
 
---- Compute hunk map from diff text. Each hunk's rendered lines are:
---- 1 line for @@ separator + N code lines.
---- N = number of lines in hunk.diff AFTER the @@ header, EXCLUDING
---- the file header lines (diff --git, index, ---, +++).
----@param diff_text string
----@return table[]
+--- Computes line ranges and hunk mapping from unified diff text.
+---@param diff_text string Unified diff body text.
+---@return table[] hunk_map Array of hunk range descriptors.
 function M._compute_hunk_map(diff_text)
   local raw_hunks = git_data()._parse_diff(diff_text, false)
   local rendered_line = 0
@@ -774,8 +788,8 @@ function M._compute_hunk_map(diff_text)
   return hunk_map
 end
 
---- Re-render buffer respecting fold state (placeholder — full fold
---- support would need tracking which hunks to hide/show)
+--- Applies manual folds to staged or folded hunks in the diff buffer.
+---@param buf integer Target buffer handle.
 function M._render_with_folds(buf)
   local hunks = buf_hunks[buf]
   if not hunks then return end
@@ -811,10 +825,9 @@ function M._render_with_folds(buf)
   end)
 end
 
---- Re-fetch diff data and re-render a diff buffer after staging/unstaging.
---- Staged hunks get auto-folded.
----@param buf number
----@param filename string
+--- Re-renders diff buffer content and applies hunk highlights and folds.
+---@param buf integer Target buffer handle.
+---@param filename string Associated file path string.
 function M._refresh_diff_buffer(buf, filename)
   -- Use cached diff data from M.get() instead of re-running git
   local diff_text = session.file_diffs and session.file_diffs[filename]
@@ -864,9 +877,10 @@ function M._refresh_diff_buffer(buf, filename)
   end
 end
 
----@param buf number
----@param item_diff string?
----@return table?
+--- Applies highlight decoration to the active diff hunk header.
+---@param buf integer Target buffer handle.
+---@param item_diff string? Optional diff hunk text to match.
+---@return table? hunk Matching hunk map record or nil.
 function M._highlight_active_hunk(buf, item_diff)
   vim.api.nvim_buf_clear_namespace(buf, ui.active_hunk_header_ns, 0, -1)
   if not item_diff then return nil end
@@ -885,10 +899,9 @@ function M._highlight_active_hunk(buf, item_diff)
   end
 end
 
---- Re-fetch the diff for a single file and update the cache.
---- Called before _refresh_diff_buffer to pick up file edits.
----@param filename string
----@param cb? fun()
+--- Asynchronously re-fetches diff and staged flags for a single file.
+---@param filename string Target file path string.
+---@param cb? fun() Optional callback invoked upon completion.
 function M._update_file_diff_cache_async(filename, cb)
   session.file_diffs = session.file_diffs or {}
   session.file_hunk_staged = session.file_hunk_staged or {}
@@ -933,8 +946,8 @@ function M._update_file_diff_cache_async(filename, cb)
   end)
 end
 
---- Render an open per-file diff buffer from the current session cache.
----@param filename string
+--- Re-renders an open per-file diff buffer from current session cache.
+---@param filename string Target file path string.
 function M.refresh_open_diff_buffer_from_cache(filename)
   local key = "diff:" .. filename
   diff_bufs = diff_bufs or {}
@@ -945,8 +958,8 @@ function M.refresh_open_diff_buffer_from_cache(filename)
   M._refresh_diff_buffer(buf, filename)
 end
 
---- Reload one open per-file diff buffer from Git.
----@param filename string
+--- Reloads one open per-file diff buffer from Git.
+---@param filename string Target file path string.
 function M.refresh_open_diff_buffer(filename)
   local key = "diff:" .. filename
   diff_bufs = diff_bufs or {}

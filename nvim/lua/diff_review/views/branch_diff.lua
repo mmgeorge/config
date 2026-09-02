@@ -13,9 +13,10 @@ local function section_builder() return require("diff_review.views.status.sectio
 local session = require("diff_review.session")
 
 
----@param branch string
----@param file? string repo-relative path when diffing a single file
----@return DiffReviewStatusHeadLine[]
+--- Builds structured head lines showing branch comparison target and optional file.
+---@param branch string Comparison target branch name string.
+---@param file? string Optional repository-relative file path string.
+---@return DiffReviewStatusHeadLine[] lines Array of structured head line descriptors.
 function M.head_lines(branch, file)
   local lines = {
     {
@@ -37,11 +38,12 @@ function M.head_lines(branch, file)
   return lines
 end
 
----@param cwd string
----@param branch string
----@param diff_text? string
----@param file? string
----@return DiffReviewStatusSection[]
+--- Builds status sections representing changes between branch and working tree.
+---@param cwd string Repository root directory path.
+---@param branch string Comparison branch name string.
+---@param diff_text? string Optional raw unified diff text.
+---@param file? string Optional repository-relative file path string.
+---@return DiffReviewStatusSection[] sections Array of constructed status sections.
 function M.sections(cwd, branch, diff_text, file)
   local provider_key = "diff:" .. branch .. (file and (":" .. file) or "")
   local sections = section_builder().sections_from_diff(cwd, {
@@ -56,11 +58,12 @@ function M.sections(cwd, branch, diff_text, file)
   return sections
 end
 
----@param branch string
----@param cwd string
----@param buf integer
----@param diff_text? string
----@param file? string
+--- Populates status state with head lines and sections and renders into buffer.
+---@param branch string Comparison branch name string.
+---@param cwd string Repository root directory path.
+---@param buf integer Target status buffer handle.
+---@param diff_text? string Optional raw unified diff text.
+---@param file? string Optional repository-relative file path string.
 function M.render(branch, cwd, buf, diff_text, file)
   local status = session.status
   if not (status and status.buf == buf) then return end
@@ -70,10 +73,11 @@ function M.render(branch, cwd, buf, diff_text, file)
   status_render().status_render_loaded(buf, nil, nil, { reuse_sections = true }, status.head_lines, status.sections)
 end
 
----@param branch string
----@param cwd string
----@param buf integer
----@param file? string
+--- Asynchronously fetches unified diff between branch and working tree and renders result.
+---@param branch string Comparison branch name string.
+---@param cwd string Repository root directory path.
+---@param buf integer Target status buffer handle.
+---@param file? string Optional repository-relative file path string.
 function M.load(branch, cwd, buf, file)
   local status = session.status
   if not (status and status.buf == buf) then return end

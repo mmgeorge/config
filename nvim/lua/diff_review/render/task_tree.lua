@@ -38,23 +38,27 @@ local display_text = require("diff_review.render.display_text")
 ---@field ancestor_ids string[]
 ---@field metadata? table
 
----@param is_last boolean
----@return string
+--- Returns the tree branch box-drawing glyph for an item.
+---@param is_last boolean True if this item is the final sibling in its group.
+---@return string glyph Branch glyph string (`"└─ "` or `"├─ "`).
 function M.branch(is_last)
   return is_last and "└─ " or "├─ "
 end
 
----@param is_last boolean
----@return string
+--- Returns the vertical continuation indent string for child lines.
+---@param is_last boolean True if the parent item was the final sibling.
+---@return string prefix Continuation indent string (`"   "` or `"│  "`).
 function M.continuation(is_last)
   return is_last and "   " or "│  "
 end
 
----@param text string
----@param width integer
----@param first_prefix string
----@param continuation_prefix string
----@return string[]
+--- Wraps text into lines constrained to a display column width.
+--- Applies custom prefix strings to initial and wrapped lines.
+---@param text string Source text to wrap.
+---@param width integer Maximum column display width.
+---@param first_prefix string Indentation prefix for the first line.
+---@param continuation_prefix string Indentation prefix for continuation lines.
+---@return string[] lines Array of wrapped text line strings.
 function M.wrap(text, width, first_prefix, continuation_prefix)
   return display_text.wrap(text, width, first_prefix, continuation_prefix)
 end
@@ -64,9 +68,10 @@ end
 ---@field continuation_prefix string
 ---@field body string
 
----Parse one rendered task-tree line into semantic wrapping parts.
----@param line string
----@return DiffReviewTaskTreeParsedLine?
+--- Parses a rendered tree line into its leading branch prefix, continuation prefix, and body text.
+--- Returns nil if the line does not match tree formatting.
+---@param line string Raw tree line text.
+---@return DiffReviewTaskTreeParsedLine? parsed Structure containing prefixes and body, or nil.
 function M.parse_line(line)
   local prefix, branch, body = line:match("^(%s*[│ ]*)([├└]─%s+)(%S.*)$")
   if not prefix or not branch or not body then return nil end
@@ -207,10 +212,10 @@ local function append_node(row_list, node, sibling_index, sibling_count, width, 
   end
 end
 
----Render normalized task nodes into width-aware semantic rows.
----@param node_list DiffReviewTaskTreeNode[]
----@param width integer
----@return DiffReviewTaskTreeRow[]
+--- Renders a hierarchy of task tree nodes into width-wrapped semantic row records.
+---@param node_list DiffReviewTaskTreeNode[] Array of task tree root nodes.
+---@param width integer Usable column width for wrapping.
+---@return DiffReviewTaskTreeRow[] rows Array of rendered task tree rows.
 function M.render(node_list, width)
   local row_list = {}
   for node_index, node in ipairs(node_list or {}) do

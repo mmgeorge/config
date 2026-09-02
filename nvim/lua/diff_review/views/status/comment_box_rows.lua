@@ -6,9 +6,9 @@ local status_buffer = require("diff_review.views.status.status_buffer")
 
 local M = {}
 
---- Resolve the narrowest displayed text width so one box layout fits every window.
----@param buf integer?
----@return integer
+--- Resolves the minimum visible text column width across all windows displaying the buffer.
+---@param buf integer? Status buffer handle.
+---@return integer width Available display text width in columns.
 local function display_columns(buf)
   local width
   if buf and vim.api.nvim_buf_is_valid(buf) then
@@ -24,11 +24,11 @@ local function display_columns(buf)
   return width or tonumber(vim.o.columns) or 80
 end
 
---- Emit a compact comment box as real status-buffer rows after its diff anchor.
----@param state table
----@param desc DiffReviewCommentDescriptor
----@param anchor_line integer
----@param style DiffReviewCommentBoxStyle?
+--- Emits formatted comment box lines as native status-buffer rows attached to an anchor line.
+---@param state table Status render state table.
+---@param desc DiffReviewCommentDescriptor Comment descriptor record.
+---@param anchor_line integer One-based buffer line index of the diff anchor.
+---@param style DiffReviewCommentBoxStyle? Optional comment box border and color style.
 function M.render_box(state, desc, anchor_line, style)
   if not (state and anchor_line and anchor_line > 0) then return end
   state.comment_box_record_by_anchor = state.comment_box_record_by_anchor or {}
@@ -75,9 +75,9 @@ function M.render_box(state, desc, anchor_line, style)
   if desc.id then state.comment_box_record_by_id[desc.id] = item end
 end
 
---- Report whether real comment boxes need a layout render after a width change.
----@param state table
----@return boolean layout_changed
+--- Determines whether buffer comment boxes require re-rendering due to display width changes.
+---@param state table Status render state table.
+---@return boolean layout_changed True if display width changed and re-rendering is needed.
 function M.refresh_buffer(state)
   local buf = state and state.buf or nil
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return false end

@@ -3,10 +3,11 @@ local M = {}
 ---@class DiffReviewHarnessPlanExecutionHost
 ---@field append_interaction fun(result: table, interaction: table, options: table)
 
----@param result table
----@param entry table
----@param options table
----@param host DiffReviewHarnessPlanExecutionHost
+--- Appends execution stream events including task starts, task completions, and plan deviations.
+---@param result table Target render collection table.
+---@param entry table Plan execution stream record.
+---@param options table Rendering options configuration.
+---@param host DiffReviewHarnessPlanExecutionHost Host adapter providing interaction formatting.
 function M.append(result, entry, options, host)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
   for _, item in ipairs(entry.item or {}) do

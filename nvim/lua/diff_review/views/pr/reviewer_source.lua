@@ -1,16 +1,19 @@
+--- Blink.cmp completion source providing GitHub contributor and reviewer suggestions.
 ---@module 'blink.cmp'
----@class blink.cmp.Source
+---@class DiffReviewBlinkReviewerSource: blink.cmp.Source
 local source = {}
 
----@param opts table?
----@return table
+--- Instantiates a new reviewer completion source.
+---@param opts table? Source configuration options.
+---@return table source Constructed completion source instance.
 function source.new(opts)
   local self = setmetatable({}, { __index = source })
   self.opts = opts or {}
   return self
 end
 
----@return boolean
+--- Determines whether reviewer completion is active at the current cursor column.
+---@return boolean enabled True if cursor is positioned after a reviewer trigger character.
 function source:enabled()
   local repo_cache = require("github.repo_cache")
   if not repo_cache.user_completion_enabled(0) then return false end
@@ -20,13 +23,15 @@ function source:enabled()
   return before_cursor:match(".*@[%w_-]*$") ~= nil
 end
 
----@return string[]
+--- Returns trigger character list for reviewer completions.
+---@return string[] triggers Array of trigger characters.
 function source:get_trigger_characters()
   return { "@" }
 end
 
----@param ctx table
----@param callback fun(result: table)
+--- Generates completion items matching contributor logins for the repository.
+---@param ctx table Completion context descriptor.
+---@param callback fun(result: table) Completion response callback.
 function source:get_completions(ctx, callback)
   local repo_cache = require("github.repo_cache")
   local repo = repo_cache.completion_repo(0)

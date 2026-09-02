@@ -36,9 +36,10 @@ local function normalized_height(value)
   return math.max(0, math.floor(tonumber(value) or 0))
 end
 
----@param index DiffReviewRowHeightIndex
----@param item_index integer
----@param delta integer
+--- Adds a height delta to the Fenwick tree prefix sum index at a given 1-based item position.
+---@param index DiffReviewRowHeightIndex Target row height index structure.
+---@param item_index integer One-based item index.
+---@param delta integer Height adjustment value (positive or negative).
 function M.row_index_add(index, item_index, delta)
   while item_index <= index.count do
     index.tree[item_index] = (index.tree[item_index] or 0) + delta
@@ -46,8 +47,9 @@ function M.row_index_add(index, item_index, delta)
   end
 end
 
----@param heights integer[]?
----@return DiffReviewRowHeightIndex
+--- Constructs a Fenwick tree indexed row height structure initialized from an array of item heights.
+---@param heights integer[]? Array of non-negative item heights.
+---@return DiffReviewRowHeightIndex index Initialized row height index.
 function M.new_row_height_index(heights)
   local index = {
     count = 0,
@@ -59,8 +61,9 @@ function M.new_row_height_index(heights)
   return index
 end
 
----@param index DiffReviewRowHeightIndex
----@param heights integer[]
+--- Rebuilds all Fenwick tree prefix sums and height arrays for the index in-place.
+---@param index DiffReviewRowHeightIndex Target row height index to reset.
+---@param heights integer[] Array of non-negative item heights.
 function M.rebuild_row_height_index(index, heights)
   index.count = #heights
   index.total = 0
@@ -75,9 +78,10 @@ function M.rebuild_row_height_index(index, heights)
   end
 end
 
----@param index DiffReviewRowHeightIndex
----@param item_index integer
----@return integer
+--- Computes the cumulative row height of all items from 1 up to `item_index` in logarithmic time.
+---@param index DiffReviewRowHeightIndex Target row height index.
+---@param item_index integer One-based inclusive item limit.
+---@return integer sum Total cumulative row height.
 function M.prefix_sum(index, item_index)
   item_index = math.min(index.count, math.max(0, math.floor(tonumber(item_index) or 0)))
   local sum = 0
@@ -88,9 +92,10 @@ function M.prefix_sum(index, item_index)
   return sum
 end
 
----@param index DiffReviewRowHeightIndex
----@param item_index integer
----@param height integer
+--- Updates the height of a single item in the index and updates prefix sums in logarithmic time.
+---@param index DiffReviewRowHeightIndex Target row height index.
+---@param item_index integer One-based index of item to update.
+---@param height integer New non-negative item height.
 function M.set_height(index, item_index, height)
   item_index = math.floor(tonumber(item_index) or 0)
   if item_index < 1 or item_index > index.count then return end
@@ -103,9 +108,10 @@ function M.set_height(index, item_index, height)
   M.row_index_add(index, item_index, delta)
 end
 
----@param index DiffReviewRowHeightIndex
----@param row integer
----@return integer?
+--- Finds the one-based item index corresponding to a one-based target buffer row via binary lifting.
+---@param index DiffReviewRowHeightIndex Target row height index.
+---@param row integer One-based target row number.
+---@return integer? item_index One-based item index containing the row, or nil if out of bounds.
 function M.item_at_row(index, row)
   row = math.floor(tonumber(row) or 0)
   if row < 1 or row > index.total then return nil end
@@ -129,27 +135,30 @@ function M.item_at_row(index, row)
   return item_index + 1
 end
 
----@param index DiffReviewRowHeightIndex
----@param item_index integer
----@return integer?
+--- Calculates the 1-based starting row number of an item.
+---@param index DiffReviewRowHeightIndex Target row height index.
+---@param item_index integer One-based item index.
+---@return integer? row One-based starting row index, or nil if invalid item.
 function M.row_start_for_item(index, item_index)
   item_index = math.floor(tonumber(item_index) or 0)
   if item_index < 1 or item_index > index.count then return nil end
   return M.prefix_sum(index, item_index - 1) + 1
 end
 
----@param index DiffReviewRowHeightIndex
----@param item_index integer
----@return integer?
+--- Calculates the 1-based ending row number of an item.
+---@param index DiffReviewRowHeightIndex Target row height index.
+---@param item_index integer One-based item index.
+---@return integer? row One-based ending row index, or nil if invalid item.
 function M.row_end_for_item(index, item_index)
   item_index = math.floor(tonumber(item_index) or 0)
   if item_index < 1 or item_index > index.count then return nil end
   return M.prefix_sum(index, item_index)
 end
 
----@param key_by_item string[]?
----@param height_by_item integer[]?
----@return DiffReviewViewLayout
+--- Constructs a view layout manager maintaining 1-based row spans mapped by unique keys.
+---@param key_by_item string[]? Ordered list of unique item key strings.
+---@param height_by_item integer[]? Array of non-negative item heights.
+---@return DiffReviewViewLayout layout Initialized view layout structure.
 function M.new_view_layout(key_by_item, height_by_item)
   key_by_item = key_by_item or {}
   height_by_item = height_by_item or {}
@@ -163,7 +172,8 @@ function M.new_view_layout(key_by_item, height_by_item)
   return layout
 end
 
----@param layout DiffReviewViewLayout
+--- Rebuilds the lookup table and start row spans for all items in the layout.
+---@param layout DiffReviewViewLayout Target view layout to rebuild.
 function M.rebuild_span(layout)
   layout.span_by_key = {}
   layout.item_index_by_key = {}
@@ -181,17 +191,19 @@ function M.rebuild_span(layout)
   end
 end
 
----@param layout DiffReviewViewLayout
----@param key string
----@return integer?
+--- Retrieves the 1-based item index matching a unique item key string.
+---@param layout DiffReviewViewLayout Target view layout.
+---@param key string Unique item key.
+---@return integer? item_index One-based item index, or nil if key not present.
 function M.item_index(layout, key)
   if not layout.item_index_by_key then M.rebuild_span(layout) end
   return layout.item_index_by_key and layout.item_index_by_key[key] or nil
 end
 
----@param layout DiffReviewViewLayout
----@param key string
----@param height integer
+--- Adjusts the row height of a keyed span and propagates row shift offsets to downstream spans.
+---@param layout DiffReviewViewLayout Target view layout.
+---@param key string Unique item key.
+---@param height integer New non-negative height in buffer rows.
 function M.set_span_height(layout, key, height)
   local item_index = M.item_index(layout, key)
   if not item_index then return end
@@ -213,8 +225,9 @@ function M.set_span_height(layout, key, height)
   end
 end
 
----@param blocks DiffReviewFileBodyBlock[]?
----@return DiffReviewFileBodyLayout
+--- Constructs a file body layout manager wrapping block components and their view layout.
+---@param blocks DiffReviewFileBodyBlock[]? Array of file body block descriptors.
+---@return DiffReviewFileBodyLayout layout Initialized file body layout structure.
 function M.new_file_body_layout(blocks)
   local key_by_item = {}
   local height_by_item = {}
@@ -237,19 +250,21 @@ function M.new_file_body_layout(blocks)
   }
 end
 
----@param body_layout DiffReviewFileBodyLayout
----@param key string
----@param height integer
+--- Updates the height of a keyed body block and synchronizes its view span.
+---@param body_layout DiffReviewFileBodyLayout Target file body layout.
+---@param key string Unique block key.
+---@param height integer New non-negative height in buffer rows.
 function M.set_block_height(body_layout, key, height)
   local block = body_layout.block_by_key and body_layout.block_by_key[key] or nil
   if block then block.height = normalized_height(height) end
   M.set_span_height(body_layout.view, key, height)
 end
 
----@param view_layout DiffReviewViewLayout
----@param first_row integer
----@param last_row integer
----@return DiffReviewLayoutSpan[]
+--- Resolves all layout spans intersecting an inclusive 1-based buffer row range.
+---@param view_layout DiffReviewViewLayout Target view layout.
+---@param first_row integer One-based starting buffer row.
+---@param last_row integer One-based ending buffer row.
+---@return DiffReviewLayoutSpan[] spans Array of visible layout span records.
 function M.spans_in_row_range(view_layout, first_row, last_row)
   local span_list = {}
   first_row = math.max(1, math.floor(tonumber(first_row) or 1))
@@ -265,10 +280,11 @@ function M.spans_in_row_range(view_layout, first_row, last_row)
   return span_list
 end
 
----@param body_layout DiffReviewFileBodyLayout
----@param first_row integer
----@param last_row integer
----@return DiffReviewLayoutSpan[]
+--- Resolves all file body block spans intersecting an inclusive 1-based buffer row range.
+---@param body_layout DiffReviewFileBodyLayout Target file body layout.
+---@param first_row integer One-based starting buffer row.
+---@param last_row integer One-based ending buffer row.
+---@return DiffReviewLayoutSpan[] spans Array of visible layout span records.
 function M.body_spans_in_row_range(body_layout, first_row, last_row)
   return M.spans_in_row_range(body_layout.view, first_row, last_row)
 end

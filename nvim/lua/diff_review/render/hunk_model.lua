@@ -18,22 +18,25 @@ local function same_hunk_context_scope(...) return syntax_engine().same_hunk_con
 local hunk_first_changed_current_line = diff_parse.hunk_first_changed_current_line
 local function hunk_line_visible_in_context_scope(...) return syntax_engine().hunk_line_visible_in_context_scope(...) end
 
----@param context DiffReviewHunkTreeSitterContext|string?
----@return DiffReviewHunkBoundaryContext?
+--- Returns the innermost ancestor boundary descriptor from a Tree-sitter context record.
+---@param context DiffReviewHunkTreeSitterContext|string? Syntax context descriptor or name.
+---@return DiffReviewHunkBoundaryContext? boundary Innermost ancestor boundary descriptor, or nil.
 function M.context_ancestor_boundary(context)
   if type(context) ~= "table" or type(context.ancestor_boundaries) ~= "table" then return nil end
   return context.ancestor_boundaries[#context.ancestor_boundaries]
 end
 
----@param context DiffReviewHunkTreeSitterContext|string?
----@return string?
+--- Returns the lookup key string of the innermost ancestor boundary in a context.
+---@param context DiffReviewHunkTreeSitterContext|string? Syntax context descriptor or name.
+---@return string? key Unique boundary identifier key, or nil.
 function M.context_ancestor_key(context)
   local boundary = M.context_ancestor_boundary(context)
   return boundary and boundary.key or nil
 end
 
----@param hunk DiffReviewParsedHunk
----@return fun(parsed_line: DiffReviewParsedHunkLine): boolean
+--- Constructs a line filter predicate restricting visible context lines to the hunk's active change window.
+---@param hunk DiffReviewParsedHunk Parsed diff hunk descriptor.
+---@return fun(parsed_line: DiffReviewParsedHunkLine): boolean filter Filter predicate returning true for visible lines.
 function M.render_line_filter(hunk)
   local first_changed_position = nil
   local last_changed_position = nil
@@ -52,9 +55,10 @@ function M.render_line_filter(hunk)
   end
 end
 
----@param parsed_lines DiffReviewParsedHunkLine[]
----@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@return table<string, boolean>
+--- Collects the set of code text lines visible under the given filter.
+---@param parsed_lines DiffReviewParsedHunkLine[] Array of parsed hunk lines.
+---@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean Optional line filter predicate.
+---@return table<string, boolean> visible Set of visible code line strings.
 function M.visible_parsed_source_lines(parsed_lines, include_line)
   local visible = {}
   for _, parsed_line in ipairs(parsed_lines or {}) do
@@ -65,9 +69,10 @@ function M.visible_parsed_source_lines(parsed_lines, include_line)
   return visible
 end
 
----@param hunk DiffReviewParsedHunk
----@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@return integer
+--- Computes the one-based new revision line number immediately following the last line in a hunk.
+---@param hunk DiffReviewParsedHunk Parsed diff hunk descriptor.
+---@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean Optional line filter predicate.
+---@return integer after_line One-based line number after hunk.
 function M.after_current_line(hunk, include_line)
   local last_new_line = nil
   local saw_removed_line = false
@@ -82,9 +87,10 @@ function M.after_current_line(hunk, include_line)
   return hunk.new_start
 end
 
----@param hunk DiffReviewParsedHunk
----@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@return table<integer, boolean>
+--- Builds a set of all new revision line numbers occupied by lines in a hunk.
+---@param hunk DiffReviewParsedHunk Parsed diff hunk descriptor.
+---@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean Optional line filter predicate.
+---@return table<integer, boolean> lines Set of occupied new line numbers.
 function M.current_line_set(hunk, include_line)
   local lines = {}
   for _, parsed_line in ipairs(hunk.lines) do
@@ -93,29 +99,33 @@ function M.current_line_set(hunk, include_line)
   return lines
 end
 
----@param item table
----@return DiffReviewParsedHunkLine
+--- Resolves the primary parsed diff line associated with a render item.
+---@param item table Render item descriptor table.
+---@return DiffReviewParsedHunkLine line Primary parsed diff line.
 function M.render_item_line(item)
   return item.line or item.display_line
 end
 
----@param item table
----@return DiffReviewParsedHunkLine[]
+--- Returns the array of underlying backing diff lines represented by a render item.
+---@param item table Render item descriptor table.
+---@return DiffReviewParsedHunkLine[] lines Array of backing diff lines.
 function M.render_item_backing_lines(item)
   if item.kind == "replacement" then return item.diff_lines or { item.display_line } end
   return { item.line }
 end
 
----@param item table
----@return boolean
+--- Reports whether a render item represents a modified, added, or deleted line.
+---@param item table Render item descriptor table.
+---@return boolean changed True if the item is a changed line or replacement.
 function M.render_item_changed(item)
   if item.kind == "replacement" then return true end
   local parsed_line = M.render_item_line(item)
   return parsed_line.prefix == "+" or parsed_line.prefix == "-"
 end
 
----@param hunk DiffReviewParsedHunk
----@return table<integer, integer>
+--- Maps hunk line positions to effective current new revision line numbers.
+---@param hunk DiffReviewParsedHunk Parsed diff hunk descriptor.
+---@return table<integer, integer> by_position Mapping from hunk position to current line number.
 function M.current_line_by_position(hunk)
   local by_position = {}
   local current_line = hunk.new_start
@@ -133,17 +143,19 @@ function M.current_line_by_position(hunk)
   return by_position
 end
 
----@param parsed_line DiffReviewParsedHunkLine?
----@param line_by_position table<integer, integer>
----@return integer?
+--- Resolves the effective current new revision line for a parsed diff line.
+---@param parsed_line DiffReviewParsedHunkLine? Parsed diff line.
+---@param line_by_position table<integer, integer> Mapping from hunk position to current line number.
+---@return integer? line Effective current line number, or nil.
 function M.parsed_line_current_line(parsed_line, line_by_position)
   if not parsed_line then return nil end
   return parsed_line.new_line or (parsed_line.position and line_by_position[parsed_line.position]) or parsed_line.old_line
 end
 
----@param item table
----@param line_by_position table<integer, integer>
----@return integer?
+--- Resolves the representative context line number for a render item.
+---@param item table Render item descriptor table.
+---@param line_by_position table<integer, integer> Mapping from hunk position to current line number.
+---@return integer? line Representative context line number, or nil.
 function M.render_item_context_line(item, line_by_position)
   if item.kind == "replacement" then
     for _, parsed_line in ipairs(item.new_lines or {}) do
@@ -153,10 +165,11 @@ function M.render_item_context_line(item, line_by_position)
   return M.parsed_line_current_line(M.render_item_line(item), line_by_position)
 end
 
----@param item table
----@param line_by_position table<integer, integer>
----@return integer?
----@return integer?
+--- Computes the start and end changed line numbers for a render item.
+---@param item table Render item descriptor table.
+---@param line_by_position table<integer, integer> Mapping from hunk position to current line number.
+---@return integer? first_line Starting changed line number.
+---@return integer? last_line Ending changed line number.
 function M.render_item_changed_line_range(item, line_by_position)
   local first_line = nil
   local last_line = nil
@@ -172,17 +185,19 @@ function M.render_item_changed_line_range(item, line_by_position)
   return first_line, last_line
 end
 
----@param context DiffReviewHunkTreeSitterContext|string?
----@param line integer?
----@return boolean
+--- Tests whether a context scope interval includes the specified one-based line number.
+---@param context DiffReviewHunkTreeSitterContext|string? Syntax context descriptor or name.
+---@param line integer? One-based line number to test.
+---@return boolean contains True if context spans the line.
 function M.context_contains_line(context, line)
   if type(context) ~= "table" or not line then return true end
   return line >= context.start_row + 1 and line <= context.end_row + 1
 end
 
----@param hunk DiffReviewParsedHunk
----@param line_by_position? table<integer, integer>
----@return table<integer, boolean>
+--- Computes the set of changed line numbers present in a hunk.
+---@param hunk DiffReviewParsedHunk Parsed diff hunk descriptor.
+---@param line_by_position? table<integer, integer> Mapping from hunk position to current line number.
+---@return table<integer, boolean> lines Set of changed line numbers.
 function M.changed_current_line_set(hunk, line_by_position)
   line_by_position = line_by_position or M.current_line_by_position(hunk)
   local lines = {}
@@ -195,9 +210,10 @@ function M.changed_current_line_set(hunk, line_by_position)
   return lines
 end
 
----@param item table
----@return integer added
----@return integer removed
+--- Counts added and removed lines represented by a render item.
+---@param item table Render item descriptor table.
+---@return integer added Count of added lines.
+---@return integer removed Count of removed lines.
 function M.render_item_stats(item)
   local added = 0
   local removed = 0
@@ -211,10 +227,11 @@ function M.render_item_stats(item)
   return added, removed
 end
 
----@param render_items table[]
----@param line_by_position table<integer, integer>
----@param context_for_line fun(line: integer): DiffReviewHunkTreeSitterContext|string?
----@return DiffReviewHunkChangeRegion[]
+--- Groups adjacent changed render items into semantic change regions bounded by context scope.
+---@param render_items table[] Array of render items.
+---@param line_by_position table<integer, integer> Mapping from hunk position to current line number.
+---@param context_for_line fun(line: integer): DiffReviewHunkTreeSitterContext|string? Resolves Tree-sitter context for a line number.
+---@return DiffReviewHunkChangeRegion[] regions Array of change region descriptor tables.
 function M.change_regions(render_items, line_by_position, context_for_line)
   local regions = {}
   local current_region = nil
@@ -278,9 +295,10 @@ function M.change_regions(render_items, line_by_position, context_for_line)
   return regions
 end
 
----@param region DiffReviewHunkChangeRegion
----@param fallback_hunk? DiffReviewParsedHunk
----@return table[]
+--- Builds formatted highlight chunks for virtual hunk headers displaying add and delete counts.
+---@param region DiffReviewHunkChangeRegion Change region descriptor table.
+---@param fallback_hunk? DiffReviewParsedHunk Optional fallback parsed hunk for missing counts.
+---@return table[] chunks Array of `[text, hl_group]` tuples for extmark formatting.
 function M.virtual_header_parts(region, fallback_hunk)
   local added = region.added
   local removed = region.removed
@@ -294,11 +312,12 @@ function M.virtual_header_parts(region, fallback_hunk)
   }
 end
 
----@param parsed_line DiffReviewParsedHunkLine
----@param previous_visible_changed boolean
----@param context DiffReviewHunkTreeSitterContext|string?
----@param visible_in_hunk? boolean
----@return boolean
+--- Tests whether a hidden context line is a closing delimiter right after modified lines.
+---@param parsed_line DiffReviewParsedHunkLine Parsed hunk line to inspect.
+---@param previous_visible_changed boolean True if the previous visible line was changed.
+---@param context DiffReviewHunkTreeSitterContext|string? Syntax context descriptor.
+---@param visible_in_hunk? boolean True if line is visible in the raw hunk.
+---@return boolean is_closing True if line is a closing delimiter.
 function M.hidden_closing_boundary_after_change(parsed_line, previous_visible_changed, context, visible_in_hunk)
   if not previous_visible_changed then return false end
   if parsed_line.prefix ~= " " or type(context) ~= "table" then return false end
@@ -307,9 +326,10 @@ function M.hidden_closing_boundary_after_change(parsed_line, previous_visible_ch
   return parsed_line.code:match("^%s*[})%]]+[,;]?%s*$") ~= nil
 end
 
----@param parsed_line DiffReviewParsedHunkLine
----@param file string
----@return table
+--- Constructs a metadata descriptor table for a single diff line.
+---@param parsed_line DiffReviewParsedHunkLine Parsed hunk line.
+---@param file string File path identifier.
+---@return table meta Diff line metadata record.
 function M.diff_line_meta(parsed_line, file)
   return {
     side = parsed_line.new_line and "right" or "left",
@@ -321,9 +341,10 @@ function M.diff_line_meta(parsed_line, file)
   }
 end
 
----@param parsed_lines DiffReviewParsedHunkLine[]?
----@param file string
----@return table[]
+--- Constructs metadata descriptor tables for an array of backing diff lines.
+---@param parsed_lines DiffReviewParsedHunkLine[]? Array of parsed diff lines.
+---@param file string File path identifier.
+---@return table[] meta_list Array of diff line metadata records.
 function M.diff_lines_meta(parsed_lines, file)
   local diff_lines = {}
   for _, parsed_line in ipairs(parsed_lines or {}) do
@@ -332,12 +353,13 @@ function M.diff_lines_meta(parsed_lines, file)
   return diff_lines
 end
 
----@param replacement table
----@param gutter DiffReviewGutterSpec
----@param file string
----@param syntax? DiffReviewTreeSitterSyntax
----@param syntax_row? integer
----@return table
+--- Constructs a rendered row chunk table for an inline modified replacement item.
+---@param replacement table Replacement item descriptor table.
+---@param gutter DiffReviewGutterSpec Gutter layout configuration.
+---@param file string File path identifier.
+---@param syntax? DiffReviewTreeSitterSyntax Syntax engine state for line highlights.
+---@param syntax_row? integer Zero-based syntax row index.
+---@return table row Formatted row chunk array.
 function M.replacement_row(replacement, gutter, file, syntax, syntax_row)
   local display_line = replacement.display_line
   local backing_lines = replacement.diff_lines or { display_line }
@@ -372,14 +394,15 @@ function M.replacement_row(replacement, gutter, file, syntax, syntax_row)
   return row
 end
 
----@param line_number integer
----@param text string
----@param gutter DiffReviewGutterSpec
----@param file? string
----@param syntax? DiffReviewTreeSitterSyntax
----@param old_line? integer
----@param new_line? integer
----@return table
+--- Constructs a rendered row chunk table for a context padding line.
+---@param line_number integer One-based source line number.
+---@param text string Context line text content.
+---@param gutter DiffReviewGutterSpec Gutter layout configuration.
+---@param file? string Optional file path identifier.
+---@param syntax? DiffReviewTreeSitterSyntax Optional syntax engine state.
+---@param old_line? integer Optional old revision line number.
+---@param new_line? integer Optional new revision line number.
+---@return table row Formatted row chunk array.
 function M.context_padding_row(line_number, text, gutter, file, syntax, old_line, new_line)
   local row = { diff_review_context_padding = true }
   old_line = old_line or line_number
@@ -413,8 +436,9 @@ function M.context_padding_row(line_number, text, gutter, file, syntax, old_line
   return row
 end
 
----@param text string?
----@return boolean
+--- Tests whether a source line contains informative context code rather than empty space or single closing braces.
+---@param text string? Line text string.
+---@return boolean is_useful True if line contains informative code text.
 function M.context_padding_line_is_useful(text)
   if type(text) ~= "string" then return false end
   if text:match("^%s*$") then return false end
@@ -422,8 +446,9 @@ function M.context_padding_line_is_useful(text)
   return true
 end
 
----@param text string?
----@return boolean
+--- Tests whether a code line begins a new declaration or block scope.
+---@param text string? Line text string.
+---@return boolean starts_scope True if line matches common scope opening patterns.
 function M.context_padding_line_starts_scope(text)
   if type(text) ~= "string" then return false end
   return text:match("^%s*#%[") ~= nil
@@ -441,14 +466,15 @@ function M.context_padding_line_starts_scope(text)
     or text:match("^%s*use%s+") ~= nil
 end
 
----@param source_lines string[]?
----@param hunk DiffReviewParsedHunk
----@param context DiffReviewHunkTreeSitterContext|string?
----@param side "before"|"after"
----@param occupied_lines? table<integer, boolean>
----@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@param bounds? { changed_line?: integer, after_line?: integer }
----@return DiffReviewHunkContextPaddingLine[]
+--- Collects candidate source context lines for padding before or after a change region.
+---@param source_lines string[]? Full buffer source text lines.
+---@param hunk DiffReviewParsedHunk Parsed diff hunk descriptor.
+---@param context DiffReviewHunkTreeSitterContext|string? Syntax context descriptor.
+---@param side "before"|"after" Padding direction relative to changes.
+---@param occupied_lines? table<integer, boolean> Set of line numbers already visible in hunk.
+---@param include_line? fun(parsed_line: DiffReviewParsedHunkLine): boolean Optional line filter predicate.
+---@param bounds? { changed_line?: integer, after_line?: integer } Optional explicit region bounds.
+---@return DiffReviewHunkContextPaddingLine[] padding_lines Array of context padding line descriptor tables.
 function M.context_padding_lines(source_lines, hunk, context, side, occupied_lines, include_line, bounds)
   if type(source_lines) ~= "table" or #source_lines == 0 then return {} end
   occupied_lines = occupied_lines or M.current_line_set(hunk)
@@ -552,14 +578,16 @@ function M.context_padding_lines(source_lines, hunk, context, side, occupied_lin
   return padding_lines
 end
 
----@return integer
+--- Returns the maximum number of context padding lines rendered around change regions.
+---@return integer limit Maximum padding line count (3).
 function M.context_padding_limit()
   return 3
 end
 
----@param hunks DiffReviewParsedHunk[]
----@param new_line integer?
----@return integer?
+--- Maps a new revision line number back to its old revision line number using diff hunk offsets.
+---@param hunks DiffReviewParsedHunk[] Array of parsed diff hunks.
+---@param new_line integer? New revision line number.
+---@return integer? old_line Corresponding old revision line number, or nil.
 function M.old_line_for_new_line(hunks, new_line)
   if not new_line then return nil end
   local delta = 0
@@ -587,9 +615,10 @@ function M.old_line_for_new_line(hunks, new_line)
   return new_line + delta
 end
 
----@param padding_lines DiffReviewHunkContextPaddingLine[]
----@param block DiffReviewParsedBlock
----@return DiffReviewHunkContextPaddingLine[]
+--- Computes and attaches old and new line numbers to context padding lines.
+---@param padding_lines DiffReviewHunkContextPaddingLine[] Array of padding line records.
+---@param block DiffReviewParsedBlock Parent parsed hunk block descriptor.
+---@return DiffReviewHunkContextPaddingLine[] padding_lines Annotated array of padding line records.
 function M.annotate_padding_line_numbers(padding_lines, block)
   for _, padding_line in ipairs(padding_lines or {}) do
     padding_line.new_line = padding_line.line_number
@@ -598,10 +627,11 @@ function M.annotate_padding_line_numbers(padding_lines, block)
   return padding_lines
 end
 
----@param region DiffReviewHunkChangeRegion
----@param render_items table[]
----@param include_render_line fun(parsed_line: DiffReviewParsedHunkLine): boolean
----@return table<string, boolean>
+--- Collects the set of source text lines visible within a change region.
+---@param region DiffReviewHunkChangeRegion Target change region.
+---@param render_items table[] Array of render items.
+---@param include_render_line fun(parsed_line: DiffReviewParsedHunkLine): boolean Line filter predicate.
+---@return table<string, boolean> visible Set of visible code line strings.
 function M.region_visible_source_lines(region, render_items, include_render_line)
   local visible = {}
   for item_index = region.first_item, region.last_item do
@@ -619,10 +649,11 @@ function M.region_visible_source_lines(region, render_items, include_render_line
   return visible
 end
 
----@param region DiffReviewHunkChangeRegion
----@param render_items table[]
----@param line_by_position table<integer, integer>
----@return table<integer, boolean>
+--- Computes the set of changed line numbers present in a change region.
+---@param region DiffReviewHunkChangeRegion Target change region.
+---@param render_items table[] Array of render items.
+---@param line_by_position table<integer, integer> Mapping from hunk position to current line number.
+---@return table<integer, boolean> changed Set of changed line numbers.
 function M.region_changed_current_lines(region, render_items, line_by_position)
   local changed_lines = {}
   for item_index = region.first_item, region.last_item do
@@ -639,11 +670,12 @@ function M.region_changed_current_lines(region, render_items, line_by_position)
   return changed_lines
 end
 
----@param region DiffReviewHunkChangeRegion
----@param before_padding_lines DiffReviewHunkContextPaddingLine[]
----@param after_padding_lines DiffReviewHunkContextPaddingLine[]
----@return integer? display_start
----@return integer? display_end
+--- Calculates the starting and ending line number range displayed for a change region including its padding.
+---@param region DiffReviewHunkChangeRegion Target change region.
+---@param before_padding_lines DiffReviewHunkContextPaddingLine[] Leading padding lines.
+---@param after_padding_lines DiffReviewHunkContextPaddingLine[] Trailing padding lines.
+---@return integer? display_start Starting displayed line number.
+---@return integer? display_end Ending displayed line number.
 function M.region_display_window(region, before_padding_lines, after_padding_lines)
   local display_start = region.changed_line or region.context_line
   local display_end = region.after_line and (region.after_line - 1) or display_start
@@ -658,9 +690,10 @@ function M.region_display_window(region, before_padding_lines, after_padding_lin
   return display_start, display_end
 end
 
----@param previous_plan DiffReviewHunkRenderPlan
----@param next_plan DiffReviewHunkRenderPlan
----@return boolean
+--- Evaluates whether two adjacent render plans should merge into one continuous render block.
+---@param previous_plan DiffReviewHunkRenderPlan Earlier render plan in file order.
+---@param next_plan DiffReviewHunkRenderPlan Subsequent render plan.
+---@return boolean should_merge True if plans overlap or bridge within context limits.
 function M.render_plans_should_merge(previous_plan, next_plan)
   if previous_plan.block.file ~= next_plan.block.file then return false end
   if previous_plan.display_end and next_plan.display_start and next_plan.display_start <= previous_plan.display_end + 1 then
@@ -672,20 +705,22 @@ function M.render_plans_should_merge(previous_plan, next_plan)
   return gap ~= nil and gap >= 0 and gap <= M.context_bridge_limit()
 end
 
----@param left_old integer?
----@param left_new integer?
----@param right_old integer?
----@param right_new integer?
----@return boolean
+--- Tests whether old or new line numbers between two render positions are immediately adjacent.
+---@param left_old integer? Preceding old line number.
+---@param left_new integer? Preceding new line number.
+---@param right_old integer? Subsequent old line number.
+---@param right_new integer? Subsequent new line number.
+---@return boolean adjacent True if old or new coordinates differ by exactly one.
 function M.render_coords_adjacent(left_old, left_new, right_old, right_new)
   if left_old and right_old and right_old == left_old + 1 then return true end
   if left_new and right_new and right_new == left_new + 1 then return true end
   return false
 end
 
----@param left DiffReviewHunkTreeSitterContext|string?
----@param right DiffReviewHunkTreeSitterContext|string?
----@return boolean
+--- Tests whether two Tree-sitter contexts share identical scope or nested enclosing scope.
+---@param left DiffReviewHunkTreeSitterContext|string? First context descriptor.
+---@param right DiffReviewHunkTreeSitterContext|string? Second context descriptor.
+---@return boolean related True if contexts share or nest scopes.
 function M.contexts_related(left, right)
   if same_hunk_context_scope(left, right) then return true end
   if type(left) ~= "table" or type(right) ~= "table" then return false end
@@ -697,16 +732,18 @@ function M.contexts_related(left, right)
     or (left_start >= right_start and left_end <= right_end)
 end
 
----@return integer
+--- Returns the maximum line gap allowed when bridging related context scopes into one plan (6).
+---@return integer limit Maximum bridging line count.
 function M.context_bridge_limit()
   return M.context_padding_limit() * 2
 end
 
----@param left_old integer?
----@param left_new integer?
----@param right_old integer?
----@param right_new integer?
----@return integer?
+--- Computes the maximum numeric line gap between two coordinate pairs.
+---@param left_old integer? Preceding old line number.
+---@param left_new integer? Preceding new line number.
+---@param right_old integer? Subsequent old line number.
+---@param right_new integer? Subsequent new line number.
+---@return integer? gap Omitted line count gap, or nil.
 function M.render_coord_gap(left_old, left_new, right_old, right_new)
   local gap = nil
   local function include_gap(left, right)
@@ -719,48 +756,52 @@ function M.render_coord_gap(left_old, left_new, right_old, right_new)
   return gap
 end
 
----@param left_new integer?
----@param right_new integer?
----@return integer?
+--- Detects if two new line coordinates are separated by exactly one omitted line.
+---@param left_new integer? Preceding new line number.
+---@param right_new integer? Subsequent new line number.
+---@return integer? hidden_line Single omitted line number, or nil.
 function M.single_hidden_new_line(left_new, right_new)
   if left_new and right_new and right_new == left_new + 2 then return left_new + 1 end
   return nil
 end
 
----@param source_lines string[]?
----@param block DiffReviewParsedBlock
----@param line_number integer?
----@param gutter DiffReviewGutterSpec
----@param file string?
----@param syntax? DiffReviewTreeSitterSyntax
----@return table?
+--- Builds a single rendered context row for an omitted line bridging a small gap.
+---@param source_lines string[]? Buffer source text lines.
+---@param block DiffReviewParsedBlock Parent hunk block descriptor.
+---@param line_number integer? Target line number.
+---@param gutter DiffReviewGutterSpec Gutter layout configuration.
+---@param file string? Optional file path identifier.
+---@param syntax? DiffReviewTreeSitterSyntax Optional syntax engine state.
+---@return table? row Rendered row chunk array, or nil.
 function M.single_hidden_context_row(source_lines, block, line_number, gutter, file, syntax)
   if not line_number or type(source_lines) ~= "table" or not source_lines[line_number] then return nil end
   local old_line = M.old_line_for_new_line(block and block.hunks or {}, line_number)
   return M.context_padding_row(line_number, source_lines[line_number], gutter, file, syntax, old_line, line_number)
 end
 
----@param source_lines string[]?
----@param block DiffReviewParsedBlock
----@param left_new integer?
----@param right_new integer?
----@param changed_lines table<integer, boolean>
----@param emitted_context_lines table<integer, boolean>
----@param gutter DiffReviewGutterSpec
----@param file string?
----@param syntax? DiffReviewTreeSitterSyntax
----@return table? row
----@return integer? line_number
+--- Constructs a rendered context row for a 1-line gap if not already emitted or changed.
+---@param source_lines string[]? Buffer source text lines.
+---@param block DiffReviewParsedBlock Parent hunk block descriptor.
+---@param left_new integer? Preceding new line number.
+---@param right_new integer? Subsequent new line number.
+---@param changed_lines table<integer, boolean> Set of changed line numbers.
+---@param emitted_context_lines table<integer, boolean> Set of emitted context line numbers.
+---@param gutter DiffReviewGutterSpec Gutter layout configuration.
+---@param file string? Optional file path identifier.
+---@param syntax? DiffReviewTreeSitterSyntax Optional syntax engine state.
+---@return table? row Rendered row chunk array, or nil.
+---@return integer? line_number Emitted line number, or nil.
 function M.single_hidden_context_gap_row(source_lines, block, left_new, right_new, changed_lines, emitted_context_lines, gutter, file, syntax)
   local hidden_line = M.single_hidden_new_line(left_new, right_new)
   if not hidden_line or emitted_context_lines[hidden_line] or changed_lines[hidden_line] then return nil, nil end
   return M.single_hidden_context_row(source_lines, block, hidden_line, gutter, file, syntax), hidden_line
 end
 
----@param plan DiffReviewHunkRenderPlan
----@param raw_context DiffReviewHunkTreeSitterContext|string?
----@return integer? old_line
----@return integer? new_line
+--- Returns the first visible old and new line coordinates rendered by a plan.
+---@param plan DiffReviewHunkRenderPlan Target render plan.
+---@param raw_context DiffReviewHunkTreeSitterContext|string? Syntax context descriptor.
+---@return integer? old_line First visible old line number.
+---@return integer? new_line First visible new line number.
 function M.first_visible_plan_coords(plan, raw_context)
   local padding_line = plan.before_padding_lines and plan.before_padding_lines[1] or nil
   if padding_line then return padding_line.old_line, padding_line.new_line end
@@ -774,10 +815,11 @@ function M.first_visible_plan_coords(plan, raw_context)
   return nil, nil
 end
 
----@param plan DiffReviewHunkRenderPlan
----@param raw_context DiffReviewHunkTreeSitterContext|string?
----@return integer? old_line
----@return integer? new_line
+--- Returns the last visible old and new line coordinates rendered by a plan.
+---@param plan DiffReviewHunkRenderPlan Target render plan.
+---@param raw_context DiffReviewHunkTreeSitterContext|string? Syntax context descriptor.
+---@return integer? old_line Last visible old line number.
+---@return integer? new_line Last visible new line number.
 function M.last_visible_plan_coords(plan, raw_context)
   local padding_line = plan.after_padding_lines and plan.after_padding_lines[#plan.after_padding_lines] or nil
   if padding_line then return padding_line.old_line, padding_line.new_line end
@@ -791,9 +833,10 @@ function M.last_visible_plan_coords(plan, raw_context)
   return nil, nil
 end
 
----@param previous_plan DiffReviewHunkRenderPlan
----@param next_plan DiffReviewHunkRenderPlan
----@return integer?
+--- Computes the line coordinate gap between two adjacent render plans.
+---@param previous_plan DiffReviewHunkRenderPlan Earlier render plan.
+---@param next_plan DiffReviewHunkRenderPlan Subsequent render plan.
+---@return integer? gap Numeric line gap between plans, or nil.
 function M.visible_plan_gap(previous_plan, next_plan)
   local previous_old_line, previous_new_line = M.last_visible_plan_coords(previous_plan, previous_plan.region.context)
   local next_old_line, next_new_line = M.first_visible_plan_coords(next_plan, next_plan.region.context)

@@ -8,21 +8,24 @@ local active_status = {
   waiting = true,
 }
 
----@param status string?
----@return boolean
+--- Checks if an agent status string indicates active execution.
+---@param status string? Status identifier string.
+---@return boolean active True if status is starting, running, or waiting.
 function AgentSummary.is_active(status)
   return active_status[status or ""] == true
 end
 
----@param run table
----@return string
+--- Resolves a human-readable display label for an agent run record.
+---@param run table Agent run descriptor table.
+---@return string label Display label string.
 function AgentSummary.label(run)
   return run.nickname or run.definition or "agent"
 end
 
----@param interaction_list table[]?
----@return integer tool_count
----@return integer failed_count
+--- Computes total and failed tool invocation counts across interactions.
+---@param interaction_list table[]? Array of interaction node tables.
+---@return integer tool_count Total count of tool invocations.
+---@return integer failed_count Count of failed tool executions.
 function AgentSummary.tool_counts(interaction_list)
   local tool_count, failed_count = 0, 0
   for _, interaction in ipairs(interaction_list or {}) do
@@ -45,12 +48,13 @@ function AgentSummary.tool_counts(interaction_list)
   return tool_count, failed_count
 end
 
----@param run table
----@param interaction_list table[]?
----@param now_ms integer
----@param capitalize? boolean
----@param include_zero_tools? boolean
----@return string
+--- Formats a status summary string with elapsed duration and tool invocation counts.
+---@param run table Agent run descriptor table.
+---@param interaction_list table[]? Array of interaction node tables.
+---@param now_ms integer Current epoch timestamp in milliseconds.
+---@param capitalize? boolean True to capitalize status label prefix.
+---@param include_zero_tools? boolean True to include tool count when zero.
+---@return string detail Formatted status description string.
 function AgentSummary.status_detail(run, interaction_list, now_ms, capitalize, include_zero_tools)
   local status = run.status or "unknown"
   local active = AgentSummary.is_active(status)
