@@ -7,45 +7,68 @@ targets:
 globs:
   - '**/*'
 ---
-Keep communication direct, grounded, and concise.
+# Clear and Functional Communication
 
-- Always answer the immediate prompt directly. Do not include unsolicited
-  background context, extra examples, or secondary elaboration before
-  answering. The user will ask for expansion or clarification when needed.
-- Apply the `technical-writing` skill to all architecture explanations, design
-  reviews, implementation plans, code advice, and documentation. Omit it only
-  for single-fact lookups, literal translations, syntax rewrites, or brief
-  acknowledgments.
-- Apply the skill's prose guidance to chat. Read a document profile only when
-  the requested output matches that document form.
-- Answer direct questions before elaborating. A question requests analysis, not
-  implementation, unless the user also asks for a change.
-- State uncertainty directly and distinguish verified facts, inferences,
-  assumptions, and unresolved questions.
-- Use concrete, established terminology. Do not invent unsupported frameworks,
-  acronyms, or shorthand.
-- Do not use semicolons in conversational or narrative prose.
+- **Direct Answers & Problem-First Framing:** Answer direct questions
+  immediately before elaborating. Open initial explanations with problem-first
+  framing: state the failure mode or breakage being prevented, followed by the
+  mechanism and invariant. Never open with process narration, bare operational
+  descriptions (`This function replaces...`), or illustrative example lists.
+  State uncertainty directly.
+- **Match Orientation to Context:** Establish system role and invariants on
+  initial explanations. On continuation prompts (`continue`, follow-ups), omit
+  orientation and address the next phase or delta immediately.
+- **Context Before Code:** Never place raw code immediately beneath a heading.
+  State the governing invariant or constraint before showing code.
+- **Active Voice and Agency:** Use active voice with components as subjects.
+  Eliminate weak modals (`would be`, `might`) and conversational wind-ups
+  (`The real problem is`).
+- **Parallel Pipeline Lists:** Write sequential steps as complete, parallel
+  grammatical sentences. Never emit loose text fragments or bare noun chains.
+- **Grounded Scenario Walkthroughs:** Trace multi-state logic through concrete
+  lifecycle transitions. Do not emit isolated set-math scratchpads or abstract
+  pseudo-tables.
+- **Ban Redundant Recaps and Artificial Conclusions:** Do not append
+  `### Conclusion` headings or re-list completed steps. Conclude naturally
+  after documenting error boundaries.
+- **Ban Conversational Code Editorializing:** Do not comment conversationally on
+  code ergonomics (*"The function feels long because..."*). State architectural
+  coupling boundaries directly.
+- **Ban Metaphors, Slang, and Anthropomorphism:** Use formal systems terminology
+  (state machines, lifecycles). Eliminate literary metaphors, theatrical
+  roleplay, colloquial slang, and marketing qualifiers.
+- **Demonstrate Claims with Bounds:** Prove qualitative claims with resource
+  bounds or failure paths. Replace subjective thresholds (`enough`, `mostly`)
+  with explicit bounds.
+- **Ban Announcement Prose:** Omit transition sentences introducing upcoming
+  artifacts (*"The following table lists..."*). State the invariant directly.
+- **Ban Meta-Announcements & Workflow Narration:** Never announce which skill,
+  workflow, or rule is being applied (*"I'm using the Rust workflow..."*, *"I will
+  locate the method..."*). Execute tools and output direct answers immediately.
+- **No Semicolons:** Do not use semicolons in conversational or narrative prose.
+
+# Code Explanations and Walkthroughs
+
+- Use the `fn-why` skill (`/fn-why <symbol>`) to explain why a function, method,
+  or subsystem exists, its controlling invariant, and its lifecycle flow.
+- Use the `fn-walk` skill (`/fn-walk <symbol>`) for a detailed, section-by-section
+  walkthrough with annotated code blocks and error boundary analysis.
+- When explaining code in chat, ground explanations in problem-first framing
+  (hazard prevented $\rightarrow$ 2–3 bold lifecycle phases $\rightarrow$ boundary isolation
+  sentence) rather than narrating local line-by-line mechanics.
 
 # Programming
 
-- Use semantic identifiers that state component role, ownership, and scope
-  directly without requiring explanatory comments.
+- **Semantic Naming:** Name entities by role, ownership, and scope without
+  single-letter names or comments. Abbreviate only `url`, `id`, `config`. Name
+  collections with singular roles (`TaskStore`, `TaskMap`). Rename types at
+  source.
 - Use the `technical-writing` skill's API Documentation profile for API docs,
   docstrings, and rustdoc. Use its Code Comments profile for source comments.
   Apply the active language or project skill for syntax and domain-specific
   contracts.
 - **Fix the design at its source.** Refactor root abstractions, eliminate
   duplicated logic, and update all affected call sites across the codebase.
-- **Use established patterns deliberately.** Make an implicit pattern explicit
-  when it clarifies the design.
-- **Preserve modular boundaries.** Keep concerns separate, interfaces narrow,
-  and internals hidden.
-- **Keep names semantic.** Never use single-letter names. Abbreviate only
-  widely understood terms such as `url`, `id`, and `config`.
-  - Name multi-value types with a singular collection role such as `TaskStore`,
-    `TaskRegistry`, `TaskSet`, `TaskMap`, or `TaskList`.
-  - Rename types at the source instead of adding aliases or compatibility
-    wrappers.
 - Keep functions focused. Remove wrapper functions that only forward arguments
   to an underlying call without adding parameter transformation, error
   handling, or validation.
@@ -57,12 +80,13 @@ Keep communication direct, grounded, and concise.
 - Use `sem_entities` to map files and symbols, then `sem_context` to read the
   selected entity and its relationships. Read raw snippets only for omitted
   imports, glue, schemas, generated output, or exact line anchors.
-- Use `sem_impact` for dependency and test effects. Use `sem_blame` and
-  `sem_log` for ownership and history.
-- Use bounded `rg` only when searching for exact string literals, comments,
-  configuration keys, or unindexed raw text.
+- Pass the exact `filePath` returned by `sem_context` or `sem_entities` to
+  `sem_impact` to trace callers, usages, and dependent tests without guessing paths.
 - Use `sem_diff` to inventory tracked changes from `filePath` and `oldFilePath`.
   Inspect raw diffs afterward for exact hunks, whitespace, and line-level proof.
+- Use `sem_blame` and `sem_log` for ownership and history.
+- Use bounded `rg` only when searching for exact string literals, comments,
+  configuration keys, or unindexed raw text.
 
 # Remote Search
 

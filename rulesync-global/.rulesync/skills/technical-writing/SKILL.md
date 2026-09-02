@@ -1,10 +1,10 @@
 ---
 name: technical-writing
 description: >-
-  Writes and revises technical documents and code documentation, including
-  architectural overviews, RFCs, reference docs, READMEs, API docs, docstrings,
-  rustdoc, and code comments. Use when prose must explain a system, define a
-  caller contract, or preserve a non-obvious code constraint.
+  Author and revise technical documents, architectural overviews, RFCs,
+  reference docs, READMEs, API docstrings, rustdoc, and source code comments.
+  Use when creating or editing standalone documentation files, docstrings,
+  or in-code comments.
 ---
 # Technical Writing
 
@@ -61,12 +61,12 @@ Apply these composition rules to keep technical explanations direct, scannable, 
   - Use the serial comma by default.
   - Enclose parenthetical material with both delimiters. Distinguish nonrestrictive clauses from restrictive clauses.
   - Put a comma before a coordinating conjunction that joins independent clauses. Otherwise use a period. Do not create comma splices.
-  - Use fragments only for deliberate, unmistakable emphasis.
-
 ## Keep Prose Clear and Functional
 
-Technical documentation must remain concrete, actionable, and free of literary decoration. Apply these rules across all sections:
-
+- **Direct Openings (Problem-First Framing):** Prefer problem-first framing for initial explanations, reviews, and walkthroughs: state the failure mode, hazard, or lifecycle breakage being prevented, followed by the mechanism and consumer invariant. Open with a 1–2 sentence summary before introducing subheadings. Never open with bare operational code descriptions (`This function replaces...`) or lists of illustrative examples (`such as meshes, textures`).
+- **Match Orientation to Context:** On initial explanations or walkthroughs, establish the problem being solved, system role, and consumer invariant (why the component exists and what guarantee it preserves). On continuation prompts (`continue`, follow-ups, or active threads), omit high-level orientation and address the next lifecycle phase, specific delta, or direct answer immediately.
+- **Active Voice and Agency:** Prefer active voice for operations, with the responsible subsystem, component, or invariant as the subject. Avoid dummy pronoun subjects (`it`, `this`, `that`).
+- **Eliminate Weak Modals:** State technical claims assertively. Eliminate tentative modals (`would be`, `could use`, `might`, `perhaps`) and conversational wind-ups (`The real problem is`, `It is worth noting`).
 - **Ban literary and mechanical metaphors:** Use software architecture constructs (pipelines, state machines, lifecycles, and contracts) instead of storytelling or structural metaphors (arcs, spines, load-bearing relationships, or machinery).
 - **Ban anthropomorphism and theatrical personas:** Do not attribute cognitive traits to models (*"the agent is already smart"*), assign theatrical roleplay personas (*"act as a ruthless QA tester"*), or use physical journey metaphors (*"robot on a path"*, *"narrow bridge with cliffs"*). Frame instructions around operation fragility, context budgets, and input/output contracts.
 - **Ban developer slang and informal shorthand:** Eliminate colloquial idioms (*"loud and obvious"*, *"gotchas"*, *"hand-roll"*, *"voodoo constants"*, *"scripts that punt"*, *"eat your own dog food"*). Use formal systems architecture terms: explicit error notification routing, unvalidated edge cases, unexplained magic constants, and unhandled process failures.
@@ -76,6 +76,11 @@ Technical documentation must remain concrete, actionable, and free of literary d
 - **Eliminate subjective thresholds:** Replace vague sufficiency words (`enough`, `materially`, `meaningful`, `practical`) and soft hedges (`mostly`, `usually`, `several`, `likely`) with explicit bounds, triggers, or verification environments.
 - **Ban subjective difficulty tiers:** Do not classify tasks or audiences with labels like `basic`, `advanced`, `trivial`, or `complex`. State the exact prerequisite tools, environment versions, and permissions instead.
 - **Ban announcement prose:** Omit mechanical transition sentences that merely introduce an upcoming artifact (such as *"The following table lists..."* or *"Below is an example of..."*). State the invariant, constraint, or takeaway in the preceding prose.
+- **Context Before Code:** Never place raw code snippets, signatures, or declarations immediately beneath a heading without introductory prose. State the governing invariant, mechanism, or constraint before showing the code.
+- **Parallel Pipeline Lists:** Structure sequential steps, state transitions, or lifecycle phases as complete, parallel grammatical sentences within numbered lists or structured diagrams. Never emit loose, unpunctuated text fragments or bare noun-phrase chains.
+- **Grounded Scenario Walkthroughs:** When explaining multi-state reconciliation, synchronization, or branch logic, trace concrete data through its lifecycle transitions. Do not interrupt explanations with isolated set-math scratchpads or abstract pseudo-tables.
+- **Ban redundant recaps and artificial conclusions:** Do not append an artificial `### Conclusion` heading or re-summarize completed steps at the end of an explanation. Conclude naturally once the execution sequence, state transitions, and error boundaries are documented.
+- **Ban conversational code editorializing:** Do not comment conversationally on code ergonomics or aesthetics (*"The function feels long because..."*, *"This looks complex..."*). State architectural coupling and responsibility boundaries directly (*"The coordinator couples graph validation, lifecycle reconciliation, and event emission"*).
 - **Ground generic placeholders:** Replace catch-all words (`things`, `details`, `another mechanism`) and vague importance modifiers (`important`, `critical`, `major`, `credible`) with exact domain entities and attributes.
 - **Demonstrate qualitative claims:** Do not assert properties such as simplicity, reliability, or maintainability directly. Prove them with error recovery paths, resource bounds, reduced coordination, or isolated change boundaries.
 - **Use precise stylistic terms:** Replace editorial idioms (throat-clearing, circle back, loading the description) with direct grammatical directives.
@@ -84,6 +89,11 @@ Technical documentation must remain concrete, actionable, and free of literary d
 
 | Category | Non-Functional Phrasing | Clear and Functional Replacement |
 | --- | --- | --- |
+| **Operational narration without problem/invariant** | *"This function loops over every record in the batch and writes it to the database, returning the count."* | *"To prevent partial writes from leaving distributed workers in an inconsistent state, `TransactionCoordinator::commit_batch` validates write locks and commits pending mutations under a single transaction ID."* |
+| **Abstract scratchpad / set math** | `"previous keys: {a, b}\nloaded keys: {a, c}\npublish: a, c\nremove: b"` | *"When reconciling previous vs new state:\n- Reused (`a`): updated in-place to preserve handle identity.\n- Added (`c`): registered as new entry.\n- Dropped (`b`): tombstoned as removed."* |
+| **Redundant continuation recap** | *"Continuing from the previous step, now we examine cache eviction..."* | *"### 3. Evict Stale Cache Entries\nEvicting expired records frees memory bounds before allocating new segment buffers."* |
+| **Conversational code editorializing** | *"The function feels long because it combines validation and state mutation."* | *"The coordinator couples graph validation, state mutation, and lifecycle reconciliation into a single method."* |
+| **Artificial conclusion / recap** | `"### Conclusion\nIn summary, the function validates, publishes, and removes entries."` | *(Omit the section. End naturally after documenting the final phase or boundary guarantee.)* |
 | **Metaphors** | *"Build a claim spine along the dominant arc."* | *"Outline the argument using a pipeline, state machine, or component-synthesis structure."* |
 | **Anthropomorphism** | *"The agent model is already smart, so act as a ruthless QA tester."* | *"Define explicit input schemas and evaluate edge cases with malformed payloads."* |
 | **Physical journey metaphor** | *"Think of the agent as a robot on a path with cliffs."* | *"Match instruction specificity to operation fragility (open guidelines vs exact commands)."* |
@@ -95,6 +105,8 @@ Technical documentation must remain concrete, actionable, and free of literary d
 | **Subjective thresholds** | *"Keep the flow short, usually no more than a few nodes when practical."* | *"Limit the longest directed path to six nodes or fewer."* |
 | **Difficulty tiers** | *"This advanced tutorial is not for trivial tasks."* | *"Prerequisites: Node.js 20+, Docker daemon running, and write access to the deployment registry."* |
 | **Announcement prose** | *"The following code snippet shows how to configure the client:"* | *"Configure the client with an explicit retry policy to prevent connection exhaustion:"* |
+| **Orphaned code** | `### 1. Validation\nlet mut keys = HashSet::new();` | `### 1. Validation\nTrack unique keys to detect collisions:\n```rust\nlet mut keys = HashSet::new();\n``` |
+| **Loose list** | `decode payload\ncheck permissions\npersist record` | `1. Decode payload for schema consistency.\n2. Verify caller write permissions.\n3. Persist record under a new revision.` |
 | **Circular triggers** | *"Qualify only the migration boundary that needs qualification."* | *"Qualify only claims with unverified dependencies or temporary migration boundaries."* |
 | **Generic nouns** | *"Show interactions between two important things."* | *"Show interactions between two components or stores."* |
 | **Asserted quality** | *"The cache provides a simple, robust, and highly reliable architecture."* | *"The cache eliminates distributed locks by isolating write mutations to a single worker queue."* |
