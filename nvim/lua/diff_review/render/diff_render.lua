@@ -21,7 +21,6 @@ local session = require("diff_review.session")
 
 -- Seams to init-owned helpers the builders share.
 local detect_filetype = util.detect_filetype
-local parse_hunk_body = diff_parse.parse_hunk_body
 local parse_unified_diff = diff_parse.parse_unified_diff
 
 --- Constructs a default 3-digit width gutter specification table.
@@ -351,7 +350,6 @@ local function build_fancy_diff_rows(diff_text, hunk_staged, filename, context_c
   for _, block in ipairs(diff) do
     for _, hunk in ipairs(block.hunks) do
       hunk_idx = hunk_idx + 1
-      hunk = parse_hunk_body(hunk)
       local include_render_line = hunk_model().render_line_filter(hunk)
       if type(source_lines) ~= "table" then
         include_render_line = function() return true end

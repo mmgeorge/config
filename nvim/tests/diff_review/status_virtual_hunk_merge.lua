@@ -1,6 +1,7 @@
 vim.loader.enable(false)
 
 local diff_review = require("diff_review")
+local diff_render = require("diff_review.render.diff_render")
 local hunk_model = require("diff_review.render.hunk_model")
 local ui = require("diff_review.infra.ui")
 local gh = require("diff_review.integrations.gh")
@@ -271,6 +272,31 @@ local function assert_true(condition, message)
   if not condition then error(message, 2) end
 end
 
+local function rendered_row_text(row)
+  local text_parts = {}
+  for _, part in ipairs(row or {}) do
+    if type(part[1]) == "string" then text_parts[#text_parts + 1] = part[1] end
+  end
+  return table.concat(text_parts)
+end
+
+local function assert_single_addition_renders_once()
+  local diff = table.concat({
+    "diff --git a/Cargo.toml b/Cargo.toml",
+    "--- a/Cargo.toml",
+    "+++ b/Cargo.toml",
+    "@@ -22,0 +23 @@",
+    "+log.workspace = true",
+  }, "\n")
+  local rows = diff_render.build_fancy_diff_rows(diff, { false }, nil, nil, nil, {
+    compact_replacements = true,
+  })
+
+  assert_true(#rows == 2, "single-line addition should render one header and one body row")
+  assert_true(rendered_row_text(rows[1]) == "@@ +1 -0", "single-line addition header should preserve its counts")
+  assert_true(rendered_row_text(rows[2]) == "log.workspace = true", "single-line addition body should render once")
+end
+
 local function command_key(command)
   return table.concat(command, "\t")
 end
@@ -444,6 +470,7 @@ local function trigger_normal_mapping(key, row)
 end
 
 local function run()
+  assert_single_addition_renders_once()
   vim.fn.delete(root, "rf")
   assert_true(vim.fn.mkdir(root .. "/src", "p") == 1, "mkdir failed")
   assert_true(vim.fn.writefile(source_lines, root .. "/src/model_store.rs") == 0, "writefile failed")
