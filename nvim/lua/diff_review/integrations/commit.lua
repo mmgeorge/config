@@ -19,10 +19,15 @@
 local M = {}
 
 local session = require("diff_review.session")
+local mutation_coordinator = require("diff_review.git.mutation_coordinator")
 
 -- Active commit session.
 -- { win, list_win, prev_buf, prev_winbar, console, on_done, aborted }
 M._active = nil
+
+-- Root resolution precedes the active session record. Reserve admission across
+-- that interval so repeated commit actions cannot launch concurrent Git writers.
+M._admission_pending = false
 
 -- ─── fake editor command ────────────────────────────────────────────────────
 
@@ -253,9 +258,13 @@ function M.commit(opts)
     vim.notify("No diff window to host the commit", vim.log.levels.ERROR)
     return
   end
-  if M._active then M._finish(1) end
+  if M._admission_pending or M._active then
+    vim.notify("A commit is already in progress", vim.log.levels.WARN, { title = "DiffReview commit" })
+    return
+  end
+  M._admission_pending = true
 
-  local ok, process = pcall(vim.system, { "git", "rev-parse", "--show-toplevel" }, {
+  local ok, root_process_or_error = pcall(vim.system, { "git", "rev-parse", "--show-toplevel" }, {
     text = true,
     stdout = true,
     stderr = true,
@@ -263,8 +272,23 @@ function M.commit(opts)
     vim.schedule(function()
       local root = vim.trim(result.stdout or "")
       if result.code ~= 0 or root == "" then
+        M._admission_pending = false
         local message = vim.trim(result.stderr or "")
         vim.notify(message ~= "" and message or "Not a git repository", vim.log.levels.ERROR)
+        return
+      end
+      if mutation_coordinator.pending(root) then
+        M._admission_pending = false
+        vim.notify(
+          "Commit is unavailable while Git index changes are pending",
+          vim.log.levels.WARN,
+          { title = "DiffReview commit" }
+        )
+        return
+      end
+      if not vim.api.nvim_win_is_valid(win) then
+        M._admission_pending = false
+        vim.notify("No diff window to host the commit", vim.log.levels.ERROR)
         return
       end
 
@@ -282,6 +306,7 @@ function M.commit(opts)
         aborted = false,
         root = root,
       }
+      M._admission_pending = false
 
       session.suspend_preview = true
       vim.api.nvim_win_set_buf(win, console)
@@ -294,7 +319,7 @@ function M.commit(opts)
       if server == nil or server == "" then server = vim.fn.serverstart() end
 
       local editor = remote_editor_cmd()
-      local commit_ok, commit_process = pcall(vim.system, { "git", "commit" }, {
+      local commit_ok, commit_process_or_error = pcall(vim.system, { "git", "commit" }, {
         cwd = root,
         env = { GIT_EDITOR = editor, GIT_SEQUENCE_EDITOR = editor, NVIM = server },
         text = true,
@@ -315,7 +340,7 @@ function M.commit(opts)
       end)
 
       if not commit_ok then
-        local message = "Failed to start `git commit`: " .. tostring(commit_process)
+        local message = "Failed to start `git commit`: " .. tostring(commit_process_or_error)
         append(console, { message })
         vim.notify(message, vim.log.levels.ERROR, { title = "Diff Review" })
         M._finish(1)
@@ -323,7 +348,12 @@ function M.commit(opts)
     end)
   end)
   if not ok then
-    vim.notify("Failed to start `git rev-parse`: " .. tostring(process), vim.log.levels.ERROR, { title = "Diff Review" })
+    M._admission_pending = false
+    vim.notify(
+      "Failed to start `git rev-parse`: " .. tostring(root_process_or_error),
+      vim.log.levels.ERROR,
+      { title = "Diff Review" }
+    )
   end
 end
 

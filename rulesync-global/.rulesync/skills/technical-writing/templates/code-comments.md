@@ -17,8 +17,10 @@ Prefer semantic types, clear variable names, and explicit control flow over comm
 - **Performance Tradeoffs:** Non-intuitive data structures or bitwise manipulations chosen to satisfy critical latency or memory bounds.
 - **Multipart Long Functions:** When a function spans 40 or more nonblank source lines and
   contains at least two of validation, state publication or mutation, and reconciliation or
-  cleanup, place a concise inline comment before each phase. Name the phase and its state boundary
-  directly instead of repeating formulaic causal clauses such as `so ...`.
+  cleanup, place a concise inline comment before each phase. Start each phase label with an
+  imperative verb and name its state boundary directly, such as `Validate output before the
+  catalog state changes.` or `Snapshot the current root set for post-publication reconciliation.`
+  Do not repeat formulaic causal clauses such as `so ...`.
 
 ## Composition Rules
 

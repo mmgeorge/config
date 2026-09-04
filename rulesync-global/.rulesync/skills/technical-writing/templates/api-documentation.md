@@ -15,7 +15,28 @@ Establish that a caller can predict an interface's runtime behavior, error state
 - **Concurrency Contract:** State thread-safety, synchronization requirements, or `Send`/`Sync` guarantees.
 - **Lifecycle:** Document construction, active state transitions, and disposal/cleanup obligations.
 
-### 2. Callable Documentation (Functions, Methods, RPCs)
+### 2. Property and Field Documentation
+- Describe a stored property or field with a concise noun phrase that states its value and lifecycle
+  boundary.
+- Omit articles unless they disambiguate the value.
+- Avoid generic action verbs such as `Identifies`, `Reports`, `Contains`, and `Represents` when
+  access performs no action.
+
+Good:
+
+```rust
+/// Root asset whose graph was removed.
+pub(crate) root: RootAssetKey,
+```
+
+Bad:
+
+```rust
+/// Identifies the root asset whose graph was removed.
+pub(crate) root: RootAssetKey,
+```
+
+### 3. Callable Documentation (Functions, Methods, RPCs)
 - **Action Line:** Begin with a concise, present-tense description of the caller-visible operation (such as `Executes a batch sync against the remote catalog.`).
 - **Arguments and Inputs:**
   - Name parameter roles directly when pronouns could be ambiguous.
@@ -28,12 +49,12 @@ Establish that a caller can predict an interface's runtime behavior, error state
   - State whether the operation is atomic or leaves partial state on failure.
 - **Side Effects and Idempotency:** Document external mutation, disk I/O, network traffic, background task spawning, and whether repeat calls are idempotent.
 
-### 3. Trait, Interface, and Protocol Documentation
+### 4. Trait, Interface, and Protocol Documentation
 - Document the capability contract that implementers must fulfill.
 - State required invariants and ordering rules between interface methods.
 - Document default method implementations and whether implementers should override them.
 
-### 4. Executable Documentation and Schema Generation
+### 5. Executable Documentation and Schema Generation
 - Treat documentation consumed by schema generators, OpenAPI compilers, or discovery endpoints as executable contracts.
 - Preserve required annotations, tags, format markers, and parameter descriptions required by tooling.
 

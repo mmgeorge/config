@@ -730,6 +730,12 @@ For stage and unstage, `actions.lua` immediately appends an optimistic journal l
 projects the section and diff caches, and renders that projection. It then submits the
 Git index mutation to `mutation_coordinator.lua`, whose repository-root FIFO prevents
 `.git/index.lock` races across every status and diff buffer for that repository.
+Commit admission resolves the repository root and rejects `git commit` while that FIFO
+contains an active, queued, settling, or recovering mutation burst. Once the commit
+session becomes active, `session.suspend_preview` rejects new stage and unstage actions.
+The admission reservation spans root lookup through active-session installation, and the
+active session remains exclusive through process exit, so repeated commit keys cannot
+start concurrent Git writers or editor clients.
 
 The Ignored section never enters the Git journal. `I` moves whole Unstaged files into
 the virtual marker set, while `U` removes those markers without invoking Git. `S`
@@ -977,8 +983,10 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
   this spawns a headless `nvim --clean` as `GIT_EDITOR`, which connects back to the parent
   over RPC (`$NVIM`) and asks it to open the real `COMMIT_EDITMSG` in a borrowed
   diff-preview window. `<C-c><C-c>` commits, `<C-q>` aborts, and pre-commit hook output
-  streams into a console buffer. This is what lets you write a commit message inside your
-  running editor with AI prefill and live hook output.
+  streams into a console buffer. Commit admission remains exclusive from repository-root
+  lookup through process exit and rejects startup while the repository mutation
+  coordinator is pending. This lets the running editor provide AI prefill and live hook
+  output without overlapping Git index writers.
 - **`conventional_commit.lua`** — parses the `type(scope)!:` prefix of a subject into
   colored segments for consistent highlighting across commit rows.
 - **`datetime.lua`** — formats epochs/ISO timestamps into relative ("2 hours ago") or
@@ -1134,6 +1142,9 @@ open_review(pr)
 ```
 press the commit key
   └─ commit.commit
+       ├─ reserve exclusive commit admission
+       ├─ resolve repository root
+       ├─ reject while mutation_coordinator.pending(root)
        ├─ spawn headless nvim as GIT_EDITOR
        │     └─ client connects back over RPC → commit.editor
        │           ├─ open COMMIT_EDITMSG in the borrowed preview window
