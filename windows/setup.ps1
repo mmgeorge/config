@@ -84,6 +84,15 @@ if (Get-Command nu -ErrorAction SilentlyContinue) {
     Write-Output 'Shared CLI dependencies: unchecked (requires Nushell installation)'
 }
 
+if (Get-Command nu -ErrorAction SilentlyContinue) {
+    & nu --no-config-file (Join-Path $RepositoryPath 'nushell/setup-github.nu') --token-writer (Join-Path $PSScriptRoot 'set-github-token.ps1') @DryRunArgument
+    if ($LASTEXITCODE -ne 0) {
+        throw "GitHub authentication setup failed (exit $LASTEXITCODE)."
+    }
+} else {
+    Write-Output 'GitHub authentication and SSH: unchecked (requires Nushell installation)'
+}
+
 $NushellSource = Join-Path $RepositoryPath 'nushell'
 $NushellTarget = Join-Path ([Environment]::GetFolderPath('ApplicationData')) 'nushell'
 $ExistingConfig = Get-Item -LiteralPath $NushellTarget -Force -ErrorAction SilentlyContinue

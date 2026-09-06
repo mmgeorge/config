@@ -50,17 +50,16 @@
     },
     "github-public-mcp-server": {
       "targets": ["claudecode", "codexcli", "antigravity-cli"],
-      "command": "github-mcp-server",
-      "args": [
-        "stdio",
-        "--toolsets=context,actions,discussions,issues,labels,pull_requests,repos,users"
-      ],
-      "env": {
-        "GITHUB_PERSONAL_ACCESS_TOKEN": "$GITHUB_PERSONAL_ACCESS_TOKEN"
+      "type": "http",
+      "url": "https://api.githubcopilot.com/mcp/",
+      "headers": {
+        "Authorization": "Bearer ${GITHUB_PERSONAL_ACCESS_TOKEN}",
+        "X-MCP-Toolsets": "context,actions,discussions,issues,labels,pull_requests,repos,users"
       },
-      "envVars": [
-        "GITHUB_PERSONAL_ACCESS_TOKEN"
-      ],
+      "bearer_token_env_var": "GITHUB_PERSONAL_ACCESS_TOKEN",
+      "http_headers": {
+        "X-MCP-Toolsets": "context,actions,discussions,issues,labels,pull_requests,repos,users"
+      },
       "default_tools_approval_mode": "approve"
     },
     "openaiDeveloperDocs": {

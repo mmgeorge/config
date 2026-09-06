@@ -14,14 +14,13 @@ end
 local function run()
   local original_notify = vim.notify
   local original_system = vim.system
-  local original_pending = mutation_coordinator.pending
   local notification_list = {}
   local process_request_list = {}
 
   local function restore()
     vim.notify = original_notify
     vim.system = original_system
-    mutation_coordinator.pending = original_pending
+    mutation_coordinator.reset_for_test()
     commit._admission_pending = false
     if commit._active and commit._active.console and vim.api.nvim_buf_is_valid(commit._active.console) then
       pcall(vim.api.nvim_buf_delete, commit._active.console, { force = true })
@@ -45,9 +44,6 @@ local function run()
       }
       return {}
     end
-
-    local mutation_pending = false
-    mutation_coordinator.pending = function() return mutation_pending end
 
     local function saw_notification(message)
       for _, notification in ipairs(notification_list) do
@@ -106,17 +102,70 @@ local function run()
     wait_for(function() return commit._active == nil end, "active commit state did not clear after exit")
     assert_true(vim.api.nvim_win_get_buf(win) == original_buf, "commit exit did not restore the borrowed window")
 
-    mutation_pending = true
+    local mutation_done
+    local settle_done
+    mutation_coordinator.set_quiet_delay_for_test(root, 0)
+    mutation_coordinator.set_handler(root, {
+      settle = function(_, done) settle_done = done end,
+      recover = function(_, done) done(true) end,
+    })
+    mutation_coordinator.enqueue(root, {
+      label = "stage",
+      paths = { "file.txt" },
+      execute = function(done) mutation_done = done end,
+    })
     commit.commit({ win = win })
     assert_true(command_count(root_command_key) == 2, "pending-mutation commit did not resolve its repository root")
     command_request(root_command_key, 2).callback({ code = 0, stdout = root .. "\n", stderr = "" })
-    wait_for(function() return not commit._admission_pending end, "pending-mutation rejection did not release admission")
+    vim.wait(20, function() return false end, 10)
+    assert_true(commit._admission_pending, "waiting commit released its admission reservation")
     assert_true(command_count(commit_command_key) == 1, "git commit started while index mutations were pending")
-    assert_true(commit._active == nil, "pending-mutation rejection installed active commit state")
-    assert_true(
-      saw_notification("Commit is unavailable while Git index changes are pending"),
-      "pending-mutation commit rejection was not reported"
-    )
+    assert_true(commit._active == nil, "waiting commit installed active commit state")
+    assert_true(not saw_notification("Commit is unavailable while Git index changes are pending"), "waiting emitted the old warning")
+    commit.commit({ win = win })
+    assert_true(command_count(root_command_key) == 2, "duplicate commit started while waiting for mutations")
+    mutation_done({ ok = true })
+    wait_for(function() return settle_done ~= nil end, "mutation did not enter settlement")
+    assert_true(command_count(commit_command_key) == 1, "commit started before authoritative settlement")
+    settle_done(true)
+    assert_true(command_count(commit_command_key) == 2, "waiting commit did not resume automatically")
+    settle_done(true)
+    assert_true(command_count(commit_command_key) == 2, "repeated settlement started duplicate commits")
+    commit._active.aborted = true
+    command_request(commit_command_key, 2).callback({ code = 1 })
+    wait_for(function() return commit._active == nil end, "resumed commit did not finish")
+
+    mutation_coordinator.enqueue(root, {
+      label = "failed stage",
+      paths = { "file.txt" },
+      execute = function(done) mutation_done = done end,
+    })
+    commit.commit({ win = win })
+    command_request(root_command_key, 3).callback({ code = 0, stdout = root })
+    vim.wait(20, function() return false end, 10)
+    mutation_done({ ok = false, error = "stage failed" })
+    assert_true(not commit._admission_pending, "failed mutation did not release admission")
+    assert_true(command_count(commit_command_key) == 2, "commit started after staging failed")
+    assert_true(saw_notification("Commit cancelled: stage failed"), "mutation failure did not cancel the waiting commit")
+
+    vim.cmd("vsplit")
+    local closed_window = vim.api.nvim_get_current_win()
+    mutation_coordinator.enqueue(root, {
+      label = "stage before window closes",
+      paths = { "file.txt" },
+      execute = function(done) mutation_done = done end,
+    })
+    commit.commit({ win = closed_window })
+    command_request(root_command_key, 4).callback({ code = 0, stdout = root })
+    vim.wait(20, function() return false end, 10)
+    vim.api.nvim_win_close(closed_window, true)
+    settle_done = nil
+    mutation_done({ ok = true })
+    wait_for(function() return settle_done ~= nil end, "closed-window mutation did not settle")
+    settle_done(true)
+    assert_true(not commit._admission_pending, "closed host window left commit admission pending")
+    assert_true(command_count(commit_command_key) == 2, "commit started with a closed host window")
+    assert_true(saw_notification("No diff window to host the commit"), "closed host window was not reported")
   end, debug.traceback)
 
   restore()

@@ -1,5 +1,6 @@
 [
   { "Name": "Git", "Id": "Git.Git", "Command": "git" },
+  { "Name": "GitHub CLI", "Id": "GitHub.cli", "Command": "gh" },
   { "Name": "Nushell", "Id": "Nushell.Nushell", "Command": "nu" },
   { "Name": "Node.js LTS", "Id": "OpenJS.NodeJS.LTS" },
   { "Name": "Steam", "Id": "Valve.Steam" },

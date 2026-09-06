@@ -196,10 +196,51 @@ local function test_handler_completion_callbacks_are_one_shot()
   assert_true(not coordinator.pending("recovery-repo"), "the recovery one-shot test should drain the repository")
 end
 
+local function test_idle_waits_for_later_bursts_and_reports_verification_failure()
+  coordinator.reset_for_test()
+  deferred_callback_list = {}
+  local settle_done
+  local callback_count = 0
+  local idle_error
+  coordinator.set_handler("repo", {
+    settle = function(_, done) settle_done = done end,
+    recover = function(_, done) done(true) end,
+  })
+  coordinator.enqueue("repo", {
+    label = "first",
+    paths = { "one.txt" },
+    execute = function(done) done({ ok = true }) end,
+  })
+  coordinator.when_idle("repo/.", function(message)
+    callback_count = callback_count + 1
+    idle_error = message
+  end)
+  local independent_ready = false
+  coordinator.when_idle("other-repo", function() independent_ready = true end)
+  assert_true(independent_ready, "unrelated repositories must not wait")
+  assert_equal(callback_count, 0, "quiet window must remain pending")
+  run_deferred()
+  coordinator.enqueue("repo", {
+    label = "later",
+    paths = { "two.txt" },
+    execute = function(done) done({ ok = true }) end,
+  })
+  settle_done(false)
+  assert_equal(callback_count, 0, "later burst must finish before idle callbacks")
+  run_deferred()
+  settle_done(true)
+  assert_equal(callback_count, 1, "idle callback must run once")
+  assert_equal(idle_error, "Git index verification failed", "earlier verification failure must survive later success")
+  coordinator.when_idle("repo", function(message)
+    assert_true(message == nil, "completed wait must not poison future idle requests")
+  end)
+end
+
 local test_ok, test_error = pcall(function()
   test_repository_fifo_and_quiet_sync()
   test_failure_cancels_burst_and_blocks_recovery()
   test_handler_completion_callbacks_are_one_shot()
+  test_idle_waits_for_later_bursts_and_reports_verification_failure()
 end)
 vim.defer_fn = original_defer_fn
 coordinator.reset_for_test()

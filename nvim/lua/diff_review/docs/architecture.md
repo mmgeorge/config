@@ -730,10 +730,13 @@ For stage and unstage, `actions.lua` immediately appends an optimistic journal l
 projects the section and diff caches, and renders that projection. It then submits the
 Git index mutation to `mutation_coordinator.lua`, whose repository-root FIFO prevents
 `.git/index.lock` races across every status and diff buffer for that repository.
-Commit admission resolves the repository root and rejects `git commit` while that FIFO
-contains an active, queued, settling, or recovering mutation burst. Once the commit
+Commit admission resolves the repository root and waits asynchronously while that FIFO
+contains an active, queued, settling, or recovering mutation burst. The coordinator
+resumes admission once all bursts finish, including their authoritative snapshots.
+A mutation or verification failure cancels the waiting commit with an error notification.
+Once the commit
 session becomes active, `session.suspend_preview` rejects new stage and unstage actions.
-The admission reservation spans root lookup through active-session installation, and the
+The admission reservation spans root lookup and queue settlement through active-session installation, and the
 active session remains exclusive through process exit, so repeated commit keys cannot
 start concurrent Git writers or editor clients.
 
@@ -1144,7 +1147,7 @@ press the commit key
   └─ commit.commit
        ├─ reserve exclusive commit admission
        ├─ resolve repository root
-       ├─ reject while mutation_coordinator.pending(root)
+       ├─ wait for mutation_coordinator.when_idle(root), cancelling on failure
        ├─ spawn headless nvim as GIT_EDITOR
        │     └─ client connects back over RPC → commit.editor
        │           ├─ open COMMIT_EDITMSG in the borrowed preview window

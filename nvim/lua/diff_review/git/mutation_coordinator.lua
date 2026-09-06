@@ -47,6 +47,8 @@ local paths = require("diff_review.infra.paths")
 ---@field next_burst_id integer
 ---@field quiet_generation integer
 ---@field quiet_delay_ms integer
+---@field idle_callback_list fun(error?: string)[]
+---@field idle_error? string
 
 ---@type table<string, DiffReviewMutationRootState>
 local state_by_root = {}
@@ -69,6 +71,7 @@ local function state_for_root(root)
   state = {
     root = root,
     queue = {},
+    idle_callback_list = {},
     next_task_id = 1,
     next_burst_id = 1,
     quiet_generation = 0,
@@ -111,7 +114,13 @@ local function run_next(state) end
 
 ---@param state DiffReviewMutationRootState
 ---@param burst DiffReviewMutationBurst
-local function finish_sync(state, burst)
+---@param ok boolean
+local function finish_sync(state, burst, ok)
+  if burst.failure then
+    state.idle_error = burst.failure.error or "Git index mutation failed"
+  elseif not ok then
+    state.idle_error = state.idle_error or "Git index verification failed"
+  end
   if state.syncing_burst == burst then state.syncing_burst = nil end
   if state.recovering_burst == burst then state.recovering_burst = nil end
   run_next(state)
@@ -136,14 +145,14 @@ local function recover_burst(state, burst)
 
   local handler = state.handler
   if not (handler and handler.recover) then
-    finish_sync(state, burst)
+    finish_sync(state, burst, true)
     return
   end
   local completed = false
-  handler.recover(burst, function()
+  handler.recover(burst, function(ok)
     if completed then return end
     completed = true
-    finish_sync(state, burst)
+    finish_sync(state, burst, ok)
   end)
 end
 
@@ -161,14 +170,14 @@ local function schedule_settle(state, burst)
     state.syncing_burst = burst
     local handler = state.handler
     if not (handler and handler.settle) then
-      finish_sync(state, burst)
+      finish_sync(state, burst, true)
       return
     end
     local completed = false
-    handler.settle(burst, function()
+    handler.settle(burst, function(ok)
       if completed then return end
       completed = true
-      finish_sync(state, burst)
+      finish_sync(state, burst, ok)
     end)
   end, state.quiet_delay_ms)
 end
@@ -178,7 +187,18 @@ local function run_next_impl(state)
   if state.running_task or state.syncing_burst or state.recovering_burst then return end
   local task = table.remove(state.queue, 1)
   if not task then
-    if state.accepting_burst then schedule_settle(state, state.accepting_burst) end
+    if state.accepting_burst then
+      schedule_settle(state, state.accepting_burst)
+    else
+      local callback_list = state.idle_callback_list
+      local idle_error = state.idle_error
+      state.idle_callback_list = {}
+      state.idle_error = nil
+      for _, callback in ipairs(callback_list) do
+        local callback_ok, callback_error = pcall(callback, idle_error)
+        if not callback_ok then vim.notify(tostring(callback_error), vim.log.levels.ERROR) end
+      end
+    end
     return
   end
 
@@ -265,6 +285,19 @@ function M.pending(root)
     or state.accepting_burst ~= nil
     or state.syncing_burst ~= nil
     or state.recovering_burst ~= nil
+end
+
+---Invoke once after all repository mutations and synchronization finish, or immediately when idle.
+---The callback receives any mutation or verification failure encountered while waiting.
+---@param root string Git repository root path.
+---@param callback fun(error?: string)
+function M.when_idle(root, callback)
+  if not M.pending(root) then
+    callback()
+    return
+  end
+  local state = state_for_root(root)
+  state.idle_callback_list[#state.idle_callback_list + 1] = callback
 end
 
 --- Reports whether a repository root is currently rolling back a failed mutation.
