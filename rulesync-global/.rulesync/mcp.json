@@ -6,7 +6,7 @@
       "url": "https://learn.microsoft.com/api/mcp",
       "default_tools_approval_mode": "approve"
     },
-    "docs-mcp": {
+    "docs": {
       "command": "docs-mcp",
       "default_tools_approval_mode": "approve"
     },
@@ -35,7 +35,7 @@
       ],
       "default_tools_approval_mode": "approve"
     },
-    "github-enterprise-mcp-server": {
+    "github-enterprise": {
       "targets": ["copilotcli"],
       "command": "github-mcp-server",
       "args": [
@@ -48,7 +48,7 @@
       },
       "default_tools_approval_mode": "approve"
     },
-    "github-public-mcp-server": {
+    "github": {
       "targets": ["claudecode", "codexcli", "antigravity-cli"],
       "type": "http",
       "url": "https://api.githubcopilot.com/mcp/",

@@ -1,2 +1,1 @@
-# Keep Lua sources LF so git diff --check and the whitespace gate stay clean.
-*.lua text eol=lf
+* text=auto eol=lf

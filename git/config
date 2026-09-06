@@ -41,6 +41,8 @@
 autoSetupRemote = true
 
 [core]
+	autocrlf = input
+	eol = lf
 	fsmonitor = true
 	untrackedCache = true
 
