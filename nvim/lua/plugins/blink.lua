@@ -121,7 +121,6 @@ return {
       'ribru17/blink-cmp-spell'
     },
 
-    -- Build the Rust fuzzy matcher locally instead of downloading a pre-built library.
     version = '1.*',
     build = 'cargo build --release',
 
@@ -150,7 +149,7 @@ return {
         -- end,
         implementation = "prefer_rust_with_warning",
         prebuilt_binaries = {
-          download = false,
+          download = true,
         },
         -- sorts = {
         --   -- function(a, b)
