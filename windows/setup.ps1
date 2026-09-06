@@ -1,6 +1,6 @@
 [CmdletBinding()]
 param(
-    [switch] $Preview,
+    [switch] $DryRun,
     [switch] $ApplyPowerToysConfig
 )
 
@@ -9,7 +9,7 @@ $RepositoryPath = Split-Path -Parent $PSScriptRoot
 $PackagePath = Join-Path $PSScriptRoot 'packages.json'
 $PackageList = Get-Content -LiteralPath $PackagePath -Raw | ConvertFrom-Json
 
-if ($Preview) { Write-Output 'Preview (no changes)' }
+if ($DryRun) { Write-Output 'Dry run (no changes)' }
 
 if ([Environment]::OSVersion.Platform -ne 'Win32NT') {
     throw 'This setup script requires Windows.'
@@ -53,14 +53,14 @@ foreach ($Package in $PackageList) {
     $MissingPackageId += $Package.Id
 }
 
-if (-not $Preview -and $MissingPackageId.Count -gt 0) {
+if (-not $DryRun -and $MissingPackageId.Count -gt 0) {
     & winget.exe install @MissingPackageId --exact --source winget --silent --no-upgrade --accept-source-agreements --accept-package-agreements --disable-interactivity
     if ($LASTEXITCODE -ne 0) {
         throw "Application batch installation failed (exit $LASTEXITCODE). Resolve the installer error and rerun setup to install remaining applications."
     }
 }
 
-if (-not $Preview) {
+if (-not $DryRun) {
     $env:Path = @(
         [Environment]::GetEnvironmentVariable('Path', 'Machine')
         [Environment]::GetEnvironmentVariable('Path', 'User')
@@ -73,10 +73,10 @@ if (-not $Preview) {
     }
 }
 
-$PreviewArgument = @()
-if ($Preview) { $PreviewArgument += '--preview' }
+$DryRunArgument = @()
+if ($DryRun) { $DryRunArgument += '--preview' }
 if (Get-Command nu -ErrorAction SilentlyContinue) {
-    & nu --no-config-file (Join-Path $RepositoryPath 'nushell/install-dependencies.nu') @PreviewArgument
+    & nu --no-config-file (Join-Path $RepositoryPath 'nushell/install-dependencies.nu') @DryRunArgument
     if ($LASTEXITCODE -ne 0) {
         throw "Nushell dependency setup failed (exit $LASTEXITCODE)."
     }
@@ -95,29 +95,29 @@ if ($null -ne $ExistingConfig) {
     }
 } else {
     Write-Output 'Nushell config: missing (link)'
-    if (-not $Preview) { New-Item -ItemType Junction -Path $NushellTarget -Target $NushellSource | Out-Null }
+    if (-not $DryRun) { New-Item -ItemType Junction -Path $NushellTarget -Target $NushellSource | Out-Null }
 }
 
-$PowerShellPreviewArgument = @()
-if ($Preview) { $PowerShellPreviewArgument += '-Preview' }
-& pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'setup-rust.ps1') @PowerShellPreviewArgument
+$PowerShellDryRunArgument = @()
+if ($DryRun) { $PowerShellDryRunArgument += '-DryRun' }
+& pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'setup-rust.ps1') @PowerShellDryRunArgument
 if ($LASTEXITCODE -ne 0) {
     throw "Rust setup failed (exit $LASTEXITCODE)."
 }
 
 $PowerToysArgument = @()
 if ($ApplyPowerToysConfig) { $PowerToysArgument += '-ApplyConfig' }
-& pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'setup-powertoys.ps1') @PowerToysArgument @PowerShellPreviewArgument
+& pwsh -NoProfile -NonInteractive -File (Join-Path $PSScriptRoot 'setup-powertoys.ps1') @PowerToysArgument @PowerShellDryRunArgument
 if ($LASTEXITCODE -ne 0) {
     throw "PowerToys setup failed (exit $LASTEXITCODE)."
 }
 
 if (Get-Command nu -ErrorAction SilentlyContinue) {
-    & nu --no-config-file (Join-Path $RepositoryPath 'kanata/setup-kanata.nu') @PreviewArgument
+    & nu --no-config-file (Join-Path $RepositoryPath 'kanata/setup-kanata.nu') @DryRunArgument
     if ($LASTEXITCODE -ne 0) {
         throw "Kanata setup failed (exit $LASTEXITCODE)."
     }
 } else {
     Write-Output 'Kanata: unchecked (requires Nushell installation)'
 }
-if (-not $Preview) { Write-Output 'Windows setup completed.' }
+if (-not $DryRun) { Write-Output 'Windows setup completed.' }

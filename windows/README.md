@@ -7,11 +7,11 @@ PowerShell 7 installation (`pwsh`) and WinGet from Microsoft App Installer.
 Keep this repository at its intended permanent location
 because Nushell and the Kanata shortcut reference it.
 
-From PowerShell at the repository root, check installed applications and current
+From Nushell or PowerShell in `D:/config` (the repository root), check installed applications and current
 configuration without installing applications or writing configuration:
 
 ```powershell
-.\windows\setup.ps1 -Preview
+./windows/setup.ps1 -DryRun
 ```
 
 Preview uses setup's detection checks and prints one status per item, such as
@@ -20,10 +20,10 @@ settings against the snapshot and checks the Kanata startup shortcut. Checks
 that require a missing Nushell or Kanata installation are reported as unchecked.
 Detection errors stop preview instead of being reported as missing packages.
 
-Run the installer after reviewing the list:
+Install and configure what is missing after reviewing the preview:
 
 ```powershell
-.\windows\setup.ps1
+./windows/setup.ps1
 ```
 
 Setup collects missing main applications and installs them in one WinGet call.
@@ -86,7 +86,7 @@ default, while an unconfigured installation receives the saved settings.
 Preview PowerToys installation and the saved files without changing anything:
 
 ```powershell
-pwsh -NoProfile -File .\windows\setup-powertoys.ps1 -Preview
+pwsh -NoProfile -File .\windows\setup-powertoys.ps1 -DryRun
 ```
 
 To replace existing settings, exit PowerToys and Command Palette, then run:

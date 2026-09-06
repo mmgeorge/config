@@ -3,7 +3,7 @@
 param(
     [string] $Backup = (Join-Path $PSScriptRoot 'powertoys/backup'),
     [switch] $ApplyConfig,
-    [switch] $Preview
+    [switch] $DryRun
 )
 
 $ErrorActionPreference = 'Stop'
@@ -42,7 +42,7 @@ if (-not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
 $Detection = & winget.exe list --id Microsoft.PowerToys --exact --source winget --accept-source-agreements --disable-interactivity 2>&1
 if ($LASTEXITCODE -eq -1978335212) {
     Write-Output 'PowerToys: missing (install)'
-    if (-not $Preview) {
+    if (-not $DryRun) {
         & winget.exe install --id Microsoft.PowerToys --exact --source winget --silent --no-upgrade --accept-source-agreements --accept-package-agreements --disable-interactivity
         if ($LASTEXITCODE -ne 0) {
             throw "PowerToys installation failed (exit $LASTEXITCODE)."
@@ -66,7 +66,7 @@ if (-not $ApplyConfig) {
     }
 }
 if (Get-Process -Name 'PowerToys*', 'Microsoft.CmdPal*', 'Microsoft.CommandPalette*' -ErrorAction SilentlyContinue) {
-    if ($Preview) {
+    if ($DryRun) {
         Write-Output 'PowerToys settings: restore blocked (exit PowerToys and Command Palette)'
         return
     }
@@ -74,7 +74,7 @@ if (Get-Process -Name 'PowerToys*', 'Microsoft.CmdPal*', 'Microsoft.CommandPalet
 }
 
 Write-Output "PowerToys settings: $($Change.Count) files (restore)"
-if ($Preview) { return }
+if ($DryRun) { return }
 $Rollback = Join-Path $LocalData ('Microsoft/PowerToys-SetupBackups/' + (Get-Date -Format 'yyyyMMdd-HHmmss-fff'))
 foreach ($Entry in $Change) {
     if (Test-Path -LiteralPath $Entry.Target) {
