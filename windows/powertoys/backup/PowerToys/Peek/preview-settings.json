@@ -1,0 +1,17 @@
+{
+  "SourceCodeFontSize": {
+    "value": 14
+  },
+  "SourceCodeMinimap": {
+    "value": false
+  },
+  "SourceCodeStickyScroll": {
+    "value": true
+  },
+  "SourceCodeTryFormat": {
+    "value": false
+  },
+  "SourceCodeWrapText": {
+    "value": false
+  }
+}

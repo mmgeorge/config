@@ -1,0 +1,29 @@
+{
+  "properties": {
+    "DefaultActivationShortcut": {
+      "win": true,
+      "ctrl": false,
+      "alt": false,
+      "shift": true,
+      "code": 84,
+      "key": "",
+      "HasConflict": false,
+      "ConflictDescription": "",
+      "IsSystemConflict": false
+    },
+    "ActivationShortcut": {
+      "win": true,
+      "ctrl": false,
+      "alt": false,
+      "shift": true,
+      "code": 84,
+      "key": "",
+      "HasConflict": false,
+      "ConflictDescription": "",
+      "IsSystemConflict": false
+    },
+    "PreferredLanguage": ""
+  },
+  "name": "TextExtractor",
+  "version": "1"
+}

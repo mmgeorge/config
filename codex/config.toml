@@ -3,7 +3,7 @@
 model = "gpt-5.5"
 # model_verbosity = "low"
 # model_reasoning_summary = "detailed"
-model_reasoning_effort = "high"
+model_reasoning_effort = "xhigh"
 model_reasoning_summary = "concise"
 # model_reasoning_summary = "none"
 model_context_window = 400000
@@ -78,6 +78,9 @@ trust_level = "trusted"
 trust_level = "trusted"
 
 [projects.'d:\code\throttle']
+trust_level = "trusted"
+
+[projects.'c:\users\matt']
 trust_level = "trusted"
 
 [notice]

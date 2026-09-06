@@ -1,5 +1,6 @@
-if "XDG_BASE" not-in ($env | columns) { $env.XDG_BASE = $env.HOME }
-$env.XDG_CONFIG_HOME = $env.XDG_BASE  | path join "config"
+const dotfiles_root = path self ..
+if "XDG_CONFIG_HOME" not-in ($env | columns) { $env.XDG_CONFIG_HOME = $dotfiles_root }
+if "XDG_BASE" not-in ($env | columns) { $env.XDG_BASE = ($env.XDG_CONFIG_HOME | path dirname) }
 $env.XDG_CACHE_HOME = $env.XDG_BASE  | path join ".cache"
 $env.XDG_DATA_HOME = $env.XDG_BASE  | path join ".local/share"
 $env.XDG_STATE_HOME = $env.XDG_BASE  | path join ".local/state"
@@ -25,6 +26,39 @@ alias tf = terraform
 alias top = btop
 alias h = yazi
 alias python = python3
+
+def --env install-rust [] {
+  let cargo_bin = ($env.CARGO_HOME? | default ($nu.home-dir | path join '.cargo') | path join 'bin')
+  if ($cargo_bin | path exists) {
+    $env.PATH = ($env.PATH | prepend $cargo_bin | uniq)
+  }
+
+  let rust_dependency = [
+    {name: 'docs-mcp', crate: 'docs-mcp'}
+  ]
+  let missing = ($rust_dependency | where {|dependency| (which $dependency.name | is-empty) })
+  if ($missing | is-empty) {
+    print 'All Rust dependencies are installed.'
+    return
+  }
+
+  if ((which cargo | is-empty) or (which rustc | is-empty)) {
+    error make {msg: 'Install Rust and Cargo before running install-rust.'}
+  }
+  let cargo_status = (^cargo --version | complete)
+  let rust_status = (^rustc --version | complete)
+  if ($cargo_status.exit_code != 0 or $rust_status.exit_code != 0) {
+    error make {msg: 'Rust and Cargo must have a working toolchain before running install-rust.'}
+  }
+
+  for dependency in $missing {
+    print $'Installing ($dependency.name)...'
+    ^cargo install $dependency.crate --locked
+    if $env.LAST_EXIT_CODE != 0 {
+      error make {msg: $'Failed to install ($dependency.name).'}
+    }
+  }
+}
 
 def wg [
     command?: string  # winget subcommand (install, upgrade, list, search, etc.)
@@ -810,15 +844,6 @@ $env.config.menus ++= [
     }
   }
 ]
-
-# Fnm setup
-if (which fnm | is-not-empty) {
-  ^fnm env --json | from json | load-env
-  $env.PATH = ($env.PATH | prepend ($env.FNM_MULTISHELL_PATH | path join "bin"))
-  $env.PATH = ($env.PATH | prepend ($env.FNM_MULTISHELL_PATH)) # No bin for windows?
-} else {
-  error "fnm not installed"
-}
 
 use ($nu.config-path | path dirname | path join 'completions/uv-completions.nu') *
 source ~/.zoxide.nu

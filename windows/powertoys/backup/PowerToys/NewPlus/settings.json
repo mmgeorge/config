@@ -1,0 +1,18 @@
+{
+  "version": "1.0",
+  "name": "NewPlus",
+  "properties": {
+    "HideFileExtension": {
+      "value": true
+    },
+    "HideStartingDigits": {
+      "value": true
+    },
+    "ReplaceVariables": {
+      "value": false
+    },
+    "TemplateLocation": {
+      "value": "C:\\Users\\mattm\\AppData\\Local\\Microsoft\\PowerToys\\NewPlus\\Templates"
+    }
+  }
+}

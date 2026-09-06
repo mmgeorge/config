@@ -1,0 +1,136 @@
+{
+  "Hotkey": {
+    "win": true,
+    "ctrl": false,
+    "alt": true,
+    "shift": false,
+    "code": 32,
+    "key": ""
+  },
+  "UseLowLevelGlobalHotkey": false,
+  "ShowAppDetails": false,
+  "HotkeyGoesHome": false,
+  "BackspaceGoesBack": false,
+  "SingleClickActivates": false,
+  "HighlightSearchOnActivate": true,
+  "ShowSystemTrayIcon": true,
+  "IgnoreShortcutWhenFullscreen": false,
+  "AllowExternalReload": false,
+  "ProviderSettings": {
+    "AllApps": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "com.microsoft.cmdpal.builtin.run": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "com.microsoft.cmdpal.builtin.calculator": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "Files": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "Bookmarks": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "WindowWalker": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "com.microsoft.cmdpal.builtin.websearch": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "Windows.ClipboardHistory": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "WinGet": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "WindowsTerminalProfiles": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "com.microsoft.cmdpal.builtin.windowssettings": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "Windows.Registry": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "Windows.Services": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "com.microsoft.cmdpal.builtin.core": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "com.microsoft.cmdpal.builtin.datetime": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    },
+    "com.microsoft.cmdpal.builtin.system": {
+      "IsEnabled": true,
+      "FallbackCommands": {}
+    }
+  },
+  "Aliases": {
+    ":": {
+      "CommandId": "com.microsoft.cmdpal.registry",
+      "Alias": ":",
+      "IsDirect": true
+    },
+    "$": {
+      "CommandId": "com.microsoft.cmdpal.windowsSettings",
+      "Alias": "$",
+      "IsDirect": true
+    },
+    "=": {
+      "CommandId": "com.microsoft.cmdpal.calculator",
+      "Alias": "=",
+      "IsDirect": true
+    },
+    "\u003E": {
+      "CommandId": "com.microsoft.cmdpal.shell",
+      "Alias": "\u003E",
+      "IsDirect": true
+    },
+    "\u003C": {
+      "CommandId": "com.microsoft.cmdpal.windowwalker",
+      "Alias": "\u003C",
+      "IsDirect": true
+    },
+    "??": {
+      "CommandId": "com.microsoft.cmdpal.websearch",
+      "Alias": "??",
+      "IsDirect": true
+    },
+    "file ": {
+      "CommandId": "com.microsoft.indexer.fileSearch",
+      "Alias": "file",
+      "IsDirect": false
+    },
+    ")": {
+      "CommandId": "com.microsoft.cmdpal.timedate",
+      "Alias": ")",
+      "IsDirect": true
+    }
+  },
+  "CommandHotkeys": [],
+  "SummonOn": "ToMouse",
+  "DisableAnimations": true,
+  "LastWindowPosition": {
+    "X": 260,
+    "Y": 150,
+    "Width": 1400,
+    "Height": 840
+  }
+}

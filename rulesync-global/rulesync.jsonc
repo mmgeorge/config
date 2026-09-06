@@ -2,7 +2,7 @@
   "$schema": "https://github.com/dyoshikawa/rulesync/releases/latest/download/config-schema.json",
   "targets": {
     "claudecode": ["rules", "ignore", "mcp", "commands", "subagents", "skills", "hooks", "permissions"],
-    "codexcli": ["rules", "ignore", "mcp", "commands", "subagents", "skills", "hooks"],
+    "codexcli": ["rules", "ignore", "mcp", "commands", "subagents", "skills", "hooks", "permissions"],
     "antigravity-cli": ["rules", "ignore", "mcp", "commands", "subagents", "skills", "hooks", "permissions"],
     "copilotcli": ["rules", "ignore", "mcp", "commands", "subagents", "skills", "hooks", "permissions"]
   },

@@ -1,0 +1,11 @@
+[
+  { "Name": "Git", "Id": "Git.Git", "Command": "git" },
+  { "Name": "Nushell", "Id": "Nushell.Nushell", "Command": "nu" },
+  { "Name": "Node.js LTS", "Id": "OpenJS.NodeJS.LTS" },
+  { "Name": "Steam", "Id": "Valve.Steam" },
+  { "Name": "Obsidian", "Id": "Obsidian.Obsidian" },
+  { "Name": "WezTerm", "Id": "wez.wezterm" },
+  { "Name": "Zotero", "Id": "DigitalScholar.Zotero" },
+  { "Name": "fd", "Id": "sharkdp.fd", "Command": "fd" },
+  { "Name": "Neovim", "Id": "Neovim.Neovim", "Command": "nvim" }
+]

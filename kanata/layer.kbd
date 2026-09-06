@@ -1,0 +1,59 @@
+;; Kanata config translated from keymap.ahk
+;;
+;; Layout: custom Angle-mod alpha layer + an Alt-held symbol/nav layer.
+;; CapsLock: tap = Esc, hold = Ctrl.
+;;
+;; NOTE on Alt: here LAlt is a pure *layer switch* key (your stated intent),
+;; so it no longer acts as a Windows Alt modifier. Alt+Tab / Alt+F4 etc. will
+;; NOT come from LAlt anymore. Two ways to keep real Alt if you want it:
+;;   - Use RIGHT Alt: it's untouched by this config and still works as Alt.
+;;   - Or put A-tab / A-f4 into the (deflayer alt) positions you want.
+;;
+;; The AHK ~LAlt vkE8 "suppress Alt menu" hack is unnecessary here: a layer
+;; key never reaches Windows as Alt, so no menu ever activates.
+
+(defcfg
+  process-unmapped-keys yes
+)
+
+(defsrc
+  q    w    e    r    t    y    u    i    o    p
+  a    s    d    f    g    h    j    k    l    ;
+  z    x    c    v    b    n    m    ,    .    /
+  caps lalt spc tab
+)
+
+(defalias
+  escctl (tap-hold-press 0 150 esc lctl)
+  ;; LAlt held = symbol/nav layer
+  alt    (layer-while-held alt)
+  numpad (layer-while-held numpad)
+)
+
+;; Base alpha layer (faithful to the active Angle remaps in keymap.ahk)
+(deflayer base
+  w      g    d    f    b    q    l    u    o    y
+  r      s    t    h    k    j    n    e    a    i
+  c      m    p    v    x    z    ;    ,    .    /
+  @escctl @alt spc tab
+)
+
+;; Alt-held layer: symbols + arrows + editing keys.
+;; S-N = shift+N on a US layout, which is how the shifted symbols are produced.
+;; XX = does nothing (was an empty Send("{}") slot in the AHK config).
+(deflayer alt
+  ;; q=none  w=PgUp  e=PgDn  r=~     t=none  y=%    u=&    i=-   o=*    p=+
+  XX      pgup   pgdn   S-grv  XX     S-5   S-7   -     S-8   S-=
+  ;; a=Left  s=Up    d=Down  f=Right g=none  h=!    j=Tab  k=Bsp l=(    ;=)
+  left    up     down   rght   XX     S-1   tab   bspc  S-9   S-0
+  ;; z=@     x=#     c=`     v=`     b=^     n=$    m=_    ,==   .={    /=}
+  S-2     S-3    grv    grv    S-6    S-4   S--   =     S-[   S-]
+  _       _      spc @numpad
+)
+
+(deflayer numpad
+  _    _    _    _    _    =    7    8    9    -
+  _    _    _    _    _    ,    4    5    6    S-=
+  _    _    _    _    _    .    1    2    3    /
+  _    _    0    _
+)

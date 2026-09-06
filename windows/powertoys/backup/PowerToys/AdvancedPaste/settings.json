@@ -1,0 +1,164 @@
+{
+  "properties": {
+    "IsAIEnabled": {
+      "value": false
+    },
+    "ShowCustomPreview": {
+      "value": true
+    },
+    "CloseAfterLosingFocus": {
+      "value": false
+    },
+    "EnableClipboardPreview": {
+      "value": true
+    },
+    "advanced-paste-ui-hotkey": {
+      "win": true,
+      "ctrl": false,
+      "alt": false,
+      "shift": true,
+      "code": 86,
+      "key": "",
+      "HasConflict": false,
+      "ConflictDescription": "",
+      "IsSystemConflict": false
+    },
+    "paste-as-plain-hotkey": {
+      "win": true,
+      "ctrl": true,
+      "alt": true,
+      "shift": false,
+      "code": 86,
+      "key": "",
+      "HasConflict": false,
+      "ConflictDescription": "",
+      "IsSystemConflict": false
+    },
+    "paste-as-markdown-hotkey": {
+      "win": false,
+      "ctrl": false,
+      "alt": false,
+      "shift": false,
+      "code": 0,
+      "key": "",
+      "HasConflict": false,
+      "ConflictDescription": "",
+      "IsSystemConflict": false
+    },
+    "paste-as-json-hotkey": {
+      "win": false,
+      "ctrl": false,
+      "alt": false,
+      "shift": false,
+      "code": 0,
+      "key": "",
+      "HasConflict": false,
+      "ConflictDescription": "",
+      "IsSystemConflict": false
+    },
+    "custom-actions": {
+      "value": []
+    },
+    "additional-actions": {
+      "image-to-text": {
+        "shortcut": {
+          "win": false,
+          "ctrl": false,
+          "alt": false,
+          "shift": false,
+          "code": 0,
+          "key": "",
+          "HasConflict": false,
+          "ConflictDescription": "",
+          "IsSystemConflict": false
+        },
+        "isShown": false
+      },
+      "paste-as-file": {
+        "isShown": true,
+        "paste-as-txt-file": {
+          "shortcut": {
+            "win": false,
+            "ctrl": false,
+            "alt": false,
+            "shift": false,
+            "code": 0,
+            "key": "",
+            "HasConflict": false,
+            "ConflictDescription": "",
+            "IsSystemConflict": false
+          },
+          "isShown": false
+        },
+        "paste-as-png-file": {
+          "shortcut": {
+            "win": false,
+            "ctrl": false,
+            "alt": false,
+            "shift": false,
+            "code": 0,
+            "key": "",
+            "HasConflict": false,
+            "ConflictDescription": "",
+            "IsSystemConflict": false
+          },
+          "isShown": false
+        },
+        "paste-as-html-file": {
+          "shortcut": {
+            "win": false,
+            "ctrl": false,
+            "alt": false,
+            "shift": false,
+            "code": 0,
+            "key": "",
+            "HasConflict": false,
+            "ConflictDescription": "",
+            "IsSystemConflict": false
+          },
+          "isShown": false
+        }
+      },
+      "transcode": {
+        "isShown": true,
+        "transcode-to-mp3": {
+          "shortcut": {
+            "win": false,
+            "ctrl": false,
+            "alt": false,
+            "shift": false,
+            "code": 0,
+            "key": "",
+            "HasConflict": false,
+            "ConflictDescription": "",
+            "IsSystemConflict": false
+          },
+          "isShown": false
+        },
+        "transcode-to-mp4": {
+          "shortcut": {
+            "win": false,
+            "ctrl": false,
+            "alt": false,
+            "shift": false,
+            "code": 0,
+            "key": "",
+            "HasConflict": false,
+            "ConflictDescription": "",
+            "IsSystemConflict": false
+          },
+          "isShown": false
+        }
+      }
+    },
+    "paste-ai-configuration": {
+      "active-provider-id": "",
+      "providers": []
+    },
+    "IsAdvancedAIEnabled": {
+      "value": false
+    }
+  },
+  "name": "AdvancedPaste",
+  "version": "1"
+}

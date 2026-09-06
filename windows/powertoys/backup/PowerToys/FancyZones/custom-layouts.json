@@ -1,0 +1,28 @@
+{
+  "custom-layouts": [
+    {
+      "uuid": "{E120C079-B2EC-45B5-A409-52A45CF86099}",
+      "name": "Side by side",
+      "type": "canvas",
+      "info": {
+        "ref-width": 2752,
+        "ref-height": 1104,
+        "zones": [
+          {
+            "X": 267,
+            "Y": 0,
+            "width": 1100,
+            "height": 1104
+          },
+          {
+            "X": 1367,
+            "Y": 0,
+            "width": 1100,
+            "height": 1104
+          }
+        ],
+        "sensitivity-radius": 0
+      }
+    }
+  ]
+}

@@ -1,0 +1,20 @@
+{
+  "properties": {
+    "hotkey": {
+      "value": {
+        "win": true,
+        "ctrl": true,
+        "alt": false,
+        "shift": false,
+        "code": 192,
+        "key": "",
+        "HasConflict": false,
+        "ConflictDescription": "",
+        "IsSystemConflict": false
+      }
+    },
+    "sortby": 0
+  },
+  "name": "Workspaces",
+  "version": "0.0.1"
+}

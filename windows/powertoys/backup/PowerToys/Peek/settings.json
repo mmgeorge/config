@@ -1,0 +1,40 @@
+{
+  "properties": {
+    "DefaultActivationShortcut": {
+      "win": false,
+      "ctrl": true,
+      "alt": false,
+      "shift": false,
+      "code": 32,
+      "key": "",
+      "HasConflict": false,
+      "ConflictDescription": "",
+      "IsSystemConflict": false
+    },
+    "ActivationShortcut": {
+      "win": false,
+      "ctrl": true,
+      "alt": false,
+      "shift": false,
+      "code": 32,
+      "key": "",
+      "HasConflict": false,
+      "ConflictDescription": "",
+      "IsSystemConflict": false
+    },
+    "AlwaysRunNotElevated": {
+      "value": true
+    },
+    "CloseAfterLosingFocus": {
+      "value": true
+    },
+    "ConfirmFileDelete": {
+      "value": true
+    },
+    "EnableSpaceToActivate": {
+      "value": true
+    }
+  },
+  "name": "Peek",
+  "version": "1.0"
+}
