@@ -1,0 +1,26 @@
+vim.loader.enable(false)
+
+local blocks = require("markdown_math.blocks")
+local block_store = require("markdown_math.block_store")
+
+assert(#blocks.find({ "$$", "unfinished" }) == 0)
+assert(#blocks.find({ "~~~latex", "$$", "literal", "$$", "~~~" }) == 0)
+assert(#blocks.find({ "````", "```", "$$", "literal", "$$", "````" }) == 0)
+assert(blocks.normalize("~~~latex\n\\(literal\\)\n~~~") == "~~~latex\n\\(literal\\)\n~~~")
+assert(blocks.normalize("  \\[\nvalue\n  \\]") == "  $$ value $$")
+
+local buffer = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "$$", "first", "$$" })
+local initial = block_store.get(buffer)
+assert(#initial == 1 and initial[1].input == "first")
+assert(initial[1].start_row == 0 and initial[1].end_row == 3)
+assert(block_store.get(buffer) == initial)
+vim.api.nvim_buf_set_lines(buffer, 1, 2, false, { "second" })
+local updated = block_store.get(buffer)
+assert(updated ~= initial and updated[1].input == "second")
+vim.api.nvim_buf_set_lines(buffer, 2, 3, false, {})
+assert(#block_store.get(buffer) == 0)
+vim.api.nvim_buf_delete(buffer, { force = true })
+
+io.write("markdown_math OK\n")
+vim.cmd("qa!")

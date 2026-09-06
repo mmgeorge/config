@@ -2,7 +2,8 @@
 AGENTS.md
 CLAUDE.md
 *~
-*lock*
+*.lock
+lazy-lock.json
 *.spl
 google-chrome/
 .claude/
