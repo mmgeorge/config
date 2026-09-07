@@ -26,3 +26,4 @@ carapace/
 .github/
 nushell/history*
 nushell/completions/
+/git/config.local

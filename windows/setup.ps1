@@ -84,6 +84,40 @@ if (Get-Command nu -ErrorAction SilentlyContinue) {
     Write-Output 'Shared CLI dependencies: unchecked (requires Nushell installation)'
 }
 
+$WindowsSshPath = Join-Path ([Environment]::GetFolderPath('System')) 'OpenSSH\ssh.exe'
+$MachineGitConfigPath = Join-Path $RepositoryPath 'git/config.local'
+if (-not (Test-Path -LiteralPath $WindowsSshPath -PathType Leaf)) {
+    throw 'Windows OpenSSH Client is missing. Install the Windows optional feature, then rerun setup.'
+}
+if (Get-Command git -ErrorAction SilentlyContinue) {
+    $WindowsSshCommand = '"' + $WindowsSshPath.Replace('\', '/') + '"'
+    $ConfiguredSshCommand = & git config --file $MachineGitConfigPath --get core.sshCommand
+    if ($LASTEXITCODE -notin @(0, 1)) {
+        throw "Cannot read the machine Git configuration (exit $LASTEXITCODE)."
+    }
+    if ($ConfiguredSshCommand -eq $WindowsSshCommand) {
+        Write-Output 'Git SSH: Windows OpenSSH configured (skip)'
+    } else {
+        Write-Output 'Git SSH: Windows OpenSSH (configure)'
+        if (-not $DryRun) {
+            & git config --file $MachineGitConfigPath --replace-all core.sshCommand $WindowsSshCommand
+            if ($LASTEXITCODE -ne 0) {
+                throw "Git SSH configuration failed (exit $LASTEXITCODE)."
+            }
+        }
+    }
+    if (-not $DryRun) {
+        $EffectiveSshCommand = & git config --global --includes --get core.sshCommand
+        if ($LASTEXITCODE -ne 0 -or $EffectiveSshCommand -ne $WindowsSshCommand) {
+            throw "Git does not load the Windows SSH setting. Include $RepositoryPath/git/config in the active global Git configuration, then rerun setup."
+        }
+    }
+} elseif ($DryRun) {
+    Write-Output 'Git SSH: unchecked (requires Git installation)'
+} else {
+    throw 'Git is not available after installation. Open a new terminal and rerun setup.'
+}
+
 if (Get-Command nu -ErrorAction SilentlyContinue) {
     & nu --no-config-file (Join-Path $RepositoryPath 'nushell/setup-github.nu') --token-writer (Join-Path $PSScriptRoot 'set-github-token.ps1') @DryRunArgument
     if ($LASTEXITCODE -ne 0) {
