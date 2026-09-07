@@ -45,7 +45,7 @@
   ;; q=none  w=PgUp  e=PgDn  r=~     t=none  y=%    u=&    i=-   o=*    p=+
   XX      pgup   pgdn   S-grv  XX     S-5   S-7   -     S-8   S-=
   ;; a=Left  s=Up    d=Down  f=Right g=none  h=!    j=Tab  k=Bsp l=(    ;=)
-  left    up     down   rght   XX     S-1   tab   bspc  S-9   S-0
+  left    (fork up A-S-s (lsft rsft)) (fork down A-S-t (lsft rsft)) rght XX S-1 tab bspc S-9 S-0
   ;; z=@     x=#     c=`     v=`     b=^     n=$    m=_    ,==   .={    /=}
   S-2     S-3    grv    grv    S-6    S-4   S--   =     S-[   S-]
   @numpad _      spc A-tab _
