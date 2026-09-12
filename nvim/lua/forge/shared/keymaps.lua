@@ -37,6 +37,8 @@ function M.setup_view_keymaps(buf, group, command_set, context)
       end
     end
   end
+  local clue = package.loaded["mini.clue"]
+  if clue and clue.ensure_buf_triggers then clue.ensure_buf_triggers(buf) end
 end
 
 ---@param group string

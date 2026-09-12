@@ -244,6 +244,8 @@ function M.attach(session, options)
     end
     owner.mapping = {}
   end
+  local clue = package.loaded["mini.clue"]
+  if clue and clue.ensure_buf_triggers then clue.ensure_buf_triggers(session.buffer) end
   return owner
 end
 

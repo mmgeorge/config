@@ -1328,6 +1328,10 @@ back four view kinds.
   Capability-gated commands never enter a command set, so unsupported actions disappear
   from mappings, hints, and help together.
 
+Forge restores loaded mini.clue buffer triggers after installing or rebinding document
+and shared-view mappings. This preserves prefix help when asynchronous view setup
+runs after mini.clue's buffer autocmd. Forge does not load mini.clue itself.
+
 Native Status, comparison, walkthrough-list, and review replicas use `document_commands.lua` for mappings, help,
 and sticky winbar hints. Hints select available bindings in `command_specs.lua` order and display each command's
 first resolved key. Disabled bindings disappear from both maps and hints. Narrow windows retain close and help.
