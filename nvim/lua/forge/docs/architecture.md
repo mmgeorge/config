@@ -1331,9 +1331,21 @@ back four view kinds.
 Native Status, comparison, walkthrough-list, and review replicas use `document_commands.lua` for mappings, help,
 and sticky winbar hints. Hints select available bindings in `command_specs.lua` order and display each command's
 first resolved key. Disabled bindings disappear from both maps and hints. Narrow windows retain close and help.
+Document and shared-view mappings use Neovim's normal prefix resolution. They do not set `nowait`, so
+`o` cannot consume the start of `opp`, `opP`, `ogp`, or configured longer mappings. A standalone ambiguous
+key resolves after the configured mapping timeout.
 Each visible window owns its prior winbar value, which is restored on departure unless another component replaced
 the hint. Historical walkthrough sources disable this hint ownership to preserve their explicit source header.
 Dropbar excludes native documents, and Harness retains its independent transcript winbar.
+
+Push and pull keep the Status buffer visible throughout the native Git operation. The context owner
+publishes Git progress into Push or Merge, preferring the latest percentage-bearing phase over a
+trailing packing summary. It retains object counts and transfer rate when available. Percentages
+describe individual Git phases, not overall operation completion. The writer normalizes carriage-return progress before
+delivery. Header text retains at most 1,024 characters. The renderer updates existing context rows
+without rebuilding file bodies, and preserves expanded bodies and folds when inserting or removing
+a temporary remote row. Completion clears progress and refreshes repository state. Failure also
+reports an error notification. Neither path opens a remote-operation console.
 
 ---
 

@@ -33,7 +33,7 @@ function M.setup_view_keymaps(buf, group, command_set, context)
       for _, key in ipairs(M.view_keys_for(group, command_id)) do
         vim.keymap.set(modes, key, function()
           require("forge.shared.view_command_set").dispatch(command_set, command_id, context)
-        end, { buffer = buf, silent = true, nowait = true, desc = spec.desc })
+        end, { buffer = buf, silent = true, desc = spec.desc })
       end
     end
   end

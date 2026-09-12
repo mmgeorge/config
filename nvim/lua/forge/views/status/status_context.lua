@@ -28,6 +28,7 @@ local function select_branch_pr(prs)
 end
 
 function M.producer_handlers(options)
+  local remote_active = false
   local function refresh()
     if options.is_alive() then options.refresh_status() end
   end
@@ -78,14 +79,39 @@ function M.producer_handlers(options)
       refresh()
     end, progress)
   end
+  local function remote(action)
+    if not options.is_alive() or remote_active then return end
+    local context = options.context and options.context()
+    if not context then notifications.error("Repository context is still loading") return end
+    local operation = {}
+    remote_active = operation
+    context.set_remote_action({ action = action, status = action == "push" and "Pushing..." or "Pulling..." })
+    require("forge.git.write").execute(options.workspace, { kind = action }, function(result)
+      if remote_active ~= operation then return end
+      remote_active = false
+      context.set_remote_action(nil)
+      if not result.ok then notifications.error("Git " .. action .. " failed: " .. result.output) end
+      refresh()
+    end, function(text)
+      if remote_active ~= operation then return end
+      local latest, percentage
+      for line in text:gmatch("[^\r\n]+") do
+        line = vim.trim(line)
+        if line ~= "" and not line:match("^Total %d+ %(delta ") then latest = line end
+        if line:match(":%s*%d+%%") then percentage = line end
+      end
+      latest = percentage or latest
+      if latest then context.set_remote_action({ action = action, status = vim.fn.strcharpart(latest, 0, 1024) }) end
+    end)
+  end
   return {
     commit = function()
       if options.is_alive() then
         require("forge.integrations.commit").commit({ win = window(), workspace = options.workspace, on_done = refresh })
       end
     end,
-    push = function() write({ kind = "push" }) end,
-    pull = function() write({ kind = "pull" }) end,
+    push = function() remote("push") end,
+    pull = function() remote("pull") end,
     pr = function() open_pull_request(false) end,
     review = function() open_pull_request(true) end,
     branch_create = function()
@@ -122,6 +148,13 @@ function M.attach(options)
   end
   local function publish()
     if alive() then options.present(vim.deepcopy(owner.presentation)) end
+  end
+
+  ---@param action? {action: "push"|"pull", status: string}
+  function owner.set_remote_action(action)
+    if not alive() then return end
+    owner.presentation.remote_action = action
+    publish()
   end
 
   function owner.generate_about(force)

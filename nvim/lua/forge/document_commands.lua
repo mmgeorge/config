@@ -138,7 +138,7 @@ function M.attach(session, options)
             local prior = vim.api.nvim_buf_call(session.buffer, function() return vim.fn.maparg(key, mode, false, true) end)
             owner.mapping[#owner.mapping + 1] = { key = key, mode = mode, callback = mapped, prior = prior }
           end
-          vim.keymap.set(modes, key, mapped, { buffer = session.buffer, silent = true, nowait = true, desc = spec.desc })
+          vim.keymap.set(modes, key, mapped, { buffer = session.buffer, silent = true, desc = spec.desc })
         end
       end
     end

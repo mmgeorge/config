@@ -207,7 +207,10 @@ local function context_entries(session, context)
     or { { (optional(context.branch) or "(detached)") .. " (no commits)", "ForgeStatusPR" } })
   for _, role in ipairs({ "upstream", "push" }) do
     local commit = optional(context[role])
-    if commit then append(leading, role, role == "upstream" and "Merge" or "Push", commit_chunks(commit, role)) end
+    local remote = session.presentation.remote_action
+    if remote and role == (remote.action == "push" and "push" or "upstream") then
+      append(leading, role, role == "upstream" and "Merge" or "Push", { { remote.status, "ForgeStatusFetching" } })
+    elseif commit then append(leading, role, role == "upstream" and "Merge" or "Push", commit_chunks(commit, role)) end
   end
   append(leading, "pr", "PR", summary_chunks(session.presentation.pr))
   append(leading, "about", "About", summary_chunks(session.presentation.about))
@@ -800,10 +803,22 @@ function M.present_context(session, presentation)
   local started = vim.uv.hrtime()
   local ok, failure = pcall(function()
     assert(vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "status buffer was changed externally")
+    local remote_changed = not vim.deep_equal(presentation.remote_action, previous_presentation.remote_action)
+    if remote_changed then
+      for _, role in ipairs({ "upstream", "push" }) do
+        local remote = presentation.remote_action
+        local visible = optional(context[role]) ~= nil
+          or (remote ~= nil and role == (remote.action == "push" and "push" or "upstream"))
+        if (session.block["status:context:" .. role] ~= nil) ~= visible then
+          adopt(session, prepare(session, session.inventory))
+          return
+        end
+      end
+    end
     local replacement, edits = {}, {}
     local leading, recent = {}, {}
     local resized = session.context_width ~= session.width
-    if resized then
+    if resized or remote_changed then
       leading, recent = context_entries(session, context)
       vim.list_extend(leading, recent)
     else
