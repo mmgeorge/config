@@ -153,3 +153,52 @@ fn command_child_stderr() {
 fn command_child_wait() {
     std::thread::sleep(Duration::from_secs(10));
 }
+
+#[test]
+fn diagnostic_overflow_preserves_exit_status_and_bounded_output() {
+    use forge_git::command::{CommandProgressSink, CommandStream, diagnostic_command};
+    use std::sync::{Arc, Mutex};
+    for (child, expected) in [("command_child_failure", 7), ("command_child_success", 0)] {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&captured);
+        let progress: CommandProgressSink = Arc::new(move |chunk| {
+            observed.lock().unwrap().push(chunk);
+            Ok(())
+        });
+        let output =
+            diagnostic_command(&mut fixture(child), limits(), None, Some(&progress), || {
+                Ok(())
+            })
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected));
+        assert!(output.stdout.len() <= 4096 && output.stderr.len() <= 4096);
+        assert!(output.stdout.ends_with(b"saved stdout\n"));
+        assert!(output.stderr.ends_with(b"saved stderr\n"));
+        for stream in [CommandStream::Stdout, CommandStream::Stderr] {
+            let chunks = captured.lock().unwrap();
+            let selected: Vec<_> = chunks
+                .iter()
+                .filter(|chunk| chunk.stream == stream)
+                .collect();
+            for (sequence, chunk) in selected.iter().enumerate() {
+                assert_eq!(chunk.sequence, sequence as u64);
+            }
+            let bytes: Vec<_> = selected
+                .iter()
+                .flat_map(|chunk| chunk.bytes.iter().copied())
+                .collect();
+            assert!(bytes.len() <= 4096);
+            assert!(String::from_utf8_lossy(&bytes).contains("Command output truncated"));
+        }
+    }
+}
+
+#[test]
+#[ignore = "subprocess fixture invoked by diagnostic ownership tests"]
+fn command_child_success() {
+    std::io::stdout().write_all(&[b'o'; 96 * 1024]).unwrap();
+    std::io::stderr().write_all(&[b'e'; 96 * 1024]).unwrap();
+    std::io::stdout().write_all(b"saved stdout\n").unwrap();
+    std::io::stderr().write_all(b"saved stderr\n").unwrap();
+    std::process::exit(0);
+}

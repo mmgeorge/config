@@ -71,6 +71,29 @@ pub fn progress_command(
     limits: CommandLimits,
     input: Option<&[u8]>,
     progress: Option<&CommandProgressSink>,
+    check: impl FnMut() -> Result<()>,
+) -> Result<Output> {
+    collect_command(command, limits, input, progress, false, check)
+}
+
+/// Drains diagnostic output to EOF without treating capture truncation as command failure.
+/// Retains a bounded tail and publishes a bounded prefix with an explicit truncation notice.
+pub fn diagnostic_command(
+    command: &mut Command,
+    limits: CommandLimits,
+    input: Option<&[u8]>,
+    progress: Option<&CommandProgressSink>,
+    check: impl FnMut() -> Result<()>,
+) -> Result<Output> {
+    collect_command(command, limits, input, progress, true, check)
+}
+
+fn collect_command(
+    command: &mut Command,
+    limits: CommandLimits,
+    input: Option<&[u8]>,
+    progress: Option<&CommandProgressSink>,
+    diagnostic: bool,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
     ensure!(
@@ -131,12 +154,12 @@ pub fn progress_command(
             .name("forge-git-stdout".into())
             .spawn_scoped(scope, move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    read_stream_progress(
-                        stdout,
-                        limits.stdout_bytes,
-                        CommandStream::Stdout,
-                        progress,
-                    )
+                    let read = if diagnostic {
+                        read_diagnostic_stream
+                    } else {
+                        read_stream_progress
+                    };
+                    read(stdout, limits.stdout_bytes, CommandStream::Stdout, progress)
                 }))
                 .unwrap_or_else(|_| {
                     Err(anyhow::anyhow!("command stdout progress reader panicked"))
@@ -151,12 +174,12 @@ pub fn progress_command(
             .name("forge-git-stderr".into())
             .spawn_scoped(scope, move || {
                 let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    read_stream_progress(
-                        stderr,
-                        limits.stderr_bytes,
-                        CommandStream::Stderr,
-                        progress,
-                    )
+                    let read = if diagnostic {
+                        read_diagnostic_stream
+                    } else {
+                        read_stream_progress
+                    };
+                    read(stderr, limits.stderr_bytes, CommandStream::Stderr, progress)
                 }))
                 .unwrap_or_else(|_| {
                     Err(anyhow::anyhow!("command stderr progress reader panicked"))
@@ -275,6 +298,62 @@ fn read_stream_progress(
             })?;
             sequence += 1;
         }
+    }
+}
+
+fn read_diagnostic_stream(
+    mut source: impl Read,
+    limit: usize,
+    stream: CommandStream,
+    progress: Option<&CommandProgressSink>,
+) -> Result<Vec<u8>> {
+    let notice = b"\n[Command output truncated]\n";
+    let notice = &notice[..notice.len().min(limit)];
+    let capacity = limit - notice.len();
+    let mut output = Vec::with_capacity(capacity);
+    let mut chunk = [0; 8192];
+    let mut published = 0;
+    let mut sequence = 0;
+    let mut truncated = false;
+    loop {
+        let received = match source.read(&mut chunk) {
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            result => result.context("read command diagnostics")?,
+        };
+        if received == 0 {
+            if truncated {
+                let mut retained = Vec::with_capacity(limit);
+                retained.extend_from_slice(notice);
+                retained.extend(output);
+                return Ok(retained);
+            }
+            return Ok(output);
+        }
+        let retained = received.min(capacity);
+        let removed = (output.len() + retained).saturating_sub(capacity);
+        output.drain(..removed);
+        output.extend_from_slice(&chunk[received - retained..received]);
+        let visible = received.min(capacity - published);
+        if let Some(progress) = progress {
+            if visible > 0 {
+                progress(CommandProgress {
+                    stream,
+                    sequence,
+                    bytes: chunk[..visible].to_vec(),
+                })?;
+                sequence += 1;
+            }
+            if visible < received && !truncated && !notice.is_empty() {
+                progress(CommandProgress {
+                    stream,
+                    sequence,
+                    bytes: notice.to_vec(),
+                })?;
+                sequence += 1;
+            }
+        }
+        published += visible;
+        truncated |= visible < received;
     }
 }
 

@@ -15,7 +15,7 @@ use tokio::sync::oneshot;
 
 use crate::{
     RepositoryPath,
-    command::{CommandLimits, CommandProgressSink, CommandStream, progress_command},
+    command::{CommandLimits, CommandProgressSink, CommandStream, diagnostic_command, progress_command},
     coordinator::{AdmissionGuard, OperationState},
     mutation::{MutationScope, OperationCompletion, OperationId},
     repository::RepositoryState,
@@ -940,11 +940,19 @@ fn git_command(repository: &RepositoryState) -> Result<Command> {
 }
 
 fn bounded_diagnostic(text: &str) -> String {
-    let mut end = text.len().min(2048);
+    if text.len() <= 2048 {
+        return text.to_owned();
+    }
+    let notice = "\n[Diagnostic truncated]\n";
+    let mut end = 1024;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    text[..end].to_owned()
+    let mut start = text.len() - (2048 - end - notice.len());
+    while !text.is_char_boundary(start) {
+        start += 1;
+    }
+    format!("{}{notice}{}", &text[..end], &text[start..])
 }
 
 fn run_path_chunk(
@@ -1161,7 +1169,15 @@ fn run_target(
             Duration::from_secs(120)
         },
     };
-    progress_command(
+    let run = if matches!(
+        action,
+        GitWriteAction::Commit { .. } | GitWriteAction::CommitWithEditor { .. }
+    ) {
+        diagnostic_command
+    } else {
+        progress_command
+    };
+    run(
         &mut command,
         limits,
         input.as_deref(),

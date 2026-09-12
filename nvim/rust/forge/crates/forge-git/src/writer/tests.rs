@@ -1,6 +1,17 @@
 use super::*;
 use crate::test_support::git;
 
+#[test]
+fn diagnostic_retains_exit_context_and_final_error_within_utf8_budget() {
+    let input = format!("Git exited 1: {}\nfinal hook error", "界".repeat(2000));
+    let diagnostic = bounded_diagnostic(&input);
+    assert!(diagnostic.len() <= 2048);
+    assert!(diagnostic.starts_with("Git exited 1:"));
+    assert!(diagnostic.contains("[Diagnostic truncated]"));
+    assert!(diagnostic.ends_with("final hook error"));
+    assert_eq!(bounded_diagnostic("short error"), "short error");
+}
+
 async fn fixture() -> (
     tempfile::TempDir,
     Arc<RepositoryStore>,
@@ -785,6 +796,34 @@ async fn head_discard_handles_staged_addition_and_deletion() {
     assert_eq!(
         std::fs::read(directory.path().join("sample.txt")).unwrap(),
         b"original\n"
+    );
+}
+
+#[tokio::test]
+async fn commit_with_large_summary_reports_completed() {
+    let (directory, _, repository, service) = fixture().await;
+    std::fs::write(directory.path().join("sample.txt"), "changed\n").unwrap();
+    git(directory.path(), &["add", "sample.txt"]);
+    let message = format!("test: {}", "large summary ".repeat(9000));
+    let completed = run(
+        &service,
+        &repository,
+        GitWriteAction::Commit {
+            message: message.clone(),
+        },
+    )
+    .await;
+    assert_eq!(completed.target[0].completion, TargetCompletion::Completed);
+    let recorded = Command::new("git")
+        .arg("-C")
+        .arg(directory.path())
+        .args(["log", "-1", "--format=%s"])
+        .output()
+        .unwrap();
+    assert!(recorded.status.success());
+    assert_eq!(
+        recorded.stdout,
+        format!("{}\n", message.trim_end()).as_bytes()
     );
 }
 

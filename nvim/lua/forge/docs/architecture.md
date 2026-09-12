@@ -1249,6 +1249,13 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
   lookup through process exit and rejects startup while the repository mutation
   coordinator is pending. This lets the running editor provide AI prefill and live hook
   output without overlapping Git index writers.
+  Native commit commands drain stdout and stderr through process exit. Each stream
+  publishes at most 64 KiB, including a truncation notice, and retains a bounded tail
+  for failure diagnostics. Output truncation never changes Git's exit status or
+  terminates a commit. Commands whose output is parsed retain strict capture limits.
+  The 2 KiB mutation diagnostic preserves its prefix and tail at UTF-8 boundaries.
+  Lua anchors pending-line matching so newline-free progress does not trigger a
+  quadratic pattern search.
 - **`conventional_commit.lua`** — parses the `type(scope)!:` prefix of a subject into
   colored segments for consistent highlighting across commit rows.
 - **`datetime.lua`** — formats epochs/ISO timestamps into relative ("2 hours ago") or

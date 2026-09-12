@@ -83,7 +83,7 @@ function M.execute(workspace, action, callback, progress)
         if state.last_carriage and visible:sub(1, 1) == "\n" then visible = visible:sub(2) end
         state.last_carriage = bytes:sub(-1) == "\r"
         state.pending = state.pending .. visible:gsub("\r\n", "\n"):gsub("\r", "\n")
-        local last = state.pending:match(".*()\n")
+        local last = state.pending:match("^.*()\n")
         if last then
           if progress then progress(state.pending:sub(1, last), chunk.stream) end
           state.pending = state.pending:sub(last + 1)
