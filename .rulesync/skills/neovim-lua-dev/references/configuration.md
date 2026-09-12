@@ -21,13 +21,13 @@ In `init.lua`, `setup` coordinates subsystem initialization from the merged opti
 ```lua
 function M.setup(opts)
   M.config = config.setup(opts)
-  perf.configure_from_diff_review_options(M.config)
+  perf.configure_from_forge_options(M.config)
   highlights.setup()
-  require("diff_review.views.status.state").register_view_controllers()
+  require("forge.views.status.state").register_view_controllers()
 end
 ```
 
-Internal modules access configuration via `require("diff_review.infra.config").options`. Avoid caching independent copies of option tables inside view modules.
+Internal modules access configuration via `require("forge.infra.config").options`. Avoid caching independent copies of option tables inside view modules.
 
 ## Keymap Organization by Interaction Vocabulary
 
@@ -174,21 +174,21 @@ Structure the lazy plugin specification to defer loading until command execution
 
 ```lua
 return {
-  "you/diff_review",
+  "you/forge",
   dependencies = { "folke/snacks.nvim" },
   cmd = {
-    "GitStatus",
-    "GitBranchDiff",
-    "GitBranchDiffFile",
-    "GitFileRevision",
-    "GitDiffCompactPreview",
+    "ForgeStatus",
+    "ForgeBranchDiff",
+    "ForgeBranchDiffFile",
+    "ForgeFileRevision",
+    "ForgeDiffCompactPreview",
   },
   keys = {
-    { "<leader>gs", "<cmd>GitStatus<cr>", desc = "Git status review" },
+    { "<leader>gs", "<cmd>ForgeStatus<cr>", desc = "Git status review" },
     {
       "<leader>gd",
       function()
-        require("diff_review").open_compact_preview()
+        require("forge").open_compact_preview()
       end,
       desc = "Compact diff preview",
     },
@@ -207,7 +207,7 @@ return {
     },
   },
   config = function(_, opts)
-    require("diff_review").setup(opts)
+    require("forge").setup(opts)
   end,
 }
 ```

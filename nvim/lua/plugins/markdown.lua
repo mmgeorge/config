@@ -20,6 +20,10 @@ return {
     end,
     opts = function()
       return {
+        ignore = function(buffer)
+          return not require('forge.native_syntax').global_parser_allowed(buffer)
+            and vim.b[buffer].forge_source_markdown ~= true
+        end,
         render_modes = { 'n', 'c', 't', 'i' },
         custom_handlers = {
           markdown = require('markdown_math.display_handler'),
@@ -45,7 +49,7 @@ return {
     dependencies = {
       'nvim-treesitter/nvim-treesitter',
     },
-    ft = { 'markdown', 'GithubIssue' },
+    ft = { 'markdown', 'ForgeGithubIssue' },
     opts = {
       verbose = {
         no_code_found = false,
@@ -57,7 +61,7 @@ return {
       local group = vim.api.nvim_create_augroup('MarkdownCodeOtter', { clear = true })
       vim.api.nvim_create_autocmd('FileType', {
         group = group,
-        pattern = { 'markdown', 'GithubIssue' },
+        pattern = { 'markdown', 'ForgeGithubIssue' },
         callback = function(args)
           markdown_code.activate(args.buf, {
             filetype = vim.bo[args.buf].filetype,
@@ -67,7 +71,7 @@ return {
       })
       local buf = vim.api.nvim_get_current_buf()
       local filetype = vim.bo[buf].filetype
-      if filetype == 'markdown' or filetype == 'GithubIssue' then
+      if filetype == 'markdown' or filetype == 'ForgeGithubIssue' then
         markdown_code.activate(buf, {
           filetype = filetype,
           register_as_markdown = filetype ~= 'markdown',

@@ -6,10 +6,14 @@ return {
     {
       "G",
       function ()
+        if not require('forge.native_syntax').global_parser_allowed(vim.api.nvim_get_current_buf()) then
+          vim.cmd('normal! G')
+          return
+        end
         require('treesj').toggle() 
       end,
       mode = { "n" },
-      desc = "Oil file browser",
+      desc = "Toggle syntax join or go to final native document row",
     }
   }, 
   config = function()

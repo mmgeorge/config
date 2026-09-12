@@ -1,0 +1,17 @@
+{
+  "$schema": "https://github.com/dyoshikawa/rulesync/releases/latest/download/permissions-schema.json",
+  "permission": {
+    "read": {
+      "*": "allow"
+    },
+    "edit": {
+      ".": "allow"
+    },
+    "webfetch": {
+      "*": "allow"
+    },
+    "mcp": {
+      "*": "ask"
+    }
+  }
+}

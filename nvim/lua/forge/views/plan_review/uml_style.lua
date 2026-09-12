@@ -1,0 +1,334 @@
+local M = {}
+
+local declaration_kind_list = {
+  "abstract class",
+  "interface",
+  "resource",
+  "struct",
+  "class",
+  "trait",
+  "config",
+  "cache",
+  "adapter",
+  "enum",
+  "fn",
+}
+
+local builtin_type = {
+  bool = true,
+  boolean = true,
+  f32 = true,
+  f64 = true,
+  i8 = true,
+  i16 = true,
+  i32 = true,
+  i64 = true,
+  i128 = true,
+  isize = true,
+  never = true,
+  number = true,
+  string = true,
+  u8 = true,
+  u16 = true,
+  u32 = true,
+  u64 = true,
+  u128 = true,
+  unit = true,
+  unknown = true,
+  usize = true,
+  void = true,
+}
+
+local function add_span(span_list, start_index, end_index, highlight)
+  if start_index and end_index and start_index <= end_index then
+    span_list[#span_list + 1] = {
+      start_index = start_index,
+      end_index = end_index,
+      highlight = highlight,
+    }
+  end
+end
+
+local function path_start(line)
+  return line:find("%[[^%]]+%]%s*$")
+end
+
+---@param line string
+---@param target table?
+---@param width integer?
+---@return string
+function M.align_owner(line, target, width)
+  local target_type = target and target.target_type or nil
+  if target_type ~= "entity"
+      and target_type ~= "flow_step"
+      and target_type ~= "flow_edge" then
+    return line
+  end
+  local inline_path_start = path_start(line)
+  if not inline_path_start or not width then return line end
+  local content = line:sub(1, inline_path_start - 1):gsub("%s+$", "")
+  local owner = line:sub(inline_path_start):gsub("%s+$", "")
+  local gap = width - vim.fn.strdisplaywidth(content) - vim.fn.strdisplaywidth(owner)
+  if gap < 1 then return line end
+  return content .. string.rep(" ", gap) .. owner
+end
+
+local function identifier_span_list(line, limit)
+  local result = {}
+  local cursor = 1
+  while cursor <= limit do
+    local start_index, end_index = line:find("[%a_][%w_]*", cursor)
+    if not start_index or start_index > limit then break end
+    result[#result + 1] = {
+      text = line:sub(start_index, end_index),
+      start_index = start_index,
+      end_index = math.min(end_index, limit),
+    }
+    cursor = end_index + 1
+  end
+  return result
+end
+
+local function declaration_spans(line, span_list, limit)
+  local keyword_start
+  local keyword_end
+  local declaration_kind
+  for _, kind in ipairs(declaration_kind_list) do
+    local start_index, end_index = line:find(kind, 1, true)
+    if start_index and (not keyword_start or start_index < keyword_start) then
+      keyword_start = start_index
+      keyword_end = end_index
+      declaration_kind = kind
+    end
+  end
+  if keyword_start then
+    add_span(span_list, keyword_start, keyword_end, "@keyword")
+    local name_start, name_end = line:find("[%a_][%w_]*", keyword_end + 1)
+    if name_start and name_start <= limit then
+      add_span(
+        span_list,
+        name_start,
+        name_end,
+        declaration_kind == "fn" and "@function" or "@type"
+      )
+    end
+  end
+
+  local extends_start, extends_end = line:find("extends", 1, true)
+  if extends_start and extends_start <= limit then
+    add_span(span_list, extends_start, extends_end, "@keyword")
+  end
+
+  for _, identifier in ipairs(identifier_span_list(line, limit)) do
+    local follows_relation = extends_end and identifier.start_index > extends_end
+    local follows_conformance = line:sub(1, identifier.start_index - 1):match(":%s*$") ~= nil
+    local continuation_type = not keyword_start and identifier.text:match("^[A-Z]") ~= nil
+    if follows_relation or follows_conformance or continuation_type then
+      add_span(span_list, identifier.start_index, identifier.end_index, "@type")
+    end
+  end
+end
+
+local function member_spans(line, span_list, limit)
+  local name_start, name_end = line:find("[%a_][%w_]*", 1)
+  if not name_start or name_start > limit then return end
+  local open_parenthesis = line:find("(", name_end + 1, true)
+  local is_operation = open_parenthesis ~= nil and open_parenthesis <= limit
+  add_span(span_list, name_start, name_end, is_operation and "@function.method" or "@variable.member")
+
+  local parameter_name = {}
+  if is_operation then
+    local close_parenthesis = line:find(")", open_parenthesis + 1, true) or limit
+    local cursor = open_parenthesis + 1
+    while cursor < close_parenthesis do
+      local parameter_start, parameter_end = line:find("[%a_][%w_]*%s*:", cursor)
+      if not parameter_start or parameter_start >= close_parenthesis then break end
+      local name = line:sub(parameter_start, parameter_end):match("^[%a_][%w_]*")
+      local name_finish = parameter_start + #name - 1
+      parameter_name[name] = true
+      add_span(span_list, parameter_start, name_finish, "@variable.parameter")
+      cursor = parameter_end + 1
+    end
+  end
+
+  for _, identifier in ipairs(identifier_span_list(line, limit)) do
+    local text = identifier.text
+    local is_type = text:find("::", 1, true)
+      or text:match("^[A-Z]") ~= nil
+      or builtin_type[text:lower()] == true
+    if text == "mut" then
+      add_span(span_list, identifier.start_index, identifier.end_index, "@keyword.modifier")
+    elseif is_type and not parameter_name[text] and identifier.start_index ~= name_start then
+      add_span(span_list, identifier.start_index, identifier.end_index, "@type")
+    end
+  end
+end
+
+local dependency_action_highlight = {
+  Add = "ForgeWalkthroughActionAdd",
+  Modify = "ForgeWalkthroughActionModify",
+  Remove = "ForgeWalkthroughActionRemove",
+}
+
+local file_status_highlight = {
+  New = "ForgeFileStatusNew",
+  Modified = "ForgeFileStatusModified",
+  Deleted = "ForgeFileStatusDeleted",
+  Renamed = "ForgeFileStatusRenamed",
+}
+
+local function file_spans(line, span_list)
+  local status_start, status_end, status = line:find("([%a]+)%s*$")
+  local highlight = status and file_status_highlight[status] or nil
+  if highlight then add_span(span_list, status_start, status_end, highlight) end
+end
+
+---@param line string
+---@param span_list table[]
+local function dependency_spans(line, span_list)
+  local _, marker_end = line:find("^├─ ", 1)
+  if not marker_end then _, marker_end = line:find("^└─ ", 1) end
+  if not marker_end then
+    add_span(span_list, 1, #line, "Normal")
+    return
+  end
+  local action_start, action_end, action = line:find("([%a]+)%s+", marker_end + 1)
+  local action_highlight = action and dependency_action_highlight[action] or nil
+  if action_start ~= marker_end + 1 or not action_highlight then
+    add_span(span_list, 1, #line, "Normal")
+    return
+  end
+  local name_start, name_end = line:find("[^%s]+", action_end + 1)
+  add_span(span_list, action_start, action_end - 1, action_highlight)
+  add_span(span_list, name_start, name_end, "ForgeDependencyName")
+  local metadata_start, metadata_end = line:find("%b()", (name_end or 0) + 1)
+  add_span(span_list, metadata_start, metadata_end, "ForgePlanMetadata")
+end
+
+local function segments_from_spans(line, span_list)
+  table.sort(span_list, function(left, right)
+    if left.start_index == right.start_index then return left.end_index > right.end_index end
+    return left.start_index < right.start_index
+  end)
+  local segment_list = {}
+  local cursor = 1
+  for _, span in ipairs(span_list) do
+    if span.start_index >= cursor then
+      if span.start_index > cursor then
+        segment_list[#segment_list + 1] = { line:sub(cursor, span.start_index - 1) }
+      end
+      segment_list[#segment_list + 1] = {
+        line:sub(span.start_index, span.end_index),
+        span.highlight,
+      }
+      cursor = span.end_index + 1
+    end
+  end
+  if cursor <= #line then segment_list[#segment_list + 1] = { line:sub(cursor) } end
+  return #segment_list > 0 and segment_list or nil
+end
+
+---@param line string
+---@param target table?
+---@return table[]?
+function M.segments(line, target)
+  local target_type = target and target.target_type or nil
+  local is_flow_row = target_type == "flow_step"
+    or target_type == "flow_edge"
+    or target_type == "flow_edge_result"
+    or target_type == "flow_branch"
+  if target_type ~= "entity"
+      and target_type ~= "entity_member"
+      and target_type ~= "enum_variant"
+      and target_type ~= "enum_variant_field"
+      and target_type ~= "dependency"
+      and target_type ~= "file"
+      and target_type ~= "test"
+      and not is_flow_row then
+    return nil
+  end
+
+  local inline_path_start = path_start(line)
+  local limit = (inline_path_start or (#line + 1)) - 1
+  local span_list = {}
+  if target_type == "flow_step" then
+    local target_name = target and target.target_name or nil
+    if type(target_name) == "string" and target_name ~= "" then
+      local target_start, target_end = line:find(target_name, 1, true)
+      if target_start and target_start <= limit then
+        add_span(
+          span_list,
+          target_start,
+          target_end,
+          target and target.target_is_type and "@type" or "@function"
+        )
+      end
+    end
+  elseif target_type == "flow_edge" then
+    local callable_name = target and target.callable_name or nil
+    if type(callable_name) == "string" and callable_name ~= "" then
+      local callable_start, callable_end = line:find(callable_name, 1, true)
+      if callable_start and callable_start <= limit then
+        local callable_highlight = target and target.callable_kind == "method"
+            and "@function.method.call"
+          or "@function.call"
+        add_span(span_list, callable_start, callable_end, callable_highlight)
+      end
+    end
+    local target_name = target and target.target_name or nil
+    if target and target.target_is_type
+        and type(target_name) == "string"
+        and target_name ~= "" then
+      local search_start = 1
+      local target_start
+      local target_end
+      while true do
+        local match_start, match_end = line:find(target_name, search_start, true)
+        if not match_start or match_start > limit then break end
+        target_start = match_start
+        target_end = match_end
+        search_start = match_end + 1
+      end
+      add_span(span_list, target_start, target_end, "@type")
+    end
+  elseif target_type == "flow_edge_result" then
+    local _, marker_end = line:find("├─", 1, true)
+    if not marker_end then _, marker_end = line:find("└─", 1, true) end
+    local arrow_start, arrow_end = line:find("→", (marker_end or 0) + 1, true)
+    local value_start = arrow_end and line:find("%S", arrow_end + 1) or nil
+    local value_end = line:find("%s*$") - 1
+    if value_start and target and target.value_kind == "type" then
+      add_span(span_list, 1, value_start - 1, "Normal")
+      add_span(span_list, value_start, value_end, "@type")
+      add_span(span_list, value_end + 1, #line, "Normal")
+    elseif arrow_start then
+      add_span(span_list, 1, #line, "Normal")
+    end
+  elseif target_type == "flow_branch" then
+    local keyword_start, keyword_end = line:find("when", 1, true)
+    if keyword_start and keyword_start <= limit then
+      add_span(span_list, keyword_start, keyword_end, "@keyword.conditional")
+    end
+  elseif target_type == "entity" then
+    declaration_spans(line, span_list, limit)
+  elseif target_type == "dependency" then
+    dependency_spans(line, span_list)
+  elseif target_type == "file" then
+    file_spans(line, span_list)
+  elseif target_type == "enum_variant" then
+    local start_index, end_index = line:find("[%a_][%w_]*", 1)
+    add_span(span_list, start_index, end_index, "@variable")
+  elseif target_type == "test" then
+    local category_start, category_end = line:find("[%a_][%w_]*Test")
+    add_span(span_list, category_start, category_end, "@type")
+  elseif not is_flow_row then
+    member_spans(line, span_list, limit)
+  end
+  if inline_path_start then
+    local inline_path_end = line:find("%]%s*$", inline_path_start)
+    add_span(span_list, inline_path_start, inline_path_end, "ForgePlanMetadata")
+  end
+  return segments_from_spans(line, span_list)
+end
+
+return M

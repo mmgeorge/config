@@ -3,41 +3,41 @@ return {
     "pwntester/octo.nvim",
     cmd = "Octo",
     init = function()
-      vim.api.nvim_create_user_command("GithubPRCreate", function()
+      vim.api.nvim_create_user_command("ForgeGithubPRCreate", function()
         require("github.open_pr").open()
       end, {
         desc = "Create a draft GitHub PR for the current branch",
       })
 
-      vim.api.nvim_create_user_command("GithubLink", function(opts)
+      vim.api.nvim_create_user_command("ForgeGithubLink", function(opts)
         require("github.link").open("blob", opts)
       end, {
         range = true,
         desc = "Open the current file or selected lines on GitHub",
       })
 
-      vim.api.nvim_create_user_command("GithubBlame", function(opts)
+      vim.api.nvim_create_user_command("ForgeGithubBlame", function(opts)
         require("github.link").open("blame", opts)
       end, {
         range = true,
         desc = "Open GitHub blame for the current file or selected lines",
       })
 
-      vim.api.nvim_create_user_command("GithubIssue", function(opts)
+      vim.api.nvim_create_user_command("ForgeGithubIssue", function(opts)
         require("github.pickers").issues(opts.args)
       end, {
         nargs = "*",
         desc = "Search GitHub issues, or open [owner/repo] <number>",
       })
 
-      vim.api.nvim_create_user_command("GithubIssueCreate", function(opts)
+      vim.api.nvim_create_user_command("ForgeGithubIssueCreate", function(opts)
         require("github.issue_create").open(opts.args)
       end, {
         nargs = "*",
         desc = "Create a GitHub issue in the current repo",
       })
 
-      vim.api.nvim_create_user_command("GithubIssueSync", function(opts)
+      vim.api.nvim_create_user_command("ForgeGithubIssueSync", function(opts)
         require("github.issue_index").sync_current({
           scope = vim.trim(opts.args or "") == "all" and "all" or "open",
         })
@@ -49,37 +49,39 @@ return {
         desc = "Sync GitHub issues for the current repo into the local issue index",
       })
 
-      vim.api.nvim_create_user_command("GithubPR", function(opts)
+      vim.api.nvim_create_user_command("ForgeGithubPR", function(opts)
         require("github.pickers").prs(opts.args)
       end, {
         nargs = "*",
         desc = "Search my open GitHub PRs, or open [owner/repo] <number>",
       })
 
-      vim.api.nvim_create_user_command("GithubReview", function()
+      vim.api.nvim_create_user_command("ForgeGithubReview", function()
         require("github.pickers").reviews()
       end, {
         desc = "Search GitHub PR review requests",
       })
 
-      vim.api.nvim_create_user_command("GithubNotifications", function()
+      vim.api.nvim_create_user_command("ForgeGithubNotifications", function()
         require("github.notifications").open()
       end, {
         desc = "Open GitHub notifications",
       })
 
-      vim.api.nvim_create_user_command("GithubDeleteRepoCache", function()
+      vim.api.nvim_create_user_command("ForgeGithubDeleteRepoCache", function()
         local cache = require("github.repo_cache")
         local gh = require("github.gh")
         local cwd = vim.fn.getcwd()
         local repo = cache.buffer_repo(0)
         local function delete(repo_name)
-          local deleted = cache.delete_current(repo_name, cwd)
-          vim.notify(
-            deleted > 0 and "Deleted GitHub repo cache" or "No GitHub repo cache found",
-            vim.log.levels.INFO,
-            { title = "GitHub" }
-          )
+          cache.delete_current(repo_name, cwd, function(deleted, failure)
+            if failure then return end
+            vim.notify(
+              deleted > 0 and "Deleted GitHub repo cache" or "No GitHub repo cache found",
+              vim.log.levels.INFO,
+              { title = "GitHub" }
+            )
+          end)
         end
         if repo then
           delete(repo)

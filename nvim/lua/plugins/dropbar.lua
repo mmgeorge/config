@@ -83,6 +83,7 @@ return {
 
           if not vim.api.nvim_buf_is_valid(buf)
               or not vim.api.nvim_win_is_valid(win)
+              or vim.b[buf].forge_native_document == true
               or vim.fn.win_gettype(win) ~= ''
               or vim.wo[win].winbar ~= ''
               or vim.bo[buf].ft == 'help'

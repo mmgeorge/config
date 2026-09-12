@@ -136,40 +136,6 @@ local function commit_buffer_git_root(buf)
   return worktree_root_from_git_dir(vim.fs.dirname(name))
 end
 
--- Commit-message generation lives in diff_review.ai_commit (context building,
--- pregeneration state, staged/HEAD fingerprint reuse) on top of the `ai`
--- prompt library. This file only wires the global triggers: pregenerate on
--- Neogit refresh, and populate plain COMMIT_EDITMSG buffers that DiffReview
--- does not own.
-local pregen_debounce_timer = nil
-
-local function pregenerate_commit()
-  vim.system({ "git", "rev-parse", "--show-toplevel" }, {
-    text = true,
-    stdout = true,
-    stderr = true,
-  }, function(result)
-    vim.schedule(function()
-      if result.code ~= 0 then return end
-      local root = vim.trim(result.stdout or "")
-      if root == "" then return end
-      require("diff_review.integrations.ai_commit").ensure(root, { ref = "HEAD" })
-    end)
-  end)
-end
-
-local function schedule_pregenerate()
-  if pregen_debounce_timer and not pregen_debounce_timer:is_closing() then
-    pregen_debounce_timer:stop()
-  else
-    pregen_debounce_timer = vim.uv.new_timer()
-  end
-  pregen_debounce_timer:start(500, 0, vim.schedule_wrap(function()
-    pregenerate_commit()
-  end))
-end
-
-
 return {
   -- {
   --   "zbirenbaum/copilot.lua",
@@ -254,16 +220,10 @@ return {
     },
     init = function()
       setup_inline_commands()
-      vim.api.nvim_create_autocmd("User", {
-        pattern = "NeogitStatusRefreshed",
-        callback = function()
-          schedule_pregenerate()
-        end,
-      })
       vim.api.nvim_create_autocmd({ "BufEnter" }, {
         pattern = "COMMIT_EDITMSG",
         callback = function(args)
-          if vim.b[args.buf].diff_review_commit_buffer then return end
+          if vim.b[args.buf].forge_commit_buffer then return end
           if vim.b[args.buf].ai_commit_generated then return end
 
           local cwd = commit_buffer_git_root(args.buf)
@@ -272,7 +232,7 @@ return {
             return
           end
 
-          require("diff_review.integrations.ai_commit").populate_commit_buffer_when_ready(args.buf, cwd, function(message, level)
+          require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(args.buf, cwd, function(message, level)
             vim.notify(message, level, { title = "commit" })
           end)
         end,

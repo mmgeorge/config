@@ -1,0 +1,88 @@
+local root = vim.fn.getcwd()
+dofile(root .. "/nvim/tests/forge/fixtures/commit_reuse_manual.lua")
+local state = forge_reuse.state
+local status = require("forge.status")
+local client = require("forge.client")
+local notices = {}
+vim.notify = function(message, level) if level == vim.log.levels.ERROR then notices[#notices + 1] = message end end
+vim.ui.select = function() error("Status invoked a Snacks picker") end
+vim.ui.input = function() error("Status invoked a Snacks input") end
+local function idle()
+  return state.ready and not state.request_active and next(client._client.pending) == nil
+end
+local function press(key)
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), "xt", false)
+end
+local function file_row(path)
+  for id, model in pairs(state.replica.file) do
+    if model.record.path == path then return select(2, state.replica.sequence:position("file:" .. id)) + 1 end
+  end
+  error("Missing fixture file " .. path)
+end
+local function read(path) return vim.fn.readfile(forge_reuse.fixture .. "/" .. path) end
+local ok, failure = xpcall(function()
+  assert(vim.wait(15000, idle, 10), "native Status did not open")
+  local origin = vim.api.nvim_get_current_win()
+  vim.v.errmsg = ""
+  press("bc")
+  assert(vim.bo.filetype == "ForgeBranchPrompt" and vim.api.nvim_win_get_height(0) == 1)
+  assert(vim.wo.winbar == "" and vim.v.errmsg == "", "branch popup inherited a Status winbar: " .. vim.v.errmsg)
+  press("q")
+  assert(vim.api.nvim_get_current_win() == origin)
+  local revision = state.replica.revision
+  local first, last = file_row("tracked.txt"), file_row("untracked.txt")
+  vim.api.nvim_win_set_cursor(origin, { first, 0 })
+  vim.cmd("normal! V" .. last .. "G")
+  status.action(state, "discard", true)
+  assert(vim.bo.filetype == "ForgeConfirm" and vim.api.nvim_get_current_line() == "Discard changes in 2 file(s)?")
+  vim.wait(250, function() return false end, 10)
+  press("n")
+  assert(vim.wait(1000, idle, 10))
+  assert(state.replica.revision == revision, "returning from confirmation refreshed and invalidated the captured selection")
+  assert(read("tracked.txt")[1] == "after" and read("untracked.txt")[1] == "new content")
+  vim.api.nvim_win_set_cursor(origin, { file_row("tracked.txt"), 0 })
+  press("j")
+  assert(vim.bo.filetype == "ForgeConfirm", "discard mapping did not open the old confirmation")
+  assert(vim.api.nvim_get_current_line() == "Discard ALL changes to file?")
+  press("n")
+  assert(read("tracked.txt")[1] == "after", "cancel discarded the tracked file")
+  press("j")
+  press("y")
+  assert(vim.wait(5000, function() return idle() and read("tracked.txt")[1] == "before" end, 10), table.concat(notices, "\n"))
+  vim.api.nvim_win_set_cursor(origin, { file_row("untracked.txt"), 0 })
+  press("j")
+  assert(vim.api.nvim_get_current_line() == "Delete untracked file?")
+  press("<Esc>")
+  assert(read("untracked.txt")[1] == "new content")
+  press("j")
+  press("y")
+  assert(vim.wait(5000, function() return idle() and vim.fn.filereadable(forge_reuse.fixture .. "/untracked.txt") == 0 end, 10))
+  first, last = file_row("deleted.txt"), file_row("old-name.txt")
+  vim.api.nvim_win_set_cursor(origin, { first, 0 })
+  vim.cmd("normal! V" .. last .. "G")
+  status.action(state, "discard", true)
+  assert(vim.api.nvim_get_current_line() == "Discard changes in 3 file(s)?")
+  vim.wait(250, function() return false end, 10)
+  press("y")
+  assert(vim.wait(5000, function() return idle() and #state.replica.inventory.file == 0 end, 10), table.concat(notices, "\n"))
+  assert(read("deleted.txt")[1] == "removed" and read("old-name.txt")[1] == "original renamed content")
+  assert(vim.fn.filereadable(forge_reuse.fixture .. "/new-name.txt") == 0)
+  local _, issue_row = state.replica.root:position("status:context:issues")
+  vim.api.nvim_win_set_cursor(origin, { issue_row + 1, 8 })
+  state.replica.issues_editor.sync()
+  assert(vim.bo.modifiable, "Issues is not editable inline")
+  vim.api.nvim_buf_set_lines(0, issue_row, issue_row + 1, false, { "Issues: #42 #7" })
+  vim.api.nvim_win_set_cursor(origin, { issue_row + 2, 0 })
+  state.replica.issues_editor.sync()
+  vim.cmd("write")
+  assert(vim.wait(5000, function() return idle() and not state.replica.issues_editor.dirty end, 10), table.concat(notices, "\n"))
+  local persisted = vim.json.decode(table.concat(read(".forge.json"), "\n"))
+  assert(vim.deep_equal(persisted.issues, { 7, 42 }), "inline Issues did not reach native persistence")
+  assert(state.replica.block["status:context:issues"].text[1] == "Issues: #7 #42")
+  assert(#notices == 0, table.concat(notices, "\n"))
+  status.close(state)
+  client.stop()
+end, debug.traceback)
+if not ok then io.stderr:write(tostring(failure), "\n") vim.cmd("cquit 1") end
+print("native discard confirmations and inline Issues persistence passed")
+vim.cmd("qa!")

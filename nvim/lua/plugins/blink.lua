@@ -258,7 +258,7 @@ return {
       -- Default list of enabled providers defined so that you can extend it
       -- elsewhere in your config, without redefining it, due to `opts_extend`
       sources = {
-        default = { 'lsp', 'path', 'custom_snippets', 'diff_review_reviewers', 'github_issues', 'spell' },
+        default = { 'lsp', 'path', 'custom_snippets', 'forge_reviewers', 'github_issues', 'spell' },
         per_filetype = {
           HarnessInput = { 'harness_commands', 'harness_files' },
         },
@@ -321,21 +321,21 @@ return {
             min_keyword_length = 2,
             module = "snippet_source",
           },
-          diff_review_reviewers = {
+          forge_reviewers = {
             name = "Reviewers",
             min_keyword_length = 0,
-            module = "diff_review.views.pr.reviewer_source",
+            module = "forge.views.pr.reviewer_source",
           },
           harness_commands = {
             name = "Harness commands",
             min_keyword_length = 0,
-            module = "diff_review.views.harness.completion.command_source",
+            module = "forge.views.harness.completion.command_source",
           },
           harness_files = {
             name = "Workspace files",
             async = true,
             min_keyword_length = 0,
-            module = "diff_review.views.harness.completion.file_source",
+            module = "forge.views.harness.completion.file_source",
           },
           github_issues = {
             name = "Issues",

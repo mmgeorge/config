@@ -1,8 +1,8 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
-  "$id": "diff-review-walkthrough.schema.json",
-  "title": "DiffReview Walkthrough",
-  "description": "Guided review walkthrough for repository changes, consumed by the DiffReview Neovim plugin. Lives at the repository root as .walkthrough.json.",
+  "$id": "forge-walkthrough.schema.json",
+  "title": "Forge Walkthrough",
+  "description": "Guided review walkthrough for repository changes, consumed by the Forge Neovim plugin. Lives at the repository root as .walkthrough.json.",
   "type": "object",
   "required": ["version", "flow", "overview", "root", "commit", "tasks"],
   "additionalProperties": false,
@@ -135,12 +135,12 @@
         "file": {
           "type": "string",
           "minLength": 1,
-          "description": "Repo-relative path with forward slashes for the current file line where DiffReview places the optional annotation."
+          "description": "Repo-relative path with forward slashes for the current file line where Forge places the optional annotation."
         },
         "line": {
           "type": "integer",
           "minimum": 1,
-          "description": "1-based line in the NEW (post-change) file where DiffReview places the optional annotation."
+          "description": "1-based line in the NEW (post-change) file where Forge places the optional annotation."
         },
         "annotation": {
           "$ref": "#/$defs/annotation",

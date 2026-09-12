@@ -48,8 +48,7 @@ return {
       vim.api.nvim_create_autocmd("FileType", {
         group = vim.api.nvim_create_augroup("UserTreesitter", { clear = true }),
         callback = function(args)
-          pcall(vim.treesitter.start, args.buf)
-          vim.bo[args.buf].indentexpr = "v:lua.require'nvim-treesitter'.indentexpr()"
+          require("forge.native_syntax").attach_global_parser(args.buf)
         end,
       })
     end

@@ -1,0 +1,729 @@
+{
+  "version": 1,
+  "upstream": {
+    "url": "https://github.com/nvim-treesitter/nvim-treesitter",
+    "revision": "42fc28ba918343ebfd5565147a42a26580579482"
+  },
+  "file": [
+    {
+      "path": "query/upstream/cue/folds.scm",
+      "origin": "nvim-treesitter/queries/cue/folds.scm",
+      "sha256": "24a378bb15b50056c2938dd602801046d31ef0c430e41baf46bbb473920eb2f5"
+    },
+    {
+      "path": "query/upstream/cue/highlights.scm",
+      "origin": "nvim-treesitter/queries/cue/highlights.scm",
+      "sha256": "16718556d96f3ac5eb55577a3c385a47a9713969906347b65993f8aa509dedfa"
+    },
+    {
+      "path": "query/upstream/cue/indents.scm",
+      "origin": "nvim-treesitter/queries/cue/indents.scm",
+      "sha256": "5591d4237fa9319ab6b72cfcdaf4f96ef7c6893ce1a2f6ae4a907c711d8fec44"
+    },
+    {
+      "path": "query/upstream/cue/injections.scm",
+      "origin": "nvim-treesitter/queries/cue/injections.scm",
+      "sha256": "e8bc96da2faabe257a32d805d3954e200215d94a85fce4d521530c89e0969244"
+    },
+    {
+      "path": "query/upstream/cue/locals.scm",
+      "origin": "nvim-treesitter/queries/cue/locals.scm",
+      "sha256": "17f90fb697a30b5531dcba63da3c702ab765a015ccef9a7f6ae292ef68c29f17"
+    },
+    {
+      "path": "query/upstream/latex/folds.scm",
+      "origin": "nvim-treesitter/queries/latex/folds.scm",
+      "sha256": "2ad9c72c0dfc081aa32a3df30465a24219316736b71c67285a3e516a9a8d7fd0"
+    },
+    {
+      "path": "query/upstream/latex/highlights.scm",
+      "origin": "nvim-treesitter/queries/latex/highlights.scm",
+      "sha256": "4b9bec2a8a483c32af26cd9657d386f651e5fd71603e5eae3d118cf90b44b747"
+    },
+    {
+      "path": "query/upstream/latex/injections.scm",
+      "origin": "nvim-treesitter/queries/latex/injections.scm",
+      "sha256": "989523087b1ac9e722b76c0c31f4967210c9400dde84d63c5619db48f50a2e83"
+    },
+    {
+      "path": "query/upstream/markdown_inline/highlights.scm",
+      "origin": "nvim-treesitter/queries/markdown_inline/highlights.scm",
+      "sha256": "64af7f4e30c97681af9db94452e58c5e2a3ad43678b1644738eb8da21f8e778a"
+    },
+    {
+      "path": "query/upstream/markdown_inline/injections.scm",
+      "origin": "nvim-treesitter/queries/markdown_inline/injections.scm",
+      "sha256": "051f44218e0fe25cd949dfccad80699d5456ee379c7c4cfa18a5165776ecab0e"
+    },
+    {
+      "path": "query/upstream/markdown/folds.scm",
+      "origin": "nvim-treesitter/queries/markdown/folds.scm",
+      "sha256": "f9cb82eb75c5d3c6946903bb2318278d3ca378e507b14569d2bb8af8bba69b95"
+    },
+    {
+      "path": "query/upstream/markdown/highlights.scm",
+      "origin": "nvim-treesitter/queries/markdown/highlights.scm",
+      "sha256": "7b71d4994cf3968e16d033ac59d28bb034427dd41be6a057b7a2985e2dfbe5b8"
+    },
+    {
+      "path": "query/upstream/markdown/indents.scm",
+      "origin": "nvim-treesitter/queries/markdown/indents.scm",
+      "sha256": "52550be38883524e3eb393982cbc3e0ff08e7bcfb8ae6e42152eeec531409faa"
+    },
+    {
+      "path": "query/upstream/markdown/injections.scm",
+      "origin": "nvim-treesitter/queries/markdown/injections.scm",
+      "sha256": "8d04801d305bb0a6ea2f97a064c2a876fd1c080d1ae553090ea643bd3f198bf3"
+    },
+    {
+      "path": "query/upstream/nu/folds.scm",
+      "origin": "nvim-treesitter/queries/nu/folds.scm",
+      "sha256": "f0a34869c99e37a090280f5648badade85719bef5d377ddfec4c6a5dbe569465"
+    },
+    {
+      "path": "query/upstream/nu/highlights.scm",
+      "origin": "nvim-treesitter/queries/nu/highlights.scm",
+      "sha256": "2e5303e1cdca5822d26e9233606f05f6b789d280bb18b145e50d78723488b1c1"
+    },
+    {
+      "path": "query/upstream/nu/indents.scm",
+      "origin": "nvim-treesitter/queries/nu/indents.scm",
+      "sha256": "7d36312eb9fefd47ef0471b4fcd1b735b654d9c51044030e91cd418d7c6b30d5"
+    },
+    {
+      "path": "query/upstream/nu/injections.scm",
+      "origin": "nvim-treesitter/queries/nu/injections.scm",
+      "sha256": "6e19701723a14fab37013bf4e490da2908edf975cae6ddb1ed90b9499d4ab224"
+    },
+    {
+      "path": "query/upstream/yaml/folds.scm",
+      "origin": "nvim-treesitter/queries/yaml/folds.scm",
+      "sha256": "a7ff158e0d3a9ac4b8e2537c542e72071ffaeca0fd0a6d15c38744941fd98111"
+    },
+    {
+      "path": "query/upstream/yaml/highlights.scm",
+      "origin": "nvim-treesitter/queries/yaml/highlights.scm",
+      "sha256": "13352b80d2ce28c3328ccb2f321e5144c3365ff6055078e00e7cff118d1488b5"
+    },
+    {
+      "path": "query/upstream/yaml/indents.scm",
+      "origin": "nvim-treesitter/queries/yaml/indents.scm",
+      "sha256": "992bc118ad191dcfe8080291bc75e6eb825d55e631ca3afd3305a6cbb58c3e0f"
+    },
+    {
+      "path": "query/upstream/yaml/injections.scm",
+      "origin": "nvim-treesitter/queries/yaml/injections.scm",
+      "sha256": "8349bd07691e2e610decdfc7b898bb5b01b226aae8745217bc811427f7af6742"
+    },
+    {
+      "path": "query/upstream/yaml/locals.scm",
+      "origin": "nvim-treesitter/queries/yaml/locals.scm",
+      "sha256": "7f16d82385db2c35fefdb12fcfc03be891ee9abb1c1238ad3190eae1347b8348"
+    },
+    {
+      "path": "query/upstream/slang/folds.scm",
+      "origin": "nvim-treesitter/queries/slang/folds.scm",
+      "sha256": "6f1830c36011f99f0c7ceed727eb032c6ec60c39e852e685f31b64bed97495b7"
+    },
+    {
+      "path": "query/upstream/slang/highlights.scm",
+      "origin": "nvim-treesitter/queries/slang/highlights.scm",
+      "sha256": "d53c32be2fe2a9d09800adcf119d771c767bb99d049fe9ddf2eee47b2587f6ea"
+    },
+    {
+      "path": "query/upstream/slang/indents.scm",
+      "origin": "nvim-treesitter/queries/slang/indents.scm",
+      "sha256": "909861ad379d87ad4924ad7b29ff2724232530439e80550a0659d19c7e024be2"
+    },
+    {
+      "path": "query/upstream/slang/injections.scm",
+      "origin": "nvim-treesitter/queries/slang/injections.scm",
+      "sha256": "ec5cd3527a0564c6ae51cd8c376bf4b3590f5e49a8aa9b865892d373d779422d"
+    },
+    {
+      "path": "query/upstream/slang/locals.scm",
+      "origin": "nvim-treesitter/queries/slang/locals.scm",
+      "sha256": "875fd01e995accd95457ee2ec71d2b15c21a56804565bc05d599cdf825344739"
+    },
+    {
+      "path": "query/upstream/hlsl/folds.scm",
+      "origin": "nvim-treesitter/queries/hlsl/folds.scm",
+      "sha256": "0ee9aa42a271eb9a179d40a2dcfdead56e00606fa2835525dffa0f2933abb477"
+    },
+    {
+      "path": "query/upstream/hlsl/highlights.scm",
+      "origin": "nvim-treesitter/queries/hlsl/highlights.scm",
+      "sha256": "146d5b3cd0b4a14c72900fda8ce8ce96707e86bf781a33a7562ab6142860f9e9"
+    },
+    {
+      "path": "query/upstream/hlsl/indents.scm",
+      "origin": "nvim-treesitter/queries/hlsl/indents.scm",
+      "sha256": "0ee9aa42a271eb9a179d40a2dcfdead56e00606fa2835525dffa0f2933abb477"
+    },
+    {
+      "path": "query/upstream/hlsl/injections.scm",
+      "origin": "nvim-treesitter/queries/hlsl/injections.scm",
+      "sha256": "fe497621ee2393dd6794f9b9613908ecec48c95de7a6ec31a93458d6f362cebf"
+    },
+    {
+      "path": "query/upstream/hlsl/locals.scm",
+      "origin": "nvim-treesitter/queries/hlsl/locals.scm",
+      "sha256": "0ee9aa42a271eb9a179d40a2dcfdead56e00606fa2835525dffa0f2933abb477"
+    },
+    {
+      "path": "query/upstream/cpp/folds.scm",
+      "origin": "nvim-treesitter/queries/cpp/folds.scm",
+      "sha256": "a1e1ba255956cfb30e720b7ef251027339ec7305a25d6771e20fba611728fb0a"
+    },
+    {
+      "path": "query/upstream/cpp/highlights.scm",
+      "origin": "nvim-treesitter/queries/cpp/highlights.scm",
+      "sha256": "69d1dbed8d49c498e93a75db6afedfb8769fa2fed455a64d588dc347281d642f"
+    },
+    {
+      "path": "query/upstream/cpp/indents.scm",
+      "origin": "nvim-treesitter/queries/cpp/indents.scm",
+      "sha256": "7ea910f1d0308158db49c22ba83d5ace260869d727daa7c12995d2a10ef5c14b"
+    },
+    {
+      "path": "query/upstream/cpp/injections.scm",
+      "origin": "nvim-treesitter/queries/cpp/injections.scm",
+      "sha256": "3586d38038fe166e1df806cb89a186abc8886a69646ef36ba2848c6c66ffd2e4"
+    },
+    {
+      "path": "query/upstream/cpp/locals.scm",
+      "origin": "nvim-treesitter/queries/cpp/locals.scm",
+      "sha256": "7047179aee75f5e85b0fadd1da4a1856b32d68d6694952738a257ca13a5e4a52"
+    },
+    {
+      "path": "query/upstream/c/folds.scm",
+      "origin": "nvim-treesitter/queries/c/folds.scm",
+      "sha256": "f909cc918deec9a7845203a1c86d29b6177fbe0cb8603b83ef3d81b6a9276a59"
+    },
+    {
+      "path": "query/upstream/c/highlights.scm",
+      "origin": "nvim-treesitter/queries/c/highlights.scm",
+      "sha256": "a99c4c0bf9d9b9f7de0124c529a4229fddada96d65bf5fb0c9d487266e15d483"
+    },
+    {
+      "path": "query/upstream/c/indents.scm",
+      "origin": "nvim-treesitter/queries/c/indents.scm",
+      "sha256": "f23c147d7b9522c6d4f4b761a4ea7de1f32090af36974527cbca6a1fd46facde"
+    },
+    {
+      "path": "query/upstream/c/injections.scm",
+      "origin": "nvim-treesitter/queries/c/injections.scm",
+      "sha256": "05567dfe061ee825d9c10e78cce8dfab6c7daf64a0e31d19e73eef2d1ba2a590"
+    },
+    {
+      "path": "query/upstream/c/locals.scm",
+      "origin": "nvim-treesitter/queries/c/locals.scm",
+      "sha256": "b3ecf04dadb49555af03644686fb68c3ce3ccfd98af33f003371beb5a37652b0"
+    },
+    {
+      "path": "query/upstream/toml/folds.scm",
+      "origin": "nvim-treesitter/queries/toml/folds.scm",
+      "sha256": "b51d400c8ec94947adf98c1474364ae2210e80e71d144ce32ae276d36e993267"
+    },
+    {
+      "path": "query/upstream/toml/highlights.scm",
+      "origin": "nvim-treesitter/queries/toml/highlights.scm",
+      "sha256": "059618709a4c7e6b287643a68282257e197c5a05cfb9d82b6ac517d32230cb12"
+    },
+    {
+      "path": "query/upstream/toml/indents.scm",
+      "origin": "nvim-treesitter/queries/toml/indents.scm",
+      "sha256": "13f2a61390cd7757cd846f1e284c13160f442247fc6e3ec518759c1b93caad07"
+    },
+    {
+      "path": "query/upstream/toml/injections.scm",
+      "origin": "nvim-treesitter/queries/toml/injections.scm",
+      "sha256": "e8bc96da2faabe257a32d805d3954e200215d94a85fce4d521530c89e0969244"
+    },
+    {
+      "path": "query/upstream/toml/locals.scm",
+      "origin": "nvim-treesitter/queries/toml/locals.scm",
+      "sha256": "c96389d2ab7a653ae9b33637e18cf40dcce428d879547b66d9b5a520e1926213"
+    },
+    {
+      "path": "query/upstream/c_sharp/folds.scm",
+      "origin": "nvim-treesitter/queries/c_sharp/folds.scm",
+      "sha256": "596a82b2b891c67d59971ad7285bc651ea811f82a6a49041438a78d47709ddf3"
+    },
+    {
+      "path": "query/upstream/c_sharp/highlights.scm",
+      "origin": "nvim-treesitter/queries/c_sharp/highlights.scm",
+      "sha256": "4b79059a52926e8cd08a1d80af70ba02acefb86bc8ed82315897fb104ed1a338"
+    },
+    {
+      "path": "query/upstream/c_sharp/injections.scm",
+      "origin": "nvim-treesitter/queries/c_sharp/injections.scm",
+      "sha256": "e8bc96da2faabe257a32d805d3954e200215d94a85fce4d521530c89e0969244"
+    },
+    {
+      "path": "query/upstream/c_sharp/locals.scm",
+      "origin": "nvim-treesitter/queries/c_sharp/locals.scm",
+      "sha256": "7dccbd815d6033de319708ef27d82350af5acafefeb5f4314e5b8a525cb85e80"
+    },
+    {
+      "path": "query/upstream/glsl/folds.scm",
+      "origin": "nvim-treesitter/queries/glsl/folds.scm",
+      "sha256": "e721d3ecb16a6bb63c84329693d5756b63e1aa3d3732f03631921bfa0d13d536"
+    },
+    {
+      "path": "query/upstream/glsl/highlights.scm",
+      "origin": "nvim-treesitter/queries/glsl/highlights.scm",
+      "sha256": "8d9fb86fcac7126b24b8719702c75568b5650e2f8554cc779a835b6ed6666187"
+    },
+    {
+      "path": "query/upstream/glsl/indents.scm",
+      "origin": "nvim-treesitter/queries/glsl/indents.scm",
+      "sha256": "e721d3ecb16a6bb63c84329693d5756b63e1aa3d3732f03631921bfa0d13d536"
+    },
+    {
+      "path": "query/upstream/glsl/injections.scm",
+      "origin": "nvim-treesitter/queries/glsl/injections.scm",
+      "sha256": "34aeb467a7df4cd7facbeba3d7d988a28b73e5dc2e099feb06f841e53c04a5c3"
+    },
+    {
+      "path": "query/upstream/glsl/locals.scm",
+      "origin": "nvim-treesitter/queries/glsl/locals.scm",
+      "sha256": "e721d3ecb16a6bb63c84329693d5756b63e1aa3d3732f03631921bfa0d13d536"
+    },
+    {
+      "path": "query/upstream/wgsl/folds.scm",
+      "origin": "nvim-treesitter/queries/wgsl/folds.scm",
+      "sha256": "d5ba4f572341dd81a211255bf50192dd2168bef11c5e785e0655e511d4837abf"
+    },
+    {
+      "path": "query/upstream/wgsl/highlights.scm",
+      "origin": "nvim-treesitter/queries/wgsl/highlights.scm",
+      "sha256": "39d3804f39160bd0a1c43467fb081cca02e3068dfdba496a435c3fd73ce1e198"
+    },
+    {
+      "path": "query/upstream/wgsl/indents.scm",
+      "origin": "nvim-treesitter/queries/wgsl/indents.scm",
+      "sha256": "6b3aa774967fc00fcad5c83c0cbfd1e28048d42c5a3793c6620df1cf25cd2c5e"
+    },
+    {
+      "path": "query/upstream/wgsl/injections.scm",
+      "origin": "nvim-treesitter/queries/wgsl/injections.scm",
+      "sha256": "54e69a34df675a26262747c95a30ef305097b7d452c99c7cfb9ce6bedf50afc5"
+    },
+    {
+      "path": "query/upstream/html/folds.scm",
+      "origin": "nvim-treesitter/queries/html/folds.scm",
+      "sha256": "554602944873b08eec04ffe76ab79b5d4609f75394490c124397426a9b0d3e44"
+    },
+    {
+      "path": "query/upstream/html/highlights.scm",
+      "origin": "nvim-treesitter/queries/html/highlights.scm",
+      "sha256": "51bd6796b8e61616ad967d31a68f6b53fc4ba44ecdec4001ec7f83fbe5f2d763"
+    },
+    {
+      "path": "query/upstream/html/indents.scm",
+      "origin": "nvim-treesitter/queries/html/indents.scm",
+      "sha256": "fedd128d8b417fd28567bab0932d7a3786ed59e5b4a4383e5fa25e26b621d73e"
+    },
+    {
+      "path": "query/upstream/html/injections.scm",
+      "origin": "nvim-treesitter/queries/html/injections.scm",
+      "sha256": "16b6d48692600f527d3ae0c386358fe7d3b0dc3a9217939b98e6f192b87afd8a"
+    },
+    {
+      "path": "query/upstream/html/locals.scm",
+      "origin": "nvim-treesitter/queries/html/locals.scm",
+      "sha256": "ac78830a6a7eab92a71ba4e5448f104e059ae1e88e355e68a3035191a260be74"
+    },
+    {
+      "path": "query/upstream/html_tags/highlights.scm",
+      "origin": "nvim-treesitter/queries/html_tags/highlights.scm",
+      "sha256": "a6cdf30cc3f9f610085f9a67f057357526913e1c8403a28ef91d233085cfb351"
+    },
+    {
+      "path": "query/upstream/html_tags/indents.scm",
+      "origin": "nvim-treesitter/queries/html_tags/indents.scm",
+      "sha256": "d9a4998f3b138a948aaf239f2930f8b0d88bb9dcb8f2b188a91416f27c66dbcd"
+    },
+    {
+      "path": "query/upstream/html_tags/injections.scm",
+      "origin": "nvim-treesitter/queries/html_tags/injections.scm",
+      "sha256": "7968fa7565e88952b76f4217171978ccfdc6e5e4f942b64cdddd3fb535efc520"
+    },
+    {
+      "path": "query/upstream/css/folds.scm",
+      "origin": "nvim-treesitter/queries/css/folds.scm",
+      "sha256": "27753670bbafb11b56c19daec2598e26993aad7bcefe68d697051fd2c52c1df0"
+    },
+    {
+      "path": "query/upstream/css/highlights.scm",
+      "origin": "nvim-treesitter/queries/css/highlights.scm",
+      "sha256": "6641fed120530bfbce5682ab88b2a8d14d99bfcd971ac9f78cd91738b4b0578a"
+    },
+    {
+      "path": "query/upstream/css/indents.scm",
+      "origin": "nvim-treesitter/queries/css/indents.scm",
+      "sha256": "91fe5062c2bb1af135a2e3ed11d79dd20b5776c9e6b34496b4eceba5ac816685"
+    },
+    {
+      "path": "query/upstream/css/injections.scm",
+      "origin": "nvim-treesitter/queries/css/injections.scm",
+      "sha256": "e8bc96da2faabe257a32d805d3954e200215d94a85fce4d521530c89e0969244"
+    },
+    {
+      "path": "query/upstream/javascript/folds.scm",
+      "origin": "nvim-treesitter/queries/javascript/folds.scm",
+      "sha256": "b6473f9af85876eaca477fbe61462e80f316c5b12387be62fe1b40cae72914c2"
+    },
+    {
+      "path": "query/upstream/javascript/highlights.scm",
+      "origin": "nvim-treesitter/queries/javascript/highlights.scm",
+      "sha256": "d429c015300e55e5dbbe11c119b844bd6f56755e46d0d2152cb4443616ef2856"
+    },
+    {
+      "path": "query/upstream/javascript/indents.scm",
+      "origin": "nvim-treesitter/queries/javascript/indents.scm",
+      "sha256": "b6473f9af85876eaca477fbe61462e80f316c5b12387be62fe1b40cae72914c2"
+    },
+    {
+      "path": "query/upstream/javascript/injections.scm",
+      "origin": "nvim-treesitter/queries/javascript/injections.scm",
+      "sha256": "b6473f9af85876eaca477fbe61462e80f316c5b12387be62fe1b40cae72914c2"
+    },
+    {
+      "path": "query/upstream/javascript/locals.scm",
+      "origin": "nvim-treesitter/queries/javascript/locals.scm",
+      "sha256": "ea7ebf53cf3bfa35e94274c1c14e379c3f3d1bde36cf8bf8e31cd016bb7654aa"
+    },
+    {
+      "path": "query/upstream/jsx/folds.scm",
+      "origin": "nvim-treesitter/queries/jsx/folds.scm",
+      "sha256": "2010b94da6016d00ebe18e31d321df127c11aa3fb75d39ae2e2a32d1fce042ff"
+    },
+    {
+      "path": "query/upstream/jsx/highlights.scm",
+      "origin": "nvim-treesitter/queries/jsx/highlights.scm",
+      "sha256": "fbeaa6de60604615a8dc7c18eb6e0d33f32aee51628b57e6e03b0c8baf687568"
+    },
+    {
+      "path": "query/upstream/jsx/indents.scm",
+      "origin": "nvim-treesitter/queries/jsx/indents.scm",
+      "sha256": "014d00e54eb822ac0c8718f8d05e65c561d7a0a08bafc9b1b4dde8ceb8569c55"
+    },
+    {
+      "path": "query/upstream/jsx/injections.scm",
+      "origin": "nvim-treesitter/queries/jsx/injections.scm",
+      "sha256": "85ded87ac041c56b6f0fde461983878d48dd29c51205c01908446ec26fc08d62"
+    },
+    {
+      "path": "query/upstream/ecma/folds.scm",
+      "origin": "nvim-treesitter/queries/ecma/folds.scm",
+      "sha256": "a97b18e52b7bc8b70075ed1a78dad12e72e5e5ae769bb212d8276186a972dd91"
+    },
+    {
+      "path": "query/upstream/ecma/highlights.scm",
+      "origin": "nvim-treesitter/queries/ecma/highlights.scm",
+      "sha256": "37834547ebaa9c160cad87eabd38387d4722b1b40d44bab54d8e71d1feff9b9e"
+    },
+    {
+      "path": "query/upstream/ecma/indents.scm",
+      "origin": "nvim-treesitter/queries/ecma/indents.scm",
+      "sha256": "da023bf0aff5fd81bdfafb753f3da3041b7c6ba953ef083821a17a622af6d155"
+    },
+    {
+      "path": "query/upstream/ecma/injections.scm",
+      "origin": "nvim-treesitter/queries/ecma/injections.scm",
+      "sha256": "0effedc2bb043d34a273845538f9aa69ed5fe81764512e56b92e1a5f6b5b7a5c"
+    },
+    {
+      "path": "query/upstream/ecma/locals.scm",
+      "origin": "nvim-treesitter/queries/ecma/locals.scm",
+      "sha256": "ca6cd6e4ee17dff4ffc360780fcf2e04a68d2836e87ac6e46036201e1f3d8a15"
+    },
+    {
+      "path": "query/upstream/query/folds.scm",
+      "origin": "nvim-treesitter/queries/query/folds.scm",
+      "sha256": "c0fffbca7122920b6c28007f991e433f051ace3772511023c2cd751e73962027"
+    },
+    {
+      "path": "query/upstream/query/highlights.scm",
+      "origin": "nvim-treesitter/queries/query/highlights.scm",
+      "sha256": "3c2bd5aa41d0ccd15fd1c39f57cbea0821f912d46bc34e258145c0be9fb6b3ea"
+    },
+    {
+      "path": "query/upstream/query/indents.scm",
+      "origin": "nvim-treesitter/queries/query/indents.scm",
+      "sha256": "628543055924bf89eaef9061e3647f829c9133e9f79c7b6e2b3d05bea2993944"
+    },
+    {
+      "path": "query/upstream/query/injections.scm",
+      "origin": "nvim-treesitter/queries/query/injections.scm",
+      "sha256": "5ba5b09917ee69c32b902f9bd16a29e74f53ef8427f9a77f21fa8cb24f9035ca"
+    },
+    {
+      "path": "query/upstream/query/locals.scm",
+      "origin": "nvim-treesitter/queries/query/locals.scm",
+      "sha256": "bcc64e8c790f6fdc92c419e30d582bf715672351f6455fdbb70f3452ef1f46cb"
+    },
+    {
+      "path": "query/upstream/json/folds.scm",
+      "origin": "nvim-treesitter/queries/json/folds.scm",
+      "sha256": "7946e857230de4899bc8eed17744fe0672c404bfdcc53118dfdedd7bb509af92"
+    },
+    {
+      "path": "query/upstream/json/highlights.scm",
+      "origin": "nvim-treesitter/queries/json/highlights.scm",
+      "sha256": "6ab09656820f0e8dac860c96dced341221284544c05308ee337727f5db937101"
+    },
+    {
+      "path": "query/upstream/json/indents.scm",
+      "origin": "nvim-treesitter/queries/json/indents.scm",
+      "sha256": "fd028a09dd815ff8c67a1156be5051ef78f5cb0661c8685a56befb1d4fdde999"
+    },
+    {
+      "path": "query/upstream/json/locals.scm",
+      "origin": "nvim-treesitter/queries/json/locals.scm",
+      "sha256": "9c7b66bb2fe5b7bc4441ae6d95eedebab7dabbbb9d74e9e6a042bcf6b91af590"
+    },
+    {
+      "path": "query/upstream/vimdoc/highlights.scm",
+      "origin": "nvim-treesitter/queries/vimdoc/highlights.scm",
+      "sha256": "c7b4e49950b0861a742f1f68ac84264f60beef667c4c44e85a33f45a50aa54b5"
+    },
+    {
+      "path": "query/upstream/vimdoc/injections.scm",
+      "origin": "nvim-treesitter/queries/vimdoc/injections.scm",
+      "sha256": "ec6578fe6956d8c85878d71d037e9b2d35d551a3beaa4cd4510ba26b78ca3dac"
+    },
+    {
+      "path": "query/upstream/vim/folds.scm",
+      "origin": "nvim-treesitter/queries/vim/folds.scm",
+      "sha256": "3d8f6dc7a1914a7fa5116e44b7516ff7197c2147a33b31418d0effa50947e311"
+    },
+    {
+      "path": "query/upstream/vim/highlights.scm",
+      "origin": "nvim-treesitter/queries/vim/highlights.scm",
+      "sha256": "3ccb59deb5ed0d363a91433a2b7baaf25489b449c587a8d6decb40dcf129a16c"
+    },
+    {
+      "path": "query/upstream/vim/injections.scm",
+      "origin": "nvim-treesitter/queries/vim/injections.scm",
+      "sha256": "547945486ea029de5d3a0e51a145f367acbc0054cb728d338d7d82bf95f68434"
+    },
+    {
+      "path": "query/upstream/vim/locals.scm",
+      "origin": "nvim-treesitter/queries/vim/locals.scm",
+      "sha256": "d0a6fba18d8434bd4820aeb687bb587ec1a6bcf3e2b9e89d96537a7fe26a22db"
+    },
+    {
+      "path": "query/upstream/lua/folds.scm",
+      "origin": "nvim-treesitter/queries/lua/folds.scm",
+      "sha256": "4e18315fb845cb6cc08fa97798298cea72c636389e626c1f336452bc9ad37238"
+    },
+    {
+      "path": "query/upstream/lua/highlights.scm",
+      "origin": "nvim-treesitter/queries/lua/highlights.scm",
+      "sha256": "0cc175254ae513064a814aaca05ca2a40912940e26b75495469a6d7e08d6ca4a"
+    },
+    {
+      "path": "query/upstream/lua/indents.scm",
+      "origin": "nvim-treesitter/queries/lua/indents.scm",
+      "sha256": "593b6b01a3a7fccf8b01dfc80de058c813bf3fa83c1f24a6244326b96e19ec51"
+    },
+    {
+      "path": "query/upstream/lua/injections.scm",
+      "origin": "nvim-treesitter/queries/lua/injections.scm",
+      "sha256": "0698f8297cfe3f7ce689d87b3e4b3d7cba301c027c734b51b09e7ce1a9648eb1"
+    },
+    {
+      "path": "query/upstream/lua/locals.scm",
+      "origin": "nvim-treesitter/queries/lua/locals.scm",
+      "sha256": "826bec7f13e70d25dc78ac06bd4bd67e89a2011ebd1dc6b8442cf67c2bd2290b"
+    },
+    {
+      "path": "query/upstream/tsx/folds.scm",
+      "origin": "nvim-treesitter/queries/tsx/folds.scm",
+      "sha256": "0631577ba119c6b1f9fbabe70d70ad17ae81e4e7d8afb0e2309bd8acee0f5f76"
+    },
+    {
+      "path": "query/upstream/tsx/highlights.scm",
+      "origin": "nvim-treesitter/queries/tsx/highlights.scm",
+      "sha256": "0631577ba119c6b1f9fbabe70d70ad17ae81e4e7d8afb0e2309bd8acee0f5f76"
+    },
+    {
+      "path": "query/upstream/tsx/indents.scm",
+      "origin": "nvim-treesitter/queries/tsx/indents.scm",
+      "sha256": "0631577ba119c6b1f9fbabe70d70ad17ae81e4e7d8afb0e2309bd8acee0f5f76"
+    },
+    {
+      "path": "query/upstream/tsx/injections.scm",
+      "origin": "nvim-treesitter/queries/tsx/injections.scm",
+      "sha256": "b6473f9af85876eaca477fbe61462e80f316c5b12387be62fe1b40cae72914c2"
+    },
+    {
+      "path": "query/upstream/tsx/locals.scm",
+      "origin": "nvim-treesitter/queries/tsx/locals.scm",
+      "sha256": "0631577ba119c6b1f9fbabe70d70ad17ae81e4e7d8afb0e2309bd8acee0f5f76"
+    },
+    {
+      "path": "query/upstream/typescript/folds.scm",
+      "origin": "nvim-treesitter/queries/typescript/folds.scm",
+      "sha256": "e5b1b0552e8312f1d048ecfaa9a7fc96e32533e3e173e9185dee563c473ae224"
+    },
+    {
+      "path": "query/upstream/typescript/highlights.scm",
+      "origin": "nvim-treesitter/queries/typescript/highlights.scm",
+      "sha256": "0caa2987e274d06aeb8f9a8a521c8348fc0dd92683b52a303338d066f0432137"
+    },
+    {
+      "path": "query/upstream/typescript/indents.scm",
+      "origin": "nvim-treesitter/queries/typescript/indents.scm",
+      "sha256": "b197d236e16cb5b9acd93c48daf411f9d64b5ee43c0ea42abba97c9c671101d1"
+    },
+    {
+      "path": "query/upstream/typescript/injections.scm",
+      "origin": "nvim-treesitter/queries/typescript/injections.scm",
+      "sha256": "26f6b37dcbf96f3b8adb47665cc457275beb36cb79c138fb9e5c8f9e694eb37c"
+    },
+    {
+      "path": "query/upstream/typescript/locals.scm",
+      "origin": "nvim-treesitter/queries/typescript/locals.scm",
+      "sha256": "f1c37f388e906d56626469108f8cc0e1268291b9974501cf3479e9f06908405c"
+    },
+    {
+      "path": "query/upstream/rust/folds.scm",
+      "origin": "nvim-treesitter/queries/rust/folds.scm",
+      "sha256": "e990d25ccf16b731621cda0536b517267396b02c33b2e6e3b3b3c6dfb6f4c000"
+    },
+    {
+      "path": "query/upstream/rust/highlights.scm",
+      "origin": "nvim-treesitter/queries/rust/highlights.scm",
+      "sha256": "c649a4785322ab72af84874b9dc03c7a4f5d9a05de45a85919a60770d7d5457d"
+    },
+    {
+      "path": "query/upstream/rust/indents.scm",
+      "origin": "nvim-treesitter/queries/rust/indents.scm",
+      "sha256": "5d15704815f121361cf35aa8ba51d78e5923c2c67467659e7a3bd23ebcdabe36"
+    },
+    {
+      "path": "query/upstream/rust/injections.scm",
+      "origin": "nvim-treesitter/queries/rust/injections.scm",
+      "sha256": "bb5d207fd3e18226ed927c5e5241f7e17574c93f350db40cccf93ee878601660"
+    },
+    {
+      "path": "query/upstream/rust/locals.scm",
+      "origin": "nvim-treesitter/queries/rust/locals.scm",
+      "sha256": "a31540dbd462ba6699a5e494764aee2bbfdaea560915d708f6da4d4df4ad3ec5"
+    },
+    {
+      "path": "query/repository/json/parent.scm",
+      "origin": "nvim/queries/json/parent.scm",
+      "sha256": "94986b4ab72d013aa8179f26de7662378a0dba61c9c82fff69d2dc666abdce95"
+    },
+    {
+      "path": "query/repository/lua/parent.scm",
+      "origin": "nvim/queries/lua/parent.scm",
+      "sha256": "9eddfa6e32d3068376fab631fd7b117aa98a05e06dfba212a86e74ec05fa7ba4"
+    },
+    {
+      "path": "query/repository/rust/aerial.scm",
+      "origin": "nvim/queries/rust/aerial.scm",
+      "sha256": "04be90c25e5308fb283c02bcbc4bbd6b19420856fc17902627d66ff3b51ca4bb"
+    },
+    {
+      "path": "query/repository/rust/highlights.scm",
+      "origin": "nvim/queries/rust/highlights.scm",
+      "sha256": "8c612d2ff3343c1f96d693cfb4f0408acbc8be897c75a315592a207800411f2e"
+    },
+    {
+      "path": "query/repository/rust/parent.scm",
+      "origin": "nvim/queries/rust/parent.scm",
+      "sha256": "d1b08b0223c8f9d93ad1dfe50dad092dbd6c5356992d8cde557b9f865a1024bb"
+    },
+    {
+      "path": "query/repository/rust/textobjects.scm",
+      "origin": "nvim/queries/rust/textobjects.scm",
+      "sha256": "bd3638759deaff93e487bb2a0431f8e4ccb2b1f346e87cd47f66a4ef1b112c41"
+    },
+    {
+      "path": "query/repository/tsx/parent.scm",
+      "origin": "nvim/queries/tsx/parent.scm",
+      "sha256": "022e5fed987432a95dd3e5d90b4e9659017b778d3b4bcf0982598dbcf208448a"
+    },
+    {
+      "path": "query/repository/tsx/textobjects.scm",
+      "origin": "nvim/queries/tsx/textobjects.scm",
+      "sha256": "89167df89689d5a82a128ba4ee7ab9c178a98de80cae039d915c13e94b21125d"
+    },
+    {
+      "path": "query/repository/typescript/aerial.scm",
+      "origin": "nvim/queries/typescript/aerial.scm",
+      "sha256": "89632824ecfc7b461503ea2ea3ceab0615f7f02a548d89893de8b2216af04591"
+    },
+    {
+      "path": "query/repository/typescript/highlights.scm",
+      "origin": "nvim/queries/typescript/highlights.scm",
+      "sha256": "d456fbf8fe7b332d137023283becef5d8c48ede77356448b547f004d98aba0b5"
+    },
+    {
+      "path": "query/repository/typescript/parent.scm",
+      "origin": "nvim/queries/typescript/parent.scm",
+      "sha256": "1aae50fea9afa6c0fb3d830c936a0b0fe1a77e9730be7ac53127de4b08a0df02"
+    },
+    {
+      "path": "query/repository/typescript/textobjects.scm",
+      "origin": "nvim/queries/typescript/textobjects.scm",
+      "sha256": "36130dcbc9822f4b5d2a0d49a004196fc256336b201c195ebaa1b8481868cffc"
+    },
+    {
+      "path": "query/repository/wesl/highlights.scm",
+      "origin": "nvim/queries/wesl/highlights.scm",
+      "sha256": "35c3682c1bffbb20cf07b0b57f89d59c39eba6933a23c9fbde02a52f6e67ace3"
+    },
+    {
+      "path": "query/forge/javascript/diff_context.scm",
+      "origin": "nvim/lua/forge/queries/javascript/diff_context.scm",
+      "sha256": "c9dfbf3a94b9fb0ef5556d665529b8698b2d2009f977f08aa17b55f8f7c73874"
+    },
+    {
+      "path": "query/forge/python/diff_context.scm",
+      "origin": "nvim/lua/forge/queries/python/diff_context.scm",
+      "sha256": "6be04f5e7a8f215c32b3aca557de3fc6b1988c636a2a0902a4f090302b96f1aa"
+    },
+    {
+      "path": "query/forge/rust/diff_context.scm",
+      "origin": "nvim/lua/forge/queries/rust/diff_context.scm",
+      "sha256": "aa7a627e2663d20d58e968092257f2f59e8868c3d3424130569919c99671acc1"
+    },
+    {
+      "path": "query/forge/rust/diff_inventory.scm",
+      "origin": "nvim/lua/forge/queries/rust/diff_inventory.scm",
+      "sha256": "e0fc08950170088a85803ff0e4c4a6675b9ae0abbabf497c006429b28ce6c71c"
+    },
+    {
+      "path": "query/forge/slang/diff_context.scm",
+      "origin": "nvim/lua/forge/queries/slang/diff_context.scm",
+      "sha256": "93246c5c1fea6ab69c7775f7c780b265de2d58af87ebad968b34279846511d9a"
+    },
+    {
+      "path": "query/forge/tsx/diff_context.scm",
+      "origin": "nvim/lua/forge/queries/tsx/diff_context.scm",
+      "sha256": "7f9696bef9afd12cc4bc39526a94e82c4b725661d21f3a15dedc435e3c38f2c2"
+    },
+    {
+      "path": "query/forge/tsx/diff_inventory.scm",
+      "origin": "nvim/lua/forge/queries/tsx/diff_inventory.scm",
+      "sha256": "ed21906b7dd1cbd8d95fc45977c2b03df0bae4f72db79d713d81195fff42f768"
+    },
+    {
+      "path": "query/forge/typescript/diff_context.scm",
+      "origin": "nvim/lua/forge/queries/typescript/diff_context.scm",
+      "sha256": "7f9696bef9afd12cc4bc39526a94e82c4b725661d21f3a15dedc435e3c38f2c2"
+    },
+    {
+      "path": "query/forge/typescript/diff_inventory.scm",
+      "origin": "nvim/lua/forge/queries/typescript/diff_inventory.scm",
+      "sha256": "ed21906b7dd1cbd8d95fc45977c2b03df0bae4f72db79d713d81195fff42f768"
+    }
+  ]
+}

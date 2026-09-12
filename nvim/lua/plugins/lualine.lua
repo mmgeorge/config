@@ -248,7 +248,12 @@ return {
             },
             -- 'encoding',
             -- 'fileformat',
-            'filetype'
+            { 'filetype', fmt = function(filetype)
+              if filetype ~= 'forge' or vim.b.forge_native_document ~= true then return filetype end
+              local path = vim.api.nvim_buf_get_name(0)
+              if path == '' or path:find('://', 1, true) then return filetype end
+              return vim.filetype.match({ filename = path }) or filetype
+            end }
           },
           lualine_y = { 'progress' },
           lualine_z = { 'location' }

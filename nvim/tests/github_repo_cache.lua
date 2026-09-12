@@ -3,6 +3,8 @@ vim.loader.enable(false)
 local cache = require("github.repo_cache")
 local github_gh = require("github.gh")
 local issue_index = require("github.issue_index")
+local host_client = require("forge.client")
+local original_request_host = host_client.request_host
 
 local function assert_true(condition, message)
   if not condition then error(message, 2) end
@@ -95,7 +97,7 @@ local function completion_labels(buf, text)
   vim.bo[buf].modifiable = true
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, { text })
   vim.api.nvim_win_set_cursor(0, { 1, #text })
-  local source = require("diff_review.views.pr.reviewer_source").new({})
+  local source = require("forge.views.pr.reviewer_source").new({})
   assert_true(source:enabled(), "completion source did not enable for " .. text)
   local result
   source:get_completions({}, function(completions) result = completions end)
@@ -126,12 +128,14 @@ local function issue_completion_result(buf, text)
 end
 
 local function write_issue_snapshot(repo_name)
+  repo_name = repo_name:lower()
   local path = issue_index.snapshot_path(repo_name)
   vim.fn.mkdir(vim.fs.dirname(path), "p")
   local result = vim.fn.writefile({ vim.json.encode({
     repo = repo_name,
     state = "open",
     issue_count = 4,
+    revision = 0,
     issues = {
       {
         repo = repo_name,
@@ -168,6 +172,10 @@ local function write_issue_snapshot(repo_name)
     },
   }) }, path)
   assert_true(result == 0, "issue snapshot write failed")
+  local loaded
+  issue_index.reload_snapshot(repo_name, function(result) loaded = result end, true)
+  assert_true(vim.wait(2000, function() return loaded ~= nil end, 5), "issue snapshot preload did not finish")
+  assert_true(loaded.ok, loaded.message)
 end
 
 local function run()
@@ -175,31 +183,35 @@ local function run()
   cache.set_data_dir_for_test(cache_root)
   issue_index._reset_for_test()
   issue_index._set_progress_enabled_for_test(false)
-  issue_index._set_runner_for_test(function(command, _, callback)
-    local key = table.concat(command, " ")
-    if key:find(" state ", 1, true) then
+  issue_index._set_sync_runner_for_test(function(_, callback)
+    callback({ refreshed = false, fetched = 0, pages = 0 }, nil)
+  end)
+  issue_index._set_storage_runner_for_test(function(params, callback)
+    if params.request.operation == "reconcile_snapshot" then
+      callback({ ready = true, republished = false, state = { repo = params.repo, revision = 0 } }, nil)
+      return
+    end
+    local action = params.request.operation
+    if action == "state" then
       local stdout = vim.json.encode({
         repo = normalized_repo,
         open_historical_complete = true,
         last_open_checked_at = os.time(),
       })
-      callback({ code = 0, stdout = stdout, stderr = "", output = stdout })
+      callback(vim.json.decode(stdout), nil)
       return
     end
-    callback({ code = 0, stdout = "{}", stderr = "", output = "{}" })
+    callback({}, nil)
   end)
   github_gh.set_backend(github_backend)
   cache.remember_cwd_repo(cwd, normalized_repo)
   cache.set_base_branch(cwd, "master")
   write_issue_snapshot(normalized_repo)
 
-  local metadata_error = cache.write_metadata(normalized_repo, {
-    { login = "bobtown" },
-    { login = "alice-dev", name = "Alice Developer" },
-    { login = "Alice-Dev", name = "Duplicate Alice" },
-    { login = "mgeorge-esri" },
-  })
-  assert_true(metadata_error == nil, "metadata write failed: " .. tostring(metadata_error))
+  vim.fn.mkdir(cache.repo_dir(normalized_repo), "p")
+  vim.fn.writefile({ vim.json.encode({ repo = normalized_repo, fetched_at = os.time(), contributors = {
+    { login = "alice-dev", name = "Alice Developer" }, { login = "bobtown" }, { login = "mgeorge-esri" },
+  } }) }, cache.metadata_path(normalized_repo))
 
   local contributors = cache.contributors(normalized_repo)
   assert_true(#contributors == 3, "contributors were not deduplicated: " .. vim.inspect(contributors))
@@ -222,7 +234,7 @@ local function run()
   vim.api.nvim_set_current_buf(disabled_buf)
   vim.api.nvim_buf_set_lines(disabled_buf, 0, -1, false, { "Comment @a" })
   vim.api.nvim_win_set_cursor(0, { 1, #"Comment @a" })
-  assert_true(not require("diff_review.views.pr.reviewer_source").new({}):enabled(), "completion source enabled without buffer whitelist")
+  assert_true(not require("forge.views.pr.reviewer_source").new({}):enabled(), "completion source enabled without buffer whitelist")
   vim.api.nvim_buf_set_lines(disabled_buf, 0, -1, false, { "Comment #issue title" })
   vim.api.nvim_win_set_cursor(0, { 1, #"Comment #issue title" })
   assert_true(not require("github.issue_source").new({}):enabled(), "issue completion source enabled without buffer whitelist")
@@ -267,16 +279,59 @@ local function run()
   vim.fn.writefile({ "{}" }, review_path)
   assert_true(vim.uv.fs_stat(review_path) ~= nil, "review file was not created")
 
-  local deleted = cache.delete_current(nil, cwd)
-  assert_true(deleted >= 2, "delete_current did not remove mapped repo and cwd cache")
+  local deletion_callback
+  local deletion_params
+  host_client.request_host = function(method, params, callback)
+    assert_true(method == "github.issues", "cache deletion bypassed the issue service")
+    assert_true(params.request.operation == "delete_cache", "cache deletion sent the wrong operation")
+    deletion_callback = callback
+    deletion_params = params
+    return 1
+  end
+  local deleted
+  local deletion_failure
+  cache.delete_current(nil, cwd, function(count, failure)
+    deleted = count
+    deletion_failure = failure
+  end)
+  assert_true(deleted == nil, "deletion completed before the host response")
+  assert_true(cache.repo_for_cwd(cwd) == normalized_repo, "pending deletion cleared the cwd mapping")
+  assert_true(#issue_index.list(normalized_repo:lower()) == 4, "pending deletion invalidated the snapshot")
+  deletion_callback(nil, "repository cache is busy")
+  assert_true(deleted == 0 and deletion_failure ~= nil, "busy deletion did not fail")
+  assert_true(saw_notification_containing("repository cache is busy"), "busy deletion did not notify")
+  assert_true(cache.repo_for_cwd(cwd) == normalized_repo, "failed deletion cleared the cwd mapping")
+  assert_true(#issue_index.list(normalized_repo:lower()) == 4, "failed deletion invalidated the snapshot")
+  deleted = nil
+  cache.delete_current(nil, cwd, function(count, failure)
+    deleted = count
+    deletion_failure = failure
+  end)
+  assert_true(deletion_params.database == vim.fs.joinpath(cache.repo_dir(normalized_repo), "issues", "issues.redb"),
+    "deletion changed the cache path contract")
+  vim.fn.delete(cache.repo_dir(normalized_repo), "rf")
+  deletion_callback({ deleted = true }, nil)
+  assert_true(deleted == 2 and deletion_failure == nil, "delete_current did not remove mapped repo and cwd cache")
+  assert_true(#issue_index.list(normalized_repo:lower()) == 0, "successful deletion retained the snapshot")
   assert_true(#cache.contributors(normalized_repo) == 0, "contributors were not deleted with repo cache")
   assert_true(cache.repo_for_cwd(cwd) == nil, "cwd repo mapping was not deleted")
   assert_true(cache.get_base_branch(cwd) == nil, "base branch was not deleted with cwd cache")
   assert_true(vim.uv.fs_stat(review_path) == nil, "review draft was not deleted with repo cache")
+  cache.remember_cwd_repo(cwd, normalized_repo)
+  deleted = nil
+  cache.delete_current(normalized_repo, cwd, function(count, failure)
+    deleted = count
+    deletion_failure = failure
+  end)
+  cache.remember_cwd_repo(cwd, "Owner/Changed")
+  deletion_callback({ deleted = false }, nil)
+  assert_true(deleted == 0 and deletion_failure ~= nil, "changed cwd context was not rejected")
+  assert_true(cache.repo_for_cwd(cwd) == "Owner/Changed", "late deletion cleared a newer cwd mapping")
 end
 
 local ok, err = xpcall(run, debug.traceback)
 vim.notify = original_notify
+host_client.request_host = original_request_host
 github_gh.reset_backend()
 issue_index._reset_for_test()
 cache.set_data_dir_for_test(nil)

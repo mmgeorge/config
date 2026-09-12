@@ -1,0 +1,2972 @@
+format_version = 2
+hash_policy = "baseline_sha256 hashes exact Git blob bytes; sha256 retains the original pre-rename capture where available; baseline_reference records added integration sources from Git without claiming a pre-rename capture"
+baseline_revision = "3992f3a7c555536116b554190a29e69e5a122bc2"
+baseline_source_root = ["nvim/lua/diff_review", "nvim/tests/diff_review", "nvim/rust/diff-review-harness", "nvim/rust/github-issue-index", "nvim/lua/github", "nvim/lua/rust_sidecar", "nvim/lua/plugins/diff_review.lua", "nvim/lua/plugins/github.lua"]
+completed_gates = ["name", "host", "remote", "native_ownership", "github_storage"]
+asset_manifest = ["nvim/rust/forge/crates/forge-diff/grammar/manifest.json", "nvim/rust/forge/crates/forge-diff/query/manifest.json"]
+
+[[source]]
+source = "nvim/lua/diff_review/docs/architecture.md"
+baseline_blob = "a96e284d343868fcdd48c18343fe66e701a17de2"
+baseline_sha256 = "5efdff85e6464899d6d162f8527b15811f8e54cb15dabd4fb4f2532b89af2779"
+capture_provenance = "dirty_overlay_unavailable"
+destination = "nvim/lua/forge/docs/architecture.md"
+sha256 = "76aa41033de93c4a675a6f4f9dedea9e1166bee9eeccb08eb7bcd8d89380069c"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/git/file_body.lua"
+baseline_blob = "3d9db17f3f0b1617ae4d3381239565aec0282e78"
+baseline_sha256 = "94f4d99128463defcd0162257e418b1aae7e382c04489dfcf9f87ef4a4326cbc"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/git/file_body.lua"
+sha256 = "94f4d99128463defcd0162257e418b1aae7e382c04489dfcf9f87ef4a4326cbc"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/git/git_backend.lua"
+baseline_blob = "7aa8ca20d2d9a6c9bd4b25929c1ec190643cc2b5"
+baseline_sha256 = "e1cae41df8a24fc38fb5fe2a2e1ef2b72268dcd1a3503af21c7e31968c3ffcdd"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/git/git_backend.lua"
+sha256 = "e1cae41df8a24fc38fb5fe2a2e1ef2b72268dcd1a3503af21c7e31968c3ffcdd"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/git/git_data.lua"
+baseline_blob = "7dc75cdc9d10fd2ace04f96a83f8ad7fcaa4cc89"
+baseline_sha256 = "2d246cb40200fb649ae5c4e43534b00cd345e2aea1e102fa60374aee22b57e44"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/git/git_data.lua"
+sha256 = "2d246cb40200fb649ae5c4e43534b00cd345e2aea1e102fa60374aee22b57e44"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/git/index_mutation.lua"
+baseline_blob = "c0cdf26df75f235fd0fe7f2beb610f82585f38e7"
+baseline_sha256 = "89ed487d3087b62c07e18b1fdd66415664f11732f8c12dd5db491c04b47f1e70"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/git/index_mutation.lua"
+sha256 = "89ed487d3087b62c07e18b1fdd66415664f11732f8c12dd5db491c04b47f1e70"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/git/mutation_coordinator.lua"
+baseline_blob = "363eda0f9f3ffe9bcb236d7edd101064ab6302af"
+baseline_sha256 = "42588e52924397ae6b2c74698520b786487195b1023e793333128f4420906bf6"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/git/mutation_coordinator.lua"
+sha256 = "42588e52924397ae6b2c74698520b786487195b1023e793333128f4420906bf6"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/git/repo_config.lua"
+baseline_blob = "a2c0dc613bcecbe50b40f1e7100dcc5dd64ae18c"
+baseline_sha256 = "4f5dd98b46d9c4d0654db7f476affeb59861c24d5cffc8651c05d01e963e3d67"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/git/repo_config.lua"
+sha256 = "4f5dd98b46d9c4d0654db7f476affeb59861c24d5cffc8651c05d01e963e3d67"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/git/status_snapshot.lua"
+baseline_blob = "145f27a326d52bf546b541b211fe172da674935c"
+baseline_sha256 = "99cee4dff23f86c261ca6ce5337d1bbc88b5b98f0462ff3950ab7c5393a91bb2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/git/status_snapshot.lua"
+sha256 = "99cee4dff23f86c261ca6ce5337d1bbc88b5b98f0462ff3950ab7c5393a91bb2"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/harness/backend_preference.lua"
+baseline_blob = "22619d1c80974f487a2cbcd79d486d5fda20175c"
+baseline_sha256 = "65122432cd4c9e0f1524439b50674159ae8d89621d98a6f0f9720c094c43f0e6"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/harness/backend_preference.lua"
+sha256 = "65122432cd4c9e0f1524439b50674159ae8d89621d98a6f0f9720c094c43f0e6"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/harness/backends/codex.lua"
+baseline_blob = "717ed2bc5d594aac194f296dd09360686ed56704"
+baseline_sha256 = "6fe59a120b543bb30d4c2d9d52f73cca63a1fe6cbb1ca5e15e617812746e2c21"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/harness/backends/codex.lua"
+sha256 = "6fe59a120b543bb30d4c2d9d52f73cca63a1fe6cbb1ca5e15e617812746e2c21"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/harness/backends/copilot.lua"
+baseline_blob = "40098406d011107100275df972a87dbcd38effb1"
+baseline_sha256 = "8a6382e31b3401bb360de1c7058f82f43da500afe40f3ec7ccae7d7a72417998"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/harness/backends/copilot.lua"
+sha256 = "8a6382e31b3401bb360de1c7058f82f43da500afe40f3ec7ccae7d7a72417998"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/harness/backends/mock.lua"
+baseline_blob = "65e4984cceb670b985fad2e8eed251117509fec8"
+baseline_sha256 = "59fd17f498b3312724dd90acc69784d0e0b66b01414b8168c592185b903b8983"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/harness/backends/mock.lua"
+sha256 = "59fd17f498b3312724dd90acc69784d0e0b66b01414b8168c592185b903b8983"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/harness/builder.lua"
+baseline_blob = "8a3cba7306b1667f03cc91ed846b74a9a0ad51a3"
+baseline_sha256 = "dfe82c9913fbf9b2dcc84f4f6be9f751210e712ebb0c5578bafed01365e226e1"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/builder.lua"
+sha256 = "dfe82c9913fbf9b2dcc84f4f6be9f751210e712ebb0c5578bafed01365e226e1"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/harness/client.lua"
+baseline_blob = "ebfef0b8eb07916dcccd03fd1398e170af7fc8d5"
+baseline_sha256 = "aa661d8319cf2a989a53586fe9d42bb76001a6af8d7cc807bd2f3340cdeb1671"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/client.lua"
+sha256 = "aa661d8319cf2a989a53586fe9d42bb76001a6af8d7cc807bd2f3340cdeb1671"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/harness/protocol.lua"
+baseline_blob = "6abfe3a49a681ef477c3a3f2bcdb0b80de27a42f"
+baseline_sha256 = "6ada4843897f3f04af4e50d2b1e9b99a998171544ad707d19128afd50da603c7"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/protocol.lua"
+sha256 = "6ada4843897f3f04af4e50d2b1e9b99a998171544ad707d19128afd50da603c7"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/choice_popup.lua"
+baseline_blob = "2842b8e7d74d6b845b87a0eea19c610359ec789c"
+baseline_sha256 = "c96a2a415d727218dd48c50de248cb130c77c5374b994b8a349d0b994b709c8c"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/choice_popup.lua"
+sha256 = "c96a2a415d727218dd48c50de248cb130c77c5374b994b8a349d0b994b709c8c"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/config.lua"
+baseline_blob = "76db2dbb772b67df17bb116165db49c3a81c71e1"
+baseline_sha256 = "9143c4ebd53d023172e45180a930a7af577da7805860b176c99e947b891ddd53"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/config.lua"
+sha256 = "9143c4ebd53d023172e45180a930a7af577da7805860b176c99e947b891ddd53"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/highlights.lua"
+baseline_blob = "03dfca9d10498004b23419fd3156e2d376fa6714"
+baseline_sha256 = "03656ad07b7c2b38d7cca2b0058075460af542f3ac0341be26c8f54066d022fb"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/highlights.lua"
+sha256 = "03656ad07b7c2b38d7cca2b0058075460af542f3ac0341be26c8f54066d022fb"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/inventory.lua"
+baseline_blob = "080bbe260760726eb7c6bddc08da58d1db5ab542"
+baseline_sha256 = "6c4c92d9c70ae708e00b462466806cc61ec5c9cd030be30f6ecb9057348c63f4"
+capture_provenance = "baseline_bytes"
+destination = "nvim/rust/forge/crates/forge-review/src/inventory.rs"
+sha256 = "6c4c92d9c70ae708e00b462466806cc61ec5c9cd030be30f6ecb9057348c63f4"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/notifications.lua"
+baseline_blob = "147532a3c16649151fb98bfdfbf111e3a75e69a9"
+baseline_sha256 = "21daca63738e6e7b33bc62bcd41838706773bcf8bebc16fd2e77736f0798b688"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/notifications.lua"
+sha256 = "21daca63738e6e7b33bc62bcd41838706773bcf8bebc16fd2e77736f0798b688"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/paths.lua"
+baseline_blob = "23fe5f5bf82451a4361740fd24137e1eddf70f49"
+baseline_sha256 = "5b22af40ad0d6a05eb709b4bfd4ff88b3a56bd2f91b9fd663d2393f4df8afb11"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/paths.lua"
+sha256 = "5b22af40ad0d6a05eb709b4bfd4ff88b3a56bd2f91b9fd663d2393f4df8afb11"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/perf.lua"
+baseline_blob = "3adc09564352e3c000834e8d0a4b243e8684e662"
+baseline_sha256 = "3a69367c2e76b7b388079943461fbf90e3f24a74fe512156ddfc99de73c75459"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/perf.lua"
+sha256 = "3a69367c2e76b7b388079943461fbf90e3f24a74fe512156ddfc99de73c75459"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/perf_trace.lua"
+baseline_blob = "99ea946b7eb1dd4b7e3f34d99cd7d09979f9efbc"
+baseline_sha256 = "e2bd2cf5db874d8608348bd6b570eef815ce958c8b6a6de9c047ff8fbabd77b6"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/perf_trace.lua"
+sha256 = "e2bd2cf5db874d8608348bd6b570eef815ce958c8b6a6de9c047ff8fbabd77b6"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/popup_window.lua"
+baseline_blob = "ec8bac7aa4c0896d209ef31cd7614ea6f68cf67c"
+baseline_sha256 = "f68eaaa27a0b75168845b609c13a93dfed0a300832b746db938d11869c970100"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/popup_window.lua"
+sha256 = "f68eaaa27a0b75168845b609c13a93dfed0a300832b746db938d11869c970100"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/ui.lua"
+baseline_blob = "7203302ddeb915a86287476320fbc2e306aeb18c"
+baseline_sha256 = "2f651beabfd26f560cbe4feec07dd25af907bc590fe80c98669cd8b7b38e9dbc"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/ui.lua"
+sha256 = "2f651beabfd26f560cbe4feec07dd25af907bc590fe80c98669cd8b7b38e9dbc"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/infra/util.lua"
+baseline_blob = "1f2095f22a5841e4fd2797245a76eb5376fc0705"
+baseline_sha256 = "bc146e31f39a2360024c6fbcbe46be48865a80b30ce984f1b52d49a371b6c18e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/infra/util.lua"
+sha256 = "bc146e31f39a2360024c6fbcbe46be48865a80b30ce984f1b52d49a371b6c18e"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/init.lua"
+baseline_blob = "543eb921938ea209127dc97a17453c3528ac1866"
+baseline_sha256 = "9a7a6e012947647e46ef8d8bd81eafe68e55117034ea4f87833398e93f2cba43"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/init.lua"
+sha256 = "9a7a6e012947647e46ef8d8bd81eafe68e55117034ea4f87833398e93f2cba43"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/integrations/ai_commit.lua"
+baseline_blob = "c8ca407d79c797f7054301f85d4f82963546252b"
+baseline_sha256 = "b9cdd646ba7bde901f2d2d77e7883af5c34f069521153ffea44f7be6aecc5b78"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/integrations/ai_commit.lua"
+sha256 = "b9cdd646ba7bde901f2d2d77e7883af5c34f069521153ffea44f7be6aecc5b78"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/integrations/commit.lua"
+baseline_blob = "98ea5f656ea3a19fe82de3ea8da54dbd62e3c7ab"
+baseline_sha256 = "e155a7ee0412bc86d92c4f363eddd2707ee7ae2975bc584841b0e5f84dd05901"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/integrations/commit.lua"
+sha256 = "b6b9212d4489e93e6ed1e62225d4b1a4679a6fad53896eb0bac242d5b432a844"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/integrations/conventional_commit.lua"
+baseline_blob = "3f4a452f65c734c489b28efc32a808d08a1900a1"
+baseline_sha256 = "29074351a648f1484e183b3b1cd4f24dfd722d579743b2cd09761c0dc5e13ddd"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/integrations/conventional_commit.lua"
+sha256 = "29074351a648f1484e183b3b1cd4f24dfd722d579743b2cd09761c0dc5e13ddd"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/integrations/datetime.lua"
+baseline_blob = "19239d2f908697b49971acd483c2dcd87a012939"
+baseline_sha256 = "d9dc6810661cc730b12346021c54ed4975a29248985babdc0f9be982b7624ab0"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/integrations/datetime.lua"
+sha256 = "d9dc6810661cc730b12346021c54ed4975a29248985babdc0f9be982b7624ab0"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/integrations/gh.lua"
+baseline_blob = "2b6556305e8ae0579586260454d641e569eaf163"
+baseline_sha256 = "bf88c5366faca33dc40a0a5d5b55eb25d8f532749fbf5b79ee13315adb2d91e9"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/integrations/gh.lua"
+sha256 = "bf88c5366faca33dc40a0a5d5b55eb25d8f532749fbf5b79ee13315adb2d91e9"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/queries/javascript/diff_context.scm"
+baseline_blob = "4aa460a09dfc56cec195b20f4814da7a9e2b69ee"
+baseline_sha256 = "b5e3d4922e85fd04ef83980c33b6b04125abc9f7e69b1a3c3b218aa201142833"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/queries/javascript/diff_context.scm"
+sha256 = "c9dfbf3a94b9fb0ef5556d665529b8698b2d2009f977f08aa17b55f8f7c73874"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/queries/python/diff_context.scm"
+baseline_blob = "537b3a82256c6c16decf275221e15df7eb567ccc"
+baseline_sha256 = "c65f37d9be528db42339efe65a2f80f803e67fe35f79f497e3e8e2c089548561"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/queries/python/diff_context.scm"
+sha256 = "6be04f5e7a8f215c32b3aca557de3fc6b1988c636a2a0902a4f090302b96f1aa"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/queries/rust/diff_context.scm"
+baseline_blob = "6a15b5206ee45a7421a3377cc2c96f586a9f708d"
+baseline_sha256 = "bab195104d5b1f036049e6cf53162eaf017431be7147c05c55f50b4703989642"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/queries/rust/diff_context.scm"
+sha256 = "aa7a627e2663d20d58e968092257f2f59e8868c3d3424130569919c99671acc1"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/queries/rust/diff_inventory.scm"
+baseline_blob = "d5d2a40cd9e5ad66c0a944c97381c420571dbd4b"
+baseline_sha256 = "d30a285ac8d22c4b5ce1c7a27d3c721612291aee46a63df22ba45f934e00b43d"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/queries/rust/diff_inventory.scm"
+sha256 = "e0fc08950170088a85803ff0e4c4a6675b9ae0abbabf497c006429b28ce6c71c"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/queries/slang/diff_context.scm"
+baseline_blob = "76b9f313dcee6e9cdcf7f3841d88d5873370d571"
+baseline_sha256 = "ca9c2a4f36941eb1f686a16c035c0c92395f362c9798933241c1e297ea4ab6c8"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/queries/slang/diff_context.scm"
+sha256 = "93246c5c1fea6ab69c7775f7c780b265de2d58af87ebad968b34279846511d9a"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/queries/tsx/diff_context.scm"
+baseline_blob = "33fb7a54bec9d984ed710028e8ba44813ac2c39b"
+baseline_sha256 = "215d03feb8e1fd090f994f884087f38b3e76462205e24855ec7b7ce0ea58e3cc"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/queries/tsx/diff_context.scm"
+sha256 = "7f9696bef9afd12cc4bc39526a94e82c4b725661d21f3a15dedc435e3c38f2c2"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/queries/tsx/diff_inventory.scm"
+baseline_blob = "c8b445e9b66729cb3a49a29e651fa2035d560b62"
+baseline_sha256 = "4e5822111328a39084deec42f6c06b24efc0fe4a71a797e020bb360b983dddb9"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/queries/tsx/diff_inventory.scm"
+sha256 = "ed21906b7dd1cbd8d95fc45977c2b03df0bae4f72db79d713d81195fff42f768"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/queries/typescript/diff_context.scm"
+baseline_blob = "33fb7a54bec9d984ed710028e8ba44813ac2c39b"
+baseline_sha256 = "215d03feb8e1fd090f994f884087f38b3e76462205e24855ec7b7ce0ea58e3cc"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/queries/typescript/diff_context.scm"
+sha256 = "7f9696bef9afd12cc4bc39526a94e82c4b725661d21f3a15dedc435e3c38f2c2"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/queries/typescript/diff_inventory.scm"
+baseline_blob = "c8b445e9b66729cb3a49a29e651fa2035d560b62"
+baseline_sha256 = "4e5822111328a39084deec42f6c06b24efc0fe4a71a797e020bb360b983dddb9"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/queries/typescript/diff_inventory.scm"
+sha256 = "ed21906b7dd1cbd8d95fc45977c2b03df0bae4f72db79d713d81195fff42f768"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/query_runtime.lua"
+baseline_blob = "dfa6268aa30cdf15c18339215554f898cd2023d6"
+baseline_sha256 = "b27d88c81e7aa652f9f6ac89d0ddad6ffd0cb34efb5d4a8ef14c9e2e834f6411"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/query_runtime.lua"
+sha256 = "b27d88c81e7aa652f9f6ac89d0ddad6ffd0cb34efb5d4a8ef14c9e2e834f6411"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/annotations.lua"
+baseline_blob = "d97c1ef5ee6be676bbae3dcf27f2ddddbd44323e"
+baseline_sha256 = "5850c84fa067171c52cf3caaa51bcda708192726f97f23c88efe0b49a56be126"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/annotations.lua"
+sha256 = "5850c84fa067171c52cf3caaa51bcda708192726f97f23c88efe0b49a56be126"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/comment_box.lua"
+baseline_blob = "2162e9f64f5f335bb8ee7ec8f8208f6e720ad257"
+baseline_sha256 = "f7386478efb077f829949ac376837972be209bc1a4a49bc6518309f82be30868"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/comment_box.lua"
+sha256 = "f7386478efb077f829949ac376837972be209bc1a4a49bc6518309f82be30868"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/comment_editor.lua"
+baseline_blob = "732c80e0a014b3aeb88ea1e01862c4f64025a6cf"
+baseline_sha256 = "d9eeae1a197de74d7ef2a7b16e2edc2df0f842cc92af236fe72de34816cf1ad0"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/comment_editor.lua"
+sha256 = "d9eeae1a197de74d7ef2a7b16e2edc2df0f842cc92af236fe72de34816cf1ad0"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/decoration.lua"
+baseline_blob = "764060c7b110d6b907b6d69a993c000016d6252d"
+baseline_sha256 = "394c5c5d53aa7fe113ea85930617641654023cbea35ef6fc0d4e409a0d6dd014"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/decoration.lua"
+sha256 = "394c5c5d53aa7fe113ea85930617641654023cbea35ef6fc0d4e409a0d6dd014"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/diff_component.lua"
+baseline_blob = "0c061ebe5cf9d6a2bbfb48efb87151f8e37bafe8"
+baseline_sha256 = "9f77fb77598a877451a41cfd2f8d9623dac996bfeabad5554b8e83056107cf0b"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/diff_component.lua"
+sha256 = "9f77fb77598a877451a41cfd2f8d9623dac996bfeabad5554b8e83056107cf0b"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/diff_parse.lua"
+baseline_blob = "8b6fcb420f5873ff025da0bb3bf4ee8f2436c40e"
+baseline_sha256 = "505c5053106e3831810a5dc4be283dd882acfb2296b9227140e1dfc7f3552024"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/diff_parse.lua"
+sha256 = "505c5053106e3831810a5dc4be283dd882acfb2296b9227140e1dfc7f3552024"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/diff_render.lua"
+baseline_blob = "c52f979067d0c818db49e9391fe107c1d7bc2ffa"
+baseline_sha256 = "87b437243d81eda6bc9a955ffef398db498f3e9fd873ef3302a6fae0a23a8d9c"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/diff_render.lua"
+sha256 = "87b437243d81eda6bc9a955ffef398db498f3e9fd873ef3302a6fae0a23a8d9c"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/diff_tree.lua"
+baseline_blob = "4e98809ed3e29b6663a4493f4aada9a754e6fd76"
+baseline_sha256 = "7a270a1d9ab7366ea036a30cb70e34a94c238d1fd79dc202ed9677fd8f21ac1a"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/diff_tree.lua"
+sha256 = "7a270a1d9ab7366ea036a30cb70e34a94c238d1fd79dc202ed9677fd8f21ac1a"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/display_text.lua"
+baseline_blob = "4cc5c6d215c7b3b6f3de1ee5e8968658004c449a"
+baseline_sha256 = "d9d7a133af241662e05647ece211e38208dca8baa619ca3419fa00adecdbdf36"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/display_text.lua"
+sha256 = "d9d7a133af241662e05647ece211e38208dca8baa619ca3419fa00adecdbdf36"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/fold_presentation.lua"
+baseline_blob = "421945efda616b30c9e70db9a74d9d487b115394"
+baseline_sha256 = "5a1c2a3b7f7056b721ea139b6f1e654f457df0883010cf2e03e31f0f84d145b9"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/fold_presentation.lua"
+sha256 = "5a1c2a3b7f7056b721ea139b6f1e654f457df0883010cf2e03e31f0f84d145b9"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/agent_event.lua"
+baseline_blob = "888e8e794bfbc1f59b4a90f901f0a02580847cb7"
+baseline_sha256 = "89fdd453828ea5a9020c954eaf6b9d1d53957f2d6c228e1baefb2ff7de28c64c"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/agent_event.lua"
+sha256 = "89fdd453828ea5a9020c954eaf6b9d1d53957f2d6c228e1baefb2ff7de28c64c"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/agent_summary.lua"
+baseline_blob = "2a1a2fe56d1802b9eccb522382a833763fc7e90a"
+baseline_sha256 = "2ed8bb5653822cc8ddca0e3c08e5ed74c3112fdfdff903ea4f3d0cef5c95e0a0"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/agent_summary.lua"
+sha256 = "2ed8bb5653822cc8ddca0e3c08e5ed74c3112fdfdff903ea4f3d0cef5c95e0a0"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/interaction_tree.lua"
+baseline_blob = "7fa475810d64d81bce4918218e651b79c6ad59df"
+baseline_sha256 = "76fd889ec221662b2917983cced37ada87cc542ef9424ef41aa6877646312cc5"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/interaction_tree.lua"
+sha256 = "76fd889ec221662b2917983cced37ada87cc542ef9424ef41aa6877646312cc5"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/markdown.lua"
+baseline_blob = "9ed5b67afb49bfd6e259a7f6056ceed1c48ef59c"
+baseline_sha256 = "fc4b3d7aea5d5341926382a01d00a87917dd2ae7bc7bb33dd252f4c81826abae"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/markdown.lua"
+sha256 = "fc4b3d7aea5d5341926382a01d00a87917dd2ae7bc7bb33dd252f4c81826abae"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/markdown_text.lua"
+baseline_blob = "298be7242161f77b2f64693258a36898c0ee158d"
+baseline_sha256 = "99c6a45b88f78416c670fc569225292c7c119d7d7032566ad18ee39e9f2ed57b"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/markdown_text.lua"
+sha256 = "99c6a45b88f78416c670fc569225292c7c119d7d7032566ad18ee39e9f2ed57b"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/plan_event.lua"
+baseline_blob = "4865127f454331f5ad245f0c31f2016210fba2e8"
+baseline_sha256 = "ed0085001589feaf5ce9463d5400aff5c2c50ceee15efb86be94c7b7e7e9575e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/plan_event.lua"
+sha256 = "ed0085001589feaf5ce9463d5400aff5c2c50ceee15efb86be94c7b7e7e9575e"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/plan_execution.lua"
+baseline_blob = "c7f490c615358001d2b1c4e2a4e516f626fcb174"
+baseline_sha256 = "1eb6b841f284c6efb60b637a006222abc06442b42e7c46ea0c2e8e0dade237fd"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/plan_execution.lua"
+sha256 = "1eb6b841f284c6efb60b637a006222abc06442b42e7c46ea0c2e8e0dade237fd"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/plan_resolution.lua"
+baseline_blob = "ce67f3d7aab06dc8e1c60401853f923d0247b900"
+baseline_sha256 = "8d2511088ad241e9529b8ca070d23b2b43cfde447bc2177ce8d54a58d30c3648"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/plan_resolution.lua"
+sha256 = "8d2511088ad241e9529b8ca070d23b2b43cfde447bc2177ce8d54a58d30c3648"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/queue.lua"
+baseline_blob = "b80dc7dd11e41f470add3df6beec092a2345e1b2"
+baseline_sha256 = "37d0db6880b7a8ebd21577cad119e735a2dc1a38e6b97f609028d6d80f5953d4"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/queue.lua"
+sha256 = "37d0db6880b7a8ebd21577cad119e735a2dc1a38e6b97f609028d6d80f5953d4"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/task_tree.lua"
+baseline_blob = "b2e439f0b39483007bbe44faa480e72e98a1efd6"
+baseline_sha256 = "09cc5c7a53e79e158b12be4f094051538b1d82dbe9ff86a804f710c998f57c8f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/task_tree.lua"
+sha256 = "09cc5c7a53e79e158b12be4f094051538b1d82dbe9ff86a804f710c998f57c8f"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/timeline_status.lua"
+baseline_blob = "b27f08edc5ee4ab56bf7d63b694769a01d87e138"
+baseline_sha256 = "a732f272adf1cd3d9e5659dab51eb7f1d05b0800dc21633fe4e211664f5ea4fe"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/timeline_status.lua"
+sha256 = "a732f272adf1cd3d9e5659dab51eb7f1d05b0800dc21633fe4e211664f5ea4fe"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/tool.lua"
+baseline_blob = "d4c9f809ceba018dad121e993dcc4eb54d2132b9"
+baseline_sha256 = "f54d857470cc5aed0229e27bf68df77ed3d2265063f7705e78ccd94c4ab5189e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/tool.lua"
+sha256 = "f54d857470cc5aed0229e27bf68df77ed3d2265063f7705e78ccd94c4ab5189e"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/harness/transaction.lua"
+baseline_blob = "748722a62235dceaf3459b6fa096ef5d0b260b67"
+baseline_sha256 = "b9944a6fa5e9f56846bebf6bf02b023a324a8151ffa36f2527f3057165e06611"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/harness/transaction.lua"
+sha256 = "b9944a6fa5e9f56846bebf6bf02b023a324a8151ffa36f2527f3057165e06611"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/hunk_index.lua"
+baseline_blob = "1ff5cca5319d50c41153d1c6474444963c232df5"
+baseline_sha256 = "d4659f851860b203d0f2a674d03ad97230c7009246ea46162a74cc7a8bdfbab4"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/hunk_index.lua"
+sha256 = "d4659f851860b203d0f2a674d03ad97230c7009246ea46162a74cc7a8bdfbab4"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/hunk_model.lua"
+baseline_blob = "ce79a4aed43af18a036fa4524c73b953b885f601"
+baseline_sha256 = "457c98805cf1a86d12c124f88ee88b31a92487a075d2c4273621071ee0f61b7b"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/hunk_model.lua"
+sha256 = "457c98805cf1a86d12c124f88ee88b31a92487a075d2c4273621071ee0f61b7b"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/intraline_diff.lua"
+baseline_blob = "b61c97d328021efcd54e0ef79faeaf30e1801b30"
+baseline_sha256 = "068709478e10fe64ad8383ff0cec1045c4fd8223ce736a78d0efdef136623a8e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/intraline_diff.lua"
+sha256 = "068709478e10fe64ad8383ff0cec1045c4fd8223ce736a78d0efdef136623a8e"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/layout.lua"
+baseline_blob = "35a74372ff1c4a198e12455a671e2e58de000455"
+baseline_sha256 = "d20de9db321c6f4980384080b7d419a3403cc365c4966119dda396f760263701"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/layout.lua"
+sha256 = "d20de9db321c6f4980384080b7d419a3403cc365c4966119dda396f760263701"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/region.lua"
+baseline_blob = "3ad9653df7fdbb6312cab785b899e31565150800"
+baseline_sha256 = "802d832185a40a5fe6d10c7268d75d1e066102626f37affccdc5564967ee2719"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/region.lua"
+sha256 = "802d832185a40a5fe6d10c7268d75d1e066102626f37affccdc5564967ee2719"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/row_emitter.lua"
+baseline_blob = "6fb704d2ba8d4bc465727f288d340efe0803177c"
+baseline_sha256 = "e330d0722b51996b92f77733c8f2c2635ace4573bdfe9e5f45ebc73ab61f1365"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/row_emitter.lua"
+sha256 = "e330d0722b51996b92f77733c8f2c2635ace4573bdfe9e5f45ebc73ab61f1365"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/row_tree.lua"
+baseline_blob = "4cf02e8e2e4c229a2fef76fdcbf1e7483d47b6a9"
+baseline_sha256 = "32d442242f912c8fb14dfceaebb7ffe5b26581333c3097fe6d10ea4d58992e08"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/row_tree.lua"
+sha256 = "32d442242f912c8fb14dfceaebb7ffe5b26581333c3097fe6d10ea4d58992e08"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/source.lua"
+baseline_blob = "aae67db611e17869781a9325384667cd01b197a5"
+baseline_sha256 = "f76bcc1e24ca91cdde982e69de3982e258dc1e47ea805f579d59c83b66d6a5f1"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/source.lua"
+sha256 = "f76bcc1e24ca91cdde982e69de3982e258dc1e47ea805f579d59c83b66d6a5f1"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/source_loader.lua"
+baseline_blob = "547dce467af3103d86753c4c6e990d8100c4e7a0"
+baseline_sha256 = "613bbe767a25a369298af44ac2cac81dd020266fa191cca2e09fc806dc4c02be"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/source_loader.lua"
+sha256 = "613bbe767a25a369298af44ac2cac81dd020266fa191cca2e09fc806dc4c02be"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/syntax_context.lua"
+baseline_blob = "3e1b5424e40160118dbd7bc0cb95fe39a1f9d572"
+baseline_sha256 = "4d94aa0fdbb11a8c2fe7ea57c1c02ccdd49def5405db3e4c02c195e5bfe43ff2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/syntax_context.lua"
+sha256 = "4d94aa0fdbb11a8c2fe7ea57c1c02ccdd49def5405db3e4c02c195e5bfe43ff2"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/syntax_engine.lua"
+baseline_blob = "97ebd3e9d19ae08dca29adfa4f2f0b308f444636"
+baseline_sha256 = "f5f951f7cca6fa805e16dadc25e5c1fc4a44c461d3d8d028a3f047d147485e5c"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/syntax_engine.lua"
+sha256 = "f5f951f7cca6fa805e16dadc25e5c1fc4a44c461d3d8d028a3f047d147485e5c"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/task_tree.lua"
+baseline_blob = "ef50a8dfb9023cbf8a5015d1ac9843fa76f55dca"
+baseline_sha256 = "bbee0ac6d71954865668cba2f9fd670e8e1f445d46b724d555dafeb5e3209302"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/task_tree.lua"
+sha256 = "bbee0ac6d71954865668cba2f9fd670e8e1f445d46b724d555dafeb5e3209302"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/task_tree_style.lua"
+baseline_blob = "a8baa494f883312e72f6ab14ba8b6f420550b7ef"
+baseline_sha256 = "a83887089e17aaac5a87540f9bb494808937b3dffd34270008b6fd4fae29a523"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/task_tree_style.lua"
+sha256 = "a83887089e17aaac5a87540f9bb494808937b3dffd34270008b6fd4fae29a523"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/render/text_snapshot.lua"
+baseline_blob = "757c81e90240b625f601eb930192d0ec5e5b5a87"
+baseline_sha256 = "11a4ffc306b792ec004e017266217a9f6df29ebbcf6b3bc5577a133bc2d3070f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/render/text_snapshot.lua"
+sha256 = "11a4ffc306b792ec004e017266217a9f6df29ebbcf6b3bc5577a133bc2d3070f"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/session.lua"
+baseline_blob = "fb8dee18698b427d45a6ed5a61351450664ae932"
+baseline_sha256 = "09d5900bbf02029c1531cf5a76057519f017b792024748eab5c50fa56065858d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/session.lua"
+sha256 = "09d5900bbf02029c1531cf5a76057519f017b792024748eab5c50fa56065858d"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/shared/command_specs.lua"
+baseline_blob = "1d4aa5d7ff497120032598d75a99fb6f074ed061"
+baseline_sha256 = "88a5efd14e9581337d14e25dc5f9b21dcd73b341dca5a9599e0cbb87f83ce89f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/shared/command_specs.lua"
+sha256 = "88a5efd14e9581337d14e25dc5f9b21dcd73b341dca5a9599e0cbb87f83ce89f"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/shared/input_gutter.lua"
+baseline_blob = "9e1bbc483f5d5a345c005457f16246c1f2a90671"
+baseline_sha256 = "965d5db1136938a21412efdc5841c9cf77a9234545a29800027ca5030da00fc9"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/shared/input_gutter.lua"
+sha256 = "965d5db1136938a21412efdc5841c9cf77a9234545a29800027ca5030da00fc9"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/shared/keymaps.lua"
+baseline_blob = "3ff89a4478c8043a432fcdbdc7e884bc7b572db2"
+baseline_sha256 = "d5e0868aa089e406b1c27cb044ca00a3d6c732cd648ea9ac75986cb1ebd354b7"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/shared/keymaps.lua"
+sha256 = "d5e0868aa089e406b1c27cb044ca00a3d6c732cd648ea9ac75986cb1ebd354b7"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/shared/view_command_set.lua"
+baseline_blob = "04f32f76b32336d5f3066bfae074fbb187a6e6cf"
+baseline_sha256 = "5a623d36dba705d258de0f6a9141fb17f089e666e829d5dfb6353ad66ff21b0d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/shared/view_command_set.lua"
+sha256 = "5a623d36dba705d258de0f6a9141fb17f089e666e829d5dfb6353ad66ff21b0d"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/shared/view_controller.lua"
+baseline_blob = "080ed77ca4e6b3db2d52d0663e135eba7ec11e02"
+baseline_sha256 = "7e093e153281dbdb3b817ee1e1ced0bd12c3b962d527d6d1e97cca91a331df61"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/shared/view_controller.lua"
+sha256 = "7e093e153281dbdb3b817ee1e1ced0bd12c3b962d527d6d1e97cca91a331df61"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/types.lua"
+baseline_blob = "80fc63e59203e167db3643c5b171663dec24b4d6"
+baseline_sha256 = "613b8d3f11343e806e1db245a5f530cdb1dc4a87c33c0598c4b5b21c0777b4d9"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/types.lua"
+sha256 = "613b8d3f11343e806e1db245a5f530cdb1dc4a87c33c0598c4b5b21c0777b4d9"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/branch_diff.lua"
+baseline_blob = "34d31dc59f8b8f5714b77c75495bea92ab8bb4e1"
+baseline_sha256 = "9d8088f0944a6217452b874045bb0fbe10513e95d9468af9f9dd2b2cd26d2b36"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/commands.lua"
+sha256 = "9d8088f0944a6217452b874045bb0fbe10513e95d9468af9f9dd2b2cd26d2b36"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/commands.lua"
+baseline_blob = "1fdbf1092b33d30ed07e73e2677275b00b6b4127"
+baseline_sha256 = "4a1b2166ebb57bf511f04676607f85594cc08d74de76c959a7a4bc772322a496"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/commands.lua"
+sha256 = "4a1b2166ebb57bf511f04676607f85594cc08d74de76c959a7a4bc772322a496"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/diff_buffer.lua"
+baseline_blob = "9afd107a87bc5904e7e5b929d89d1d75fef3c464"
+baseline_sha256 = "9a793ecb0712c318cfe2cf8894a2c885a8a2412582a53e63b567bf02b1f36df0"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/diff_buffer.lua"
+sha256 = "9a793ecb0712c318cfe2cf8894a2c885a8a2412582a53e63b567bf02b1f36df0"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/file_revision.lua"
+baseline_blob = "f468b6e654e308e42fbe455ec83e64b9bec15713"
+baseline_sha256 = "df4a62cf34a1fc353bc3461500367b0af49642d24cf6db7f35082f817b286810"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/file_revision.lua"
+sha256 = "df4a62cf34a1fc353bc3461500367b0af49642d24cf6db7f35082f817b286810"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/agent_catalog.lua"
+baseline_blob = "8a5117078f3ef5014fe6428bc9ab39d7e9766fbe"
+baseline_sha256 = "616a280084ded26ae19d366ce99075799cc720fd17fa69512af28089239795c9"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/agent_catalog.lua"
+sha256 = "616a280084ded26ae19d366ce99075799cc720fd17fa69512af28089239795c9"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/agent_picker.lua"
+baseline_blob = "1a62a7132bfaef2488f0191db8e8a1a9a4d525c8"
+baseline_sha256 = "e5d670d24b948aec3fa37aa640f831f0bc140706d1ec3e304cff88033f104026"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/agent_picker.lua"
+sha256 = "e5d670d24b948aec3fa37aa640f831f0bc140706d1ec3e304cff88033f104026"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/approval.lua"
+baseline_blob = "d2906706922c3e1820af95dc45e2ccdb686f159d"
+baseline_sha256 = "14a84e719f859d01fa149e9e4b0c978638602616be3cf744060748ac671bff44"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/approval.lua"
+sha256 = "14a84e719f859d01fa149e9e4b0c978638602616be3cf744060748ac671bff44"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/completion/command_source.lua"
+baseline_blob = "f229a9cc00955dc991da5eab8868b75b429eeff5"
+baseline_sha256 = "21cd623df9ce982e9b2ebcbf342838f38750518c715c0ac43a72136c7910da7f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/completion/command_source.lua"
+sha256 = "21cd623df9ce982e9b2ebcbf342838f38750518c715c0ac43a72136c7910da7f"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/completion/file_source.lua"
+baseline_blob = "9b6ad74d4fde475ac5344f04c671b3bde84b0758"
+baseline_sha256 = "795b49266c5dd18313fb517ffa5669f63848afb02f41cb1e148d11952ac68bc4"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/completion/file_source.lua"
+sha256 = "795b49266c5dd18313fb517ffa5669f63848afb02f41cb1e148d11952ac68bc4"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/context_status.lua"
+baseline_blob = "5ff365aa516a5d3d90fcf30b9d89a9b373d896c8"
+baseline_sha256 = "7d6f24e11e19f0ce88521306e0e1304ca3c38c21fd49a7e7fca2f14ec601f0c2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/context_status.lua"
+sha256 = "7d6f24e11e19f0ce88521306e0e1304ca3c38c21fd49a7e7fca2f14ec601f0c2"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/controller.lua"
+baseline_blob = "ca0f040c84c0b5352df008b381463ebd2248b145"
+baseline_sha256 = "6e3a5524bf27430d64a672dbdba3d7a61e4d04e7ba3a7c4f195e531b802f7df1"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/controller.lua"
+sha256 = "6e3a5524bf27430d64a672dbdba3d7a61e4d04e7ba3a7c4f195e531b802f7df1"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/init.lua"
+baseline_blob = "9cceb9d5369b71e129726caa124bfa44b27c5016"
+baseline_sha256 = "6ad6963803f7427d07cf89a285a81af3231fb5eef073e231a624028f629fd1cb"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/init.lua"
+sha256 = "6ad6963803f7427d07cf89a285a81af3231fb5eef073e231a624028f629fd1cb"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/layout.lua"
+baseline_blob = "10749850999e9c246943b588abd46081fe553c69"
+baseline_sha256 = "f3f1f4af5cda651dc4ee4ddcef06c119f1c4918553306192c2db52b2f7624914"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/layout.lua"
+sha256 = "f3f1f4af5cda651dc4ee4ddcef06c119f1c4918553306192c2db52b2f7624914"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/model_picker.lua"
+baseline_blob = "68572e393cfead2b47b9e409852d809799f98cd5"
+baseline_sha256 = "83d3b73237beb643072fd51ab085969347386d7c2d5fbe66de2875da9363710e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/model_picker.lua"
+sha256 = "83d3b73237beb643072fd51ab085969347386d7c2d5fbe66de2875da9363710e"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/plan_question/init.lua"
+baseline_blob = "48db2617cca19544ec71cdf1cfdc95e014fafa52"
+baseline_sha256 = "be49daea4a03e9ac4ab4f60b126b113fe74aba8d7ccd2f01ff479f1690848401"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/plan_question/init.lua"
+sha256 = "be49daea4a03e9ac4ab4f60b126b113fe74aba8d7ccd2f01ff479f1690848401"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/plan_question/model.lua"
+baseline_blob = "e851db51871fa3a0bd81961b217bd3b33af543ac"
+baseline_sha256 = "be3353e5c4dd6204f582258edea27a646394413c73e49809d55349cf7597b54e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/plan_question/model.lua"
+sha256 = "be3353e5c4dd6204f582258edea27a646394413c73e49809d55349cf7597b54e"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/prompt_history.lua"
+baseline_blob = "2c20e8ee8b0f47e4fcfeb8c2e299a87220961abe"
+baseline_sha256 = "144b5505246070f6e31095f713e4285c2ff1c5aadcf2f623503bdd0743019d4e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/prompt_history.lua"
+sha256 = "144b5505246070f6e31095f713e4285c2ff1c5aadcf2f623503bdd0743019d4e"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/provider_catalog.lua"
+baseline_blob = "0a0df4b6394114c5f498c070c739af09210132d0"
+baseline_sha256 = "09ef228723a09391418cf18f49263d95d1eb9101d63adcaf58b54a2495033080"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/provider_catalog.lua"
+sha256 = "09ef228723a09391418cf18f49263d95d1eb9101d63adcaf58b54a2495033080"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/provider_picker.lua"
+baseline_blob = "69772b2e08ed1b7966eba204cf8f4c1207c87c45"
+baseline_sha256 = "6c494c73b5f26885e7355a08e4937c67264e3158bc55f869b196ff5eadb2ff67"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/provider_picker.lua"
+sha256 = "6c494c73b5f26885e7355a08e4937c67264e3158bc55f869b196ff5eadb2ff67"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/question_presentation.lua"
+baseline_blob = "c46f2942031110e5d5f87e26cf48343cbd47264b"
+baseline_sha256 = "b38702e0d10abcf9e2cdb0edf42e395dcac6052fa3e52f91f3432451eb8f3664"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/question_presentation.lua"
+sha256 = "b38702e0d10abcf9e2cdb0edf42e395dcac6052fa3e52f91f3432451eb8f3664"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/session_navigation.lua"
+baseline_blob = "9d89fa943c148f2e44124221e366fce6418ba6e1"
+baseline_sha256 = "ea8cb0855c6493aa8aa7b2d0c8c508a3631097fd1640facbb205165eae1a2408"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/session_navigation.lua"
+sha256 = "ea8cb0855c6493aa8aa7b2d0c8c508a3631097fd1640facbb205165eae1a2408"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/session_picker.lua"
+baseline_blob = "5f4debac23d2ec518c67bb035a0b2d443a16b438"
+baseline_sha256 = "be316d6b718a25dda4c37cf8dbffeb6c898416ac313d870168e0205cdab97566"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/session_picker.lua"
+sha256 = "be316d6b718a25dda4c37cf8dbffeb6c898416ac313d870168e0205cdab97566"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/session_preview.lua"
+baseline_blob = "6be40ef3e5f0f7126c70762768e197262679b44d"
+baseline_sha256 = "edfcb4a9ef673cb38a3b1fe8cd45b31576349ed363ab32ce21905e7fc66f99a2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/session_preview.lua"
+sha256 = "edfcb4a9ef673cb38a3b1fe8cd45b31576349ed363ab32ce21905e7fc66f99a2"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/snapshot.lua"
+baseline_blob = "011ccb9aad35f8bb6a5b3b15ac7a36a0c28bf939"
+baseline_sha256 = "af27fff62fde4f81a4084adb7915e05e3051aa98d0a9173bbc57f78c247267fe"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/snapshot.lua"
+sha256 = "af27fff62fde4f81a4084adb7915e05e3051aa98d0a9173bbc57f78c247267fe"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/spawn_picker.lua"
+baseline_blob = "a9b708bcab5a9e2bb5adb54d6662de90f235b1dc"
+baseline_sha256 = "e548dd4b165380416b828e6f373d690b46785ea9388907cf581907a63f3d7459"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/spawn_picker.lua"
+sha256 = "e548dd4b165380416b828e6f373d690b46785ea9388907cf581907a63f3d7459"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/timeline_cache.lua"
+baseline_blob = "91749fbcf57e1659c70623f58903cd2789eb11ed"
+baseline_sha256 = "7f58fb7c26f6a09ca80ece4f1a2f61f185a1a868666c99a6749661c9988c2cdf"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/timeline_cache.lua"
+sha256 = "7f58fb7c26f6a09ca80ece4f1a2f61f185a1a868666c99a6749661c9988c2cdf"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/harness/timeline_status.lua"
+baseline_blob = "3acf14837e273c5c84c35aa99e3bd6eded4852e3"
+baseline_sha256 = "fcab6d4f3f1e383314a093a60227a86f50b7dec518e5a711debd18555d7903bf"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/harness/timeline_status.lua"
+sha256 = "fcab6d4f3f1e383314a093a60227a86f50b7dec518e5a711debd18555d7903bf"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/permissions.lua"
+baseline_blob = "5ed7969db8465f62fac3083415b3aa7be63cb60d"
+baseline_sha256 = "984a8ade9fb90096e8376f99d494db99190ae701b2d6a8719d2d3adee0ffd38d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/permissions.lua"
+sha256 = "984a8ade9fb90096e8376f99d494db99190ae701b2d6a8719d2d3adee0ffd38d"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/picker/filter.lua"
+baseline_blob = "9496961c834074e81cabfb69d5e550f1e5353cbe"
+baseline_sha256 = "cc6ad1f66127977d5c169627b702ae873ba16fe920125509613b8d89b47233b1"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/picker/filter.lua"
+sha256 = "cc6ad1f66127977d5c169627b702ae873ba16fe920125509613b8d89b47233b1"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/picker/init.lua"
+baseline_blob = "642edf56781bf4ed386070877779097ed90c636e"
+baseline_sha256 = "6e2f69b6683ba8859fd99bd23a8bb6fdbe6dedfced05401b83d8b88d11cc6695"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/picker/init.lua"
+sha256 = "6e2f69b6683ba8859fd99bd23a8bb6fdbe6dedfced05401b83d8b88d11cc6695"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/picker/input.lua"
+baseline_blob = "ad3477be88024b807fa2abe092b372e0ca31d178"
+baseline_sha256 = "d99b402f32506dd7c11f2066a10a49d66281f1b0cf989eb0a0300a324d605119"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/picker/input.lua"
+sha256 = "d99b402f32506dd7c11f2066a10a49d66281f1b0cf989eb0a0300a324d605119"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/picker/layout.lua"
+baseline_blob = "f81111d5eb3d508864375ac1581ccd44e123f97d"
+baseline_sha256 = "976978acbf71656012bf7e35116e02674285dd8fac680ba342c78c14aae444c7"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/picker/layout.lua"
+sha256 = "976978acbf71656012bf7e35116e02674285dd8fac680ba342c78c14aae444c7"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/picker/render.lua"
+baseline_blob = "c6fb05f7976c80cdf71fccfc8e9ab2bdac4db69f"
+baseline_sha256 = "670e823ecf16402b7d85a43f48f310da355af684de3114c4c638f788680f35db"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/picker/render.lua"
+sha256 = "670e823ecf16402b7d85a43f48f310da355af684de3114c4c638f788680f35db"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/picker/search_input.lua"
+baseline_blob = "a5ffd9f6c48d7434d19511c5f3d813d4f8e00278"
+baseline_sha256 = "6ca931b032a46d3f7f6095bdd7cec395beb5cb1b0e5b1898d66549924a86d76f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/picker/search_input.lua"
+sha256 = "6ca931b032a46d3f7f6095bdd7cec395beb5cb1b0e5b1898d66549924a86d76f"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/picker/state.lua"
+baseline_blob = "c5326bcefbee730e3228cf8ebe433c417602cadd"
+baseline_sha256 = "690ab41e1bba653d221e4141e9e47949926e8a5120d28f6500e8134f12b12fa6"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/picker/state.lua"
+sha256 = "690ab41e1bba653d221e4141e9e47949926e8a5120d28f6500e8134f12b12fa6"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/picker/window.lua"
+baseline_blob = "6fa80ea901d14afaf277880de0723d1e790d55fc"
+baseline_sha256 = "8ce49cc4628060b118c5309d5433ddb73b6f8db945ecd12c2417cb6b4fc6d6d1"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/picker/window.lua"
+sha256 = "8ce49cc4628060b118c5309d5433ddb73b6f8db945ecd12c2417cb6b4fc6d6d1"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/comment.lua"
+baseline_blob = "3b81c23ebbac9b3061125585a72cf25bc1370f26"
+baseline_sha256 = "755faae01d769203bee239211bd7d8a66c7f876c2b2a68547dd4af67c7a0471b"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/comment.lua"
+sha256 = "755faae01d769203bee239211bd7d8a66c7f876c2b2a68547dd4af67c7a0471b"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/dependency_browser.lua"
+baseline_blob = "5166d86df91505914966ca16116371ce3a016971"
+baseline_sha256 = "1b73b6a896b435766a69d80889c8ed9cad4d093b43637f23f78c235c09aa7c31"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/dependency_browser.lua"
+sha256 = "1b73b6a896b435766a69d80889c8ed9cad4d093b43637f23f78c235c09aa7c31"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/entity_info.lua"
+baseline_blob = "25177639e444bb738c0b292dbec69f45a7fdc663"
+baseline_sha256 = "cff11363df240f9033bc2dcadcc1ccb2ac3ccddbbc9e684627303a7d3203bd8a"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/entity_info.lua"
+sha256 = "cff11363df240f9033bc2dcadcc1ccb2ac3ccddbbc9e684627303a7d3203bd8a"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/entity_navigation.lua"
+baseline_blob = "c5287be6c6caebbee515a816074f0bcccc2e625b"
+baseline_sha256 = "77cab87748ffa4bb824691d7eb00a514c8088b00966589418001c24008f7a2e8"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/entity_navigation.lua"
+sha256 = "77cab87748ffa4bb824691d7eb00a514c8088b00966589418001c24008f7a2e8"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/entity_rename.lua"
+baseline_blob = "519275fec4ae826235ad3c9c545512bacf1e4c1a"
+baseline_sha256 = "406b6b9ce685a99a7147ef221323f1f5026446a50d40aff9cb6518b314067a3d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/entity_rename.lua"
+sha256 = "406b6b9ce685a99a7147ef221323f1f5026446a50d40aff9cb6518b314067a3d"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/fold.lua"
+baseline_blob = "3991052a15f6eb25c7b8b13c8fd2184ef10bdf44"
+baseline_sha256 = "fc4b1882f2bcc0852aae051e53598779bdce6a3ddc1524e7a446a4f9ff2c03b2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/fold.lua"
+sha256 = "fc4b1882f2bcc0852aae051e53598779bdce6a3ddc1524e7a446a4f9ff2c03b2"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/init.lua"
+baseline_blob = "2e945641dbfdcce3e993c87e5ff706dc90dd424a"
+baseline_sha256 = "425f99452c896bbd3decf7c77cb2b5f52b4937046077897cc175fd2d24919940"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/init.lua"
+sha256 = "425f99452c896bbd3decf7c77cb2b5f52b4937046077897cc175fd2d24919940"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/schema.lua"
+baseline_blob = "8fe15be72205f59ec7d325aca37a5313b95f6123"
+baseline_sha256 = "8aaffbe19589b71af1f3ff17bf1fd89560e93f45d2d13d2640ebdfbbfae5bd0a"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/schema.lua"
+sha256 = "8aaffbe19589b71af1f3ff17bf1fd89560e93f45d2d13d2640ebdfbbfae5bd0a"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/task_model.lua"
+baseline_blob = "b3a9544f34e16b39389db704d22f366e3c615540"
+baseline_sha256 = "37c8668a8fb42fe67b0b584ba154b6a114b3649be8e1332bd6fcb5d179ae1bd1"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/task_model.lua"
+sha256 = "37c8668a8fb42fe67b0b584ba154b6a114b3649be8e1332bd6fcb5d179ae1bd1"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/plan_review/uml_style.lua"
+baseline_blob = "c9bd091ebdac7e8c8b8d776398ce9634387f6973"
+baseline_sha256 = "1adca9c5ad2c80edf71c353490a29c97700b3156081690709b6211738e373c1e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/plan_review/uml_style.lua"
+sha256 = "1adca9c5ad2c80edf71c353490a29c97700b3156081690709b6211738e373c1e"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/pr/pr_edit.lua"
+baseline_blob = "4a0f20b76b808291deaba4dc552660f71c6d3b7c"
+baseline_sha256 = "73fab90a335f316ab61e9538a74e564a8ab89a90ffc7d6c0e482d43309bf36b1"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/review_document.lua"
+sha256 = "73fab90a335f316ab61e9538a74e564a8ab89a90ffc7d6c0e482d43309bf36b1"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/pr/pr_overview.lua"
+baseline_blob = "a26ebeccaa9bc702e3b23e63dc18fe257cb980a8"
+baseline_sha256 = "b841e46616c2bc8118eb846637a3435609796ea21713f7e3a3edac092c23182d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/review_document.lua"
+sha256 = "b841e46616c2bc8118eb846637a3435609796ea21713f7e3a3edac092c23182d"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/pr/pr_view.lua"
+baseline_blob = "548746cdec8e7ea7446bbb2df9a1c772392444b6"
+baseline_sha256 = "e13b6340e7b664d80d654e21491f13aadf464dd6a70b08efd6ac531e93e8eb47"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/review_document.lua"
+sha256 = "e13b6340e7b664d80d654e21491f13aadf464dd6a70b08efd6ac531e93e8eb47"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/pr/review.lua"
+baseline_blob = "0cfe2f42335e79edc001e643aa1471d13a759b49"
+baseline_sha256 = "75b389a44dcc546ae76678353ff4bfaee99c151dd059bb9f234003e215f9a36f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/review_document.lua"
+sha256 = "75b389a44dcc546ae76678353ff4bfaee99c151dd059bb9f234003e215f9a36f"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/pr/reviewer_source.lua"
+baseline_blob = "ec8b2a7fca143678aee7cb6b27c9283dc2c99321"
+baseline_sha256 = "5989f4d72fb2a3aa4da16a490a69ce665e1fdb47fa6c6afb44a8ea4f851a94d7"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/pr/reviewer_source.lua"
+sha256 = "5989f4d72fb2a3aa4da16a490a69ce665e1fdb47fa6c6afb44a8ea4f851a94d7"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/actions.lua"
+baseline_blob = "22d281d07695a89c9880fa0d9b8f871e0dd45c49"
+baseline_sha256 = "b5d5b2cc27244b70bde66a4ec3b04068abd89bb4732dfc9392a57c3a575dce80"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "b5d5b2cc27244b70bde66a4ec3b04068abd89bb4732dfc9392a57c3a575dce80"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/comment_box_rows.lua"
+baseline_blob = "e38985823a3f7a0e277a855b13ccc2b16a631d9e"
+baseline_sha256 = "447ecb2dd80000253ac16b96ce21d049f9f047b6323c485dda2fe735d69a704a"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "447ecb2dd80000253ac16b96ce21d049f9f047b6323c485dda2fe735d69a704a"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/commit_view.lua"
+baseline_blob = "757492566d96951ff9c9ab450080edc0220e57a0"
+baseline_sha256 = "d72aed5f654a3891a54a5b22087091aadeed159e9ace983fa491fcd881f71619"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "d72aed5f654a3891a54a5b22087091aadeed159e9ace983fa491fcd881f71619"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/diff_source_state.lua"
+baseline_blob = "62bf4423ef4de6712ab9052e7f3723740571b604"
+baseline_sha256 = "3f66e9034f9ac28f2ec78fd5d04eb8422598527624d23ac7161c0fd98e26220f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "3f66e9034f9ac28f2ec78fd5d04eb8422598527624d23ac7161c0fd98e26220f"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/entry_nav.lua"
+baseline_blob = "f5dce5bb068f194b160c7adf33cd8f3cb66f1cf3"
+baseline_sha256 = "bc9df90337b3657b0d233c585910464d5f2e0429cad10113ef1fd04413d04c9d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "bc9df90337b3657b0d233c585910464d5f2e0429cad10113ef1fd04413d04c9d"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/fold_state.lua"
+baseline_blob = "e7873fc34a5a549306a13baf8628353aeb20d2fc"
+baseline_sha256 = "2b9775b6579a2d0e48ba838334261bb3d1b659545eb182c3ee518c0e2ecedb09"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "2b9775b6579a2d0e48ba838334261bb3d1b659545eb182c3ee518c0e2ecedb09"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/ignored_path_store.lua"
+baseline_blob = "f5438edccd42f2d80b9d5900ac8ae450868217fc"
+baseline_sha256 = "3fb1d1414cf0bb8e05ef38ef9adcbdfef7bc8a9f6055b6d2f5ebb15d12557eea"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "3fb1d1414cf0bb8e05ef38ef9adcbdfef7bc8a9f6055b6d2f5ebb15d12557eea"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/operation_journal.lua"
+baseline_blob = "168318e64ac5da1cdc4cdeb2be874e80980aaa34"
+baseline_sha256 = "4377a77a818fd43ad6bfcbf29c63fd28fe68ac910ba461b312ad31633b87d86c"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "4377a77a818fd43ad6bfcbf29c63fd28fe68ac910ba461b312ad31633b87d86c"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/pr_state.lua"
+baseline_blob = "b2cd826f500727576b42c9cd0b165d1267de58f6"
+baseline_sha256 = "889cd97d6262330abeb7ebb70e300ad5ee8fd6bdfcc564f802b3400bfae66466"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/views/status/status_context.lua"
+sha256 = "889cd97d6262330abeb7ebb70e300ad5ee8fd6bdfcc564f802b3400bfae66466"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/render_orchestrator.lua"
+baseline_blob = "a8f6509ae52dc2e7f1a1f3982c829cee3d1b98ef"
+baseline_sha256 = "c6b9fa829f7aa0ed5bac80d08cf575aea8fb72a7b3e2639237ab5061ec48c826"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "c6b9fa829f7aa0ed5bac80d08cf575aea8fb72a7b3e2639237ab5061ec48c826"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/section_builder.lua"
+baseline_blob = "ab0ab55d0cb4140413f8a0c4fd98e509b6a07122"
+baseline_sha256 = "82e7d1294861a4b5ab64c65f758b955e0355bbb23934a3fb5c1a4763fcbced7b"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "82e7d1294861a4b5ab64c65f758b955e0355bbb23934a3fb5c1a4763fcbced7b"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/section_map.lua"
+baseline_blob = "8f1f3f19f3518b8c1f8d66fbd931c9462dd06759"
+baseline_sha256 = "1acffa5cf9708ba73463ce0dbaa990dcaadd4e1f1a81ccd3c798773b80c1d447"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "1acffa5cf9708ba73463ce0dbaa990dcaadd4e1f1a81ccd3c798773b80c1d447"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/size_gate.lua"
+baseline_blob = "bb52e15067f29f5fb662c9d8df2fec3acca9b0b7"
+baseline_sha256 = "31ab23874b034bb24c5f91cd0edf8954ddaac74146f39533f39a9a99a9240ac6"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "31ab23874b034bb24c5f91cd0edf8954ddaac74146f39533f39a9a99a9240ac6"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/state.lua"
+baseline_blob = "20ad7a4e82170177c274ceca8a29e37218c4915f"
+baseline_sha256 = "6ce518248dff36dda78ea1be1035b381760d81a479401cf1b942987e97803095"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "6ce518248dff36dda78ea1be1035b381760d81a479401cf1b942987e97803095"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/status_buffer.lua"
+baseline_blob = "5182107e8dca8f20fb9f083ea95ddb13aa6577e3"
+baseline_sha256 = "5b8fc983c5e5e479eff0d39692729420e865943d854077757d08785740d6844f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "5b8fc983c5e5e479eff0d39692729420e865943d854077757d08785740d6844f"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/status_debug.lua"
+baseline_blob = "01dd6a3f99b096345dd3a4652147fbc52c94a6d6"
+baseline_sha256 = "a262fa9796ad27dda16b67754878df0cc92065e38c26852a7c55258e3a17e17d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "a262fa9796ad27dda16b67754878df0cc92065e38c26852a7c55258e3a17e17d"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/status_head.lua"
+baseline_blob = "08576c71eb955a7cbb30cc979276e397270af734"
+baseline_sha256 = "521a25bfc972846a7d3b15fd10fb9db7bbe6a65da965b0320a5117a125b2cbe4"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "521a25bfc972846a7d3b15fd10fb9db7bbe6a65da965b0320a5117a125b2cbe4"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/status_helpers.lua"
+baseline_blob = "8c8513106164587c8d200ca0da12a054afc02e0e"
+baseline_sha256 = "e44299946d6d42f1359fe5f64851652dcf148a565f4ce7f5029e25c64ed6efb2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "e44299946d6d42f1359fe5f64851652dcf148a565f4ce7f5029e25c64ed6efb2"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/status_issues.lua"
+baseline_blob = "8c04fc87c05cc8853261374a90b266bbf0011dae"
+baseline_sha256 = "e145d1ad04ab480e92fb0ea964cae7e8b179c8c4e254f2f3dbaf9a89c88ca272"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "e145d1ad04ab480e92fb0ea964cae7e8b179c8c4e254f2f3dbaf9a89c88ca272"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/status_keys.lua"
+baseline_blob = "ad549b57777e674dfa66b43a89e504b97caea73c"
+baseline_sha256 = "4818597152e07f02f9dec4e6bcc32ebe8aa091343376573fa7d6ed93f74fd66d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "4818597152e07f02f9dec4e6bcc32ebe8aa091343376573fa7d6ed93f74fd66d"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/status_render.lua"
+baseline_blob = "70a72a2fe01bf00337f17c1fc95f48332331dd67"
+baseline_sha256 = "1abac8c0e00ea84a2dbb155746636bf3f32a490a0bff0efdb7a2308b18beff22"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "1abac8c0e00ea84a2dbb155746636bf3f32a490a0bff0efdb7a2308b18beff22"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/status_sync.lua"
+baseline_blob = "84e4781a7d95652b260b5ff0b7bace4325d22253"
+baseline_sha256 = "2cfe98e5507d0f5f5da4d3540841eed28a818f26c691671a8f21b2b631292edb"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "2cfe98e5507d0f5f5da4d3540841eed28a818f26c691671a8f21b2b631292edb"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/status/window_options.lua"
+baseline_blob = "c690910ba2da4c92c97644bacc9d7ca3ae0af067"
+baseline_sha256 = "133aebd8ff755871771b675b4d0de9b63762b01d350b9aa07a22b2bd79d44d93"
+capture_provenance = "baseline_bytes"
+destination = "nvim/lua/forge/status.lua"
+sha256 = "133aebd8ff755871771b675b4d0de9b63762b01d350b9aa07a22b2bd79d44d93"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/views/walkthrough.lua"
+baseline_blob = "788caf261702f20df579d1a5d6e088cbe42655f7"
+baseline_sha256 = "1990eca9070997b0fcb26b6f02c977784a43ce3437c9b6da08daf7584f054ad4"
+capture_provenance = "baseline_bytes"
+destination = "nvim/rust/forge/crates/forge-review/src/walkthrough.rs"
+sha256 = "1990eca9070997b0fcb26b6f02c977784a43ce3437c9b6da08daf7584f054ad4"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/diff_review/walkthrough.schema.json"
+baseline_blob = "ecac5a29731c25f87c800d86aca01c75f39046b4"
+baseline_sha256 = "22447003f2fae9acc2caa7c751c397e32a003afedf6567e665ce490c5efd203c"
+capture_provenance = "baseline_crlf"
+destination = "nvim/lua/forge/walkthrough.schema.json"
+sha256 = "410a09c784b346422bffda18515ea3abadc4d3b112474be574617d15ee4208e7"
+gate = "name"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/.gitignore"
+baseline_blob = "b83d22266ac8aa2f8df2edef68082c789727841d"
+baseline_sha256 = "306fd52e74fca6746e12acc750f232de15e71da917756a1270d74c91f5eb7368"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/.gitignore"
+sha256 = "517b2c5ebb94b4ec644cc7999710d327942ee37d73168930b0c6f5f4b44bf6ae"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/Cargo.toml"
+baseline_blob = "d5de986f36c6320572c379ee6a4b6eadb216b854"
+baseline_sha256 = "5845b0ca0c02d2d818e5c30f3cfb8cdb4b652b98fac9dec19753f4c83791ac41"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/Cargo.toml"
+sha256 = "701f65eb74e6fdba55c6657615a5272e545ba24401f56011c24a0e3b33feb5ad"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/agent/mod.rs"
+baseline_blob = "638803d5691b7daa212eafae160e1b38613a670c"
+baseline_sha256 = "868ecacd6124dbf8ebcd64c552b417b23de76566584cae0efda3d5074ec81ee8"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/agent/mod.rs"
+sha256 = "e749e1ae5b4df612acbe1762cd5efe0b5dfa5b83497fc62a797625605949646d"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/approval.rs"
+baseline_blob = "d417c8be6d8dbb0f85be65c015e00eee28b212a0"
+baseline_sha256 = "be05b9370c6df2c6e1beaa609c2565f72a7e1a546ac441ee1498cf14c7403e9f"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/approval.rs"
+sha256 = "f118dd8de860f4eba30e8753ccd3527446e84e370ef359d7875b53a1fe7f7837"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/catalog.rs"
+baseline_blob = "292047f7160b035efb319e30716cf47f16b22a42"
+baseline_sha256 = "68e74b199fb236718fefd072028a39c66fc219f64179e45298fe081f64726d29"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/catalog.rs"
+sha256 = "b792612c55221d673dea226066823999ebff90edf4fcc5c94510dfab0366351b"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/codex/json_rpc.rs"
+baseline_blob = "c742813a58bf56ba4b8ee729e700a2c8489e8074"
+baseline_sha256 = "5a2986aeb94abbeb6f5e5ed13f70421a5235d6392f6d93b8d75434dd449e2082"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/codex/json_rpc.rs"
+sha256 = "604e362c397eee20ea6726d8382caa1308e1bf0661e1a1b7660120929dc21718"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/codex/mod.rs"
+baseline_blob = "bf83c81300050656a53f727e0ab6b1be01b484f6"
+baseline_sha256 = "68effba60e16014434d67622dd35a2b3eaefd969a7b8f234c0cd69d148b21bcd"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/codex/mod.rs"
+sha256 = "b862f02481cb74bbeea8184a0cfa373f06ae55f6c6b9303de29594d00443c346"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/codex/process.rs"
+baseline_blob = "3251ec571b033d82330bec3cf8a0cd3fdee49ddb"
+baseline_sha256 = "8daeed318bab87dccccaeb2a3dfb569e4ad1c8e7ca8510d8350e70517e4de118"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/codex/process.rs"
+sha256 = "a064562ab77c1ce2a80a6dd4cea6f248776c93811ea12a6361d39ce688de05f3"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/codex/runtime.rs"
+baseline_blob = "b7454f13bab2062c9bd74a70254e676938508bdc"
+baseline_sha256 = "408d815b89a78f1a50ca7110f32f011f62ce5a87b77be4dbf6dc11e7609d5828"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/codex/runtime.rs"
+sha256 = "367eb1c96e41a3cbac46ca67a9ee1b7242482fce82a7686672505243c3b9062a"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/codex/security.rs"
+baseline_blob = "1e1ec6607f48a3abd969aafa410f5636f13852e3"
+baseline_sha256 = "1b7b6d8e1a97cc73a14e10ef74cac2e53c5fa461061e560495397f20413155d9"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/codex/security.rs"
+sha256 = "a0f57914ae9a8d84e6e37e49858fcd27792feb28e973eb8725095e0dc899198f"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/codex/turn_coordinator.rs"
+baseline_blob = "cad086acc6e9c57853187f4f5a2802ce1a217d39"
+baseline_sha256 = "14ebcd662d5a56cdddc72f6207feabcb0217a99abeeff99642d4ebeb3ae7eecc"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/codex/turn_coordinator.rs"
+sha256 = "d644560630b524b94b2592f48aa3a110bd5bcf5595f812fc4b8c12725d6f256e"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/copilot/event_decoder.rs"
+baseline_blob = "55203f8763e887661b45ce487279a6c4d9c854ab"
+baseline_sha256 = "de2a86ca0c46e175616b14df22b7005aa21e8bd3e6da7d14236a85269b1e805c"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/copilot/event_decoder.rs"
+sha256 = "aa400454f63cf25dc9f5b8d0d6833bc62c0bb3f5bedd38c3de28f2d813e83033"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/copilot/mod.rs"
+baseline_blob = "f98a2cf95508bbb5e859e3dccb74b9cf144d9520"
+baseline_sha256 = "cdea89a18bdd11d8268db2f55e651421ef51692b479bde0bcc755706ea026b9b"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/copilot/mod.rs"
+sha256 = "3b22fdb502b470e5fa4ddfda359be0d5f235640e28b79678ee75791c2dc08a6b"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/mod.rs"
+baseline_blob = "e38faaa61df5c2559f466e809d668e6326a154b7"
+baseline_sha256 = "171eeb014c866d43d1e97cbabecea3e7d2a1b977e35aac7b88196a12a2ba9fdd"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/mod.rs"
+sha256 = "2ac08860c57f5274cc45198a796111b19ee33c5b93cdf8fb78c7350edae0b587"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/backend/steering.rs"
+baseline_blob = "3be2f015074ed78e7d714674e14a4139a761ca84"
+baseline_sha256 = "fef8885a5faf9974b290c236c2cc5820ae0e40c886cba77a034c64eb31c81568"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/backend/steering.rs"
+sha256 = "62375fad9a3c6b95c873e3a2557014efbbf3aa52613dcd419ed9943203977d86"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/broker/fork.rs"
+baseline_blob = "b97cc6657026d66faf78b01a39ed734e9de98baf"
+baseline_sha256 = "97bc15d62e986e2ae08147bbeaf2f86975a4ddfefefea6d9f512d3973aeae004"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/broker/fork.rs"
+sha256 = "0a697661cf7669e8502defc2ddbf7c9a09ed37dc8099dd77ae304051804ee9d4"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/broker/mod.rs"
+baseline_blob = "2dce5c9e906aeb633392e9976365f4983724fc70"
+baseline_sha256 = "52397b4b545feb8843f8c20967fe896f6faf9d5d666843b5de3163c7f3f415e4"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/broker/mod.rs"
+sha256 = "335dce619bc5d445071affdbcb16c47788cb0b20d0df5c6eb65f7222134a5e19"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/broker/new_session.rs"
+baseline_blob = "969e9577adb393d2382439bdb78a1153578a674a"
+baseline_sha256 = "256b81e1db89abba9a5e121d9a88d499c33584372fa2fb42ffa56a7c13a5c8db"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/broker/new_session.rs"
+sha256 = "1749d4f50a918535109b66e8a732cad6c36f49894597ff3345e23d599e769a42"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/checkpoint/mod.rs"
+baseline_blob = "618ae02e8f37c54c1cbf393087f891c072577fcf"
+baseline_sha256 = "fa92e52bd7d53bd148625639896e48d038ed9676a2a34e35f97b511f1e3a3fed"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/checkpoint/mod.rs"
+sha256 = "85eeabbd550ceca3f25a6c0ad542e4c9bda51034fbd4ecaf51f8aac2f8ed3d06"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/control_tools/failure.rs"
+baseline_blob = "da322c1f28374a7aea6e366765b3f754b304c514"
+baseline_sha256 = "7a478448a59800f133a34e8e813987f90d6906b759f6312c7ac3f694e20493d7"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/control_tools/failure.rs"
+sha256 = "64bd1bf18be2a76aa2f1a86b09c0dc6a662851da756e4d3910b0b342fc39db78"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/control_tools/mod.rs"
+baseline_blob = "93e2dbe2f3addf65dd8c85dcc26dcc608754df0b"
+baseline_sha256 = "5def37b603512951d5b8dfbcf5c70706fb5e454ff571e76ffa77116041965ba2"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/control_tools/mod.rs"
+sha256 = "f9d2e447821f3cec0f631f6407e54ca9b274d7064ff3f725c9bf0a2480b6312d"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/control_tools/runtime.rs"
+baseline_blob = "66ffcb9a3c9c6287e0c62ea330b3bb6723e2997b"
+baseline_sha256 = "8e5f4ee6059da135b6c14aba579318d303131c4375c72574edd64790d1e1ab7d"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/control_tools/runtime.rs"
+sha256 = "84eae4060b49ebd39dda855d87b02f7bcd0b85abd14614f52f747281350953b7"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/goal/mod.rs"
+baseline_blob = "316541410c6b64d85463d8ca8a2579d91c67af42"
+baseline_sha256 = "192b7d91ab84389eaf4fc0c55dcc2983a8ee8ad005e20019caafc76343407aa0"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/goal/mod.rs"
+sha256 = "3b3bfce7a7d47303511186e6586528b0e14672fe4d7607cee56dc9f570922039"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/interaction/change.rs"
+baseline_blob = "9f446ef3cd03a2505d9964673da58c175aeb8866"
+baseline_sha256 = "a0d0c957294fe87e2511f2866018934a45d864cefa4dbf51d4ec23accddc5153"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/interaction/change.rs"
+sha256 = "730b621bccb23a949e5778fff3365fc220cfc91d0b038e17464040174f498c37"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/interaction/mod.rs"
+baseline_blob = "2af34576472b74eb6206a26175da5636477a5c05"
+baseline_sha256 = "09043793ef14440d9bff3d824e4ff5468180a817f07e35f35c9008764ff7c012"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/interaction/mod.rs"
+sha256 = "b810f6f87aa432c5f9c8293cd2cf906713548fc17a8ce17a1153d086cd15729a"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/interaction/node.rs"
+baseline_blob = "8e125f636738b52f71115c57ac34112ed9af51a6"
+baseline_sha256 = "8a57300a03b5ddda0fdf689bb09ea3ebd2bd24324b17604b2783d8221675d1ee"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/interaction/node.rs"
+sha256 = "daf55ae443cd1638e67f97ccab5c41f6ab7bffc1c224f88c7f59fd31282a0303"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/interaction/task.rs"
+baseline_blob = "a96d2941f56927569aece96eb029b36a68700776"
+baseline_sha256 = "43ae3a5caf5af5d88f204076221e005135a31630c5ebd186e2d609e077e9a250"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/interaction/task.rs"
+sha256 = "35a04d2290e4fbb3c0e5086a5a89695b742927dd9d1839d60c68e6519cb69bdb"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/interaction/timeline.rs"
+baseline_blob = "6688dd6b8044f700c9a51b8aea416becad6009ca"
+baseline_sha256 = "bae8b2a8081b59b006f9f739cf51866e08469629381a7acdec1f57c1d5309735"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/interaction/timeline.rs"
+sha256 = "9756cd7a5e6ec58c5c6c56363d677b78a8221215f8713f1a893fd2e4f29940ec"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/lib.rs"
+baseline_blob = "72ff8d4a512da6a2e5cabf3adabf57e1ac0d325b"
+baseline_sha256 = "4fcea6fba1190e50b2460d798869d080167f42c26ef66432af3c3251f2ffdf37"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/lib.rs"
+sha256 = "58f44d0de838d8ba62e2e9b05cab60d1acd8aefb9867422d68a021e1c81f6311"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/main.rs"
+baseline_blob = "2f7afced8bac0d67d5c180494b8d689ab99d16b1"
+baseline_sha256 = "bc11f33e84ed62d6b1612820228f646063cc65c5ec246f51a79d990cb49163c6"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/src/main.rs"
+sha256 = "5bae1251b3a8296a979cbdf73731a65ce30526ae060e9ec0ba81be912729734e"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/permissions/command.rs"
+baseline_blob = "4ee9e10a958c888d57d7abbf67b8bb36c8f5df2b"
+baseline_sha256 = "b63899b950d31c8defb7e132321cac31ab2f5bccb3e51dac74c706ae985ebfba"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/permissions/command.rs"
+sha256 = "7f4a7ec195d9f731e8014bfccc886cff9151582a6c6e83899bd7766658e2c8b0"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/permissions/document.rs"
+baseline_blob = "902dcc685f9659216cc727ef00bbfd65122cb8de"
+baseline_sha256 = "27f62a4bf8614ccef8d736c45e4cff21b545a6a63b0a0431c9564490602ef2e7"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/permissions/document.rs"
+sha256 = "a5ea87c9d2a0d377583ca3a564e2cc87696af4307e1a8eff5b9b310d1f4124eb"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/permissions/matcher.rs"
+baseline_blob = "d4b30ca2ab12970a4927f856343b8fb92991c693"
+baseline_sha256 = "d59fe06917648eb886f2e35392ce9dae43b11a9357dee0a1fa474b520f4a9355"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/permissions/matcher.rs"
+sha256 = "095eff3a012b3ca4ff796239c7930217ecdfede4e2d4e8b691af6f5811ba2431"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/permissions/mod.rs"
+baseline_blob = "8fd5dda08e04961769781446a1d2698ff945315c"
+baseline_sha256 = "59b050a0b4adf324d82b485898759094cbb33fb1dee52ac7ab3810d3cb434b87"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/permissions/mod.rs"
+sha256 = "6755db8139fbbb2174b9594bbc7fd24102d37f9bb6a76b3cc805a56429041c98"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/permissions/store.rs"
+baseline_blob = "f1eda4bc16d5bfcb138d2af54ff5f99e68421973"
+baseline_sha256 = "3f34f715c2f8e7b6d0922f15d5af06e979fd65a49515537e40c95d8e2a187129"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/permissions/store.rs"
+sha256 = "6c139f2c086d995b5003703eda8417d5d95c5ce772769549248b92cde29e3d83"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/audit.rs"
+baseline_blob = "dadcfcc180d9ab960542a8ac28c1ab990e5d742e"
+baseline_sha256 = "e0362ecaa24669f0940614a283651aa6677bdf5241ab8be848d8fcd24ed073a1"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/audit.rs"
+sha256 = "ed614945e6bfc01e377ea493e1f47b693e92b0200f574216cbf23456a5ee4710"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/deviation.rs"
+baseline_blob = "86ba5c3b4c0fa20bf67cff77a330b40d647a3c8e"
+baseline_sha256 = "f0dda61c377ed3f2a889143df648ad2b07a9c9c238649123424a9ccb54ee1bb1"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/deviation.rs"
+sha256 = "382faa23d37bc154d5d1ce529b8239d53f4f6907725eecc99cb789ae0d91b68b"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/document.rs"
+baseline_blob = "37257e5b57224b1e3b07d41a9841775243c2fe83"
+baseline_sha256 = "c46d9b8a6b57884caef1ba36c4ac97dbb9b0b9fe0df32304cbc4ffab58b97e36"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/document.rs"
+sha256 = "81656ab3c362f1fade3a7d24f5228a5d1bf9dc82925eb0ac071dde6a14d278d0"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/edit.rs"
+baseline_blob = "f7b2d73765015900ca7387596456cad8884e464c"
+baseline_sha256 = "07a8f882fb330c5967f93d2e8073622fdd213c2914813ef49d0474f8fc5c5d89"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/edit.rs"
+sha256 = "ccc7c830a961a1265ac85a11b7eddb5ee2efdb64e115a0d7b6bf404339ea1339"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/graph.rs"
+baseline_blob = "10e14387d07bd69cc6b89fb31aebc24620f66d87"
+baseline_sha256 = "76b5aa2098751131ed9b7d6932b63d2e46d6fceea3c34b2adaa2b3b137a2d45f"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/graph.rs"
+sha256 = "a0ad521f458434284bee84ddf1a5e69bcf1b4f3802a9486bbdceb284c4b57146"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/mod.rs"
+baseline_blob = "b40b5ec8e36b63d02c155f9c4fd73000f3b04dfd"
+baseline_sha256 = "e855efb79fc48b3fe4789b53191d85c15ba48b310cdf2b14bc0c42a3d6b293d9"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/mod.rs"
+sha256 = "d6ccdb2d0787d24833ed94bd50c81f791199c09962730f83e2b9d74bf3318bca"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/prompt.rs"
+baseline_blob = "831ad69f6bb9f8fd6d358d3e412d8e0994d8fc28"
+baseline_sha256 = "c1d672898789701b0d582a4677ffbf9dde781141259f64033ec8aec01b53ebf9"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/prompt.rs"
+sha256 = "afce0eddf79428b4f36da4bbb8ab25905bd440a521a9553e23e292b7bdc40ad7"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/render.rs"
+baseline_blob = "d66d53c8a92d783e59158e8354e61f9ca2d66a94"
+baseline_sha256 = "ce7b74b7aaf6068bdac2fb5c546ba599dc868dc36a54e850767635ce1d8093da"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/render.rs"
+sha256 = "e6a8ea7a0bb9d7df838e0f1786b5db0b40a5a70f206fc5c82f505bda34cf69c6"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/resolution.rs"
+baseline_blob = "b1b6ec83a87fe9f8201df245ca31c3211d2a3bf0"
+baseline_sha256 = "245119a33e0ed82f40cfbed64094df60fee0b833853d4492081c6308ef772c3a"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/resolution.rs"
+sha256 = "26193e87ff1d87013de4af7dd458a9e9fd2c8a888832c8ffaa9cb8e7561e13e3"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/scheduler.rs"
+baseline_blob = "ac678e7a58c5a95396fa3ced07686ebf94ff8706"
+baseline_sha256 = "043059f592860ae804c01294fcd977ff6237996c8ef537e15aff157407159899"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/scheduler.rs"
+sha256 = "eb1639789f42f352c47f9f6690db1775ab348c69d62ccf98217b205108e054a4"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/state_machine.rs"
+baseline_blob = "307d21d5174ba7a445f6f51476eb53bdc49a7fd9"
+baseline_sha256 = "af90a2ddc52e69cd49642b0964b2aff870e44831a69ce16a0de4bbf01ca13942"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/state_machine.rs"
+sha256 = "2f011accaa63d70b215f577270c2df43879f65ca7a9cd59fe3f46d7c9f1c8b70"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/plan/validation.rs"
+baseline_blob = "16ddd474adba0c5b77e3a8822acd0ba6e54ceab9"
+baseline_sha256 = "22f10efd4cf23d3389922a3763f39097e7270ace5970c9cefce2f97600a256d8"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/plan/validation.rs"
+sha256 = "166a78af1f8cb52ab90dacc8a636f8ddf200519432c66520f510ebbb29496c9d"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/protocol/mod.rs"
+baseline_blob = "b6b60e9df0ee9a4dbea3c1370370dd2bc8690e3c"
+baseline_sha256 = "001140864410f2952e7bd3276220e483094bc9ba4129fb82edc251c792fa6159"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-protocol/src/message.rs"
+sha256 = "5c6d4972fdb9d5856e637d6d092bcdfacc60443fdcfef2634dc383484c7de0c3"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/rustdoc/index.rs"
+baseline_blob = "0009b85382113b5967c659acb0d49fdd382dfb00"
+baseline_sha256 = "299dcafaaaef9ad8c939a1f45c3932f1372dde34f2d80649663f763e8a0295ec"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/rustdoc/index.rs"
+sha256 = "2536847ac9a9580d3b570c34ab63606288a6cad9690cb5dd1612093e78cc1586"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/rustdoc/mod.rs"
+baseline_blob = "84ebaef0675b9dfa0caa64ea4fe7558063f0c2a7"
+baseline_sha256 = "b15ddfe762caa3b572c024c9c1ca9d5994c164db58fad257d176231cf4c6fec5"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/rustdoc/mod.rs"
+sha256 = "aa680440181b0c29b6a16e4d59e82059eabae791d452867234706f794c97d892"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/rustdoc/resolver.rs"
+baseline_blob = "1348dc42af3c16ac1fef98e452aad3d466cd010b"
+baseline_sha256 = "f51e29319283564498163edcf7fa8c842fd74d62d2508cd14394b8d88f3b5661"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/rustdoc/resolver.rs"
+sha256 = "204f8140cecc4b42f2175b0e61ea57ac04983d67a09a22b317fbf67b1b12beb3"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/rustdoc/source.rs"
+baseline_blob = "862ec89b3ba266616e1ece5143b055aca50ffa23"
+baseline_sha256 = "7a89aa8f2ea721f13527041251016353b499361a29d1de3054937cb40366978f"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/rustdoc/source.rs"
+sha256 = "96d9c1460106498b79a3083fb17571b6f8c13ce99081e5b649c215792f90f735"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/rustdoc/validation.rs"
+baseline_blob = "f1f740a886cf4ec2c9688454e80e77e924c958df"
+baseline_sha256 = "a28acc9246055b264efbf0e0fd95fab21422e31ab48b056f8e0e4de7c15d27b7"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/rustdoc/validation.rs"
+sha256 = "6ff0ee70bc71fa7330fe8829d6f11b076574acaea81d0881f8aa22d2a8fba893"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/session/continuation.rs"
+baseline_blob = "6a5b49ffe11457d9b72be2a152ae658777e186b2"
+baseline_sha256 = "b34bde2e4baa08c25abdd6f6addeb9c80b1e28b3b3a4063469a8a9699fa51690"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/session/continuation.rs"
+sha256 = "0a165bf472434d16547a879978d998ea9dd5902177f4a623e10d0ce3849a47bf"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/session/mod.rs"
+baseline_blob = "bb8b1bce82963542f29d5bd9655aef8bee05e3d7"
+baseline_sha256 = "2dd811c5aedd5ce6fb7fa0160e571a13c7a0da90e3e5bc9306321b68dc98ce9e"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/session/mod.rs"
+sha256 = "4d6d9e314bf3c7eb2a8c3cec9194281f70ba4bd80cade1e3af051bcfbd1acd38"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/session/state_machine.rs"
+baseline_blob = "d6719580fe62196c443c6487cfb75acb7a2e0901"
+baseline_sha256 = "d7adf7ded72409af89c861b9532f24e7802f78f483e65a010419d02a7ef488c6"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/session/state_machine.rs"
+sha256 = "296272cc9c8fb1436e471963af87e7bf53878abcdbf55aee08018a36119f5be2"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/storage/mod.rs"
+baseline_blob = "07e5a9941e47e11076ab5bbeaaed6372412dc592"
+baseline_sha256 = "c9a433c5e789be6874b7cbfc93cc9b4772c66fcd8ef9f144126e3626afeec7c1"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/storage/mod.rs"
+sha256 = "b24f38e89bf71839a369157964d39d0bc1057805f4ee85251611488ebb8d5278"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/timeline/mod.rs"
+baseline_blob = "3a8c2c59791527579240fd509645afbc13fac57f"
+baseline_sha256 = "885b4c009a0039eddc3a7480fbfc81d4d035f9182c0b33a050ac3a329ae006c9"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/timeline/mod.rs"
+sha256 = "ad51316cf06d0498495ad45e301b39736a9eb96221df5c5eac0777f1d4e8cec2"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/timeline/stream.rs"
+baseline_blob = "7786563c719882dd7a77edd36006bdaf847d8600"
+baseline_sha256 = "9b715595021c31d3abb6d7dc2858ec55c0e787a458adc5410eaff8d01130a24d"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/timeline/stream.rs"
+sha256 = "ee8a32255857ec1c25cf50e1e710c495b9fea5e73c6ac94be189dbff497f4da8"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/trace/mod.rs"
+baseline_blob = "bb1efa5b781efd65b5d0ab69674b4e9d0ef8f04d"
+baseline_sha256 = "46ced26b3eae01b58b9a2aebed4d6573be7472ccc995d3affa0f781bca789566"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/trace/mod.rs"
+sha256 = "2d4ac4357f66c095fd30b917515b4c5457f52f5179e8900dcb976523c9b4b513"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/src/workspace/mod.rs"
+baseline_blob = "25bc3c3b634898f24238da6a1d0014116cecd507"
+baseline_sha256 = "3de9b32a4b3aa4564fae22a02667c77771d2a7d82a278137bffcdb6abab9d129"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/src/workspace/mod.rs"
+sha256 = "0c45dcf51348483e96687c0a4e394efe1e27c83d6e02a25b0c7408f8a3c727ab"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/tests/broker_stdio.rs"
+baseline_blob = "670a811a2f4f52b710fe52cbd0f069766e5c5919"
+baseline_sha256 = "9156ca76da76ebe222c3d736eaacf19815d5a5e5b5c5b9d80891609d6d45efd8"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/tests/harness_broker_stdio.rs"
+sha256 = "69b7615fb6277b43022d2435e1235967a67f09892acc7ef53818cd43ad95bcd8"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/tests/codex_cli.rs"
+baseline_blob = "f1440b9e5d6d16b6a596f1c7df2325ecd147beec"
+baseline_sha256 = "96c69efea0ac9af4c47dc451815793187faa66b752986363f5a2da29cd7607c9"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/tests/codex_cli.rs"
+sha256 = "8173110147dc831b04b0ef54dbae066834e032dfb7cd78905d71bb7be496bf07"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/tests/codex_real.rs"
+baseline_blob = "4c38252d0ba005c2a9286476b2274c46e788aad9"
+baseline_sha256 = "94bfd1cf574f25bd601204e69144f83949ed5401b7e859cfc5c9c3c47c930fe9"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/tests/codex_real.rs"
+sha256 = "d7abd710dd540e894c5c9ed1797265576b9103ff05cca08c4742126cf898f0fd"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/tests/copilot_real.rs"
+baseline_blob = "b2b97cc1cd0551f3495e29f45870ec2456e32384"
+baseline_sha256 = "19177ce3da93213871209854a33e6392bb9be23198947f83930d419bed066d14"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/tests/copilot_real.rs"
+sha256 = "ce56a52776a653bdc86f6abe5beec22f7870e1db801ea13b1d6c79217692bd56"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/diff-review-harness/tests/permission_document.rs"
+baseline_blob = "5dadf82a63530d248f0ad69953da9a1b6d1ce741"
+baseline_sha256 = "9befd7baf330c3515500fbfa3ce2f7b3e8fd4c92ce18ed41e2b4ca276cc19aa5"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-harness/tests/permission_document.rs"
+sha256 = "a44bf9e07dff692aa9d66f334d86c87d7fa103c56e6f75088efa1a6f2ea8675d"
+gate = "host"
+
+[[source]]
+source = "nvim/rust/github-issue-index/.gitignore"
+baseline_blob = "75aaec4cd8473350ddf08cefedea93b2227a442e"
+baseline_sha256 = "db005ca0c8ad1bb3cfb42a108e48b0a65dab146f230b660f344647a5354d4354"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/.gitignore"
+sha256 = "e98d274e029070d09e08634f92a6864df272ee285d92d12c4161293bb6decd43"
+gate = "remote"
+
+[[source]]
+source = "nvim/rust/github-issue-index/Cargo.lock"
+baseline_blob = "933447dad9c0f030bac50432fea216dc97e91493"
+baseline_sha256 = "da9a965c9ea61024e801562011b06577e0a230d2ba8f212e2c7e50da801c65eb"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/Cargo.lock"
+sha256 = "f19674a85261dba195b913b7aa9eb0f9855838e488bf9350b1471c77f0e58b46"
+gate = "remote"
+
+[[source]]
+source = "nvim/rust/github-issue-index/Cargo.toml"
+baseline_blob = "35a860282d7e770b0ba64719793767a27f984f43"
+baseline_sha256 = "114dc6f752d04ce3dc8e4ddf2882a496d46b3dbc209075ad932ebe656fc628f4"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-github/Cargo.toml"
+sha256 = "3a285eebbb47fc7c0379e139830696879613d860e3624f9d146420e2dc9a5090"
+gate = "remote"
+
+[[source]]
+source = "nvim/rust/github-issue-index/src/main.rs"
+baseline_blob = "998d0a5e07cfb3e3a377ace12bff46333e440c5d"
+baseline_sha256 = "7938aa9f0cd9cf95a884d820f9f2564bb90a47a5e3537d9a3f7c4ed429a6cd9b"
+capture_provenance = "baseline_crlf"
+destination = "nvim/rust/forge/crates/forge-github/src/issue_store.rs"
+sha256 = "36eb356acadeadc0f4f2d2f3ee028e9ff1f91a01713c422d0584533fb3bf99d1"
+gate = "remote"
+
+[[source]]
+source = "nvim/tests/diff_review/agent_picker.lua"
+baseline_blob = "de82247655e27bc33a6e43a8e19771c0e68ce927"
+baseline_sha256 = "76e14cea18a2623fe411ed2d5130833c4f387f201b71e4b8927473be344351d8"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/agent_picker.lua"
+sha256 = "76e14cea18a2623fe411ed2d5130833c4f387f201b71e4b8927473be344351d8"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/ai_commit_ignored.lua"
+baseline_blob = "41030fd73f602ac1f626349ce17cd29d85ad1193"
+baseline_sha256 = "7daee106ac7926c249e43a3806a59ce02e95888aad0e576a0a93145ac0976cff"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/commit_lifecycle.lua"
+sha256 = "7daee106ac7926c249e43a3806a59ce02e95888aad0e576a0a93145ac0976cff"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/async_stale.lua"
+baseline_blob = "c32e6856c47a5bd95fdf30e837b6abb5e16a3b48"
+baseline_sha256 = "601dd26fbd04b7f1ccec23a7909980b5dc826d7d83c876858983f56e0dfbe8fe"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/source_document_stale.lua"
+sha256 = "601dd26fbd04b7f1ccec23a7909980b5dc826d7d83c876858983f56e0dfbe8fe"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/binary_files.lua"
+baseline_blob = "d4dad02c3e82ac51f15bb9d8ce9d953f654794fb"
+baseline_sha256 = "6717c909692b7da4f17285646475f9f29e9c14e4540fb93ce316150fccad9c97"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/local_diff_native.lua"
+sha256 = "6717c909692b7da4f17285646475f9f29e9c14e4540fb93ce316150fccad9c97"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/branch_create.lua"
+baseline_blob = "06dae32cd18e087fcfff0857716f1bd18de47783"
+baseline_sha256 = "b1dc186281bcc847321a9418a3f199cf7ade591d4d239eb6f3b35fac952a0f47"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/native_git_write.lua"
+sha256 = "b1dc186281bcc847321a9418a3f199cf7ade591d4d239eb6f3b35fac952a0f47"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/branch_diff.lua"
+baseline_blob = "a293708805219a204b425ec5f37999d661e708f6"
+baseline_sha256 = "d54e9438de8e20b738dfcd5eff9fbddbe98c5484b462c0bd6989d17e72a2d723"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/branch_diff.lua"
+sha256 = "d54e9438de8e20b738dfcd5eff9fbddbe98c5484b462c0bd6989d17e72a2d723"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/comment_box.lua"
+baseline_blob = "6459ac58b743d391af29eeb9acaf518808128d31"
+baseline_sha256 = "3c208a7ef527ddc99e0420bfb21d4f65edddb8281349411045ce5c7c54e8e140"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_annotation_edit.lua"
+sha256 = "3c208a7ef527ddc99e0420bfb21d4f65edddb8281349411045ce5c7c54e8e140"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/commit_lifecycle.lua"
+baseline_blob = "2aa8cc23082389a529148ad594972b47f2d92395"
+baseline_sha256 = "810375c97409915d3cbf89feb5169271666620209005d654d8d78e9570b7b9aa"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/commit_lifecycle.lua"
+sha256 = "810375c97409915d3cbf89feb5169271666620209005d654d8d78e9570b7b9aa"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/diff_architecture.lua"
+baseline_blob = "1e1263522c8dcc1bc39f34952ddf0bb6bca1e313"
+baseline_sha256 = "93f1ab77b4fe7937d1ce0c0dd6193b6a78791a94d251c5006296074f947874ed"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/diff_architecture.lua"
+sha256 = "93f1ab77b4fe7937d1ce0c0dd6193b6a78791a94d251c5006296074f947874ed"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/diff_buffer_action_cursor.lua"
+baseline_blob = "983dc541d78ca205ac760c19d17db4774fe05d74"
+baseline_sha256 = "a1c2768954b32ce3be6f25e9234d1fdffcce158df4cdbdf8f51bfbc61320a0ed"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/local_edit_patch.lua"
+sha256 = "a1c2768954b32ce3be6f25e9234d1fdffcce158df4cdbdf8f51bfbc61320a0ed"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/editable_region_append.lua"
+baseline_blob = "523e8b11e3f7015d8ee2616172222fbcc1edeed5"
+baseline_sha256 = "9ceeb66fb1c67b2b98c36d72f4ef840e97f8a263012434e2c4e2f13d835cd9f0"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/editable_region_append.lua"
+sha256 = "9ceeb66fb1c67b2b98c36d72f4ef840e97f8a263012434e2c4e2f13d835cd9f0"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/empty_diff_cursor.lua"
+baseline_blob = "f21dbbcad91236db8d375fe554574e9b53160ffd"
+baseline_sha256 = "537e335f779ab482108c6bb0ac065d7a9d6d528b514ccc97b28447a314277493"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/empty_diff_cursor.lua"
+sha256 = "537e335f779ab482108c6bb0ac065d7a9d6d528b514ccc97b28447a314277493"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/ferrous_full_syntax.lua"
+baseline_blob = "118273819be549a3610cd71dc0695da59f2ff20e"
+baseline_sha256 = "8b16246c22235af026781054028a6243d03637939814546ad8c724ca60772d56"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/native_syntax_bypass.lua"
+sha256 = "8b16246c22235af026781054028a6243d03637939814546ad8c724ca60772d56"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/file_body.lua"
+baseline_blob = "670f329b1ac9be70126fa36db79d001de98ffb24"
+baseline_sha256 = "05e0a1d61442f12d79599eac301966c77dc64434a0e98b79e1defe94b13007c0"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/file_body.lua"
+sha256 = "05e0a1d61442f12d79599eac301966c77dc64434a0e98b79e1defe94b13007c0"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/file_expansion_context.lua"
+baseline_blob = "339c071ccb86de0866deefb628e1a60d6c6bd027"
+baseline_sha256 = "87faea3e5dd662b629169badab78d2119154c41435bc29ab72bbd55cc630f590"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/local_diff_native.lua"
+sha256 = "87faea3e5dd662b629169badab78d2119154c41435bc29ab72bbd55cc630f590"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/file_revision.lua"
+baseline_blob = "7fec0767a853ba6cc497f9b7a0ed3e2579e7ec84"
+baseline_sha256 = "7738bf8b490a505faf9668627d1248c3d51fe80e5344b83a3b0475b254928735"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/file_revision.lua"
+sha256 = "7738bf8b490a505faf9668627d1248c3d51fe80e5344b83a3b0475b254928735"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/fixtures/agent_picker_manual.lua"
+baseline_blob = "8cf3c89dbf5493c04045286d3daffc8aa2e2c902"
+baseline_sha256 = "c9d9f007fe6dbe2f6edd6666cfa50fdcc58474b20defe32036c0dea70af90603"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/fixtures/agent_picker_manual.lua"
+sha256 = "c9d9f007fe6dbe2f6edd6666cfa50fdcc58474b20defe32036c0dea70af90603"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/fixtures/plan_question_manual.lua"
+baseline_blob = "18162eef3ad27fe2e0d58d10279c610d21bedcea"
+baseline_sha256 = "7423cdb41c88393fcf8ba96a4f1ef61c961d22a7c0a2b19822192a950979d2bc"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/fixtures/plan_question_manual.lua"
+sha256 = "7423cdb41c88393fcf8ba96a4f1ef61c961d22a7c0a2b19822192a950979d2bc"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/fixtures/session_picker_manual.lua"
+baseline_blob = "df62389dc3cc8cda19ace8818b3f7802d6dd2a94"
+baseline_sha256 = "34f3cb6ae38d6b524db5bee5f7d2c7b7c8d25d6643cec11b740084dc820aac63"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/fixtures/session_picker_manual.lua"
+sha256 = "34f3cb6ae38d6b524db5bee5f7d2c7b7c8d25d6643cec11b740084dc820aac63"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/github_integration.lua"
+baseline_blob = "d2f9f4a63d9e235e93780fe2307bda4e884a7044"
+baseline_sha256 = "1fa06b5d447055a8d2d7816aa4157a0eecaf2138f0498b7545eba84bf1e2146f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/github_pull_request.lua"
+sha256 = "1fa06b5d447055a8d2d7816aa4157a0eecaf2138f0498b7545eba84bf1e2146f"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/harness.lua"
+baseline_blob = "16b7980914e47323678558bfeec58667a0064c13"
+baseline_sha256 = "ce40ac304d280a847caddbaca04ea2423039a6eab618197c16690c3b40c3b815"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/harness_host.lua"
+sha256 = "ce40ac304d280a847caddbaca04ea2423039a6eab618197c16690c3b40c3b815"
+gate = "name"
+mode = "replacement"
+
+[[source]]
+source = "nvim/tests/diff_review/harness_markdown_text.lua"
+baseline_blob = "45296b9d3aa9bd3440429ca7f32a3d53ede7e5a4"
+baseline_sha256 = "ed79385ef075130532a281b84f95a44d66491964be2955ba9eefa7c8cda00419"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/harness_markdown_text.lua"
+sha256 = "ed79385ef075130532a281b84f95a44d66491964be2955ba9eefa7c8cda00419"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/harness_new.lua"
+baseline_blob = "55d2f4f902a269f138c267723ea2cdb109265674"
+baseline_sha256 = "3ee4a18b79e8bef7c66d4daca944495555e3a37c9e3ba2c25019aeab476918a5"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/harness_new.lua"
+sha256 = "3ee4a18b79e8bef7c66d4daca944495555e3a37c9e3ba2c25019aeab476918a5"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/harness_provider_catalog.lua"
+baseline_blob = "d118936dc9743549fad321f4d9b5105b9baf4f0f"
+baseline_sha256 = "a77fe03ddc7d9af2757e79fe3c2a262149184d794865abb94d1f5162bed462c3"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/harness_provider_catalog.lua"
+sha256 = "a77fe03ddc7d9af2757e79fe3c2a262149184d794865abb94d1f5162bed462c3"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/hunk_boundary_context.lua"
+baseline_blob = "225e16ad08a1e99a27ba9158deea727235de812f"
+baseline_sha256 = "a96403b7193f0151b96a8312995640ba08cc1386f7dc3fa90c78268dbb7f6af3"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/native_syntax_bypass.lua"
+sha256 = "a96403b7193f0151b96a8312995640ba08cc1386f7dc3fa90c78268dbb7f6af3"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/ignored_path_store.lua"
+baseline_blob = "ad97b49b17efb63721625832551ced22c972cf3f"
+baseline_sha256 = "94c113e9c9ee19d3360b670e9d2136bde7895cbf6c9be4ba1557b09c53fad649"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_native.lua"
+sha256 = "94c113e9c9ee19d3360b670e9d2136bde7895cbf6c9be4ba1557b09c53fad649"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/ignored_status_actions.lua"
+baseline_blob = "e2fa550081cbc54b3e71841de5be531e468cb26f"
+baseline_sha256 = "b6b4944abc8a5de5d4d796a177fb09d640598c35a093349f9fe1c7be2c1f6712"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_host.lua"
+sha256 = "b6b4944abc8a5de5d4d796a177fb09d640598c35a093349f9fe1c7be2c1f6712"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/index_mutation.lua"
+baseline_blob = "5faf3a3635fd4ca5920fc0a0239ce0e1b7ab9a69"
+baseline_sha256 = "66c1c83061f062e22c98bb08cd88e1f1c4ee0ba1b0550a7ba0dc941143d42919"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/index_mutation.lua"
+sha256 = "66c1c83061f062e22c98bb08cd88e1f1c4ee0ba1b0550a7ba0dc941143d42919"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/index_mutation_real_git.lua"
+baseline_blob = "9c20daf7fa57c5d1e48f5c093a86dda069f26673"
+baseline_sha256 = "9b692ca5caf3a2799f0bba24ba6d6b5b1daf03431dd63efab57741023f488829"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/index_mutation_real_git.lua"
+sha256 = "9b692ca5caf3a2799f0bba24ba6d6b5b1daf03431dd63efab57741023f488829"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/intraline_diff.lua"
+baseline_blob = "7151c4cc8a3e459ee536725158d2d6f0269cc494"
+baseline_sha256 = "fa9a32362abbdd9f59a6a0806853a3e17978907fbf10d6125576ca04d4336dda"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/intraline_diff.lua"
+sha256 = "fa9a32362abbdd9f59a6a0806853a3e17978907fbf10d6125576ca04d4336dda"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/inventory.lua"
+baseline_blob = "a9a9736c45374b76e5f909a976c303f3fbadce40"
+baseline_sha256 = "d8b4d26a813c2f79f21f6b7d81d0b6123f954b5cf183384700065fe1b734009a"
+capture_provenance = "baseline_bytes"
+destination = "nvim/rust/forge/crates/forge-review/src/inventory.rs"
+sha256 = "d8b4d26a813c2f79f21f6b7d81d0b6123f954b5cf183384700065fe1b734009a"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/markdown_math_dependency.lua"
+baseline_blob = "93547e50f907f8f02a8036fb2e90e49edf18b4c8"
+baseline_sha256 = "60282986ad3c580b2d14bb39f5f87dad9186edb615ffbe5bc2bd1daacbe48a5b"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/markdown_math_dependency.lua"
+sha256 = "60282986ad3c580b2d14bb39f5f87dad9186edb615ffbe5bc2bd1daacbe48a5b"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/markdown_math_render.lua"
+baseline_blob = "3ec34108f0086d7e20110820f0477be55c037c02"
+baseline_sha256 = "bcf001a430016a1be5c530fcffdf35f35b0e4191b18b3836884956dcb94b13ed"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/markdown_math_render.lua"
+sha256 = "bcf001a430016a1be5c530fcffdf35f35b0e4191b18b3836884956dcb94b13ed"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/markdown_parser_reconcile.lua"
+baseline_blob = "cbc5869b5ede3ea632a8f09fd08999b5aa7d192b"
+baseline_sha256 = "dcf58672016539cb5d46df2145e1b9278ace8e3415f69a5015f6658cd6254f3a"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/native_pr_runtime_boundary.lua"
+sha256 = "dcf58672016539cb5d46df2145e1b9278ace8e3415f69a5015f6658cd6254f3a"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/mock_backend.lua"
+baseline_blob = "1386d0f158b22f6a31cce12e123cc8d214b9b4c4"
+baseline_sha256 = "79cc940e091d3fd9d3ac06b054dcfb17cebe26da6d049dc485e6e7d28f724e7d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/mock_backend.lua"
+replacement_coverage = [
+  "nvim/tests/forge/status_native.lua",
+  "nvim/tests/forge/status_host.lua",
+  "nvim/tests/forge/native_syntax_bypass.lua",
+  "nvim/tests/forge/syntax_resource_acceptance.lua",
+  "nvim/tests/forge/native_git_write.lua",
+  "nvim/tests/forge/index_mutation_real_git.lua",
+]
+sha256 = "79cc940e091d3fd9d3ac06b054dcfb17cebe26da6d049dc485e6e7d28f724e7d"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/mutation_coordinator.lua"
+baseline_blob = "01b9f987acfd17a176be5edc7290b6179ba90fa5"
+baseline_sha256 = "d835121ed992a96e8aa10d8eec3d1573120d70f7606f8166b3ad622982a44513"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/mutation_coordinator.lua"
+sha256 = "d835121ed992a96e8aa10d8eec3d1573120d70f7606f8166b3ad622982a44513"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/operation_journal.lua"
+baseline_blob = "f4c6edf4334d7fbcea549c5a68a6b0eae871e44d"
+baseline_sha256 = "03482a2bed18d08156ee82a6ca74e97ce732a0bc86aea7c27a5fa3a897d80e9e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/native_git_write.lua"
+sha256 = "03482a2bed18d08156ee82a6ca74e97ce732a0bc86aea7c27a5fa3a897d80e9e"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/perf.lua"
+baseline_blob = "1484e3c1cbb6380e76379fc2c62b21576c2658de"
+baseline_sha256 = "d3b2d8748f5306803db53c9bf0f9a37b90e67bad34d6be6262e37dd5abcd6fe2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/perf.lua"
+sha256 = "d3b2d8748f5306803db53c9bf0f9a37b90e67bad34d6be6262e37dd5abcd6fe2"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/permissions.lua"
+baseline_blob = "cc89edec66dc9496d3a6f348f8b3ae3351498f45"
+baseline_sha256 = "f6a646b46f16d9074f4cca684d19b65092910b37b9d15576ec5fa0191bcf18b2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/permissions.lua"
+sha256 = "f6a646b46f16d9074f4cca684d19b65092910b37b9d15576ec5fa0191bcf18b2"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/picker.lua"
+baseline_blob = "12ba3b900c9926f664d37d794f4109e8a1a5ae27"
+baseline_sha256 = "642b52e335780efc7b7de17b0a80480e3fa51143205a829c5f3844f287fb8046"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/picker.lua"
+sha256 = "642b52e335780efc7b7de17b0a80480e3fa51143205a829c5f3844f287fb8046"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_execution_timeline.lua"
+baseline_blob = "d1e18b73199221e4c617fd117401595a3532dea2"
+baseline_sha256 = "186311d81b70b32e4ded8e6819f2e900437174e7812426cc74a0eb2298c090d2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_execution_timeline.lua"
+sha256 = "186311d81b70b32e4ded8e6819f2e900437174e7812426cc74a0eb2298c090d2"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_file_tree.lua"
+baseline_blob = "5d2dbda9ce0873cb5c61c3a7b79e06b7a7c788ef"
+baseline_sha256 = "7e723de0ced4e6fb617c2b524f3ac22a2a40fdc4dbc08a1e7fcf910b439f9e76"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_file_tree.lua"
+sha256 = "7e723de0ced4e6fb617c2b524f3ac22a2a40fdc4dbc08a1e7fcf910b439f9e76"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_question.lua"
+baseline_blob = "11c7532e7fa5861c5132bbaeef62d31eaa5a5572"
+baseline_sha256 = "3bd744a9a984abe55ce1f37bd580eeea8a8cf01f2dac34f0d42b152b1621eea5"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_question.lua"
+sha256 = "3bd744a9a984abe55ce1f37bd580eeea8a8cf01f2dac34f0d42b152b1621eea5"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_resolution.lua"
+baseline_blob = "e4474b499e6b63d2aadac5aaae5df6d594bd9487"
+baseline_sha256 = "aa774052fdf9bb1d18a05adc30e1b8d5c5fbccdb36837c6255562759f8ce34f3"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_resolution.lua"
+sha256 = "aa774052fdf9bb1d18a05adc30e1b8d5c5fbccdb36837c6255562759f8ce34f3"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_review_comment.lua"
+baseline_blob = "e091bff338793c2bedf65296b159980530020d7a"
+baseline_sha256 = "8730103ed7ac1671c70b906693bf723842dadbd6bd8a056659396b9bffe8c8d0"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_review_comment.lua"
+sha256 = "8730103ed7ac1671c70b906693bf723842dadbd6bd8a056659396b9bffe8c8d0"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_review_entity_info.lua"
+baseline_blob = "915eb621950f98c98f1821a6003b653b90e90534"
+baseline_sha256 = "14039597bd53edd69cfcf572b6d7922dff9df337f7465feb917f63292429f8b8"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_review_entity_info.lua"
+sha256 = "14039597bd53edd69cfcf572b6d7922dff9df337f7465feb917f63292429f8b8"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_review_entity_navigation.lua"
+baseline_blob = "ae327a48a84f238ced841c4e14c803747c278ce9"
+baseline_sha256 = "68dc20429b13218ca0c1b40210c5074c3603519c95f8ca6a44945222af4f9bab"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_review_entity_navigation.lua"
+sha256 = "68dc20429b13218ca0c1b40210c5074c3603519c95f8ca6a44945222af4f9bab"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_review_entity_rename.lua"
+baseline_blob = "7b42d82ff128afaf3bb804cb97d5955205f14703"
+baseline_sha256 = "8c7247e6df55f4d3d124b06a1fe720733d29d8f9a0a4a7e5e03e876d5a22a96b"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_review_entity_rename.lua"
+sha256 = "8c7247e6df55f4d3d124b06a1fe720733d29d8f9a0a4a7e5e03e876d5a22a96b"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_review_rustdoc.lua"
+baseline_blob = "c6539b3a5dc35b41a3ade85384aedf90afecf606"
+baseline_sha256 = "c485d7b0af652525195c2938cf9eb9bec356427746d1ed392e3722dcad38332d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_review_rustdoc.lua"
+sha256 = "c485d7b0af652525195c2938cf9eb9bec356427746d1ed392e3722dcad38332d"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_task_model.lua"
+baseline_blob = "903300c7a2021e20ce77bbb2237c9fdcc134dc13"
+baseline_sha256 = "2b4a11331f02ba584c933866e75d96a0ff2e123575cfdcea243938c13b88da62"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_task_model.lua"
+sha256 = "2b4a11331f02ba584c933866e75d96a0ff2e123575cfdcea243938c13b88da62"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_task_model_entity_reference.lua"
+baseline_blob = "d84c324eadb7406f6d4c60765dfa26fd2eb13e43"
+baseline_sha256 = "6562a40ed5c89eeda379415fcff0dc753bf4ad88494787d5b9693a4b5476fa9a"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_task_model_entity_reference.lua"
+sha256 = "6562a40ed5c89eeda379415fcff0dc753bf4ad88494787d5b9693a4b5476fa9a"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plan_uml_style.lua"
+baseline_blob = "5bed55fe8c304230f8419d2dd69b778431d73a3c"
+baseline_sha256 = "030c269bba50803332508e46db14837e29a2f71a35a276d2d5506fb953c01b55"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/plan_uml_style.lua"
+sha256 = "030c269bba50803332508e46db14837e29a2f71a35a276d2d5506fb953c01b55"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plans/harness-owned-agents.md"
+baseline_blob = "32aa31da3f55c342590ae9256b5d1c39172cc864"
+baseline_sha256 = "eb9cbb709a97a6660fdb557455b4641dc077ffff3ef4c4afe05cf757cc1666aa"
+capture_provenance = "baseline_crlf"
+destination = "nvim/tests/forge/plans/harness-owned-agents.md"
+sha256 = "b2dce72bb94f3b212c4d22fb599c99ecfec6130ff06905e651a9e312fb13d391"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plans/mcp.md"
+baseline_blob = "9e751a46152a46eec5a39f4976d40e7c1eed2191"
+baseline_sha256 = "1df7169c1252f563d77db5079b8ac2c46c835ebe08216fda39b6e22349c26e1a"
+capture_provenance = "baseline_crlf"
+destination = "nvim/tests/forge/plans/mcp.md"
+sha256 = "1a8fe8ad7000ce8f5a61ddeb557a7096639873b2d671438cadb1e0fababd6448"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/plans/sandbox.md"
+baseline_blob = "e19ac7a5d4c24d11d596ca31100ab4c94f9eef8f"
+baseline_sha256 = "204840e92c476796357f4e9452935e18df62f303b58e51b7c2bd3f581fc2f22c"
+capture_provenance = "baseline_crlf"
+destination = "nvim/tests/forge/plans/sandbox.md"
+sha256 = "cf5a930f7a773163b8d1c544b78ce33182116de403170c6bd94b2dc7a15599f6"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/popup_window.lua"
+baseline_blob = "692b0b9783ef6929ce0258b12c1bdd1dec0cf0de"
+baseline_sha256 = "7cc34600f26f4b7cd82039bc4da7fd2293aaf3883066caf5364736486207bd37"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/popup_window.lua"
+sha256 = "7cc34600f26f4b7cd82039bc4da7fd2293aaf3883066caf5364736486207bd37"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/pr_edit.lua"
+baseline_blob = "d8aa3139e5eaaa47ae7d8d14e7a4496b30fc0e8b"
+baseline_sha256 = "322d63198b1bf43fe1fd75fc39b179aefabc8b2e1a7c5ae8aba9eef473d23840"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/pr_entry_cutover.lua"
+sha256 = "322d63198b1bf43fe1fd75fc39b179aefabc8b2e1a7c5ae8aba9eef473d23840"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/pr_review.lua"
+baseline_blob = "dd8f50e938f5a8e052db62e801b0a43da5919d63"
+baseline_sha256 = "47115eddff1bdcb32a469e7de9ad739fdaae213f39b3ec076e4328141c3e4b6a"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/pr_entry_cutover.lua"
+sha256 = "47115eddff1bdcb32a469e7de9ad739fdaae213f39b3ec076e4328141c3e4b6a"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/pr_syntax.lua"
+baseline_blob = "025fb7aa1461d5d5db5729fcee8e23bd49d3fe78"
+baseline_sha256 = "2982faf0e0537ca4b95e001acf50f12ea507abcf7af44e451b02eccaabea664c"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/native_syntax_bypass.lua"
+sha256 = "2982faf0e0537ca4b95e001acf50f12ea507abcf7af44e451b02eccaabea664c"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/process_stdio.lua"
+baseline_blob = "0ae3ef2f60102928c44fcdde66783966f0a73095"
+baseline_sha256 = "e89696ac38136290e8e8ce281ee15e9fb74068f6a693000f400af40a90d5a340"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/process_stdio.lua"
+replacement_coverage = [
+  "nvim/tests/forge/windows_ui_parity.lua",
+  "nvim/tests/forge/client_initialize_host.lua",
+  "nvim/tests/forge/status_host.lua",
+  "nvim/tests/forge/status_native.lua",
+  "nvim/tools/forge_soak.nu",
+]
+sha256 = "e89696ac38136290e8e8ce281ee15e9fb74068f6a693000f400af40a90d5a340"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/section_map_reducer.lua"
+baseline_blob = "f8e5cbc0fd8d85971f453fe089cd59bf9e4bf734"
+baseline_sha256 = "3b935ccb4d2a584a62fa6e0a74a1995e76f994aa4ab613b6052d829004795534"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_native.lua"
+sha256 = "3b935ccb4d2a584a62fa6e0a74a1995e76f994aa4ab613b6052d829004795534"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/session_picker.lua"
+baseline_blob = "97c7bc183199cc830cbac5ef87d876876275a8b6"
+baseline_sha256 = "dd3bb6ebe7599bb0f2d793d47e64ab72fd97141110889d9cd389cacee35b2f55"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/session_picker.lua"
+sha256 = "dd3bb6ebe7599bb0f2d793d47e64ab72fd97141110889d9cd389cacee35b2f55"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/staged_rust_syntax.lua"
+baseline_blob = "d87c489f8220a34c62dc3535668574f78d82c750"
+baseline_sha256 = "071eb98166a25a661ff0fb93e2e8772065e9600e25361dd2053c54a9ef820901"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/native_syntax_bypass.lua"
+sha256 = "071eb98166a25a661ff0fb93e2e8772065e9600e25361dd2053c54a9ef820901"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/status_flows.lua"
+baseline_blob = "bd30d324c18e88848bced78db6f08d587fec7c2d"
+baseline_sha256 = "e668500e04a4ca87b9b178eaa2ef362dfaeffbc68777b9558c279960e55944fa"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_host.lua"
+sha256 = "e668500e04a4ca87b9b178eaa2ef362dfaeffbc68777b9558c279960e55944fa"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/status_intraline_render.lua"
+baseline_blob = "9fea3651d6afc5b24d017b16e5ffb66c4e932d05"
+baseline_sha256 = "f562b0bda76c7c3eee77e91e03529b1f7bbef4eb6c29fe2539af7d911cec8c0d"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_native.lua"
+sha256 = "f562b0bda76c7c3eee77e91e03529b1f7bbef4eb6c29fe2539af7d911cec8c0d"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/status_issues.lua"
+baseline_blob = "3e56b1b0d46b7a677a7f2b88226bcaa8bef42a73"
+baseline_sha256 = "cbe2d2b4fe2141ed9b8e7e83ffa52cade6460f7f9426c611529167cde9b7bf12"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_context.lua"
+sha256 = "cbe2d2b4fe2141ed9b8e7e83ffa52cade6460f7f9426c611529167cde9b7bf12"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/status_line_reconcile.lua"
+baseline_blob = "84cb5469145d8dc590abdc827abecd5d18e74a99"
+baseline_sha256 = "a5731222589e950eee448f389ee27ca1657337314b7b6042b447955cd3a90936"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_native.lua"
+sha256 = "a5731222589e950eee448f389ee27ca1657337314b7b6042b447955cd3a90936"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/status_size_gate.lua"
+baseline_blob = "f8839734aa8fead2d9f9ed3b44b617fa7c72dd25"
+baseline_sha256 = "6f8364e1d6c4cf63075594b27843ea012c0cc6ea849e0106132777046057f3b2"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_native.lua"
+sha256 = "6f8364e1d6c4cf63075594b27843ea012c0cc6ea849e0106132777046057f3b2"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/status_snapshot.lua"
+baseline_blob = "c208bba8400c7926442ab051f8986f349abd2073"
+baseline_sha256 = "70a533ad6c976c4db97baee8982808e5d554eec6103d549ffd65df455c0b0799"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_native.lua"
+sha256 = "70a533ad6c976c4db97baee8982808e5d554eec6103d549ffd65df455c0b0799"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/status_virtual_hunk_merge.lua"
+baseline_blob = "045ebb86441053be10aa74c4c874b6477d40ca12"
+baseline_sha256 = "32faa315dfc71e6aab6a6785bc51eb0a99ffd05c423f7fbdf1759efb8bbc205c"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/status_virtual_hunk_merge.lua"
+sha256 = "32faa315dfc71e6aab6a6785bc51eb0a99ffd05c423f7fbdf1759efb8bbc205c"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/syntax_rerender.lua"
+baseline_blob = "4dba47cb95d52c3c346b30a371a300831f7fbc61"
+baseline_sha256 = "06a59b6df678dce6e8eb0f6275c866f3419f1a5da4df5e58481a9519c9b53e24"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/syntax_rerender.lua"
+sha256 = "06a59b6df678dce6e8eb0f6275c866f3419f1a5da4df5e58481a9519c9b53e24"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/task_tree.lua"
+baseline_blob = "175fcd7ff893500380d4ca42f91ddf4991d1e082"
+baseline_sha256 = "5c61db961b1bbb906c8a218cb9e8ef0b60e0fcacfdd30abcd56de324c95f571b"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/task_tree.lua"
+sha256 = "5c61db961b1bbb906c8a218cb9e8ef0b60e0fcacfdd30abcd56de324c95f571b"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/timeline_cache.lua"
+baseline_blob = "60f83893c4d0967b79a4f41643a662143639db6b"
+baseline_sha256 = "fc1e06987dbdd6cf16b2e57d0694c86ebd7850ce3d7d9c852b0d577ee73fc9aa"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/timeline_cache.lua"
+sha256 = "fc1e06987dbdd6cf16b2e57d0694c86ebd7850ce3d7d9c852b0d577ee73fc9aa"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/timeline_status.lua"
+baseline_blob = "2ee157622236cf4a7e0b76059c6a6617b84402fe"
+baseline_sha256 = "618d50cf256027afa821e089cb9da0c53c430e5a9d19a3b48747aafe6cbebf32"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/timeline_status.lua"
+sha256 = "618d50cf256027afa821e089cb9da0c53c430e5a9d19a3b48747aafe6cbebf32"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/treesitter_context.lua"
+baseline_blob = "fb1bfba023f24263c92266a2f0289d077d94651c"
+baseline_sha256 = "b95708784a37c0234cc945b36be6c54435ae9a4bd7346f2bdc09b9fa58f45792"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/treesitter_context.lua"
+sha256 = "b95708784a37c0234cc945b36be6c54435ae9a4bd7346f2bdc09b9fa58f45792"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/unmerged_commits.lua"
+baseline_blob = "b881128f8f79fe9bebc8034e3a6d86cee4de4dfe"
+baseline_sha256 = "818e7168d1a6fa59b257f80508b38d8358010d2cc96c44b62fb135294c031f3f"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/native_git_write.lua"
+sha256 = "818e7168d1a6fa59b257f80508b38d8358010d2cc96c44b62fb135294c031f3f"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/visual_selection.lua"
+baseline_blob = "659c88d47a4d81c15df7e4986abc608cbe98fbd5"
+baseline_sha256 = "e12e08ed4b2f5ce9d0a9dc078126f5314c27b4f75a214931dc49201f56f0b20e"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/local_edit_patch.lua"
+sha256 = "e12e08ed4b2f5ce9d0a9dc078126f5314c27b4f75a214931dc49201f56f0b20e"
+gate = "name"
+
+[[source]]
+source = "nvim/tests/diff_review/walkthrough.lua"
+baseline_blob = "7b453545da0860d74940f97ef883a704b441347b"
+baseline_sha256 = "3b1843aa0c78965b88a00d747a3ef46ca127996e512b7b3057c68fc996813b77"
+capture_provenance = "baseline_bytes"
+destination = "nvim/tests/forge/walkthrough_adapter.lua"
+sha256 = "3b1843aa0c78965b88a00d747a3ef46ca127996e512b7b3057c68fc996813b77"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/github/comment_rows.lua"
+baseline_blob = "1b05570d79a1d4b67a8ec7c20baa0207afba333a"
+baseline_sha256 = "e3d705f8daf64984b7fc0139bf0bec79ae4bc0078f2b44f25bb612a1dcaa000a"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/comment_rows.lua"
+sha256 = "e3d705f8daf64984b7fc0139bf0bec79ae4bc0078f2b44f25bb612a1dcaa000a"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/gh.lua"
+baseline_blob = "f2ad51bfcdc3b0e0c560b43bae1987f39c5825c6"
+baseline_sha256 = "df5f8401e673d16293b315bfaa7d7c448b01630509dd936747c4a39625306871"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/gh.lua"
+sha256 = "df5f8401e673d16293b315bfaa7d7c448b01630509dd936747c4a39625306871"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/issue_create.lua"
+baseline_blob = "54e917ec1f5a52d03ebdab613fbf2321f74dc153"
+baseline_sha256 = "abcdb2f119262c940e1953eca7b58e4f7b5f4fa9f5bf488a845072134a21fb0a"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/issue_create.lua"
+sha256 = "abcdb2f119262c940e1953eca7b58e4f7b5f4fa9f5bf488a845072134a21fb0a"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/issue_index.lua"
+baseline_blob = "2fc815f29ef7bd3b10c5cb9fb39a420efe438efa"
+baseline_sha256 = "26b1eea3637623a8262ee556bed6c1a3f67f97eba18307d2f0617ba17964cd0a"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/issue_index.lua"
+sha256 = "26b1eea3637623a8262ee556bed6c1a3f67f97eba18307d2f0617ba17964cd0a"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/issue_index_builder.lua"
+baseline_blob = "e9aa8ac6bbc486d668a55d22d0e67f0b0e2bf39a"
+baseline_sha256 = "7e822dfb1666f647218bf7f4d9c8f2d3abdaa14ec5620267f8163897035b35f5"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/forge/builder.lua"
+sha256 = "7e822dfb1666f647218bf7f4d9c8f2d3abdaa14ec5620267f8163897035b35f5"
+mode = "replacement"
+gate = "github_storage"
+
+[[source]]
+source = "nvim/lua/github/issue_source.lua"
+baseline_blob = "61a1c5f88d799e4e359f1312395471d2957a643a"
+baseline_sha256 = "cd57beee13930b8e6a2d01004fae62a7bded31eb4050fb3df3b8cd540a83408a"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/issue_source.lua"
+sha256 = "cd57beee13930b8e6a2d01004fae62a7bded31eb4050fb3df3b8cd540a83408a"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/issue_view.lua"
+baseline_blob = "9a46bc8f909834f10278e0d9219ab0790860387f"
+baseline_sha256 = "e6741655657ae0895e6abdb8d2fddbbe17f9599c971ca6cb94229e403f1e8d88"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/issue_document.lua"
+sha256 = "e6741655657ae0895e6abdb8d2fddbbe17f9599c971ca6cb94229e403f1e8d88"
+mode = "replacement"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/link.lua"
+baseline_blob = "cc8ee1de8738c63b35c80f10eb62cffb6b8eddae"
+baseline_sha256 = "a6e7905f1b2265b97abdd3e299a012c3a5378369071eea7b666bf9cc4cf13c57"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/link.lua"
+sha256 = "a6e7905f1b2265b97abdd3e299a012c3a5378369071eea7b666bf9cc4cf13c57"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/notifications.lua"
+baseline_blob = "036ddba730e96f9643705eb5818f04bba56a9fa6"
+baseline_sha256 = "7994cbd37d57738c31f75765af9f8f465c580b84200d784dee90cd9392502429"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/notifications.lua"
+sha256 = "7994cbd37d57738c31f75765af9f8f465c580b84200d784dee90cd9392502429"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/open_pr.lua"
+baseline_blob = "b2ca323f184ffb70f0e1b930e212fcccfef67326"
+baseline_sha256 = "44c1906b69845f9bd19cfd70b487033ec65a48a8010306b80c3d3be3a056ac62"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/open_pr.lua"
+sha256 = "44c1906b69845f9bd19cfd70b487033ec65a48a8010306b80c3d3be3a056ac62"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/pickers.lua"
+baseline_blob = "cdeed23cb0f8bc046088013f5753adc8a66f66dd"
+baseline_sha256 = "e3264eb1e41fd3d2963741769b5cb4547066902630b54e69bb60f8669308262d"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/pickers.lua"
+sha256 = "e3264eb1e41fd3d2963741769b5cb4547066902630b54e69bb60f8669308262d"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/repo_cache.lua"
+baseline_blob = "18531e9bda28691bba68576877a584bc9558c0b1"
+baseline_sha256 = "10056215d0b39fff786a0542471862128da982700a69f7ad783c2735c2c5ce66"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/repo_cache.lua"
+sha256 = "10056215d0b39fff786a0542471862128da982700a69f7ad783c2735c2c5ce66"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/github/repo_users.lua"
+baseline_blob = "46f5a3cf47e56e961deff830ce693414bff4c46b"
+baseline_sha256 = "170a3d414db7b23c2b45ee9044954a24e6c0b4e4ebcf9fd12803cd49dfc3de27"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/github/repo_users.lua"
+sha256 = "170a3d414db7b23c2b45ee9044954a24e6c0b4e4ebcf9fd12803cd49dfc3de27"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/plugins/diff_review.lua"
+baseline_blob = "25a05d4ae1640e88e7692047253ef7252d09e995"
+baseline_sha256 = "4a2ac5a5b25d4e28c0ab60164cf68fbb7ef2caca5d276754665fe63480e0ecec"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/plugins/forge.lua"
+sha256 = "4a2ac5a5b25d4e28c0ab60164cf68fbb7ef2caca5d276754665fe63480e0ecec"
+mode = "relocation"
+gate = "name"
+
+[[source]]
+source = "nvim/lua/plugins/github.lua"
+baseline_blob = "b74328562b75e0e8db7c1d2a9557ffb24adfd68c"
+baseline_sha256 = "f4b1dc5e6fd602fc6ee9b074a29b72061acac5836eaacd680e84208799a3c381"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/plugins/github.lua"
+sha256 = "f4b1dc5e6fd602fc6ee9b074a29b72061acac5836eaacd680e84208799a3c381"
+mode = "in_place"
+gate = "native_ownership"
+
+[[source]]
+source = "nvim/lua/rust_sidecar/init.lua"
+baseline_blob = "0a63f62e1cbfc0ea9bf6bb52a08b2c33a8be7522"
+baseline_sha256 = "4e1b356a1ecac66d99c67d1a91538338834abc4f2313c17255e085a0f1e390dd"
+capture_provenance = "baseline_reference"
+destination = "nvim/lua/rust_sidecar/init.lua"
+sha256 = "4e1b356a1ecac66d99c67d1a91538338834abc4f2313c17255e085a0f1e390dd"
+mode = "in_place"
+gate = "native_ownership"

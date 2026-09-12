@@ -1,0 +1,21 @@
+[package]
+name = "forge-review"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.94"
+license = "MIT"
+
+[dependencies]
+anyhow = "1.0"
+forge-buffer = { path = "../forge-buffer" }
+forge-diff = { path = "../forge-diff" }
+forge-github = { path = "../forge-github" }
+forge-git = { path = "../forge-git" }
+serde = { version = "1.0", features = ["derive", "rc"] }
+serde_json = "1.0"
+tokio = { version = "1.48", features = ["macros", "rt", "sync", "time"] }
+uuid = { version = "1.18", features = ["v4"] }
+
+[dev-dependencies]
+tempfile = "3.23"
+tokio = { version = "1.48", features = ["rt-multi-thread", "test-util"] }

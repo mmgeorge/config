@@ -22,7 +22,7 @@ A `render/` module must never require a `views/` module. A view must not depend 
 ### Package Directory Layout
 
 ```text
-diff_review/
+forge/
 ├── init.lua            Thin public API facade (setup, open*, get)
 ├── session.lua         Shared mutable session state (requires no dependencies)
 ├── types.lua           Type annotations (---@class, ---@alias, never required at runtime)
@@ -41,15 +41,15 @@ diff_review/
 `init.lua` serves exclusively as the public API facade. It must remain small (~250 lines) and avoid bulk re-export loops.
 
 ```lua
-local config = require("diff_review.infra.config")
-local commands = require("diff_review.views.commands")
-local git_backend = require("diff_review.git.git_backend")
+local config = require("forge.infra.config")
+local commands = require("forge.views.commands")
+local git_backend = require("forge.git.git_backend")
 
 local M = {}
 
 function M.setup(opts)
   M.config = config.setup(opts)
-  require("diff_review.views.status.state").register_view_controllers()
+  require("forge.views.status.state").register_view_controllers()
 end
 
 M.open = commands.open
@@ -91,7 +91,7 @@ Complex interactive plugins often contain cyclic dispatch dependencies (such as 
 ```lua
 -- Lazy accessor breaking load cycle from keymaps to render_orchestrator
 local function render_orchestrator()
-  return require("diff_review.views.status.render_orchestrator")
+  return require("forge.views.status.render_orchestrator")
 end
 
 -- Call site invocation

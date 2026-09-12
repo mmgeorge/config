@@ -1,0 +1,684 @@
+---
+globs:
+  - 'nvim/lua/forge/**/*'
+  - 'nvim/tests/forge/**/*'
+  - 'nvim/lua/plugins/forge.lua'
+  - 'nvim/lua/rust_sidecar/**/*'
+  - 'nvim/rust/forge/**/*'
+---
+
+# Forge Plugin Rules
+
+## Manual Rust Builds
+
+The agent or developer changing Forge owns rebuilding its Rust executable. After
+editing Rust sources, Cargo manifests or lockfiles, bundled grammars or queries,
+protocol definitions, or other compiled inputs under `nvim/rust/forge`, rebuild
+before runtime verification and before reporting the task complete. `cargo check`
+and `cargo test` do not replace building the executable Neovim launches.
+
+Use `require("forge.builder").build_command()` to resolve the manual Cargo command
+and `require("forge.builder").binary_path()` to identify the runtime artifact.
+The default profile is `release` for development, runtime verification, and profiling.
+Set `vim.g.forge_build_profile` before Forge loads only when explicitly testing a
+different profile. Cargo output belongs under
+`stdpath("cache")/rust-sidecar/forge/build`, not the crate's default `target`
+directory. Pass `--bin forge --locked` and the selected profile. Invoke Cargo
+with `nvim/rust/forge` as its working directory so Cargo selects that directory's
+`rust-toolchain.toml`. In this Windows checkout the default command is:
+
+```text
+cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --profile release --bin forge --locked
+```
+
+Resolve the cache directory from Neovim on other machines. Run the build with the
+same inherited Cargo configuration used for that artifact directory. Verify the
+rebuilt executable in a fresh test host and report the command, timeout, exit
+status, and artifact path. Existing hosts retain their process-owned executable
+copy until shutdown, so they do not adopt a rebuild automatically.
+
+Forge startup must never compile, scan compiler inputs, compare source freshness,
+compute executable fingerprints, or maintain build receipts. It launches the
+already-built executable and reports a missing artifact with manual build
+instructions. Keep protocol handshake validation. Do not add automatic rebuilds
+or fallback executables when protocol versions differ.
+
+
+Keep `nvim/lua/forge/docs/architecture.md` up to date when changing Forge subsystem boundaries, data flow, buffer types, render pipelines, state ownership, or cross-module invariants. The Rulesync rule directs agent workflows, while the architecture document explains system structure and ownership boundaries.
+
+Forge is a standalone local Neovim plugin. Trouble must not own this
+feature: do not place Forge code under `trouble/sources`, do not register a
+`forge` Trouble mode, and do not route `:ForgeStatus` through Trouble.
+
+The public commands are `:ForgeStatus`, `:ForgeBranchDiff <branch>` (read-only diff
+of the working tree against a branch or revision),
+`:ForgeBranchDiffFile <file> <branch>` (same, limited to one file), and
+`:ForgeFileRevision <file> <commit>` (read-only buffer with the file's content at
+a revision), `:ForgeDiffCompactPreview`, `:ForgeHarness`, `:ForgeHarnessNew`,
+`:ForgeHarnessLog`, and `:ForgePermissions`,
+registered by `nvim/lua/plugins/forge.lua`. The plugin
+entrypoints are `require("forge").open()`,
+`require("forge").open_branch_diff(branch, { file = ... })`, and
+`require("forge").open_file_revision(file, rev)`, plus the corresponding
+Harness open functions on the same facade.
+
+Harness keeps Lua presentation state in `session.harness` and durable state in
+`nvim/rust/forge/crates/forge-harness`. The executable entrypoint lives in
+`nvim/rust/forge/src/main.rs`. Keep the Rust crate feature-first. Use the
+`broker`, `session`, `plan`, `goal`, `interaction`, `checkpoint`, `backend`,
+`storage`, `workspace`, `protocol`, and `control_tools` directories. Do not add
+generic `application`, `domain`, or `ports` layers.
+
+Only the Harness transcript window owns the winbar. Clear the composer winbar.
+Start the transcript winbar with `Read` or `Write`, omit the redundant Harness
+title and trust-profile suffix, then name the underlying CLI/provider and
+resolved runtime model rather than only the adapter kind or configured `default` sentinel.
+Resolve the Codex default through `model/list`, persist `provider_label` and
+`resolved_model` on the Harness session, and show an explicit resolving state
+until provider metadata arrives. Stream provider events into the transcript
+before the final response, but discard Codex `userMessage` lifecycle echoes
+because the broker already records each admitted user action.
+
+Render every explicit assistant delta and tool lifecycle update on the Neovim
+main loop without coalescing distinct provider events into one visual frame.
+Never classify arbitrary lifecycle string fields as assistant prose. Route
+token-usage notifications into final turn metadata. Render user prompts with
+`>` and aligned continuation rows, omit `You` and `Assistant` labels, indent
+assistant Markdown, and replace the streaming `▸ Thinking…` marker with
+`▸ Thought for <duration>, <tokens>` at completion. Guard snapshots with a
+transcript revision so initialization and state reconciliation cannot flash an
+older empty transcript over optimistic or streamed content.
+
+Normalize each provider tool lifecycle by its stable call ID. Keep complete
+tool output in durable state, but render commands as one Codex-style preview:
+the command, first output line, folded middle-line count, and last output line.
+`oa` expands the native fold to show every real output row. While any request
+runs, append a transient `Working (Ns)` row, update it once per second, keep the
+transcript at the tail unless the user is actively inspecting it, and remove
+the row without persisting it when the request finishes.
+
+Map `Shift-Tab` in both normal and insert mode to toggle Read and Write through
+the durable broker `mode.set` method. Queue a busy-turn toggle for the next safe
+boundary and mark the pending winbar mode with `*`. Preserve the explicit
+confirmation before enabling Write without Git checkpoints.
+
+Every `/plan` result must stop in a physical editable `PlanReview` file before
+execution. Accept only an explicit `harness_plan_submit` result or a complete
+native plan artifact. `oY` accepts the exact saved digest and starts the visible
+`Complete the plan` goal. `oN` sends the full edited plan, its diff against the
+last model revision, and every extmark-anchored annotation back for revision.
+ACP planning should select a provider-advertised plan or architect mode through
+`session/set_mode` when one exists. The control-tool normalizer must recognize
+exact structured tool names, never names printed inside prose or command output.
+Copilot ACP does not advertise model selection. Retry an initial session's exact
+unsupported-model failure once through a fresh ACP process and session. Preserve
+established sessions and surface actionable provider model guidance instead of
+discarding their context, looping, or silently changing models.
+
+One Harness interaction starts with one admitted user action. Automatic goal
+continuations stay in that interaction until another user action starts the next
+record. Render admitted review actions separately from typed questions so prompt
+navigation remains exact. Keep the 20-total-turn limit and the
+two-consecutive-no-progress guard. A tool call or workspace change resets the
+no-progress count. A failed backend turn pauses the goal before the client
+reconciles durable state, preventing an automatic retry loop.
+
+Native fork must remain capability gated. When the backend or ACP agent cannot
+fork, omit the mapping, hint, help entry, and action. Do not copy transcripts or
+offer a warning-confirm fallback.
+
+Pressing open on a deleted (left-side) diff line opens a file revision buffer
+(`ForgeFileRevision://<path>@<short sha>`, owned by `M._file_revision`) at the
+diff's base revision — index for unstaged hunks, HEAD for staged hunks, the
+branch for `:ForgeBranchDiff` views — where the old line number is exact. The
+buffer name carries the short sha of the underlying commit (HEAD's sha for the
+index, which is not a commit). The buffer is `nowrite` (not `nofile`, so
+buffer pickers list it), persists when hidden, closes on `q`, and shows a red
+winbar header while displayed. If the base content cannot be fetched, the
+operation notifies the Git failure and leaves the view unchanged. Do not ask for
+confirmation before opening. Avoid using `vim.fn.confirm` on open because it
+blocks on a key query (hangs headless). Trigger open via `<CR>` instead.
+
+In the PR view (`ogp`), the PR title and description are editable in place
+(`M._pr_edit`): the buffer is `acwrite`, and 'modifiable' follows the cursor
+— unlocked exactly while the cursor sits on the title line or inside the
+description block (regions tracked with extmarks), locked everywhere else,
+so every native editing command works in the regions. Unsynced fields show
+an inline `*` before their label. `:w` clears the markers immediately and
+syncs through `forge.review` and the `review.*` host document routes. Rust owns
+accepted revisions, submitted captures, and saved title/body baselines, using
+the same GithubService resource queue as PR lifecycle changes. Lua flushes
+region edits and waits for acknowledgements before a captured save. Native
+typing after that capture remains local until the save settles, then flushes
+as newer edits. Completion adopts only host baselines and must not render over
+newer native text. Empty descriptions contain an empty editable row, and raw
+description text preserves trailing rows and CR characters. Folded descriptions
+retain their field text without claiming adjacent generated rows. Uncertain
+results reconcile through the host without reposting. Failures
+notify and retain markers for text that remains unconfirmed. Do not restore
+Lua `gh pr edit` subprocesses or Lua-owned submitted baselines. Host document
+identities include a UUID for their service lifetime, preventing stale requests
+from addressing a replacement host's documents. Re-renders are blocked while
+edits are unsynced. Clean views remain interactive during their initial host read.
+
+The PR lifecycle row renders `DRAFT`, `OPEN`, or `CLOSED`. Activating its
+status value with the shared open action displays exactly the other two states
+in a keyboard chooser (`d`/`o`/`c`), with `q`/`<Esc>` cancelling. Route every
+transition through the PR edit queue and `github.pull_request` host route.
+Rust reads current remote state and retains one resource queue owner across
+reopen followed by draft or ready. A proven second-step rejection preserves
+the confirmed intermediate state. An uncertain write blocks further writes
+until read-only reconciliation succeeds. Lua requests that reconciliation,
+updates the observed label, and reports the original failure without retrying
+the mutation. Do not restore Lua GraphQL lifecycle sequencing.
+
+Branch PR discovery must list all PRs for the current head branch, not ask
+`gh pr view` to choose one. Sort by descending PR number, open the newest
+`OPEN` PR (draft or ready) automatically, and ignore older active candidates.
+If no active PR exists, retain the newest `CLOSED` PR and make `ogp` show a
+choice between opening that PR and creating a new draft PR. Ignore merged PRs
+for this fallback. `q`/`<Esc>` cancels without opening or creating anything.
+
+Pressing `or` in the status or PR view starts PR review mode
+(`M._review`, view_kind = "review", `M.open_review(pr, opts)`): the PR title,
+an editable review summary, and the changed files split into Unviewed/Viewed
+sections (files start expanded). This is the **normal batched review flow** —
+comments are drafted locally, synced deliberately, and submitted together:
+- `S`/`U` move the hunk/file under the cursor between the sections, while on
+  Unviewed/Viewed section headers they move the whole section.
+- `C` on a changed (diff body) line creates an empty inline editable comment
+  body and focuses it. `C` only creates comments. Entering an existing compact
+  comment with normal cursor movement promotes that exact occurrence to an
+  inline editor and makes its body editable automatically. Every unfocused
+  inline comment renders through `render/comment_box.lua` as compact real
+  status-buffer rows below its diff row. `section_builder.emit_anchored_comments` owns this dispatch for PR
+  Changes, expanded submitted Reviews, and batched review mode. Walkthroughs
+  call the same box-line builder through virtual lines because they remain readonly.
+  It resolves viewer-authored remote snapshots through the PR-owned editable
+  store before both box and editor rendering. Saved edits, reply threads, and
+  deletions must therefore survive every focus transition and re-render.
+  Only the occurrence entered by the cursor transforms into full-width buffer
+  rows: a read-only rule header, raw editable body rows, and a read-only rule
+  footer. Track that occurrence by its stable diff-entry ID, not its raw row,
+  because collapsing the previous editor shifts later rows. Saving keeps the
+  selected editor open. Moving the cursor outside its header, body, replies,
+  and footer clears that focus and restores the compact box. Header rules start
+  directly with the author/date, use dashes only between the left label and the
+  right-aligned line number, and do not have surrounding `--` frame markers.
+  Size header/footer rules to the window text area so they never overflow or
+  soft-wrap, and refresh those rule rows from shared display/resize handling
+  (`WinResized`/`VimResized` plus `BufWinEnter`). The review window enables soft
+  word wrap. Do not hard-wrap, reflow, prefix, or draw box sides into editable
+  body text. Measure box width in display cells, split unbroken text, preserve
+  same-anchor box order, and re-render compact rows on resize.
+- Inline replies in the PR overview (`view_kind = "pr"`) render inside their
+  parent comment box. Separate the parent and each reply with an internal
+  heading rule while preserving one outer top/bottom border for the full
+  thread. `R` stays bound across both compact and focused remote comment modes
+  and creates a real inline reply draft below the selected thread. The shared
+  comment dispatcher renders only that draft body as editable, `<C-s>` posts it
+  through GitHub's review-comment reply endpoint, and `J` discards it. Outside
+  an inline comment, `R` keeps its PR refresh behavior. Do not expose reply
+  creation in batched
+  review mode or walkthroughs.
+- Top-level PR conversation comments in the `Comments` section are foldable
+  list entries, not inline annotations. Render every comment closed by default
+  as one metadata/preview row. Normal cursor movement must never expand or
+  focus these comments. The shared open action (`o`, `<CR>`, or `.` by default)
+  expands the selected conversation comment, and `<Tab>` collapses it. A
+  manually opened comment stays open when the cursor leaves. Viewer-authored
+  bodies remain editable after opening, but they must not enter the inline
+  annotation focus or auto-collapse lifecycle.
+- `J` deletes the editable draft or viewer-authored inline comment under the
+  cursor. Remote deletions sync on `<C-s>` and remove the
+  identity from both flattened and submitted-review comment views.
+  `y`/`z` jump between full-width comments and compact box rows.
+- `b` on actual comment rows (header/body/footer) opens the GitHub comment
+  anchor, while adjacent diff rows keep their code-line anchors instead of borrowing
+  the nearby comment.
+- Unsynced comment creates/edits show `*` before the username in the comment
+  header. `<C-s>` clears the marker immediately and syncs dirty comments to the
+  pending GitHub review, and failures restore the marker.
+- `b` browses the PR changes tab. The submit key (`cc`) picks a verdict
+  (`vim.ui.select` → APPROVE/COMMENT/REQUEST_CHANGES) and posts the summary,
+  verdict, and every draft comment in ONE `gh api .../reviews` request
+  (`gh.submit_pr_review_async`, `commit_id` = head SHA, `comments[]`), and on
+  success the drafts clear.
+
+The review summary is edited in place with the same cursor-follows-modifiable
+mechanism as `M._pr_edit`. Diff rows carry absolute paths, so comments keep
+both `path` (repo-relative, for GitHub) and `abs_file` (for matching rendered
+rows). Tests drive the comment body and verdict through the
+`M._review.verdict_provider` seam. The summary
+region's end extmark uses right gravity (a left-gravity boundary mark gets
+pulled into an edit of the adjacent line). Review-specific key defaults live in
+`config.keymaps.review`, but the hint bar, `?` help, and installed mappings must
+come through the shared status command specs in `init.lua`. Pin only the compact
+high-value subset in the winbar and keep the full command list in `?`. The
+verdict chooser is a plain popup window (`M._review.pick_verdict`,
+`c`/`a`/`r`/`q`), not `vim.ui.select`/snacks.
+
+`bc` in the status view creates a branch (`M._create_branch`): it prompts for
+a name via a centered popup (`M._prompt_branch_name`, not vim.ui.input/snacks,
+prefilled with the branch prefix), then runs `git switch -c` and refreshes.
+The prefix comes from per-repository config — `<repo root>/.forge.json`
+(`{ "branch_prefix": "..." }`, read by `M._repo_config`, test seam
+`set_reader`) — falling back to `config.branch_prefix` (default `matt9222/`).
+
+init.lua is at Lua's hard limit of 200 local variables per chunk: new
+file-scope helpers must hang off the module table (see `M._branch_diff` and
+`M._review`) instead of being declared `local`. (luals's syntax check can
+over-count this, but the ground truth is whether real nvim loads the file.)
+
+The diff gutter (old/new line numbers and the `+`/`-` sign) is rendered as
+inline virtual text (`hunk_add_gutter`), not buffer text: buffer lines for
+hunk rows contain only the code content, so visual selection, yank, and
+search operate on the code alone. Tests asserting gutter content must read
+the row's inline `virt_text` extmark (see `gutter_text` in
+`tests/forge/hunk_boundary_context.lua`).
+
+Walkthrough startup must resolve the repository root from the status view's
+working directory before reading `.walkthrough.json` or computing inventory.
+Cache that canonical root in the walkthrough host and use it for every
+root-scoped process and repository-relative path conversion. Neovim may start
+in any repository subdirectory.
+
+Walkthrough inventory must derive each canonical repository-relative path from
+the file's absolute filename and the resolved Git root. Treat a status-provided
+`relpath` as fallback data because status rows may have computed it relative to
+Neovim's launch directory rather than the repository root.
+
+`walkthrough_inventory` accepts only `"sem"` or `false` and defaults to
+`"sem"`. Sem inventory runs one asynchronous `sem diff HEAD --format json
+--no-cosmetics` for tracked changes and one batched asynchronous `sem entities
+--format json` for untracked files. Do not add a native Git or Tree-sitter
+fallback. Missing Sem, command failures, invalid JSON, and unsupported filetypes
+produce no fallback inventory. Failures must notify with the Sem error. When
+set to `false`, omit `inventory_async` from `ForgeWalkthroughHost` so the
+walkthrough skips inventory scheduling and its completion rerender.
+
+Folded walkthrough tasks must keep the complete task heading visible, including
+every wrapped title and task-justification line. Anchor the native child fold at
+the final heading row so its fold text preserves that row, while `<Tab>` only
+reveals or hides the nested subtask and change rows. Keep the task title segment
+bold through `ForgeWalkthroughItemTitle` in both folded and expanded states.
+
+The walkthrough's initial fold state must expose task headings and each subtask
+title while keeping every subtask's justification and concrete change rows
+folded. `<Tab>` on a subtask reveals its changes. `<Tab>` on a task still folds
+or unfolds the complete task subtree.
+
+Diff rendering uses two layers:
+
+- Raw hunks are the data/action model. Git diff/show commands should request
+  zero-context hunks (`--unified=0`) so each raw hunk maps tightly to actual
+  changed lines. Stage/unstage/discard, viewed/unviewed state, comments, jumps,
+  and future line-level actions must use the raw hunk metadata and line mapping,
+  not whatever rows happen to be visible after presentation merging.
+- Virtual display hunks are the presentation model. `build_fancy_diff_rows()`
+  builds render plans from raw hunks, injects bounded Tree-sitter-aware context,
+  and merges adjacent or overlapping display windows so the user does not see
+  duplicate `@@` headers or repeated context. A displayed hunk may therefore
+  contain multiple raw hunks. Carry them in `raw_hunks` and expand them again
+  before any action that writes state or talks to git.
+
+ForgeStatus has an additional status-level grouping step before each hunk is
+handed to `build_fancy_diff_rows()`. That grouping must use the same effective
+display-window idea: expand each raw hunk by the shared context padding limit and
+merge hunks whose padded ranges touch. If status renders the raw hunks one at a
+time, the row builder cannot merge across them and bridge context such as
+`Self {` can be duplicated or split under separate headers. Keep
+`tests/forge/status_virtual_hunk_merge.lua` covering this edge case.
+
+The `@@ +N -N` header in ForgeStatus/Forge is a display summary for the
+merged virtual group, not a patch header to feed back to git. If a test or
+feature needs the original patch, assert against the raw hunk diff. If a test
+needs the visible UI, assert that nearby zero-context changes render under one
+header without duplicated semantic context.
+
+## LuaLS Typing
+
+Use LuaLS/EmmyLua comment annotations for plugin code. Public module functions,
+test seams, and non-trivial tables must have explicit types so LSP jump-to-type,
+completion, and diagnostics work.
+
+Required patterns:
+
+- Define table shapes with `---@class` and fields with `---@field`.
+- Define narrow aliases with `---@alias` when a primitive table has semantic
+  meaning, for example `---@alias ForgeGitCommand string[]`.
+- Annotate public functions and injected callbacks with `---@param` and
+  `---@return`.
+- Type module tables with `---@type` when the module exposes state or a stable
+  public API.
+- Keep test mocks typed too. If a test injects a backend, mark it with
+  `---@type ForgeGitBackend` or `---@type ForgeGhBackend`.
+- Prefer exact union literals for known variants, for example
+  `"section"|"file"|"hunk"`, instead of plain `string`.
+
+Do not leave new public tables or callback seams as untyped `table` unless the
+shape is genuinely arbitrary.
+
+## Linting
+
+Editor diagnostics come from `lua-language-server` (lua-ls). Run it in batch mode to
+check the whole plugin from the command line (no editor required):
+
+```text
+lua-language-server --check nvim/lua/forge --checklevel=Warning --logpath ./.luals
+```
+
+It writes `<logpath>/check.json` listing every diagnostic with `file`, `range`, and `code`.
+Notes:
+
+- Use the **scoop** build (`~/scoop/shims/lua-language-server.exe`). The Mason build crashes
+  on `--check` with a `script/locale-loader.lua` error (works fine as the in-editor LSP).
+- Config is `nvim/.luarc.json` (`runtime.version = "LuaJIT"`, `diagnostics.globals = ["vim"]`,
+  `workspace.checkThirdParty = false`). It silences `undefined-global vim`. In the editor,
+  **lazydev** additionally supplies the real `vim` runtime types.
+
+Known non-defect diagnostic patterns:
+
+- `undefined-global` (`vim`) — configuration noise handled by `.luarc.json` and lazydev.
+- `undefined-field` / `inject-field` — primarily the dynamic `dr()` seam pattern. `init.lua` injects `M._x` fields via `for _, fn in pairs(module) do M[name] = fn end` loops that lua-ls cannot analyze statically. (`init`'s `M` is annotated `---@class ForgeModule`, so explicit `M._x = mod.fn` seam lines are recognized, while only loop injections trigger warnings.)
+- Fixable issues worth maintaining: `redundant-return-value` (wrap expressions like `(s:gsub(pat, rep))` to return one value), `undefined-doc-param` (remove annotations naming non-existent parameters), `duplicate-doc-param`, `redundant-parameter`, `*-type-mismatch`, and `missing-fields` / `missing-return-value`.
+
+After a large refactor that moves files with `git mv`, the in-editor lua-ls can hold a STALE index of
+BOTH the old and new paths, producing spurious `duplicate-set-field` and duplicate-`---@class`
+warnings (it merges the two copies). `:LspRestart` (or reopening nvim) re-indexes from disk and
+clears them — there is nothing to fix in the code.
+
+## Testing
+
+Run the load check:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false); require('forge').setup(); require('forge.integrations.commit'); require('plugins.forge')" -c "qa!"
+```
+
+Run the command-open check:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -c "ForgeStatus" -c "lua assert(vim.bo.filetype == 'ForgeStatus', 'ForgeStatus buffer did not open')" -c "qa!"
+```
+
+Run the mocked integration test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/mock_backend.lua
+```
+
+Run the Harness UI/process mock:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/harness.lua
+```
+
+Run the Rust broker suite:
+
+```text
+cargo +1.94.0 test --manifest-path nvim/rust/forge/Cargo.toml --locked --workspace
+```
+
+Run the opt-in real Codex integration only in its temporary Git repository:
+
+```text
+cargo +1.94.0 test --manifest-path nvim/rust/forge/Cargo.toml --locked -p forge-harness --test codex_cli -- --ignored --nocapture
+```
+
+Run the opt-in real ACP prompt integration through Copilot CLI:
+
+```text
+cargo +1.94.0 test --manifest-path nvim/rust/forge/Cargo.toml --locked -p forge-harness --test copilot_real -- --ignored --nocapture
+```
+
+After automated verification, use Terminal MCP at 160x48 and 100x30 to inspect
+the live Harness, PlanReview, Interactions, and Sessions buffers.
+
+Run the GitHub integration test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/github_integration.lua
+```
+
+Run the async stale-refresh test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/async_stale.lua
+```
+
+Run the real-git visual selection integration test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/visual_selection.lua
+```
+
+Run the walkthrough test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/walkthrough.lua
+```
+
+Run the branch-diff test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/branch_diff.lua
+```
+
+Run the file-revision test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/file_revision.lua
+```
+
+Run the PR-edit test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/pr_edit.lua
+```
+
+Run the PR-review test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/pr_review.lua
+```
+
+Run the editable-region append guard (pins that opening a line at the bottom of the description, review summary, or comment body stays editable — the O/o cursor-follows-modifiable bug):
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/editable_region_append.lua
+```
+
+Run the branch-create test:
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)" -S nvim/tests/forge/branch_create.lua
+```
+
+Run the markdown-parser reconcile guard (pins the parser invalidate that prevents the PR/review fold segfault):
+
+```text
+nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -S nvim/tests/forge/markdown_parser_reconcile.lua
+```
+
+Run the whitespace check:
+
+```text
+git diff --check -- nvim/lua/forge nvim/lua/plugins/forge.lua nvim/lua/plugins/trouble.lua nvim/tests/forge
+```
+
+Headless Neovim may create `nvim.log`, which must be removed before finishing a task.
+
+## Git Backend Seam
+
+Tests may inject git behavior with:
+
+```lua
+require("forge").set_git_backend(backend)
+require("forge").reset_git_backend()
+```
+
+The backend may implement:
+
+- `systemlist_async(command, cb) -> nil`
+- `system_async(command, input, cb) -> nil`
+- `systemlist(command) -> output_lines, exit_code`
+- `system(command, input) -> output_text, exit_code`
+- `delete(path) -> exit_code`
+
+Production code should prefer the async methods and route process errors through
+notifications. Synchronous methods are only compatibility for tests or
+non-interactive helper paths. Keep index-mutating git operations asynchronous
+but sequential within a batch so tests and production avoid `.git/index.lock`
+races.
+
+## Walkthrough Seam
+
+`forge.walkthrough` drives the `ow` review walkthrough from
+`.walkthrough.json` at the repo root (schema: `walkthrough.schema.json` next to
+the module, generated by the `walkthrough` skill). It never accesses `init.lua`
+internals directly, as `init` injects a `ForgeWalkthroughHost` of closures via
+`M._walkthrough_host(buf)`. Tests inject the JSON with:
+
+```lua
+require("forge.views.walkthrough").set_reader(function(path) return fixtures[path] end)
+require("forge.views.walkthrough").reset_reader()
+```
+
+HEAD SHA staleness lookups execute through the git backend seam (`rev-parse HEAD`).
+
+## GitHub CLI Seam
+
+Use `forge.gh` for all GitHub CLI integration. Do not call `gh` directly
+from status, PRView, keymaps, renderers, or tests. The wrapper owns nonblocking
+`vim.system` calls, JSON normalization, no-PR detection, URL opening, and the
+`ForgeGhBackend` test seam. Tests that render status must mock this backend
+so they never depend on a real `gh` installation, auth state, network, or
+repository remote.
+
+All GitHub and Git request consumers must notify request failures. Nonzero exits,
+API errors, invalid JSON, missing required repo/PR context, and failed background
+lookups should reach the user via `notify_error`, `vim.notify`, or the owning
+notification helper with the underlying stderr, API, or decode error text. Distinguish
+empty successful results from request failures in code and test assertions.
+
+Report all caught rendering, synchronization, completion, cursor behavior, or user
+action handling errors via notifications rather than silently falling back.
+
+ForgeStatus, PR overview, PR review, issue, and notification buffers share GitHub
+repo metadata and issue completion through `github.repo_cache` and
+`github.issue_index`. Keep that ownership centralized. Repo-scoped durable data
+lives under `vim.fn.stdpath("data")/forge/github/<host>/repos/<owner>/<repo>/`, not inside
+Forge module state or ad hoc temp paths. The issue index specifically uses
+`issues/issues.redb` plus `issues/open-snapshot.json`, populated by background
+GraphQL sync and the shared Forge host's `forge-github` storage service. Lua sends
+typed `github.issues` requests through `forge.client`, and no separate storage
+executable or startup builder remains. `#`
+completion must read the snapshot locally and must not run a live GitHub search
+per keystroke. `:ForgeGithubIssueSync [all]` owns manual refresh, and
+`:ForgeGithubDeleteRepoCache` owns repo cache cleanup.
+
+Any status, picker, preview, header, or detail row that displays text starting
+with a commit subject must use the shared conventional commit formatter. In this
+module, route subject text through `M._status_conventional_commit_subject_segments(...)`
+or `M._status_conventional_commit_type_end(...)` instead of hand-building a
+plain string, so the conventional commit `<type>` prefix is colorized
+consistently across Head/Merge/Push, PR, About, and commit-list rows.
+
+## Shared Status UX Pattern
+
+ForgeStatus' Unstaged/Staged model is the canonical UX pattern for all
+Forge list-style buffers. When adding related surfaces (PR review
+Unviewed/Viewed, branch diffs, walkthroughs, or future grouped review flows),
+reuse the same concepts instead of inventing a separate interaction model:
+
+- Group content into named sections that can be toggled with `<Tab>` via
+  `status_toggle()`. Section, file, and hunk folds should all flow through the
+  shared fold state (`status_folded` / `set_status_folded`).
+- Use movement actions like ForgeStatus stage/unstage: update the in-memory
+  section model immediately, preserve fold intent, then synchronize
+  asynchronously. ForgeStatus stage/unstage must never restore or explicitly
+  move the cursor. For review mode, `S`/`U` moving hunks or files between
+  Unviewed/Viewed must behave identically to ForgeStatus `S`/`U` moving items between
+  Unstaged/Staged. Pressing `S`/`U` on a section header applies to all actionable
+  items in that section, matching ForgeStatus staged/unstaged header behavior.
+- Keep the same command model for mappings, hint bars, and `?` help. The winbar
+  should show only a compact pinned subset, while the full command palette stays in
+  `?`.
+
+Status-buffer mappings must be defined from `config.defaults.keymaps.status` and
+the central status command spec in `init.lua`. Review-specific defaults may live
+under `config.defaults.keymaps.review`, but their command specs, visibility,
+hint participation, and help text still belong in the shared command model. Do
+not hardcode key text in the hint row, the `?` help popup, or tests. User config
+can override or disable a mapping, and the actual keymaps plus displayed help
+must stay in sync from that single source.
+
+For status actions, do not replace an already-rendered status buffer with a
+generic loading line. Append an optimistic operation-journal layer, project the
+section and per-file diff caches, and render immediately. Route every stage and
+unstage index write from status and `diff://` buffers through one FIFO keyed by
+repository root, preventing `.git/index.lock` races across views.
+
+After the FIFO drains, wait for a 120 ms quiet window and run one path-scoped
+authoritative snapshot for the union of burst paths. The snapshot must execute
+exactly three commands with one shared pathspec: porcelain-v2 status with NUL
+records and all untracked files, a zero-context unstaged diff, and a zero-context
+staged diff. Full status load uses the same seam with an empty path list. Treat
+those three commands as one attempt. Retry one failed authoritative attempt after
+120 ms, then mark verification stale if the retry also fails. Do not render or
+notify between attempts.
+
+Read untracked file content through a bounded asynchronous libuv pool after
+the three Git commands finish. Do not add one Git command per untracked file and do
+not call `vim.fn.readfile` in the snapshot callback. Preserve CRLF bytes and the
+missing-final-newline marker, skip NUL-containing content, and retain the status row
+when a file disappears during the read.
+
+Keep full snapshot collection pure until `render_orchestrator.lua` accepts the
+request generation and confirms that no index mutation is pending. Only then replace
+the session diff, staged-flag, and untracked caches. A stale full load must not mutate
+those caches even when its status model never renders.
+
+When Git truth semantically matches the optimistic UI state, retire the
+resolved journal layers without rendering the status buffer or writing an open
+diff buffer. On a mismatch, replace only the affected paths and perform one
+corrective render. Replay later optimistic layers over the new confirmed
+baseline.
+
+Do not predict a correction for tracked hunk staging merely because the worktree
+uses CRLF or a clean filter. Git-generated hunk patches already reflect canonical
+content and must not modify worktree bytes. Whole-file staging of an untracked file
+can legitimately differ because `git add` normalizes EOLs and applies clean filters
+while writing the index. Treat that authoritative difference as one correction, not
+as a Git failure.
+
+On the first Git mutation failure in a burst, notify immediately and cancel its
+queued tasks. Preserve completed Git writes, path-resync actual truth, and force
+one recovery render. If both snapshot attempts fail, retain only the optimistic models
+for targets Git reported complete, reverse failed and cancelled cache layers, mark
+verification stale, and render once. Keep discard outside this index-mutation pipeline because
+its destructive worktree semantics require an explicit action target.
+
+Carry rename-versus-copy identity from porcelain status into the section model.
+Include the original path in a mutation and replacement scope only for a rename.
+A copied destination behaves like an added path, while its source stays untouched.
+
+When a status render changes text, use `vim.diff` histogram indices and apply
+disjoint line edits from bottom to top. Do not rewrite unchanged rows, which
+keeps extmark movement and visible redraw work bounded to the real correction.
+
+Tree-sitter context lookup must use async `LanguageTree:parse(range, on_parse)`
+with a cached fallback-render-then-upgrade flow. Do not call synchronous
+`parser:parse()` from Forge renderers, keymaps, autocmds, or preview
+refresh paths.
+
+Do not register the whole `ForgeStatus` filetype as markdown to support PR/issue
+description rendering. ForgeStatus is a mixed buffer: status rows, editable
+markdown regions, and real diff/code rows live together. Whole-buffer markdown
+registration lets markdown Tree-sitter syntax overlay diff rows with `Special`
+or `@markup.*`, which can make Rust/Slang/etc syntax look missing even when
+Forge's own syntax extmarks are present. Markdown rendering and otter code
+completion must be explicit for the description/comment region or a true
+markdown-like buffer, and syntax regressions should inspect the rendered cell
+stack with `nvim__inspect_cell`, not just Forge extmarks.

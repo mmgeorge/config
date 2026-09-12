@@ -1,7 +1,7 @@
 local M = {}
 
 local markdown_filetypes = {
-  GithubIssue = true,
+  ForgeGithubIssue = true,
   markdown = true,
 }
 
@@ -134,6 +134,7 @@ end
 function M.activate(buf, opts)
   opts = opts or {}
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return false end
+  if not require("forge.native_syntax").global_parser_allowed(buf) then return false end
 
   local filetype = opts.filetype or vim.bo[buf].filetype
   if not (opts.register_as_markdown or markdown_filetypes[filetype]) then return false end

@@ -93,27 +93,27 @@ local function run_tests()
 
   reset()
   vim.api.nvim_win_set_cursor(0, { 6, 0 })
-  vim.cmd.GithubLink()
-  wait_for(function() return #opened_urls == 1 end, "single-line GithubLink did not open")
+  vim.cmd.ForgeGithubLink()
+  wait_for(function() return #opened_urls == 1 end, "single-line ForgeGithubLink did not open")
   assert_true(
     opened_urls[1] == "https://github.com/mmgeorge/config/blob/master/AGENTS.md?plain=1#L6",
-    "wrong single-line GithubLink URL: " .. tostring(opened_urls[1])
+    "wrong single-line ForgeGithubLink URL: " .. tostring(opened_urls[1])
   )
 
   reset()
-  vim.cmd("4,6GithubLink")
-  wait_for(function() return #opened_urls == 1 end, "range GithubLink did not open")
+  vim.cmd("4,6ForgeGithubLink")
+  wait_for(function() return #opened_urls == 1 end, "range ForgeGithubLink did not open")
   assert_true(
     opened_urls[1] == "https://github.com/mmgeorge/config/blob/master/AGENTS.md?plain=1#L4-L6",
-    "wrong range GithubLink URL: " .. tostring(opened_urls[1])
+    "wrong range ForgeGithubLink URL: " .. tostring(opened_urls[1])
   )
 
   reset()
-  vim.cmd("4,6GithubBlame")
-  wait_for(function() return #opened_urls == 1 end, "range GithubBlame did not open")
+  vim.cmd("4,6ForgeGithubBlame")
+  wait_for(function() return #opened_urls == 1 end, "range ForgeGithubBlame did not open")
   assert_true(
     opened_urls[1] == "https://github.com/mmgeorge/config/blame/master/AGENTS.md#L4-L6",
-    "wrong range GithubBlame URL: " .. tostring(opened_urls[1])
+    "wrong range ForgeGithubBlame URL: " .. tostring(opened_urls[1])
   )
 
   assert_true(#system_calls >= 3, "git commands were not used")

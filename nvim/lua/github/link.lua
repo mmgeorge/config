@@ -14,7 +14,7 @@ local M = {}
 
 ---@param message string
 local function notify_error(message)
-  vim.notify(message, vim.log.levels.ERROR, { title = "GithubLink" })
+  vim.notify(message, vim.log.levels.ERROR, { title = "ForgeGithubLink" })
 end
 
 ---@param value string

@@ -1,12 +1,42 @@
 local gh = require("github.gh")
 local issue_index = require("github.issue_index")
-local issue_view = require("github.issue_view")
+local issue_preview = require("github.issue_preview")
 local repo_cache = require("github.repo_cache")
-local popup_window = require("diff_review.infra.popup_window")
+local popup_window = require("forge.infra.popup_window")
 
 local M = {}
 
 local issue_preview_request_id = 0
+
+---@param repo string
+---@return {hostname:string, owner:string, name:string}?, string?
+local function issue_repository(repo)
+  local owner, name = vim.trim(tostring(repo or "")):match("^([^/%s]+)/([^/%s]+)$")
+  if not owner or not name then return nil, "GitHub issue repository must use owner/repo" end
+  return { hostname = repo_cache.hostname(), owner = owner, name = name }, nil
+end
+
+---@param repo string
+---@param number integer|string
+---@param cwd string
+local function open_issue_document(repo, number, cwd)
+  local repository, failure = issue_repository(repo)
+  if not repository then
+    vim.notify(failure, vim.log.levels.ERROR, { title = "GitHub" })
+    return
+  end
+  local issue_number = tonumber(number)
+  if not issue_number or issue_number < 1 or issue_number % 1 ~= 0 then
+    vim.notify("GitHub issue number must be a positive integer", vim.log.levels.ERROR, { title = "GitHub" })
+    return
+  end
+  require("github.issue_document").open({
+    kind = "issue",
+    repository = repository,
+    number = issue_number,
+    cwd = cwd,
+  })
+end
 
 ---@class GithubPickerCommandTarget
 ---@field repo? string
@@ -42,19 +72,13 @@ end
 ---@param item GithubGhItem
 local function open_item(item)
   if item.kind == "pr" then
-    require("diff_review").open_pr_number(item.number, {
+    require("forge").open_pr_number(item.number, {
       repo = item.repo,
       cwd = vim.fn.getcwd(),
     })
     return
   end
-  require("github.issue_view").open({
-    kind = item.kind,
-    repo = item.repo,
-    number = item.number,
-    cwd = vim.fn.getcwd(),
-    item = item,
-  })
+  open_issue_document(item.repo, item.number, vim.fn.getcwd())
 end
 
 ---@param item GithubGhItem
@@ -64,7 +88,7 @@ local function render_issue_preview(item, body)
   local preview_item = vim.deepcopy(item or {})
   preview_item.kind = preview_item.kind or "issue"
   if body ~= nil then preview_item.body = body end
-  return issue_view.render_item(preview_item, { folds = {} })
+  return issue_preview.render(preview_item, { folds = {} })
 end
 
 ---@param ctx table
@@ -107,8 +131,8 @@ local function set_preview_rendered(ctx, title, rendered)
     end
     local buf = preview_buffer(ctx)
     if buf then
-      vim.bo[buf].filetype = "GithubIssue"
-      issue_view.present_rendered(buf, rendered, { markdown = true, win = preview_window(ctx) })
+      vim.bo[buf].filetype = "ForgeGithubIssue"
+      issue_preview.present(buf, rendered, { markdown = true, win = preview_window(ctx) })
       return
     end
     if type(ctx.preview.highlight) == "function" then ctx.preview:highlight({ lang = "markdown" }) end
@@ -186,7 +210,7 @@ local function open_synced_issue_picker(cwd, repo)
   local items = issue_index.list(repo, { limit = 100 })
   if #items == 0 then
     vim.notify(
-      "No synced GitHub issues found for " .. repo .. ". Run :GithubIssueSync to refresh.",
+      "No synced GitHub issues found for " .. repo .. ". Run :ForgeGithubIssueSync to refresh.",
       vim.log.levels.INFO,
       { title = "GitHub" }
     )
@@ -214,16 +238,28 @@ end
 function M.issues(args)
   local target, err = parse_open_args(args)
   if err then
-    vim.notify("Usage: GithubIssue [owner/repo] <number>", vim.log.levels.ERROR, { title = "GitHub" })
+    vim.notify("Usage: ForgeGithubIssue [owner/repo] <number>", vim.log.levels.ERROR, { title = "GitHub" })
     return
   end
   if target then
-    require("github.issue_view").open({
-      kind = "issue",
-      repo = target.repo,
-      number = target.number,
-      cwd = vim.fn.getcwd(),
-    })
+    local cwd = vim.fn.getcwd()
+    local repo = target.repo or repo_cache.completion_repo(0, cwd)
+    if repo then
+      open_issue_document(repo, target.number, cwd)
+      return
+    end
+    vim.notify("Resolving current GitHub repo...", vim.log.levels.INFO, { title = "GitHub" })
+    gh.current_repo_async(cwd, function(result)
+      if not (result and result.ok and result.repo) then
+        vim.notify(
+          "Could not resolve current GitHub repo:\n" .. tostring(result and result.message or "unknown error"),
+          vim.log.levels.ERROR,
+          { title = "GitHub" }
+        )
+        return
+      end
+      open_issue_document(result.repo, target.number, cwd)
+    end)
     return
   end
 
@@ -252,11 +288,11 @@ end
 function M.prs(args)
   local target, err = parse_open_args(args)
   if err then
-    vim.notify("Usage: GithubPR [owner/repo] <number>", vim.log.levels.ERROR, { title = "GitHub" })
+    vim.notify("Usage: ForgeGithubPR [owner/repo] <number>", vim.log.levels.ERROR, { title = "GitHub" })
     return
   end
   if target then
-    require("diff_review").open_pr_number(target.number, {
+    require("forge").open_pr_number(target.number, {
       repo = target.repo,
       cwd = vim.fn.getcwd(),
     })

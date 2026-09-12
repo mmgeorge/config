@@ -1,39 +1,49 @@
 local M = {}
 
-local stale_after_seconds = 10 * 60
+---@class GithubIssueSyncRequest
+---@field database string
+---@field directory string
+---@field progress boolean
+---@field request {repository: {hostname: string, owner: string, name: string}, scope: "open"|"all", manual: boolean, snapshot: string}
+---@alias GithubIssueSyncResult {ok: true, refreshed: boolean, fetched: integer, pages: integer}|{ok: false, message: string}
+---@class GithubIssueSyncOptions
+---@field scope? "open"|"all"
+---@field manual? boolean
+---@field remember_cwd? boolean
+---@field on_complete? fun(result: GithubIssueSyncResult)
+---@class GithubIssueSyncContext
+---@field repo string
+---@field database string
+---@field cwd string
+---@field snapshot string
+---@field progress table?
+---@field on_complete? fun(result: GithubIssueSyncResult)
+---@class GithubIssueDetailRequest
+---@field database string
+---@field directory string
+---@field request {repository: {hostname: string, owner: string, name: string}, number: integer}
+
 local detail_stale_after_seconds = 2 * 60
 local progress_by_repo = {}
+---@type table<string, GithubIssueSyncContext>
 local in_flight = {}
 local detail_in_flight = {}
 local detail_prefetch_in_flight = {}
 local detail_waiters = {}
 local detail_memory_cache = {}
-local sync_locks = {}
-local snapshot_cache = {}
+local issue_snapshot = require("github.issue_snapshot")
 local notified = {}
 local invalid_repos = {}
 local spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
 local hostname_by_cwd = {}
-local runner_for_test = nil
-local gh_runner_for_test = nil
+---@type fun(params: GithubIssueStorageRequest, callback: fun(value: table?, failure: string?))?
+local storage_runner_for_test = nil
+---@type fun(params: GithubIssueSyncRequest, callback: fun(value: table?, failure: string?), progress: fun(value: table))?
+local sync_runner_for_test = nil
+---@type fun(params: GithubIssueDetailRequest, callback: fun(value: table?, failure: string?))?
+local detail_runner_for_test = nil
 local progress_enabled = true
 local notifier_failed = false
-
-local issue_query = table.concat({
-  "query($owner:String!, $name:String!, $states:[IssueState!], $cursor:String) {",
-  "  rateLimit { cost remaining resetAt }",
-  "  repository(owner:$owner, name:$name) {",
-  "    issues(first:100, after:$cursor, states:$states, orderBy:{field:UPDATED_AT, direction:DESC}) {",
-  "      totalCount",
-  "      pageInfo { hasNextPage endCursor }",
-  "      nodes {",
-  "          number title state url createdAt updatedAt",
-  "        labels(first:50) { nodes { name color description } }",
-  "      }",
-  "    }",
-  "  }",
-  "}",
-}, "\n")
 
 ---@param message string
 ---@param level any
@@ -65,6 +75,8 @@ local function notify_once(key, message, level)
   notify(message, level)
 end
 
+---@param repo unknown
+---@return string?
 local function normalize_repo(repo)
   repo = vim.trim(tostring(repo or ""))
   repo = repo:gsub("^https://github.com/", ""):gsub("%.git$", "")
@@ -73,33 +85,12 @@ local function normalize_repo(repo)
   return owner:lower() .. "/" .. name:lower()
 end
 
-local function split_repo(repo)
-  local normalized = normalize_repo(repo)
-  if not normalized then return nil, nil end
-  local owner, name = normalized:match("^([^/]+)/(.+)$")
-  return owner, name
-end
-
----@param value any
----@return string?
-local function optional_string(value)
-  if value == nil or value == vim.NIL then return nil end
-  value = tostring(value)
-  return value ~= "" and value or nil
-end
-
----@param value any
----@return table
-local function optional_table(value)
-  return type(value) == "table" and value or {}
-end
-
 ---@param hostname string?
 ---@return string?
 local function normalize_hostname(hostname)
   hostname = vim.trim(tostring(hostname or ""))
   hostname = hostname:gsub("^https?://", ""):gsub("/.*$", "")
-  return hostname ~= "" and hostname or nil
+  return hostname ~= "" and hostname:lower() or nil
 end
 
 ---@param remote_url string?
@@ -124,12 +115,12 @@ local function first_remote_hostname(remote_text)
 end
 
 local function issue_dir(repo)
-  repo = normalize_repo(repo) or repo
+  local repo = normalize_repo(repo) or repo
   return vim.fs.joinpath(require("github.repo_cache").repo_dir(repo), "issues")
 end
 
 local function detail_key(repo, number)
-  return (normalize_repo(repo) or tostring(repo or "")) .. "#" .. tostring(number)
+  return M.db_path(normalize_repo(repo) or tostring(repo or "")) .. "#" .. tostring(number)
 end
 
 ---@param repo string
@@ -137,8 +128,8 @@ end
 ---@param item table
 ---@param fetched_at integer?
 local function remember_detail(repo, number, item, fetched_at)
-  repo = normalize_repo(repo)
-  number = tonumber(number)
+  local repo = normalize_repo(repo)
+  local number = tonumber(number)
   if not (repo and number and type(item) == "table") then return end
   local cached_item = vim.deepcopy(item)
   cached_item.kind = cached_item.kind or "issue"
@@ -157,8 +148,8 @@ end
 ---@param source "memory"|"redb"
 ---@return table?
 local function detail_result_from_record(repo, number, record, source)
-  repo = normalize_repo(repo)
-  number = tonumber(number)
+  local repo = normalize_repo(repo)
+  local number = tonumber(number)
   if not (repo and number and type(record) == "table" and type(record.item) == "table") then return nil end
   local fetched_at = tonumber(record.fetched_at or 0) or 0
   local item = vim.deepcopy(record.item)
@@ -189,23 +180,18 @@ local function remember_detail_output(output, fallback_repo, fallback_number)
 end
 
 function M.db_path(repo)
-  repo = normalize_repo(repo) or repo
+  local repo = normalize_repo(repo) or repo
   return vim.fs.joinpath(issue_dir(repo), "issues.redb")
 end
 
 function M.snapshot_path(repo)
-  repo = normalize_repo(repo) or repo
+  local repo = normalize_repo(repo) or repo
   return vim.fs.joinpath(issue_dir(repo), "open-snapshot.json")
 end
 
 function M.log_path(repo)
-  repo = normalize_repo(repo) or repo
+  local repo = normalize_repo(repo) or repo
   return vim.fs.joinpath(issue_dir(repo), "sync.log")
-end
-
-function M.sync_lock_path(repo)
-  repo = normalize_repo(repo) or repo
-  return vim.fs.joinpath(issue_dir(repo), "sync.lock")
 end
 
 ---@param value any
@@ -214,14 +200,14 @@ local function log_value(value)
   if value == vim.NIL then return "" end
   if type(value) == "boolean" then return value and "true" or "false" end
   if type(value) == "table" then value = vim.inspect(value) end
-  return tostring(value or ""):gsub("[\r\n\t]", " ")
+  return (tostring(value or ""):gsub("[\r\n\t]", " "))
 end
 
 ---@param repo string?
 ---@param event string
 ---@param fields? table<string, any>
 local function log_sync(repo, event, fields)
-  repo = normalize_repo(repo)
+  local repo = normalize_repo(repo)
   if not repo or vim.g.github_issue_index_log == false then return end
   if vim.in_fast_event() then
     vim.schedule(function()
@@ -234,7 +220,8 @@ local function log_sync(repo, event, fields)
     os.date("!%Y-%m-%dT%H:%M:%SZ"),
     event,
   }
-  local keys = vim.tbl_keys(fields or {})
+  local fields = fields or {}
+  local keys = vim.tbl_keys(fields)
   table.sort(keys)
   for _, key in ipairs(keys) do
     parts[#parts + 1] = key .. "=" .. log_value(fields[key])
@@ -248,151 +235,12 @@ local function log_sync(repo, event, fields)
   end
 end
 
----@class GithubIssueIndexSyncLock
----@field repo string
----@field path string
----@field token string
-
----@return integer
-local function lock_stale_after_seconds()
-  return tonumber(vim.g.github_issue_index_lock_stale_seconds) or (30 * 60)
-end
-
----@param stat table?
----@return integer?
-local function stat_mtime_seconds(stat)
-  return stat and stat.mtime and stat.mtime.sec or nil
-end
-
----@param repo string
----@param path string
----@param stat table?
----@return boolean
-local function remove_stale_sync_lock(repo, path, stat)
-  local mtime = stat_mtime_seconds(stat)
-  if not mtime then return false end
-  local age_seconds = os.time() - mtime
-  if age_seconds < lock_stale_after_seconds() then return false end
-
-  log_sync(repo, "sync:lock:stale-remove", {
-    age_seconds = age_seconds,
-    path = path,
-  })
-  return vim.fn.delete(path, "rf") == 0
-end
-
----@param repo string
----@param path string
----@param token string
-local function write_sync_lock_owner(repo, path, token)
-  local lines = {
-    token,
-    "pid=" .. tostring(vim.uv.os_getpid()),
-    "started_at=" .. os.date("!%Y-%m-%dT%H:%M:%SZ"),
-  }
-  local ok, result = pcall(vim.fn.writefile, lines, vim.fs.joinpath(path, "owner"))
-  if not (ok and result == 0) then
-    log_sync(repo, "sync:lock:owner-write-failed", {
-      path = path,
-      result = result or "",
-    })
-  end
-end
-
----@param repo string
----@return GithubIssueIndexSyncLock?
-local function acquire_sync_lock(repo)
-  local path = M.sync_lock_path(repo)
-  vim.fn.mkdir(vim.fs.dirname(path), "p")
-  local token = tostring(vim.uv.os_getpid()) .. ":" .. tostring(vim.uv.hrtime())
-
-  for _ = 1, 2 do
-    local ok, err, err_name = vim.uv.fs_mkdir(path, 448)
-    if ok then
-      write_sync_lock_owner(repo, path, token)
-      log_sync(repo, "sync:lock:acquired", { path = path })
-      return { repo = repo, path = path, token = token }
-    end
-
-    local stat = vim.uv.fs_stat(path)
-    if stat and stat.type == "directory" and remove_stale_sync_lock(repo, path, stat) then
-      -- Retry once after stale lock removal.
-    else
-      log_sync(repo, "sync:lock:busy", {
-        error = err or err_name or "",
-        path = path,
-      })
-      return nil
-    end
-  end
-
-  log_sync(repo, "sync:lock:busy", { path = path })
-  return nil
-end
-
----@param path string
----@return string?
-local function read_lock_token(path)
-  local owner_path = vim.fs.joinpath(path, "owner")
-  local ok, lines = pcall(vim.fn.readfile, owner_path, "", 1)
-  if ok and type(lines) == "table" then return lines[1] end
-  return nil
-end
-
----@param lock GithubIssueIndexSyncLock?
-local function release_sync_lock(lock)
-  if not lock then return end
-  local current = read_lock_token(lock.path)
-  if current and current ~= lock.token then
-    log_sync(lock.repo, "sync:lock:release-skipped", {
-      path = lock.path,
-    })
-    return
-  end
-
-  if vim.fn.delete(lock.path, "rf") == 0 then
-    log_sync(lock.repo, "sync:lock:released", { path = lock.path })
-  else
-    log_sync(lock.repo, "sync:lock:release-failed", { path = lock.path })
-  end
-end
-
----@param repo string
-local function release_repo_sync_lock(repo)
-  local lock = sync_locks[repo]
-  sync_locks[repo] = nil
-  release_sync_lock(lock)
-end
-
-local function executable_name()
-  return vim.fn.has("win32") == 1 and "github-issue-index.exe" or "github-issue-index"
-end
-
-function M.sidecar_path()
-  local configured = vim.g.github_issue_index_bin
-  if type(configured) == "string" and configured ~= "" then return configured end
-  local name = executable_name()
-  local candidates = {
-    vim.fs.joinpath(vim.fn.stdpath("data"), "gitstatus", "bin", name),
-    vim.fs.joinpath(vim.fn.stdpath("config"), "rust", "github-issue-index", "target", "release", name),
-    vim.fs.joinpath(vim.fn.stdpath("config"), "rust", "github-issue-index", "target", "debug", name),
-  }
-  for _, path in ipairs(candidates) do
-    if vim.fn.executable(path) == 1 or vim.uv.fs_stat(path) ~= nil then return path end
-  end
-  return nil
-end
-
 ---@param command string[]
 ---@param input string?
 ---@param cwd string?
 ---@param callback fun(result: table)
 ---@param opts? { timeout_ms?: integer, label?: string, log_repo?: string }
 local function system_text_async(command, input, cwd, callback, opts)
-  if runner_for_test then
-    runner_for_test(command, input, callback, cwd)
-    return
-  end
   opts = opts or {}
   local timeout_ms = tonumber(opts.timeout_ms or 0) or 0
   local label = opts.label or table.concat(command, " ")
@@ -481,19 +329,8 @@ local function system_text_async(command, input, cwd, callback, opts)
   end
 end
 
-local function gh_text_async(command, input, cwd, callback)
-  if gh_runner_for_test then
-    gh_runner_for_test(command, input, callback, cwd)
-    return
-  end
-  system_text_async(command, input, cwd, callback, {
-    label = "GitHub issue page request",
-    timeout_ms = 120000,
-  })
-end
-
 ---@param cwd string?
----@param callback fun(hostname?: string)
+---@param callback fun(hostname: string?, failure: string?)
 local function resolve_hostname_async(cwd, callback)
   local configured = normalize_hostname(vim.g.github_issue_index_hostname)
   if configured then
@@ -501,8 +338,8 @@ local function resolve_hostname_async(cwd, callback)
     return
   end
 
-  if gh_runner_for_test then
-    callback(nil)
+  if sync_runner_for_test or detail_runner_for_test then
+    callback(require("github.repo_cache").hostname())
     return
   end
 
@@ -513,7 +350,11 @@ local function resolve_hostname_async(cwd, callback)
   end
 
   system_text_async({ "git", "remote", "-v" }, nil, cwd, function(result)
-    local host = result.code == 0 and first_remote_hostname(result.stdout) or nil
+    if result.code ~= 0 then
+      callback(nil, "GitHub remote hostname lookup failed: " .. tostring(result.output))
+      return
+    end
+    local host = first_remote_hostname(result.stdout)
     hostname_by_cwd[key] = host or false
     callback(host)
   end, {
@@ -522,102 +363,83 @@ local function resolve_hostname_async(cwd, callback)
   })
 end
 
-local function run_sidecar_binary(binary, args, input, cwd, callback)
-  local command = { binary }
-  vim.list_extend(command, args)
-  local repo = nil
-  for index, arg in ipairs(args) do
-    if arg == "--repo" then
-      repo = args[index + 1]
-      break
+---@alias GithubIssueStorageOperation
+---| { operation: "detail", number: integer }
+---| { operation: "details", number: integer[] }
+---| { operation: "upsert_detail", number: integer, detail: table }
+---| { operation: "reconcile_snapshot", state: "open", output: string }
+---@class GithubIssueStorageRequest
+---@field database string
+---@field repo string
+---@field request GithubIssueStorageOperation
+---@alias GithubIssueStorageResult { ok: true, value: table }|{ ok: false, message: string }
+
+---@param repo string
+---@param operation GithubIssueStorageOperation
+---@param callback fun(result: GithubIssueStorageResult)
+local function request_storage(repo, operation, callback)
+  local finished = false
+  ---@param value unknown
+  ---@param failure string?
+  local function finish(value, failure)
+    if finished then return end
+    finished = true
+    if failure then
+      callback({ ok = false, message = tostring(failure) })
+    elseif type(value) ~= "table" or value == vim.NIL then
+      callback({ ok = false, message = "Forge issue storage returned an invalid result" })
+    else
+      callback({ ok = true, value = value })
     end
   end
-  system_text_async(command, input, cwd, function(result)
-    if result.code ~= 0 then
-      callback({ ok = false, message = result.output ~= "" and result.output or ("issue indexer exited " .. tostring(result.code)) })
-      return
+  ---@type GithubIssueStorageRequest
+  local params = { database = M.db_path(repo), repo = repo, request = operation }
+  local ok, failure = pcall(function()
+    if storage_runner_for_test then
+      storage_runner_for_test(params, finish)
+    else
+      require("forge.client").request_host("github.issues", params, finish)
     end
-    callback({ ok = true, stdout = result.stdout })
-  end, {
-    label = "GitHub issue indexer " .. tostring(args[1] or "request"),
-    log_repo = repo,
-    timeout_ms = 180000,
-  })
+  end)
+  if not ok then
+    if finished then error(failure) end
+    finish(nil, "Forge issue storage request failed: " .. tostring(failure))
+  end
 end
 
-local function run_sidecar(args, input, cwd, callback)
-  local binary = runner_for_test and "github-issue-index" or M.sidecar_path()
-  if binary then
-    run_sidecar_binary(binary, args, input, cwd, callback)
+---@param repo string
+---@param callback? fun(result: {ok: boolean, message?: string})
+---@param force? boolean
+function M.reload_snapshot(repo, callback, force)
+  local repo = normalize_repo(repo)
+  if not repo then
+    local failure = { ok = false, message = "Invalid issue snapshot repository" }
+    if callback then callback(failure) else notify(failure.message) end
     return
   end
-
-  require("github.issue_index_builder").ensure(function(result)
-    if not result.ok or not result.path then
-      callback({
-        ok = false,
-        message = result.message
-          or "GitHub issue indexer is not built and auto-build did not return a binary path",
-      })
-      return
-    end
-    run_sidecar_binary(result.path, args, input, cwd, callback)
-  end)
-end
-
-local function run_sidecar_json(args, input, cwd, callback)
-  run_sidecar(args, input, cwd, function(result)
-    if not result.ok then
-      callback(result)
-      return
-    end
-    if result.stdout == "" then
-      callback({ ok = true, value = {} })
-      return
-    end
-    local ok, decoded = pcall(vim.json.decode, result.stdout)
-    if not ok or type(decoded) ~= "table" then
-      callback({ ok = false, message = "issue indexer returned invalid JSON" })
-      return
-    end
-    callback({ ok = true, value = decoded })
-  end)
-end
-
-local function snapshot_stat(repo)
   local path = M.snapshot_path(repo)
-  local stat = vim.uv.fs_stat(path)
-  if not stat then return nil end
-  return {
-    path = path,
-    mtime = stat.mtime and stat.mtime.sec or 0,
-    size = stat.size or 0,
-  }
-end
-
-local function read_snapshot(repo)
-  repo = normalize_repo(repo)
-  if not repo then return nil end
-  local stat = snapshot_stat(repo)
-  if not stat then return nil end
-  local cached = snapshot_cache[repo]
-  if cached and cached.mtime == stat.mtime and cached.size == stat.size then return cached.snapshot end
-  local ok, lines = pcall(vim.fn.readfile, stat.path)
-  if not ok then
-    notify_once("snapshot-read:" .. repo, "Could not read GitHub issue snapshot: " .. stat.path)
-    return nil
-  end
-  local decoded_ok, decoded = pcall(vim.json.decode, table.concat(lines, "\n"))
-  if not decoded_ok or type(decoded) ~= "table" then
-    notify_once("snapshot-json:" .. repo, "GitHub issue snapshot contains invalid JSON: " .. stat.path)
-    return nil
-  end
-  snapshot_cache[repo] = {
-    mtime = stat.mtime,
-    size = stat.size,
-    snapshot = decoded,
-  }
-  return decoded
+  local database = M.db_path(repo)
+  issue_snapshot.load(repo, path, function(failure)
+    if callback then
+      callback(failure and { ok = false, message = failure } or { ok = true })
+    elseif failure and failure ~= "Snapshot load invalidated" then
+      notify_once("snapshot-load:" .. repo, "Could not preload GitHub issue snapshot: " .. failure)
+    end
+  end, force, function(done)
+    if M.snapshot_path(repo) ~= path or M.db_path(repo) ~= database then done("Snapshot load invalidated") return end
+    request_storage(repo, { operation = "reconcile_snapshot", state = "open", output = path }, function(result)
+      if M.snapshot_path(repo) ~= path or M.db_path(repo) ~= database then done("Snapshot load invalidated") return end
+      if not result.ok then done(result.message or "Completion snapshot reconciliation failed") return end
+      local recovery = result.value
+      if type(recovery) ~= "table" or type(recovery.ready) ~= "boolean" or type(recovery.state) ~= "table"
+        or recovery.state.repo ~= repo or type(recovery.state.revision) ~= "number"
+        or recovery.state.revision < 0 or recovery.state.revision > 9007199254740991 or recovery.state.revision % 1 ~= 0 then
+        done("Forge returned invalid completion snapshot recovery")
+        return
+      end
+      done(nil, recovery.state.revision, recovery.ready)
+    end)
+  end)
 end
 
 local function token_terms(query)
@@ -677,29 +499,20 @@ local function issue_result(repo, issue)
     updated_at = tostring(issue.updated_at or issue.updatedAt or ""),
     is_draft = false,
     body = tostring(issue.body or ""),
-    labels = issue.labels or {},
+    labels = vim.deepcopy(issue.labels or {}),
   }
-end
-
----@param repo string
----@return table[]
-local function snapshot_issues(repo)
-  local snapshot = read_snapshot(repo)
-  local issues = snapshot and snapshot.issues or {}
-  if type(issues) ~= "table" then return {} end
-  return issues
 end
 
 ---@param repo string
 ---@param opts? { limit?: integer }
 ---@return table[]
 function M.list(repo, opts)
-  repo = normalize_repo(repo)
+  local repo = normalize_repo(repo)
   if not repo then return {} end
 
   local items = {}
   local limit = opts and opts.limit or 100
-  for _, issue in ipairs(snapshot_issues(repo)) do
+  for _, issue in ipairs(issue_snapshot.records(repo)) do
     if type(issue) == "table" then
       items[#items + 1] = issue_result(repo, issue)
       if #items >= limit then break end
@@ -709,7 +522,7 @@ function M.list(repo, opts)
 end
 
 function M.search(repo, query, opts)
-  repo = normalize_repo(repo)
+  local repo = normalize_repo(repo)
   if not repo then return {} end
   local raw_query = vim.trim(tostring(query or "")):lower()
   if raw_query == "" then return {} end
@@ -717,7 +530,7 @@ function M.search(repo, query, opts)
   if #terms == 0 then return {} end
 
   local scored = {}
-  for _, issue in ipairs(snapshot_issues(repo)) do
+  for _, issue in ipairs(issue_snapshot.records(repo)) do
     if type(issue) == "table" then
       local score = score_issue(issue, terms, raw_query)
       if score then
@@ -745,54 +558,34 @@ end
 ---@param number integer|string
 ---@param callback fun(result: table)
 local function read_detail_async(repo, number, callback)
-  repo = normalize_repo(repo)
-  number = tonumber(number)
+  local repo = normalize_repo(repo)
+  local number = tonumber(number)
   if not (repo and number) then
     callback({ ok = false, message = "Invalid issue detail cache key" })
     return
   end
-  run_sidecar_json({
-    "detail",
-    "--db",
-    M.db_path(repo),
-    "--repo",
-    repo,
-    "--number",
-    tostring(number),
-  }, nil, nil, callback)
+  request_storage(repo, { operation = "detail", number = number }, callback)
 end
 
 ---@param repo string
 ---@param numbers integer[]
 ---@param callback fun(result: table)
 local function read_details_async(repo, numbers, callback)
-  repo = normalize_repo(repo)
+  local repo = normalize_repo(repo)
   if not repo then
     callback({ ok = false, message = "Invalid issue detail cache repo" })
     return
   end
-  local args = {
-    "details",
-    "--db",
-    M.db_path(repo),
-    "--repo",
-    repo,
-  }
-  for _, number in ipairs(numbers) do
-    args[#args + 1] = "--number"
-    args[#args + 1] = tostring(number)
-  end
-  run_sidecar_json(args, nil, nil, callback)
+  request_storage(repo, { operation = "details", number = numbers }, callback)
 end
 
----@param cwd string?
 ---@param repo string
 ---@param number integer|string
 ---@param item table
 ---@param callback fun(result: table)
-local function write_detail_async(cwd, repo, number, item, callback)
-  repo = normalize_repo(repo)
-  number = tonumber(number)
+local function write_detail_async(repo, number, item, callback)
+  local repo = normalize_repo(repo)
+  local number = tonumber(number)
   if not (repo and number) then
     callback({ ok = false, message = "Invalid issue detail cache key" })
     return
@@ -803,15 +596,7 @@ local function write_detail_async(cwd, repo, number, item, callback)
     fetched_at = os.time(),
     item = item,
   }
-  run_sidecar_json({
-    "upsert-detail",
-    "--db",
-    M.db_path(repo),
-    "--repo",
-    repo,
-    "--number",
-    tostring(number),
-  }, vim.json.encode(payload), cwd, callback)
+  request_storage(repo, { operation = "upsert_detail", number = number, detail = payload }, callback)
 end
 
 ---@param key string
@@ -820,41 +605,63 @@ local function finish_detail_fetch(key, result)
   local waiters = detail_waiters[key] or {}
   detail_waiters[key] = nil
   detail_in_flight[key] = nil
+  if not result.ok then notify("GitHub issue detail fetch failed:\n" .. tostring(result.message)) end
   for _, waiter in ipairs(waiters) do
-    waiter(result)
+    local accepted, failure = pcall(waiter, result)
+    if not accepted then notify("GitHub issue detail callback failed:\n" .. tostring(failure)) end
   end
 end
 
 ---@param cwd string?
 ---@param repo string
----@param number integer|string
+---@param number integer
 local function fetch_detail_async(cwd, repo, number)
   local key = detail_key(repo, number)
   if detail_in_flight[key] then return end
-  detail_in_flight[key] = true
-  require("github.gh").issue_view_async(cwd, number, repo, function(result)
-    if not (result and result.ok and result.item) then
-      finish_detail_fetch(key, {
-        ok = false,
-        message = result and result.message or "GitHub issue detail fetch failed",
-        code = result and result.code,
-      })
+  local pending = {}
+  detail_in_flight[key] = pending
+  local directory = cwd or vim.fn.getcwd()
+  local database = M.db_path(repo)
+  local completed = false
+  ---@param value unknown
+  ---@param failure string?
+  local function complete(value, failure)
+    if completed or detail_in_flight[key] ~= pending then return end
+    completed = true
+    if not failure and detail_key(repo, number) ~= key then failure = "GitHub cache context changed during detail fetch" end
+    if not failure and (type(value) ~= "table" or type(value.item) ~= "table"
+      or value.repo ~= repo or value.number ~= number or value.item.number ~= number
+      or normalize_repo(value.item.repo) ~= repo or type(value.fetched_at) ~= "number") then
+      failure = "Forge issue detail returned an invalid result"
+    end
+    if failure then
+      finish_detail_fetch(key, { ok = false, message = tostring(failure) })
       return
     end
-    result.item.repo = normalize_repo(result.item.repo or repo) or result.item.repo or repo
-    write_detail_async(cwd, repo, number, result.item, function(write_result)
-      if not (write_result and write_result.ok) then
-        notify("GitHub issue detail cache update failed:\n" .. tostring(write_result and write_result.message or "unknown error"), vim.log.levels.WARN)
-      end
-      remember_detail(repo, number, result.item, os.time())
-      finish_detail_fetch(key, {
-        ok = true,
-        item = vim.deepcopy(result.item),
-        fetched_at = os.time(),
-        cached = false,
-        cache_updated = write_result and write_result.ok == true,
-      })
+    remember_detail(repo, number, value.item, value.fetched_at)
+    finish_detail_fetch(key, { ok = true, item = vim.deepcopy(value.item), fetched_at = value.fetched_at,
+      cached = false, cache_updated = true })
+  end
+  resolve_hostname_async(directory, function(hostname, failure)
+    if detail_in_flight[key] ~= pending then return end
+    local cache_hostname = require("github.repo_cache").hostname()
+    hostname = hostname or cache_hostname
+    if failure or hostname ~= cache_hostname or M.db_path(repo) ~= database then
+      complete(nil, failure or "GitHub detail hostname does not match the current cache context")
+      return
+    end
+    local owner, name = repo:match("^([^/]+)/([^/]+)$")
+    ---@type GithubIssueDetailRequest
+    local params = { database = database, directory = directory,
+      request = { repository = { hostname = hostname, owner = owner, name = name }, number = number } }
+    local accepted, request_failure = pcall(function()
+      if detail_runner_for_test then detail_runner_for_test(params, complete)
+      else require("forge.client").request_host("github.detail", params, complete) end
     end)
+    if not accepted then
+      if completed then error(request_failure) end
+      complete(nil, "Forge issue detail request failed: " .. tostring(request_failure))
+    end
   end)
 end
 
@@ -865,10 +672,12 @@ end
 ---@param callback fun(result: table)
 function M.detail_async(cwd, repo, number, opts, callback)
   opts = opts or {}
-  repo = normalize_repo(repo)
-  number = tonumber(number)
-  if not (repo and number) then
-    callback({ ok = false, message = "Issue detail cache requires an owner/repo and issue number" })
+  local repo = normalize_repo(repo)
+  local number = tonumber(number)
+  if not (repo and number and number > 0 and number <= 2147483647 and number == math.floor(number)) then
+    local message = "Issue detail cache requires an owner/repo and a positive integer issue number"
+    notify(message)
+    callback({ ok = false, message = message })
     return
   end
 
@@ -886,6 +695,12 @@ function M.detail_async(cwd, repo, number, opts, callback)
   end
 
   read_detail_async(repo, number, function(cache_result)
+    if detail_key(repo, number) ~= key then
+      local message = "GitHub cache context changed during detail lookup"
+      notify(message)
+      callback({ ok = false, message = message })
+      return
+    end
     local should_fetch = opts.force == true
     if cache_result and cache_result.ok and cache_result.value and cache_result.value.found == true then
       local value = cache_result.value
@@ -917,8 +732,8 @@ end
 ---@param number integer|string
 ---@return table?
 function M.cached_detail(repo, number)
-  repo = normalize_repo(repo)
-  number = tonumber(number)
+  local repo = normalize_repo(repo)
+  local number = tonumber(number)
   if not (repo and number) then return nil end
   return detail_result_from_record(repo, number, detail_memory_cache[detail_key(repo, number)], "memory")
 end
@@ -948,7 +763,7 @@ end
 ---@param callback? fun(result: table)
 function M.prefetch_details(repo, values, opts, callback)
   opts = opts or {}
-  repo = normalize_repo(repo)
+  local repo = normalize_repo(repo)
   if not repo then
     if callback then callback({ ok = false, message = "Invalid issue detail cache repo" }) end
     return
@@ -993,7 +808,7 @@ end
 ---@param callback? fun(result: table)
 function M.store_detail_async(cwd, repo, number, item, callback)
   local fetched_at = os.time()
-  write_detail_async(cwd, repo, number, item, function(result)
+  write_detail_async(repo, number, item, function(result)
     if result and result.ok then remember_detail(repo, number, item, fetched_at) end
     if callback then
       callback(result)
@@ -1073,24 +888,24 @@ function stop_progress_timer(progress)
   progress.timer = nil
 end
 
-local function ensure_progress(repo, manual)
+local function ensure_progress(repo, request_key)
   if not progress_enabled then return nil end
-  if progress_by_repo[repo] then return progress_by_repo[repo] end
+  if progress_by_repo[request_key] then return progress_by_repo[request_key] end
   local progress = {
     repo = repo,
     fetched = 0,
     total = nil,
     phase = "loading issues",
-    id = "github_issue_index:" .. repo,
+    id = "github_issue_index:" .. request_key,
     active = true,
   }
-  progress_by_repo[repo] = progress
+  progress_by_repo[request_key] = progress
   return progress
 end
 
-local function close_progress(repo, message, level)
-  local progress = progress_by_repo[repo]
-  progress_by_repo[repo] = nil
+local function close_progress(request_key, message, level)
+  local progress = progress_by_repo[request_key]
+  progress_by_repo[request_key] = nil
   if not progress then return end
   stop_progress_timer(progress)
   progress.done = true
@@ -1111,423 +926,183 @@ local function update_progress(progress, values)
   render_progress(progress)
 end
 
-local function normalize_issue(raw, repo)
-  local labels = {}
-  local nodes = raw.labels and raw.labels.nodes or {}
-  for _, label in ipairs(type(nodes) == "table" and nodes or {}) do
-    if type(label) == "table" and type(label.name) == "string" then
-      labels[#labels + 1] = {
-        name = label.name,
-        color = label.color,
-        description = label.description,
-      }
+---@param value unknown
+---@return boolean
+local function sync_count(value)
+  return type(value) == "number" and value >= 0 and value <= 9007199254740991 and value == math.floor(value)
+end
+
+---@param repo string
+function M.invalidate_repo(repo)
+  local normalized = normalize_repo(repo)
+  if not normalized then return end
+  issue_snapshot.invalidate(normalized)
+  local prefix = M.db_path(normalized) .. "#"
+  for key in pairs(detail_memory_cache) do
+    if key:sub(1, #prefix) == prefix then detail_memory_cache[key] = nil end
+  end
+  local pending = {}
+  for key in pairs(detail_waiters) do
+    if key:sub(1, #prefix) == prefix then pending[#pending + 1] = key end
+  end
+  for _, key in ipairs(pending) do
+    finish_detail_fetch(key, { ok = false, message = "Issue detail cache invalidated by repository deletion" })
+  end
+end
+
+---@param context GithubIssueSyncContext
+---@param result GithubIssueSyncResult
+local function finish_sync(context, result)
+  if in_flight[context.database] ~= context then return end
+  in_flight[context.database] = nil
+  local level = result.ok and vim.log.levels.INFO or vim.log.levels.ERROR
+  if not result.ok then
+    local message = result.message
+    if M.db_path(context.repo) == context.database and message:find("Could not resolve to a Repository", 1, true) then
+      invalid_repos[context.database] = true
+      local repo_cache = require("github.repo_cache")
+      if repo_cache.clear_cwd_repo(context.cwd, context.repo) then
+        message = message .. "\nCleared stale cached repo mapping for this cwd."
+      end
+      repo_cache.delete_repo(context.repo)
     end
+    notify("GitHub issue sync failed for " .. context.repo .. ":\n" .. message, level)
   end
-  return {
-    repo = repo,
-    number = raw.number,
-    title = raw.title or "",
-    state = raw.state or "",
-    url = raw.url or "",
-    created_at = raw.createdAt,
-    updated_at = raw.updatedAt,
-    body = raw.body,
-    labels = labels,
-  }
+  close_progress(context.database, result.ok and "issues synced" or "sync failed", level)
+  if context.on_complete then context.on_complete(result) end
 end
 
-local function parse_graphql_issues(stdout, repo)
-  local ok, decoded = pcall(vim.json.decode, stdout or "")
-  if not ok or type(decoded) ~= "table" then return nil, "gh api graphql returned invalid JSON" end
-  if type(decoded.errors) == "table" and #decoded.errors > 0 then
-    return nil, vim.json.encode(decoded.errors)
-  end
-  local repository = decoded.data and decoded.data.repository
-  local issue_connection = repository and repository.issues
-  if type(issue_connection) ~= "table" then return nil, "gh api graphql returned no issue connection" end
-  local issues = {}
-  for _, node in ipairs(type(issue_connection.nodes) == "table" and issue_connection.nodes or {}) do
-    if type(node) == "table" then issues[#issues + 1] = normalize_issue(node, repo) end
-  end
-  return {
-    issues = issues,
-    page_info = optional_table(issue_connection.pageInfo),
-    total_count = issue_connection.totalCount,
-    rate_limit = optional_table(decoded.data and decoded.data.rateLimit),
-  }
-end
-
-local function fetch_issue_page(cwd, repo, states, cursor, callback)
-  local owner, name = split_repo(repo)
-  if not owner then
-    callback({ ok = false, message = "Invalid GitHub repo: " .. tostring(repo) })
+---@param context GithubIssueSyncContext
+---@param value table
+local function sync_progress(context, value)
+  if in_flight[context.database] ~= context then return end
+  local phase = ({
+    starting = "loading issues", reading = "loading issues", indexing = "indexing issues",
+    publishing = "writing snapshot", rate_limited = "rate limited", complete = "issues synced", fresh = "issues synced",
+  })[value.phase]
+  if not phase or not sync_count(value.fetched) or not sync_count(value.pages)
+    or (value.total ~= nil and value.total ~= vim.NIL and not sync_count(value.total))
+    or (value.retry_after_ms ~= nil and value.retry_after_ms ~= vim.NIL and not sync_count(value.retry_after_ms)) then
+    notify_once("sync-progress:" .. context.database, "Forge issue sync returned invalid progress for " .. context.repo)
     return
   end
-  cursor = optional_string(cursor)
-  local variables = {
-    owner = owner,
-    name = name,
-    states = states,
-  }
-  if cursor and cursor ~= "" then variables.cursor = cursor end
-  local started_at = vim.uv.now()
-  log_sync(repo, "gh:page:start", {
-    cursor = cursor or "",
-    states = table.concat(states or {}, ","),
-  })
-  resolve_hostname_async(cwd, function(hostname)
-    local command = { "gh", "api" }
-    if hostname then vim.list_extend(command, { "--hostname", hostname }) end
-    vim.list_extend(command, { "graphql", "--input", "-" })
-    gh_text_async(command, vim.json.encode({
-      query = issue_query,
-      variables = variables,
-    }), cwd, function(result)
-      log_sync(repo, "gh:page:finish", {
-        code = result.code,
-        duration_ms = vim.uv.now() - started_at,
-        hostname = hostname or "",
-        stderr_bytes = #(result.stderr or ""),
-        stdout_bytes = #(result.stdout or ""),
-      })
-      if result.code ~= 0 then
-        callback({ ok = false, message = result.output ~= "" and result.output or ("gh exited " .. tostring(result.code)) })
-        return
-      end
-      local page, err = parse_graphql_issues(result.stdout, repo)
-      if not page then
-        log_sync(repo, "gh:page:parse-failed", {
-          message = err or "GitHub issue sync failed",
-        })
-        callback({ ok = false, message = err or "GitHub issue sync failed" })
-        return
-      end
-      local page_info = page.page_info or {}
-      log_sync(repo, "gh:page:parsed", {
-        end_cursor = page_info.endCursor or "",
-        has_next_page = page_info.hasNextPage == true,
-        issue_count = #page.issues,
-        total_count = page.total_count or "",
-      })
-      callback({ ok = true, page = page })
-    end)
-  end)
-end
-
-local function is_rate_limit_message(message)
-  message = tostring(message or ""):lower()
-  return message:find("rate limit", 1, true) ~= nil or message:find("api rate limit exceeded", 1, true) ~= nil
-end
-
-local function is_repo_not_found_message(message)
-  local text = tostring(message or "")
-  return text:find("Could not resolve to a Repository", 1, true) ~= nil
-    or (
-      text:find('"type":"NOT_FOUND"', 1, true) ~= nil
-      and text:find('"path":["repository"]', 1, true) ~= nil
-    )
-end
-
-local function write_snapshot(cwd, repo, callback)
-  local started_at = vim.uv.now()
-  log_sync(repo, "sidecar:snapshot:start", {
-    db = M.db_path(repo),
-    output = M.snapshot_path(repo),
-  })
-  run_sidecar_json({
-    "snapshot",
-    "--db",
-    M.db_path(repo),
-    "--repo",
-    repo,
-    "--state",
-    "open",
-    "--output",
-    M.snapshot_path(repo),
-  }, nil, cwd, function(result)
-    if result.ok then snapshot_cache[repo] = nil end
-    local stat = snapshot_stat(repo)
-    log_sync(repo, "sidecar:snapshot:finish", {
-      duration_ms = vim.uv.now() - started_at,
-      ok = result.ok == true,
-      output_size = stat and stat.size or "",
-      message = result.message or "",
-    })
-    callback(result)
-  end)
-end
-
-local function upsert_page(cwd, repo, scope, payload, callback)
-  local started_at = vim.uv.now()
-  local payload_json = vim.json.encode(payload)
-  log_sync(repo, "sidecar:upsert-page:start", {
-    completed = payload.completed == true,
-    cursor = payload.cursor or "",
-    issue_count = #(payload.issues or {}),
-    payload_bytes = #payload_json,
-    scope = scope,
-  })
-  run_sidecar_json({
-    "upsert-page",
-    "--db",
-    M.db_path(repo),
-    "--repo",
-    repo,
-    "--scope",
-    scope,
-  }, payload_json, cwd, function(result)
-    log_sync(repo, "sidecar:upsert-page:finish", {
-      duration_ms = vim.uv.now() - started_at,
-      ok = result.ok == true,
-      message = result.message or "",
-      upserted = result.value and result.value.upserted or "",
-    })
-    callback(result)
-  end)
-end
-
-local function state_cursor(state, scope)
-  if scope == "all" then return optional_string(state.all_cursor) end
-  return optional_string(state.open_cursor)
-end
-
-local function historical_complete(state, scope)
-  if scope == "all" then return state.all_historical_complete == true end
-  return state.open_historical_complete == true
-end
-
-local function high_water(state, scope)
-  if scope == "all" then return optional_string(state.all_high_water) end
-  return optional_string(state.open_high_water)
-end
-
-local function checked_at(state, scope)
-  if scope == "all" then return tonumber(state.last_all_checked_at or 0) or 0 end
-  return tonumber(state.last_open_checked_at or 0) or 0
-end
-
-local function should_sync(repo, state, scope, manual)
-  if manual then return true end
-  if not snapshot_stat(repo) then return true end
-  if not historical_complete(state, scope) then return true end
-  return os.time() - checked_at(state, scope) >= stale_after_seconds
-end
-
-local function sync_finished(repo, progress, message)
-  close_progress(repo, message or "issues synced")
-  in_flight[repo] = nil
-  release_repo_sync_lock(repo)
-end
-
----@param context table
----@param message string
-local function sync_failed(context, message)
-  local repo = context.repo
-  local progress = context.progress
-  update_progress(progress, { phase = "sync failed", message = message })
-  if is_repo_not_found_message(message) then
-    invalid_repos[repo] = os.time()
-    local repo_cache = require("github.repo_cache")
-    local cleared_cwd = repo_cache.clear_cwd_repo(context.cwd, repo)
-    release_repo_sync_lock(repo)
-    repo_cache.delete_repo(repo)
-    local suffix = cleared_cwd and "\nCleared stale cached repo mapping for this cwd." or ""
-    notify_once("repo-not-found:" .. repo, "GitHub issue sync failed for " .. repo .. ":\n" .. tostring(message) .. suffix, vim.log.levels.ERROR)
-  else
-    notify("GitHub issue sync failed for " .. repo .. ":\n" .. tostring(message), vim.log.levels.ERROR)
+  if not context.progress and value.phase ~= "starting" and value.phase ~= "fresh" and value.phase ~= "complete" then
+    context.progress = ensure_progress(context.repo, context.database)
   end
-  close_progress(repo, "sync failed", vim.log.levels.ERROR)
-  in_flight[repo] = nil
-  release_repo_sync_lock(repo)
-end
-
-local function sync_pages(context)
-  local repo = context.repo
-  log_sync(repo, "sync:page:start", {
-    cursor = context.cursor or "",
-    fetched = context.fetched,
-    incremental = context.incremental == true,
-    total = context.total or "",
-  })
   update_progress(context.progress, {
-    phase = context.incremental and "refreshing issues" or "loading issues",
-    waiting_label = "waiting for GitHub",
-    waiting_since = vim.uv.now(),
+    phase = phase,
+    fetched = value.fetched,
+    total = type(value.total) == "number" and value.total or 0,
+    message = type(value.retry_after_ms) == "number" and ("retry in %ds"):format(math.ceil(value.retry_after_ms / 1000)) or "",
   })
-  fetch_issue_page(context.cwd, repo, context.states, context.cursor, function(result)
-    if not result.ok then
-      if is_rate_limit_message(result.message) then
-        log_sync(repo, "sync:rate-limited", {
-          message = result.message or "",
-          retry_ms = 60000,
-        })
-        update_progress(context.progress, {
-          phase = "rate limited",
-          message = "Retrying in 60s: " .. tostring(result.message),
-        })
-        vim.defer_fn(function()
-          if in_flight[repo] then sync_pages(context) end
-        end, 60000)
-        return
-      end
-      sync_failed(context, result.message or "GitHub issue fetch failed")
-      return
-    end
-
-    local page = result.page
-    local page_info = page.page_info or {}
-    local issues = page.issues or {}
-    context.fetched = context.fetched + #issues
-    context.total = page.total_count or context.total
-    update_progress(context.progress, {
-      phase = context.incremental and "refreshing issues" or "loading issues",
-      fetched = context.fetched,
-      total = context.total,
-      message = "",
-      waiting_label = nil,
-      waiting_since = nil,
-    })
-
-    local reached_high_water = false
-    if context.incremental and context.high_water then
-      for _, issue in ipairs(issues) do
-        local updated_at = tostring(issue.updated_at or "")
-        if updated_at ~= "" and updated_at <= context.high_water then
-          reached_high_water = true
-          break
-        end
-      end
-    end
-    local has_next_page = page_info.hasNextPage == true and not reached_high_water
-    log_sync(repo, "sync:page:fetched", {
-      fetched = context.fetched,
-      has_next_page = has_next_page,
-      issue_count = #issues,
-      reached_high_water = reached_high_water,
-      total = context.total or "",
-    })
-    local payload = {
-      issues = issues,
-      cursor = has_next_page and page_info.endCursor or nil,
-      has_next_page = has_next_page,
-      total_count = page.total_count,
-      completed = not has_next_page,
-      high_water = issues[1] and issues[1].updated_at or nil,
-      checked_at = os.time(),
-    }
-    update_progress(context.progress, {
-      phase = "indexing issues",
-      message = ("Writing page with %d issues"):format(#issues),
-      waiting_label = "indexing",
-      waiting_since = vim.uv.now(),
-    })
-    upsert_page(context.cwd, repo, context.scope, payload, function(upsert_result)
-      if not upsert_result.ok then
-        sync_failed(context, upsert_result.message or "issue index upsert failed")
-        return
-      end
-      update_progress(context.progress, {
-        phase = "writing snapshot",
-        message = "Refreshing local completion snapshot",
-        waiting_label = "writing snapshot",
-        waiting_since = vim.uv.now(),
-      })
-      write_snapshot(context.cwd, repo, function(snapshot_result)
-        if not snapshot_result.ok then
-          sync_failed(context, snapshot_result.message or "issue snapshot write failed")
-          return
-        end
-        update_progress(context.progress, {
-          phase = context.incremental and "refreshing issues" or "loading issues",
-          message = "",
-          waiting_label = nil,
-          waiting_since = nil,
-        })
-        if has_next_page then
-          context.cursor = optional_string(page_info.endCursor)
-          local delay_ms = 150
-          local rate_limit = optional_table(page.rate_limit)
-          local remaining = tonumber(rate_limit.remaining)
-          if remaining == 0 then
-            delay_ms = 60000
-            log_sync(repo, "sync:rate-budget-empty", {
-              reset_at = rate_limit.resetAt or "",
-              retry_ms = delay_ms,
-            })
-            update_progress(context.progress, {
-              phase = "rate limited",
-              message = "Retrying in 60s" .. (rate_limit.resetAt and ("; reset at " .. rate_limit.resetAt) or ""),
-            })
-          end
-          vim.defer_fn(function()
-            if in_flight[repo] then sync_pages(context) end
-          end, delay_ms)
-          return
-        end
-        sync_finished(repo, context.progress)
-      end)
-    end)
-  end)
 end
 
+---@param cwd string?
+---@param repo string
+---@param opts? GithubIssueSyncOptions
 function M.sync_repo(cwd, repo, opts)
-  repo = normalize_repo(repo)
-  if not repo then return end
+  local normalized = normalize_repo(repo)
   opts = opts or {}
-  if invalid_repos[repo] and opts.manual ~= true then return end
-  if opts.manual == true then invalid_repos[repo] = nil end
-  local scope = opts.scope == "all" and "all" or "open"
-  if in_flight[repo] then
-    if opts.manual then notify("GitHub issue sync is already running for " .. repo, vim.log.levels.INFO) end
+  if not normalized then
+    local result = { ok = false, message = "Invalid GitHub issue sync repository: " .. tostring(repo) }
+    notify(result.message)
+    if opts.on_complete then opts.on_complete(result) end
     return
   end
-
-  local lock = acquire_sync_lock(repo)
-  if not lock then
-    if opts.manual then
-      notify(
-        "GitHub issue sync is already running for " .. repo .. " in another Neovim instance. Using the latest local snapshot.",
-        vim.log.levels.INFO
-      )
-    end
+  local database = M.db_path(normalized)
+  if invalid_repos[database] and not opts.manual then
+    if opts.on_complete then opts.on_complete({ ok = false, message = "Repository was not found during this session" }) end
     return
   end
-  sync_locks[repo] = lock
-
-  run_sidecar_json({ "state", "--db", M.db_path(repo), "--repo", repo }, nil, cwd, function(state_result)
-    if not state_result.ok then
-      release_repo_sync_lock(repo)
-      notify_once("state:" .. repo, "GitHub issue index state failed for " .. repo .. ":\n" .. tostring(state_result.message))
+  if in_flight[database] then
+    local message = "GitHub issue sync is already running for " .. normalized
+    if opts.manual then notify(message, vim.log.levels.INFO) end
+    if opts.on_complete then opts.on_complete({ ok = false, message = message }) end
+    return
+  end
+  if opts.manual then invalid_repos[database] = nil end
+  ---@type GithubIssueSyncContext
+  local context = {
+    repo = normalized, database = database, cwd = cwd or vim.fn.getcwd(),
+    snapshot = M.snapshot_path(normalized), on_complete = opts.on_complete,
+    progress = opts.manual and ensure_progress(normalized, database) or nil,
+  }
+  in_flight[database] = context
+  M.reload_snapshot(normalized)
+  update_progress(context.progress, { phase = "loading issues", fetched = 0 })
+  resolve_hostname_async(context.cwd, function(hostname, failure)
+    if in_flight[database] ~= context then return end
+    local cache_hostname = require("github.repo_cache").hostname()
+    hostname = hostname or cache_hostname
+    if failure or M.db_path(normalized) ~= database or hostname ~= cache_hostname then
+      finish_sync(context, { ok = false, message = failure or
+        ("GitHub sync host %s does not match cache context %s. Set GH_HOST to the intended host before syncing."):format(hostname, cache_hostname) })
       return
     end
-    local state = state_result.value or {}
-    if not should_sync(repo, state, scope, opts.manual == true) then
-      release_repo_sync_lock(repo)
-      return
+    local owner, name = normalized:match("^([^/]+)/([^/]+)$")
+    ---@type GithubIssueSyncRequest
+    local params = {
+      database = database, directory = context.cwd, progress = progress_enabled,
+      request = {
+        repository = { hostname = hostname, owner = owner, name = name },
+        scope = opts.scope == "all" and "all" or "open", manual = opts.manual == true,
+        snapshot = context.snapshot,
+      },
+    }
+    local received = false
+    ---@param value unknown
+    ---@param request_failure string?
+    local function complete(value, request_failure)
+      if received or in_flight[database] ~= context then return end
+      received = true
+      if request_failure then
+        finish_sync(context, { ok = false, message = tostring(request_failure) })
+        return
+      end
+      if type(value) ~= "table" or type(value.refreshed) ~= "boolean" or not sync_count(value.fetched) or not sync_count(value.pages) then
+        finish_sync(context, { ok = false, message = "Forge issue sync returned an invalid result" })
+        return
+      end
+      if M.db_path(normalized) ~= database then
+        finish_sync(context, { ok = false, message = "GitHub cache context changed during sync" })
+        return
+      end
+      if value.refreshed and not context.progress then
+        context.progress = ensure_progress(normalized, database)
+      end
+      update_progress(context.progress, { fetched = value.fetched, phase = "writing snapshot" })
+      M.reload_snapshot(normalized, function(loaded)
+        if M.db_path(normalized) ~= database then
+          finish_sync(context, { ok = false, message = "GitHub cache context changed during snapshot refresh" })
+        elseif not loaded.ok then
+          finish_sync(context, { ok = false, message = "Issue sync completed but snapshot refresh failed: " .. tostring(loaded.message) })
+        else
+          finish_sync(context, { ok = true, refreshed = value.refreshed, fetched = value.fetched, pages = value.pages })
+        end
+      end, true)
     end
-
-    in_flight[repo] = true
-    local progress = ensure_progress(repo, opts.manual == true)
-    update_progress(progress, { phase = "loading issues", fetched = 0, total = state.open_total_count or state.all_total_count })
-    local incremental = historical_complete(state, scope)
-    local sync_states = incremental and { "OPEN", "CLOSED" } or (scope == "all" and { "OPEN", "CLOSED" } or { "OPEN" })
-    sync_pages({
-      cwd = cwd,
-      repo = repo,
-      scope = scope,
-      states = sync_states,
-      cursor = incremental and nil or state_cursor(state, scope),
-      incremental = incremental,
-      high_water = incremental and high_water(state, scope) or nil,
-      fetched = 0,
-      total = nil,
-      progress = progress,
-    })
+    local function progress(value)
+      if not received then sync_progress(context, value) end
+    end
+    local accepted, request_failure = pcall(function()
+      if sync_runner_for_test then
+        sync_runner_for_test(params, complete, progress)
+      else
+        require("forge.client").request_host("github.sync", params, complete, progress)
+      end
+    end)
+    if not accepted then
+      if received then error(request_failure) end
+      complete(nil, "Forge issue sync request failed: " .. tostring(request_failure))
+    end
   end)
 end
 
+---@param cwd string?
+---@param repo string
+---@param opts? GithubIssueSyncOptions
 function M.ensure_repo(cwd, repo, opts)
-  repo = normalize_repo(repo)
+  local repo = normalize_repo(repo)
   if not repo then return end
   opts = opts or {}
   if opts.remember_cwd == true then require("github.repo_cache").remember_cwd_repo(cwd, repo) end
@@ -1536,7 +1111,7 @@ end
 
 function M.ensure_for_buffer(buf, repo)
   buf = buf or vim.api.nvim_get_current_buf()
-  repo = normalize_repo(repo) or require("github.repo_cache").completion_repo(buf)
+  local repo = normalize_repo(repo) or require("github.repo_cache").completion_repo(buf)
   if not repo then return end
   M.ensure_repo(vim.fn.getcwd(), repo, { manual = false })
 end
@@ -1563,12 +1138,19 @@ function M.sync_current(opts)
   M.ensure_current(vim.fn.getcwd(), vim.tbl_extend("force", opts or {}, { manual = true }))
 end
 
-function M._set_runner_for_test(runner)
-  runner_for_test = runner
+---@param runner fun(params: GithubIssueStorageRequest, callback: fun(value: table?, failure: string?))?
+function M._set_storage_runner_for_test(runner)
+  storage_runner_for_test = runner
 end
 
-function M._set_gh_runner_for_test(runner)
-  gh_runner_for_test = runner
+---@param runner fun(params: GithubIssueSyncRequest, callback: fun(value: table?, failure: string?), progress: fun(value: table))?
+function M._set_sync_runner_for_test(runner)
+  sync_runner_for_test = runner
+end
+
+---@param runner fun(params: GithubIssueDetailRequest, callback: fun(value: table?, failure: string?))?
+function M._set_detail_runner_for_test(runner)
+  detail_runner_for_test = runner
 end
 
 function M._set_progress_enabled_for_test(enabled)
@@ -1589,22 +1171,19 @@ function M._reset_for_test()
   for _, progress in pairs(progress_by_repo) do
     stop_progress_timer(progress)
   end
-  for _, lock in pairs(sync_locks) do
-    release_sync_lock(lock)
-  end
   progress_by_repo = {}
   in_flight = {}
   detail_in_flight = {}
   detail_prefetch_in_flight = {}
   detail_waiters = {}
   detail_memory_cache = {}
-  sync_locks = {}
-  snapshot_cache = {}
+  issue_snapshot.clear()
   notified = {}
   invalid_repos = {}
   hostname_by_cwd = {}
-  runner_for_test = nil
-  gh_runner_for_test = nil
+  storage_runner_for_test = nil
+  sync_runner_for_test = nil
+  detail_runner_for_test = nil
   progress_enabled = true
   detail_stale_after_seconds = 2 * 60
   notifier_failed = false

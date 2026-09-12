@@ -83,26 +83,9 @@
 ---@field message? string
 ---@field code? integer
 
----@class GithubGhRepoContributorsResult
----@field ok boolean
----@field contributors? table[]
----@field message? string
----@field code? integer
-
 ---@class GithubGhCreateIssueResult
 ---@field ok boolean
 ---@field url? string
----@field message? string
----@field code? integer
-
----@class GithubGhIssueEdit
----@field title? string
----@field body? string
----@field add_assignees? string[]
----@field remove_assignees? string[]
-
----@class GithubGhUpdateIssueResult
----@field ok boolean
 ---@field message? string
 ---@field code? integer
 
@@ -112,7 +95,6 @@
 ---@type GithubGhModule
 local M = {}
 
-local repo_users = require("github.repo_users")
 
 local issue_search_fields = table.concat({
   "number",
@@ -135,22 +117,6 @@ local pr_search_fields = table.concat({
   "updatedAt",
   "state",
   "isDraft",
-}, ",")
-
-local issue_fields = table.concat({
-  "number",
-  "title",
-  "body",
-  "url",
-  "state",
-  "author",
-  "assignees",
-  "labels",
-  "milestone",
-  "projectItems",
-  "comments",
-  "createdAt",
-  "updatedAt",
 }, ",")
 
 local pr_fields = table.concat({
@@ -438,20 +404,6 @@ function M.current_repo_async(cwd, callback)
   end)
 end
 
----@param cwd string?
----@param repo string
----@param callback fun(result: GithubGhRepoContributorsResult)
-function M.repo_contributors_async(cwd, repo, callback)
-  repo_users.fetch_async({
-    cwd = cwd,
-    repo = repo,
-    system_async = system_text_async,
-    decode_json = decode_json,
-    result_error = result_error,
-    callback = callback,
-  })
-end
-
 ---@param stdout string
 ---@return table[], string?
 local function decode_json_lines(stdout)
@@ -632,7 +584,7 @@ end
 ---@param repo string?
 ---@return GithubGhCommand
 local function detail_command(kind, number, repo)
-  local fields = kind == "pr" and pr_fields or issue_fields
+  local fields = pr_fields
   local command = { "gh", kind, "view", tostring(number), "--json", fields }
   if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
   return command
@@ -664,14 +616,6 @@ end
 ---@param number integer|string
 ---@param repo string?
 ---@param callback fun(result: GithubGhDetailResult)
-function M.issue_view_async(cwd, number, repo, callback)
-  detail_async(cwd, "issue", number, repo, callback)
-end
-
----@param cwd string?
----@param number integer|string
----@param repo string?
----@param callback fun(result: GithubGhDetailResult)
 function M.pr_view_async(cwd, number, repo, callback)
   detail_async(cwd, "pr", number, repo, callback)
 end
@@ -696,36 +640,6 @@ function M.create_issue_async(cwd, title, body, repo, callback)
       return
     end
     callback({ ok = true, url = url })
-  end)
-end
-
----@param cwd string?
----@param number integer|string
----@param repo string?
----@param edit GithubGhIssueEdit
----@param callback fun(result: GithubGhUpdateIssueResult)
-function M.update_issue_async(cwd, number, repo, edit, callback)
-  local command = { "gh", "issue", "edit", tostring(number) }
-  local input = nil
-  if repo and repo ~= "" then vim.list_extend(command, { "--repo", repo }) end
-  if type(edit.title) == "string" then vim.list_extend(command, { "--title", edit.title }) end
-  if type(edit.body) == "string" then
-    vim.list_extend(command, { "--body-file", "-" })
-    input = edit.body
-  end
-  for _, assignee in ipairs(edit.add_assignees or {}) do
-    vim.list_extend(command, { "--add-assignee", assignee })
-  end
-  for _, assignee in ipairs(edit.remove_assignees or {}) do
-    vim.list_extend(command, { "--remove-assignee", assignee })
-  end
-
-  system_text_async(command, input, cwd, function(result)
-    if result.code ~= 0 then
-      callback({ ok = false, message = result_error(result), code = result.code })
-      return
-    end
-    callback({ ok = true })
   end)
 end
 

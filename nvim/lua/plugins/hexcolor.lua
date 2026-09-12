@@ -8,6 +8,12 @@ return {
       ccc.setup({
         highlighter = {
           auto_enable = true,
+          excludes = {
+            "forge", "ForgeStatus", "ForgeWalkthrough", "ForgeGithubNotifications",
+            "ForgeHarness", "ForgeHarnessInput", "ForgeHarnessTool",
+            "ForgeHelp", "ForgePopup", "ForgeChoicePopup", "ForgeReviewRecovery",
+            "ForgePicker", "ForgePickerInput", "ForgePickerSearch",
+          },
           lsp = false
         },
         preserve = true,

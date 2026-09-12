@@ -24,8 +24,8 @@ return {
     keys = {
       {
         key("og"),
-        "<cmd>GitStatus<cr>",
-        desc = "GitStatus",
+        "<cmd>ForgeStatus<cr>",
+        desc = "ForgeStatus",
       }
     },
     config = function()

@@ -1,7 +1,7 @@
 ---
 name: walkthrough
 description: >-
-  Generate, regenerate, validate, or repair a DiffReview `.walkthrough.json` artifact
+  Generate, regenerate, validate, or repair a Forge `.walkthrough.json` artifact
   directly from repository changes. Use when creating review walkthroughs, guided
   code review artifacts, or `.walkthrough.json` files after local modifications.
 targets:
@@ -10,7 +10,7 @@ targets:
 
 # Walkthrough
 
-Dispatch the complete DiffReview walkthrough generation workflow to the `walkthrough-writer` subagent to isolate semantic discovery, raw patch extraction, artifact construction, and schema validation from the parent context.
+Dispatch the complete Forge walkthrough generation workflow to the `walkthrough-writer` subagent to isolate semantic discovery, raw patch extraction, artifact construction, and schema validation from the parent context.
 
 ## Dispatch Workflow
 

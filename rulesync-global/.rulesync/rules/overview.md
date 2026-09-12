@@ -122,7 +122,7 @@ globs:
 
 Use this section when asked to create, draft, write, review, or update an implementation plan, execution plan, refactor plan, test plan, or reviewer-readable code-flow walkthrough before making changes.
 
-When DiffReview Harness exposes structured planning tools, treat its `PlanDocument` JSON as the canonical artifact and the rendered Markdown as a read-only reviewer view. Create the document with `harness_plan_create`, apply focused semantic operations with `harness_plan_edit`, request current state with `harness_plan_read`, and submit the exact validated ID and version with `harness_plan_submit`. Update complete definition member or enum variant arrays instead of issuing member-level operations.
+When Forge Harness exposes structured planning tools, treat its `PlanDocument` JSON as the canonical artifact and the rendered Markdown as a read-only reviewer view. Create the document with `harness_plan_create`, apply focused semantic operations with `harness_plan_edit`, request current state with `harness_plan_read`, and submit the exact validated ID and version with `harness_plan_submit`. Update complete definition member or enum variant arrays instead of issuing member-level operations.
 
 During accepted-plan execution, work one complete task at a time. Use subtasks and code edits as progress and audit evidence rather than separate goals, report each task through `harness_plan_task_report`, and record divergences through `harness_plan_deviation`. Informational deviations preserve scope. Scope deviations follow the Harness review policy. Planning and plan approval never widen command permissions.
 

@@ -1,0 +1,30 @@
+vim.loader.enable(false)
+local replica = require("forge.buffer")
+local function snapshot(document, text)
+  return { document = document, revision = 0, block = { { id = "body", text = text,
+    metadata = { target = {}, decoration = {}, editable_region = {} } } } }
+end
+local existing = vim.api.nvim_create_buf(false, true)
+vim.api.nvim_buf_set_lines(existing, 0, -1, true, { "typed at startup" })
+local initial = vim.api.nvim_buf_get_changedtick(existing)
+local owner = replica.open("pending-composer", { buffer = existing, generated = true, expected_changedtick = initial })
+local ok, failure = xpcall(function()
+  assert(vim.bo[existing].modifiable, "pending admission prevented typing")
+  vim.api.nvim_buf_set_lines(existing, 0, -1, true, { "newer startup text" })
+  local changed = vim.api.nvim_buf_get_changedtick(existing)
+  assert(replica.apply_snapshot(owner, snapshot(owner.document, { "stale startup text" })).kind == "SourceChanged")
+  assert(vim.api.nvim_buf_get_changedtick(existing) == changed, "rejected admission changed native text")
+  assert(vim.api.nvim_buf_get_lines(existing, 0, -1, true)[1] == "newer startup text")
+  replica.close(owner)
+  assert(vim.api.nvim_buf_is_valid(existing), "closing rejected admission deleted user input")
+  owner = replica.open("accepted-composer", { buffer = existing, generated = true, expected_changedtick = changed })
+  assert(replica.apply_snapshot(owner, snapshot(owner.document, { "newer startup text" })).kind == "Applied")
+  assert(owner.generated_owned and vim.b[existing].forge_native_document)
+  assert(not vim.bo[existing].modifiable)
+  replica.close(owner)
+  assert(not vim.api.nvim_buf_is_valid(existing), "generated ownership was not released")
+end, debug.traceback)
+if vim.api.nvim_buf_is_valid(existing) then vim.api.nvim_buf_delete(existing, { force = true }) end
+if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") end
+print("generated_adoption OK")
+vim.cmd("qa!")

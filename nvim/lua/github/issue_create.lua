@@ -1,19 +1,21 @@
 local gh = require("github.gh")
-local popup_window = require("diff_review.infra.popup_window")
+local popup_window = require("forge.infra.popup_window")
 
 local M = {}
 
 ---@param message string
 ---@param level integer
 local function notify(message, level)
-  vim.notify(message, level, { title = "GithubIssueCreate" })
+  vim.notify(message, level, { title = "ForgeGithubIssueCreate" })
 end
 
 ---@param url string
----@return string?, string?
+---@return {hostname:string, owner:string, name:string}?, string?
 local function parse_issue_url(url)
-  local owner, repo, number = url:match("^https?://[^/]+/([^/]+)/([^/]+)/issues/(%d+)")
-  if owner and repo and number then return owner .. "/" .. repo, number end
+  local hostname, owner, name, number = url:match("^https?://([^/]+)/([^/]+)/([^/]+)/issues/(%d+)")
+  if hostname and owner and name and number then
+    return { hostname = hostname:lower(), owner = owner, name = name }, tonumber(number)
+  end
   return nil, nil
 end
 
@@ -28,16 +30,16 @@ local function create_issue(cwd, title, body)
       return
     end
 
-    local repo, number = parse_issue_url(result.url)
-    if not (repo and number) then
+    local repository, number = parse_issue_url(result.url)
+    if not (repository and number) then
       notify("Created GitHub issue: " .. result.url, vim.log.levels.INFO)
       gh.open_url(result.url)
       return
     end
 
-    require("github.issue_view").open({
+    require("github.issue_document").open({
       kind = "issue",
-      repo = repo,
+      repository = repository,
       number = number,
       cwd = cwd,
     })

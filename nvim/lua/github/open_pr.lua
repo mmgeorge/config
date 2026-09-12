@@ -1,6 +1,6 @@
 local M = {}
 local repo_cache = require("github.repo_cache")
-local popup_window = require("diff_review.infra.popup_window")
+local popup_window = require("forge.infra.popup_window")
 
 local default_base_branch = "main"
 local state_cache = nil
@@ -44,7 +44,7 @@ local function notify(message, level, opts)
 
   opts = vim.tbl_extend("force", {
     id = progress.id,
-    title = "GithubPRCreate",
+    title = "ForgeGithubPRCreate",
   }, opts or {})
   vim.notify(message, level or vim.log.levels.INFO, opts)
 end
@@ -382,8 +382,8 @@ local function confirm(lines, on_yes, on_no)
     relative = "editor",
     width = width,
     height = #body,
-    title = "GithubPRCreate",
-    filetype = "DiffReviewConfirm",
+    title = "ForgeGithubPRCreate",
+    filetype = "ForgeConfirm",
   })
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, body)
   vim.bo[buf].modifiable = false
@@ -526,70 +526,58 @@ local function generate_description(context, callback)
   end)
 end
 
-local function push_branch(cwd, branch, callback)
-  git({ "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}" }, cwd, function(upstream)
-    local args = { "push" }
-    if upstream and vim.trim(upstream) ~= "" then
-      show_progress("Pushing current branch...")
-    else
-      show_progress("Pushing current branch and setting upstream...")
-      vim.list_extend(args, { "-u", "origin", branch })
-    end
-
-    git(args, cwd, callback)
+local function push_branch(cwd, branch, head, callback)
+  show_progress("Pushing current branch...")
+  require("forge.git.write").execute(cwd, { kind = "publish_branch", name = branch, head = head }, function(result)
+    callback(result.output, not result.ok and result.output or nil)
+  end, function(text)
+    local latest = vim.trim(text)
+    if latest ~= "" then show_progress(latest) end
   end)
 end
 
-local function create_pr(cwd, branch, selected_base_branch, metadata)
+local function create_pr(cwd, context, selected_base_branch, metadata)
   show_progress("Creating draft PR...")
-  run({
-    "gh",
-    "pr",
-    "create",
-    "--draft",
-    "--base",
-    selected_base_branch,
-    "--head",
-    branch,
-    "--title",
-    metadata.title,
-    "--body",
-    metadata.body,
-  }, { cwd = cwd }, function(output, err)
+  require("github.pr_creation").create(cwd, context, selected_base_branch, metadata, function(created, err)
     if err then
       fail_progress("Failed to create PR: " .. err)
       return
     end
 
-    local pr_ref = output:match("https?://%S+") or vim.trim(output)
+    local pr_ref = created and created.html_url
+    if type(pr_ref) ~= "string" or pr_ref == "" then
+      fail_progress("Created PR receipt omitted its URL")
+      return
+    end
     show_progress("Opening PR in nvim...")
-    require("diff_review.integrations.gh").pr_async(cwd, pr_ref, nil, function(result)
+    require("forge.integrations.gh").pr_async(cwd, pr_ref, nil, function(result)
       if not result.ok or not result.pr then
         fail_progress("Created PR, but failed to open PR view: " .. (result.message or "Unable to load GitHub pull request"))
         return
       end
 
-      require("diff_review").open_pr(result.pr, { cwd = cwd })
+      require("forge").open_pr(result.pr, { cwd = cwd })
       complete_progress("Created draft PR: " .. pr_ref)
     end)
   end)
 end
 
-function M.open()
-  git({ "rev-parse", "--show-toplevel" }, nil, function(root, root_err)
+function M.open(options)
+  options = options or {}
+  git({ "rev-parse", "--show-toplevel" }, options.cwd, function(root, root_err)
     if root_err then
       fail_progress("Not in a git repository: " .. root_err)
       return
     end
 
     local cwd = vim.trim(root)
-    git({ "branch", "--show-current" }, cwd, function(branch, branch_err)
+    require("github.pr_creation").context(cwd, function(context, branch_err)
       if branch_err then
         fail_progress("Could not determine current branch: " .. branch_err)
         return
       end
 
-      branch = vim.trim(branch)
+      local branch = context.branch
       if branch == "" then
         fail_progress("Cannot create a PR from a detached HEAD")
         return
@@ -605,7 +593,7 @@ function M.open()
 
         git({ "rev-parse", "--verify", "origin/" .. selected_base_branch }, cwd, function(_, origin_err)
           local base_ref = origin_err and selected_base_branch or "origin/" .. selected_base_branch
-          git({ "log", "--reverse", "--format=%s%n%b%n---END-COMMIT---", base_ref .. "..HEAD" }, cwd,
+          git({ "log", "--reverse", "--format=%s%n%b%n---END-COMMIT---", base_ref .. ".." .. context.head_commit }, cwd,
             function(commits, commits_err)
               if commits_err then
                 fail_progress("Could not read PR commit messages: " .. commits_err)
@@ -624,13 +612,13 @@ function M.open()
                 return
               end
 
-              git({ "diff", "--stat", "--summary", base_ref .. "..HEAD" }, cwd, function(diff_stat, stat_err)
+              git({ "diff", "--stat", "--summary", base_ref .. ".." .. context.head_commit }, cwd, function(diff_stat, stat_err)
                 if stat_err then
                   fail_progress("Could not read PR diff summary: " .. stat_err)
                   return
                 end
 
-                git({ "diff", "--no-ext-diff", "--no-color", base_ref .. "..HEAD" }, cwd, function(raw_diff, diff_err)
+                git({ "diff", "--no-ext-diff", "--no-color", base_ref .. ".." .. context.head_commit }, cwd, function(raw_diff, diff_err)
                   if diff_err then
                     fail_progress("Could not read PR diff context: " .. diff_err)
                     return
@@ -647,13 +635,13 @@ function M.open()
                       body = build_pr_body(description),
                     }
 
-                    push_branch(cwd, branch, function(_, push_err)
+                    push_branch(cwd, branch, context.head_commit, function(_, push_err)
                       if push_err then
                         fail_progress("Failed to push branch: " .. push_err)
                         return
                       end
 
-                      create_pr(cwd, branch, selected_base_branch, metadata)
+                      create_pr(cwd, context, selected_base_branch, metadata)
                     end)
                   end)
                 end)

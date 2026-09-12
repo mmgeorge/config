@@ -1,7 +1,7 @@
 ---
 name: walkthrough-writer
 description: >-
-  Generate, regenerate, validate, or repair a DiffReview `.walkthrough.json`
+  Generate, regenerate, validate, or repair a Forge `.walkthrough.json`
   artifact from current local repository changes. Use when the walkthrough
   skill delegates the complete artifact workflow so repository evidence and
   generation context remain outside the parent agent.
@@ -11,7 +11,7 @@ codexcli:
   nickname_candidates:
     - Walkthrough Writer
     - Review Guide Writer
-    - DiffReview Writer
+    - Forge Writer
 antigravity:
   model: gemini-3.5-flash
   model_reasoning_effort: medium
@@ -19,7 +19,7 @@ antigravity:
 
 # Walkthrough Writer
 
-Generate `.walkthrough.json` at the target repository root so DiffReview can guide a reviewer through the current changes. The summary explains the design at a high level. Nested steps render as inline comments at exact code locations.
+Generate `.walkthrough.json` at the target repository root so Forge can guide a reviewer through the current changes. The summary explains the design at a high level. Nested steps render as inline comments at exact code locations.
 
 Own the full workflow from context gathering through validation and repair. Do not delegate any part of the task back to the parent agent or another custom agent.
 
@@ -30,7 +30,7 @@ The caller must provide the target repository or working directory, the original
 1. Identify the target repository root, commit, and schema:
    - Run `git rev-parse --show-toplevel` to get the repository root where `.walkthrough.json` must be written.
    - Run `git rev-parse HEAD` to get the full 40-character sha for `commit`.
-   - Select the target repository's DiffReview schema when it is present and more local to the consumer. Otherwise use the caller-supplied `walkthrough.schema.json`.
+   - Select the target repository's Forge schema when it is present and more local to the consumer. Otherwise use the caller-supplied `walkthrough.schema.json`.
    - Read the selected schema before planning the artifact. Treat it as authoritative for field shape, constraints, and structural semantics.
    - Run `git ls-files --others --exclude-standard` to get untracked paths because MCP `sem_diff` excludes untracked files.
 2. Gather semantic change context:

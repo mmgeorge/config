@@ -1,0 +1,21 @@
+{
+  "id": "ISSUE_7",
+  "number": 7,
+  "title": "Unicode é issue",
+  "body": "Issue body with **Markdown** and λ.",
+  "url": "https://enterprise.example/Owner/Repo/issues/7",
+  "state": "OPEN",
+  "author": { "login": "alice" },
+  "assignees": [{ "login": "bob" }],
+  "labels": [{ "name": "bug" }],
+  "milestone": { "title": "v1.0" },
+  "projectItems": [{ "title": "Planning", "status": { "name": "In progress" } }],
+  "createdAt": "2026-09-01T00:00:00Z",
+  "updatedAt": "2026-09-07T00:00:00Z",
+  "comments": [{
+    "body": "Comment λ",
+    "author": { "login": "app/automation" },
+    "createdAt": "2026-09-02T00:00:00Z",
+    "url": "https://enterprise.example/Owner/Repo/issues/7#issuecomment-123"
+  }]
+}

@@ -57,7 +57,7 @@ Wrap multi-line or stateful Lua evaluations in immediately invoked function expr
 Use `execute()` within `--remote-expr` to trigger plugin commands and capture output:
 
 ```powershell
-nvim --server $env:NVIM --remote-expr 'execute("GitStatus")'
+nvim --server $env:NVIM --remote-expr 'execute("ForgeStatus")'
 nvim --server $env:NVIM --remote-expr 'execute("LspRestart")'
 ```
 
@@ -68,7 +68,7 @@ nvim --server $env:NVIM --remote-expr 'execute("LspRestart")'
 
 ```powershell
 nvim --server $env:NVIM --remote-send ':echo "hello"<CR>'
-nvim --server $env:NVIM --remote nvim/lua/diff_review/init.lua
+nvim --server $env:NVIM --remote nvim/lua/forge/init.lua
 ```
 
 ## Common Diagnostic Queries
@@ -109,7 +109,7 @@ Query runtime paths dynamically instead of opening interactive help splits:
 nvim --server $env:NVIM --remote-expr 'luaeval("require(\"lazy.core.config\").plugins[\"trouble.nvim\"].dir")'
 
 # Locate runtime files
-nvim --server $env:NVIM --remote-expr 'luaeval("vim.json.encode(vim.api.nvim_get_runtime_file(\"lua/diff_review/**\", true))")'
+nvim --server $env:NVIM --remote-expr 'luaeval("vim.json.encode(vim.api.nvim_get_runtime_file(\"lua/forge/**\", true))")'
 ```
 
 ## Hot-Reloading Plugin Modules
@@ -117,9 +117,9 @@ nvim --server $env:NVIM --remote-expr 'luaeval("vim.json.encode(vim.api.nvim_get
 To verify plugin modifications in a running session, clear the package cache for each affected module, invoke `setup()`, and test command execution:
 
 ```powershell
-nvim --server $env:NVIM --remote-expr 'execute("lua package.loaded[\"diff_review\"] = nil; package.loaded[\"diff_review.views.status.state\"] = nil")'
-nvim --server $env:NVIM --remote-expr 'execute("lua require(\"diff_review\").setup({})")'
-nvim --server $env:NVIM --remote-expr 'execute("GitStatus")'
+nvim --server $env:NVIM --remote-expr 'execute("lua package.loaded[\"forge\"] = nil; package.loaded[\"forge.views.status.state\"] = nil")'
+nvim --server $env:NVIM --remote-expr 'execute("lua require(\"forge\").setup({})")'
+nvim --server $env:NVIM --remote-expr 'execute("ForgeStatus")'
 ```
 
 `package.loaded` caches every submodule separately. Clear all modified submodule paths explicitly before reloading the parent package.

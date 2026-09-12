@@ -173,7 +173,7 @@ function M.rows(comments, opts)
     if opts.is_folded then folded = opts.is_folded(entry_id, true, entry) end
     local line = M.line(comment, not folded, alignment, opts)
     local highlights = {
-      { start_col = 0, end_col = #line, hl_group = opts.line_hl_group or "DiffReviewReviewComment" },
+      { start_col = 0, end_col = #line, hl_group = opts.line_hl_group or "ForgeReviewComment" },
     }
     local date_text = M.date(comment, opts)
     local date_start = date_text ~= "" and line:find(date_text, 1, true) or nil
@@ -187,7 +187,7 @@ function M.rows(comments, opts)
     rows[#rows + 1] = {
       text = line,
       entry = entry,
-      line_hl_group = opts.line_hl_group or "DiffReviewReviewComment",
+      line_hl_group = opts.line_hl_group or "ForgeReviewComment",
       highlights = highlights,
     }
     if not folded then
@@ -205,7 +205,7 @@ function M.rows(comments, opts)
           body_highlights[#body_highlights + 1] = {
             start_col = 0,
             end_col = #body_line,
-            hl_group = opts.body_hl_group or opts.line_hl_group or "DiffReviewReviewComment",
+            hl_group = opts.body_hl_group or opts.line_hl_group or "ForgeReviewComment",
           }
         end
         rows[#rows + 1] = {

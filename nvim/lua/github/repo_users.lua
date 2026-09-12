@@ -1,108 +1,52 @@
 ---@class GithubRepoUsersFetchOptions
 ---@field cwd string?
 ---@field repo string
----@field system_async fun(command: string[], input: string?, cwd: string?, callback: fun(result: table))
----@field decode_json fun(stdout: string): table?, string?
----@field result_error fun(result: table): string
----@field callback fun(result: { ok: boolean, contributors?: table[], message?: string, code?: integer })
+---@field ttl_seconds? integer
+---@field callback fun(result: { ok: boolean, contributors?: table[], metadata?: table, message?: string })
 
 local M = {}
-
----@param repo string
----@return { name: string, command: string[] }[]
-local function user_endpoints(repo)
-  return {
-    {
-      name = "contributors",
-      command = { "gh", "api", "/repos/" .. repo .. "/contributors", "--paginate", "--slurp" },
-    },
-    {
-      name = "collaborators",
-      command = { "gh", "api", "/repos/" .. repo .. "/collaborators", "--paginate", "--slurp" },
-    },
-  }
-end
-
----@param users table<string, table>
----@param raw any
-local function add_user(users, raw)
-  if type(raw) ~= "table" then return end
-  if type(raw.login) == "string" and raw.login ~= "" then
-    local key = raw.login:lower()
-    if not users[key] then
-      users[key] = {
-        login = raw.login,
-        name = type(raw.name) == "string" and raw.name or nil,
-      }
-    elseif not users[key].name and type(raw.name) == "string" then
-      users[key].name = raw.name
-    end
-    return
-  end
-  for _, item in ipairs(raw) do
-    add_user(users, item)
-  end
-end
-
----@param users table<string, table>
----@return table[]
-local function user_list(users)
-  local items = {}
-  for _, user in pairs(users) do
-    items[#items + 1] = user
-  end
-  table.sort(items, function(left, right)
-    return tostring(left.login or ""):lower() < tostring(right.login or ""):lower()
-  end)
-  return items
-end
+local runner_for_test
 
 ---@param opts GithubRepoUsersFetchOptions
 function M.fetch_async(opts)
-  local endpoints = user_endpoints(opts.repo)
-  local users = {}
-  local errors = {}
-  local successful_requests = 0
-  local failure_code = 1
-
-  local function fetch_next(index)
-    local endpoint = endpoints[index]
-    if not endpoint then
-      if successful_requests == 0 then
-        opts.callback({
-          ok = false,
-          message = table.concat(errors, "; "),
-          code = failure_code,
-        })
-        return
-      end
-      opts.callback({ ok = true, contributors = user_list(users) })
+  local cache = require("github.repo_cache")
+  local hostname = cache.hostname()
+  local directory = cache.repo_dir(opts.repo)
+  local owner, name = opts.repo:match("^([^/]+)/([^/]+)$")
+  if not owner then opts.callback({ ok = false, message = "Invalid GitHub repository" }) return end
+  local params = {
+    cache_directory = directory,
+    directory = opts.cwd or vim.fn.getcwd(),
+    request = { repository = { hostname = hostname, owner = owner, name = name }, ttl_seconds = opts.ttl_seconds },
+  }
+  local completed = false
+  local function finish(metadata, failure)
+    if completed then return end
+    completed = true
+    if failure then opts.callback({ ok = false, message = tostring(failure) }) return end
+    if cache.hostname() ~= hostname or cache.repo_dir(opts.repo) ~= directory then
+      opts.callback({ ok = false, message = "GitHub metadata cache context changed" })
       return
     end
-
-    opts.system_async(endpoint.command, nil, opts.cwd, function(result)
-      if result.code ~= 0 then
-        failure_code = tonumber(result.code) or failure_code
-        errors[#errors + 1] = endpoint.name .. ": " .. opts.result_error(result)
-        fetch_next(index + 1)
-        return
-      end
-      local decoded, decode_error = opts.decode_json(result.stdout)
-      if not decoded then
-        failure_code = tonumber(result.code) or failure_code
-        errors[#errors + 1] = endpoint.name .. ": " .. (decode_error or "gh api returned invalid JSON")
-        fetch_next(index + 1)
-        return
-      end
-      successful_requests = successful_requests + 1
-      for _, raw in ipairs(decoded) do
-        add_user(users, raw)
-      end
-      fetch_next(index + 1)
-    end)
+    if type(metadata) ~= "table" or type(metadata.repo) ~= "string" or metadata.repo:lower() ~= opts.repo:lower()
+      or (metadata.hostname ~= nil and metadata.hostname ~= hostname)
+      or type(metadata.fetched_at) ~= "number" or metadata.fetched_at < 0 or metadata.fetched_at % 1 ~= 0
+      or type(metadata.contributors) ~= "table" then
+      opts.callback({ ok = false, message = "Forge returned invalid repository metadata" })
+      return
+    end
+    opts.callback({ ok = true, contributors = metadata.contributors, metadata = metadata })
   end
+  local succeeded, failure = pcall(function()
+    if runner_for_test then runner_for_test(params, finish)
+    else require("forge.client").request_host("github.metadata", params, finish) end
+  end)
+  if not succeeded then finish(nil, failure) end
+end
 
-  fetch_next(1)
+---@param runner? fun(params: table, callback: fun(metadata: table?, failure: string?))
+function M._set_runner_for_test(runner)
+  runner_for_test = runner
 end
 
 return M

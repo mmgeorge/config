@@ -2,7 +2,7 @@
 -- line is not a function definition (left behind when a function was extracted to a module).
 -- Only ever deletes comment lines; never touches code. Standalone ---@class/---@alias typedefs
 -- and plain comments are preserved.
-local path = arg[1] or "D:/config/nvim/lua/diff_review/init.lua"
+local path = arg[1] or "D:/config/nvim/lua/forge/init.lua"
 local lines = vim.fn.readfile(path)
 local n = #lines
 local function is_anno(l) return l:sub(1, 3) == "---" end

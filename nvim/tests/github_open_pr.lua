@@ -1,8 +1,8 @@
 vim.loader.enable(false)
 
 local open_pr = require("github.open_pr")
-local diff_review = require("diff_review")
-local gh = require("diff_review.integrations.gh")
+local forge = require("forge")
+local gh = require("forge.integrations.gh")
 
 local root = "D:/mock/github"
 local other_root = "D:/mock/other-github"
@@ -20,9 +20,16 @@ local created_pr_url = "https://github.example.test/org/repo/pull/42"
 local generated_model = nil
 local generated_prompt = nil
 local generated_system = nil
+local captured_head = string.rep("1", 40)
+local original_write = require("forge.git.write").execute
+local original_forge_open_pr = forge.open_pr
+local original_host_request = require("forge.client").request_host
+local creation_draft
+local creation_capture
+local opened_pull_request
 local generated_pr_body = table.concat({
   "Related #",
-  "Created by GithubPRCreate.",
+  "Created by ForgeGithubPRCreate.",
   table.concat({
     "## Testing",
     "- [ ] Automated (integration, performance, screenshot, unit)",
@@ -49,6 +56,8 @@ local function reset()
   generated_model = nil
   generated_prompt = nil
   generated_system = nil
+  creation_draft, creation_capture = nil, nil
+  opened_pull_request = nil
   branch_list_output = table.concat({
     "main",
     "feature/current",
@@ -70,11 +79,11 @@ end
 
 open_pr._set_state_path_for_test(state_path)
 reset()
-diff_review.setup({ pr_buffer_name = "DiffReviewPRTest" })
+forge.setup({ pr_buffer_name = "ForgePRTest" })
 gh.set_backend({
   system_async = function(command, _, cb)
     local key = command_key(command)
-    if key == "gh\tpr\tview\t" .. created_pr_url .. "\t--json\tid,number,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions,reviewRequests,milestone,isDraft" then
+    if key == "gh\tpr\tview\t" .. created_pr_url .. "\t--json\tid,number,title,body,url,headRefName,headRefOid,commits,files,changedFiles,additions,deletions,reviewRequests,milestone,isDraft,state,createdAt,updatedAt,closedAt" then
       cb({
         code = 0,
         stdout = vim.json.encode({
@@ -123,11 +132,45 @@ package.loaded["ai"] = {
     generated_system = opts.system
     cb({
       ok = true,
-      content = "Created by GithubPRCreate.",
+      content = "Created by ForgeGithubPRCreate.",
     })
   end,
 }
 vim.notify = function() end
+require("forge.git.write").execute = function(directory, action, callback)
+  assert_true(directory == root and action.kind == "publish_branch" and action.name == "feature/current"
+    and action.head == captured_head, "publish branch lost captured workspace/head")
+  callback({ ok = true, output = "" })
+end
+local function native_request(method, params, callback)
+  if method == "github.creation.context" then
+    assert_true(params.directory == root, "creation context lost workspace")
+    callback({ repository = { hostname = require("github.repo_cache").hostname(), owner = "org", name = "repo" },
+      repository_node_id = "R_test", branch = "feature/current", head_commit = captured_head })
+  elseif method == "github.review.draft" then callback(creation_draft)
+  elseif method == "github.review.draft.write" then creation_draft = vim.deepcopy(params.draft) callback(true)
+  elseif method == "github.recovery.inspect" then callback(nil)
+  elseif method == "github.actor" then callback({ node_id = "ACTOR_test", login = "viewer" })
+  elseif method == "github.review.mutate" then
+    creation_capture = vim.deepcopy(params.request)
+    assert_true(creation_capture.resource.number == 0 and creation_capture.resource.kind == "repository", "creation used a PR-number scope")
+    assert_true(creation_capture.mutation.head_commit == captured_head and creation_capture.mutation.body == generated_pr_body,
+      "creation lost captured generation/head")
+    callback({ version = 1, resource = params.request.resource,
+      capture = { operation_id = params.request.operation_id, actor = params.request.actor_node_id },
+      state = { phase = "confirmed", result = { html_url = created_pr_url, number = 42 } } })
+  elseif method == "github.recovery.settle_draft" then
+    assert_true(creation_capture ~= nil and params.operation_id == creation_capture.operation_id, "creation settlement lost operation identity")
+    creation_draft = vim.deepcopy(params.draft)
+    callback(true)
+  else callback(nil, "unavailable fixture route " .. method) end
+end
+require("forge.client").request_host = native_request
+require("github.pr_creation")._set_runner_for_test(native_request)
+require("github.mutation")._set_runner_for_test(native_request)
+forge.open_pr = function(pr, options)
+  opened_pull_request = { pr = vim.deepcopy(pr), options = vim.deepcopy(options) }
+end
 if not _G.Snacks then _G.Snacks = {} end
 if not Snacks.picker then Snacks.picker = {} end
 Snacks.picker.pick = function(opts)
@@ -154,15 +197,15 @@ vim.system = function(command, opts, callback)
     callback({ code = 0, stdout = "abc123456789\n", stderr = "" })
     return
   end
-  if key == "git\tlog\t--reverse\t--format=%s%n%b%n---END-COMMIT---\torigin/main..HEAD" then
+  if key == "git\tlog\t--reverse\t--format=%s%n%b%n---END-COMMIT---\torigin/main.." .. captured_head then
     callback({ code = 0, stdout = "feat: create draft pr\n---END-COMMIT---\n", stderr = "" })
     return
   end
-  if key == "git\tdiff\t--stat\t--summary\torigin/main..HEAD" then
+  if key == "git\tdiff\t--stat\t--summary\torigin/main.." .. captured_head then
     callback({ code = 0, stdout = " nvim/lua/github/open_pr.lua | 12 +++++++-----\n", stderr = "" })
     return
   end
-  if key == "git\tdiff\t--no-ext-diff\t--no-color\torigin/main..HEAD" then
+  if key == "git\tdiff\t--no-ext-diff\t--no-color\torigin/main.." .. captured_head then
     callback({
       code = 0,
       stdout = table.concat({
@@ -177,18 +220,6 @@ vim.system = function(command, opts, callback)
     })
     return
   end
-  if key == "git\trev-parse\t--abbrev-ref\t--symbolic-full-name\t@{u}" then
-    callback({ code = 1, stdout = "", stderr = "no upstream" })
-    return
-  end
-  if key == "git\tpush\t-u\torigin\tfeature/current" then
-    callback({ code = 0, stdout = "", stderr = "" })
-    return
-  end
-  if key == "gh\tpr\tcreate\t--draft\t--base\tmain\t--head\tfeature/current\t--title\tfeat: create draft pr\t--body\t" .. generated_pr_body then
-    callback({ code = 0, stdout = created_pr_url .. "\n", stderr = "" })
-    return
-  end
   callback({
     code = 0,
     stdout = branch_list_output,
@@ -197,9 +228,14 @@ vim.system = function(command, opts, callback)
 end
 
 local function cleanup()
+  require("forge.git.write").execute = original_write
+  require("forge.client").request_host = original_host_request
+  require("github.pr_creation")._set_runner_for_test(nil)
+  require("github.mutation")._set_runner_for_test(nil)
+  forge.open_pr = original_forge_open_pr
   open_pr._set_state_path_for_test(nil)
   gh.reset_backend()
-  diff_review.reset_git_backend()
+  forge.reset_git_backend()
   package.loaded["ai"] = original_ai
   package.loaded["ai.adapters"] = original_ai_adapters
   pcall(vim.fn.delete, state_path)
@@ -319,10 +355,11 @@ local function run_tests()
     "PR prompt should include description instructions"
   )
   wait_for(function()
-    return vim.bo[vim.api.nvim_get_current_buf()].filetype == "GitStatus"
-      and vim.api.nvim_buf_get_name(0):find("DiffReviewPRTest://42", 1, true) ~= nil
-  end, "created PR did not open in DiffReview PR view")
-  assert_true(vim.tbl_contains(vim.api.nvim_buf_get_lines(0, 0, -1, false), "Title:  feat: create draft pr"), "created PR view missing title")
+    return opened_pull_request ~= nil
+  end, "created PR did not open in Forge PR view")
+  assert_true(opened_pull_request.pr.title == "feat: create draft pr", "created PR view missing title")
+  assert_true(opened_pull_request.options.cwd == root, "created PR view lost its repository root")
+  assert_true(creation_capture and creation_capture.mutation.operation == "pull_request_create", "PR creation bypassed durable native capture")
   assert_true(
     not vim.tbl_contains(vim.tbl_map(function(call) return call.key end, system_calls), "gh\tpr\tview\t" .. created_pr_url .. "\t--web"),
     "create flow still opened the browser"

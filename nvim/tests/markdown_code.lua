@@ -89,7 +89,7 @@ local function run_tests()
   reset()
   local issue_buf = vim.api.nvim_create_buf(true, false)
   vim.api.nvim_buf_set_name(issue_buf, "github://issue/org/repo/12")
-  vim.bo[issue_buf].filetype = "GithubIssue"
+  vim.bo[issue_buf].filetype = "ForgeGithubIssue"
   set_lines(issue_buf, {
     "Description:",
     "```ts",
@@ -99,20 +99,20 @@ local function run_tests()
     "```",
   })
   assert_true(
-    markdown_code.activate(issue_buf, { filetype = "GithubIssue", register_as_markdown = true }),
+    markdown_code.activate(issue_buf, { filetype = "ForgeGithubIssue", register_as_markdown = true }),
     "custom markdown buffer did not activate"
   )
   assert_true(#otter_calls == 1, "custom markdown buffer should activate otter once")
   assert_true(#register_calls == 1, "custom markdown buffer should register its filetype once")
   assert_true(register_calls[1].language == "markdown", "custom markdown buffer should register markdown language")
-  assert_true(register_calls[1].filetype == "GithubIssue", "custom markdown buffer registered the wrong filetype")
+  assert_true(register_calls[1].filetype == "ForgeGithubIssue", "custom markdown buffer registered the wrong filetype")
   assert_true(not otter_calls[1].name:find("://", 1, true), "custom markdown buffer should activate with temp name")
   assert_true(
     vim.api.nvim_buf_get_name(issue_buf) == "github://issue/org/repo/12",
     "custom markdown buffer name should be restored after otter activation"
   )
 
-  assert_true(markdown_code.activate(issue_buf, { filetype = "GithubIssue", register_as_markdown = true }), "active buffer did not sync")
+  assert_true(markdown_code.activate(issue_buf, { filetype = "ForgeGithubIssue", register_as_markdown = true }), "active buffer did not sync")
   assert_true(#otter_calls == 1, "unchanged active buffer should not resync")
   set_lines(issue_buf, {
     "Description:",
@@ -123,7 +123,7 @@ local function run_tests()
     "}",
     "```",
   })
-  assert_true(markdown_code.activate(issue_buf, { filetype = "GithubIssue", register_as_markdown = true }), "changed active buffer did not sync")
+  assert_true(markdown_code.activate(issue_buf, { filetype = "ForgeGithubIssue", register_as_markdown = true }), "changed active buffer did not sync")
   assert_true(otter_calls[#otter_calls].kind == "sync", "changed active buffer should sync otter raft")
   set_lines(issue_buf, {
     "Description:",
@@ -137,7 +137,7 @@ local function run_tests()
     "```",
   })
   assert_true(
-    markdown_code.activate(issue_buf, { filetype = "GithubIssue", register_as_markdown = true }),
+    markdown_code.activate(issue_buf, { filetype = "ForgeGithubIssue", register_as_markdown = true }),
     "new fenced language did not reactivate otter"
   )
   assert_true(otter_calls[#otter_calls - 1].kind == "deactivate", "new fenced language should deactivate old otter raft")
@@ -145,7 +145,7 @@ local function run_tests()
 
   reset()
   local status_buf = vim.api.nvim_create_buf(true, false)
-  vim.bo[status_buf].filetype = "GitStatus"
+  vim.bo[status_buf].filetype = "ForgeStatus"
   set_lines(status_buf, {
     "Modified src/main.rs +1 -0",
     "    let value = 1;",
@@ -155,16 +155,34 @@ local function run_tests()
     "}",
     "```",
   })
-  assert_true(not markdown_code.activate(status_buf, { filetype = "GitStatus" }), "GitStatus should not activate markdown code by default")
-  assert_true(#register_calls == 0, "GitStatus should not register as markdown by default")
-  assert_true(#otter_calls == 0, "GitStatus should not activate otter by default")
+  assert_true(not markdown_code.activate(status_buf, { filetype = "ForgeStatus" }), "ForgeStatus should not activate markdown code by default")
+  assert_true(#register_calls == 0, "ForgeStatus should not register as markdown by default")
+  assert_true(#otter_calls == 0, "ForgeStatus should not activate otter by default")
 
   assert_true(
-    markdown_code.activate(status_buf, { filetype = "GitStatus", register_as_markdown = true }),
-    "explicit GitStatus markdown region should activate"
+    markdown_code.activate(status_buf, { filetype = "ForgeStatus", register_as_markdown = true }),
+    "explicit ForgeStatus markdown region should activate"
   )
-  assert_true(#register_calls == 1, "explicit GitStatus markdown region should register once")
-  assert_true(register_calls[1].filetype == "GitStatus", "explicit GitStatus registration used the wrong filetype")
+  assert_true(#register_calls == 1, "explicit ForgeStatus markdown region should register once")
+  assert_true(register_calls[1].filetype == "ForgeStatus", "explicit ForgeStatus registration used the wrong filetype")
+
+  reset()
+  vim.b[markdown_buf].forge_native_document = true
+  assert_true(not markdown_code.activate(markdown_buf), "native markdown source activated whole-buffer Otter")
+  assert_true(not markdown_code.activate(markdown_buf, { register_as_markdown = true }), "filetype override bypassed native syntax ownership")
+  assert_true(#otter_calls == 0 and #register_calls == 0, "native markdown source reached global parser dependencies")
+  local original_dependency = package.loaded["markdown_math.dependency"]
+  local original_handler = package.loaded["markdown_math.display_handler"]
+  package.loaded["markdown_math.dependency"] = { executable_path = function() return "fixture-converter" end }
+  package.loaded["markdown_math.display_handler"] = {}
+  local markdown_options = require("plugins.markdown")[1].opts()
+  package.loaded["markdown_math.dependency"] = original_dependency
+  package.loaded["markdown_math.display_handler"] = original_handler
+  assert_true(markdown_options.ignore(markdown_buf), "render-markdown admitted native source ownership")
+  assert_true(not markdown_options.ignore(issue_buf), "render-markdown rejected an ordinary markdown presentation buffer")
+  vim.b[markdown_buf].forge_native_document = nil
+  assert_true(not markdown_options.ignore(markdown_buf), "render-markdown rejected ordinary markdown")
+  assert_true(markdown_code.activate(markdown_buf), "ordinary markdown activation changed after native rejection")
 end
 
 local ok, err = xpcall(run_tests, debug.traceback)

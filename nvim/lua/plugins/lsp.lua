@@ -188,7 +188,7 @@ return {
             schemas = {
               {
                 fileMatch = { ".walkthrough.json" },
-                url = vim.uri_from_fname(vim.fs.joinpath(vim.fn.stdpath("config"), "lua", "diff_review", "walkthrough.schema.json")),
+                url = vim.uri_from_fname(vim.fs.joinpath(vim.fn.stdpath("config"), "lua", "forge", "walkthrough.schema.json")),
               },
             },
           },

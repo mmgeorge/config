@@ -3,6 +3,8 @@ AGENTS.md
 CLAUDE.md
 *~
 *.lock
+!nvim/rust/forge/Cargo.lock
+/nvim/rust/github-issue-index/target/
 lazy-lock.json
 *.spl
 google-chrome/
