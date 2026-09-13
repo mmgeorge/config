@@ -10,7 +10,7 @@ lazy-lock.json
 google-chrome/
 .claude/
 .aider.*
-gh/
+/gh/
 .wrangler/
 lazygit/
 scoop/
