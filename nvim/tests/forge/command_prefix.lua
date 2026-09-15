@@ -9,10 +9,13 @@ assert(replica.apply_snapshot(session, { document = session.document, revision =
 vim.api.nvim_set_current_buf(session.buffer)
 local observed = {}
 local handler = {}
-for _, action in ipairs({ "open", "push", "pull", "pr", "review", "close" }) do
+for _, action in ipairs({ "open", "push", "pull", "pr", "review", "close", "stage" }) do
   handler[action] = function() observed[#observed + 1] = action end
 end
+vim.keymap.set("n", "Sr", function() error("global spelling mapping dispatched") end)
 local owner = require("forge.document_commands").attach(session, { view = "status", handler = handler })
+assert(vim.fn.maparg("S", "n", false, true).nowait == 1)
+assert(vim.fn.maparg("S", "x", false, true).nowait == 0)
 local steps = {}
 local function step(delay, callback) steps[#steps + 1] = { delay = delay, callback = callback } end
 local function sequence(keys, expected)
@@ -31,6 +34,7 @@ local function sequence(keys, expected)
   end)
 end
 
+sequence("S", "stage")
 sequence("opp", "push")
 sequence("opP", "pull")
 sequence("ogp", "pr")

@@ -2578,20 +2578,28 @@ and Lua transport code disagree. Existing Harness feature methods remain unchang
 successful handshake.
 
 
-## 25. Manual builds and executable ownership
+## 25. Automatic builds and executable ownership
 
-The agent or developer editing compiled Forge inputs rebuilds the executable before
-runtime verification. Forge startup never invokes Cargo, scans source inputs, hashes
-executables, or compares build receipts. `forge.builder.build_command()` describes
-the manual Cargo invocation, and `binary_path()` selects its output under
+The agent or developer editing compiled Forge inputs rebuilds an existing executable
+before runtime verification. When the selected executable is missing, Forge startup
+runs Cargo asynchronously and shares the build result with pending callers. Startup
+does not scan source inputs, hash executables, or compare build receipts.
+`forge.builder.build_command()` describes the Cargo invocation, and `binary_path()` selects its output under
 `stdpath("cache")/rust-sidecar/forge/build`.
 
 Forge defaults to the optimized Cargo `release` profile for development and profiling.
 Release builds retain level-one debug information. Set `vim.g.forge_build_profile` to `"dev"`
 or `"release"` before loading Forge to select the corresponding `debug` or `release`
-artifact. Each profile must be built explicitly. A missing executable fails startup
-with its path and a manual build command. Protocol handshake errors remain startup
+artifact. Startup builds a missing artifact with the selected profile and `--locked`,
+then verifies that the executable exists before launching. Missing Cargo, spawn errors,
+compiler failures, and absent build output fail startup with a diagnostic. A later load
+can retry a failed build. Protocol handshake errors remain startup
 failures and never trigger compilation.
+
+Cargo builds update one notification with an animated spinner, elapsed seconds,
+and the latest compiler output line, limited to 240 bytes. A one-second timer keeps
+the notification visible while Cargo is quiet. Completion stops the timer and replaces
+progress with a success or failure status. Startup errors retain the full compiler output.
 
 Each host asynchronously copies the selected executable into its own directory under
 `rust-sidecar/forge/leases`. Running the copy allows Cargo to replace its output on
@@ -3865,7 +3873,7 @@ build plugin have been removed. Prior generated Cargo output remains ignored at 
 The existing seven redb tests live in forge-github. The executable contract fixture now uses two
 independent Forge hosts against one database, covering page updates, state, atomic publication,
 detail writes, ordered detail batches, and single detail reads between short transactions. Generic
-manual executable selection and process-copy ownership are verified by `tests/forge/sidecar_manual.lua`.
+automatic builds, executable selection, and process-copy ownership are verified by `tests/forge/sidecar_manual.lua`.
 
 The real Neovim issue fixture runs a mocked two-page remote sync with the actual Forge host, verifies
 three persisted completion records, confirms body omission, and checks clean process shutdown. The

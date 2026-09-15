@@ -25,6 +25,27 @@ local success, failure = xpcall(function()
   local wrote = pcall(log.write, "failure")
   vim.fn.writefile = original_write
   assert(wrote, "logging failure escaped into startup")
+  local original_provider = vim.api.nvim_set_decoration_provider
+  local provider
+  vim.api.nvim_set_decoration_provider = function(_, callbacks) provider = callbacks end
+  local buffer = vim.api.nvim_get_current_buf()
+  local started = vim.uv.hrtime()
+  log.watch_redraw(buffer, "fixture", started, "status.action.redraw", { operation = 1 })
+  log.watch_redraw(buffer, "fixture", started, "status.update.redraw", { operation = 1, phase = "accepted" })
+  vim.api.nvim_set_decoration_provider = original_provider
+  assert(provider.on_start())
+  provider.on_win(nil, vim.api.nvim_get_current_win(), buffer)
+  provider.on_end()
+  assert(vim.wait(1000, function() return #vim.fn.readfile(path) == 3 end, 5))
+  local events = {}
+  for _, row in ipairs(vim.fn.readfile(path)) do
+    local record = vim.json.decode(row)
+    events[record.event] = record.fields
+  end
+  assert(events["status.action.redraw"].operation == 1)
+  assert(events["status.update.redraw"].phase == "accepted")
+  assert(events["status.action.redraw"].ready_to_redraw_us >= 0)
+  assert(not provider.on_start(), "completed redraw watches survived")
 end, debug.traceback)
 vim.defer_fn = original_defer
 vim.fn.delete(path)

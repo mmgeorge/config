@@ -7,6 +7,18 @@ local config = require("forge.infra.config")
 local popup_window = require("forge.infra.popup_window")
 local command_specs = require("forge.shared.command_specs")
 
+---@param key string
+---@param bindings string[]
+---@return boolean
+function M.is_prefix(key, bindings)
+  local prefix = vim.api.nvim_replace_termcodes(key, true, true, true)
+  for _, binding in ipairs(bindings) do
+    local candidate = vim.api.nvim_replace_termcodes(binding, true, true, true)
+    if #candidate > #prefix and candidate:sub(1, #prefix) == prefix then return true end
+  end
+  return false
+end
+
 ---@param group string
 ---@param command_id string
 ---@return string[]
@@ -25,15 +37,25 @@ end
 function M.setup_view_keymaps(buf, group, command_set, context)
   context = context or {}
   local spec_by_id = command_specs.view_spec_by_id[group] or {}
+  local normal_keys = {}
+  for _, command_id in ipairs(command_set.order or {}) do
+    local action, spec = command_set.action_by_id[command_id], spec_by_id[command_id]
+    if action and spec and (not action.enabled or action.enabled(context)) then
+      local modes = type(spec.modes) == "table" and spec.modes or { spec.modes or "n" }
+      if vim.tbl_contains(modes, "n") then vim.list_extend(normal_keys, M.view_keys_for(group, command_id)) end
+    end
+  end
   for _, command_id in ipairs(command_set.order or {}) do
     local action = command_set.action_by_id[command_id]
     local spec = spec_by_id[command_id]
     if action and spec and (not action.enabled or action.enabled(context)) then
       local modes = type(spec.modes) == "table" and spec.modes or { spec.modes or "n" }
       for _, key in ipairs(M.view_keys_for(group, command_id)) do
-        vim.keymap.set(modes, key, function()
-          require("forge.shared.view_command_set").dispatch(command_set, command_id, context)
-        end, { buffer = buf, silent = true, desc = spec.desc })
+        for _, mode in ipairs(modes) do
+          vim.keymap.set(mode, key, function()
+            require("forge.shared.view_command_set").dispatch(command_set, command_id, context)
+          end, { buffer = buf, silent = true, nowait = mode == "n" and not M.is_prefix(key, normal_keys), desc = spec.desc })
+        end
       end
     end
   end

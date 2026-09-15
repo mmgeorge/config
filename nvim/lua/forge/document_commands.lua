@@ -120,6 +120,13 @@ function M.attach(session, options)
     vim.bo[help_buffer].modifiable = false
     vim.keymap.set("n", "q", function() popup.close(window) end, { buffer = help_buffer, silent = true, desc = "Close help" })
   end
+  local normal_keys = {}
+  for _, spec in ipairs(specs.specs) do
+    local modes = type(spec.modes) == "table" and spec.modes or { spec.modes }
+    if (not spec.views or spec.views[options.view]) and handler[spec.id] and vim.tbl_contains(modes, "n") then
+      vim.list_extend(normal_keys, keys_for(spec, options.keymaps))
+    end
+  end
   for _, spec in ipairs(specs.specs) do
     if (not spec.views or spec.views[options.view]) and handler[spec.id] then
       local keys = keys_for(spec, options.keymaps)
@@ -137,8 +144,9 @@ function M.attach(session, options)
           for _, mode in ipairs(modes) do
             local prior = vim.api.nvim_buf_call(session.buffer, function() return vim.fn.maparg(key, mode, false, true) end)
             owner.mapping[#owner.mapping + 1] = { key = key, mode = mode, callback = mapped, prior = prior }
+            vim.keymap.set(mode, key, mapped, { buffer = session.buffer, silent = true,
+              nowait = mode == "n" and not require("forge.shared.keymaps").is_prefix(key, normal_keys), desc = spec.desc })
           end
-          vim.keymap.set(modes, key, mapped, { buffer = session.buffer, silent = true, desc = spec.desc })
         end
       end
     end

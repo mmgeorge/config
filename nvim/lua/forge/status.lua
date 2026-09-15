@@ -362,6 +362,11 @@ end
 
 function M.action(state, action, visual)
   local action_started = vim.uv.hrtime()
+  local log = require("forge.startup_log")
+  local input_at = log.input_time(state.replica.buffer)
+  local action_id = tostring(action_started)
+  log.write("status.action.enter", { document = state.document, action = action, action_id = action_id,
+    input_to_handler_us = input_at and math.floor((action_started - input_at) / 1000) }, action_started)
   if not host_current(state) then notice(host_unavailable_message) return end
   state.navigation = nil
   local window = vim.api.nvim_get_current_win()
@@ -375,6 +380,9 @@ function M.action(state, action, visual)
     selection = result
   end
   local captured, failure = buffer.capture(state.replica, view, action, selection)
+  log.write("status.action.captured", { document = state.document, action_id = action_id, action = action,
+    elapsed_us = math.floor((vim.uv.hrtime() - action_started) / 1000), location = captured and captured.location,
+    error = failure })
   if not captured then notice(failure or "Cannot capture status input") return end
   if action == "open" and state.context and captured.location.kind == "context" then
     state.context.activate("status:context:" .. captured.location.role)
@@ -391,13 +399,24 @@ function M.action(state, action, visual)
     vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Esc>", true, false, true), "nx", false)
   end
   local function submit()
+    log.write("status.action.submit", { document = state.document, action_id = action_id,
+      elapsed_us = math.floor((vim.uv.hrtime() - action_started) / 1000) })
     request(state, { operation = "input", input = captured, selection = selection }, function(result, request_failure)
+      log.write("status.action.response", { document = state.document, action_id = action_id,
+        operation = result and result.operation_id, error = request_failure,
+        elapsed_us = math.floor((vim.uv.hrtime() - action_started) / 1000) })
       if request_failure or not result then notice(request_failure or "Missing Git write outcome") return end
       if result.update then
         M.apply_update(state, result.update)
         local visible = state.applied_operation and state.applied_operation[result.operation_id] or vim.uv.hrtime()
-        require("forge.startup_log").write("status.action.visible", { operation = result.operation_id, action = action,
+        require("forge.startup_log").write("status.action.visible", { operation = result.operation_id, action = action, action_id = action_id,
           elapsed_us = math.floor((visible - action_started) / 1000), native_us = result.update.elapsed_us })
+        log.watch_redraw(state.replica.buffer, state.document, input_at or action_started,
+          "status.action.redraw", { operation = result.operation_id, action = action, action_id = action_id })
+        vim.schedule(function()
+          log.write("status.action.loop_resumed", { document = state.document, action_id = action_id,
+            elapsed_us = math.floor((vim.uv.hrtime() - action_started) / 1000) })
+        end)
         if state.applied_operation then state.applied_operation[result.operation_id] = nil end
         return
       end
@@ -451,6 +470,8 @@ function M.apply_update(state, update)
   local result = buffer.apply_update(state.replica, update)
   if result.kind == "Desynchronized" then recover(state) return end
   if result.kind ~= "Applied" then return end
+  require("forge.startup_log").watch_redraw(state.replica.buffer, state.document, vim.uv.hrtime(),
+    "status.update.redraw", { operation = update.operation_id, phase = update.phase })
   state.applied_operation = state.applied_operation or {}
   if update.phase == "accepted" then state.applied_operation[update.operation_id] = vim.uv.hrtime() end
   state.done = {}
@@ -461,6 +482,7 @@ end
 ---@param options? ForgeNativeStatusOptions
 ---@return ForgeNativeStatus
 function M.open(options)
+  require("forge.startup_log").observe_input()
   options = options or {}
   local open_started = options.started_at or vim.uv.hrtime()
   local opening_window = options.window or vim.api.nvim_get_current_win()

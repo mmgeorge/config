@@ -22,7 +22,7 @@
 ---@field artifact_root fun(): string
 ---@field binary_path fun(): string
 ---@field build_command fun(): string[]
----@field ensure fun(callback: fun(result: RustSidecarExecutableResult)) Checks only executable presence, never builds.
+---@field ensure fun(callback: fun(result: RustSidecarExecutableResult)) Builds a missing executable asynchronously and shares the result with pending callers.
 ---@field acquire fun(path: string, callback: fun(lease?: RustSidecarLease, failure?: string)) Copies the executable asynchronously for one process.
 ---@field _set_crate_dir_for_test fun(crate_dir: string?)
 ---@field _set_artifact_root_for_test fun(artifact_root: string?)
@@ -50,6 +50,8 @@ function M.new(spec)
   assert(profile == "dev" or profile == "release", "Rust sidecar profile must be dev or release")
   local crate_dir_for_test = nil
   local artifact_root_for_test = nil
+  ---@type (fun(result: RustSidecarExecutableResult))[]?
+  local build_callback = nil
   ---@type RustSidecarBuilder
   local builder = {}
   local function executable_name()
@@ -92,14 +94,93 @@ function M.new(spec)
   end
 
   function builder.ensure(callback)
-    local path = builder.binary_path()
-    local stat = vim.uv.fs_stat(path)
-    if not stat or stat.type ~= "file" then
-      callback({ ok = false, message = "Rust sidecar executable is missing: " .. path
-        .. "\nBuild it manually before opening Forge: " .. table.concat(builder.build_command(), " ") })
+    if build_callback then
+      build_callback[#build_callback + 1] = callback
       return
     end
-    callback({ ok = true, path = path })
+    local path = builder.binary_path()
+    local stat = vim.uv.fs_stat(path)
+    if stat and stat.type == "file" then
+      callback({ ok = true, path = path })
+      return
+    end
+    if vim.fn.executable("cargo") ~= 1 then
+      callback({ ok = false, message = "Cannot build Rust sidecar: cargo is not executable on PATH" })
+      return
+    end
+    local command = builder.build_command()
+    build_callback = { callback }
+    local active = true
+    local started_at = vim.uv.hrtime()
+    local status = "Starting Cargo"
+    local partial_line = ""
+    ---@type string[]
+    local compiler_output = {}
+    local spinner = { "⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏" }
+    ---@param result? RustSidecarExecutableResult
+    local function notify_progress(result)
+      local elapsed = math.floor((vim.uv.hrtime() - started_at) / 1e9)
+      local message = result and (result.ok and "Build completed" or "Build failed") or status
+      vim.notify(message .. " (" .. elapsed .. "s)",
+        result and not result.ok and vim.log.levels.ERROR or vim.log.levels.INFO, {
+          id = "rust_sidecar_build_" .. path,
+          title = spec.crate_name .. " · Cargo " .. profile,
+          timeout = result and 3000 or 10000,
+          opts = function(notification)
+            notification.icon = result and (result.ok and " " or " ")
+              or spinner[math.floor(vim.uv.hrtime() / 8e7) % #spinner + 1]
+          end,
+        })
+    end
+    local progress_timer = assert(vim.uv.new_timer())
+    progress_timer:start(1000, 1000, vim.schedule_wrap(function()
+      if active then notify_progress() end
+    end))
+    ---@param result RustSidecarExecutableResult
+    local function finish(result)
+      active = false
+      progress_timer:stop()
+      progress_timer:close()
+      notify_progress(result)
+      local pending = build_callback or {}
+      build_callback = nil
+      for _, consumer in ipairs(pending) do
+        vim.schedule(function() consumer(result) end)
+      end
+    end
+    notify_progress()
+    local started, failure = pcall(vim.system, command,
+      { text = true, stdout = true, stderr = function(stream_error, data)
+        if stream_error then compiler_output[#compiler_output + 1] = tostring(stream_error) end
+        if not data then return end
+        compiler_output[#compiler_output + 1] = data
+        vim.schedule(function()
+          if not active then return end
+          local lines = vim.split(partial_line .. data, "\n", { plain = true })
+          partial_line = table.remove(lines) or ""
+          for _, line in ipairs(lines) do
+            local message = vim.trim(line)
+            if message ~= "" then status = message:sub(1, 240) end
+          end
+          if partial_line ~= "" then status = vim.trim(partial_line):sub(1, 240) end
+          notify_progress()
+        end)
+      end }, vim.schedule_wrap(function(result)
+        if result.code ~= 0 then
+          finish({ ok = false, message = "Rust sidecar build failed (exit " .. result.code .. "):\n"
+            .. table.concat(compiler_output) .. (result.stderr or "") .. (result.stdout or "") })
+          return
+        end
+        local built = vim.uv.fs_stat(path)
+        if not built or built.type ~= "file" then
+          finish({ ok = false, message = "Rust sidecar build produced no executable: " .. path })
+          return
+        end
+        finish({ ok = true, path = path })
+      end))
+    if not started then
+      finish({ ok = false, message = "Failed to start Rust sidecar build: " .. tostring(failure) })
+    end
   end
 
   function builder.acquire(path, callback)

@@ -3,6 +3,25 @@ local maximum_bytes = 2 * 1024 * 1024
 local redraw_watch = {}
 local redraw_namespace
 local logging_us = 0
+local input_namespace
+local input_buffer, input_at
+
+---@return nil
+function M.observe_input()
+  if input_namespace then return end
+  input_namespace = vim.api.nvim_create_namespace("ForgeInputTiming")
+  vim.on_key(function(_, typed)
+    if typed == "" then return end
+    input_at = vim.uv.hrtime()
+    input_buffer = vim.api.nvim_get_current_buf()
+  end, input_namespace)
+end
+
+---@param buffer integer
+---@return integer?
+function M.input_time(buffer)
+  if input_buffer == buffer and input_at and vim.uv.hrtime() - input_at < 5e9 then return input_at end
+end
 
 ---@return string
 function M.path()
@@ -67,7 +86,7 @@ function M.watch_redraw(buffer, document, started_at, event, context)
       on_start = function()
         local redraw_started = vim.uv.hrtime()
         for watched, trace in pairs(redraw_watch) do
-          if not vim.api.nvim_buf_is_valid(watched) or vim.uv.hrtime() - trace.armed_at > 30e9 then
+          if not vim.api.nvim_buf_is_valid(trace.buffer) or vim.uv.hrtime() - trace.armed_at > 30e9 then
             redraw_watch[watched] = nil
           else
             trace.visible = false
@@ -77,7 +96,9 @@ function M.watch_redraw(buffer, document, started_at, event, context)
         return next(redraw_watch) ~= nil
       end,
       on_win = function(_, _, drawn_buffer)
-        if redraw_watch[drawn_buffer] then redraw_watch[drawn_buffer].visible = true end
+        for _, trace in pairs(redraw_watch) do
+          if trace.buffer == drawn_buffer then trace.visible = true end
+        end
         return false
       end,
       on_end = function()
@@ -85,7 +106,7 @@ function M.watch_redraw(buffer, document, started_at, event, context)
         for watched, trace in pairs(redraw_watch) do
           if trace.visible then
             redraw_watch[watched] = nil
-            local fields = vim.tbl_extend("force", trace.context or {}, { document = trace.document, buffer = watched,
+            local fields = vim.tbl_extend("force", trace.context or {}, { document = trace.document, buffer = trace.buffer,
               elapsed_us = math.floor((finished_at - trace.started_at) / 1000),
               ready_to_redraw_start_us = math.floor((trace.redraw_started - trace.armed_at) / 1000),
               redraw_us = math.floor((finished_at - trace.redraw_started) / 1000),
@@ -96,7 +117,8 @@ function M.watch_redraw(buffer, document, started_at, event, context)
       end,
     })
   end
-  redraw_watch[buffer] = { document = document, started_at = started_at, armed_at = vim.uv.hrtime(),
+  local key = table.concat({ buffer, event or "status.first_redraw", context and context.operation or "", context and context.phase or "" }, ":")
+  redraw_watch[key] = { buffer = buffer, document = document, started_at = started_at, armed_at = vim.uv.hrtime(),
     event = event or "status.first_redraw", context = context }
 end
 
