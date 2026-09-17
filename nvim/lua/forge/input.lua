@@ -19,6 +19,7 @@ local function present(view)
   if not view.document_folds then return end
   require("forge.folds").attach(view.session, view.window)
   local applied = vim.deepcopy(native_option)
+  applied.virtualedit = view.virtualedit
   applied.statuscolumn = string.rep(" ", view.margin)
   for name, value in pairs(view.columns) do applied[name] = value end
   if view.conceal then
@@ -45,6 +46,7 @@ end
 ---@field effect table<string, boolean>
 ---@field document_folds boolean Whether this view owns native document fold options.
 ---@field margin integer Number of fixed leading display cells.
+---@field virtualedit string Virtual cursor movement allowed by this view.
 ---@field columns table<string, boolean|string> Column options inherited from the invoking window.
 ---@field conceal? {level: integer, cursor: string} Source concealment options retained by this view.
 ---@field wrapping? {indent: boolean, options: string} Source continuation indentation retained by this view.
@@ -64,7 +66,7 @@ end
 
 ---@param session table
 ---@param window integer
----@param options? {exact_source?: boolean, margin?: integer, columns?: table<string, boolean|string>, conceal?: {level: integer, cursor: string}, wrapping?: {indent: boolean, options: string}} Source presentation options retained for this view.
+---@param options? {exact_source?: boolean, margin?: integer, virtualedit?: string, columns?: table<string, boolean|string>, conceal?: {level: integer, cursor: string}, wrapping?: {indent: boolean, options: string}} Source presentation options retained for this view.
 ---@return ForgeInputView
 function M.open(session, window, options)
   if window == 0 then window = vim.api.nvim_get_current_win() end
@@ -84,6 +86,7 @@ function M.open(session, window, options)
   local view = { id = "view:" .. vim.uv.hrtime() .. ":" .. next_view, document = session.document,
     window = window, sequence = 0, active = true, effect = {}, document_folds = not (options and options.exact_source),
     session = session, baseline = baseline, margin = margin, columns = columns,
+    virtualedit = options and options.virtualedit or native_option.virtualedit,
     conceal = options and options.conceal and vim.deepcopy(options.conceal),
     wrapping = options and options.wrapping and vim.deepcopy(options.wrapping) }
   window_view[window] = view

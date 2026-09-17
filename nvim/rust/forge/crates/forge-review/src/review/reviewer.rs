@@ -2,6 +2,28 @@ use super::*;
 use forge_github::review_mutation::ReviewerSelection;
 
 impl ReviewDocument {
+    /// Rejects the authenticated user before any field mutation is dispatched.
+    pub(crate) fn validate_reviewers(&self, actor: &str) -> Result<()> {
+        if !self.reviewers_loaded {
+            return Ok(());
+        }
+        let field = self.edits.snapshot(&RegionId("reviewers".into()))?;
+        if !field.dirty {
+            return Ok(());
+        }
+        let repository = self.target.repository.repository_name();
+        let owner = repository.split('/').next().expect("validated repository");
+        let requested = selection(field.text, owner)?;
+        ensure!(
+            !requested
+                .reviewer
+                .iter()
+                .any(|login| login.eq_ignore_ascii_case(actor)),
+            "You cannot request a review from yourself (@{actor})"
+        );
+        Ok(())
+    }
+
     /// Refreshes requested reviewers without replacing local edits or an unresolved submission.
     pub(crate) fn refresh_reviewers(&mut self, detail: &[(String, String)]) -> Result<()> {
         let text = reviewer_text(

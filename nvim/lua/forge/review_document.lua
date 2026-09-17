@@ -6,6 +6,10 @@ local effects = require("forge.effects")
 local log = require("forge.startup_log")
 local runner_for_test
 local finish_close
+local dispatch_save
+local load_actor
+---@class ForgeReviewSave
+---@field text table<string, string> Native field values accepted by the latest save action.
 ---@type table<string, table>
 local retained = {}
 local CACHE_LIMIT = 8
@@ -135,7 +139,8 @@ local function settled(state)
   if state.closing then finish_close(state)
   elseif state.activation_pending and state.view_ready then M.activate(state)
   elseif state.comment_pending then M.comment(state)
-  elseif state.save_pending then M.save(state)
+  elseif state.submission_pending then M.submit_batched(state)
+  elseif state.save_pending then dispatch_save(state)
   elseif state.refresh_pending then M.refresh(state) end
 end
 
@@ -184,11 +189,24 @@ end
 ---@param state table
 function M.sync_editing(state)
   if not state.active or not state.replica or vim.api.nvim_get_current_buf() ~= state.replica.buffer then return end
-  vim.bo[state.replica.buffer].modifiable = M.editable_region(state) ~= nil
+  local region = M.editable_region(state)
+  vim.bo[state.replica.buffer].modifiable = region ~= nil
+  vim.b[state.replica.buffer].forge_reviewer_input = region == "reviewers"
   if state.commands then state.commands.sync_editing() end
 end
 
 local dirty_namespace = vim.api.nvim_create_namespace("ForgeReviewDirty")
+
+---@param replica {buffer: integer, namespace: integer}
+---@param row integer
+---@return any[]? Extmark identity, position, and presentation details.
+local function heading_mark(replica, row)
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(replica.buffer, replica.namespace,
+    { row, 0 }, { row, -1 }, { details = true })) do
+    local chunks = mark[4].virt_text
+    if chunks and #chunks == 1 and chunks[1][1]:match("^.-%*?:%s*$") then return mark end
+  end
+end
 
 ---@param state table
 function M.sync_dirty(state)
@@ -205,13 +223,28 @@ function M.sync_dirty(state)
     if anchor then
       local text = table.concat(vim.api.nvim_buf_get_text(replica.buffer, anchor.start.row, anchor.start.column,
         anchor.finish.row, anchor.finish.column, {}), "\n")
-      if text ~= field.baseline then
+      local submitted = state.save_pending or state.saving
+      local baseline = submitted and submitted.text[field.region] or field.baseline
+      local dirty = text ~= baseline
+      local heading = heading_mark(replica, anchor.start.row)
+      if heading then
+        local details = heading[4]
+        local label = details.virt_text[1][1]:gsub("%*?:%s*$", "")
+        local marked = dirty or state.editing_region == field.region
+        vim.api.nvim_buf_set_extmark(replica.buffer, replica.namespace, heading[2], heading[3], {
+          id = heading[1], virt_text = { { label .. (marked and "*: " or ": "), details.virt_text[1][2] } },
+          virt_text_pos = "inline", hl_mode = "combine", priority = details.priority, right_gravity = false,
+        })
+      end
+      if dirty then
         modified = true
-        local row = field.region == "body" and math.max(0, anchor.start.row - 1) or anchor.start.row
-        local label = vim.api.nvim_buf_get_lines(replica.buffer, row, row + 1, false)[1]
-        local colon = field.region == "body" and label:find(":", 1, true)
-        vim.api.nvim_buf_set_extmark(replica.buffer, dirty_namespace, row, colon and colon - 1 or 0,
-          { virt_text = { { colon and "*" or " *", "DiagnosticWarn" } }, virt_text_pos = colon and "inline" or "eol" })
+        if not heading then
+          local row = field.region == "body" and math.max(0, anchor.start.row - 1) or anchor.start.row
+          local label = vim.api.nvim_buf_get_lines(replica.buffer, row, row + 1, false)[1]
+          local colon = field.region == "body" and label:find(":", 1, true)
+          vim.api.nvim_buf_set_extmark(replica.buffer, dirty_namespace, row, colon and colon - 1 or 0,
+            { virt_text = { { colon and "*" or " *", "DiagnosticWarn" } }, virt_text_pos = colon and "inline" or "eol" })
+        end
       end
     end
   end
@@ -222,12 +255,14 @@ function M.refresh(state, callback)
   if not state.active or not state.document then return end
   state.refresh_waiter = state.refresh_waiter or {}
   if callback then state.refresh_waiter[#state.refresh_waiter + 1] = callback end
+  if state.saving or state.save_pending then state.refresh_pending = true return end
   if state.rendering then state.refresh_pending = true return end
   if state.replica and editable.suspend_generated_text(state.replica.editable) then
     state.refresh_pending = true
     return
   end
   state.refresh_pending, state.rendering = false, true
+  local save_generation = state.save_generation
   local width = require("forge.width").capture(vim.api.nvim_win_is_valid(state.window) and state.window or vim.api.nvim_get_current_win())
   request(state, "review.materialize", { document = state.document, width = width }, function(delivery, failure)
     local apply_started = vim.uv.hrtime()
@@ -240,7 +275,7 @@ function M.refresh(state, callback)
       settled(state)
       return
     end
-    if delivery.field then state.fields = delivery.field end
+    if delivery.field and save_generation == state.save_generation then state.fields = delivery.field end
     local applied
     if state.replica.revision == nil then applied = buffer.apply_snapshot(state.replica, delivery.snapshot)
     elseif delivery.patch and delivery.patch ~= vim.NIL then applied = buffer.apply_patch(state.replica, delivery.patch)
@@ -268,7 +303,7 @@ function M.refresh(state, callback)
         or vim.api.nvim_win_get_buf(state.window) == state.replica.buffer) then
         vim.api.nvim_win_set_buf(state.window, state.replica.buffer)
       end
-      state.view = input.open(state.replica, state.window, { margin = 0, conceal = { level = 2, cursor = "" } })
+      state.view = input.open(state.replica, state.window, { margin = 0, virtualedit = "", conceal = { level = 2, cursor = "" } })
       M.attach_fold_window(state, state.window)
       M.resize(state)
       if state.on_open then state.on_open(state) end
@@ -324,7 +359,7 @@ function M.activate(state, action)
   if not vim.deep_equal(pending.cursor, vim.api.nvim_win_get_cursor(state.window)) then return false end
   local captured, failure = input.capture(state.replica, state.view, pending.action or "activate")
   if not captured then if failure then failed(state, failure) end return false end
-  if not captured.target then return false end
+  if not captured.target and captured.action ~= "browse" then return false end
   state.action_running = true
   request(state, "review.act", { input = captured, directory = state.directory }, function(delivery, action_failure)
     state.action_running = false
@@ -352,25 +387,141 @@ function M.activate(state, action)
   return true
 end
 
-function M.save(state)
-  if not state.active or state.saving or not state.replica then return end
-  state.save_pending = true
-  if not editable.flush(state.replica.editable) then failed(state, "Review edits could not be submitted") return end
-  if editable.suspend_generated_text(state.replica.editable) then return end
-  state.save_pending, state.saving = false, true
-  request(state, "review.save", { document = state.document }, function(result, failure)
-    state.saving = false
-    if result and result.snapshot and result.snapshot.field then state.fields = result.snapshot.field end
-    M.sync_dirty(state)
-    if failure then failed(state, failure)
-    elseif result and result.snapshot and result.snapshot.uncertain then
-      failed(state, "Review save outcome requires reconciliation")
-    elseif result and result.remote and result.remote ~= vim.NIL and result.remote.outcome ~= "confirmed" then
-      failed(state, result.remote.message or "Review save was rejected")
+---@param state table
+dispatch_save = function(state)
+  if not state.active or state.saving or not state.save_pending or not state.replica then return end
+  if state.repository and not state.actor then load_actor(state) return end
+  for login in (state.save_pending.text.reviewers or ""):gmatch("[^,%s]+") do
+    if state.actor and login:gsub("^@", ""):lower() == state.actor:lower() then
+      state.save_pending = nil
+      M.sync_dirty(state)
+      failed(state, "You cannot request a review from yourself (@" .. state.actor .. ")")
+      return
     end
+  end
+  if not editable.flush(state.replica.editable) then
+    state.save_pending = nil
+    M.sync_dirty(state)
+    failed(state, "Review edits could not be submitted")
+    return
+  end
+  if editable.suspend_generated_text(state.replica.editable) then return end
+  state.saving, state.save_pending = state.save_pending, nil
+  request(state, "review.save", { document = state.document }, function(result, failure)
+    local submitted = state.saving
+    state.saving = nil
+    state.save_generation = (state.save_generation or 0) + 1
+    local snapshot = type(result) == "table" and type(result.snapshot) == "table" and result.snapshot
+    local remote = type(result) == "table" and type(result.remote) == "table" and result.remote
+    if snapshot and snapshot.field then state.fields = snapshot.field end
+    if not failure and not snapshot then
+      failure = "Missing native review save result"
+    elseif snapshot and snapshot.uncertain then
+      failure = failure or "Review save outcome requires reconciliation"
+    elseif remote and remote.outcome ~= "confirmed" then
+      failure = failure or remote.message or "Review save was rejected"
+    end
+    local uncertain = snapshot and snapshot.uncertain
+      or failure and failure:find("requires reconciliation", 1, true) ~= nil
+    if failure then
+      state.save_pending = nil
+      if not uncertain then failed(state, failure) end
+    end
+    M.sync_dirty(state)
+    if uncertain then
+      state.recovery_capture = submitted.text
+      state.save_uncertain = true
+      M.reconcile_save(state)
+    elseif state.save_pending then
+      state.refresh_pending = true
+    else
+      state.reconciling = true
+      M.refresh(state, function() state.reconciling = false end)
+    end
+    settled(state)
+  end)
+end
+
+---@param state table
+load_actor = function(state)
+  if state.actor_loading or not state.repository then return end
+  state.actor_loading = true
+  request(state, "github.actor", { directory = state.directory, repository = state.repository }, function(actor, failure)
+    state.actor_loading = false
+    if failure or type(actor) ~= "table" or type(actor.login) ~= "string" or actor.login == "" then
+      state.save_pending = nil
+      M.sync_dirty(state)
+      failed(state, failure or "Missing authenticated GitHub user")
+      return
+    end
+    state.actor = actor.login
+    vim.b[state.replica.buffer].forge_reviewer_actor = actor.login
+    settled(state)
+  end)
+end
+
+---@param state table
+function M.reconcile_save(state)
+  if not state.active or state.save_recovering or state.saving then return end
+  state.save_pending, state.save_recovering = nil, true
+  request(state, "review.reconcile", { document = state.document }, function(snapshot, failure)
+    state.save_recovering = false
+    if failure or type(snapshot) ~= "table" or type(snapshot.field) ~= "table" or snapshot.uncertain then
+      state.save_uncertain = true
+      failed(state, (failure or "Review save remains unresolved") .. ". Press gR to retry recovery. Your edits are retained.")
+      M.sync_dirty(state)
+      return
+    end
+    state.save_uncertain = false
+    state.failure = nil
+    state.fields = snapshot.field
+    state.save_generation = (state.save_generation or 0) + 1
+    for _, field in ipairs(state.fields) do
+      local captured = state.recovery_capture and state.recovery_capture[field.region]
+      local anchor = state.replica.editable.native.anchor[field.region]
+      if captured and anchor and field.baseline ~= captured then
+        local text = table.concat(vim.api.nvim_buf_get_text(state.replica.buffer, anchor.start.row, anchor.start.column,
+          anchor.finish.row, anchor.finish.column, {}), "\n")
+        if text == captured then
+          local modifiable = vim.bo[state.replica.buffer].modifiable
+          vim.bo[state.replica.buffer].modifiable = true
+          local ok, message = pcall(vim.api.nvim_buf_set_text, state.replica.buffer, anchor.start.row, anchor.start.column,
+            anchor.finish.row, anchor.finish.column, vim.split(field.baseline, "\n", { plain = true }))
+          vim.bo[state.replica.buffer].modifiable = modifiable
+          if not ok then failed(state, tostring(message)) end
+        end
+      end
+    end
+    state.recovery_capture = nil
+    M.sync_dirty(state)
     M.refresh(state)
     settled(state)
   end)
+end
+
+---@param state table
+function M.save(state)
+  if not state.active or not state.replica or not state.replica.editable.native then return end
+  for _, field in ipairs(state.fields or {}) do
+    if field.uncertain then state.save_uncertain = true end
+  end
+  if state.save_uncertain or state.save_recovering then M.reconcile_save(state) return end
+  ---@type ForgeReviewSave
+  local submitted = { text = {} }
+  for _, field in ipairs(state.fields or {}) do
+    local anchor = state.replica.editable.native.anchor[field.region]
+    if anchor then
+      local text, failure = editable.trim_trailing_newlines(state.replica.editable, field.region)
+      if not text then failed(state, failure) return end
+      submitted.text[field.region] = text
+    end
+  end
+  state.editing_region = nil
+  if not state.saving or not vim.deep_equal(submitted, state.saving) or state.save_pending then
+    state.save_pending = submitted
+  end
+  M.sync_dirty(state)
+  dispatch_save(state)
 end
 
 local lifecycle_desired = { draft = "DRAFT", open = "OPEN", closed = "CLOSED" }
@@ -479,8 +630,23 @@ end
 
 function M.submit_batched(state, callback)
   if not state.active or not state.document or state.submission_running then return false end
-  if not editable.flush(state.replica.editable) then return false end
-  if editable.suspend_generated_text(state.replica.editable) then return false end
+  if not state.submission_pending then
+    for region in pairs(state.replica.editable.region) do
+      if region ~= "title" and region ~= "body" and region ~= "reviewers" then
+        local text, failure = editable.trim_trailing_newlines(state.replica.editable, region)
+        if not text then failed(state, failure) return false end
+      end
+    end
+    state.submission_pending = { callback = callback }
+  end
+  if not editable.flush(state.replica.editable) then
+    state.submission_pending = nil
+    failed(state, "Review submission edits could not be submitted")
+    return false
+  end
+  if editable.suspend_generated_text(state.replica.editable) then return true end
+  local pending = state.submission_pending
+  state.submission_pending = nil
   pick_verdict(state, function(verdict)
     if not verdict or state.submission_running then return end
     state.submission_running = true
@@ -493,7 +659,7 @@ function M.submit_batched(state, callback)
         failed(state, delivery.outcome == "outcome_unknown" and "Review outcome is unknown and requires recovery" or "Review submission was rejected")
       end
       M.refresh(state)
-      if callback then callback(delivery, failure) end
+      if pending.callback then pending.callback(delivery, failure) end
     end)
   end)
   return true
@@ -580,6 +746,10 @@ function M.save_comment(state, action, callback)
   local comment = state.comment_focus
   if not state.active or not comment or type(comment.comment) ~= "number" then return false end
   if action ~= "save" and action ~= "delete" then return false end
+  if action == "save" then
+    local text, failure = editable.trim_trailing_newlines(state.replica.editable, comment.region)
+    if not text then failed(state, failure) return false end
+  end
   return M.comment(state, { operation = "save", comment = comment.comment, action = action }, function(delivery, failure)
     if not failure and delivery and delivery.snapshot and delivery.snapshot ~= vim.NIL then
       if action == "delete" then
@@ -734,7 +904,7 @@ function M.open(options)
     vim.api.nvim_win_set_buf(window, cached.replica.buffer)
     local previous_view = cached.view or cached.closed_view
     if previous_view then input.close(previous_view) end
-    cached.view = input.open(cached.replica, window, { margin = 0, conceal = { level = 2, cursor = "" } })
+    cached.view = input.open(cached.replica, window, { margin = 0, virtualedit = "", conceal = { level = 2, cursor = "" } })
     if previous_view then cached.view.id, cached.view.sequence = previous_view.id, previous_view.sequence end
     cached.closed_view, cached.view_ready = nil, false
     M.attach_fold_window(cached, window)
@@ -776,6 +946,7 @@ function M.open(options)
     end
     state.document = opened.document
     state.fields = opened.field
+    state.save_uncertain = opened.uncertain == true
     request(state, "review.header", { document = state.document, directory = state.directory }, function(_, header_failure)
     if header_failure then
       failed(state, header_failure)
@@ -806,6 +977,7 @@ function M.open(options)
     vim.bo[state.replica.buffer].buftype = "acwrite"
     vim.bo[state.replica.buffer].buflisted = true
     vim.api.nvim_buf_set_name(state.replica.buffer, "forge://pull-request/" .. state.document)
+    if state.repository then load_actor(state) end
     if repository and repository.owner and repository.name then
       local repo = repository.owner .. "/" .. repository.name
       local cache = require("github.repo_cache")
@@ -820,13 +992,24 @@ function M.open(options)
     vim.api.nvim_create_autocmd("BufUnload", { group = state.group, buffer = state.replica.buffer, callback = function() state.unloading = true finish_close(state, true) end })
     vim.api.nvim_create_autocmd("BufWinEnter", { group = state.group, buffer = state.replica.buffer,
       callback = function() M.attach_fold_window(state, vim.api.nvim_get_current_win()) end })
-    vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter", "InsertLeave", "TextChanged", "TextChangedI" }, {
+    vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter", "InsertEnter", "InsertLeave", "TextChanged", "TextChangedI" }, {
       group = state.group, buffer = state.replica.buffer,
       callback = function(event)
         M.sync_comment_focus(state)
         M.sync_editing(state)
-        if event.event == "TextChanged" or event.event == "TextChangedI" then M.sync_dirty(state) end
+        if event.event == "InsertEnter" then state.editing_region = M.editable_region(state) end
+        if event.event == "InsertLeave" then state.editing_region = nil end
+        if event.event == "InsertEnter" or event.event == "InsertLeave"
+          or event.event == "TextChanged" or event.event == "TextChangedI" then M.sync_dirty(state) end
       end })
+    vim.keymap.set("n", "i", function()
+      local region = M.editable_region(state)
+      local anchor = region and state.replica.editable.native.anchor[region]
+      if anchor and heading_mark(state.replica, anchor.start.row) then
+        return "0" .. (anchor.start.column > 0 and tostring(anchor.start.column) .. "l" or "") .. "i"
+      end
+      return "i"
+    end, { buffer = state.replica.buffer, expr = true, desc = "Insert at field input" })
     vim.keymap.set("i", "<CR>", function()
       local region = M.editable_region(state)
       return (region == "title" or region == "reviewers") and "" or "<CR>"
@@ -858,8 +1041,8 @@ function M.open(options)
       handler = {
         close = function() M.close(state) end,
         refresh = function() M.refresh(state) end,
-        open = function() M.activate(state) end,
-        browse = function() M.activate(state) end,
+        open = function() M.activate(state, "open") end,
+        browse = function() M.activate(state, "browse") end,
         review = function() M.begin_batched(state) end,
         reply = function() if not M.reply_comment(state) then M.refresh(state) end end,
         comment = function()
@@ -878,12 +1061,18 @@ function M.open(options)
     })
     end
     state.bind_commands()
-    vim.keymap.set("n", "gR", function() M.reconcile_lifecycle(state) end,
-      { buffer = state.replica.buffer, desc = "Reconcile pull request lifecycle" })
+    vim.keymap.set("n", "gR", function()
+      if state.save_uncertain or state.fields and vim.iter(state.fields):any(function(field) return field.uncertain end) then
+        M.reconcile_save(state)
+      else M.reconcile_lifecycle(state) end
+    end, { buffer = state.replica.buffer, desc = "Recover pull request save or lifecycle" })
     vim.keymap.set("n", "gB", function() pick_submission_recovery(state) end,
       { buffer = state.replica.buffer, desc = "Resolve review submission" })
     M.refresh(state, function(rendered)
-      if rendered then load_initial_sections(state) end
+      if rendered then
+        load_initial_sections(state)
+        if state.save_uncertain then M.reconcile_save(state) end
+      end
     end)
     end)
   end)

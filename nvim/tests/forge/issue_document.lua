@@ -4,6 +4,9 @@ local editable = require("forge.editable")
 local pending, closed, saves, resolves, views, errors = {}, {}, 0, {}, {}, {}
 local revision, text = 0, "initial"
 local opening, captured
+local browse_input, browsed_url
+local original_open = vim.ui.open
+vim.ui.open = function(url) browsed_url = url end
 local function metadata(value, accepted)
   return { target = {}, decoration = {}, visible_decoration = {}, fold = {}, gutter = {},
     editable_region = { { id = "body", revision = accepted, sequence = 100,
@@ -18,6 +21,11 @@ adapter._set_runner_for_test(function(method, params, callback)
       fields = { { region = "body", revision = revision, sequence = 100 } } }
     if params.number == 8 then opening = function() callback(result) end else callback(result) end
   elseif params.operation == "edit" then pending[#pending + 1] = { edit = params.edit, callback = callback }
+  elseif params.operation == "act" then
+    browse_input = params.input
+    local effect = vim.deepcopy(params.input)
+    effect.id, effect.kind, effect.url = "issue-browse-test", "browser", "https://enterprise.example/owner/other/issues/7"
+    callback({ effect = effect })
   elseif params.operation == "save" then saves = saves + 1 callback({ fields = {} })
   elseif params.operation == "resolve" then
     resolves[#resolves + 1] = vim.deepcopy(params)
@@ -53,6 +61,11 @@ assert(vim.fn.maparg("<C-s>", "i", false, true).desc == "Save issue", "native is
 assert(vim.fn.maparg("<CR>", "i", false, true).expr == 1, "native issue lost scalar newline guard")
 assert(vim.fn.maparg("?", "n", false, true).desc == "Show issue commands", "native issue lost command help")
 assert(vim.wait(1000, function() return #views >= 1 end), "native issue did not register its input view")
+vim.fn.maparg("b", "n", false, true).callback()
+assert(vim.wait(1000, function() return browsed_url ~= nil end))
+assert(browse_input.action == "browse" and not browse_input.target, "issue browse required a row target")
+assert(browsed_url == "https://enterprise.example/owner/other/issues/7")
+vim.ui.open = original_open
 vim.cmd("vsplit")
 local split_window = vim.api.nvim_get_current_win()
 assert(vim.wait(1000, function() return state.view[split_window] ~= nil and #views >= 2 end),
@@ -89,8 +102,10 @@ local function confirm(index)
 end
 type_text("captured")
 assert(pending[1].edit.sequence > 100, "restored draft reused an earlier edit sequence")
-type_text("newer")
+type_text("newer\r")
 adapter.save(state)
+assert(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1] == "newer",
+  "issue save retained a trailing carriage return")
 assert(saves == 0)
 confirm(1)
 assert(vim.wait(1000, function() return #pending == 2 end))

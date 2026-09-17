@@ -216,6 +216,10 @@ function M.save(state)
     report(state, "Issue requires a fresh remote observation before saving. Press R to refresh.")
     return false
   end
+  for region in pairs(state.replica.editable.region) do
+    local text, failure = editable.trim_trailing_newlines(state.replica.editable, region)
+    if not text then report(state, failure) return false end
+  end
   state.save_pending = true
   if not editable.flush(state.replica.editable) then
     report(state, "Issue edits could not be submitted")

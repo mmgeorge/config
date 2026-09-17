@@ -584,19 +584,7 @@ impl ReviewService {
                                     block.push(super::file::continuation_block(&source.path)?);
                                 }
                             }
-                            if source.status != "removed" {
-                                block.push(action_block(
-                                    format!("{identity}:open-file"),
-                                    "Open working file",
-                                    super::thread_projection::ReviewTarget::WorkspaceFile {
-                                        path: source.path.clone(),
-                                    },
-                                    &mut target,
-                                )?);
-                            }
-                            if block.len() == item_start + 1 {
-                                block.push(title_block(format!("{identity}:deferred"), "")?);
-                            }
+                            block.push(title_block(format!("{identity}:deferred"), "")?);
                         }
                         if let Some(url) = &item.url {
                             block.push(action_block(

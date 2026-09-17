@@ -58,6 +58,13 @@ assert(issue_open.number == 7 and issue_open.repository == "acme/widgets" and is
 
 state.open_effect({ kind = "browse", url = "https://github.example/acme/widgets/pull/42" }, vim.api.nvim_get_current_win(), function() return true end)
 assert(browsed_url == "https://github.example/acme/widgets/pull/42", "notification browse fallback changed")
+local failure_notice
+state.notice = function(message) failure_notice = message end
+vim.ui.open = function() return nil, "browser unavailable" end
+state.open_effect({ kind = "browse", url = browsed_url }, vim.api.nvim_get_current_win(), function() return true end)
+assert(failure_notice == "browser unavailable", "notification browser failure was hidden")
+state.open_effect({ kind = "browse" }, vim.api.nvim_get_current_win(), function() return true end)
+assert(failure_notice == "This notification has no browser URL", "missing notification URL was hidden")
 
 notifications.close(state)
 package.loaded["forge"] = original_forge

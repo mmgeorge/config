@@ -1429,14 +1429,21 @@ async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
         file_header.text.wire_rows(),
         ["Modified notes.txt +180 -180"]
     );
-    let open_file = initial
+    let deferred = initial
         .snapshot
         .block
         .iter()
-        .find(|block| block.text.wire_rows() == ["Open working file"])
-        .expect("working-file action");
-    assert_eq!(file_body_fold.end.block, open_file.id);
-    assert_eq!(file_body_fold.end.position.row, open_file.text.row_count());
+        .find(|block| block.id.0.ends_with(":deferred"))
+        .expect("deferred diff body");
+    assert_eq!(file_body_fold.end.block, deferred.id);
+    assert_eq!(file_body_fold.end.position.row, deferred.text.row_count());
+    assert!(
+        !initial
+            .snapshot
+            .block
+            .iter()
+            .any(|block| block.text.wire_rows() == ["Open working file"])
+    );
     let view = forge_buffer::identity::ViewId("review-visual-fixture".into());
     service
         .view(&opened.document, view.clone(), Default::default())
@@ -1831,7 +1838,10 @@ impl forge_github::review_mutation::GithubReviewWriteRemote for TestRemote {
                 request.mutation,
                 forge_github::review_mutation::ReviewMutation::ReviewerChange { .. }
             ) {
-                return Ok(serde_json::json!({"users":[{"login":"bob"}],"teams":[]}));
+                return Err(RemoteFailure {
+                    kind: RemoteFailureKind::InvalidResponse,
+                    message: "this operation requires explicit unknown closure or operation-specific reconciliation".into(),
+                });
             }
             if !matches!(
                 request.mutation,
@@ -2672,7 +2682,7 @@ async fn foreign_open_does_not_adopt_text_and_document_admission_recovers() {
 }
 
 #[tokio::test]
-async fn remote_panic_retains_unknown_save_for_explicit_reconciliation() {
+async fn remote_panic_reconciles_observed_state_without_reposting() {
     let remote = remote();
     let github = github(&remote);
     let service = ReviewService::new(github.clone());
@@ -2683,30 +2693,11 @@ async fn remote_panic_retains_unknown_save_for_explicit_reconciliation() {
     let snapshot = service.snapshot(&initial.document).unwrap();
     assert!(snapshot.uncertain && !snapshot.saving);
     assert_eq!(snapshot.field[1].text, "not confirmed");
-    assert!(service.reconcile(&initial.document).await.is_err());
-    let resource = forge_github::recovery::RecoveryResource {
-        repository: target().repository,
-        kind: forge_github::recovery::RecoveryResourceKind::PullRequest,
-        number: 7,
-    };
-    let record = github
-        .recovery_inspect(resource.clone())
-        .await
-        .unwrap()
-        .unwrap();
-    github
-        .recovery_resolve(
-            remote.clone(),
-            resource,
-            record.capture.operation_id,
-            forge_github::review_mutation::RecoveryResolution::CloseUnknown,
-        )
-        .await
-        .unwrap();
-    assert_eq!(
-        service.reconcile(&initial.document).await.unwrap().field[1].baseline,
-        "Initial body"
-    );
+    let recovered = service.reconcile(&initial.document).await.unwrap();
+    assert!(!recovered.uncertain);
+    assert_eq!(recovered.field[1].baseline, "Initial body");
+    assert_eq!(recovered.field[1].text, "not confirmed");
+    assert_eq!(remote.writes.lock().unwrap().len(), 1);
     assert_eq!(github.shutdown(Duration::from_secs(1)).await.failed_jobs, 1);
 }
 
@@ -4381,6 +4372,72 @@ async fn mismatched_batched_recovery_capture_is_rejected() {
 }
 
 #[tokio::test]
+async fn browse_opens_pr_from_plain_rows_and_never_activates_other_targets() {
+    use forge_buffer::{
+        block::TextPosition,
+        identity::{InputSequence, ViewId},
+        input::DocumentInput,
+        width::WidthProfile,
+    };
+    let remote = remote();
+    let analysis =
+        forge_diff::engine::DiffEngine::new(forge_diff::cache::CacheLimits::default(), 1)
+            .analysis_pool();
+    let service = ReviewService::with_analysis(github(&remote), analysis);
+    let directory = remote.recovery.path().to_path_buf();
+    let mut target = target();
+    target.repository = GithubRepositoryId::new("github.example.test", "owner", "repo").unwrap();
+    let opened = service
+        .open_pr_in_directory(directory.clone(), remote.clone(), target)
+        .await
+        .unwrap();
+    let presentation = service
+        .materialize(&opened.document, WidthProfile::default())
+        .await
+        .unwrap();
+    let view = ViewId("browse-test".into());
+    service
+        .view(&opened.document, view.clone(), WidthProfile::default())
+        .await
+        .unwrap();
+    let mut sequence = 0;
+    for block in &presentation.snapshot.block {
+        if block.text.row_count() == 0 {
+            continue;
+        }
+        sequence += 1;
+        let position = TextPosition { row: 0, column: 0 };
+        let input = DocumentInput {
+            document: opened.document.clone(),
+            revision: presentation.snapshot.revision,
+            view: view.clone(),
+            sequence: InputSequence(sequence),
+            action: "browse".into(),
+            block: block.id.clone(),
+            position,
+            target: block.target_at(position).cloned(),
+        };
+        let delivery = service.act(input.clone(), directory.clone()).await.unwrap();
+        assert!(
+            delivery.patch.is_empty() && delivery.choice.is_none() && delivery.comment.is_none()
+        );
+        let effect = delivery
+            .effect
+            .expect("browse must open a URL on every row");
+        assert_eq!(effect.kind, "browser");
+        assert_eq!(
+            effect.url.as_deref(),
+            Some("https://github.example.test/owner/repo/pull/7")
+        );
+        assert!(
+            service.act(input, directory.clone()).await.is_err(),
+            "browse accepted replayed input"
+        );
+    }
+    assert!(sequence > 0);
+}
+
+#[tokio::test]
 async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_url() {
     use forge_buffer::{
         block::TextPosition,
@@ -4477,14 +4534,13 @@ async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_u
             target: Some(block.metadata.target[0].id.clone()),
         }
     };
-    let mut expansion = activate(":open-file", 1);
+    let mut expansion = activate(":browser", 1);
     expansion.action = "expand".into();
     let expansion = service.act(expansion, directory.clone()).await.unwrap();
     assert!(expansion.effect.is_none() && expansion.patch.is_empty());
-    let working = service
-        .act(activate(":open-file", 2), directory.clone())
-        .await
-        .unwrap();
+    let mut opening = activate(":title", 2);
+    opening.action = "open".into();
+    let working = service.act(opening, directory.clone()).await.unwrap();
     let working = working.effect.expect("native working-file effect");
     assert_eq!(working.kind, "open_file");
     assert_eq!(
@@ -4501,7 +4557,24 @@ async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_u
         browser.url.as_deref(),
         Some("https://github.example.test/owner/repository/pull/7/files#diff")
     );
-    let mut expansion = activate(":title", 4);
+    let mut browse = activate(":title", 4);
+    browse.action = "browse".into();
+    let delivery = service.act(browse, directory.clone()).await.unwrap();
+    let effect = delivery.effect.unwrap();
+    assert_eq!(effect.kind, "browser");
+    assert_eq!(
+        effect.url.as_deref(),
+        Some("https://github.com/owner/repo/pull/7")
+    );
+    assert!(delivery.patch.is_empty());
+    let mut browse = activate(":browser", 5);
+    browse.action = "browse".into();
+    let delivery = service.act(browse, directory.clone()).await.unwrap();
+    assert_eq!(
+        delivery.effect.unwrap().url.as_deref(),
+        Some("https://github.example.test/owner/repository/pull/7/files#diff")
+    );
+    let mut expansion = activate(":title", 6);
     expansion.action = "expand".into();
     let diff = service.act(expansion, directory).await.unwrap();
     assert!(diff.effect.is_none());
@@ -4527,7 +4600,7 @@ async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_u
                 document: opened.document.clone(),
                 revision: file_patch.next,
                 view,
-                sequence: InputSequence(5),
+                sequence: InputSequence(7),
                 action: "activate".into(),
                 block: inline.0,
                 position: TextPosition { row: 0, column: 0 },
@@ -4574,7 +4647,7 @@ async fn status_snapshot_opens_header_without_remote_reads() {
         "url": "https://example.invalid/owner/repo/pull/7", "state": "OPEN", "isDraft": true,
         "baseRefOid": "a".repeat(40), "baseRefName": "main",
         "headRefOid": "b".repeat(40), "headRefName": "feature",
-        "headRepository": { "name": "repo" }, "headRepositoryOwner": { "login": "fork" },
+        "headRepository": { "name": "repo", "nameWithOwner": "" }, "headRepositoryOwner": { "login": "fork" },
         "milestone": { "title": "v1" }, "updatedAt": "1 day ago", "createdAt": "2 days ago",
         "commits": [{ "oid": "b".repeat(40), "messageHeadline": "feat: cached head", "committedDate": "1 day ago" }],
         "reviewRequests": [{ "login": "alice" }, { "slug": "team" }]
@@ -4915,6 +4988,59 @@ async fn reviewer_formatting_only_save_needs_no_remote_write() {
     let saved = service.save(&document).await.unwrap();
     assert!(saved.snapshot.field.iter().all(|field| !field.dirty));
     assert!(remote.reviewer_writes.lock().unwrap().is_empty());
+    service.close();
+}
+
+#[tokio::test]
+async fn reviewer_self_selection_rejects_all_writes_before_admission() {
+    let remote = remote();
+    let (service, document) = reviewer_document(&remote).await;
+    change(&service, &document, "title", "Keep this local").await;
+    change(&service, &document, "reviewers", "@ViEwEr @bob").await;
+    let failure = service.save(&document).await.unwrap_err();
+    assert!(
+        failure
+            .to_string()
+            .contains("cannot request a review from yourself")
+    );
+    assert!(remote.writes.lock().unwrap().is_empty());
+    assert!(remote.reviewer_writes.lock().unwrap().is_empty());
+    assert!(!service.snapshot(&document).unwrap().uncertain);
+    change(&service, &document, "reviewers", "@bob").await;
+    assert!(!service.save(&document).await.unwrap().snapshot.uncertain);
+    service.close();
+}
+
+#[tokio::test]
+async fn reviewer_partial_outcome_recovers_observed_baseline_and_allows_another_save() {
+    let remote = remote();
+    let (service, document) = reviewer_document(&remote).await;
+    change(&service, &document, "reviewers", "@bob").await;
+    remote.uncertain.store(true, Ordering::Release);
+    assert!(service.save(&document).await.unwrap().snapshot.uncertain);
+    change(&service, &document, "reviewers", "@carol").await;
+    remote
+        .section_page
+        .lock()
+        .unwrap()
+        .push_back(forge_github::review_api::ReviewPage {
+            records: vec![serde_json::json!({"users":[],"teams":[]})],
+            next_cursor: None,
+            complete: true,
+        });
+    let recovered = service.reconcile(&document).await.unwrap();
+    let reviewer = recovered
+        .field
+        .iter()
+        .find(|field| field.region.0 == "reviewers")
+        .unwrap();
+    assert!(!recovered.uncertain);
+    assert_eq!(reviewer.baseline, "");
+    assert_eq!(reviewer.text, "@carol");
+    assert_eq!(remote.reviewer_writes.lock().unwrap().len(), 1);
+    remote.uncertain.store(false, Ordering::Release);
+    assert!(!service.save(&document).await.unwrap().snapshot.uncertain);
+    assert_eq!(remote.reviewer_writes.lock().unwrap().len(), 2);
     service.close();
 }
 

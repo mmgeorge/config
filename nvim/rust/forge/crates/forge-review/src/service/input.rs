@@ -55,17 +55,28 @@ impl ReviewService {
         ensure!(
             matches!(
                 input.action.as_str(),
-                "activate" | "expand" | "lifecycle:draft" | "lifecycle:open" | "lifecycle:closed"
+                "activate"
+                    | "open"
+                    | "browse"
+                    | "expand"
+                    | "lifecycle:draft"
+                    | "lifecycle:open"
+                    | "lifecycle:closed"
             ),
             "unsupported review input action"
         );
         let owner = self.owner(&input.document)?;
         owner.validate_directory(&directory)?;
-        let target = owner
+        let mut target = owner
             .document
             .lock()
             .expect("review document poisoned")
             .capture_input(&input)?;
+        if input.action == "open" {
+            if let ReviewTarget::FileDiff { path } = &target {
+                target = ReviewTarget::WorkspaceFile { path: path.clone() };
+            }
+        }
         let mut delivery = ReviewActionDelivery {
             patch: Vec::new(),
             effect: None,
@@ -89,7 +100,7 @@ impl ReviewService {
         }
         match target {
             ReviewTarget::Lifecycle { available } => {
-                if input.action == "activate" {
+                if matches!(input.action.as_str(), "activate" | "open") {
                     delivery.choice = Some(available.into_iter().map(lifecycle_choice).collect());
                     return Ok(delivery);
                 }
@@ -387,6 +398,38 @@ impl ReviewDocument {
             row.is_char_boundary(input.position.column),
             "review input byte position is invalid"
         );
+        if input.action == "browse" {
+            let selected = if let Some(target) = &input.target {
+                ensure!(
+                    block.target_at(input.position) == Some(target),
+                    "review input target does not match captured position"
+                );
+                self.projection_target.get(target).cloned().or_else(|| {
+                    self.projection_link
+                        .get(&input.block)?
+                        .iter()
+                        .find(|link| &link.target == target)
+                        .map(|link| ReviewTarget::Browser {
+                            url: link.destination.clone(),
+                        })
+                })
+            } else {
+                None
+            };
+            let target = match selected {
+                Some(target @ ReviewTarget::Browser { .. }) => target,
+                _ => ReviewTarget::Browser {
+                    url: format!(
+                        "https://{}/{}/pull/{}",
+                        self.target.repository.hostname(),
+                        self.target.repository.repository_name(),
+                        self.target.number
+                    ),
+                },
+            };
+            self.input.insert(input.view.clone(), input.sequence);
+            return Ok(target);
+        }
         let target = input
             .target
             .as_ref()

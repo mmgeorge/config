@@ -30,6 +30,7 @@ adapter._set_runner_for_test(function(method, params, callback)
   if method == "review.open_pr" then
     if params.target.number == 8 then delayed_open = callback
     else callback({ document = "review-adapter" }) end
+  elseif method == "github.actor" then callback({ login = "viewer" })
   elseif method == "review.open" then
     discovery_request = params
     if params.number == 9 then delayed_discovery = callback
@@ -109,6 +110,14 @@ assert(vim.wo.wrap and vim.wo.linebreak and not vim.wo.breakindent and vim.wo.st
 assert(vim.fn.maparg("S", "n", false, true).buffer ~= 1, "overview exposed batched viewed action")
 assert(vim.fn.maparg("or", "n", false, true).buffer ~= 1, "review shortcut delays native o in editable text")
 assert(not state.replica.physical and not state.replica.generated)
+for _, mode in ipairs({ "n", "x" }) do
+  local browse = vim.fn.maparg("b", mode, false, true)
+  assert(browse.buffer == 1, "editable PR field lost its browse mapping")
+  browse.callback()
+  assert(vim.wait(1000, function() return not state.action_running end))
+  assert(action_request[#action_request].action == "browse", "browse invoked generic row activation")
+end
+action_request = {}
 assert(vim.wait(1000, function() return #section_request == 1 end),
   "native review did not request Rust-owned initial loading")
 local shared_snapshot = { id = "PR_shared", number = 7, title = "Refreshed title" }
@@ -296,6 +305,12 @@ end)
 assert(vim.wait(1000, function() return thread_loaded end))
 assert(materialize_count == before_thread, "thread continuation re-materialized the entire document")
 assert(vim.api.nvim_buf_get_lines(discovered.replica.buffer, 1, 2, false)[1] == "next thread comment")
+vim.api.nvim_win_set_cursor(discovered.window, { 2, 0 })
+local browse_count = #action_request
+vim.fn.maparg("b", "n", false, true).callback()
+assert(vim.wait(1000, function() return #action_request == browse_count + 1 end))
+assert(action_request[#action_request].action == "browse" and not action_request[#action_request].target,
+  "browse on plain text required an interactive row target")
 cache.hostname = previous_hostname
 adapter.close(discovered)
 assert(discovered.hidden and discovered.active and not closed[3], "close discarded cached PR state")

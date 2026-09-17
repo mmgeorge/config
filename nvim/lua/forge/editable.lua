@@ -105,11 +105,11 @@ function M.conflict(state, response)
 end
 
 function M.suspend_generated_text(state)
-  return state.suspended
+  return state.suspended or state.native and state.native.rejecting or false
 end
 
 function M.ready_to_reconcile(state)
-  if not state.suspended or state.fault then
+  if not state.suspended or state.fault or state.native and state.native.rejecting then
     return false
   end
   for _, entry in pairs(state.region) do
@@ -218,6 +218,39 @@ function M.capture(state, region)
   return M.record(state, region, native_rows(native.buffer, anchor))
 end
 
+---Remove trailing line breaks from a native input and retain the normalized text for dispatch.
+---@param state {native: {buffer: integer, active: boolean, anchor: table<string, ForgeEditableAnchor>}, fault?: string}
+---@param region string
+---@return string? text
+---@return string? failure
+function M.trim_trailing_newlines(state, region)
+  local native = state.native
+  if not native or not native.active or state.fault then return nil, state.fault or "Native input is unavailable" end
+  local anchor = refresh_anchor(native, region)
+  if not anchor then return nil, "Unknown native input: " .. region end
+  local text = table.concat(native_rows(native.buffer, anchor), "\n")
+  local trimmed = text:gsub("[\r\n]+$", "")
+  if trimmed == text then return text end
+  local rows = vim.split(trimmed, "\n", { plain = true })
+  local row = anchor.start.row + #rows - 1
+  local column = #rows[#rows] + (#rows == 1 and anchor.start.column or 0)
+  local finish = anchor.finish
+  local count = vim.api.nvim_buf_line_count(native.buffer)
+  if finish.row == count then
+    finish = { row = count - 1, column = #vim.api.nvim_buf_get_lines(native.buffer, count - 1, count, false)[1] }
+  end
+  local modifiable = vim.bo[native.buffer].modifiable
+  vim.bo[native.buffer].modifiable = true
+  local ok, failure = pcall(vim.api.nvim_buf_set_text, native.buffer, row, column, finish.row, finish.column, { "" })
+  vim.bo[native.buffer].modifiable = modifiable
+  if not ok or state.fault then return nil, state.fault or tostring(failure) end
+  if anchor.finish.row == vim.api.nvim_buf_line_count(native.buffer) then
+    anchor.finish = { row = row, column = column }
+    M.capture(state, region)
+  end
+  return trimmed
+end
+
 function M.flush(state)
   local native = state.native
   if not native or not native.active or state.fault then
@@ -264,6 +297,63 @@ local function native_fault(state, message)
       end
     end)
   end
+end
+
+---Restore the last permitted text and pre-splice marks after a rejected native edit.
+---@param state table
+---@param message string
+---@param start {row: integer, column: integer}
+---@param finish {row: integer, column: integer}
+local function reject_edit(state, message, start, finish)
+  local native = state.native
+  local marks = vim.api.nvim_buf_get_extmarks(native.buffer, -1, 0, -1, { details = true })
+  local cursor = {}
+  for _, window in ipairs(vim.fn.win_findbuf(native.buffer)) do
+    cursor[window] = vim.api.nvim_win_get_cursor(window)
+    local region = M.guard_region(state, finish, finish) or M.guard_region(state, start, start)
+    if region then
+      local anchor = refresh_anchor(native, region)
+      local position = { row = cursor[window][1] - 1, column = cursor[window][2] }
+      if not before_or_equal(anchor.start, position) then
+        cursor[window] = { anchor.start.row + 1, anchor.start.column }
+      elseif not before_or_equal(position, anchor.finish) then
+        cursor[window] = { anchor.finish.row + 1, anchor.finish.column }
+      end
+    end
+  end
+  native.rejecting = true
+  vim.schedule(function()
+    if not native.active or state.native ~= native or not vim.api.nvim_buf_is_valid(native.buffer) then return end
+    local modifiable = vim.bo[native.buffer].modifiable
+    local modified = native.modified
+    local ok, failure = pcall(function()
+      vim.bo[native.buffer].modifiable = true
+      vim.api.nvim_buf_call(native.buffer, function() pcall(vim.cmd, "undojoin") end)
+      vim.api.nvim_buf_set_lines(native.buffer, 0, -1, false, native.shadow)
+      for _, mark in ipairs(marks) do
+        local details = mark[4]
+        local namespace = details.ns_id
+        details.ns_id, details.invalid = nil, nil
+        details.id = mark[1]
+        vim.api.nvim_buf_set_extmark(native.buffer, namespace, mark[2], mark[3], details)
+      end
+      for window, position in pairs(cursor) do
+        if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == native.buffer then
+          position[1] = math.min(position[1], #native.shadow)
+          position[2] = math.min(position[2], #native.shadow[position[1]])
+          vim.api.nvim_win_set_cursor(window, position)
+        end
+      end
+      vim.bo[native.buffer].modified = modified
+    end)
+    vim.bo[native.buffer].modifiable = modifiable
+    native.rejecting = nil
+    if not ok then native_fault(state, tostring(failure))
+    else
+      vim.api.nvim_exec_autocmds("TextChanged", { buffer = native.buffer })
+      if native.notice then native.notice(message) end
+    end
+  end)
 end
 
 function M.detach(state)
@@ -324,6 +414,7 @@ function M.attach(state, buffer, region_ranges, options)
   local native = {
     buffer = buffer, anchor = anchor, send = options.send, notice = options.notice,
     delay = delay, max_delay = max_delay, timer = assert(vim.uv.new_timer()), active = true, generation = 0,
+    shadow = vim.api.nvim_buf_get_lines(buffer, 0, -1, false), modified = vim.bo[buffer].modified,
   }
   state.native = native
   local attached = vim.api.nvim_buf_attach(buffer, false, {
@@ -331,7 +422,20 @@ function M.attach(state, buffer, region_ranges, options)
       if not native.active then
         return true
       end
-      if native.applying then return end
+      if native.rejecting then return end
+      local function retain_rows()
+        local replacement = vim.api.nvim_buf_get_lines(buffer, row, row + new_rows + 1, false)
+        if #replacement == old_rows + 1 then
+          for index, text in ipairs(replacement) do native.shadow[row + index] = text end
+        else
+          for _ = 1, old_rows + 1 do
+            if row + 1 <= #native.shadow then table.remove(native.shadow, row + 1) end
+          end
+          for index = #replacement, 1, -1 do table.insert(native.shadow, row + 1, replacement[index]) end
+        end
+        native.modified = vim.bo[buffer].modified
+      end
+      if native.applying then retain_rows() return end
       if state.fault then
         return
       end
@@ -339,11 +443,12 @@ function M.attach(state, buffer, region_ranges, options)
       local finish = { row = row + old_rows, column = old_rows == 0 and column + old_column or old_column }
       local new_finish = { row = row + new_rows, column = new_rows == 0 and column + new_column or new_column }
       local owner, message = M.guard_region(state, start, finish)
-      state.suspended = true
       if not owner then
-        native_fault(state, message)
+        reject_edit(state, message, start, finish)
         return
       end
+      retain_rows()
+      state.suspended = true
       local function shift(position)
         if position.row == finish.row then
           position.column = new_finish.column + position.column - finish.column

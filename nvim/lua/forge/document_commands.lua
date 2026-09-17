@@ -155,7 +155,7 @@ function M.attach(session, options)
   function owner.sync_editing()
     if not options.editable or owner.closed then return end
     local editing = options.editable()
-    local keep = { sync = true, toggle = true, collapse_parent = true, close = true, help = true }
+    local keep = { browse = true, sync = true, toggle = true, collapse_parent = true, close = true, help = true }
     for _, mapping in ipairs(owner.mapping) do
       local active = not editing or keep[mapping.command] == true
       if mapping.active ~= active then

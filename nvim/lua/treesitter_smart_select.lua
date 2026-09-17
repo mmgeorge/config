@@ -1,6 +1,5 @@
 local cursor_stack = {}
 local selected_node_ranges = {}
-local last_was_expand = false
 local last_changedtick = nil
 local last_bufnr = nil
 
@@ -123,7 +122,6 @@ vim.api.nvim_create_autocmd("ModeChanged", {
   callback = function(args)
     selected_node_ranges = {}
     cursor_stack = {}
-    last_was_expand = false
   end,
   -- once = true, -- Ensure it triggers only once
 })
@@ -205,7 +203,6 @@ local function get_selection_end(lines, node, at_start, is_list_arg)
 end
 
 local function select_chain(lines, tree, node)
-  print("select_chain")
   local start_row, start_col, end_row, end_col = node:range()
   local line = lines[start_row + 1]
   local did_capture_dot_start = false
@@ -213,7 +210,6 @@ local function select_chain(lines, tree, node)
   -- end_col = end_col - 1 -- node:range() is not inclusive?
 
   if line:sub(start_col, start_col):match("%.") then
-    print("select_chain:capture_dot_left")
     start_col = start_col - 1
     did_capture_dot_start = true
   end
@@ -235,7 +231,6 @@ local function select_chain(lines, tree, node)
     return select_region(node, start_row, start_col, args_end_row, args_end_col - 1)
     -- call(f|oo.value) select foo. if we are the first item
   elseif not did_capture_dot_start and line:sub(end_col + 1, end_col + 1):match("%.") then
-    print("select_chain:capture_dot_right")
     end_col = end_col + 1
   end
 
@@ -305,15 +300,6 @@ function find_closest_node(tree)
   local cursor_col = next_non_ws and (next_non_ws - 1) or cursor_pos[2]
   local root = tree:root()
   local node = root:named_descendant_for_range(cursor_row, cursor_col, cursor_row, cursor_col)
-  if not node then
-    vim.notify(
-      "Error: Could not find a Tree-sitter node at the cursor position. Position: r" ..
-      cursor_row .. " c" .. cursor_col,
-      vim.log.levels.ERROR
-    )
-    return
-  end
-
   return node
 end
 
@@ -330,28 +316,21 @@ function query_for(lang)
   return query
 end
 
-local function get_tree(bufnr, lang)
+---@param bufnr integer
+---@param lang string?
+---@param callback fun(tree: TSTree?)
+local function get_tree(bufnr, lang, callback)
+  if not lang or lang == "" then callback(nil) return end
   local parser = vim.treesitter.get_parser(bufnr, lang, { error = false })
   if not parser then
-    vim.notify("Error: No Tree-sitter parser found for language: " .. lang, vim.log.levels.ERROR)
-    return
+    callback(nil) return
   end
-
-  -- Parse the current buffer's content. Select the first (and usually only) tree
-  -- TODO: Handle multiple trees?
-  local trees = parser:parse(true)
-  local tree = trees[1]
-  if not tree then
-    vim.notify("Error: Could not parse the buffer.", vim.log.levels.ERROR)
-    return
-  end
-
-  if #trees ~= 1 then
-    vim.notify("Error: Unexpected tree count", vim.log.levels.ERROR)
-    return
-  end
-
-  return tree
+  parser:parse(nil, function(failure, trees)
+    vim.schedule(function()
+      if failure then vim.notify(tostring(failure), vim.log.levels.ERROR) end
+      callback(trees and #trees == 1 and trees[1] or nil)
+    end)
+  end)
 end
 
 local function get_capture_index(query, capture_name)
@@ -450,7 +429,6 @@ local function invalidate_if_changed(bufnr)
   if bufnr ~= last_bufnr or tick ~= last_changedtick then
     selected_node_ranges = {}
     cursor_stack = {}
-    last_was_expand = false
   end
   last_bufnr = bufnr
   last_changedtick = tick
@@ -494,15 +472,7 @@ local function try_select_touching_siblings(node, query, tree, bufnr)
   return select_region(node, start_row, start_col, end_row, end_col)
 end
 
-function select_parent()
-  local bufnr = vim.api.nvim_get_current_buf()
-  invalidate_if_changed(bufnr)
-
-  local ftype = vim.bo[bufnr].filetype
-  local lang = vim.treesitter.language.get_lang(ftype)
-  local query = query_for(lang)
-  local tree = get_tree(bufnr, lang)
-
+local function select_syntax_parent(bufnr, tree, query)
   local node
   local last_range = selected_node_ranges[#selected_node_ranges]
   if not last_range then
@@ -559,8 +529,67 @@ function select_parent()
   end
 end
 
+---Expand parserless text through words, tokens, lines, paragraphs, and the buffer.
+---@param bufnr integer
+local function select_text_parent(bufnr)
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local anchor = vim.fn.getpos("v")
+  local start_row, start_col = anchor[2] - 1, anchor[3] - 1
+  local end_row, end_col = cursor[1] - 1, cursor[2]
+  if start_row > end_row or start_row == end_row and start_col > end_col then
+    start_row, start_col, end_row, end_col = end_row, end_col, start_row, start_col
+  end
+  if #cursor_stack == 0 then
+    cursor_stack[1] = { start_row = start_row, start_col = start_col, end_row = end_row, end_col = end_col }
+    selected_node_ranges[1] = false
+  end
+  local lines = vim.api.nvim_buf_get_lines(bufnr, 0, -1, false)
+  local function last_column(line, exclusive)
+    return exclusive > 0 and vim.fn.byteidx(line:sub(1, exclusive), vim.fn.strchars(line:sub(1, exclusive)) - 1) or 0
+  end
+  if start_row == end_row then
+    local line = lines[start_row + 1]
+    for _, pattern in ipairs({ [[\k\+]], [[\S\+]] }) do
+      local offset = 0
+      while offset < #line do
+        local match = vim.fn.matchstrpos(line, pattern, offset)
+        if match[2] < 0 then break end
+        if match[2] <= start_col and match[3] > end_col
+          and select_region(nil, start_row, match[2], end_row, last_column(line, match[3])) then return end
+        offset = match[3]
+      end
+    end
+  end
+  if select_region(nil, start_row, 0, end_row, last_column(lines[end_row + 1], #lines[end_row + 1])) then return end
+  local first, last = start_row, end_row
+  while first > 0 and lines[first]:find("%S") do first = first - 1 end
+  while last + 1 < #lines and lines[last + 2]:find("%S") do last = last + 1 end
+  if select_region(nil, first, 0, last, last_column(lines[last + 1], #lines[last + 1])) then return end
+  select_region(nil, 0, 0, #lines - 1, last_column(lines[#lines], #lines[#lines]))
+end
+
+---Expand syntax when available, retaining a text fallback for unsupported buffers.
+function select_parent()
+  local bufnr = vim.api.nvim_get_current_buf()
+  invalidate_if_changed(bufnr)
+  local window, cursor = vim.api.nvim_get_current_win(), vim.api.nvim_win_get_cursor(0)
+  local tick, anchor, mode = vim.b[bufnr].changedtick, vim.fn.getpos("v"), vim.api.nvim_get_mode().mode
+  local lang = vim.treesitter.language.get_lang(vim.bo[bufnr].filetype)
+  get_tree(bufnr, lang, function(tree)
+    if vim.api.nvim_get_current_win() ~= window or vim.api.nvim_get_current_buf() ~= bufnr
+      or vim.b[bufnr].changedtick ~= tick or vim.api.nvim_get_mode().mode ~= mode
+      or not vim.deep_equal(vim.api.nvim_win_get_cursor(0), cursor)
+      or not vim.deep_equal(vim.fn.getpos("v"), anchor) then return end
+    if tree then
+      local previous = #cursor_stack
+      select_syntax_parent(bufnr, tree, query_for(lang))
+      if #cursor_stack > previous then return end
+    end
+    select_text_parent(bufnr)
+  end)
+end
+
 function try_select_node(node, query, tree, bufnr)
-  print("try_select", node:type());
   local parent = node:parent();
   if not parent then
     -- At root
@@ -618,13 +647,12 @@ function select_region(node, start_row, start_col, end_row, end_col)
     end
   end
 
-  table.insert(selected_node_ranges, { node:range() })
+  table.insert(selected_node_ranges, node and { node:range() } or false)
 
   vim.api.nvim_buf_set_mark(0, '<', start_row + 1, start_col, {})
   vim.api.nvim_buf_set_mark(0, '>', end_row + 1, end_col, {})
   vim.cmd("normal! gvo")
 
-  last_was_expand = true
   table.insert(cursor_stack, {
     start_row = start_row,
     end_row   = end_row,
@@ -640,18 +668,15 @@ function undo_select_parent()
   invalidate_if_changed(bufnr)
 
   if #cursor_stack ~= 0 then
-    if last_was_expand then
-      last_was_expand = false
-      table.remove(cursor_stack)
-      table.remove(selected_node_ranges)
-    end
+    if #cursor_stack <= 1 then return end
+    table.remove(cursor_stack)
+    table.remove(selected_node_ranges)
 
     if #cursor_stack == 0 then
       return
     end
 
-    local cursor = table.remove(cursor_stack)
-    table.remove(selected_node_ranges)
+    local cursor = cursor_stack[#cursor_stack]
     vim.api.nvim_buf_set_mark(0, '<', cursor.start_row + 1, cursor.start_col, {})
     vim.api.nvim_buf_set_mark(0, '>', cursor.end_row + 1, cursor.end_col, {})
     vim.cmd("normal! gvo")

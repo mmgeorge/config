@@ -20,7 +20,7 @@ local function requester(params, callback)
     copied.document = params.document
     callback({ snapshot = copied, more = false })
   elseif params.operation == "act" then
-    if params.input.action == "open" then
+    if params.input.action == "open" or params.input.action == "browse" then
       delayed_open, open_input = callback, params.input
     elseif params.input.action == "save" then
       writes[#writes + 1] = params.input
@@ -44,6 +44,15 @@ assert(vim.wo.winbar == "%#WinBar# 󰈔 %*%#DropBarFileName#notifications%*", "n
 local buffer = require("forge.buffer")
 local _, row = state.replica.sequence:position("notification:9007199254740993")
 vim.api.nvim_win_set_cursor(0, { row + 1, 0 })
+vim.fn.maparg("b", "n", false, true).callback()
+assert(vim.wait(1000, function() return delayed_open ~= nil end, 5))
+assert(open_input.action == "browse", "notification b invoked a different action")
+local browse_effect = vim.deepcopy(open_input)
+browse_effect.id, browse_effect.kind = "captured-browse", "browse"
+delayed_open({ more = false, effect = browse_effect })
+assert(vim.wait(1000, function() return not state.pending and #state.queue == 0 end, 5))
+assert(opened_effect == 1, "notification b did not deliver its browser effect")
+opened_effect, delayed_open = 0, nil
 notifications.open_current()
 assert(vim.wait(1000, function() return delayed_open ~= nil end, 5))
 vim.api.nvim_win_set_cursor(0, { row + 2, 0 })

@@ -16,6 +16,7 @@ local function comment_fold()
 end
 review._set_runner_for_test(function(method, params, callback)
   if method == "review.open" then callback({ document = "comment-folds" })
+  elseif method == "github.actor" then callback({ login = "viewer" })
   elseif method == "review.header" then callback({ ready = true })
   elseif method == "review.view" then callback(vim.NIL)
   elseif method == "review.load" then complete_load = callback

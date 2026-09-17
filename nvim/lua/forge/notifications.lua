@@ -157,7 +157,12 @@ function M.open(options)
   state.open_effect = options.open_effect or function(effect, effect_window, is_current)
     if not is_current() then return end
     if effect.kind == "browse" or not effect.number or effect.number == vim.NIL then
-      if effect.url and effect.url ~= vim.NIL then vim.ui.open(effect.url) end
+      if type(effect.url) ~= "string" or effect.url == "" then
+        state.notice("This notification has no browser URL")
+        return
+      end
+      local _, failure = vim.ui.open(effect.url)
+      if failure then state.notice(tostring(failure)) end
     else
       vim.api.nvim_win_call(effect_window, function()
         if effect.subject_kind == "PullRequest" then

@@ -47,24 +47,27 @@ function source:get_completions(ctx, callback)
   local before_cursor = line:sub(1, cursor_col)
   local token_start = before_cursor:match(".*()@[%w_-]*$")
   local items = {}
+  local actor = vim.b.forge_reviewer_actor
 
   if token_start then
     for _, reviewer in ipairs(repo_cache.contributors(repo)) do
-      local label = "@" .. reviewer.login
-      items[#items + 1] = {
-        label = label,
-        filterText = label,
-        sortText = reviewer.login,
-        detail = reviewer.name and reviewer.name ~= "" and reviewer.name or repo,
-        kind = vim.lsp.protocol.CompletionItemKind.Text,
-        textEdit = {
-          newText = label,
-          range = {
-            start = { line = row, character = token_start - 1 },
-            ["end"] = { line = row, character = cursor_col },
+      if not vim.b.forge_reviewer_input or type(actor) == "string" and reviewer.login:lower() ~= actor:lower() then
+        local label = "@" .. reviewer.login
+        items[#items + 1] = {
+          label = label,
+          filterText = label,
+          sortText = reviewer.login,
+          detail = reviewer.name and reviewer.name ~= "" and reviewer.name or repo,
+          kind = vim.lsp.protocol.CompletionItemKind.Text,
+          textEdit = {
+            newText = label,
+            range = {
+              start = { line = row, character = token_start - 1 },
+              ["end"] = { line = row, character = cursor_col },
+            },
           },
-        },
-      }
+        }
+      end
     end
   end
 

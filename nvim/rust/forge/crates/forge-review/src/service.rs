@@ -792,13 +792,28 @@ impl ReviewService {
         self.spawn(async move {
             let _job = job;
             let result = async {
-                let fields = service.save_fields(&guard, false).await?;
+                let repository = guard
+                    .owner
+                    .document
+                    .lock()
+                    .expect("review document poisoned")
+                    .target
+                    .repository
+                    .clone();
+                let actor = guard.owner.remote.read_actor(repository).await?;
+                guard
+                    .owner
+                    .document
+                    .lock()
+                    .expect("review document poisoned")
+                    .validate_reviewers(&actor.login)?;
+                let fields = service.save_fields(&guard, false, &actor).await?;
                 if fields.snapshot.uncertain
                     || fields.remote.as_ref().is_some_and(|result| !result.ok)
                 {
                     return Ok(fields);
                 }
-                let mut reviewers = service.save_fields(&guard, true).await?;
+                let mut reviewers = service.save_fields(&guard, true, &actor).await?;
                 if reviewers.remote.is_none() {
                     reviewers.remote = fields.remote;
                 }
@@ -814,7 +829,12 @@ impl ReviewService {
     }
 
     /// Saves one field group through the durable mutation queue before admitting another group.
-    async fn save_fields(&self, guard: &RemoteGuard, reviewers: bool) -> Result<ReviewSaveResult> {
+    async fn save_fields(
+        &self,
+        guard: &RemoteGuard,
+        reviewers: bool,
+        actor: &forge_github::remote::RemoteActor,
+    ) -> Result<ReviewSaveResult> {
         use forge_github::recovery::RecoveryPhase;
         use forge_github::review_mutation::ReviewMutationRequest;
         let operation_id = uuid::Uuid::new_v4().to_string();
@@ -825,6 +845,9 @@ impl ReviewService {
                 .lock()
                 .expect("review document poisoned");
             let snapshot = document.snapshot()?;
+            if reviewers {
+                document.validate_reviewers(&actor.login)?;
+            }
             let sequence = snapshot
                 .field
                 .iter()
@@ -895,11 +918,6 @@ impl ReviewService {
                     .await?;
                 draft_published = true;
             }
-            let actor = guard
-                .owner
-                .remote
-                .read_actor(target.repository.clone())
-                .await?;
             dispatch_attempted = true;
             service
                 .github
@@ -909,7 +927,7 @@ impl ReviewService {
                         parent_node_id: Some(target.node_id.clone()),
                         resource: resource.clone(),
                         operation_id: operation_id.clone(),
-                        actor_node_id: actor.node_id,
+                        actor_node_id: actor.node_id.clone(),
                         edit_sequence: Some(sequence),
                         draft_target: Some("pr:fields".into()),
                         mutation,
@@ -1070,27 +1088,6 @@ impl ReviewService {
                         .is_none_or(|record| record.capture.operation_id == operation_id),
                     "PR recovery record belongs to another captured operation"
                 );
-                if let Some(record) = &recovery
-                    && matches!(
-                        record.state,
-                        forge_github::recovery::RecoveryPhase::DispatchPossible
-                            | forge_github::recovery::RecoveryPhase::OutcomeUnknown { .. }
-                    )
-                {
-                    recovery = Some(
-                        service
-                            .github
-                            .recovery_resolve(
-                                guard.owner.remote.clone(),
-                                resource.clone(),
-                                record.capture.operation_id.clone(),
-                                forge_github::review_mutation::RecoveryResolution::Link {
-                                    remote_id: target.number,
-                                },
-                            )
-                            .await?,
-                    );
-                }
                 let observed = if reviewers {
                     let page = guard
                         .owner
@@ -1149,12 +1146,47 @@ impl ReviewService {
                         .filter_map(|(name, text)| text.map(|text| (name.into(), text)))
                         .collect()
                 };
+                if let Some(record) = &recovery
+                    && matches!(
+                        record.state,
+                        forge_github::recovery::RecoveryPhase::DispatchPossible
+                            | forge_github::recovery::RecoveryPhase::OutcomeUnknown { .. }
+                    )
+                {
+                    let matches = guard
+                        .owner
+                        .document
+                        .lock()
+                        .expect("review document poisoned")
+                        .submitted_fields()
+                        .iter()
+                        .all(|(region, text)| observed.get(region) == Some(text));
+                    let resolution = if matches && !reviewers {
+                        forge_github::review_mutation::RecoveryResolution::Link {
+                            remote_id: resource.number,
+                        }
+                    } else {
+                        forge_github::review_mutation::RecoveryResolution::CloseUnknown
+                    };
+                    recovery = Some(
+                        service
+                            .github
+                            .recovery_resolve(
+                                guard.owner.remote.clone(),
+                                resource.clone(),
+                                record.capture.operation_id.clone(),
+                                resolution,
+                            )
+                            .await?,
+                    );
+                }
                 let _publication = guard.owner.publication.lock().await;
                 let record = recovery.context("captured PR recovery record is unavailable")?;
                 ensure!(
                     matches!(
                         record.state,
                         forge_github::recovery::RecoveryPhase::Confirmed { .. }
+                            | forge_github::recovery::RecoveryPhase::Rejected { .. }
                             | forge_github::recovery::RecoveryPhase::UserLinked { .. }
                             | forge_github::recovery::RecoveryPhase::UserClosedUnknown { .. }
                     ),
@@ -1167,9 +1199,10 @@ impl ReviewService {
                     .expect("review document poisoned")
                     .reconciled_draft(
                         &observed,
-                        !matches!(
+                        matches!(
                             record.state,
-                            forge_github::recovery::RecoveryPhase::UserClosedUnknown { .. }
+                            forge_github::recovery::RecoveryPhase::Confirmed { .. }
+                                | forge_github::recovery::RecoveryPhase::UserLinked { .. }
                         ),
                     )?;
                 service
