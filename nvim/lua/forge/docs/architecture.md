@@ -4099,7 +4099,7 @@ preserves bodies, metadata, project status, and comment source URLs. CLI issue c
 export an update timestamp, so the normalized updated_at remains empty, matching the former Lua
 representation. Complete timestamp validation and global allocation accounting remain open.
 
-GithubService.fetch_detail shares the two-job asynchronous admission bound with sync. The owned job
+GithubService.fetch_detail shares the sixteen-job asynchronous admission bound with sync and review reads. The owned job
 acquires a repository operation lease before reading remotely and retains it through detail
 persistence. Remote waits hold no database handle. Dropping a caller leaves admitted work owned.
 Shutdown cancels pending remote reads and drains retained jobs. Service repository admission is
@@ -4162,7 +4162,7 @@ fixture verifies full remote and persisted detail bodies above the single-frame 
 ## 79. Repository user metadata ownership
 
 The github.metadata route owns contributor and collaborator reads and metadata.json publication
-without initializing Harness. It uses the same two-job service admission bound as issue sync and
+without initializing Harness. It uses the same sixteen-job service admission bound as issue sync and
 detail fetches. Native commands share the existing four-request pool. Explicit hostname arguments
 select the API host independently of the checkout's default repository.
 
@@ -4699,6 +4699,18 @@ creation, receipt correlation, unchanged local identities, and exact saved-basel
 tests issue no live GitHub mutations. Inline creation, replies, pending reviews, full comment loading,
 persistent recovery, and the Lua comment consumer cutover remain open.
 
+
+## PR buffer loading
+
+Editable PR descriptions retain their exact Markdown source rows. Source-preserving Markdown metadata supplies links and structural formatting, and the shared Rust syntax engine supplies Markdown captures and fenced-language injections before publication. The review window conceals presentation markers outside the active cursor line. Accepted description edits request a fresh projection so removed fences and stale syntax decorations do not persist.
+
+Opening a PR retains the current buffer until its title, metadata, and description are ready. Initial loading reads overview, editable fields, and requested reviewers concurrently by repository and PR number. `review.header` consumes the retained overview and reviewer responses without repeating either request. The first visible native presentation contains the complete header and description, with normal heading highlights and dark gray `Loading...` rows in pending sections. Leaving the originating buffer before presentation prevents a late response from replacing the newer buffer.
+
+The Lua adapter retains up to eight PR documents and their native buffers for the Neovim session, keyed by workspace, hostname, repository, and PR number. Reopening a retained PR displays its existing text and loaded sections immediately, then refreshes header and secondary sections concurrently. Clean title, description, and requested-reviewer fields adopt remote changes. Local edits and pending saves remain intact. Explicit buffer deletion releases the retained document.
+
+Title, description, and requested reviewers have native editable regions. Cursor entry unlocks the selected region and restores native editing bindings. Unsaved fields display `*`. Both `<C-s>` and `:w` flush local edits before Rust saves title and description together, then applies reviewer additions and removals through the durable mutation queue. Confirmed captures update only their submitted baselines, so failures and newer edits retain their text and unsaved markers. The buffer enables the shared `@` username and `#` issue completion sources, with metadata refreshed at open and issue queries served from the local index.
+
+After the first presentation, `review.load` starts file, check, conversation, and commit reads concurrently in Rust. Lua requests one presentation refresh after the batch settles. Successful sections survive failures in other sections, and failed sections display diagnostics. The shared GitHub service admits at most sixteen remote jobs, independently of storage-worker admission. Native `gh` execution runs at most four subprocesses concurrently. Additional admitted requests wait asynchronously for native job and input-byte capacity, and shutdown wakes waiting requests with a closed-pool error. Section updates serialize against presentation capture without blocking editable-field acceptance during analysis.
 
 ## 98. Native batched-review ownership
 

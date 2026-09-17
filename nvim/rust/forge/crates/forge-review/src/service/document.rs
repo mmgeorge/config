@@ -36,6 +36,9 @@ impl std::ops::Deref for ReviewEditResult {
 
 #[derive(Debug, Serialize)]
 pub struct ReviewMaterialization {
+    pub field: Vec<crate::review::ReviewField>,
+    /// Durations in microseconds for the current presentation.
+    pub timing: std::collections::BTreeMap<&'static str, u64>,
     pub snapshot: BufferSnapshot,
     pub patch: Option<BufferPatch>,
 }
@@ -54,18 +57,20 @@ impl ReviewService {
         id: &DocumentId,
         width: WidthProfile,
     ) -> Result<ReviewMaterialization> {
+        let started = std::time::Instant::now();
         width.validate()?;
         let analysis = self
             .analysis
             .as_ref()
             .context("review analysis service is unavailable")?;
         let owner = self.owner(id)?;
+        let _section_projection = owner.section_projection.lock().await;
         let (
             identity,
             captured,
             region,
             section_revision,
-            section,
+            mut section,
             mut file,
             owner_width,
             repository,
@@ -141,6 +146,44 @@ impl ReviewService {
                 document.viewed_file.clone(),
             )
         };
+        for kind in [
+            super::ReviewSectionKind::Overview,
+            super::ReviewSectionKind::RequestedReviewers,
+            super::ReviewSectionKind::Files,
+            super::ReviewSectionKind::Checks,
+            super::ReviewSectionKind::Conversation,
+            super::ReviewSectionKind::Commits,
+        ] {
+            section.entry(kind).or_default();
+        }
+        let syntax_started = std::time::Instant::now();
+        let body_syntax = if let (Some(engine), Some(body)) = (
+            self.syntax.as_ref(),
+            region.iter().find(|field| field.region.0 == "body"),
+        ) {
+            Some(
+                engine
+                    .analyze(forge_diff::syntax::SyntaxRequest {
+                        source: forge_diff::source::SourceVersion::new(
+                            body.text.as_bytes().to_vec(),
+                            forge_diff::source::Representation::Raw,
+                        )?,
+                        language: forge_diff::syntax::SyntaxLanguage::Markdown,
+                        priority: WorkPriority::Visible,
+                        deadline: Some(
+                            std::time::Instant::now() + std::time::Duration::from_secs(10),
+                        ),
+                    })
+                    .await
+                    .map_err(|failure| {
+                        anyhow::anyhow!("PR description syntax analysis failed: {failure:?}")
+                    })?,
+            )
+        } else {
+            None
+        };
+        let syntax_us = syntax_started.elapsed().as_micros() as u64;
+        let analysis_started = std::time::Instant::now();
         let input_bytes = region.iter().map(|field| field.text.len()).sum::<usize>()
             + section.values().map(|state| state.bytes).sum::<usize>()
             + file
@@ -163,11 +206,30 @@ impl ReviewService {
             let result = (|| {
                 let mut block = Vec::with_capacity(region.len() * 2);
                 let mut description = Vec::new();
+                let mut reviewer_block = None;
                 let mut link = std::collections::BTreeMap::new();
                 let mut target = std::collections::BTreeMap::new();
                 for region in region {
                     let region_id = region.region.0.clone();
-                    let body_block = region_block(region, &width, &mut link)?;
+                    let mut body_block = region_block(region, &width, &mut link)?;
+                    if region_id == "body"
+                        && let Some(syntax) = &body_syntax
+                    {
+                        body_block.metadata.decoration.clear();
+                        for row in 0..body_block.text.row_count() {
+                            forge_diff::projection::append_source_syntax_row(
+                                &mut body_block.metadata,
+                                syntax,
+                                row,
+                                row,
+                                body_block.text.row(row).expect("description row"),
+                            )?;
+                        }
+                    }
+                    if region_id == "reviewers" {
+                        reviewer_block = Some(body_block);
+                        continue;
+                    }
                     let label_block = region_label(&region_id, &body_block)?;
                     if region_id == "body" {
                         description.push(label_block);
@@ -188,7 +250,19 @@ impl ReviewService {
                     .map(|(_, value)| format!("@{value}"))
                     .collect::<Vec<_>>()
                     .join(", ");
-                let reviewer = if reviewer.is_empty() {
+                let reviewer = if section
+                    .get(&super::ReviewSectionKind::RequestedReviewers)
+                    .is_some_and(|state| state.diagnostic.is_some())
+                {
+                    "Unavailable".to_owned()
+                } else if section
+                    .get(&super::ReviewSectionKind::RequestedReviewers)
+                    .is_some_and(|state| {
+                        !state.complete && state.item.is_empty() && state.diagnostic.is_none()
+                    })
+                {
+                    "Loading...".to_owned()
+                } else if reviewer.is_empty() {
                     reviewer
                 } else {
                     format!("◷ {}", reviewer.replace(", ", " "))
@@ -210,7 +284,13 @@ impl ReviewService {
                             .filter_map(|item| item.commit.as_ref())
                             .find(|commit| commit.sha == *head_sha)
                     })
-                    .cloned();
+                    .cloned()
+                    .or_else(|| {
+                        section
+                            .get(&super::ReviewSectionKind::Overview)
+                            .and_then(|state| state.item.first())
+                            .and_then(|item| item.commit.clone())
+                    });
                 let commit_activity = section
                     .get(&super::ReviewSectionKind::Commits)
                     .into_iter()
@@ -268,14 +348,30 @@ impl ReviewService {
                         continue;
                     }
                     if kind == super::ReviewSectionKind::Overview {
+                        if state.item.is_empty() {
+                            for name in ["Repo", "Head", "Release", "Review", "Status", "Activity"]
+                            {
+                                let value = if name == "Repo" {
+                                    repository.as_str()
+                                } else if state.diagnostic.is_some() {
+                                    "Unavailable"
+                                } else {
+                                    "Loading..."
+                                };
+                                block.push(metadata_block(
+                                    format!("overview:{name}"),
+                                    &format!("{name}: {value}"),
+                                )?);
+                            }
+                        }
                         for item in &state.item {
                             block.extend(overview_blocks(
                                 item,
                                 &repository,
                                 &reviewer,
+                                reviewer_block.as_ref(),
                                 head_commit.as_ref(),
                                 &commit_activity,
-                                &width,
                                 &mut target,
                             )?);
                         }
@@ -336,6 +432,9 @@ impl ReviewService {
                         empty.metadata.decoration[0].capture = "ForgeStatusDate".into();
                         block.push(empty);
                     }
+                    if !state.complete && state.item.is_empty() && state.diagnostic.is_none() {
+                        block.push(title_block(format!("{prefix}:loading"), "Loading...")?);
+                    }
                     if let Some(diagnostic) = state.diagnostic {
                         block.push(render_markdown(
                             BlockId(format!("{prefix}:diagnostic")),
@@ -354,6 +453,7 @@ impl ReviewService {
                     } else {
                         None
                     };
+                    let has_items = !state.item.is_empty();
                     for item in state.item {
                         use std::hash::{Hash, Hasher};
                         let mut hash = std::hash::DefaultHasher::new();
@@ -466,11 +566,7 @@ impl ReviewService {
                                 .map(|(label, value)| format!("{label}: {value}"))
                                 .collect::<Vec<_>>()
                                 .join("\n");
-                            block.push(metadata_block(
-                                format!("{identity}:detail"),
-                                &detail,
-                                &width,
-                            )?);
+                            block.push(metadata_block(format!("{identity}:detail"), &detail)?);
                         }
                         if let Some(body) = &item.body {
                             block.push(render_markdown(
@@ -534,11 +630,11 @@ impl ReviewService {
                             );
                         }
                     }
-                    if state.loading || !state.complete {
-                        let status = if kind == super::ReviewSectionKind::Checks {
-                            "...loading checks..."
-                        } else if state.loading {
-                            "Loading"
+                    if (state.loading || !state.complete)
+                        && (has_items || state.next_cursor.is_some())
+                    {
+                        let status = if kind == super::ReviewSectionKind::Checks || state.loading {
+                            "Loading..."
                         } else {
                             "Additional records are available"
                         };
@@ -548,13 +644,13 @@ impl ReviewService {
                             &width,
                             &mut link,
                         )?;
-                        if kind == super::ReviewSectionKind::Checks {
+                        if kind == super::ReviewSectionKind::Checks || state.loading {
                             completion.metadata.decoration = vec![Decoration {
                                 range: TextRange {
                                     start: TextPosition { row: 0, column: 0 },
                                     end: TextPosition { row: 1, column: 0 },
                                 },
-                                capture: "ForgeStatusFetching".into(),
+                                capture: "ForgeLoading".into(),
                                 priority: 200,
                             }];
                         }
@@ -569,7 +665,11 @@ impl ReviewService {
                             &mut block[section_start],
                             format!("review:{prefix}"),
                             &endpoint,
-                            kind == super::ReviewSectionKind::Commits,
+                            matches!(
+                                kind,
+                                super::ReviewSectionKind::Commits
+                                    | super::ReviewSectionKind::Conversation
+                            ),
                         );
                     }
                 }
@@ -602,6 +702,8 @@ impl ReviewService {
             .context("review analysis ended without a result");
         ticket.completed().await;
         let (block, link, target) = completed??;
+        let analysis_us = analysis_started.elapsed().as_micros() as u64;
+        let publication_started = std::time::Instant::now();
         let _publication = owner.publication.lock().await;
         let mut document = owner.document.lock().expect("review document poisoned");
         ensure!(
@@ -632,6 +734,20 @@ impl ReviewService {
             };
         }
         Ok(ReviewMaterialization {
+            field: document.snapshot()?.field,
+            timing: std::collections::BTreeMap::from([
+                (
+                    "capture_us",
+                    syntax_started.duration_since(started).as_micros() as u64,
+                ),
+                ("syntax_us", syntax_us),
+                ("analysis_us", analysis_us),
+                (
+                    "publication_us",
+                    publication_started.elapsed().as_micros() as u64,
+                ),
+                ("total_us", started.elapsed().as_micros() as u64),
+            ]),
             snapshot: document
                 .projection
                 .as_ref()
@@ -792,11 +908,24 @@ fn region_block(
             link,
         );
     }
-    link.insert(BlockId(format!("region:{}", region.region.0)), Vec::new());
-    let text = BufferText::from_rows(region.text.split('\n'))?;
+    let identity = BlockId(format!("region:{}", region.region.0));
+    let (text, mut metadata) = if matches!(region.region.0.as_str(), "title" | "reviewers") {
+        link.insert(identity, Vec::new());
+        (
+            BufferText::from_rows(region.text.split('\n'))?,
+            BlockMetadata::default(),
+        )
+    } else {
+        let rendered = forge_buffer::markdown::MarkdownRenderer::source(
+            identity.clone(),
+            &region.text,
+            width,
+        )?;
+        link.insert(identity, rendered.link);
+        (rendered.block.text, rendered.block.metadata)
+    };
     let end_row = text.row_count() - 1;
-    let mut metadata = BlockMetadata::default();
-    if region.region.0 == "title" {
+    if matches!(region.region.0.as_str(), "title" | "reviewers") {
         metadata.decoration.push(Decoration {
             range: TextRange {
                 start: TextPosition { row: 0, column: 0 },
@@ -805,13 +934,23 @@ fn region_block(
                     column: text.row(0).expect("title row").len(),
                 },
             },
-            capture: "ForgeStatusPath".into(),
+            capture: if region.region.0 == "title" {
+                "ForgeStatusPath"
+            } else {
+                "ForgeReviewPending"
+            }
+            .into(),
             priority: 100,
         });
         metadata.gutter.push(Gutter {
             position: TextPosition { row: 0, column: 0 },
             chunk: vec![TextChunk {
-                text: "Title:  ".into(),
+                text: if region.region.0 == "title" {
+                    "Title:  "
+                } else {
+                    "Review: "
+                }
+                .into(),
                 capture: "ForgeStatusLabel".into(),
             }],
             priority: 110,
@@ -1364,7 +1503,7 @@ fn review_preview(body: &str) -> String {
         .join(" ")
 }
 
-fn metadata_block(identity: String, detail: &str, width: &WidthProfile) -> Result<BufferBlock> {
+fn metadata_block(identity: String, detail: &str) -> Result<BufferBlock> {
     let mut rows = Vec::new();
     let mut decoration = Vec::new();
     for detail in detail.lines() {
@@ -1387,35 +1526,30 @@ fn metadata_block(identity: String, detail: &str, width: &WidthProfile) -> Resul
         let prefix = format!("{label}:");
         let padding = 8.max(prefix.len() + 1);
         let text = format!("{prefix:padding$}{value}");
-        let wrapped = width.wrap_plain(&text, padding.min(width.columns.saturating_sub(1)))?;
-        for (offset, line) in wrapped.into_iter().enumerate() {
-            let row = rows.len();
-            decoration.push(Decoration {
-                range: TextRange {
-                    start: TextPosition { row, column: 0 },
-                    end: TextPosition {
-                        row,
-                        column: line.len(),
-                    },
+        let row = rows.len();
+        decoration.push(Decoration {
+            range: TextRange {
+                start: TextPosition { row, column: 0 },
+                end: TextPosition {
+                    row,
+                    column: text.len(),
                 },
-                capture: capture.into(),
-                priority: 90,
-            });
-            if offset == 0 && prefix.len() <= line.len() {
-                decoration.push(Decoration {
-                    range: TextRange {
-                        start: TextPosition { row, column: 0 },
-                        end: TextPosition {
-                            row,
-                            column: prefix.len(),
-                        },
-                    },
-                    capture: "ForgeStatusLabel".into(),
-                    priority: 110,
-                });
-            }
-            rows.push(line);
-        }
+            },
+            capture: capture.into(),
+            priority: 90,
+        });
+        decoration.push(Decoration {
+            range: TextRange {
+                start: TextPosition { row, column: 0 },
+                end: TextPosition {
+                    row,
+                    column: prefix.len(),
+                },
+            },
+            capture: "ForgeStatusLabel".into(),
+            priority: 110,
+        });
+        rows.push(text);
     }
     Ok(BufferBlock {
         id: BlockId(identity),
@@ -1446,7 +1580,12 @@ fn title_block(identity: String, title: &str) -> Result<BufferBlock> {
                     start: TextPosition { row: 0, column: 0 },
                     end: TextPosition { row: 1, column: 0 },
                 },
-                capture: "ForgeStatusHeader".into(),
+                capture: if title == "Loading..." {
+                    "ForgeLoading"
+                } else {
+                    "ForgeStatusHeader"
+                }
+                .into(),
                 priority: 100,
             }],
             ..BlockMetadata::default()
@@ -1488,9 +1627,9 @@ fn overview_blocks(
     item: &super::ReviewSectionItem,
     repository: &str,
     reviewer: &str,
+    reviewer_block: Option<&BufferBlock>,
     head_commit: Option<&super::ReviewCommitPresentation>,
     commit_activity: &[String],
-    width: &WidthProfile,
     target: &mut std::collections::BTreeMap<TargetId, super::thread_projection::ReviewTarget>,
 ) -> Result<Vec<BufferBlock>> {
     let detail = |name: &str| {
@@ -1506,7 +1645,6 @@ fn overview_blocks(
     } else {
         detail("State").to_uppercase()
     };
-    let url = item.url.as_deref().unwrap_or("");
     let milestone = detail("Milestone");
     let release = if milestone.is_empty() {
         String::new()
@@ -1522,7 +1660,6 @@ fn overview_blocks(
     for (name, value, capture) in [
         ("Repo", repository, "ForgeStatusRemote"),
         ("Head", head, "ForgeStatusObjectId"),
-        ("URL", url, "ForgeStatusPR"),
         ("Release", release.as_str(), "ForgeStatusBranch"),
         ("Review", reviewer, "ForgeReviewPending"),
         (
@@ -1536,6 +1673,12 @@ fn overview_blocks(
         ),
         ("Activity", activity.as_str(), "ForgeStatusDate"),
     ] {
+        if name == "Review"
+            && let Some(reviewer) = reviewer_block
+        {
+            block.push(reviewer.clone());
+            continue;
+        }
         if name == "Head" {
             if let Some(commit) = head_commit {
                 block.push(head_overview_block(commit, detail("Head"))?);
@@ -1543,7 +1686,7 @@ fn overview_blocks(
             }
         }
         let text = format!("{name}: {value}");
-        let mut row = metadata_block(format!("overview:{name}"), &text, width)?;
+        let mut row = metadata_block(format!("overview:{name}"), &text)?;
         for decoration in &mut row.metadata.decoration {
             if decoration.priority == 90 {
                 decoration.capture = capture.into();
@@ -1553,9 +1696,6 @@ fn overview_blocks(
             }
         }
         let action = match name {
-            "URL" if !url.is_empty() => {
-                Some(super::thread_projection::ReviewTarget::Browser { url: url.into() })
-            }
             "Status" => Some(super::thread_projection::ReviewTarget::Lifecycle {
                 available: available_lifecycle(&item.detail),
             }),
@@ -1580,96 +1720,71 @@ fn overview_blocks(
     Ok(block)
 }
 
+/// Caps the complete commit summary and maps its highlights onto indented physical rows.
 fn head_overview_block(
     commit: &super::ReviewCommitPresentation,
     branch: &str,
 ) -> Result<BufferBlock> {
     let sha = commit.sha.get(..7).unwrap_or(&commit.sha);
     let date = crate::presentation_time::relative(&commit.committed_at);
-    let text = format!("Head:   {sha} {date} {branch} {}", commit.headline);
+    let mut summary = format!("{sha} {date} {branch} {}", commit.headline);
+    let truncated = summary.chars().count() > 100;
+    if truncated {
+        summary.truncate(summary.char_indices().nth(99).expect("long summary").0);
+    }
+    let content_end = "Head:   ".len() + summary.len();
+    if truncated {
+        summary.push('…');
+    }
+    let text = format!("Head:   {summary}");
     let sha_start = "Head:   ".len();
     let date_start = sha_start + sha.len() + 1;
     let branch_start = date_start + date.len() + 1;
     let headline_start = branch_start + branch.len() + 1;
-    let conventional_type_end = conventional_type_end(&commit.headline);
+    let mut spans = vec![
+        (0, "Head:".len(), "ForgeStatusLabel", 110),
+        (sha_start, sha_start + sha.len(), "ForgeStatusObjectId", 110),
+        (date_start, date_start + date.len(), "ForgeStatusDate", 110),
+        (
+            branch_start,
+            branch_start + branch.len(),
+            "ForgeStatusBranch",
+            110,
+        ),
+    ];
+    if let Some(type_end) = conventional_type_end(&commit.headline) {
+        spans.push((
+            headline_start,
+            headline_start + type_end,
+            "ForgeStatusCommitType",
+            120,
+        ));
+    }
+    let decoration = spans
+        .into_iter()
+        .filter_map(|(start, end, capture, priority)| {
+            let end = end.min(content_end);
+            (start < end).then(|| Decoration {
+                range: TextRange {
+                    start: TextPosition {
+                        row: 0,
+                        column: start,
+                    },
+                    end: TextPosition {
+                        row: 0,
+                        column: end,
+                    },
+                },
+                capture: capture.into(),
+                priority,
+            })
+        })
+        .collect();
     Ok(BufferBlock {
         id: BlockId("overview:Head".into()),
-        text: BufferText::from_rows([text.clone()])?,
+        text: BufferText::from_rows([text])?,
         metadata: BlockMetadata {
-            decoration: {
-                let mut decoration = vec![
-                    Decoration {
-                        range: TextRange {
-                            start: TextPosition { row: 0, column: 0 },
-                            end: TextPosition {
-                                row: 0,
-                                column: "Head:".len(),
-                            },
-                        },
-                        capture: "ForgeStatusLabel".into(),
-                        priority: 110,
-                    },
-                    Decoration {
-                        range: TextRange {
-                            start: TextPosition {
-                                row: 0,
-                                column: sha_start,
-                            },
-                            end: TextPosition {
-                                row: 0,
-                                column: sha_start + sha.len(),
-                            },
-                        },
-                        capture: "ForgeStatusObjectId".into(),
-                        priority: 110,
-                    },
-                    Decoration {
-                        range: TextRange {
-                            start: TextPosition {
-                                row: 0,
-                                column: date_start,
-                            },
-                            end: TextPosition {
-                                row: 0,
-                                column: date_start + date.len(),
-                            },
-                        },
-                        capture: "ForgeStatusDate".into(),
-                        priority: 110,
-                    },
-                    Decoration {
-                        range: TextRange {
-                            start: TextPosition {
-                                row: 0,
-                                column: branch_start,
-                            },
-                            end: TextPosition {
-                                row: 0,
-                                column: branch_start + branch.len(),
-                            },
-                        },
-                        capture: "ForgeStatusBranch".into(),
-                        priority: 110,
-                    },
-                ];
-                if let Some(type_end) = conventional_type_end {
-                    decoration.push(Decoration {
-                        range: TextRange {
-                            start: TextPosition {
-                                row: 0,
-                                column: headline_start,
-                            },
-                            end: TextPosition {
-                                row: 0,
-                                column: headline_start + type_end,
-                            },
-                        },
-                        capture: "ForgeStatusCommitType".into(),
-                        priority: 120,
-                    });
-                }
-                decoration
-            },
+            decoration,
             ..Default::default()
         },
     })
@@ -1732,4 +1847,62 @@ fn render_markdown(
         forge_buffer::markdown::MarkdownRenderer::render(identity.clone(), source, width)?;
     link.insert(identity, rendered.link);
     Ok(rendered.block)
+}
+
+#[cfg(test)]
+mod header_tests {
+    use super::*;
+
+    #[test]
+    fn head_summary_caps_the_whole_value_in_one_native_line() {
+        let commit = super::super::ReviewCommitPresentation {
+            sha: "a".repeat(40),
+            committed_at: "1 day ago".into(),
+            headline: format!("refactor: {}", "界 change ".repeat(30)),
+        };
+        for branch in ["origin/feature".to_owned(), "branch-é".repeat(30)] {
+            let block = head_overview_block(&commit, &branch).unwrap();
+            let rows = block.text.wire_rows();
+            assert_eq!(rows.len(), 1);
+            let value = &rows[0][8..];
+            let original = format!("aaaaaaa 1 day ago {branch} {}", commit.headline);
+            assert_eq!(
+                value,
+                format!("{}…", original.chars().take(99).collect::<String>())
+            );
+            assert_eq!(value.chars().count(), 100);
+            for decoration in &block.metadata.decoration {
+                let range = &decoration.range;
+                assert_eq!(range.start.row, 0);
+                assert_eq!(range.end.row, 0);
+                assert!(range.start.column < range.end.column && range.end.column <= rows[0].len());
+                assert!(
+                    rows[0].is_char_boundary(range.start.column)
+                        && rows[0].is_char_boundary(range.end.column)
+                );
+            }
+            if branch == "origin/feature" {
+                let span = block
+                    .metadata
+                    .decoration
+                    .iter()
+                    .find(|span| span.capture == "ForgeStatusCommitType")
+                    .unwrap();
+                assert_eq!(
+                    &rows[0][span.range.start.column..span.range.end.column],
+                    "refactor"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn metadata_keeps_long_values_on_their_native_lines() {
+        let detail = format!("Repo: {}\nStatus: DRAFT", "long-name/".repeat(20));
+        let block = metadata_block("overview:test".into(), &detail).unwrap();
+        let rows = block.text.wire_rows();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0], format!("Repo:   {}", "long-name/".repeat(20)));
+        assert_eq!(rows[1], "Status: DRAFT");
+    }
 }

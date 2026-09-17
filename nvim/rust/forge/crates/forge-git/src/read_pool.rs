@@ -130,6 +130,38 @@ impl BlockingReadPool {
         input_bytes: usize,
         work: impl FnOnce(ReadCancellation) -> Result<Output> + Send + 'static,
     ) -> std::result::Result<ReadTask<Output>, ReadAdmissionError> {
+        self.submit_retained(input_bytes, &mut Some(work))
+    }
+
+    /// Waits for native job and byte capacity without blocking the executor.
+    /// Callers bound queued inputs. Dropping this future before admission discards its work.
+    pub async fn submit_wait<Output: Send + 'static>(
+        &self,
+        input_bytes: usize,
+        work: impl FnOnce(ReadCancellation) -> Result<Output> + Send + 'static,
+    ) -> std::result::Result<ReadTask<Output>, ReadAdmissionError> {
+        let mut changed = self.shared.changed.subscribe();
+        let mut work = Some(work);
+        loop {
+            changed.borrow_and_update();
+            match self.submit_retained(input_bytes, &mut work) {
+                Err(ReadAdmissionError::Busy) => {
+                    changed
+                        .changed()
+                        .await
+                        .map_err(|_| ReadAdmissionError::Closed)?;
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// Consumes retained work only after reserving native capacity.
+    fn submit_retained<Output: Send + 'static>(
+        &self,
+        input_bytes: usize,
+        work: &mut Option<impl FnOnce(ReadCancellation) -> Result<Output> + Send + 'static>,
+    ) -> std::result::Result<ReadTask<Output>, ReadAdmissionError> {
         let runtime =
             tokio::runtime::Handle::try_current().map_err(|_| ReadAdmissionError::NoRuntime)?;
         let cancellation = ReadCancellation {
@@ -167,6 +199,7 @@ impl BlockingReadPool {
             id,
             input_bytes,
         };
+        let work = work.take().expect("admitted repository read work");
         let worker_cancellation = cancellation.clone();
         let handle = runtime.spawn_blocking(move || {
             let result = (move || {
@@ -233,6 +266,7 @@ impl PoolShared {
     fn close(&self) {
         let mut state = self.state.lock().expect("repository read state lock");
         state.closed = true;
+        self.changed.send_replace(state.active.len());
         for cancellation in state.active.values() {
             cancellation.requested.store(true, Ordering::Release);
         }
@@ -297,6 +331,75 @@ mod tests {
         })
         .await
         .unwrap();
+    }
+
+    #[tokio::test]
+    async fn waiting_reads_resume_after_collection_and_shutdown_wakes_waiters() {
+        let pool = BlockingReadPool::new(1, 8).unwrap();
+        let first = pool.submit(8, |_| Ok(())).unwrap();
+        wait_for_native_completion(&first).await;
+        let waiting = pool.submit_wait(8, |_| Ok("second"));
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        first.finish().await.unwrap();
+        let second = tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(second.finish().await.unwrap(), "second");
+        let held = pool.submit(8, |_| Ok(())).unwrap();
+        let waiting = pool.submit_wait(1, |_| Ok(()));
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+        pool.shutdown(Duration::ZERO).await;
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(1), &mut waiting)
+                .await
+                .unwrap()
+                .err(),
+            Some(ReadAdmissionError::Closed)
+        );
+        drop(held);
+    }
+
+    #[tokio::test]
+    async fn concurrent_read_bursts_wait_without_exceeding_native_capacity() {
+        let pool = Arc::new(BlockingReadPool::new(4, 32).unwrap());
+        let mut jobs = tokio::task::JoinSet::new();
+        for index in 0..16 {
+            let pool = pool.clone();
+            jobs.spawn(async move {
+                let task = pool
+                    .submit_wait(8, move |_| {
+                        std::thread::sleep(Duration::from_millis(5));
+                        Ok(index)
+                    })
+                    .await
+                    .unwrap();
+                let status = pool.status();
+                assert!(status.active_jobs <= 4 && status.reserved_input_bytes <= 32);
+                task.finish().await.unwrap()
+            });
+        }
+        let mut completed = Vec::new();
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while let Some(result) = jobs.join_next().await {
+                completed.push(result.unwrap());
+            }
+        })
+        .await
+        .unwrap();
+        completed.sort();
+        assert_eq!(completed, (0..16).collect::<Vec<_>>());
+        assert_eq!(pool.status().active_jobs, 0);
     }
 
     #[tokio::test]

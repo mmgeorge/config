@@ -42,7 +42,7 @@ pub struct ReviewSectionItem {
     pub thread: Option<Arc<super::thread::ReviewThread>>,
 }
 
-#[derive(Clone, Debug, Serialize, PartialEq, Eq)]
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct ReviewCommitPresentation {
     pub sha: String,
     pub headline: String,
@@ -81,6 +81,8 @@ pub struct ReviewFileSource {
 
 #[derive(Clone, Debug, Default, Serialize)]
 pub struct ReviewSectionState {
+    /// Durations in microseconds for the latest section request.
+    pub timing: std::collections::BTreeMap<&'static str, u64>,
     pub item: Vec<Arc<ReviewSectionItem>>,
     pub next_cursor: Option<String>,
     pub complete: bool,
@@ -157,6 +159,7 @@ impl ReviewSectionState {
         viewed_file: &std::collections::BTreeSet<String>,
     ) -> (Self, Self) {
         let Self {
+            timing,
             item,
             next_cursor,
             complete,
@@ -171,6 +174,7 @@ impl ReviewSectionState {
                 .is_some_and(|source| viewed_file.contains(&source.path))
         });
         let viewed = Self {
+            timing: timing.clone(),
             item: viewed_item,
             next_cursor: None,
             complete: true,
@@ -180,6 +184,7 @@ impl ReviewSectionState {
             charge: None,
         };
         let unviewed = Self {
+            timing,
             item: unviewed_item,
             next_cursor,
             complete,
@@ -193,6 +198,77 @@ impl ReviewSectionState {
 }
 
 impl ReviewService {
+    /// Returns bounded phase timings without section content.
+    pub fn section_timings(
+        &self,
+        id: &DocumentId,
+    ) -> Result<std::collections::BTreeMap<String, std::collections::BTreeMap<&'static str, u64>>>
+    {
+        let owner = self.owner(id)?;
+        let document = owner.document.lock().expect("review document poisoned");
+        Ok(document
+            .section
+            .iter()
+            .map(|(kind, state)| (format!("{kind:?}"), state.timing.clone()))
+            .collect())
+    }
+
+    /// Loads required header metadata before the first visible presentation.
+    pub async fn header(
+        &self,
+        id: &DocumentId,
+        directory: PathBuf,
+        remote: Arc<dyn GithubReviewRemote>,
+    ) -> Result<()> {
+        let (overview, reviewer) = tokio::join!(
+            self.read_section(
+                id,
+                directory.clone(),
+                remote.clone(),
+                ReviewSectionKind::Overview,
+                None
+            ),
+            self.read_section(
+                id,
+                directory,
+                remote,
+                ReviewSectionKind::RequestedReviewers,
+                None
+            ),
+        );
+        let overview = overview?;
+        ensure!(
+            overview.complete && overview.item.len() == 1,
+            "PR header requires one complete overview"
+        );
+        ensure!(
+            reviewer?.complete,
+            "PR header reviewer metadata is incomplete"
+        );
+        Ok(())
+    }
+
+    /// Loads independent overview sections concurrently and retains each successful result.
+    pub async fn load(
+        &self,
+        id: &DocumentId,
+        directory: PathBuf,
+        remote: Arc<dyn GithubReviewRemote>,
+    ) -> Vec<String> {
+        let read =
+            |section| self.read_section(id, directory.clone(), remote.clone(), section, None);
+        let (file, check, conversation, commit) = tokio::join!(
+            read(ReviewSectionKind::Files),
+            read(ReviewSectionKind::Checks),
+            read(ReviewSectionKind::Conversation),
+            read(ReviewSectionKind::Commits),
+        );
+        [file, check, conversation, commit]
+            .into_iter()
+            .filter_map(|result| result.err().map(|failure| failure.to_string()))
+            .collect()
+    }
+
     pub async fn read_section(
         &self,
         id: &DocumentId,
@@ -201,6 +277,7 @@ impl ReviewService {
         section: ReviewSectionKind,
         cursor: Option<String>,
     ) -> Result<ReviewSectionState> {
+        let started = std::time::Instant::now();
         let owner = self.owner(id)?;
         owner.validate_directory(&directory)?;
         let analysis = self
@@ -213,6 +290,7 @@ impl ReviewService {
             .try_acquire_owned()
             .context("review section admission is full")?;
         let (request, parent_node) = {
+            let _section_projection = owner.section_projection.lock().await;
             let mut document = owner.document.lock().expect("review document poisoned");
             document.section_revision = document
                 .section_revision
@@ -243,7 +321,27 @@ impl ReviewService {
         let spawned = self.spawn(async move {
             let _admission = admission;
             let number = request.number;
-            let observed = service.github.review_page(directory, remote, request).await;
+            let remote_started = std::time::Instant::now();
+            let initial = owner
+                .initial_page
+                .lock()
+                .expect("review initial page poisoned")
+                .remove(&section);
+            let refresh_fields = section == ReviewSectionKind::Overview
+                && (initial.is_none()
+                    || owner
+                        .document
+                        .lock()
+                        .expect("review document poisoned")
+                        .section
+                        .get(&section)
+                        .is_some_and(|state| !state.item.is_empty()));
+            let observed = match initial {
+                Some(page) => Ok(page),
+                None => service.github.review_page(directory, remote, request).await,
+            };
+            let remote_us = remote_started.elapsed().as_micros() as u64;
+            let analysis_started = std::time::Instant::now();
             let observed = async {
                 let page = observed?;
                 ensure!(
@@ -271,6 +369,23 @@ impl ReviewService {
                             bytes <= MAX_SECTION_BYTES,
                             "review section page exceeds its byte limit"
                         );
+                        let fields = if refresh_fields {
+                            page.records
+                                .first()
+                                .map(|record| forge_github::pull_request::PullRequestEdit {
+                                    title: record
+                                        .get("title")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                    body: record
+                                        .get("body")
+                                        .and_then(Value::as_str)
+                                        .map(str::to_owned),
+                                })
+                                .filter(|text| text.title.is_some() || text.body.is_some())
+                        } else {
+                            None
+                        };
                         let item = page
                             .records
                             .into_iter()
@@ -278,7 +393,13 @@ impl ReviewService {
                                 normalize(section, record, number, &parent_node).map(Arc::new)
                             })
                             .collect::<Result<Vec<_>>>()?;
-                        Ok::<_, anyhow::Error>((item, bytes, page.next_cursor, page.complete))
+                        Ok::<_, anyhow::Error>((
+                            item,
+                            bytes,
+                            page.next_cursor,
+                            page.complete,
+                            fields,
+                        ))
                     })();
                     let _ = sender.send(result);
                 });
@@ -289,6 +410,22 @@ impl ReviewService {
                 result?
             }
             .await;
+            let analysis_us = analysis_started.elapsed().as_micros() as u64;
+            let publication_started = std::time::Instant::now();
+            let _section_projection = owner.section_projection.lock().await;
+            let timing = std::collections::BTreeMap::from([
+                (
+                    "admission_us",
+                    remote_started.duration_since(started).as_micros() as u64,
+                ),
+                ("remote_us", remote_us),
+                ("analysis_us", analysis_us),
+                (
+                    "publication_wait_us",
+                    publication_started.elapsed().as_micros() as u64,
+                ),
+                ("total_us", started.elapsed().as_micros() as u64),
+            ]);
             let result = (|| {
                 let mut document = owner.document.lock().expect("review document poisoned");
                 document.section_revision = document
@@ -296,7 +433,7 @@ impl ReviewService {
                     .checked_add(1)
                     .context("review section revision exhausted")?;
                 let outcome = (|| {
-                    let (item, page_bytes, next_cursor, complete) = observed?;
+                    let (item, page_bytes, next_cursor, complete, fields) = observed?;
                     let previous = document.section.get(&section).expect("admitted section");
                     let mut candidate = if cursor.is_some() {
                         previous.clone()
@@ -334,11 +471,23 @@ impl ReviewService {
                     candidate.next_cursor = next_cursor;
                     candidate.complete = complete;
                     candidate.loading = false;
+                    candidate.timing = timing.clone();
                     candidate.diagnostic = None;
                     candidate.charge = Some(SectionCharge::reserve(
                         service.section_bytes.clone(),
                         candidate.bytes,
                     )?);
+                    if section == ReviewSectionKind::RequestedReviewers && complete {
+                        let detail = candidate
+                            .item
+                            .iter()
+                            .flat_map(|item| item.detail.clone())
+                            .collect::<Vec<_>>();
+                        document.refresh_reviewers(&detail)?;
+                    }
+                    if let Some(fields) = fields {
+                        document.refresh_fields(fields)?;
+                    }
                     Ok::<_, anyhow::Error>(candidate)
                 })();
                 match outcome {
@@ -352,6 +501,7 @@ impl ReviewService {
                             .get_mut(&section)
                             .expect("admitted section");
                         state.loading = false;
+                        state.timing = timing;
                         state.diagnostic = Some(failure.to_string());
                         Err(failure)
                     }
@@ -419,10 +569,14 @@ fn normalize(
     match kind {
         ReviewSectionKind::Overview => {
             ensure!(
-                record.get("number").and_then(Value::as_u64) == Some(number)
-                    && record.get("node_id").and_then(Value::as_str) == Some(node_id),
+                record.get("number").and_then(Value::as_u64) == Some(number),
                 "PR section identity changed"
             );
+            item.commit = record
+                .get("head_commit")
+                .filter(|value| !value.is_null())
+                .map(|value| serde_json::from_value(value.clone()))
+                .transpose()?;
             item.identity = node_id.into();
             required(&record, "title")?;
             item.title = format!("PR #{number}");

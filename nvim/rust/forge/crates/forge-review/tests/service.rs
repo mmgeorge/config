@@ -18,6 +18,7 @@ use forge_review::service::ReviewService;
 use tokio::sync::Semaphore;
 
 struct TestRemote {
+    section_barrier: Mutex<Option<Arc<tokio::sync::Barrier>>>,
     source_content: Mutex<Option<(Vec<u8>, Vec<u8>)>>,
     source_request: Mutex<Vec<forge_github::review_source::ReviewSourceRequest>>,
     section_page: Mutex<std::collections::VecDeque<forge_github::review_api::ReviewPage>>,
@@ -28,6 +29,7 @@ struct TestRemote {
     creation: Mutex<Vec<ConversationCommentCreation>>,
     inline_creation: Mutex<Vec<forge_github::review_mutation::ReviewMutation>>,
     submission: Mutex<Vec<forge_github::review_mutation::ReviewMutationRequest>>,
+    reviewer_writes: Mutex<Vec<forge_github::review_mutation::ReviewMutation>>,
     writes: Mutex<Vec<PullRequestMutation>>,
     entered: Semaphore,
     release: Semaphore,
@@ -125,6 +127,7 @@ impl GithubRemote for TestRemote {
 
 fn remote() -> Arc<TestRemote> {
     Arc::new(TestRemote {
+        section_barrier: Mutex::new(None),
         source_content: Mutex::new(None),
         source_request: Mutex::new(Vec::new()),
         section_page: Mutex::new(std::collections::VecDeque::new()),
@@ -134,6 +137,7 @@ fn remote() -> Arc<TestRemote> {
         creation: Mutex::new(Vec::new()),
         inline_creation: Mutex::new(Vec::new()),
         submission: Mutex::new(Vec::new()),
+        reviewer_writes: Mutex::new(Vec::new()),
         state: Mutex::new(PullRequestState {
             node_id: "PR_test".into(),
             number: 7,
@@ -212,7 +216,7 @@ impl forge_github::review_api::GithubReviewRemote for TestRemote {
     }
     fn read_review(
         &self,
-        _: forge_github::review_api::ReviewReadRequest,
+        request: forge_github::review_api::ReviewReadRequest,
     ) -> Pin<
         Box<
             dyn Future<Output = Result<forge_github::review_api::ReviewPage, RemoteFailure>>
@@ -220,17 +224,203 @@ impl forge_github::review_api::GithubReviewRemote for TestRemote {
                 + '_,
         >,
     > {
-        Box::pin(async {
-            self.section_page
-                .lock()
-                .unwrap()
-                .pop_front()
-                .ok_or(RemoteFailure {
-                    kind: RemoteFailureKind::InvalidResponse,
-                    message: "no queued section page".into(),
+        Box::pin(async move {
+            let barrier = self.section_barrier.lock().unwrap().clone();
+            if let Some(barrier) = barrier {
+                barrier.wait().await;
+            }
+            if matches!(
+                request.view,
+                forge_github::review_api::ReviewSection::EditableFields
+            ) {
+                return Ok(forge_github::review_api::ReviewPage {
+                    records: vec![
+                        serde_json::to_value(self.state.lock().unwrap().clone()).unwrap(),
+                    ],
+                    next_cursor: None,
+                    complete: true,
+                });
+            }
+            let mut pages = self.section_page.lock().unwrap();
+            let index = pages
+                .iter()
+                .position(|page| {
+                    page.records
+                        .first()
+                        .is_some_and(|record| match request.view {
+                            forge_github::review_api::ReviewSection::Overview => {
+                                record.get("number").is_some()
+                            }
+                            forge_github::review_api::ReviewSection::RequestedReviewers => {
+                                record.get("users").is_some()
+                            }
+                            _ => false,
+                        })
                 })
+                .unwrap_or(0);
+            pages.remove(index).ok_or(RemoteFailure {
+                kind: RemoteFailureKind::InvalidResponse,
+                message: "no queued section page".into(),
+            })
         })
     }
+}
+
+#[tokio::test]
+async fn editable_description_keeps_markdown_source_and_typescript_syntax() {
+    use forge_diff::{
+        cache::CacheLimits,
+        engine::DiffEngine,
+        syntax::{SyntaxEngine, SyntaxLimits},
+    };
+    let remote = remote();
+    let source = "# Description\n\n**Bold** text and [a link](https://example.com).\n\n```ts\ninterface TestValue {\n  Foobar: number,\n  Test: number;\n  NextValue: number\n}\n```\n\nFollowing paragraph.\n";
+    remote.state.lock().unwrap().body = Some(source.into());
+    let diff = DiffEngine::new(CacheLimits::default(), 2);
+    let syntax = SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default());
+    let service = ReviewService::with_engines(github(&remote), diff, syntax);
+    let opened = service.open_pr(remote.clone(), target()).await.unwrap();
+    let rendered = service
+        .materialize(&opened.document, Default::default())
+        .await
+        .unwrap();
+    let body = rendered
+        .snapshot
+        .block
+        .iter()
+        .find(|block| block.id.0 == "region:body")
+        .unwrap();
+    assert_eq!(body.text.wire_rows().join("\n"), source);
+    assert_eq!(body.metadata.editable_region.len(), 1);
+    assert!(
+        !body.metadata.target.is_empty(),
+        "Markdown links lost their targets"
+    );
+    assert!(
+        body.metadata
+            .source_overlay
+            .iter()
+            .any(|overlay| overlay.text == "ts"),
+        "fenced language label missing"
+    );
+    assert!(
+        body.metadata
+            .source_highlight
+            .iter()
+            .any(|capture| capture.capture == "RenderMarkdownCode"),
+        "fenced code background missing"
+    );
+    assert!(
+        body.metadata
+            .visible_decoration
+            .iter()
+            .any(|capture| capture.capture.contains("typescript")),
+        "TypeScript injection was not highlighted"
+    );
+    change(
+        &service,
+        &opened.document,
+        "body",
+        "**Changed** description",
+    )
+    .await;
+    let rendered = service
+        .materialize(&opened.document, Default::default())
+        .await
+        .unwrap();
+    let body = rendered
+        .snapshot
+        .block
+        .iter()
+        .find(|block| block.id.0 == "region:body")
+        .unwrap();
+    assert_eq!(body.text.wire_rows(), ["**Changed** description"]);
+    assert!(
+        body.metadata.source_overlay.is_empty(),
+        "old code fence survived editing"
+    );
+    service.close();
+}
+
+#[tokio::test]
+async fn initial_sections_start_together_and_failures_finish_loading() {
+    use forge_buffer::width::WidthProfile;
+    use forge_diff::workers::{AnalysisPool, PoolLimits};
+    let remote = remote();
+    let pool = Arc::new(AnalysisPool::new(PoolLimits {
+        workers: 2,
+        jobs: 16,
+        input_bytes: 64 * 1024 * 1024,
+    }));
+    let service = ReviewService::with_analysis(github(&remote), pool.clone());
+    let opened = service.open_pr(remote.clone(), target()).await.unwrap();
+    let initial = service
+        .materialize(&opened.document, WidthProfile::default())
+        .await
+        .unwrap();
+    let checks = initial
+        .snapshot
+        .block
+        .iter()
+        .filter(|block| block.id.0.starts_with("section:Checks"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        checks
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>(),
+        ["", "Checks:", "Loading..."]
+    );
+    assert_eq!(
+        checks[1].metadata.decoration[0].capture,
+        "ForgeStatusHeader"
+    );
+    assert_eq!(checks[2].metadata.decoration[0].capture, "ForgeLoading");
+    let initial = serde_json::to_string(&initial).unwrap();
+    assert!(initial.contains("overview:Activity") && initial.contains("Loading..."));
+    let header_barrier = Arc::new(tokio::sync::Barrier::new(3));
+    *remote.section_barrier.lock().unwrap() = Some(header_barrier.clone());
+    let header = service.header(
+        &opened.document,
+        remote.recovery.path().into(),
+        remote.clone(),
+    );
+    let observer = async {
+        tokio::time::timeout(Duration::from_secs(2), header_barrier.wait())
+            .await
+            .expect("both required metadata reads must start together");
+    };
+    let (header, ()) = tokio::join!(header, observer);
+    assert!(header.is_err());
+    let barrier = Arc::new(tokio::sync::Barrier::new(5));
+    *remote.section_barrier.lock().unwrap() = Some(barrier.clone());
+    let loading = service.load(
+        &opened.document,
+        remote.recovery.path().into(),
+        remote.clone(),
+    );
+    let observer = async {
+        tokio::time::timeout(Duration::from_secs(2), barrier.wait())
+            .await
+            .expect("all four secondary reads must enter before any completes");
+    };
+    let (diagnostic, ()) = tokio::join!(loading, observer);
+    assert_eq!(
+        diagnostic.len(),
+        4,
+        "each failed read must report its error"
+    );
+    let settled = service
+        .materialize(&opened.document, WidthProfile::default())
+        .await
+        .unwrap();
+    let settled = serde_json::to_string(&settled.snapshot).unwrap();
+    assert!(
+        !settled.contains("Loading..."),
+        "failed sections retained loading placeholders"
+    );
+    assert!(settled.contains("no queued section page"));
+    service.close();
 }
 
 #[tokio::test]
@@ -498,11 +688,8 @@ async fn checks_and_submitted_reviews_preserve_the_lua_summary_rows() {
         .iter()
         .find(|block| block.id.0 == "section:Checks:completion")
         .expect("incomplete checks message");
-    assert_eq!(loading.text.wire_rows(), ["...loading checks..."]);
-    assert_eq!(
-        loading.metadata.decoration[0].capture,
-        "ForgeStatusFetching"
-    );
+    assert_eq!(loading.text.wire_rows(), ["Loading..."]);
+    assert_eq!(loading.metadata.decoration[0].capture, "ForgeLoading");
 
     let review = materialized
         .snapshot
@@ -681,6 +868,14 @@ async fn pull_request_head_row_preserves_commit_date_branch_and_subject() {
         )
         .await
         .unwrap();
+    assert!(
+        !materialized
+            .snapshot
+            .block
+            .iter()
+            .any(|block| block.id.0 == "overview:URL"),
+        "PR header retained the URL row"
+    );
     let head = materialized
         .snapshot
         .block
@@ -726,13 +921,15 @@ async fn pull_request_head_row_preserves_commit_date_branch_and_subject() {
         .snapshot
         .block
         .iter()
-        .find(|block| block.id.0 == "overview:Review")
+        .find(|block| block.id.0 == "region:reviewers")
         .expect("review row");
-    assert_eq!(review.text.wire_rows(), ["Review: ◷ @alice-dev @bobtown"]);
+    assert_eq!(review.text.wire_rows(), ["@alice-dev @bobtown"]);
+    assert_eq!(review.metadata.editable_region[0].id.0, "reviewers");
+    assert_eq!(review.metadata.gutter[0].chunk[0].text, "Review: ");
     assert!(review.metadata.decoration.iter().any(|decoration| {
         decoration.capture == "ForgeReviewPending"
-            && decoration.range.start.column == "Review: ".len()
-            && decoration.range.end.column == "Review: ◷ @alice-dev @bobtown".len()
+            && decoration.range.start.column == 0
+            && decoration.range.end.column == "@alice-dev @bobtown".len()
     }));
     let activity = materialized
         .snapshot
@@ -1063,6 +1260,14 @@ async fn pull_request_sections_keep_legacy_order_and_open_description_fold() {
     let checks = heading_index("Checks:");
     let reviews = heading_index("Reviews (1):");
     let comments = heading_index("Comments (1):");
+    assert!(
+        blocks[comments]
+            .metadata
+            .fold
+            .iter()
+            .any(|fold| fold.id.0 == "review:section:Conversation" && fold.closed),
+        "Comments section must start collapsed"
+    );
     let changes = heading_index("Changes (1):");
     let commits = heading_index("Recent Commits (2):");
 
@@ -1081,7 +1286,7 @@ async fn pull_request_sections_keep_legacy_order_and_open_description_fold() {
     );
     for row in [
         "Release: ◆ v1.2.0",
-        "Review: ◷ @alice @core",
+        "@alice @owner/core",
         "✓ alice 2 days ago  Looks good",
         "Modified notes.txt +1 -1",
         "abc1234  2 days ago chore: head commit",
@@ -1104,6 +1309,10 @@ async fn pull_request_sections_keep_legacy_order_and_open_description_fold() {
             block.id.0.starts_with("section:Conversation:") && block.id.0.ends_with(":summary")
         })
         .expect("conversation summary");
+    assert!(
+        conversation.metadata.fold.iter().any(|fold| fold.closed),
+        "Individual PR comments must start folded"
+    );
     assert_eq!(
         conversation.text.wire_rows(),
         ["󰅺 alice 2 days ago  Please retain this behavior"]
@@ -1405,7 +1614,13 @@ async fn batched_file_sections_remain_stable_and_move_viewed_files() {
         .collect::<Vec<_>>();
     assert_eq!(
         initial_headings,
-        ["Unviewed Changes (2):", "Viewed Changes (0):"]
+        [
+            "Checks:",
+            "Comments (0):",
+            "Unviewed Changes (2):",
+            "Viewed Changes (0):",
+            "Recent Commits (0):"
+        ]
     );
 
     service
@@ -1612,6 +1827,12 @@ impl forge_github::review_mutation::GithubReviewWriteRemote for TestRemote {
         _: u64,
     ) -> Pin<Box<dyn Future<Output = Result<serde_json::Value, RemoteFailure>> + Send + '_>> {
         Box::pin(async move {
+            if matches!(
+                request.mutation,
+                forge_github::review_mutation::ReviewMutation::ReviewerChange { .. }
+            ) {
+                return Ok(serde_json::json!({"users":[{"login":"bob"}],"teams":[]}));
+            }
             if !matches!(
                 request.mutation,
                 forge_github::review_mutation::ReviewMutation::PullRequestEdit { .. }
@@ -1693,6 +1914,29 @@ impl forge_github::review_mutation::GithubReviewWriteRemote for TestRemote {
     > {
         Box::pin(async move {
             use forge_github::review_mutation::{ReviewMutation, ReviewMutationOutcome};
+            if matches!(request.mutation, ReviewMutation::ReviewerChange { .. }) {
+                self.reviewer_writes
+                    .lock()
+                    .unwrap()
+                    .push(request.mutation.clone());
+                self.entered.add_permits(1);
+                if self.hold.load(Ordering::Acquire) {
+                    self.release.acquire().await.unwrap().forget();
+                }
+                let failure = || RemoteFailure {
+                    kind: RemoteFailureKind::Transport,
+                    message: "reviewer write failed".into(),
+                };
+                if self.reject.load(Ordering::Acquire) {
+                    return ReviewMutationOutcome::Rejected(failure());
+                }
+                if self.uncertain.load(Ordering::Acquire) {
+                    return ReviewMutationOutcome::OutcomeUnknown(failure());
+                }
+                return ReviewMutationOutcome::Confirmed(
+                    serde_json::json!({"users":[{"login":"bob"}],"teams":[]}),
+                );
+            }
             if matches!(request.mutation, ReviewMutation::ReviewSubmit { .. }) {
                 self.submission.lock().unwrap().push(request.clone());
                 let failure = || RemoteFailure {
@@ -4313,51 +4557,162 @@ async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_u
 }
 
 #[tokio::test]
-async fn repository_pr_discovery_validates_summary_before_adopting_canonical_fields() {
+async fn status_snapshot_opens_header_without_remote_reads() {
+    use forge_diff::workers::{AnalysisPool, PoolLimits};
     let remote = remote();
-    remote.section_page.lock().unwrap().extend(
-        [(8, "PR_test"), (7, "PR_foreign"), (7, "PR_test")]
-            .into_iter()
-            .map(|(number, node_id)| forge_github::review_api::ReviewPage {
-                records: vec![serde_json::json!({"number":number,"node_id":node_id})],
-                next_cursor: None,
-                complete: true,
-            }),
+    let service = ReviewService::with_analysis(
+        github(&remote),
+        Arc::new(AnalysisPool::new(PoolLimits {
+            workers: 1,
+            jobs: 2,
+            input_bytes: 32 * 1024 * 1024,
+        })),
     );
-    let service = ReviewService::new(github(&remote));
-    assert!(
-        service
-            .open_repository_pr(
-                remote.recovery.path().into(),
-                remote.clone(),
-                target().repository,
-                7
-            )
-            .await
-            .unwrap_err()
-            .to_string()
-            .contains("another number")
-    );
-    assert!(
-        service
-            .open_repository_pr(
-                remote.recovery.path().into(),
-                remote.clone(),
-                target().repository,
-                7
-            )
-            .await
-            .is_err()
-    );
-    let opened = service
-        .open_repository_pr(
+    let body = "Paragraph\r\n\r\n```ts\r\nconst value = 1;\r\n```";
+    let mut initial = serde_json::json!({
+        "id": "PR_test", "number": 7, "title": "Cached title", "body": body,
+        "url": "https://example.invalid/owner/repo/pull/7", "state": "OPEN", "isDraft": true,
+        "baseRefOid": "a".repeat(40), "baseRefName": "main",
+        "headRefOid": "b".repeat(40), "headRefName": "feature",
+        "headRepository": { "name": "repo" }, "headRepositoryOwner": { "login": "fork" },
+        "milestone": { "title": "v1" }, "updatedAt": "1 day ago", "createdAt": "2 days ago",
+        "commits": [{ "oid": "b".repeat(40), "messageHeadline": "feat: cached head", "committedDate": "1 day ago" }],
+        "reviewRequests": [{ "login": "alice" }, { "slug": "team" }]
+    });
+    *remote.section_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(100)));
+    let opened = tokio::time::timeout(
+        Duration::from_secs(2),
+        service.open_pr_snapshot(
             remote.recovery.path().into(),
             remote.clone(),
             target().repository,
             7,
+            initial.clone(),
+        ),
+    )
+    .await
+    .expect("snapshot open repeated discovery")
+    .unwrap();
+    assert_eq!(
+        opened
+            .field
+            .iter()
+            .find(|field| field.region.0 == "body")
+            .unwrap()
+            .text,
+        body
+    );
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        service.header(
+            &opened.document,
+            remote.recovery.path().into(),
+            remote.clone(),
+        ),
+    )
+    .await
+    .expect("snapshot header repeated remote reads")
+    .unwrap();
+    let materialized = service
+        .materialize(
+            &opened.document,
+            forge_buffer::width::WidthProfile::default(),
         )
         .await
         .unwrap();
+    let head = materialized
+        .snapshot
+        .block
+        .iter()
+        .find(|block| block.id.0 == "overview:Head")
+        .unwrap();
+    assert_eq!(
+        head.text.wire_rows(),
+        ["Head:   bbbbbbb 1 day ago feature feat: cached head"]
+    );
+    let fields = service.snapshot(&opened.document).unwrap().field;
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.region.0 == "reviewers" && field.text.contains("alice"))
+    );
+    service
+        .region_edit(RegionEdit {
+            document: opened.document.clone(),
+            region: RegionId("body".into()),
+            base: forge_buffer::identity::RegionRevision(0),
+            sequence: EditSequence(1),
+            text: "Unsaved local body".into(),
+        })
+        .await
+        .unwrap();
+    initial["title"] = serde_json::json!("Refreshed title");
+    initial["body"] = serde_json::json!("Refreshed remote body");
+    service
+        .retain_pr_snapshot(&opened.document, remote.recovery.path(), initial)
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(2),
+        service.header(
+            &opened.document,
+            remote.recovery.path().into(),
+            remote.clone(),
+        ),
+    )
+    .await
+    .expect("snapshot refresh repeated remote reads")
+    .unwrap();
+    let fields = service.snapshot(&opened.document).unwrap().field;
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.region.0 == "title" && field.text == "Refreshed title")
+    );
+    assert!(
+        fields
+            .iter()
+            .any(|field| field.region.0 == "body" && field.text == "Unsaved local body")
+    );
+}
+
+#[tokio::test]
+async fn repository_pr_discovery_runs_concurrently_and_reuses_header() {
+    use forge_diff::workers::{AnalysisPool, PoolLimits};
+    use forge_github::review_api::ReviewPage;
+    let remote = remote();
+    let pool = Arc::new(AnalysisPool::new(PoolLimits {
+        workers: 2,
+        jobs: 16,
+        input_bytes: 64 * 1024 * 1024,
+    }));
+    let service = ReviewService::with_analysis(github(&remote), pool);
+    *remote.section_barrier.lock().unwrap() = Some(Arc::new(tokio::sync::Barrier::new(3)));
+    remote.section_page.lock().unwrap().extend([
+        ReviewPage { records: vec![serde_json::json!({"number":7,"node_id":"PR_other","title":"Overview","body":"Overview body"})], next_cursor: None, complete: true },
+        ReviewPage { records: vec![serde_json::json!({"users":[],"teams":[]})], next_cursor: None, complete: true },
+    ]);
+    let opened = tokio::time::timeout(
+        Duration::from_secs(2),
+        service.open_repository_pr(
+            remote.recovery.path().into(),
+            remote.clone(),
+            target().repository,
+            7,
+        ),
+    )
+    .await
+    .expect("initial reads did not run concurrently")
+    .unwrap();
+    *remote.section_barrier.lock().unwrap() = None;
+    service
+        .header(
+            &opened.document,
+            remote.recovery.path().into(),
+            remote.clone(),
+        )
+        .await
+        .unwrap();
+    assert!(remote.section_page.lock().unwrap().is_empty());
     assert_eq!(
         opened
             .field
@@ -4367,5 +4722,270 @@ async fn repository_pr_discovery_validates_summary_before_adopting_canonical_fie
             .text,
         remote.state.lock().unwrap().body.as_deref().unwrap()
     );
+    service
+        .region_edit(RegionEdit {
+            document: opened.document.clone(),
+            region: RegionId("body".into()),
+            base: forge_buffer::identity::RegionRevision(0),
+            sequence: EditSequence(1),
+            text: "Local draft".into(),
+        })
+        .await
+        .unwrap();
+    remote.section_page.lock().unwrap().extend([
+        ReviewPage { records: vec![serde_json::json!({"number":7,"node_id":"PR_other","title":"Updated title","body":"Updated remote body"})], next_cursor: None, complete: true },
+        ReviewPage { records: vec![serde_json::json!({"users":[],"teams":[]})], next_cursor: None, complete: true },
+    ]);
+    service
+        .header(
+            &opened.document,
+            remote.recovery.path().into(),
+            remote.clone(),
+        )
+        .await
+        .unwrap();
+    let refreshed = service.snapshot(&opened.document).unwrap();
+    assert_eq!(
+        refreshed
+            .field
+            .iter()
+            .find(|field| field.region.0 == "title")
+            .unwrap()
+            .text,
+        "Updated title"
+    );
+    assert_eq!(
+        refreshed
+            .field
+            .iter()
+            .find(|field| field.region.0 == "body")
+            .unwrap()
+            .text,
+        "Local draft"
+    );
     assert!(remote.writes.lock().unwrap().is_empty());
+}
+
+/// Opens an editable reviewer field through the same section boundary used by the PR header.
+async fn reviewer_document(remote: &Arc<TestRemote>) -> (ReviewService, DocumentId) {
+    use forge_diff::workers::{AnalysisPool, PoolLimits};
+    let service = ReviewService::with_analysis(
+        github(remote),
+        Arc::new(AnalysisPool::new(PoolLimits {
+            workers: 1,
+            jobs: 8,
+            input_bytes: 64 * 1024 * 1024,
+        })),
+    );
+    let opened = service.open_pr(remote.clone(), target()).await.unwrap();
+    remote
+        .section_page
+        .lock()
+        .unwrap()
+        .push_back(forge_github::review_api::ReviewPage {
+            records: vec![
+                serde_json::json!({"users":[{"login":"alice"}],"teams":[{"slug":"core"}]}),
+            ],
+            next_cursor: None,
+            complete: true,
+        });
+    service
+        .read_section(
+            &opened.document,
+            remote.recovery.path().into(),
+            remote.clone(),
+            forge_review::service::ReviewSectionKind::RequestedReviewers,
+            None,
+        )
+        .await
+        .unwrap();
+    (service, opened.document)
+}
+
+#[tokio::test]
+async fn reviewer_save_preserves_teams_and_newer_edits_then_restores_the_draft() {
+    let remote = remote();
+    let (service, document) = reviewer_document(&remote).await;
+    change(&service, &document, "title", "Edited title").await;
+    change(&service, &document, "body", "Edited description").await;
+    change(&service, &document, "reviewers", "@bob @owner/core").await;
+    let saved = service.save(&document).await.unwrap();
+    assert!(saved.snapshot.field.iter().all(|field| !field.dirty));
+    let writes = remote.reviewer_writes.lock().unwrap().clone();
+    let forge_github::review_mutation::ReviewMutation::ReviewerChange { add, remove } = &writes[0]
+    else {
+        panic!("reviewer mutation missing")
+    };
+    assert_eq!(add.reviewer, ["bob"]);
+    assert_eq!(remove.reviewer, ["alice"]);
+    assert!(add.team.is_empty() && remove.team.is_empty());
+    assert_eq!(
+        remote.writes.lock().unwrap().len(),
+        1,
+        "title and description must share one mutation"
+    );
+    change(&service, &document, "reviewers", "@carol @owner/core").await;
+    remote.hold.store(true, Ordering::Release);
+    remote
+        .entered
+        .forget_permits(remote.entered.available_permits());
+    let saving = {
+        let service = service.clone();
+        let document = document.clone();
+        tokio::spawn(async move { service.save(&document).await })
+    };
+    remote.entered.acquire().await.unwrap().forget();
+    change(&service, &document, "reviewers", "@dave @owner/core").await;
+    remote.release.add_permits(1);
+    let saved = saving.await.unwrap().unwrap();
+    let field = saved
+        .snapshot
+        .field
+        .iter()
+        .find(|field| field.region.0 == "reviewers")
+        .unwrap();
+    assert!(field.dirty);
+    assert_eq!(field.baseline, "@carol @owner/core");
+    assert_eq!(field.text, "@dave @owner/core");
+    service.close_document(&document).unwrap();
+    let replacement = ReviewService::new(github(&remote));
+    let restored = replacement.open_pr(remote.clone(), target()).await.unwrap();
+    let field = restored
+        .field
+        .iter()
+        .find(|field| field.region.0 == "reviewers")
+        .unwrap();
+    assert!(field.dirty);
+    assert_eq!(field.text, "@dave @owner/core");
+    assert_eq!(field.baseline, "@carol @owner/core");
+    replacement.close();
+    service.close();
+}
+
+#[tokio::test]
+async fn reviewer_rejection_and_refresh_preserve_unsaved_text() {
+    let remote = remote();
+    let (service, document) = reviewer_document(&remote).await;
+    change(&service, &document, "reviewers", "@bob").await;
+    remote.reject.store(true, Ordering::Release);
+    let saved = service.save(&document).await.unwrap();
+    assert!(!saved.remote.unwrap().ok);
+    remote
+        .section_page
+        .lock()
+        .unwrap()
+        .push_back(forge_github::review_api::ReviewPage {
+            records: vec![serde_json::json!({"users":[{"login":"another"}],"teams":[]})],
+            next_cursor: None,
+            complete: true,
+        });
+    service
+        .read_section(
+            &document,
+            remote.recovery.path().into(),
+            remote.clone(),
+            forge_review::service::ReviewSectionKind::RequestedReviewers,
+            None,
+        )
+        .await
+        .unwrap();
+    let snapshot = service.snapshot(&document).unwrap();
+    let field = snapshot
+        .field
+        .iter()
+        .find(|field| field.region.0 == "reviewers")
+        .unwrap();
+    assert!(field.dirty && !field.uncertain);
+    assert_eq!(field.text, "@bob");
+    assert_eq!(field.baseline, "@alice @owner/core");
+    service.close();
+}
+
+#[tokio::test]
+async fn reviewer_formatting_only_save_needs_no_remote_write() {
+    let remote = remote();
+    let (service, document) = reviewer_document(&remote).await;
+    change(
+        &service,
+        &document,
+        "reviewers",
+        "@ALICE, @owner/core @alice",
+    )
+    .await;
+    let saved = service.save(&document).await.unwrap();
+    assert!(saved.snapshot.field.iter().all(|field| !field.dirty));
+    assert!(remote.reviewer_writes.lock().unwrap().is_empty());
+    service.close();
+}
+
+#[tokio::test]
+async fn uncertain_reviewer_save_restores_and_reconciles_without_reposting() {
+    let remote = remote();
+    let (service, document) = reviewer_document(&remote).await;
+    change(&service, &document, "reviewers", "@BOB").await;
+    remote.uncertain.store(true, Ordering::Release);
+    assert!(service.save(&document).await.unwrap().snapshot.uncertain);
+    change(&service, &document, "reviewers", "@carol").await;
+    service.close_document(&document).unwrap();
+    let replacement = ReviewService::new(github(&remote));
+    let restored = replacement.open_pr(remote.clone(), target()).await.unwrap();
+    assert!(restored.uncertain);
+    assert!(replacement.save(&restored.document).await.is_err());
+    remote
+        .section_page
+        .lock()
+        .unwrap()
+        .push_back(forge_github::review_api::ReviewPage {
+            records: vec![serde_json::json!({"users":[{"login":"bob"}],"teams":[]})],
+            next_cursor: None,
+            complete: true,
+        });
+    let reconciled = replacement.reconcile(&restored.document).await.unwrap();
+    let field = reconciled
+        .field
+        .iter()
+        .find(|field| field.region.0 == "reviewers")
+        .unwrap();
+    assert!(!field.uncertain && field.dirty);
+    assert_eq!(field.text, "@carol");
+    assert_eq!(field.baseline, "@BOB");
+    assert_eq!(remote.reviewer_writes.lock().unwrap().len(), 1);
+    replacement.close();
+    service.close();
+}
+
+#[tokio::test]
+async fn dropped_save_receiver_keeps_the_queued_reviewer_change() {
+    let remote = remote();
+    let (service, document) = reviewer_document(&remote).await;
+    change(&service, &document, "title", "Saved title").await;
+    change(&service, &document, "reviewers", "@bob").await;
+    remote.hold.store(true, Ordering::Release);
+    let saving = {
+        let service = service.clone();
+        let document = document.clone();
+        tokio::spawn(async move { service.save(&document).await })
+    };
+    remote.entered.acquire().await.unwrap().forget();
+    saving.abort();
+    remote.hold.store(false, Ordering::Release);
+    remote.release.add_permits(1);
+    tokio::time::timeout(Duration::from_secs(2), async {
+        loop {
+            if service
+                .snapshot(&document)
+                .unwrap()
+                .field
+                .iter()
+                .all(|field| !field.dirty)
+            {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+    })
+    .await
+    .unwrap();
+    assert_eq!(remote.reviewer_writes.lock().unwrap().len(), 1);
+    service.close();
 }

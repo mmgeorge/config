@@ -58,6 +58,7 @@ local function selected_rows(session)
 end
 
 function M.attach(session, options)
+  local normalize_gutter = options.view == "diff" or options.view == "status"
   local handler = vim.tbl_extend("force", {
     toggle = function()
       if vim.fn.foldlevel(".") > 0 then vim.cmd("normal! za") end
@@ -84,7 +85,7 @@ function M.attach(session, options)
       end
     end)
     prior_clipboard, clipboard_callback = nil, nil
-    gutter.normalize(session, false)
+    if normalize_gutter then gutter.normalize(session, false) end
   end
   handler.visual_line_with_gutter = handler.visual_line_with_gutter or function()
     clear_selection()
@@ -143,11 +144,32 @@ function M.attach(session, options)
           if type(modes) == "string" then modes = { modes } end
           for _, mode in ipairs(modes) do
             local prior = vim.api.nvim_buf_call(session.buffer, function() return vim.fn.maparg(key, mode, false, true) end)
-            owner.mapping[#owner.mapping + 1] = { key = key, mode = mode, callback = mapped, prior = prior }
+            owner.mapping[#owner.mapping + 1] = { key = key, mode = mode, callback = mapped, prior = prior, command = spec.id, active = true, desc = spec.desc, nowait = mode == "n" and not require("forge.shared.keymaps").is_prefix(key, normal_keys) }
             vim.keymap.set(mode, key, mapped, { buffer = session.buffer, silent = true,
               nowait = mode == "n" and not require("forge.shared.keymaps").is_prefix(key, normal_keys), desc = spec.desc })
           end
         end
+      end
+    end
+  end
+  function owner.sync_editing()
+    if not options.editable or owner.closed then return end
+    local editing = options.editable()
+    local keep = { sync = true, toggle = true, collapse_parent = true, close = true, help = true }
+    for _, mapping in ipairs(owner.mapping) do
+      local active = not editing or keep[mapping.command] == true
+      if mapping.active ~= active then
+        if active then
+          vim.keymap.set(mapping.mode, mapping.key, mapping.callback, { buffer = session.buffer,
+            silent = true, nowait = mapping.nowait, desc = mapping.desc })
+        else
+          local current = vim.fn.maparg(mapping.key, mapping.mode, false, true)
+          if current.buffer == 1 and current.callback == mapping.callback then
+            vim.api.nvim_buf_del_keymap(session.buffer, mapping.mode, mapping.key)
+            if mapping.prior.buffer == 1 then vim.fn.mapset(mapping.mode, false, mapping.prior) end
+          end
+        end
+        mapping.active = active
       end
     end
   end
@@ -230,7 +252,9 @@ function M.attach(session, options)
     if mode ~= "v" and mode ~= "V" and mode ~= "\22" then clear_selection() end
   end })
   vim.api.nvim_create_autocmd({ "CursorMoved", "BufEnter", "WinEnter" }, {
-    group = group, buffer = session.buffer, callback = function() gutter.normalize(session, owner.selection) end,
+    group = group, buffer = session.buffer, callback = function()
+      if normalize_gutter or owner.selection then gutter.normalize(session, owner.selection) end
+    end,
   })
   vim.api.nvim_create_autocmd("BufLeave", { group = group, buffer = session.buffer, callback = clear_selection })
   vim.api.nvim_create_autocmd("BufWipeout", { group = group, buffer = session.buffer, callback = function() owner.close() end })
@@ -252,6 +276,7 @@ function M.attach(session, options)
     end
     owner.mapping = {}
   end
+  owner.sync_editing()
   local clue = package.loaded["mini.clue"]
   if clue and clue.ensure_buf_triggers then clue.ensure_buf_triggers(session.buffer) end
   return owner

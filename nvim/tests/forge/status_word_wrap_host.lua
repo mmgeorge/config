@@ -42,7 +42,7 @@ local success, failure = xpcall(function()
       assert(first_cell.row == last_cell.row, "native wrapping split a word: " .. word)
       if previous_row and first_cell.row ~= previous_row then
         continuation_count = continuation_count + 1
-        assert(first_cell.col == vim.api.nvim_win_get_position(0)[2] + 2, "wrapped source lost its one-cell left margin")
+        assert(first_cell.col == vim.api.nvim_win_get_position(0)[2] + 1, "wrapped source retained a continuation-line margin")
       end
       previous_row = last_cell.row
     end

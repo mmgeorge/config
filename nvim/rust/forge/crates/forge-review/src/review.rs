@@ -3,6 +3,7 @@ use std::collections::BTreeMap;
 
 mod comment;
 mod restore;
+mod reviewer;
 pub(crate) use comment::{CommentRequest, CommentSettlement, PreparedComment};
 pub use comment::{ReviewCommentCommand, ReviewCommentSnapshot};
 use forge_buffer::editable::EditAcknowledgement;
@@ -90,6 +91,7 @@ pub struct ReviewDocument {
     pub(crate) mode: ReviewMode,
     pub(crate) viewed_file: std::collections::BTreeSet<String>,
     edits: EditStore,
+    reviewers_loaded: bool,
     pub comments: CommentStore,
     pending: Vec<SaveSubmission>,
     pub(crate) pending_operation: Option<String>,
@@ -154,6 +156,7 @@ impl ReviewDocument {
             mode: ReviewMode::Overview,
             viewed_file: std::collections::BTreeSet::new(),
             edits,
+            reviewers_loaded: false,
             comments,
             pending: Vec::new(),
             pending_operation: None,
@@ -171,17 +174,21 @@ impl ReviewDocument {
         if self.comments.contains_region(&edit.region) {
             return self.comments.accept(&mut self.edits, edit);
         }
-        if edit.region.0 == "title" {
+        if matches!(edit.region.0.as_str(), "title" | "reviewers") {
             ensure!(
                 edit.text.len() <= 4096,
-                "PR title exceeds its local text limit"
+                "PR single-line field exceeds its local text limit"
             );
         }
         Ok(self.edits.accept(edit)?)
     }
 
-    /// Captures all dirty fields as one remote mutation, leaving omitted fields unchanged.
-    pub(crate) fn begin_save(&mut self, operation_id: String) -> Result<Option<PullRequestEdit>> {
+    /// Captures one dirty field group as a mutation while retaining unsubmitted fields.
+    pub(crate) fn begin_save(
+        &mut self,
+        operation_id: String,
+        reviewers: bool,
+    ) -> Result<Option<ReviewMutation>> {
         ensure!(!self.saving, "review save is already running");
         ensure!(
             self.pending.is_empty()
@@ -189,17 +196,52 @@ impl ReviewDocument {
                 && self.restored_uncertain_comment.is_empty(),
             "review save outcome requires reconciliation"
         );
-        let title = self.edits.snapshot(&RegionId("title".into()))?;
-        let body = self.edits.snapshot(&RegionId("body".into()))?;
-        if !title.dirty && !body.dirty {
-            return Ok(None);
-        }
-        let edit = PullRequestEdit {
-            title: title.dirty.then(|| title.text.to_owned()),
-            body: body.dirty.then(|| body.text.to_owned()),
+        let (mutation, regions) = if reviewers {
+            if !self.reviewers_loaded {
+                return Ok(None);
+            }
+            let field = self.edits.snapshot(&RegionId("reviewers".into()))?;
+            if !field.dirty {
+                return Ok(None);
+            }
+            let mutation = reviewer::change(
+                field.baseline,
+                field.text,
+                self.target
+                    .repository
+                    .repository_name()
+                    .split('/')
+                    .next()
+                    .expect("validated repository"),
+            )?;
+            let Some(mutation) = mutation else {
+                let text = field.text.to_owned();
+                self.edits
+                    .restore_confirmed_baseline(&RegionId("reviewers".into()), text)?;
+                return Ok(None);
+            };
+            (mutation, vec![RegionId("reviewers".into())])
+        } else {
+            let title = self.edits.snapshot(&RegionId("title".into()))?;
+            let body = self.edits.snapshot(&RegionId("body".into()))?;
+            if !title.dirty && !body.dirty {
+                return Ok(None);
+            }
+            let edit = PullRequestEdit {
+                title: title.dirty.then(|| title.text.to_owned()),
+                body: body.dirty.then(|| body.text.to_owned()),
+            };
+            edit.validate()?;
+            (
+                ReviewMutation::PullRequestEdit {
+                    node_id: self.target.node_id.clone(),
+                    title: edit.title,
+                    body: edit.body,
+                },
+                vec![RegionId("title".into()), RegionId("body".into())],
+            )
         };
-        edit.validate()?;
-        for region in [RegionId("title".into()), RegionId("body".into())] {
+        for region in regions {
             match self.edits.begin_save(&region) {
                 Ok(Some(submission)) => self.pending.push(submission),
                 Ok(None) => {}
@@ -214,7 +256,7 @@ impl ReviewDocument {
         }
         self.saving = true;
         self.pending_operation = Some(operation_id);
-        Ok(Some(edit))
+        Ok(Some(mutation))
     }
 
     /// Settles only captured fields. Delivery failure conservatively retains uncertainty.
@@ -243,19 +285,34 @@ impl ReviewDocument {
         Ok(())
     }
 
+    /// Updates clean PR fields from a remote refresh while retaining local edits and pending saves.
+    pub(crate) fn refresh_fields(&mut self, text: PullRequestEdit) -> Result<()> {
+        text.validate()?;
+        for (name, observed) in [("title", text.title), ("body", text.body)] {
+            if let Some(observed) = observed {
+                let region = RegionId(name.into());
+                let field = self.edits.snapshot(&region)?;
+                if !field.dirty
+                    && !field.uncertain
+                    && field.pending_saves == 0
+                    && field.remote.is_none()
+                {
+                    let revision = field.revision;
+                    self.edits.refresh(&region, revision, observed)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// Applies a read-only observation to unresolved captures while preserving all current text.
     /// If byte admission fails, unreconciled captures remain available for another observation.
-    pub(crate) fn reconcile(&mut self, text: PullRequestEdit) -> Result<()> {
+    pub(crate) fn reconcile(&mut self, observed: BTreeMap<String, String>) -> Result<()> {
         ensure!(!self.saving, "review save is still running");
-        text.validate()?;
-        let title = text.title.context("PR observation omitted title")?;
-        let body = text.body.context("PR observation omitted body")?;
         while let Some(submission) = self.pending.last() {
-            let observed = if submission.region().0 == "title" {
-                &title
-            } else {
-                &body
-            };
+            let observed = observed
+                .get(&submission.region().0)
+                .context("PR observation omitted captured field")?;
             self.edits.reconcile_save(submission, observed.clone())?;
             self.pending.pop();
         }
@@ -264,8 +321,11 @@ impl ReviewDocument {
     }
 
     pub fn snapshot(&self) -> Result<ReviewSnapshot> {
-        let mut field = Vec::with_capacity(2);
-        for region in [RegionId("title".into()), RegionId("body".into())] {
+        let mut field = Vec::with_capacity(3);
+        let names = ["title", "body"]
+            .into_iter()
+            .chain(self.reviewers_loaded.then_some("reviewers"));
+        for region in names.map(|name| RegionId(name.into())) {
             let state = self.edits.snapshot(&region)?;
             field.push(ReviewField {
                 region,

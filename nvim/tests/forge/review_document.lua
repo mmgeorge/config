@@ -24,6 +24,8 @@ local delayed_open
 local delayed_discovery, discovery_request
 local hold_materialize, delayed_materialize, materialize_count = false, nil, 0
 local section_request = {}
+local delayed_header, header_request
+local hold_header = true
 adapter._set_runner_for_test(function(method, params, callback)
   if method == "review.open_pr" then
     if params.target.number == 8 then delayed_open = callback
@@ -32,15 +34,18 @@ adapter._set_runner_for_test(function(method, params, callback)
     discovery_request = params
     if params.number == 9 then delayed_discovery = callback
     else callback({ document = "review-discovered" }) end
+  elseif method == "review.header" then
+    header_request = params
+    if hold_header then hold_header = false delayed_header = callback else callback({ ready = true }) end
   elseif method == "review.materialize" then
     materialize_count = materialize_count + 1
     if hold_materialize then
       hold_materialize = false
       delayed_materialize = function() callback({ snapshot = snapshot(params.document), patch = vim.NIL }) end
     else callback({ snapshot = snapshot(params.document), patch = vim.NIL }) end
-  elseif method == "review.section" then
-    section_request[#section_request + 1] = params.section
-    callback({ complete = true })
+  elseif method == "review.load" then
+    section_request[#section_request + 1] = params.document
+    callback({ diagnostic = {} })
   elseif method == "review.region_edit" then pending[#pending + 1] = { request = params, callback = callback }
   elseif method == "review.view" then callback(vim.NIL)
   elseif method == "review.thread" then
@@ -91,15 +96,26 @@ adapter._set_runner_for_test(function(method, params, callback)
   else error("unexpected route " .. method) end
 end)
 local errors = {}
+local origin = vim.api.nvim_get_current_buf()
 local state = adapter.open({ directory = vim.fn.getcwd(), target = { number = 7 },
   on_error = function(message) errors[#errors + 1] = message end })
+assert(vim.wait(1000, function() return delayed_header ~= nil end))
+assert(vim.api.nvim_get_current_buf() == origin and not state.shown and not state.replica,
+  "review displayed before required header metadata arrived")
+delayed_header({ ready = true })
 assert(vim.wait(1000, function() return state.shown end), "native presentation did not open")
+assert(vim.wo.wrap and vim.wo.linebreak and not vim.wo.breakindent and vim.wo.statuscolumn == "",
+  "PR header did not retain native wrapping without a margin")
 assert(vim.fn.maparg("S", "n", false, true).buffer ~= 1, "overview exposed batched viewed action")
-assert(vim.fn.maparg("or", "n", false, true).buffer == 1, "overview omitted start review action")
+assert(vim.fn.maparg("or", "n", false, true).buffer ~= 1, "review shortcut delays native o in editable text")
 assert(not state.replica.physical and not state.replica.generated)
-assert(vim.wait(1000, function() return vim.deep_equal(section_request, { "overview", "requested_reviewers", "files", "checks", "conversation", "commits" }) end),
-  "native review did not load the initial overview sections in order")
-for _, key in ipairs({ "<C-S>", "<Tab>", "b", "<CR>", "C", "J", "R", "gR", "q" }) do
+assert(vim.wait(1000, function() return #section_request == 1 end),
+  "native review did not request Rust-owned initial loading")
+local shared_snapshot = { id = "PR_shared", number = 7, title = "Refreshed title" }
+adapter.refresh_snapshot(state, shared_snapshot)
+assert(vim.wait(1000, function() return not state.snapshot_refreshing and not state.rendering end))
+assert(vim.deep_equal(header_request.initial, shared_snapshot), "status refresh did not supply its shared snapshot")
+for _, key in ipairs({ "<C-S>", "<Tab>", "gR", "q" }) do
   assert(vim.fn.maparg(key, "n", false, true).buffer == 1, "native review omitted " .. key .. " action")
 end
 assert(vim.fn.maparg("l", "n", false, true).buffer ~= 1, "l must retain cursor movement, not open a lifecycle picker")
@@ -111,7 +127,7 @@ assert(adapter.begin_batched(state, function(delivery, failure)
   batched = true
 end))
 assert(vim.wait(1000, function() return batched end), "batched review mode did not settle")
-assert(vim.fn.maparg("S", "n", false, true).buffer == 1, "batched review omitted viewed action after rebinding")
+assert(vim.fn.maparg("S", "n", false, true).buffer ~= 1, "viewed action overrides native editing")
 assert(vim.fn.maparg("or", "n", false, true).buffer ~= 1, "batched review retained overview start action")
 local viewed = false
 assert(adapter.set_viewed(state, "src/lib.rs", true, function(delivery, failure)
@@ -258,6 +274,8 @@ assert(vim.wait(1000, function() return not state.active end))
 assert(closed[1] == "review-adapter")
 assert(#errors == 0, table.concat(errors, "\n"))
 local closing = adapter.open({ directory = vim.fn.getcwd(), target = { number = 8 }, on_error = error })
+assert(vim.api.nvim_get_current_buf() == closing.origin and not closing.shown,
+  "review displayed before the remote response")
 adapter.close(closing)
 delayed_open({ document = "late-review" })
 assert(vim.wait(1000, function() return closed[2] == "late-review" end), "late native open leaked its document")
@@ -280,6 +298,37 @@ assert(materialize_count == before_thread, "thread continuation re-materialized 
 assert(vim.api.nvim_buf_get_lines(discovered.replica.buffer, 1, 2, false)[1] == "next thread comment")
 cache.hostname = previous_hostname
 adapter.close(discovered)
+assert(discovered.hidden and discovered.active and not closed[3], "close discarded cached PR state")
+assert(vim.api.nvim_get_current_buf() == discovered.origin)
+local cached_view_id = discovered.closed_view.id
+local cached_buffer = discovered.replica.buffer
+local old_request = discovery_request
+hold_header = true
+local reopened = adapter.open({ directory = vim.fn.getcwd(),
+  repository = { hostname = "github.example", owner = "owner", name = "repo" }, number = 7, on_error = error })
+assert(reopened == discovered and vim.api.nvim_get_current_buf() == cached_buffer,
+  "cached PR did not reopen synchronously")
+assert(discovery_request == old_request, "cached PR repeated document discovery")
+assert(reopened.view.id == cached_view_id, "cache reopen leaked a native view")
+assert(vim.api.nvim_buf_get_lines(cached_buffer, 1, 2, false)[1] == "next thread comment",
+  "cached PR lost loaded sections")
+assert(vim.wait(1000, function() return reopened.revalidating end))
+delayed_header({ ready = true })
+assert(vim.wait(1000, function() return not reopened.revalidating end))
+adapter.close(reopened)
+local refresh_failure
+hold_header = true
+local stale = adapter.open({ directory = vim.fn.getcwd(),
+  repository = { hostname = "github.example", owner = "owner", name = "repo" }, number = 7,
+  on_error = function(message) refresh_failure = message end })
+assert(stale == reopened and vim.api.nvim_get_current_buf() == cached_buffer)
+assert(vim.wait(1000, function() return not hold_header end))
+delayed_header(nil, "refresh unavailable")
+assert(vim.wait(1000, function() return not stale.revalidating end))
+assert(refresh_failure == "refresh unavailable" and stale.active,
+  "refresh failure discarded cached PR or omitted notification")
+adapter.close(stale)
+vim.api.nvim_buf_delete(cached_buffer, { force = true })
 assert(vim.wait(1000, function() return closed[3] == "review-discovered" end))
 local current = true
 local late = adapter.open({ directory = vim.fn.getcwd(), repository = repository, number = 9,

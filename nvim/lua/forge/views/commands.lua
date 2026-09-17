@@ -97,7 +97,7 @@ function M.open_pr(pr, opts)
     return nil
   end
   local cwd = opts.cwd or (session.status and session.status.cwd) or vim.fn.getcwd()
-  return review_document().open({ directory = cwd, repository = repository, number = tonumber(pr.number), window = opts.window })
+  return review_document().open({ directory = cwd, repository = repository, number = tonumber(pr.number), initial = pr.snapshot, window = opts.window, started_at = opts.started_at })
 end
 
 --- Fetches pull request metadata by number and opens the PR overview buffer.
@@ -129,7 +129,7 @@ function M.open_review(pr, opts)
   end
   local cwd = opts.cwd or (session.status and session.status.cwd) or vim.fn.getcwd()
   local state
-  state = review_document().open({ directory = cwd, repository = repository, number = tonumber(pr.number), window = opts.window,
+  state = review_document().open({ directory = cwd, repository = repository, number = tonumber(pr.number), initial = pr.snapshot, window = opts.window, started_at = opts.started_at,
     on_open = function(opened)
       if opened == state and opened.active then review_document().begin_batched(opened) end
     end })

@@ -113,7 +113,10 @@ impl GhClient {
             .map_err(|error| invalid(error.to_string()))?;
         let graph = matches!(
             request.view,
-            ReviewSection::Threads | ReviewSection::ThreadComments { .. } | ReviewSection::Checks
+            ReviewSection::Threads
+                | ReviewSection::ThreadComments { .. }
+                | ReviewSection::Checks
+                | ReviewSection::EditableFields
         );
         let number = request.number;
         let repository = request.repository.repository_name();
@@ -130,6 +133,10 @@ impl GhClient {
                 .split_once('/')
                 .ok_or_else(|| invalid("repository omits owner"))?;
             let (query, thread) = match &request.view {
+                ReviewSection::EditableFields => (
+                    "query($owner:String!,$name:String!,$number:Int!){repository(owner:$owner,name:$name){pullRequest(number:$number){id number state isDraft title body}}}",
+                    Value::Null,
+                ),
                 ReviewSection::Threads => (THREAD_QUERY, Value::Null),
                 ReviewSection::ThreadComments { thread_node_id } => {
                     (THREAD_COMMENT_QUERY, json!(thread_node_id))
@@ -243,6 +250,17 @@ fn decode_graph(value: Value, request: &ReviewReadRequest) -> Result<ReviewPage,
     {
         return Err(invalid("GitHub GraphQL returned errors"));
     }
+    if matches!(request.view, ReviewSection::EditableFields) {
+        let record = value
+            .pointer("/data/repository/pullRequest")
+            .filter(|record| record.is_object())
+            .ok_or_else(|| invalid("GitHub pull request is missing"))?;
+        return Ok(ReviewPage {
+            records: vec![record.clone()],
+            next_cursor: None,
+            complete: true,
+        });
+    }
     let connection = match request.view {
         ReviewSection::ThreadComments { .. } => {
             let thread = value
@@ -324,6 +342,34 @@ mod tests {
     #[test]
     fn check_query_requests_the_workflow_name_used_by_review_projection() {
         assert!(CHECK_QUERY.contains("checkSuite{workflowRun{workflow{name}}}"));
+    }
+
+    #[test]
+    fn editable_fields_preserve_markdown_and_reject_missing_pr() {
+        let request = ReviewReadRequest {
+            repository: crate::model::GithubRepositoryId::new("github.com", "owner", "repo")
+                .unwrap(),
+            number: 7,
+            view: ReviewSection::EditableFields,
+            cursor: None,
+        };
+        let record = json!({"id":"PR_test","number":7,"state":"OPEN","isDraft":true,
+            "title":"Title","body":"# Body\n\n```ts\nconst value = 1;\n```"});
+        let page = decode_graph(
+            json!({"data":{"repository":{"pullRequest":record}}}),
+            &request,
+        )
+        .unwrap();
+        assert_eq!(page.records, vec![record]);
+        assert!(page.complete && page.next_cursor.is_none());
+        assert!(
+            decode_graph(
+                json!({"data":{"repository":{"pullRequest":null}}}),
+                &request
+            )
+            .is_err()
+        );
+        assert!(decode_graph(json!({"errors":[{"message":"denied"}]}), &request).is_err());
     }
 
     #[test]

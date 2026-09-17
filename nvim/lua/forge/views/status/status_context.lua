@@ -4,6 +4,23 @@ local ai_commit = require("forge.integrations.ai_commit")
 local gh = require("forge.integrations.gh")
 local notifications = require("forge.infra.notifications")
 
+local pr_cache = {}
+local pr_cache_order = {}
+
+local function cache_key(workspace, info)
+  return vim.json.encode({ require("github.repo_cache").hostname(), vim.fs.normalize(workspace),
+    type(info.branch) == "string" and info.branch or "",
+    (not info.branch or info.branch == "") and info.head or "" })
+end
+
+local function retain_pr(key, pr, presentation)
+  if not pr_cache[key] then
+    pr_cache_order[#pr_cache_order + 1] = key
+    if #pr_cache_order > 32 then pr_cache[table.remove(pr_cache_order, 1)] = nil end
+  end
+  pr_cache[key] = { pr = vim.deepcopy(pr), presentation = vim.deepcopy(presentation) }
+end
+
 local function confirm_create_pull_request(callback)
   require("forge.infra.confirm").open({ "No GitHub PR found for this branch.", "", "Create a draft PR now?" },
     callback, nil, { title = "ForgeStatus", min_width = 40 })
@@ -188,29 +205,46 @@ function M.attach(options)
   end
 
   local function open_pr(_, _, captured, command)
+    local started = command and command.started_at or vim.uv.hrtime()
+    require("forge.startup_log").write("pr.intent", { load_id = tostring(started), status_document = options.document_id,
+      lookup_state = owner.presentation.pr.state, elapsed_us = math.floor((vim.uv.hrtime() - started) / 1000) })
     local target_window = captured and options.input_window(captured) or command.window
+    local origin = vim.api.nvim_win_get_buf(target_window)
     local revision = owner.revision
     local function current()
       return alive(revision) and vim.api.nvim_win_is_valid(target_window)
+        and vim.api.nvim_win_get_buf(target_window) == origin
         and (not captured or options.is_input_current(captured))
     end
     local function create(confirmed)
       if not current() then return end
       local function open_creation()
-        if current() then vim.api.nvim_win_call(target_window, function() require("github.open_pr").open({ cwd = options.workspace }) end) end
+        if current() then
+          vim.api.nvim_win_call(target_window, function() require("github.open_pr").open({ cwd = options.workspace }) end)
+        end
       end
       if confirmed then open_creation() else confirm_create_pull_request(open_creation) end
     end
-    if owner.presentation.pr.state == "fetching" then vim.notify("Pull request lookup is still running", vim.log.levels.INFO, { title = "Forge" }) return end
-    if owner.presentation.pr.state == "error" or owner.presentation.pr.state == "unavailable" then notifications.error("Pull request lookup is " .. owner.presentation.pr.state) return end
-    if not owner.pr then create() return end
+    if owner.presentation.pr.state == "fetching" then
+      owner.pending_pr = { window = target_window, review = command and command.review,
+        origin = origin, started_at = started }
+      return
+    end
+    if owner.presentation.pr.state == "error" or owner.presentation.pr.state == "unavailable" then
+      notifications.error("Pull request lookup is " .. owner.presentation.pr.state)
+      return
+    end
+    if not owner.pr then
+      create()
+      return
+    end
     local pr = owner.pr
     local function open()
       if not current() then return end
       vim.api.nvim_win_call(target_window, function()
         local commands = require("forge.views.commands")
         local open = command and command.review and commands.open_review or commands.open_pr
-        open(pr, { cwd = options.workspace })
+        owner.pr_view = open(pr, { cwd = options.workspace, window = target_window, started_at = started })
       end)
     end
     if owner.presentation.pr.state == "closed" then
@@ -234,15 +268,35 @@ function M.attach(options)
     owner.revision = owner.revision + 1
     local revision = owner.revision
     owner.info = assert(options.get_info(), "Missing native status context")
+    local lookup_started = vim.uv.hrtime()
     refresh.branch = type(owner.info.branch) == "string" and owner.info.branch or nil
-    owner.presentation.pr = { state = "fetching", text = "" }
+    local key = cache_key(options.workspace, owner.info)
+    local cached = pr_cache[key]
+    owner.pr = cached and vim.deepcopy(cached.pr) or nil
+    owner.presentation.pr = cached and vim.deepcopy(cached.presentation) or { state = "fetching", text = "" }
     publish()
     local function accept_pr(result, state)
       if not alive(revision) then return end
-      owner.pr = result.pr
-      owner.presentation.pr = { state = state or (result.unavailable and "unavailable" or not result.ok and "error" or result.pr and "ready" or "none"), text = result.pr and result.pr.title or "" }
+      require("forge.startup_log").write("pr.lookup.complete", { status_document = options.document_id, revision = revision,
+        elapsed_us = math.floor((vim.uv.hrtime() - lookup_started) / 1000), ok = result.ok })
+      if result.ok then
+        owner.pr = result.pr
+        owner.presentation.pr = { state = state or (result.pr and "ready" or "none"), text = result.pr and result.pr.title or "" }
+        retain_pr(key, owner.pr, owner.presentation.pr)
+        if owner.pr_view and owner.pr_view.active and result.pr and result.pr.snapshot
+          and owner.pr_view.number == result.pr.number then
+          require("forge.review_document").refresh_snapshot(owner.pr_view, result.pr.snapshot)
+        end
+      elseif not cached then
+        owner.pr = nil
+        owner.presentation.pr = { state = result.unavailable and "unavailable" or "error", text = "" }
+      end
       if result.error then notifications.error("Status pull request lookup failed: " .. tostring(result.error)) end
       publish()
+      local pending = owner.pending_pr
+      owner.pending_pr = nil
+      if pending and vim.api.nvim_win_is_valid(pending.window)
+        and vim.api.nvim_win_get_buf(pending.window) == pending.origin then open_pr(nil, nil, nil, pending) end
     end
     local config = require("forge.infra.config")
     local settings = config.options or config.defaults
@@ -316,6 +370,7 @@ function M.attach(options)
 
   function owner.close()
     stop_lookup_timers()
+    owner.pending_pr = nil
     owner.closed = true
     owner.revision = owner.revision + 1
   end

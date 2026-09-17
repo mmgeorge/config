@@ -195,6 +195,10 @@ local pr_json_fields = table.concat({
   "url",
   "headRefName",
   "headRefOid",
+  "baseRefOid",
+  "baseRefName",
+  "headRepository",
+  "headRepositoryOwner",
   "commits",
   "files",
   "changedFiles",
@@ -217,6 +221,10 @@ local pr_list_json_fields = table.concat({
   "url",
   "headRefName",
   "headRefOid",
+  "baseRefOid",
+  "baseRefName",
+  "headRepository",
+  "headRepositoryOwner",
   "state",
   "isDraft",
   "createdAt",
@@ -498,6 +506,8 @@ local function normalize_pr(raw, repo)
   local state = tostring(raw.state or ""):upper()
   if state == "" then state = raw.closed == true and "CLOSED" or "OPEN" end
   return {
+    snapshot = type(raw.id) == "string" and type(raw.body) == "string"
+      and type(raw.reviewRequests) == "table" and type(raw.commits) == "table" and vim.deepcopy(raw) or nil,
     id = type(raw.id) == "string" and raw.id or nil,
     number = as_integer(raw.number),
     title = tostring(raw.title or ""),

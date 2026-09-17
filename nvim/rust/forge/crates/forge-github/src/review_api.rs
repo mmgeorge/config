@@ -18,13 +18,17 @@ pub const MAX_REVIEW_DOCUMENT_BYTES: usize = 16 * 1024 * 1024;
 #[serde(tag = "section", rename_all = "snake_case", deny_unknown_fields)]
 pub enum ReviewSection {
     Overview,
+    /// Initial editable PR fields queried by repository and number.
+    EditableFields,
     Commits,
     Files,
     Reviews,
     ReviewComments,
     Conversation,
     Threads,
-    ThreadComments { thread_node_id: String },
+    ThreadComments {
+        thread_node_id: String,
+    },
     Checks,
     RequestedReviewers,
     Milestones,

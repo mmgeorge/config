@@ -3,15 +3,38 @@ local buffer = require("forge.buffer")
 local editable = require("forge.editable")
 local input = require("forge.input")
 local effects = require("forge.effects")
+local log = require("forge.startup_log")
 local runner_for_test
 local finish_close
+---@type table<string, table>
+local retained = {}
+local CACHE_LIMIT = 8
+
+---@param state table
+local function retain(state)
+  if not state.cache_key then return end
+  if not retained[state.cache_key] and vim.tbl_count(retained) >= CACHE_LIMIT then
+    local oldest
+    for _, candidate in pairs(retained) do
+      if candidate.hidden and (not oldest or candidate.load_started < oldest.load_started) then oldest = candidate end
+    end
+    if oldest then finish_close(oldest, true) else state.cache_key = nil return end
+  end
+  retained[state.cache_key] = state
+end
 
 local function request(state, method, params, callback)
+  local started = vim.uv.hrtime()
+  log.write("pr.request", { load_id = state.load_id, document = state.document, method = method })
   local delivered = false
   local function receive(result, failure)
     if delivered then return end
     delivered = true
+    local received = vim.uv.hrtime()
     vim.schedule(function()
+      log.write("pr.response", { load_id = state.load_id, document = state.document, method = method,
+        elapsed_us = math.floor((received - started) / 1000), schedule_us = math.floor((vim.uv.hrtime() - received) / 1000),
+        failed = failure ~= nil, timing = type(result) == "table" and result.timing or nil })
       local current = state.active and (state.shown or not state.is_current or state.is_current())
       if not current and method ~= "review.close" then
         if state.active then finish_close(state) end
@@ -34,6 +57,22 @@ local function request(state, method, params, callback)
   if not ok then receive(nil, tostring(failure)) end
 end
 
+---@param state table
+local function revalidate(state, initial)
+  if state.revalidating or state.initial_section_loading then return end
+  state.revalidating = true
+  local pending = 2
+  local function complete(result, failure)
+    if failure then state.notice(tostring(failure)) end
+    for _, diagnostic in ipairs(result and result.diagnostic or {}) do state.notice(diagnostic) end
+    pending = pending - 1
+    if pending == 0 then state.revalidating = false M.refresh(state) end
+  end
+  local params = { document = state.document, directory = state.directory }
+  request(state, "review.header", vim.tbl_extend("force", params, { initial = initial }), complete)
+  request(state, "review.load", params, complete)
+end
+
 local function failed(state, failure)
   state.failure = tostring(failure)
   state.notice(state.failure)
@@ -45,38 +84,42 @@ local function finish_refresh(state, ok)
   for _, callback in ipairs(waiter) do callback(ok) end
 end
 
-local function load_next_initial_section(state)
+local function load_initial_sections(state)
   if not state.active or state.initial_section_loading then return end
-  local section = table.remove(state.initial_sections or {}, 1)
-  if not section then return end
   state.initial_section_loading = true
-  request(state, "review.section", {
+  request(state, "review.load", {
     document = state.document,
     directory = state.directory,
-    section = section,
-  }, function(_, failure)
+  }, function(result, failure)
     state.initial_section_loading = false
-    if failure then
-      failed(state, failure)
-      load_next_initial_section(state)
-      return
-    end
-    M.refresh(state, function(rendered)
-      if rendered then load_next_initial_section(state) end
-    end)
+    state.initial_sections_complete = true
+    log.write("pr.sections.ready", { load_id = state.load_id, document = state.document,
+      elapsed_us = math.floor((vim.uv.hrtime() - state.load_started) / 1000) })
+    if failure then failed(state, failure) end
+    for _, diagnostic in ipairs(result and result.diagnostic or {}) do failed(state, diagnostic) end
+    M.refresh(state)
   end)
 end
 
-finish_close = function(state)
+finish_close = function(state, dispose)
+  if not dispose and state.cache_key and retained[state.cache_key] == state
+    and state.replica and vim.api.nvim_buf_is_loaded(state.replica.buffer) then
+    state.closing, state.hidden = false, true
+    if state.view then state.closed_view = state.view input.close(state.view) state.view = nil end
+    if vim.api.nvim_win_is_valid(state.window) and vim.api.nvim_win_get_buf(state.window) == state.replica.buffer
+      and vim.api.nvim_buf_is_valid(state.origin) then vim.api.nvim_win_set_buf(state.window, state.origin) end
+    return
+  end
+  if state.cache_key and retained[state.cache_key] == state then retained[state.cache_key] = nil end
   state.active = false
   if state.commands then state.commands.close() state.commands = nil end
   if state.view then input.close(state.view) end
   if state.group then pcall(vim.api.nvim_del_augroup_by_id, state.group) end
   if state.replica then
-    buffer.close(state.replica)
+    buffer.close(state.replica, { preserve_buffer = state.unloading })
     if vim.api.nvim_win_is_valid(state.window) and vim.api.nvim_win_get_buf(state.window) == state.replica.buffer
       and vim.api.nvim_buf_is_valid(state.origin) then vim.api.nvim_win_set_buf(state.window, state.origin) end
-    if vim.api.nvim_buf_is_valid(state.replica.buffer) then pcall(vim.api.nvim_buf_delete, state.replica.buffer, { force = true }) end
+    if not state.unloading and vim.api.nvim_buf_is_valid(state.replica.buffer) then pcall(vim.api.nvim_buf_delete, state.replica.buffer, { force = true }) end
   end
   if state.document then request(state, "review.close", { document = state.document }, function(_, failure)
     if failure then state.notice(failure) end
@@ -127,6 +170,54 @@ function M.apply_new_default_folds(state)
   end
 end
 
+---@param state table
+---@return string?
+function M.editable_region(state)
+  local replica = state.replica
+  if not replica or not replica.editable.native or replica.editable.fault
+    or vim.api.nvim_get_current_buf() ~= replica.buffer then return nil end
+  local cursor = vim.api.nvim_win_get_cursor(0)
+  local position = { row = cursor[1] - 1, column = math.min(cursor[2], #vim.api.nvim_get_current_line()) }
+  return editable.guard_region(replica.editable, position, position)
+end
+
+---@param state table
+function M.sync_editing(state)
+  if not state.active or not state.replica or vim.api.nvim_get_current_buf() ~= state.replica.buffer then return end
+  vim.bo[state.replica.buffer].modifiable = M.editable_region(state) ~= nil
+  if state.commands then state.commands.sync_editing() end
+end
+
+local dirty_namespace = vim.api.nvim_create_namespace("ForgeReviewDirty")
+
+---@param state table
+function M.sync_dirty(state)
+  local replica = state.replica
+  if not replica or not replica.editable.native or not state.fields then return end
+  vim.api.nvim_buf_clear_namespace(replica.buffer, dirty_namespace, 0, -1)
+  local modified = false
+  local fields = vim.list_extend({}, state.fields)
+  for _, comment in pairs(state.comment_by_region or {}) do
+    if not comment.deleted and type(comment.baseline) == "string" then fields[#fields + 1] = comment end
+  end
+  for _, field in ipairs(fields) do
+    local anchor = replica.editable.native.anchor[field.region]
+    if anchor then
+      local text = table.concat(vim.api.nvim_buf_get_text(replica.buffer, anchor.start.row, anchor.start.column,
+        anchor.finish.row, anchor.finish.column, {}), "\n")
+      if text ~= field.baseline then
+        modified = true
+        local row = field.region == "body" and math.max(0, anchor.start.row - 1) or anchor.start.row
+        local label = vim.api.nvim_buf_get_lines(replica.buffer, row, row + 1, false)[1]
+        local colon = field.region == "body" and label:find(":", 1, true)
+        vim.api.nvim_buf_set_extmark(replica.buffer, dirty_namespace, row, colon and colon - 1 or 0,
+          { virt_text = { { colon and "*" or " *", "DiagnosticWarn" } }, virt_text_pos = colon and "inline" or "eol" })
+      end
+    end
+  end
+  vim.bo[replica.buffer].modified = modified
+end
+
 function M.refresh(state, callback)
   if not state.active or not state.document then return end
   state.refresh_waiter = state.refresh_waiter or {}
@@ -139,6 +230,7 @@ function M.refresh(state, callback)
   state.refresh_pending, state.rendering = false, true
   local width = require("forge.width").capture(vim.api.nvim_win_is_valid(state.window) and state.window or vim.api.nvim_get_current_win())
   request(state, "review.materialize", { document = state.document, width = width }, function(delivery, failure)
+    local apply_started = vim.uv.hrtime()
     state.rendering = false
     if failure or type(delivery) ~= "table" then
       if not state.refresh_pending then
@@ -148,10 +240,13 @@ function M.refresh(state, callback)
       settled(state)
       return
     end
+    if delivery.field then state.fields = delivery.field end
     local applied
     if state.replica.revision == nil then applied = buffer.apply_snapshot(state.replica, delivery.snapshot)
     elseif delivery.patch and delivery.patch ~= vim.NIL then applied = buffer.apply_patch(state.replica, delivery.patch)
     elseif delivery.snapshot and delivery.snapshot.revision == state.replica.revision then
+      M.sync_editing(state)
+      M.sync_dirty(state)
       finish_refresh(state, true)
       settled(state)
       return
@@ -165,19 +260,42 @@ function M.refresh(state, callback)
       finish_refresh(state, false)
       return
     end
-    M.apply_new_default_folds(state)
     if not state.shown and applied.kind == "Applied" then
+      vim.bo[state.replica.buffer].buftype = "acwrite"
       state.shown = true
-      if vim.api.nvim_win_is_valid(state.window) and vim.api.nvim_win_get_buf(state.window) == state.origin then
+      retain(state)
+      if vim.api.nvim_win_is_valid(state.window) and (vim.api.nvim_win_get_buf(state.window) == state.origin
+        or vim.api.nvim_win_get_buf(state.window) == state.replica.buffer) then
         vim.api.nvim_win_set_buf(state.window, state.replica.buffer)
       end
-      state.view = input.open(state.replica, state.window)
+      state.view = input.open(state.replica, state.window, { margin = 0, conceal = { level = 2, cursor = "" } })
       M.attach_fold_window(state, state.window)
       M.resize(state)
       if state.on_open then state.on_open(state) end
     end
+    M.apply_new_default_folds(state)
+    M.sync_editing(state)
+    M.sync_dirty(state)
+    log.write("pr.presentation.applied", { load_id = state.load_id, document = state.document,
+      apply_us = math.floor((vim.uv.hrtime() - apply_started) / 1000),
+      elapsed_us = math.floor((vim.uv.hrtime() - state.load_started) / 1000), rows = state.replica.row_count })
+    log.watch_redraw(state.replica.buffer, state.document, state.load_started, "pr.redraw",
+      { load_id = state.load_id, phase = state.initial_sections_complete and "sections" or "header" })
     finish_refresh(state, true)
     settled(state)
+    if state.pending_snapshot then M.refresh_snapshot(state, state.pending_snapshot) end
+  end)
+end
+
+function M.refresh_snapshot(state, snapshot)
+  if not state.active then return end
+  state.pending_snapshot = snapshot
+  if not state.shown or state.rendering or state.snapshot_refreshing or state.revalidating then return end
+  state.pending_snapshot, state.snapshot_refreshing = nil, true
+  request(state, "review.header", { document = state.document, directory = state.directory, initial = snapshot }, function(_, failure)
+    state.snapshot_refreshing = false
+    if failure then failed(state, failure) end
+    M.refresh(state)
   end)
 end
 
@@ -191,6 +309,7 @@ function M.resize(state)
       if applied.kind ~= "Applied" and applied.kind ~= "Deferred" then failed(state, applied.reason or applied.kind) return end
     end
     state.view_ready = true
+    M.sync_editing(state)
     settled(state)
   end)
 end
@@ -205,6 +324,7 @@ function M.activate(state, action)
   if not vim.deep_equal(pending.cursor, vim.api.nvim_win_get_cursor(state.window)) then return false end
   local captured, failure = input.capture(state.replica, state.view, pending.action or "activate")
   if not captured then if failure then failed(state, failure) end return false end
+  if not captured.target then return false end
   state.action_running = true
   request(state, "review.act", { input = captured, directory = state.directory }, function(delivery, action_failure)
     state.action_running = false
@@ -240,6 +360,8 @@ function M.save(state)
   state.save_pending, state.saving = false, true
   request(state, "review.save", { document = state.document }, function(result, failure)
     state.saving = false
+    if result and result.snapshot and result.snapshot.field then state.fields = result.snapshot.field end
+    M.sync_dirty(state)
     if failure then failed(state, failure)
     elseif result and result.snapshot and result.snapshot.uncertain then
       failed(state, "Review save outcome requires reconciliation")
@@ -518,6 +640,8 @@ function M.comment(state, command, callback)
       end
     end
     if pending.callback then pending.callback(delivery, failure) end
+    M.sync_editing(state)
+    M.sync_dirty(state)
     settled(state)
   end)
     return true
@@ -591,14 +715,46 @@ function M.close(state)
 end
 
 function M.open(options)
+  local started = options.started_at or vim.uv.hrtime()
   local window = options.window or vim.api.nvim_get_current_win()
   local origin = vim.api.nvim_win_get_buf(window)
   local is_current = options.is_current
   local repository = options.repository or (options.target and options.target.repository)
+  local cache_key = repository and repository.hostname and repository.owner and repository.name
+    and vim.json.encode({ options.directory, repository.hostname, repository.owner, repository.name,
+      options.number or (options.target and options.target.number) }) or nil
+  local cached = cache_key and retained[cache_key]
+  if cached and cached.active and cached.replica.status ~= "Closed" and vim.api.nvim_buf_is_loaded(cached.replica.buffer) then
+    cached.window = window
+    if origin ~= cached.replica.buffer then cached.origin = origin end
+    cached.load_started, cached.load_id = started, tostring(started)
+    cached.hidden, cached.closing = false, false
+    cached.on_open = options.on_open
+    if options.on_error then cached.notice = options.on_error end
+    vim.api.nvim_win_set_buf(window, cached.replica.buffer)
+    local previous_view = cached.view or cached.closed_view
+    if previous_view then input.close(previous_view) end
+    cached.view = input.open(cached.replica, window, { margin = 0, conceal = { level = 2, cursor = "" } })
+    if previous_view then cached.view.id, cached.view.sequence = previous_view.id, previous_view.sequence end
+    cached.closed_view, cached.view_ready = nil, false
+    M.attach_fold_window(cached, window)
+    M.resize(cached)
+    log.write("pr.cache.hit", { load_id = cached.load_id, document = cached.document,
+      elapsed_us = math.floor((vim.uv.hrtime() - started) / 1000) })
+    log.watch_redraw(cached.replica.buffer, cached.document, started, "pr.redraw",
+      { load_id = cached.load_id, phase = "cached" })
+    if cached.on_open then cached.on_open(cached) end
+    M.sync_editing(cached)
+    M.sync_dirty(cached)
+    revalidate(cached, options.initial)
+    return cached
+  end
+  if cached then finish_close(cached, true) end
   local state = {
     active = true, directory = assert(options.directory), window = window,
     mode = "overview", number = options.number or (options.target and options.target.number),
-    origin = origin,
+    origin = origin, cache_key = cache_key, load_started = started, load_id = tostring(started),
+    repository = repository,
     hostname = repository and repository.hostname or require("github.repo_cache").hostname(),
     explicit_repository = repository ~= nil,
     is_current = function()
@@ -609,8 +765,9 @@ function M.open(options)
     notice = options.on_error or function(message) vim.notify(message, vim.log.levels.ERROR, { title = "Forge review" }) end,
   }
   local method = options.target and "review.open_pr" or "review.open"
+  log.write("pr.open", { load_id = state.load_id, elapsed_us = math.floor((vim.uv.hrtime() - started) / 1000) })
   local params = options.target and { directory = state.directory, target = vim.deepcopy(options.target) }
-    or { directory = state.directory, repository = vim.deepcopy(assert(options.repository)), number = assert(options.number) }
+    or { directory = state.directory, repository = vim.deepcopy(assert(options.repository)), number = assert(options.number), initial = vim.deepcopy(options.initial) }
   request(state, method, params, function(opened, failure)
     if failure or type(opened) ~= "table" or type(opened.document) ~= "string" then
       failed(state, failure or "Missing native review identity")
@@ -618,7 +775,13 @@ function M.open(options)
       return
     end
     state.document = opened.document
-    state.initial_sections = { "overview", "requested_reviewers", "files", "checks", "conversation", "commits" }
+    state.fields = opened.field
+    request(state, "review.header", { document = state.document, directory = state.directory }, function(_, header_failure)
+    if header_failure then
+      failed(state, header_failure)
+      finish_close(state)
+      return
+    end
     state.replica = buffer.open(state.document, {
       filetype = "forge", notice = state.notice,
       recover = function() failed(state, "Review presentation requires explicit recovery") end,
@@ -632,6 +795,9 @@ function M.open(options)
           end
           local applied = buffer.acknowledge_edit(state.replica, acknowledgement, acknowledgement.patch)
           if applied.kind ~= "Applied" and applied.kind ~= "Deferred" then failed(state, applied.reason or applied.kind) return end
+          if edit.region == "body" then state.refresh_pending = true end
+          M.sync_editing(state)
+          M.sync_dirty(state)
           settled(state)
         end)
         return true
@@ -639,18 +805,49 @@ function M.open(options)
     })
     vim.bo[state.replica.buffer].buftype = "acwrite"
     vim.bo[state.replica.buffer].buflisted = true
+    vim.api.nvim_buf_set_name(state.replica.buffer, "forge://pull-request/" .. state.document)
+    if repository and repository.owner and repository.name then
+      local repo = repository.owner .. "/" .. repository.name
+      local cache = require("github.repo_cache")
+      if not repository.hostname or repository.hostname == cache.hostname() then
+        cache.enable_user_completion(state.replica.buffer, repo)
+        cache.ensure_metadata(state.directory, repo)
+        require("github.issue_index").ensure_repo(state.directory, repo, { manual = false })
+      end
+    end
     state.group = vim.api.nvim_create_augroup("ForgeReviewDocument" .. state.replica.buffer, { clear = true })
     vim.api.nvim_create_autocmd("BufWriteCmd", { group = state.group, buffer = state.replica.buffer, callback = function() M.save(state) end })
-    vim.api.nvim_create_autocmd("BufUnload", { group = state.group, buffer = state.replica.buffer, callback = function() M.close(state) end })
+    vim.api.nvim_create_autocmd("BufUnload", { group = state.group, buffer = state.replica.buffer, callback = function() state.unloading = true finish_close(state, true) end })
     vim.api.nvim_create_autocmd("BufWinEnter", { group = state.group, buffer = state.replica.buffer,
       callback = function() M.attach_fold_window(state, vim.api.nvim_get_current_win()) end })
-    vim.api.nvim_create_autocmd("CursorMoved", { group = state.group, buffer = state.replica.buffer,
-      callback = function() M.sync_comment_focus(state) end })
+    vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "BufEnter", "InsertLeave", "TextChanged", "TextChangedI" }, {
+      group = state.group, buffer = state.replica.buffer,
+      callback = function(event)
+        M.sync_comment_focus(state)
+        M.sync_editing(state)
+        if event.event == "TextChanged" or event.event == "TextChangedI" then M.sync_dirty(state) end
+      end })
+    vim.keymap.set("i", "<CR>", function()
+      local region = M.editable_region(state)
+      return (region == "title" or region == "reviewers") and "" or "<CR>"
+    end, { buffer = state.replica.buffer, expr = true })
+    for _, key in ipairs({ "o", "O" }) do
+      vim.keymap.set("n", key, function()
+        local region = M.editable_region(state)
+        if region == "title" or region == "reviewers" then return "" end
+        local anchor = region and state.replica.editable.native.anchor[region]
+        if key == "o" and anchor and vim.api.nvim_win_get_cursor(0)[1] - 1 == anchor.finish.row then
+          return "A<CR>"
+        end
+        return key
+      end, { buffer = state.replica.buffer, expr = true })
+    end
     vim.api.nvim_create_autocmd({ "VimResized", "WinResized" }, { group = state.group, callback = function() M.resize(state) end })
     state.bind_commands = function()
     if state.commands then state.commands.close() end
     local batched = state.mode == "batched"
     state.commands = require("forge.document_commands").attach(state.replica, {
+      editable = function() return M.editable_region(state) ~= nil end,
       view = batched and "review" or "pr", title = (batched and "Review #" or "PR #") .. tostring(state.number or ""),
       narrow_title = "< #" .. tostring(state.number or ""),
       changed = function()
@@ -681,21 +878,20 @@ function M.open(options)
     })
     end
     state.bind_commands()
-    vim.keymap.set("n", "R", function()
-      if not M.reply_comment(state) then M.refresh(state) end
-    end, { buffer = state.replica.buffer, desc = "Reply to selected review comment or refresh" })
     vim.keymap.set("n", "gR", function() M.reconcile_lifecycle(state) end,
       { buffer = state.replica.buffer, desc = "Reconcile pull request lifecycle" })
     vim.keymap.set("n", "gB", function() pick_submission_recovery(state) end,
       { buffer = state.replica.buffer, desc = "Resolve review submission" })
     M.refresh(state, function(rendered)
-      if rendered then load_next_initial_section(state) end
+      if rendered then load_initial_sections(state) end
+    end)
     end)
   end)
   return state
 end
 
 function M._set_runner_for_test(runner)
+  for _, state in pairs(retained) do finish_close(state, true) end
   runner_for_test = runner
 end
 

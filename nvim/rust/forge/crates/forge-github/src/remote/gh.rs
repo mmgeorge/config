@@ -366,7 +366,7 @@ impl GhClient {
                 .sum::<usize>()
             + decode_bytes;
         self.requests
-            .submit(input_bytes, move |cancellation| {
+            .submit_wait(input_bytes, move |cancellation| {
                 let mut command = Command::new(executable);
                 command.current_dir(directory).args(argument);
                 let _input = if let Some(encoded) = encoded {
@@ -396,7 +396,8 @@ impl GhClient {
                 )?;
                 cancellation.check()?;
                 Ok(decode(output))
-            })?
+            })
+            .await?
             .finish()
             .await
     }

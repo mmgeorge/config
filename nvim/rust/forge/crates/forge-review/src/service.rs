@@ -35,6 +35,7 @@ mod commit;
 mod document;
 pub(crate) mod file;
 mod input;
+mod snapshot;
 pub(crate) mod thread_projection;
 pub use file::{ReviewFileAnalysis, ReviewFileDelivery};
 mod section;
@@ -147,7 +148,9 @@ struct DocumentOwner {
     workspace: Option<std::path::PathBuf>,
     document: Mutex<ReviewDocument>,
     publication: tokio::sync::Mutex<()>,
+    section_projection: tokio::sync::Mutex<()>,
     remote: Arc<dyn ReviewRemote>,
+    initial_page: Mutex<BTreeMap<ReviewSectionKind, forge_github::review_api::ReviewPage>>,
     remote_active: AtomicBool,
     _admission: OwnedSemaphorePermit,
 }
@@ -507,6 +510,53 @@ impl ReviewService {
         service
     }
 
+    /// Opens a PR from a complete status lookup without repeating remote header reads.
+    pub async fn open_pr_snapshot(
+        &self,
+        directory: std::path::PathBuf,
+        remote: Arc<dyn ReviewRemote>,
+        repository: forge_github::model::GithubRepositoryId,
+        number: u64,
+        snapshot: serde_json::Value,
+    ) -> Result<ReviewSnapshot> {
+        validate_workspace(&directory)?;
+        let (target, text, page) = snapshot::decode(repository, number, snapshot)?;
+        self.open_captured_pr(remote, target, Some(directory), Some((text, page)))
+            .await
+    }
+
+    /// Supplies refreshed header pages from the shared status lookup.
+    pub fn retain_pr_snapshot(
+        &self,
+        id: &DocumentId,
+        directory: &std::path::Path,
+        snapshot: serde_json::Value,
+    ) -> Result<()> {
+        let owner = self.owner(id)?;
+        ensure!(
+            owner.workspace.as_deref() == Some(directory),
+            "review snapshot workspace changed"
+        );
+        let target = owner
+            .document
+            .lock()
+            .expect("review document poisoned")
+            .target
+            .clone();
+        let (observed, _, page) =
+            snapshot::decode(target.repository.clone(), target.number, snapshot)?;
+        ensure!(
+            observed.node_id == target.node_id,
+            "review snapshot identity changed"
+        );
+        owner
+            .initial_page
+            .lock()
+            .expect("review initial page poisoned")
+            .extend(page);
+        Ok(())
+    }
+
     /// Reads remote text before publishing a document. Failed or abandoned opens release admission.
     pub async fn open_repository_pr(
         &self,
@@ -516,39 +566,52 @@ impl ReviewService {
         number: u64,
     ) -> Result<ReviewSnapshot> {
         validate_workspace(&directory)?;
-        let page = self
-            .github
-            .review_page(
+        use forge_github::review_api::{ReviewReadRequest, ReviewSection};
+        let read = |view| {
+            self.github.review_page(
                 directory.clone(),
                 remote.clone(),
-                forge_github::review_api::ReviewReadRequest {
+                ReviewReadRequest {
                     repository: repository.clone(),
                     number,
-                    view: forge_github::review_api::ReviewSection::Overview,
+                    view,
                     cursor: None,
                 },
             )
-            .await?;
+        };
+        let (overview, fields, reviewer) = tokio::join!(
+            read(ReviewSection::Overview),
+            read(ReviewSection::EditableFields),
+            read(ReviewSection::RequestedReviewers),
+        );
+        let overview = overview?;
+        let fields = fields?;
+        let reviewer = reviewer?;
         ensure!(
-            page.complete && page.records.len() == 1,
+            overview.complete && overview.records.len() == 1,
             "PR discovery omitted its complete summary"
         );
-        let record = &page.records[0];
         ensure!(
-            record.get("number").and_then(serde_json::Value::as_u64) == Some(number),
-            "PR discovery returned another number"
+            fields.complete && fields.records.len() == 1,
+            "PR discovery omitted editable fields"
         );
+        let observed: forge_github::pull_request::PullRequestState =
+            serde_json::from_value(fields.records.into_iter().next().expect("one field record"))?;
         let target = PullRequestTarget {
             repository,
             number,
-            node_id: record
-                .get("node_id")
-                .and_then(serde_json::Value::as_str)
-                .context("PR discovery omitted node identity")?
-                .into(),
+            node_id: observed.node_id,
         };
-        target.validate()?;
-        self.open_captured_pr(remote, target, Some(directory)).await
+        let text = forge_github::pull_request::PullRequestEdit {
+            title: observed.title,
+            body: observed.body,
+        };
+        let initial_page = BTreeMap::from([
+            (ReviewSectionKind::Overview, overview),
+            (ReviewSectionKind::RequestedReviewers, reviewer),
+        ]);
+        self.open_captured_pr(remote, target, Some(directory), Some((text, initial_page)))
+            .await
     }
 
     pub async fn open_pr(
@@ -556,7 +619,7 @@ impl ReviewService {
         remote: Arc<dyn ReviewRemote>,
         target: PullRequestTarget,
     ) -> Result<ReviewSnapshot> {
-        self.open_captured_pr(remote, target, None).await
+        self.open_captured_pr(remote, target, None, None).await
     }
 
     pub async fn open_pr_in_directory(
@@ -566,7 +629,8 @@ impl ReviewService {
         target: PullRequestTarget,
     ) -> Result<ReviewSnapshot> {
         validate_workspace(&directory)?;
-        self.open_captured_pr(remote, target, Some(directory)).await
+        self.open_captured_pr(remote, target, Some(directory), None)
+            .await
     }
 
     async fn open_captured_pr(
@@ -574,6 +638,10 @@ impl ReviewService {
         remote: Arc<dyn ReviewRemote>,
         target: PullRequestTarget,
         workspace: Option<std::path::PathBuf>,
+        initial: Option<(
+            forge_github::pull_request::PullRequestEdit,
+            BTreeMap<ReviewSectionKind, forge_github::review_api::ReviewPage>,
+        )>,
     ) -> Result<ReviewSnapshot> {
         target.validate()?;
         let admission = Arc::clone(&self.document_admission)
@@ -596,19 +664,27 @@ impl ReviewService {
         self.spawn(async move {
             let _job = job;
             let result = async {
-                let observation = service
-                    .github
-                    .pull_request(
-                        remote.clone(),
-                        PullRequestRequest {
-                            target: target.clone(),
-                            request: PullRequestOperation::Reconcile,
-                        },
-                    )
-                    .await?;
-                let text = observation
-                    .text
-                    .context("PR reconciliation omitted field text")?;
+                let (text, initial_page) = match initial {
+                    Some(initial) => initial,
+                    None => {
+                        let observation = service
+                            .github
+                            .pull_request(
+                                remote.clone(),
+                                PullRequestRequest {
+                                    target: target.clone(),
+                                    request: PullRequestOperation::Reconcile,
+                                },
+                            )
+                            .await?;
+                        (
+                            observation
+                                .text
+                                .context("PR reconciliation omitted field text")?,
+                            BTreeMap::new(),
+                        )
+                    }
+                };
                 let resource = forge_github::recovery::RecoveryResource {
                     repository: target.repository.clone(),
                     kind: forge_github::recovery::RecoveryResourceKind::PullRequest,
@@ -628,7 +704,9 @@ impl ReviewService {
                     workspace,
                     document: Mutex::new(document),
                     publication: tokio::sync::Mutex::new(()),
+                    section_projection: tokio::sync::Mutex::new(()),
                     remote,
+                    initial_page: Mutex::new(initial_page),
                     remote_active: AtomicBool::new(false),
                     _admission: admission,
                 });
@@ -703,14 +781,42 @@ impl ReviewService {
             .snapshot()
     }
 
-    /// Sends one captured title/body batch. Receiver cancellation never cancels an admitted write.
+    /// Saves PR text and requested reviewers in order, retaining admitted work after receiver cancellation.
     pub async fn save(&self, id: &DocumentId) -> Result<ReviewSaveResult> {
-        use forge_github::recovery::RecoveryPhase;
-        use forge_github::review_mutation::{ReviewMutation, ReviewMutationRequest};
         let job = Arc::clone(&self.job_admission)
             .try_acquire_owned()
             .context("review job admission is full")?;
         let guard = self.remote_guard(id)?;
+        let service = self.clone();
+        let (sender, receiver) = oneshot::channel();
+        self.spawn(async move {
+            let _job = job;
+            let result = async {
+                let fields = service.save_fields(&guard, false).await?;
+                if fields.snapshot.uncertain
+                    || fields.remote.as_ref().is_some_and(|result| !result.ok)
+                {
+                    return Ok(fields);
+                }
+                let mut reviewers = service.save_fields(&guard, true).await?;
+                if reviewers.remote.is_none() {
+                    reviewers.remote = fields.remote;
+                }
+                Ok(reviewers)
+            }
+            .await;
+            drop(guard);
+            let _ = sender.send(result);
+        })?;
+        receiver
+            .await
+            .context("review save sequence ended without a result")?
+    }
+
+    /// Saves one field group through the durable mutation queue before admitting another group.
+    async fn save_fields(&self, guard: &RemoteGuard, reviewers: bool) -> Result<ReviewSaveResult> {
+        use forge_github::recovery::RecoveryPhase;
+        use forge_github::review_mutation::ReviewMutationRequest;
         let operation_id = uuid::Uuid::new_v4().to_string();
         let prepared = {
             let mut document = guard
@@ -726,10 +832,36 @@ impl ReviewService {
                 .max()
                 .unwrap_or(0);
             document
-                .begin_save(operation_id.clone())?
-                .map(|edit| (document.target.clone(), edit, sequence))
+                .begin_save(operation_id.clone(), reviewers)?
+                .map(|mutation| {
+                    (
+                        document.target.clone(),
+                        mutation,
+                        sequence,
+                        document.submitted_fields(),
+                    )
+                })
         };
-        let Some((target, edit, sequence)) = prepared else {
+        let Some((target, mutation, sequence, submitted)) = prepared else {
+            let _publication = guard.owner.publication.lock().await;
+            let (target, draft) = {
+                let document = guard
+                    .owner
+                    .document
+                    .lock()
+                    .expect("review document poisoned");
+                (document.target.clone(), document.draft_payload()?)
+            };
+            self.github
+                .review_draft_write(
+                    forge_github::recovery::RecoveryResource {
+                        repository: target.repository,
+                        kind: forge_github::recovery::RecoveryResourceKind::PullRequest,
+                        number: target.number,
+                    },
+                    draft,
+                )
+                .await?;
             return Ok(ReviewSaveResult {
                 snapshot: guard
                     .owner
@@ -740,52 +872,101 @@ impl ReviewService {
                 remote: None,
             });
         };
-        let service = self.clone();
-        let (sender, receiver) = oneshot::channel();
-        self.spawn(async move {
-            let _job = job;
-            let resource = forge_github::recovery::RecoveryResource {
-                repository: target.repository.clone(),
-                kind: forge_github::recovery::RecoveryResourceKind::PullRequest,
-                number: target.number,
-            };
-            let mut dispatch_attempted = false;
-            let mut draft_published = false;
-            let outcome = async {
-                {
-                    let _publication = guard.owner.publication.lock().await;
-                    let draft = guard.owner.document.lock().expect("review document poisoned").draft_payload()?;
-                    service.github.review_draft_write(resource.clone(), draft).await?;
-                    draft_published = true;
-                }
-                let actor = guard.owner.remote.read_actor(target.repository.clone()).await?;
-                dispatch_attempted = true;
-                service.github.review_mutation(guard.owner.remote.clone(), ReviewMutationRequest {
-                    parent_node_id: Some(target.node_id.clone()),
-                    resource: resource.clone(), operation_id: operation_id.clone(), actor_node_id: actor.node_id,
-                    edit_sequence: Some(sequence), draft_target: Some("pr:fields".into()), mutation: ReviewMutation::PullRequestEdit {
-                        node_id: target.node_id, title: edit.title.clone(), body: edit.body.clone(),
+        let service = self;
+        let resource = forge_github::recovery::RecoveryResource {
+            repository: target.repository.clone(),
+            kind: forge_github::recovery::RecoveryResourceKind::PullRequest,
+            number: target.number,
+        };
+        let mut dispatch_attempted = false;
+        let mut draft_published = false;
+        let outcome = async {
+            {
+                let _publication = guard.owner.publication.lock().await;
+                let draft = guard
+                    .owner
+                    .document
+                    .lock()
+                    .expect("review document poisoned")
+                    .draft_payload()?;
+                service
+                    .github
+                    .review_draft_write(resource.clone(), draft)
+                    .await?;
+                draft_published = true;
+            }
+            let actor = guard
+                .owner
+                .remote
+                .read_actor(target.repository.clone())
+                .await?;
+            dispatch_attempted = true;
+            service
+                .github
+                .review_mutation(
+                    guard.owner.remote.clone(),
+                    ReviewMutationRequest {
+                        parent_node_id: Some(target.node_id.clone()),
+                        resource: resource.clone(),
+                        operation_id: operation_id.clone(),
+                        actor_node_id: actor.node_id,
+                        edit_sequence: Some(sequence),
+                        draft_target: Some("pr:fields".into()),
+                        mutation,
                     },
-                }).await
-            }.await;
-            let remote_result = match &outcome {
-                Ok(record) => {
-                    let (outcome, message, state) = match &record.state {
-                        RecoveryPhase::Confirmed { result } => (PullRequestOutcome::Confirmed, None, Some(result)),
-                        RecoveryPhase::Rejected { diagnostic } => (PullRequestOutcome::Rejected, Some(diagnostic.clone()), None),
-                        RecoveryPhase::OutcomeUnknown { diagnostic } => (PullRequestOutcome::OutcomeUnknown, Some(diagnostic.clone()), None),
-                        _ => (PullRequestOutcome::OutcomeUnknown, Some("remote settlement remains unresolved".into()), None),
-                    };
-                    PullRequestResult { ok: outcome == PullRequestOutcome::Confirmed, outcome,
-                        state: state.and_then(|state| state.get("state")).and_then(|state| serde_json::from_value(state.clone()).ok()),
-                        is_draft: state.and_then(|state| state.get("isDraft")).and_then(serde_json::Value::as_bool),
-                        message, matches_submission: (outcome == PullRequestOutcome::Confirmed).then_some(true), text: None }
+                )
+                .await
+        }
+        .await;
+        let remote_result = match &outcome {
+            Ok(record) => {
+                let (outcome, message, state) = match &record.state {
+                    RecoveryPhase::Confirmed { result } => {
+                        (PullRequestOutcome::Confirmed, None, Some(result))
+                    }
+                    RecoveryPhase::Rejected { diagnostic } => {
+                        (PullRequestOutcome::Rejected, Some(diagnostic.clone()), None)
+                    }
+                    RecoveryPhase::OutcomeUnknown { diagnostic } => (
+                        PullRequestOutcome::OutcomeUnknown,
+                        Some(diagnostic.clone()),
+                        None,
+                    ),
+                    _ => (
+                        PullRequestOutcome::OutcomeUnknown,
+                        Some("remote settlement remains unresolved".into()),
+                        None,
+                    ),
+                };
+                PullRequestResult {
+                    ok: outcome == PullRequestOutcome::Confirmed,
+                    outcome,
+                    state: state
+                        .and_then(|state| state.get("state"))
+                        .and_then(|state| serde_json::from_value(state.clone()).ok()),
+                    is_draft: state
+                        .and_then(|state| state.get("isDraft"))
+                        .and_then(serde_json::Value::as_bool),
+                    message,
+                    matches_submission: (outcome == PullRequestOutcome::Confirmed).then_some(true),
+                    text: None,
                 }
-                Err(failure) => PullRequestResult { ok: false,
-                    outcome: if !dispatch_attempted || failure.is::<MutationNotStarted>() { PullRequestOutcome::Rejected } else { PullRequestOutcome::OutcomeUnknown },
-                    state: None, is_draft: None, message: Some(failure.to_string()), matches_submission: None, text: None },
-            };
-            let settled = async {
+            }
+            Err(failure) => PullRequestResult {
+                ok: false,
+                outcome: if !dispatch_attempted || failure.is::<MutationNotStarted>() {
+                    PullRequestOutcome::Rejected
+                } else {
+                    PullRequestOutcome::OutcomeUnknown
+                },
+                state: None,
+                is_draft: None,
+                message: Some(failure.to_string()),
+                matches_submission: None,
+                text: None,
+            },
+        };
+        let settled = async {
                 let _publication = guard.owner.publication.lock().await;
                 if outcome.is_err() && remote_result.outcome == PullRequestOutcome::Rejected {
                     let draft = {
@@ -804,7 +985,7 @@ impl ReviewService {
                     let mut snapshot = guard.owner.document.lock().expect("review document poisoned").snapshot()?;
                     if matches!(record.state, RecoveryPhase::Confirmed { .. }) {
                         for field in &mut snapshot.field {
-                            let submitted = if field.region.0 == "title" { edit.title.as_ref() } else { edit.body.as_ref() };
+                            let submitted = submitted.get(&field.region.0);
                             if let Some(submitted) = submitted {
                                 field.baseline = submitted.clone();
                                 field.dirty = field.text != *submitted;
@@ -823,15 +1004,15 @@ impl ReviewService {
                 outcome?;
                 Ok::<_, anyhow::Error>(ReviewSaveResult { snapshot: document.snapshot()?, remote: Some(remote_result) })
             }.await;
-            if settled.is_err() {
-                let _ = guard.owner.document.lock().expect("review document poisoned").complete_save(None);
-            }
-            drop(guard);
-            let _ = sender.send(settled);
-        })?;
-        receiver
-            .await
-            .context("review save ended without a result")?
+        if settled.is_err() {
+            let _ = guard
+                .owner
+                .document
+                .lock()
+                .expect("review document poisoned")
+                .complete_save(None);
+        }
+        settled
     }
     /// Observes an unresolved write without reposting it. Local edits remain available throughout.
     pub async fn reconcile(&self, id: &DocumentId) -> Result<ReviewSnapshot> {
@@ -839,7 +1020,7 @@ impl ReviewService {
             .try_acquire_owned()
             .context("review job admission is full")?;
         let guard = self.remote_guard(id)?;
-        let (target, operation_id) = {
+        let (target, operation_id, reviewers) = {
             let document = guard
                 .owner
                 .document
@@ -858,6 +1039,7 @@ impl ReviewService {
                     .pending_operation
                     .clone()
                     .context("uncertain PR capture lacks operation identity")?,
+                document.submitted_fields().contains_key("reviewers"),
             )
         };
         let service = self.clone();
@@ -876,7 +1058,11 @@ impl ReviewService {
                     .await?
                     .filter(|record| {
                         record.capture.operation
-                            == forge_github::recovery::RecoveryOperation::PullRequestEdit
+                            == if reviewers {
+                                forge_github::recovery::RecoveryOperation::ReviewerSet
+                            } else {
+                                forge_github::recovery::RecoveryOperation::PullRequestEdit
+                            }
                     });
                 ensure!(
                     recovery
@@ -905,16 +1091,64 @@ impl ReviewService {
                             .await?,
                     );
                 }
-                let observation = service
-                    .github
-                    .pull_request(
-                        guard.owner.remote.clone(),
-                        PullRequestRequest {
-                            target,
-                            request: PullRequestOperation::Reconcile,
-                        },
-                    )
-                    .await?;
+                let observed = if reviewers {
+                    let page = guard
+                        .owner
+                        .remote
+                        .read_review(forge_github::review_api::ReviewReadRequest {
+                            repository: resource.repository.clone(),
+                            number: resource.number,
+                            view: forge_github::review_api::ReviewSection::RequestedReviewers,
+                            cursor: None,
+                        })
+                        .await?;
+                    let record = page
+                        .records
+                        .first()
+                        .context("requested reviewer observation is missing")?;
+                    let mut detail = Vec::new();
+                    for (kind, key) in [("users", "login"), ("teams", "slug")] {
+                        for value in record
+                            .get(kind)
+                            .and_then(serde_json::Value::as_array)
+                            .context("requested reviewer collection is missing")?
+                        {
+                            detail.push((
+                                kind.to_owned(),
+                                value
+                                    .get(key)
+                                    .and_then(serde_json::Value::as_str)
+                                    .context("requested reviewer name is missing")?
+                                    .to_owned(),
+                            ));
+                        }
+                    }
+                    let observed = guard
+                        .owner
+                        .document
+                        .lock()
+                        .expect("review document poisoned")
+                        .observed_reviewers(&detail)?;
+                    std::collections::BTreeMap::from([("reviewers".into(), observed)])
+                } else {
+                    let observation = service
+                        .github
+                        .pull_request(
+                            guard.owner.remote.clone(),
+                            PullRequestRequest {
+                                target,
+                                request: PullRequestOperation::Reconcile,
+                            },
+                        )
+                        .await?;
+                    let text = observation
+                        .text
+                        .context("PR reconciliation omitted field text")?;
+                    [("title", text.title), ("body", text.body)]
+                        .into_iter()
+                        .filter_map(|(name, text)| text.map(|text| (name.into(), text)))
+                        .collect()
+                };
                 let _publication = guard.owner.publication.lock().await;
                 let record = recovery.context("captured PR recovery record is unavailable")?;
                 ensure!(
@@ -926,9 +1160,6 @@ impl ReviewService {
                     ),
                     "captured PR operation has no verified terminal result"
                 );
-                let observed = observation
-                    .text
-                    .context("PR reconciliation omitted field text")?;
                 let draft = guard
                     .owner
                     .document

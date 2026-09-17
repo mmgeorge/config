@@ -112,6 +112,7 @@ struct CommentParams {
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 struct ReviewOpenParams {
+    initial: Option<serde_json::Value>,
     directory: PathBuf,
     target: Option<forge_github::pull_request::PullRequestTarget>,
     repository: Option<forge_github::model::GithubRepositoryId>,
@@ -138,6 +139,14 @@ struct ReviewSectionParams {
     directory: PathBuf,
     section: forge_review::service::ReviewSectionKind,
     cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ReviewLoadParams {
+    document: DocumentId,
+    directory: PathBuf,
+    initial: Option<serde_json::Value>,
 }
 
 #[derive(Deserialize)]
@@ -364,6 +373,8 @@ pub(crate) enum RoutedMethod {
     ReviewSnapshot,
     ReviewMaterialize,
     ReviewSection,
+    ReviewLoad,
+    ReviewHeader,
     ReviewFile,
     ReviewFileMore,
     ReviewThread,
@@ -444,6 +455,8 @@ fn decode_method(method: &str) -> Result<RoutedMethod> {
         "review.snapshot" => Ok(RoutedMethod::ReviewSnapshot),
         "review.materialize" => Ok(RoutedMethod::ReviewMaterialize),
         "review.section" => Ok(RoutedMethod::ReviewSection),
+        "review.load" => Ok(RoutedMethod::ReviewLoad),
+        "review.header" => Ok(RoutedMethod::ReviewHeader),
         "review.file" => Ok(RoutedMethod::ReviewFile),
         "review.file.more" => Ok(RoutedMethod::ReviewFileMore),
         "review.thread" => Ok(RoutedMethod::ReviewThread),
@@ -475,7 +488,10 @@ pub(crate) struct HostRouter {
 
 impl HostRouter {
     pub(crate) fn new(host: Arc<ForgeRuntime>) -> Self {
-        Self { host, status_events: std::sync::OnceLock::new() }
+        Self {
+            host,
+            status_events: std::sync::OnceLock::new(),
+        }
     }
 
     pub(crate) async fn prepare(&self, envelope: &RoutedRequestEnvelope) -> Result<RoutedMethod> {
@@ -733,7 +749,9 @@ impl HostRouter {
                     }
                     StatusRequest::Input { input, selection } => {
                         match self.host.status.act(input, selection).await? {
-                            forge_status::StatusAction::Accepted(accepted, _) => serde_json::to_value(accepted)?,
+                            forge_status::StatusAction::Accepted(accepted, _) => {
+                                serde_json::to_value(accepted)?
+                            }
                             forge_status::StatusAction::Write(ticket) => {
                                 let outcome = ticket.finish().await?;
                                 crate::runtime::repository_write::outcome_value(&outcome)
@@ -790,10 +808,23 @@ impl HostRouter {
                             .await?
                     }
                     (None, Some(repository), Some(number)) => {
-                        self.host
-                            .review
-                            .open_repository_pr(params.directory, remote, repository, number)
-                            .await?
+                        if let Some(initial) = params.initial {
+                            self.host
+                                .review
+                                .open_pr_snapshot(
+                                    params.directory,
+                                    remote,
+                                    repository,
+                                    number,
+                                    initial,
+                                )
+                                .await?
+                        } else {
+                            self.host
+                                .review
+                                .open_repository_pr(params.directory, remote, repository, number)
+                                .await?
+                        }
                     }
                     _ => anyhow::bail!(
                         "review open requires exactly one captured target or repository and number"
@@ -933,6 +964,50 @@ impl HostRouter {
                     )
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
+            }
+            RoutedMethod::ReviewHeader => {
+                let params: ReviewLoadParams = serde_json::from_value(request.params)?;
+                if let Some(initial) = params.initial {
+                    self.host.review.retain_pr_snapshot(
+                        &params.document,
+                        &params.directory,
+                        initial,
+                    )?;
+                }
+                let remote = self
+                    .host
+                    .github_remote
+                    .for_directory(params.directory.clone())?;
+                self.host
+                    .review
+                    .header(&params.document, params.directory, remote)
+                    .await?;
+                let timing = self.host.review.section_timings(&params.document)?;
+                send_completed_result(
+                    sink,
+                    request.id,
+                    serde_json::json!({ "ready": true, "timing": timing }),
+                )
+                .await?;
+            }
+            RoutedMethod::ReviewLoad => {
+                let params: ReviewLoadParams = serde_json::from_value(request.params)?;
+                let remote = self
+                    .host
+                    .github_remote
+                    .for_directory(params.directory.clone())?;
+                let diagnostic = self
+                    .host
+                    .review
+                    .load(&params.document, params.directory, remote)
+                    .await;
+                let timing = self.host.review.section_timings(&params.document)?;
+                send_completed_result(
+                    sink,
+                    request.id,
+                    serde_json::json!({ "diagnostic": diagnostic, "timing": timing }),
+                )
+                .await?;
             }
             RoutedMethod::ReviewSection => {
                 let params: ReviewSectionParams = serde_json::from_value(request.params)?;
@@ -1186,17 +1261,38 @@ pub(crate) fn validate_initialize(params: &Value) -> Result<()> {
     Ok(())
 }
 
-async fn send_status_update(sink: &MessageSender, update: &forge_status::StatusUpdate) -> Result<()> {
-    let message = Message::DocumentEvent(DocumentEvent { document: update.document.0.clone(), event: "status.update".into(), payload: serde_json::to_value(update)? });
-    if forge_protocol::outbound::encode(&message, forge_protocol::MAX_FRAME_BYTES).is_ok() { sink.send_wait(message).await?; return Ok(()); }
+async fn send_status_update(
+    sink: &MessageSender,
+    update: &forge_status::StatusUpdate,
+) -> Result<()> {
+    let message = Message::DocumentEvent(DocumentEvent {
+        document: update.document.0.clone(),
+        event: "status.update".into(),
+        payload: serde_json::to_value(update)?,
+    });
+    if forge_protocol::outbound::encode(&message, forge_protocol::MAX_FRAME_BYTES).is_ok() {
+        sink.send_wait(message).await?;
+        return Ok(());
+    }
     let _permit = sink.begin_transfer()?;
     let transfer = forge_protocol::transfer::JsonTransfer::new(&message)?;
-    let complete = json!({"part_count": transfer.part_count(), "total_bytes": transfer.total_bytes()});
+    let complete =
+        json!({"part_count": transfer.part_count(), "total_bytes": transfer.total_bytes()});
     for part in transfer {
-        sink.send_wait(Message::DocumentEvent(DocumentEvent { document: update.document.0.clone(), event: "document.part".into(), payload: serde_json::to_value(part)? })).await?;
+        sink.send_wait(Message::DocumentEvent(DocumentEvent {
+            document: update.document.0.clone(),
+            event: "document.part".into(),
+            payload: serde_json::to_value(part)?,
+        }))
+        .await?;
         tokio::task::yield_now().await;
     }
-    sink.send_wait(Message::DocumentEvent(DocumentEvent { document: update.document.0.clone(), event: "document.complete".into(), payload: complete })).await?;
+    sink.send_wait(Message::DocumentEvent(DocumentEvent {
+        document: update.document.0.clone(),
+        event: "document.complete".into(),
+        payload: complete,
+    }))
+    .await?;
     Ok(())
 }
 

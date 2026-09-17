@@ -481,7 +481,7 @@ async fn all_scope_preserves_closed_records_and_rejects_foreign_records_before_c
 }
 
 #[tokio::test]
-async fn two_sync_jobs_leave_storage_capacity_and_reject_a_third_sync() -> Result<()> {
+async fn remote_job_limit_leaves_storage_capacity_and_rejects_excess_sync() -> Result<()> {
     let root = tempfile::tempdir()?;
     let (store, request) = request(root.path())?;
     let service = GithubService::default();
@@ -490,14 +490,15 @@ async fn two_sync_jobs_leave_storage_capacity_and_reject_a_third_sync() -> Resul
         release: Default::default(),
     });
     let mut caller = Vec::new();
-    for name in ["first", "second"] {
+    for index in 0..16 {
+        let name = format!("repository-{index}");
         let store = IssueStore::new(
-            root.path().join(name).join("issues/issues.redb"),
+            root.path().join(&name).join("issues/issues.redb"),
             &format!("owner/{name}"),
             Duration::ZERO,
         )?;
         let mut request = request.clone();
-        request.repository = GithubRepositoryId::new("github.com", "owner", name).unwrap();
+        request.repository = GithubRepositoryId::new("github.com", "owner", &name).unwrap();
         request.snapshot = root.path().join(name).join("issues/open-snapshot.json");
         let service = service.clone();
         let task_remote = remote.clone();

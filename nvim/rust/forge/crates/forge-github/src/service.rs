@@ -47,7 +47,7 @@ pub fn not_started(failure: anyhow::Error) -> anyhow::Error {
 }
 
 const MAX_STORAGE_JOBS: usize = 8;
-const MAX_REMOTE_JOBS: usize = 2;
+const MAX_REMOTE_JOBS: usize = 16;
 
 /// Issue storage operation with owned inputs retained for the blocking worker's lifetime.
 #[derive(Debug, Deserialize)]
@@ -456,7 +456,7 @@ impl GithubService {
 
     /// Fetches and commits a normalized issue detail while excluding cache deletion.
     ///
-    /// Shares the two-job remote admission bound with sync. Remote waits hold a repository lease
+    /// Shares the sixteen-job remote admission bound with sync and review reads. Remote waits hold a repository lease
     /// but no database handle. Caller cancellation retains the owned job through persistence.
     pub async fn fetch_detail(
         &self,

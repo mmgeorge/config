@@ -19,17 +19,15 @@ struct BatchedDraft {
 impl ReviewDocument {
     pub(crate) fn reconciled_draft(
         &self,
-        observed: &forge_github::pull_request::PullRequestEdit,
+        observed: &BTreeMap<String, String>,
         require_submission_match: bool,
     ) -> Result<serde_json::Value> {
         let mut draft = self.draft_payload()?;
         for submission in &self.pending {
-            let text = if submission.region().0 == "title" {
-                observed.title.as_deref()
-            } else {
-                observed.body.as_deref()
-            }
-            .context("PR reconciliation omitted captured field text")?;
+            let text = observed
+                .get(&submission.region().0)
+                .map(String::as_str)
+                .context("PR reconciliation omitted captured field text")?;
             ensure!(
                 !require_submission_match || text == submission.text(),
                 "remote PR text no longer matches the captured operation"
@@ -68,7 +66,10 @@ impl ReviewDocument {
             "stored PR draft belongs to another resource"
         );
         let fields: Vec<ReviewField> = serde_json::from_value(fields.clone())?;
-        ensure!(fields.len() == 2, "stored PR field set is incomplete");
+        ensure!(
+            (2..=3).contains(&fields.len()),
+            "stored PR field set is incomplete"
+        );
         let pending: Vec<PendingPrField> = draft
             .get("pr_pending")
             .map(|pending| serde_json::from_value(pending.clone()))
@@ -89,7 +90,7 @@ impl ReviewDocument {
         for mut pending in pending {
             pending.capture.uncertain = true;
             ensure!(
-                matches!(pending.region.0.as_str(), "title" | "body")
+                matches!(pending.region.0.as_str(), "title" | "body" | "reviewers")
                     && capture.insert(pending.region, pending.capture).is_none(),
                 "stored PR capture region is invalid or duplicated"
             );
@@ -97,11 +98,21 @@ impl ReviewDocument {
         let mut seen = std::collections::BTreeSet::new();
         for field in fields {
             ensure!(
-                matches!(field.region.0.as_str(), "title" | "body")
+                matches!(field.region.0.as_str(), "title" | "body" | "reviewers")
                     && seen.insert(field.region.clone()),
                 "stored PR field region is invalid or duplicated"
             );
-            let observed = self.edits.snapshot(&field.region)?.text.to_owned();
+            let observed = if field.region.0 == "reviewers" {
+                self.edits.insert(
+                    field.region.clone(),
+                    RegionRevision(0),
+                    field.baseline.clone(),
+                )?;
+                self.reviewers_loaded = true;
+                None
+            } else {
+                Some(self.edits.snapshot(&field.region)?.text.to_owned())
+            };
             let pending = capture.remove(&field.region);
             ensure!(
                 !field.uncertain || pending.is_some(),
@@ -120,10 +131,16 @@ impl ReviewDocument {
             )?;
             if let Some(pending) = restored_pending {
                 self.pending.push(pending);
-            } else {
+            } else if let Some(observed) = observed {
                 self.edits.merge(&field.region, observed)?;
             }
         }
+        ensure!(
+            seen.contains(&RegionId("title".into()))
+                && seen.contains(&RegionId("body".into()))
+                && capture.is_empty(),
+            "stored PR field set is incomplete"
+        );
         self.pending_operation = (!self.pending.is_empty()).then(|| operation.unwrap().to_owned());
         Ok(())
     }

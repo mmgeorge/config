@@ -115,73 +115,34 @@ local function file_header(record, body)
   return header
 end
 
-local function wrap(text, width, indent)
-  local result, source = { "" }, { { start = 0, prefix = 0 } }
-  local indentation = string.rep(" ", math.min(indent, width - 1))
-  local offset = 0
-  local function continuation()
-    assert(#result < 65536, "status context row budget exceeded")
-    result[#result + 1] = indentation
-    source[#source + 1] = { start = offset, prefix = #indentation }
-  end
-  for physical_index, physical in ipairs(vim.split(text, "\n", { plain = true })) do
-    if physical_index > 1 then offset = offset + 1 continuation() end
-    for part in physical:gmatch("[^%s]*%s?") do
-      if #part > 0 then
-        local prefix = #result == 1 and 0 or #indentation
-        if #result[#result] > prefix and vim.fn.strdisplaywidth(result[#result] .. part) > width then continuation() end
-        if vim.fn.strdisplaywidth(result[#result] .. part) <= width then
-          result[#result] = result[#result] .. part
-          offset = offset + #part
-        else
-          local character_index = 0
-          while true do
-            local character = vim.fn.strcharpart(part, character_index, 1, true)
-            if character == "" then break end
-            prefix = #result == 1 and 0 or #indentation
-            if #result[#result] > prefix and vim.fn.strdisplaywidth(result[#result] .. character) > width then continuation() end
-            result[#result] = result[#result] .. character
-            offset = offset + #character
-            character_index = character_index + 1
-          end
-        end
-      end
-    end
-  end
-  return result, source
-end
-
-local function context_entry(role, label, values, width)
+local function context_entry(role, label, values)
   local prefix = label ~= "" and string.format("%-8s", label .. ":") or ""
   local chunk = { { prefix, "ForgeStatusLabel" } }
   vim.list_extend(chunk, values)
-  local parts, spans, offset = {}, {}, 0
-  for _, value in ipairs(chunk) do
-    parts[#parts + 1] = value[1]
-    spans[#spans + 1] = { start = offset, finish = offset + #value[1], capture = value[2] }
-    offset = offset + #value[1]
-  end
+  local parts = {}
+  for index, value in ipairs(chunk) do parts[index] = value[1] end
   local text = table.concat(parts)
-  assert(#text <= 65536 and not text:find("%z"), "status context text exceeds capacity")
-  local rows, source = wrap(text, role == "issues" and math.max(width, vim.fn.strdisplaywidth(text)) or width, #prefix)
-  local chunks = {}
-  for index, row in ipairs(rows) do
-    local mapping = source[index]
-    local line = {}
-    if mapping.prefix > 0 then line[#line + 1] = { row:sub(1, mapping.prefix), "ForgeStatusPR" } end
-    local finish = mapping.start + #row - mapping.prefix
-    for _, span in ipairs(spans) do
-      local first, last = math.max(span.start, mapping.start), math.min(span.finish, finish)
-      if first < last then line[#line + 1] = { text:sub(first + 1, last), span.capture } end
-    end
-    chunks[index] = line
-  end
-  return entry(rows, chunks, { kind = "context", role = role }, "context")
+  assert(#text <= 65536 and not text:find("[%z\r\n]"), "status context text exceeds capacity")
+  return entry({ text }, { chunk }, { kind = "context", role = role }, "context")
 end
 
-local function commit_chunks(commit, role)
-  return { { commit.oid:sub(1, 7), "ForgeStatusObjectId" }, { " ", "ForgeStatusPR" },
-    { commit.reference, role == "head" and "ForgeStatusBranch" or "ForgeStatusRemote" }, { " " .. commit.subject, "ForgeStatusPR" } }
+local function commit_chunks(commit, role, reference_width)
+  local padding = math.max(0, reference_width - vim.fn.strdisplaywidth(commit.reference))
+  local chunks = { { commit.oid:sub(1, 7), "ForgeStatusObjectId" }, { " ", "ForgeStatusPR" },
+    { commit.reference, role == "head" and "ForgeStatusBranch" or "ForgeStatusRemote" },
+    { string.rep(" ", padding + 1) .. commit.subject, "ForgeStatusPR" } }
+  local count = 0
+  for _, chunk in ipairs(chunks) do count = count + vim.fn.strchars(chunk[1]) end
+  if count <= 100 then return chunks end
+  local result, remaining = {}, 99
+  for _, chunk in ipairs(chunks) do
+    local text = vim.fn.strcharpart(chunk[1], 0, remaining)
+    if text ~= "" then result[#result + 1] = { text, chunk[2] } end
+    remaining = remaining - vim.fn.strchars(text)
+    if remaining == 0 then break end
+  end
+  result[#result + 1] = { "…", "ForgeStatusPR" }
+  return result
 end
 
 local function summary_chunks(summary)
@@ -200,17 +161,22 @@ local function context_entries(session, context)
   local leading, recent = {}, {}
   local function append(collection, role, label, chunks)
     collection[#collection + 1] = { id = "status:context:" .. role,
-      entry = context_entry(role, label, chunks, session.width) }
+      entry = context_entry(role, label, chunks) }
+  end
+  local reference_width = 0
+  for _, role in ipairs({ "head", "upstream", "push" }) do
+    local commit = optional(context[role])
+    if commit then reference_width = math.max(reference_width, vim.fn.strdisplaywidth(commit.reference)) end
   end
   local head = optional(context.head)
-  append(leading, "head", "Head", head and commit_chunks(head, "head")
+  append(leading, "head", "Head", head and commit_chunks(head, "head", reference_width)
     or { { (optional(context.branch) or "(detached)") .. " (no commits)", "ForgeStatusPR" } })
   for _, role in ipairs({ "upstream", "push" }) do
     local commit = optional(context[role])
     local remote = session.presentation.remote_action
     if remote and role == (remote.action == "push" and "push" or "upstream") then
       append(leading, role, role == "upstream" and "Merge" or "Push", { { remote.status, "ForgeStatusFetching" } })
-    elseif commit then append(leading, role, role == "upstream" and "Merge" or "Push", commit_chunks(commit, role)) end
+    elseif commit then append(leading, role, role == "upstream" and "Merge" or "Push", commit_chunks(commit, role, reference_width)) end
   end
   append(leading, "pr", "PR", summary_chunks(session.presentation.pr))
   append(leading, "about", "About", summary_chunks(session.presentation.about))
@@ -826,7 +792,7 @@ function M.present_context(session, presentation)
         local chunks = summary_chunks(presentation[role])
         if not vim.deep_equal(chunks, summary_chunks(previous_presentation[role])) then
           leading[#leading + 1] = { id = "status:context:" .. role,
-            entry = context_entry(role, role == "pr" and "PR" or "About", chunks, session.width) }
+            entry = context_entry(role, role == "pr" and "PR" or "About", chunks) }
         end
       end
     end

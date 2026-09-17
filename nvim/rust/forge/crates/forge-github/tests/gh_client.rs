@@ -459,14 +459,18 @@ async fn detail_and_page_reads_share_admission_and_reap_abandoned_children() -> 
         }));
     }
     let marker = started(root.path(), 4).await?;
-    let failure = client
-        .read_issue_detail(IssueDetailRequest {
+    {
+        let waiting = client.read_issue_detail(IssueDetailRequest {
             repository: request().repository,
             number: 7,
-        })
-        .await
-        .unwrap_err();
-    assert_eq!(failure.kind, RemoteFailureKind::Busy);
+        });
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+    }
     let mut alive = Vec::new();
     for marker in marker {
         let id = marker
@@ -541,7 +545,7 @@ async fn abandoned_native_request_is_reaped_before_its_ownership_is_released() -
 }
 
 #[tokio::test]
-async fn four_native_requests_bound_admission_and_overflow_does_not_start_a_child() -> Result<()> {
+async fn four_native_requests_bound_admission_and_overflow_waits_for_capacity() -> Result<()> {
     let (root, client) = fixture("block")?;
     let mut caller = Vec::new();
     for _ in 0..4 {
@@ -551,13 +555,21 @@ async fn four_native_requests_bound_admission_and_overflow_does_not_start_a_chil
         ));
     }
     started(root.path(), 4).await?;
-    let failure = client.read_issues(request()).await.unwrap_err();
-    assert_eq!(failure.kind, RemoteFailureKind::Busy, "{failure}");
+    let waiting = client.read_issues(request());
+    tokio::pin!(waiting);
+    assert!(
+        tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+            .await
+            .is_err()
+    );
     assert_eq!(started(root.path(), 4).await?.len(), 4);
+    fs::write(root.path().join("mode"), "success")?;
     for caller in caller {
         caller.abort();
         let _ = caller.await;
     }
+    tokio::time::timeout(Duration::from_secs(3), &mut waiting).await??;
+    assert_eq!(started(root.path(), 5).await?.len(), 5);
     client.shutdown(Duration::from_secs(2)).await?;
     Ok(())
 }
@@ -595,10 +607,15 @@ async fn checkout_contexts_share_one_native_admission_budget() -> Result<()> {
     }
     started(first.path(), 2).await?;
     started(second.path(), 2).await?;
-    assert_eq!(
-        context.read_issues(request()).await.unwrap_err().kind,
-        RemoteFailureKind::Busy
-    );
+    {
+        let waiting = context.read_issues(request());
+        tokio::pin!(waiting);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(20), &mut waiting)
+                .await
+                .is_err()
+        );
+    }
     for caller in caller {
         caller.abort();
         let _ = caller.await;
