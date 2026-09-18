@@ -52,11 +52,62 @@ function M.new(spec)
   local artifact_root_for_test = nil
   ---@type (fun(result: RustSidecarExecutableResult))[]?
   local build_callback = nil
+  local lease_cleanup_started = false
   ---@type RustSidecarBuilder
   local builder = {}
   local function executable_name()
     local name = spec.executable_name or spec.crate_name
     return vim.fn.has("win32") == 1 and (name .. ".exe") or name
+  end
+
+  ---Return Windows process IDs that currently belong to Neovim.
+  ---@param output string
+  ---@return table<integer, boolean>
+  local function windows_neovim_pids(output)
+    local process_ids = {}
+    for line in output:gmatch("[^\r\n]+") do
+      local image, process_id = line:match('^"([^"]+)","(%d+)"')
+      if image and image:lower() == "nvim.exe" then process_ids[tonumber(process_id)] = true end
+    end
+    return process_ids
+  end
+
+  ---Remove executable leases whose owning Neovim process no longer exists.
+  ---@param live_neovim_pids? table<integer, boolean>
+  local function cleanup_stale_leases(live_neovim_pids)
+    local leases_root = vim.fs.joinpath(builder.artifact_root(), "leases")
+    local directory = vim.uv.fs_scandir(leases_root)
+    if not directory then return end
+    while true do
+      local name, entry_type = vim.uv.fs_scandir_next(directory)
+      if not name then return end
+      local owner_pid = entry_type == "directory" and tonumber(name:match("^(%d+)%-")) or nil
+      if owner_pid then
+        local _, _, process_error = vim.uv.kill(owner_pid, 0)
+        local owner_gone = process_error == "ESRCH"
+          or (not process_error and live_neovim_pids and not live_neovim_pids[owner_pid])
+        if owner_gone then
+          local lease_root = vim.fs.joinpath(leases_root, name)
+          local executable = vim.fs.joinpath(lease_root, executable_name())
+          vim.uv.fs_unlink(executable)
+          vim.uv.fs_rmdir(lease_root)
+        end
+      end
+    end
+  end
+
+  local function start_lease_cleanup()
+    if lease_cleanup_started then return end
+    lease_cleanup_started = true
+    if vim.fn.has("win32") ~= 1 then
+      vim.schedule(cleanup_stale_leases)
+      return
+    end
+    local started = pcall(vim.system, { "tasklist", "/FO", "CSV", "/NH" }, { text = true },
+      vim.schedule_wrap(function(result)
+        cleanup_stale_leases(result.code == 0 and windows_neovim_pids(result.stdout or "") or nil)
+      end))
+    if not started then vim.schedule(cleanup_stale_leases) end
   end
 
   function builder.crate_dir()
@@ -184,6 +235,7 @@ function M.new(spec)
   end
 
   function builder.acquire(path, callback)
+    start_lease_cleanup()
     local lease_root = vim.fs.joinpath(builder.artifact_root(), "leases", ("%s-%s"):format(vim.fn.getpid(), vim.uv.hrtime()))
     local created, failure = pcall(vim.fn.mkdir, lease_root, "p")
     if not created then callback(nil, tostring(failure)) return end
@@ -211,6 +263,7 @@ function M.new(spec)
   function builder._set_artifact_root_for_test(artifact_root) artifact_root_for_test = artifact_root end
   function builder._reset_for_test()
     crate_dir_for_test, artifact_root_for_test = nil, nil
+    lease_cleanup_started = false
   end
 
   return builder

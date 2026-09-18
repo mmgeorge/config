@@ -145,6 +145,7 @@ impl BackendEvent {
     /// Borrow the provider message identity shared by lifecycle and delta events.
     pub(crate) fn message_id(&self) -> Option<&str> {
         [
+            "/provider_message_id",
             "/params/item/id",
             "/params/itemId",
             "/params/item_id",

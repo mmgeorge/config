@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExchangeNode {
+    PlanEvent { event: Box<crate::plan::ExchangePlanEvent> },
     TurnContent {
         id: String,
         turn_id: String,
@@ -28,6 +29,7 @@ pub enum ExchangeNode {
 impl ExchangeNode {
     pub fn id(&self) -> &str {
         match self {
+            Self::PlanEvent { event } => &event.id,
             Self::TurnContent { id, .. } => id,
             Self::AgentReference { agent } => &agent.id,
             Self::ExchangeInput { prompt } => &prompt.id,

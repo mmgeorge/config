@@ -1,16 +1,16 @@
 use crate::agent::Agent;
 use crate::exchange::Exchange;
 use crate::plan::{
-    PlanAudit, PlanDeviation, PlanExecutionLifecycleEvent, PlanExecutionLifecycleRecord,
-    PlanExecutionRecord, PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanRecord,
+    PlanAudit, PlanDeviation, PlanExecutionRecord, PlanFileStore, PlanLifecycleRecord, PlanRecord,
     PlanResolutionRecord,
 };
 use crate::session::state_machine::SessionPhase;
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap};
 
 pub mod stream;
+mod planning;
 
 /// Represents one durable session action projected outside model interactions.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -35,37 +35,6 @@ pub struct SessionEventRecord {
     pub detail: SessionEventKind,
 }
 
-/// Represents one causally ordered row inside an accepted plan execution.
-#[derive(Clone, Debug, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PlanExecutionTimelineItem {
-    Exchange {
-        exchange: Box<Exchange>,
-    },
-    TaskStarted {
-        task_path: String,
-        ordinal: usize,
-        total: usize,
-        title: String,
-    },
-    TaskCompleted {
-        task_path: String,
-        ordinal: usize,
-        total: usize,
-        title: String,
-        elapsed_ms: i64,
-    },
-    DeviationRecorded {
-        deviation_id: String,
-        summary: String,
-    },
-    Resolution {
-        resolution: PlanResolutionRecord,
-        deviation: Vec<PlanDeviation>,
-        audit: Option<PlanAudit>,
-    },
-}
-
 /// Represents one fully resolved top-level Harness timeline entry.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
@@ -75,26 +44,6 @@ pub enum TimelineEntry {
         created_at_ms: i64,
         exchange: Exchange,
         agent_by_id: HashMap<String, TimelineEntry>,
-    },
-    PlanLifecycle {
-        id: String,
-        created_at_ms: i64,
-        plan: PlanRecord,
-        lifecycle: PlanLifecycleRecord,
-    },
-    PlanExecution {
-        id: String,
-        created_at_ms: i64,
-        plan: PlanRecord,
-        execution: PlanExecutionRecord,
-        item: Vec<PlanExecutionTimelineItem>,
-    },
-    PlanResolution {
-        id: String,
-        created_at_ms: i64,
-        resolution: PlanResolutionRecord,
-        deviation: Vec<PlanDeviation>,
-        audit: Option<PlanAudit>,
     },
     AgentLifecycle {
         id: String,
@@ -120,9 +69,6 @@ impl TimelineEntry {
     pub fn id(&self) -> String {
         match self {
             Self::Exchange { id, .. }
-            | Self::PlanLifecycle { id, .. }
-            | Self::PlanExecution { id, .. }
-            | Self::PlanResolution { id, .. }
             | Self::AgentLifecycle { id, .. }
             | Self::SessionEvent { id, .. }
             | Self::Status { id, .. } => id.clone(),
@@ -142,13 +88,6 @@ impl TimelineEntry {
                     agent.index_exchanges(owner, index);
                 }
             }
-            Self::PlanExecution { item, .. } => {
-                for item in item {
-                    if let PlanExecutionTimelineItem::Exchange { exchange } = item {
-                        index.insert(exchange.id.clone(), owner);
-                    }
-                }
-            }
             Self::AgentLifecycle {
                 exchange, agent, ..
             } => {
@@ -163,7 +102,7 @@ impl TimelineEntry {
         }
     }
 
-    /// Replace a contained exchange without changing its plan or agent ownership.
+    /// Replace a contained exchange without changing its planning events or agent ownership.
     fn replace_exchange(&mut self, replacement: &Exchange) -> bool {
         match self {
             Self::Exchange {
@@ -172,7 +111,7 @@ impl TimelineEntry {
                 ..
             } => {
                 if exchange.id == replacement.id {
-                    *exchange = replacement.clone();
+                    crate::plan::event::replace_exchange(exchange, replacement);
                     true
                 } else {
                     agent_by_id
@@ -180,15 +119,6 @@ impl TimelineEntry {
                         .any(|agent| agent.replace_exchange(replacement))
                 }
             }
-            Self::PlanExecution { item, .. } => item.iter_mut().any(|item| {
-                if let PlanExecutionTimelineItem::Exchange { exchange } = item
-                    && exchange.id == replacement.id
-                {
-                    **exchange = replacement.clone();
-                    return true;
-                }
-                false
-            }),
             Self::AgentLifecycle {
                 exchange, agent, ..
             } => {
@@ -196,7 +126,7 @@ impl TimelineEntry {
                     .iter_mut()
                     .find(|exchange| exchange.id == replacement.id)
                 {
-                    *exchange = replacement.clone();
+                    crate::plan::event::replace_exchange(exchange, replacement);
                     true
                 } else {
                     agent
@@ -208,19 +138,13 @@ impl TimelineEntry {
         }
     }
 
-    /// Remove a nested exchange while retaining its plan or agent container.
+    /// Remove a nested exchange while retaining its agent container.
     fn remove_exchange(&mut self, id: &str) {
         match self {
             Self::Exchange { agent_by_id, .. } => {
                 for agent in agent_by_id.values_mut() {
                     agent.remove_exchange(id);
                 }
-            }
-            Self::PlanExecution { item, .. } => {
-                item.retain(|item| {
-                    !matches!(item,
-                    PlanExecutionTimelineItem::Exchange { exchange } if exchange.id == id)
-                });
             }
             Self::AgentLifecycle {
                 exchange, agent, ..
@@ -237,9 +161,6 @@ impl TimelineEntry {
     fn created_at_ms(&self) -> i64 {
         match self {
             Self::Exchange { created_at_ms, .. }
-            | Self::PlanLifecycle { created_at_ms, .. }
-            | Self::PlanExecution { created_at_ms, .. }
-            | Self::PlanResolution { created_at_ms, .. }
             | Self::AgentLifecycle { created_at_ms, .. }
             | Self::SessionEvent { created_at_ms, .. }
             | Self::Status { created_at_ms, .. } => *created_at_ms,
@@ -281,94 +202,13 @@ impl TimelineProjector {
             session_event_list,
             plan_file: _,
         } = projection;
-        let plan_by_id = plan_list
-            .iter()
-            .map(|plan| (plan.id.as_str(), plan))
-            .collect::<HashMap<_, _>>();
-        let mut interaction_by_execution = HashMap::<String, Vec<Exchange>>::new();
-        let mut result = Vec::new();
-        for interaction in interaction_list {
-            if let Some(execution_id) = interaction.execution_id.as_ref() {
-                interaction_by_execution
-                    .entry(execution_id.clone())
-                    .or_default()
-                    .push(interaction);
-            } else {
-                result.push(TimelineEntry::Exchange {
-                    id: interaction.id.clone(),
-                    created_at_ms: interaction.created_at_ms,
-                    exchange: interaction,
-                    agent_by_id: std::collections::HashMap::new(),
-                });
-            }
-        }
-        for lifecycle in lifecycle_list {
-            if matches!(
-                lifecycle.kind,
-                PlanLifecycleKind::QuestionAnswered
-                    | PlanLifecycleKind::Created
-                    | PlanLifecycleKind::RevisionCreated
-                    | PlanLifecycleKind::ChangesRequested
-            ) {
-                continue;
-            }
-            let Some(plan) = plan_by_id.get(lifecycle.plan_id.as_str()) else {
-                continue;
-            };
-            result.push(TimelineEntry::PlanLifecycle {
-                id: lifecycle.id.clone(),
-                created_at_ms: lifecycle.created_at_ms,
-                plan: (*plan).clone(),
-                lifecycle,
-            });
-        }
-        let mut resolution_by_execution = HashMap::<String, Vec<PlanResolutionRecord>>::new();
-        for resolution in resolution_list {
-            resolution_by_execution
-                .entry(resolution.execution_id.clone())
-                .or_default()
-                .push(resolution);
-        }
-        for execution in execution_list {
-            let Some(plan) = plan_by_id.get(execution.plan_id.as_str()) else {
-                continue;
-            };
-            let interaction_list = interaction_by_execution
-                .remove(&execution.id)
-                .unwrap_or_default();
-            let item = project_plan_execution_item(
-                &execution,
-                interaction_list,
-                resolution_by_execution
-                    .remove(&execution.id)
-                    .unwrap_or_default(),
-                &deviation_list,
-                &audit_list,
-            );
-            result.push(TimelineEntry::PlanExecution {
-                id: execution.id.clone(),
-                created_at_ms: execution.created_at_ms,
-                plan: (*plan).clone(),
-                item,
-                execution,
-            });
-        }
-        for resolution in resolution_by_execution.into_values().flatten() {
-            result.push(TimelineEntry::PlanResolution {
-                id: resolution.id.clone(),
-                created_at_ms: resolution.resolved_at_ms,
-                deviation: deviation_list
-                    .iter()
-                    .filter(|deviation| resolution.deviation_ids.contains(&deviation.id))
-                    .cloned()
-                    .collect(),
-                audit: audit_list
-                    .iter()
-                    .find(|audit| audit.id == resolution.audit_id)
-                    .cloned(),
-                resolution,
-            });
-        }
+        let mut interaction_list = interaction_list;
+        planning::attach(&mut interaction_list, plan_list, lifecycle_list, execution_list,
+            resolution_list, &deviation_list, &audit_list);
+        let mut result = interaction_list.into_iter().map(|exchange| TimelineEntry::Exchange {
+            id: exchange.id.clone(), created_at_ms: exchange.created_at_ms,
+            exchange, agent_by_id: HashMap::new(),
+        }).collect::<Vec<_>>();
         project_agent_tree(&mut result, agent_run_list, agent_exchange_list);
         for event in session_event_list {
             result.push(TimelineEntry::SessionEvent {
@@ -380,143 +220,6 @@ impl TimelineProjector {
         result.sort_by_key(TimelineEntry::created_at_ms);
         Ok(result)
     }
-}
-
-fn project_plan_execution_item(
-    execution: &PlanExecutionRecord,
-    mut interaction_list: Vec<Exchange>,
-    mut resolution_list: Vec<PlanResolutionRecord>,
-    deviation_list: &[PlanDeviation],
-    audit_list: &[PlanAudit],
-) -> Vec<PlanExecutionTimelineItem> {
-    interaction_list.sort_by_key(|interaction| interaction.ordinal);
-    let interaction_id_set = interaction_list
-        .iter()
-        .map(|interaction| interaction.id.clone())
-        .collect::<HashSet<_>>();
-    let mut lifecycle_list = execution.lifecycle.clone();
-    for record in &mut lifecycle_list {
-        if let PlanExecutionLifecycleEvent::TaskCompleted {
-            task_path,
-            elapsed_ms,
-            ..
-        } = &mut record.event
-        {
-            *elapsed_ms = execution.task_duration_ms(
-                task_path,
-                interaction_list.iter(),
-                record.occurred_at_ms,
-            );
-        }
-    }
-    lifecycle_list.sort_by_key(|record| record.sequence);
-    let mut item_list = Vec::new();
-    append_plan_execution_lifecycle(
-        &mut item_list,
-        lifecycle_list
-            .iter()
-            .filter(|record| record.after_exchange_id.is_none()),
-    );
-    resolution_list.sort_by_key(|resolution| resolution.resolved_at_ms);
-    let mut resolutions = resolution_list.into_iter().peekable();
-    let mut interactions = interaction_list.into_iter().peekable();
-    while let Some(interaction) = interactions.next() {
-        let interaction_id = interaction.id.clone();
-        item_list.push(PlanExecutionTimelineItem::Exchange {
-            exchange: Box::new(interaction),
-        });
-        append_plan_execution_lifecycle(
-            &mut item_list,
-            lifecycle_list.iter().filter(|record| {
-                record.after_exchange_id.as_deref() == Some(interaction_id.as_str())
-            }),
-        );
-        while resolutions.peek().is_some_and(|resolution| {
-            interactions
-                .peek()
-                .is_none_or(|next| resolution.resolved_at_ms < next.created_at_ms)
-        }) {
-            let resolution = resolutions.next().unwrap();
-            item_list.push(project_plan_resolution(
-                resolution,
-                deviation_list,
-                audit_list,
-            ));
-        }
-    }
-    append_plan_execution_lifecycle(
-        &mut item_list,
-        lifecycle_list.iter().filter(|record| {
-            record
-                .after_exchange_id
-                .as_deref()
-                .is_some_and(|interaction_id| !interaction_id_set.contains(interaction_id))
-        }),
-    );
-    item_list.extend(
-        resolutions
-            .map(|resolution| project_plan_resolution(resolution, deviation_list, audit_list)),
-    );
-    item_list
-}
-
-/// Attach only the audit and deviations that existed when a plan settled.
-fn project_plan_resolution(
-    resolution: PlanResolutionRecord,
-    deviation_list: &[PlanDeviation],
-    audit_list: &[PlanAudit],
-) -> PlanExecutionTimelineItem {
-    PlanExecutionTimelineItem::Resolution {
-        deviation: deviation_list
-            .iter()
-            .filter(|deviation| resolution.deviation_ids.contains(&deviation.id))
-            .cloned()
-            .collect(),
-        audit: audit_list
-            .iter()
-            .find(|audit| audit.id == resolution.audit_id)
-            .cloned(),
-        resolution,
-    }
-}
-
-fn append_plan_execution_lifecycle<'a>(
-    item_list: &mut Vec<PlanExecutionTimelineItem>,
-    lifecycle_list: impl Iterator<Item = &'a PlanExecutionLifecycleRecord>,
-) {
-    item_list.extend(lifecycle_list.map(|record| match &record.event {
-        PlanExecutionLifecycleEvent::TaskStarted {
-            task_path,
-            ordinal,
-            total,
-            title,
-        } => PlanExecutionTimelineItem::TaskStarted {
-            task_path: task_path.clone(),
-            ordinal: *ordinal,
-            total: *total,
-            title: title.clone(),
-        },
-        PlanExecutionLifecycleEvent::TaskCompleted {
-            task_path,
-            ordinal,
-            total,
-            title,
-            elapsed_ms,
-        } => PlanExecutionTimelineItem::TaskCompleted {
-            task_path: task_path.clone(),
-            ordinal: *ordinal,
-            total: *total,
-            title: title.clone(),
-            elapsed_ms: *elapsed_ms,
-        },
-        PlanExecutionLifecycleEvent::DeviationRecorded {
-            deviation_id,
-            summary,
-        } => PlanExecutionTimelineItem::DeviationRecorded {
-            deviation_id: deviation_id.clone(),
-            summary: summary.clone(),
-        },
-    }));
 }
 
 fn project_agent_tree(
@@ -654,8 +357,7 @@ fn build_agent_entry(
 #[cfg(test)]
 mod test {
     use super::{
-        PlanExecutionTimelineItem, TimelineEntry, TimelineProjection, TimelineProjector,
-        project_plan_execution_item,
+        TimelineEntry, TimelineProjection, TimelineProjector,
     };
     use crate::{
         agent::{Agent, AgentState},
@@ -930,6 +632,7 @@ mod test {
             execution_backend_session_id: None,
             scheduler,
             lifecycle: vec![PlanExecutionLifecycleRecord {
+                    anchor: None,
                 sequence: 1,
                 after_exchange_id: Some("second".into()),
                 occurred_at_ms: 120,
@@ -973,162 +676,12 @@ mod test {
             execution.task_duration_ms("/tasks/0", exchanges.iter(), 5),
             0
         );
-        let items = project_plan_execution_item(&execution, exchanges, Vec::new(), &[], &[]);
-        assert!(items.iter().any(|item| matches!(
-            item,
-            PlanExecutionTimelineItem::TaskCompleted { elapsed_ms: 30, .. }
-        )));
+        super::planning::attach(&mut exchanges, &[], Vec::new(), vec![execution], Vec::new(), &[], &[]);
+        assert!(exchanges.iter().flat_map(|exchange| &exchange.node_list).any(|node| matches!(node,
+            crate::exchange::ExchangeNode::PlanEvent { event }
+            if matches!(&event.content, crate::plan::PlanEventContent::Execution {
+                event: PlanExecutionLifecycleEvent::TaskCompleted { elapsed_ms: 30, .. }
+            }))));
     }
 
-    #[test]
-    fn projects_scheduler_lifecycle_around_its_causal_interaction() {
-        let mut first = interaction("first");
-        first.execution_id = Some("execution".into());
-        let mut second = interaction("second");
-        second.ordinal = 2;
-        second.execution_id = Some("execution".into());
-        let execution = PlanExecutionRecord {
-            id: "execution".into(),
-            session_id: "session".into(),
-            plan_id: "plan".into(),
-            goal_id: "goal".into(),
-            state: PlanExecutionState::Active,
-            planning_backend_session_id: None,
-            execution_backend_session_id: None,
-            scheduler: PlanScheduler::default(),
-            lifecycle: vec![
-                PlanExecutionLifecycleRecord {
-                    sequence: 1,
-                    after_exchange_id: None,
-                    occurred_at_ms: 1,
-                    event: PlanExecutionLifecycleEvent::TaskStarted {
-                        task_path: "/tasks/0".into(),
-                        ordinal: 1,
-                        total: 2,
-                        title: "First task".into(),
-                    },
-                },
-                PlanExecutionLifecycleRecord {
-                    sequence: 2,
-                    after_exchange_id: Some("first".into()),
-                    occurred_at_ms: 2,
-                    event: PlanExecutionLifecycleEvent::TaskCompleted {
-                        task_path: "/tasks/0".into(),
-                        ordinal: 1,
-                        total: 2,
-                        title: "First task".into(),
-                        elapsed_ms: 1000,
-                    },
-                },
-                PlanExecutionLifecycleRecord {
-                    sequence: 3,
-                    after_exchange_id: Some("first".into()),
-                    occurred_at_ms: 2,
-                    event: PlanExecutionLifecycleEvent::TaskStarted {
-                        task_path: "/tasks/1".into(),
-                        ordinal: 2,
-                        total: 2,
-                        title: "Second task".into(),
-                    },
-                },
-                PlanExecutionLifecycleRecord {
-                    sequence: 4,
-                    after_exchange_id: Some("second".into()),
-                    occurred_at_ms: 3,
-                    event: PlanExecutionLifecycleEvent::DeviationRecorded {
-                        deviation_id: "deviation".into(),
-                        summary: "Narrow correction".into(),
-                    },
-                },
-            ],
-            created_at_ms: 1,
-            completed_at_ms: None,
-        };
-
-        let item_list = project_plan_execution_item(
-            &execution,
-            vec![second.clone(), first.clone()],
-            Vec::new(),
-            &[],
-            &[],
-        );
-        assert!(matches!(
-            &item_list[0],
-            PlanExecutionTimelineItem::TaskStarted { task_path, .. } if task_path == "/tasks/0"
-        ));
-        assert!(matches!(
-            &item_list[1],
-            PlanExecutionTimelineItem::Exchange { exchange } if exchange.id == "first"
-        ));
-        assert!(matches!(
-            &item_list[2],
-            PlanExecutionTimelineItem::TaskCompleted { task_path, .. } if task_path == "/tasks/0"
-        ));
-        assert!(matches!(
-            &item_list[3],
-            PlanExecutionTimelineItem::TaskStarted { task_path, .. } if task_path == "/tasks/1"
-        ));
-        assert!(matches!(
-            &item_list[4],
-            PlanExecutionTimelineItem::Exchange { exchange } if exchange.id == "second"
-        ));
-        assert!(matches!(
-            &item_list[5],
-            PlanExecutionTimelineItem::DeviationRecorded { deviation_id, .. }
-                if deviation_id == "deviation"
-        ));
-        second.created_at_ms = 3;
-        let resolution = |id: &str, kind, resolved_at_ms| crate::plan::PlanResolutionRecord {
-            id: id.into(),
-            session_id: "session".into(),
-            plan_id: "plan".into(),
-            execution_id: "execution".into(),
-            accepted_revision: 1,
-            kind,
-            task_summary: crate::plan::PlanTaskSummary {
-                completed: 0,
-                blocked: 1,
-                total: 2,
-            },
-            test_summary: crate::plan::PlanTestSummary {
-                passed: 0,
-                failed: 0,
-                skipped: 0,
-                not_run: 0,
-            },
-            deviation_ids: Vec::new(),
-            audit_id: "audit".into(),
-            resolved_at_ms,
-        };
-        let blocked = resolution("blocked", crate::plan::PlanResolutionKind::Blocked, 2);
-        let complete = resolution("complete", crate::plan::PlanResolutionKind::Completed, 4);
-        let item_list = project_plan_execution_item(
-            &execution,
-            vec![second, first],
-            vec![complete.clone(), blocked.clone()],
-            &[],
-            &[],
-        );
-        assert!(
-            matches!(&item_list[4], PlanExecutionTimelineItem::Resolution { resolution, .. }
-            if resolution.id == "blocked")
-        );
-        assert!(
-            matches!(&item_list[5], PlanExecutionTimelineItem::Exchange { exchange }
-            if exchange.id == "second")
-        );
-        assert!(
-            matches!(&item_list[7], PlanExecutionTimelineItem::Resolution { resolution, .. }
-            if resolution.id == "complete")
-        );
-        let empty =
-            project_plan_execution_item(&execution, Vec::new(), vec![blocked, complete], &[], &[]);
-        assert_eq!(
-            empty
-                .iter()
-                .filter(|item| matches!(item, PlanExecutionTimelineItem::Resolution { .. }))
-                .count(),
-            2
-        );
-    }
 }

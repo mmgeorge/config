@@ -335,6 +335,10 @@ function M.render()
     is_alive = function() return vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf) end,
     notice = function(message) notifications.error(message, "ForgeHarness") end,
     on_update = function()
+      if state.presentation and vim.api.nvim_win_is_valid(state.transcript_win) then
+        require("forge.views.harness.status_hint").render(state.presentation.transcript,
+          M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
+      end
       if render_observer_for_test then render_observer_for_test(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), { native = true }) end
     end,
   }, function(opened, failure)

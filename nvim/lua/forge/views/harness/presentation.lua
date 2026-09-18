@@ -381,6 +381,7 @@ function M.open(options, callback)
     owner.closed = true
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     for _, output in ipairs(owner.output) do output.close() end
+    require("forge.views.harness.status_hint").clear(options.transcript_buffer)
     owner.output = {}
     for _, view in pairs(owner.views) do input.close(view) end
     owner.views = {}

@@ -33,6 +33,8 @@ pub struct PlanTestSummary {
 /// Represents one chronological terminal plan event and its audit references.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanResolutionRecord {
+    #[serde(default)]
+    pub anchor: Option<super::ExchangeAnchor>,
     pub id: String,
     pub session_id: String,
     pub plan_id: String,
@@ -80,6 +82,7 @@ pub fn build_plan_resolution(
         );
     }
     Ok(PlanResolutionRecord {
+        anchor: None,
         id,
         session_id,
         plan_id: scheduler.plan_id.clone(),

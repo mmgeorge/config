@@ -6,6 +6,7 @@ use serde::{Deserialize, Serialize};
 pub enum MessageKind {
     Assistant,
     Reasoning,
+    ReasoningSummary,
 }
 
 /// Distinguishes progress commentary from the provider's final answer.

@@ -71,6 +71,15 @@ pub struct Exchange {
 }
 
 impl Exchange {
+    /// Return the latest readable reasoning summary from the active provider turn.
+    pub fn latest_reasoning_summary(&self) -> Option<&str> {
+        self.turn
+            .iter()
+            .rev()
+            .find(|turn| turn.state() == crate::turn::TurnState::Running)
+            .and_then(crate::turn::Turn::latest_reasoning_summary)
+    }
+
     /// Admit a delegated request before its first provider turn arrives.
     pub(crate) fn delegated(session_id: &str, delegation: &Delegation, ordinal: u64) -> Self {
         Self {
@@ -183,6 +192,7 @@ impl Exchange {
                     let kind = match event.kind.as_str() {
                         "assistant_message" => Some(crate::turn::MessageKind::Assistant),
                         "reasoning" => Some(crate::turn::MessageKind::Reasoning),
+                        "reasoning_summary" => Some(crate::turn::MessageKind::ReasoningSummary),
                         _ => None,
                     };
                     if let Some(kind) = kind {
@@ -617,6 +627,41 @@ mod test {
     }
 
     #[test]
+    fn active_turn_exposes_only_its_latest_readable_reasoning_summary() {
+        use crate::backend::{BackendEvent, ProviderAddress};
+        let mut exchange = interaction();
+        let address = ProviderAddress {
+            thread_id: "parent".into(),
+            turn_id: "turn".into(),
+        };
+        exchange.start_turn(address.clone(), 10).unwrap();
+        let mut event = BackendEvent {
+            address: Some(address),
+            turn_boundary: None,
+            kind: "reasoning_summary".into(),
+            text: Some("Inspecting the repository".into()),
+            data: serde_json::json!({"provider_message_id":"reasoning:summary:0"}),
+            activity: None,
+            summary: None,
+            task_update: None,
+        };
+        exchange.observe_turn(&event, 11).unwrap();
+        event.kind = "reasoning".into();
+        event.text = Some("private chain of thought".into());
+        event.data = serde_json::json!({"params":{"itemId":"reasoning"}});
+        exchange.observe_turn(&event, 12).unwrap();
+
+        assert_eq!(
+            exchange.latest_reasoning_summary(),
+            Some("Inspecting the repository")
+        );
+        exchange.turn[0]
+            .finish(crate::turn::TurnOutcome::Completed, 13)
+            .unwrap();
+        assert_eq!(exchange.latest_reasoning_summary(), None);
+    }
+
+    #[test]
     fn preserves_delegation_and_steering_order_without_duplicate_agents() {
         let mut interaction = interaction();
         assert!(
@@ -658,6 +703,7 @@ mod test {
                 ExchangeNode::ExchangeInput { .. } => "steering",
                 ExchangeNode::PlanCommentResolution { .. } => "resolution",
                 ExchangeNode::ArtifactChange { .. } => "artifact",
+                ExchangeNode::PlanEvent { .. } => "plan",
             })
             .collect::<Vec<_>>();
         assert_eq!(kind_list, ["agent", "steering"]);

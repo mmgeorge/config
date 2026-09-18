@@ -2185,11 +2185,21 @@ cancels pending acceptance and restores plan-review status. Rust attaches one co
 `Resolved N comments` node before the revision artifact delta only after the model submits the
 replacement plan. Acceptance prevents an accepted write plan from inheriting Read authorization and
 blocking its first file change. It then emits
-`Plan accepted`, creates the guarded `Complete accepted plan: <title>` goal, and groups every
-execution turn under one `PlanExecution` entry. `PlanScheduler` timestamps each whole-task
-activation and successful report. `PlanExecutionRecord` appends causally anchored task and
-deviation lifecycle events so the timeline places control outcomes after the interaction that
-persisted them. Cancellation pauses the execution without closing its active task. `/goal resume`
+`Plan accepted` inside the admitted execution exchange and creates the guarded
+`Complete accepted plan: <title>` goal. `PlanScheduler` timestamps each whole-task activation
+and successful report. Plan lifecycle, task transitions, deviations, and execution resolutions
+retain an `ExchangeAnchor` containing the owning exchange ID and a boundary in its append-only
+source node sequence. `TimelineProjector` inserts their content as `ExchangeNode::PlanEvent`
+inside that exchange. The timeline has no separate plan lifecycle, execution, or resolution
+container. Live provider replacement preserves these derived nodes at their captured positions.
+Question answers and withdrawals retain the matching question identity and place its resolved
+details at the response boundary.
+The collapsed clarification row retains the question, options, and response, without duplicating
+the user input row. Review feedback retains annotations before revision execution, including
+failed revisions. Direct review renames remain visible as exchange-owned revision events.
+Records saved before anchors existed use a compatibility path scoped to the matching plan or
+execution. That path uses clarification input boundaries when available, but old provider content
+without item timestamps cannot recover every historical intra-turn position exactly. Cancellation pauses the execution without closing its active task. `/goal resume`
 reuses that task, the effective canonical plan, and an interruption-specific prompt that preserves
 completed workspace work.
 
@@ -2205,13 +2215,13 @@ cleared states do not occupy winbar space because they contain no active work.
 
 Canonical scheduler rows render only `Task X/Y started: <PlanTask.title>` and
 `Task X/Y completed in Ns`. A successfully persisted deviation renders immediately after its
-causal interaction, while the terminal plan resolution retains the full deviation audit. Pending
+causal source position inside the exchange, while the terminal plan resolution retains the full deviation audit. Pending
 tasks, subtasks, rationale text, and file lists do not become lifecycle rows.
 
 Provider task rows remain advisory turn detail. They can expand their frozen thoughts but never
 drive scheduler ordinals, winbar progress, goal completion, or canonical task titles. The live
-projection recognizes interactions already owned by a durable `PlanExecution` and never appends
-the same execution as a second standalone row. The structured goal tool, the 20-turn limit, and
+projection replaces an exchange by its stable identity and preserves attached planning events
+without adding a second transcript occurrence. The structured goal tool, the 20-turn limit, and
 the two-turn no-progress guard remain the execution authority.
 
 Harness defaults to the direct Codex app-server backend. Set `harness.backend = "copilot"` to use

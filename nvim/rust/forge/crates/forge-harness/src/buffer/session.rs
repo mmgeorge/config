@@ -1568,7 +1568,6 @@ mod tests {
     fn continued_exchanges_keep_their_plan_and_agent_document_owner() -> Result<()> {
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
         use crate::exchange::ExchangeState;
-        use crate::timeline::PlanExecutionTimelineItem;
 
         for nesting in ["plan", "agent", "nested-agent"] {
             let TimelineEntry::Exchange { mut exchange, .. } = interaction_entry("continued")
@@ -1597,31 +1596,9 @@ mod tests {
                     }
                 };
             let entry = if nesting == "plan" {
-                TimelineEntry::PlanExecution {
-                    id: "execution".into(),
-                    created_at_ms: 0,
-                    plan: serde_json::from_value(serde_json::json!({
-                        "id": "plan", "session_id": "session", "request": "two tasks",
-                        "title": "Two tasks", "state": "accepted", "working_path": "",
-                        "model_revision": 1, "user_revision": 1,
-                        "created_at_ms": 0, "updated_at_ms": 0,
-                    }))?,
-                    execution: crate::plan::PlanExecutionRecord {
-                        id: "execution".into(),
-                        session_id: "session".into(),
-                        plan_id: "plan".into(),
-                        goal_id: "goal".into(),
-                        state: crate::plan::PlanExecutionState::Active,
-                        planning_backend_session_id: None,
-                        execution_backend_session_id: None,
-                        scheduler: Default::default(),
-                        lifecycle: Vec::new(),
-                        created_at_ms: 0,
-                        completed_at_ms: None,
-                    },
-                    item: vec![PlanExecutionTimelineItem::Exchange {
-                        exchange: Box::new(exchange.clone()),
-                    }],
+                TimelineEntry::Exchange {
+                    id: exchange.id.clone(), created_at_ms: exchange.created_at_ms,
+                    exchange: exchange.clone(), agent_by_id: HashMap::new(),
                 }
             } else {
                 let child = agent_entry("child", vec![exchange.clone()], Vec::new());
@@ -1702,12 +1679,9 @@ mod tests {
 
             owner.update_live(None, Some(&exchange.id), SessionPhase::Idle)?;
             owner.sync(&document, snapshot.revision)?;
-            assert_eq!(owner.timeline.entry_list().len(), 1);
-            assert!(
-                !serde_json::to_string(owner.timeline.entry_list())?
-                    .contains("Second task is running")
-            );
-            assert_eq!(owner.timeline.entry_list()[0].id(), owner_id);
+            assert_eq!(owner.timeline.entry_list().len(), if nesting == "plan" { 0 } else { 1 });
+            assert!(!serde_json::to_string(owner.timeline.entry_list())?.contains("Second task is running"));
+            if nesting != "plan" { assert_eq!(owner.timeline.entry_list()[0].id(), owner_id); }
         }
         Ok(())
     }
@@ -1796,6 +1770,7 @@ mod tests {
                 status: SessionPhase::Working {
                     started_at_ms: 0,
                     activity: crate::session::state_machine::WorkflowActivity::Working,
+                    reasoning_summary: None,
                 },
             },
         ])?;

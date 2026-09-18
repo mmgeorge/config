@@ -147,6 +147,16 @@ impl Turn {
         &self.message
     }
 
+    /// Return the latest readable reasoning summary section for this execution.
+    pub fn latest_reasoning_summary(&self) -> Option<&str> {
+        self.message
+            .iter()
+            .rev()
+            .find(|message| message.kind() == MessageKind::ReasoningSummary)
+            .map(Message::text)
+            .filter(|text| !text.trim().is_empty())
+    }
+
     /// Start a new presentation-independent message at an acknowledged input boundary.
     pub(crate) fn close_message(&mut self) {
         self.current_message = None;
@@ -233,7 +243,7 @@ impl Turn {
 fn default_delivery(kind: MessageKind) -> MessageDelivery {
     match kind {
         MessageKind::Assistant => MessageDelivery::Final,
-        MessageKind::Reasoning => MessageDelivery::Commentary,
+        MessageKind::Reasoning | MessageKind::ReasoningSummary => MessageDelivery::Commentary,
     }
 }
 
@@ -300,6 +310,47 @@ mod tests {
         let restored: Turn = serde_json::from_str(&encoded).unwrap();
         assert_eq!(restored.messages()[2].text(), "After steering");
         assert_eq!(restored.items(), turn.items());
+    }
+
+    #[test]
+    fn latest_reasoning_summary_uses_the_newest_readable_section() {
+        let mut turn = Turn::new(
+            "local".into(),
+            ProviderAddress {
+                thread_id: "thread".into(),
+                turn_id: "provider".into(),
+            },
+            10,
+        );
+        turn.record_provider_text(
+            MessageKind::ReasoningSummary,
+            "Inspecting ownership",
+            Some("reasoning:summary:0".into()),
+            MessageDelivery::Commentary,
+            false,
+        )
+        .unwrap();
+        turn.record_provider_text(
+            MessageKind::Reasoning,
+            "private chain of thought",
+            Some("reasoning".into()),
+            MessageDelivery::Commentary,
+            false,
+        )
+        .unwrap();
+        turn.record_provider_text(
+            MessageKind::ReasoningSummary,
+            "Implementing the data path",
+            Some("reasoning:summary:1".into()),
+            MessageDelivery::Commentary,
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            turn.latest_reasoning_summary(),
+            Some("Implementing the data path")
+        );
     }
 
     #[test]

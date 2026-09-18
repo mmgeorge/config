@@ -5,16 +5,29 @@ local builder = require("rust_sidecar").new({ crate_name = "fixture", binary_tar
   crate_dir = function() error("startup inspected compiler inputs") end,
   artifact_root = function() return root end,
 })
-local original_system, original_hash, original_scan = vim.system, vim.fn.sha256, vim.uv.fs_scandir
+local original_system, original_hash = vim.system, vim.fn.sha256
 local original_executable, original_notify = vim.fn.executable, vim.notify
 ---@type RustSidecarLease?
 local lease
 local succeeded, failure = xpcall(function()
-  vim.system = function() error("startup invoked a compiler") end
+  vim.system = function(command, _, callback)
+    if command[1] ~= "tasklist" then error("startup invoked a compiler") end
+    callback({ code = 0, signal = 0, stdout = ('"nvim.exe","%s","Console","1","1 K"\n')
+      :format(vim.fn.getpid()), stderr = "" })
+  end
   vim.fn.sha256 = function() error("startup hashed contents") end
-  vim.uv.fs_scandir = function() error("startup scanned sources or deployments") end
   vim.fn.mkdir(vim.fs.dirname(builder.binary_path()), "p")
   vim.fn.writefile({ "manually built executable" }, builder.binary_path())
+  local leases_root = vim.fs.joinpath(root, "leases")
+  local stale_root = vim.fs.joinpath(leases_root, "999999-1")
+  local live_root = vim.fs.joinpath(leases_root, ("%s-1"):format(vim.fn.getpid()))
+  local reused_root = vim.fs.joinpath(leases_root, ("%s-1"):format(vim.uv.os_getppid()))
+  vim.fn.mkdir(stale_root, "p")
+  vim.fn.mkdir(live_root, "p")
+  vim.fn.mkdir(reused_root, "p")
+  vim.fn.writefile({ "stale" }, vim.fs.joinpath(stale_root, "fixture.exe"))
+  vim.fn.writefile({ "live" }, vim.fs.joinpath(live_root, "fixture.exe"))
+  vim.fn.writefile({ "reused" }, vim.fs.joinpath(reused_root, "fixture.exe"))
   ---@type RustSidecarExecutableResult?
   local available
   builder.ensure(function(result) available = result end)
@@ -24,6 +37,9 @@ local succeeded, failure = xpcall(function()
     lease = result
   end)
   assert(vim.wait(1000, function() return lease ~= nil end, 5), "copy did not finish")
+  assert(vim.wait(1000, function() return not vim.uv.fs_stat(stale_root) end, 5), "stale lease was retained")
+  assert(vim.wait(1000, function() return not vim.uv.fs_stat(reused_root) end, 5), "reused PID lease was retained")
+  assert(vim.uv.fs_stat(live_root), "live editor lease was removed")
   assert(lease.path ~= available.path)
   vim.fn.writefile({ "rebuilt executable" }, builder.binary_path())
   assert(vim.fn.readfile(lease.path)[1] == "manually built executable", "rebuild changed a running host's copy")
@@ -110,7 +126,7 @@ local succeeded, failure = xpcall(function()
   builder.ensure(function(result) available = result end)
   assert(not available.ok and available.message:find("cargo is not executable", 1, true))
 end, debug.traceback)
-vim.system, vim.fn.sha256, vim.uv.fs_scandir = original_system, original_hash, original_scan
+vim.system, vim.fn.sha256 = original_system, original_hash
 vim.fn.executable, vim.notify = original_executable, original_notify
 if lease then pcall(lease.release) end
 vim.fn.delete(root, "rf")

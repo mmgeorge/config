@@ -10,6 +10,8 @@ mod audit;
 mod deviation;
 mod document;
 mod edit;
+pub(crate) mod event;
+pub use event::{ExchangeAnchor, ExchangePlanEvent, PlanEventContent};
 mod graph;
 mod prompt;
 mod render;
@@ -121,6 +123,10 @@ pub enum PlanLifecycleKind {
 /// Represents one immutable plan lifecycle event in the session timeline.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanLifecycleRecord {
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub anchor: Option<ExchangeAnchor>,
     pub id: String,
     pub session_id: String,
     pub plan_id: String,
@@ -688,7 +694,10 @@ pub enum PlanExecutionLifecycleEvent {
 /// Tracks one causally ordered scheduler event for timeline projection.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanExecutionLifecycleRecord {
+    #[serde(default)]
+    pub anchor: Option<ExchangeAnchor>,
     pub sequence: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after_exchange_id: Option<String>,
     pub occurred_at_ms: i64,
     #[serde(flatten)]
@@ -728,10 +737,10 @@ impl PlanExecutionRecord {
             .fold(0i64, |duration, turn| duration.saturating_add(turn.duration_between(start_ms, end_ms)))
     }
 
-    /// Append one durable scheduler event after its causal interaction.
+    /// Append one durable scheduler event at its causal exchange position.
     pub fn append_lifecycle(
         &mut self,
-        after_exchange_id: Option<String>,
+        anchor: ExchangeAnchor,
         occurred_at_ms: i64,
         event: PlanExecutionLifecycleEvent,
     ) {
@@ -740,8 +749,9 @@ impl PlanExecutionRecord {
             .last()
             .map_or(1, |record| record.sequence.saturating_add(1));
         self.lifecycle.push(PlanExecutionLifecycleRecord {
+            anchor: Some(anchor),
             sequence,
-            after_exchange_id,
+            after_exchange_id: None,
             occurred_at_ms,
             event,
         });

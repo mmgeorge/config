@@ -372,6 +372,7 @@ impl std::fmt::Display for TurnRetracted {
 impl std::error::Error for TurnRetracted {}
 
 struct ExchangeAdmission {
+    plan_event_id: Option<String>,
     prompt: String,
     kind: ExchangeKind,
     plan_id: Option<String>,
@@ -390,6 +391,7 @@ struct PromptControlSnapshot {
 impl ExchangeAdmission {
     fn chat(prompt: String) -> Self {
         Self {
+            plan_event_id: None,
             prompt,
             kind: ExchangeKind::Chat,
             plan_id: None,
@@ -401,6 +403,7 @@ impl ExchangeAdmission {
 
     fn agent(prompt: String, agent_run_id: String) -> Self {
         Self {
+            plan_event_id: None,
             prompt,
             kind: ExchangeKind::Chat,
             plan_id: None,
@@ -412,6 +415,7 @@ impl ExchangeAdmission {
 
     fn plan(prompt: String, plan_id: Option<String>, revision: bool) -> Self {
         Self {
+            plan_event_id: None,
             prompt,
             kind: if revision {
                 ExchangeKind::PlanRevision
@@ -427,6 +431,7 @@ impl ExchangeAdmission {
 
     fn execution(prompt: String, plan_id: String, execution_id: String, goal_id: String) -> Self {
         Self {
+            plan_event_id: None,
             prompt,
             kind: ExchangeKind::PlanExecution,
             plan_id: Some(plan_id),
@@ -438,6 +443,7 @@ impl ExchangeAdmission {
 
     fn goal(prompt: String, goal_id: String) -> Self {
         Self {
+            plan_event_id: None,
             prompt,
             kind: ExchangeKind::Chat,
             plan_id: None,
@@ -799,6 +805,12 @@ impl HarnessBroker {
                 .cloned()
         });
         let active_wait = self.active_wait_projection.clone();
+        let reasoning_summary = interaction
+            .iter()
+            .rev()
+            .find(|exchange| exchange.state == ExchangeState::Running)
+            .and_then(Exchange::latest_reasoning_summary)
+            .map(str::to_owned);
         let status = if let Some(exchange) = interaction
             .iter()
             .find(|exchange| exchange.state == ExchangeState::Finalizing)
@@ -813,7 +825,7 @@ impl HarnessBroker {
                 active_elicitation.as_ref(),
                 active_wait.as_ref(),
                 self.working_started_at_ms
-                    .map(|started_at_ms| (started_at_ms, self.working_activity)),
+                    .map(|started_at_ms| (started_at_ms, self.working_activity, reasoning_summary)),
             )
         };
         self.record_plan_trace(
@@ -2393,6 +2405,8 @@ impl HarnessBroker {
             plan.generation.reset_no_progress();
             self.store.save_plan(&plan)?;
             let lifecycle = PlanLifecycleRecord {
+                title: plan.title.clone(),
+                anchor: Some(self.plan_exchange_anchor(&plan.id)?),
                 id: Uuid::new_v4().to_string(),
                 session_id: self.session.id.clone(),
                 plan_id: plan.id.clone(),
@@ -2445,6 +2459,8 @@ impl HarnessBroker {
             plan.updated_at_ms = self.clock.now_ms();
             self.store.save_plan(&plan)?;
             let lifecycle = PlanLifecycleRecord {
+                title: plan.title.clone(),
+                anchor: Some(self.plan_exchange_anchor(&plan.id)?),
                 id: Uuid::new_v4().to_string(),
                 session_id: self.session.id.clone(),
                 plan_id: plan.id.clone(),
@@ -2549,7 +2565,15 @@ impl HarnessBroker {
             .find(|interaction| interaction.awaiting_input && interaction.elicitation.is_some()))
     }
 
-    /// Records planning feedback only on the live exchange that owns the plan.
+    /// Capture the owning planning exchange for a user review or question action.
+    fn plan_exchange_anchor(&self, plan_id: &str) -> Result<crate::plan::ExchangeAnchor> {
+        let exchange = self.store.list_exchange(&self.session.id)?.into_iter().rev()
+            .find(|exchange| exchange.plan_id.as_deref() == Some(plan_id))
+            .context("planning event has no owning exchange")?;
+        Ok(crate::plan::ExchangeAnchor::capture(&exchange))
+    }
+
+    /// Record planning feedback only on the live exchange that owns the plan.
     fn append_plan_feedback(&mut self, plan_id: &str, text: String) -> Result<()> {
         let mut exchange = self
             .store
@@ -2722,6 +2746,8 @@ impl HarnessBroker {
         self.store.save_plan(&plan)?;
         self.record_plan_trace("feedback_consumed", plan_trace_fields(&plan));
         let lifecycle = PlanLifecycleRecord {
+            title: plan.title.clone(),
+            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
             id: Uuid::new_v4().to_string(),
             session_id: self.session.id.clone(),
             plan_id: plan.id.clone(),
@@ -3034,6 +3060,24 @@ Planning continuation: turn {} of {}.",
         {
             self.resume_exchange_runtime(&interaction)?;
         }
+        if new_interaction {
+            if let Some(event_id) = admission.as_ref().and_then(|admission| admission.plan_event_id.as_deref()) {
+                let mut lifecycle = self.store.list_plan_lifecycle(&self.session.id)?.into_iter()
+                    .find(|record| record.id == event_id).context("admitted planning event is missing")?;
+                lifecycle.anchor = Some(crate::plan::ExchangeAnchor::capture(&interaction));
+                self.store.save_plan_lifecycle(&lifecycle)?;
+            }
+            if let Some(execution_id) = interaction.execution_id.as_deref() {
+                if let Some(mut execution) = self.store.load_plan_execution(execution_id)? {
+                    for record in &mut execution.lifecycle {
+                        if admission.as_ref().is_some_and(|admission| admission.plan_event_id.is_some()) {
+                            record.anchor = Some(crate::plan::ExchangeAnchor::capture(&interaction));
+                        }
+                    }
+                    self.store.save_plan_execution(&execution)?;
+                }
+            }
+        }
         interaction.resume(self.clock.now_ms())?;
         self.store.save_exchange(&interaction)?;
         self.settle_composer_admission(true, &mut event).await?;
@@ -3052,6 +3096,13 @@ Planning continuation: turn {} of {}.",
             &mut event,
         )
         .await?;
+
+        if mode == PromptMode::Plan
+            || admission.as_ref().is_some_and(|admission| admission.plan_event_id.is_some())
+        {
+            let patch = self.reconcile_timeline()?;
+            self.emit_timeline_patch(patch, &mut event).await?;
+        }
 
         let goal = self.session.goal_id.as_deref()
             .map(|id| self.store.load_goal(id)).transpose()?.flatten();
@@ -3425,6 +3476,8 @@ Planning continuation: turn {} of {}.",
                     },
                 });
                 let lifecycle = PlanLifecycleRecord {
+                    title: plan.title.clone(),
+                    anchor: Some(crate::plan::ExchangeAnchor::capture(&interaction)),
                     id: Uuid::new_v4().to_string(),
                     session_id: self.session.id.clone(),
                     plan_id: plan.id.clone(),
@@ -3468,6 +3521,8 @@ Planning continuation: turn {} of {}.",
                     self.record_plan_trace("plan_question_asked", plan_trace_fields(&plan));
                     interaction.awaiting_input = true;
                     let lifecycle = PlanLifecycleRecord {
+                        title: plan.title.clone(),
+                        anchor: Some(crate::plan::ExchangeAnchor::capture(&interaction)),
                         id: Uuid::new_v4().to_string(),
                         session_id: self.session.id.clone(),
                         plan_id: plan.id.clone(),
@@ -4399,6 +4454,9 @@ Planning continuation: turn {} of {}.",
             crate::session::state_machine::SessionPhase::Working {
                 started_at_ms,
                 activity: self.working_activity,
+                reasoning_summary: interaction
+                    .and_then(Exchange::latest_reasoning_summary)
+                    .map(str::to_owned),
             }
         } else {
             crate::session::state_machine::SessionPhase::Idle
@@ -4597,6 +4655,8 @@ Planning continuation: turn {} of {}.",
         self.session.active_plan_id = Some(plan.id.clone());
         self.save_session()?;
         let lifecycle = PlanLifecycleRecord {
+            title: plan.title.clone(),
+            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
             id: Uuid::new_v4().to_string(),
             session_id: self.session.id.clone(),
             plan_id: plan.id.clone(),
@@ -4712,6 +4772,8 @@ Planning continuation: turn {} of {}.",
         let objective = format!("Complete accepted plan: {}", plan.title);
         let goal = self.create_goal(objective, false)?;
         let lifecycle = PlanLifecycleRecord {
+            title: plan.title.clone(),
+            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
             id: Uuid::new_v4().to_string(),
             session_id: self.session.id.clone(),
             plan_id: plan.id.clone(),
@@ -4763,7 +4825,7 @@ Planning continuation: turn {} of {}.",
                 .map(|task| task.task_path.clone())
                 .context("activated task path is missing")?;
             execution_record.append_lifecycle(
-                None,
+                lifecycle.anchor.clone().context("plan acceptance has no owning exchange")?,
                 execution_created_at_ms,
                 PlanExecutionLifecycleEvent::TaskStarted {
                     task_path,
@@ -4803,17 +4865,11 @@ Planning continuation: turn {} of {}.",
             active_task,
             &accepted_document,
         )?;
-        let execution = self
-            .run_interaction(
-                execution_prompt,
-                PromptMode::ExecutePlan,
-                Some(ExchangeAdmission::execution(
-                    format!("Accept plan: {}", plan.request),
-                    plan.id.clone(),
-                    execution_record.id.clone(),
-                    goal.id.clone(),
-                )),
-            )
+        let mut admission = ExchangeAdmission::execution(
+            format!("Accept plan: {}", plan.request), plan.id.clone(),
+            execution_record.id.clone(), goal.id.clone());
+        admission.plan_event_id = Some(lifecycle.id.clone());
+        let execution = self.run_interaction(execution_prompt, PromptMode::ExecutePlan, Some(admission))
             .await;
         let execution_succeeded = execution.is_ok();
         execution_record = self
@@ -4939,6 +4995,8 @@ Planning continuation: turn {} of {}.",
         self.session.mode = HarnessMode::Plan;
         self.save_session()?;
         let lifecycle = PlanLifecycleRecord {
+            title: plan.title.clone(),
+            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
             id: Uuid::new_v4().to_string(),
             session_id: self.session.id.clone(),
             plan_id: plan.id.clone(),
@@ -4966,15 +5024,9 @@ Planning continuation: turn {} of {}.",
             .as_deref()
             .map(|comment| format!("Request plan changes: {comment}"))
             .unwrap_or_else(|| "Request plan changes".into());
-        match self
-            .run_planning_interaction(
-                instruction,
-                Some(ExchangeAdmission::plan(
-                    review_prompt,
-                    Some(plan.id.clone()),
-                    true,
-                )),
-            )
+        let mut admission = ExchangeAdmission::plan(review_prompt, Some(plan.id.clone()), true);
+        admission.plan_event_id = Some(lifecycle.id.clone());
+        match self.run_planning_interaction(instruction, Some(admission))
             .await
         {
             Ok((result, mut event)) => {
@@ -4998,6 +5050,8 @@ Planning continuation: turn {} of {}.",
         PlanStateMachine::apply(&mut plan, PlanEvent::Cancelled, self.clock.now_ms())?;
         self.store.save_plan(&plan)?;
         let lifecycle = PlanLifecycleRecord {
+            title: plan.title.clone(),
+            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
             id: Uuid::new_v4().to_string(),
             session_id: self.session.id.clone(),
             plan_id: plan.id.clone(),
@@ -5377,7 +5431,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         event: &mut Vec<SessionEvent>,
         exchange: &Exchange,
     ) -> Result<bool> {
-        let exchange_id = exchange.id.as_str();
         if output.plan_deviation.is_empty() && output.plan_task_report.is_empty() {
             return Ok(false);
         }
@@ -5463,7 +5516,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 serde_json::to_value(&deviation)?,
             )?);
             execution.append_lifecycle(
-                Some(exchange_id.to_owned()),
+                crate::plan::ExchangeAnchor::capture(exchange),
                 deviation_created_at_ms,
                 PlanExecutionLifecycleEvent::DeviationRecorded {
                     deviation_id: deviation.id.clone(),
@@ -5517,7 +5570,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                     .apply_report(&effective.document, report, transition_at_ms)?;
             if report_state == crate::plan::PlanTaskState::Complete {
                 execution.append_lifecycle(
-                    Some(exchange_id.to_owned()),
+                    crate::plan::ExchangeAnchor::capture(exchange),
                     transition_at_ms,
                     PlanExecutionLifecycleEvent::TaskCompleted {
                         task_path,
@@ -5537,7 +5590,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                     .context("activated task not found")?;
                 let next_task_path = execution.scheduler.task[next_index].task_path.clone();
                 execution.append_lifecycle(
-                    Some(exchange_id.to_owned()),
+                    crate::plan::ExchangeAnchor::capture(exchange),
                     transition_at_ms,
                     PlanExecutionLifecycleEvent::TaskStarted {
                         task_path: next_task_path,
@@ -5703,7 +5756,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             now_ms,
         );
         self.store.save_plan_audit(&self.session.id, &audit)?;
-        let resolution = crate::plan::build_plan_resolution(
+        let mut resolution = crate::plan::build_plan_resolution(
             Uuid::new_v4().to_string(),
             self.session.id.clone(),
             accepted_revision,
@@ -5715,6 +5768,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             },
             now_ms,
         )?;
+        resolution.anchor = Some(crate::plan::ExchangeAnchor::capture(
+            &self.store.list_exchange(&self.session.id)?.into_iter().rev()
+                .find(|exchange| exchange.execution_id.as_deref() == Some(&execution.id))
+                .context("plan resolution has no owning exchange")?));
         self.store.save_plan_resolution(&resolution)
     }
 
@@ -6533,6 +6590,16 @@ fn default_goal_max_turns() -> u32 {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    /// Render persisted timeline state through the native document projection.
+    fn timeline_text(snapshot: &BrokerSnapshot) -> String {
+        snapshot.timeline.iter().flat_map(|entry| {
+            let rendered = crate::buffer::projection::project(entry, &Default::default(), false).unwrap();
+            rendered.entry.block.into_iter().flat_map(|block|
+                (0..block.text.row_count()).map(|row| block.text.row(row).unwrap().to_owned()).collect::<Vec<_>>()
+            ).collect::<Vec<_>>()
+        }).collect::<Vec<_>>().join("\n")
+    }
 
     #[test]
     fn resolves_explicit_named_and_unnamed_fork_names() {
@@ -9470,6 +9537,9 @@ mod test {
                 .any(|event| event.event == "plan_created")
         );
         let completed_snapshot = broker.snapshot().unwrap();
+        let rendered = timeline_text(&completed_snapshot);
+        assert_eq!(rendered.matches("Clarification: Migration: Staged").count(), 1);
+        assert!(!rendered.contains("QuestionAsked"));
         let plan = completed_snapshot.active_plan.expect("submitted plan");
         assert_eq!(plan.state, PlanState::AwaitingReview);
         assert!(plan.elicitation.is_none());
@@ -9497,18 +9567,8 @@ mod test {
                 .is_err()
         );
         assert_eq!(completed_snapshot.exchange[0].plan_id, Some(plan.id));
-        assert!(!completed_snapshot.timeline.iter().any(|entry| {
-            matches!(
-                entry,
-                TimelineEntry::PlanLifecycle {
-                    lifecycle: PlanLifecycleRecord {
-                        kind: PlanLifecycleKind::QuestionAnswered,
-                        ..
-                    },
-                    ..
-                }
-            )
-        }));
+        assert!(completed_snapshot.timeline.iter().all(|entry| matches!(entry,
+            TimelineEntry::Exchange { .. } | TimelineEntry::Status { .. })));
         let lifecycle = broker
             .store
             .list_plan_lifecycle(&broker.session.id)
@@ -10070,7 +10130,11 @@ mod test {
                 .any(|event| event.event == "plan_entity_renamed")
         );
 
-        let updated_plan = broker.snapshot().unwrap().active_plan.unwrap();
+        let renamed_snapshot = broker.snapshot().unwrap();
+        let rendered = timeline_text(&renamed_snapshot);
+        assert!(rendered.contains("Renamed migrate to MigrationRunner"));
+        assert!(rendered.contains("Plan revised"));
+        let updated_plan = renamed_snapshot.active_plan.unwrap();
         let updated_document = broker
             .plan_file
             .read_working_document(&broker.session.id, &updated_plan.id)
@@ -10239,15 +10303,12 @@ mod test {
             revised.response.error()
         );
         let revised_snapshot = broker.snapshot().unwrap();
-        assert!(!revised_snapshot.timeline.iter().any(|entry| matches!(
-            entry,
-            TimelineEntry::PlanLifecycle { lifecycle, .. }
-                if matches!(
-                    lifecycle.kind,
-                    PlanLifecycleKind::ChangesRequested
-                        | PlanLifecycleKind::RevisionCreated
-                )
-        )));
+        assert!(revised_snapshot.timeline.iter().all(|entry| matches!(entry,
+            TimelineEntry::Exchange { .. } | TimelineEntry::Status { .. })));
+        let rendered = timeline_text(&revised_snapshot);
+        assert!(rendered.contains("Plan changes requested"));
+        assert!(rendered.find("Keep the reader boundary narrow").unwrap()
+            < rendered.find("Resolved Overview").unwrap());
         let revised_interaction = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(
             revised_interaction[1].prompt,
@@ -10497,9 +10558,20 @@ mod test {
                     params: if planning { json!({"execution_mode":"write"}) } else { json!({}) },
                 }, sink).await
             });
+            let mut admitted_plan_events = false;
             let state = tokio::time::timeout(std::time::Duration::from_secs(2), async {
                 loop {
                     let event = stream.recv().await.unwrap().unwrap();
+                    if event.kind == "timeline_patch" {
+                        if let Some(operations) = event.data["operation"].as_array() {
+                            admitted_plan_events |= operations.iter().any(|operation| {
+                                let exchange = &operation["entry"]["exchange"];
+                                exchange["kind"] == "plan_execution" && exchange["node_list"].as_array().is_some_and(|nodes|
+                                    nodes.iter().any(|node| node["event"]["content"]["lifecycle"]["kind"] == "accepted")
+                                    && nodes.iter().any(|node| node["event"]["content"]["event"]["kind"] == "task_started"))
+                            });
+                        }
+                    }
                     if event.kind == "execution_state" { break event.data; }
                 }
             }).await.unwrap();
@@ -10507,6 +10579,7 @@ mod test {
             assert!(!operation.is_finished(), "state arrived only after provider completion");
             assert_eq!(state["goal"]["state"], "active");
             if planning {
+                assert!(admitted_plan_events, "planning events arrived only after provider completion");
                 assert_eq!(state["session"]["execution_mode"], "write");
                 assert_eq!(state["goal_execution"]["state"], "active");
             } else {
@@ -10683,8 +10756,11 @@ mod test {
         assert_eq!(broker.store.list_plan_resolution(&broker.session.id).unwrap().len(), 3);
         let snapshot = broker.snapshot().unwrap();
         let projected: Vec<_> = snapshot.timeline.iter().flat_map(|entry| match entry {
-            TimelineEntry::PlanExecution { item, .. } => item.iter().filter_map(|item| match item {
-                crate::timeline::PlanExecutionTimelineItem::Resolution { resolution, .. } => Some(resolution.kind),
+            TimelineEntry::Exchange { exchange, .. } => exchange.node_list.iter().filter_map(|node| match node {
+                ExchangeNode::PlanEvent { event } => match &event.content {
+                    crate::plan::PlanEventContent::Resolution { resolution, .. } => Some(resolution.kind),
+                    _ => None,
+                },
                 _ => None,
             }).collect::<Vec<_>>(),
             _ => Vec::new(),

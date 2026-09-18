@@ -1021,6 +1021,7 @@ async fn normalize_event_in_workspace(
     let tool_event = is_tool_lifecycle_event(&method_lower, &encoded);
     let plan_event = method_lower.contains("plan");
     let reasoning_event = method_lower.contains("reason") || encoded.contains("\"thought\"");
+    let reasoning_summary_event = method_lower == "item/reasoning/summarytextdelta";
     let assistant_event = method_lower.contains("agentmessage");
     let error_event = method_lower.contains("error") || encoded.contains("\"type\":\"error\"");
     let kind = if error_event {
@@ -1030,6 +1031,8 @@ async fn normalize_event_in_workspace(
         "tool"
     } else if plan_event {
         "plan"
+    } else if reasoning_summary_event {
+        "reasoning_summary"
     } else if reasoning_event {
         "reasoning"
     } else {
@@ -1068,12 +1071,26 @@ async fn normalize_event_in_workspace(
         let task_update = plan_event
             .then(|| normalize_task_update(method, &params))
             .flatten();
+        let provider_message_id = reasoning_summary_event.then(|| {
+            let item_id = pointer_string(&params, &["/itemId", "/item_id", "/item/id"])
+                .unwrap_or_else(|| "reasoning".into());
+            let summary_index = params
+                .pointer("/summaryIndex")
+                .or_else(|| params.pointer("/summary_index"))
+                .and_then(Value::as_u64)
+                .unwrap_or(0);
+            format!("{item_id}:summary:{summary_index}")
+        });
+        let mut data = json!({ "method": method, "params": params });
+        if let Some(provider_message_id) = provider_message_id {
+            data["provider_message_id"] = Value::String(provider_message_id);
+        }
         let event = BackendEvent {
             address,
             turn_boundary: None,
             kind: kind.into(),
             text: activity.is_none().then_some(text).flatten(),
-            data: json!({ "method": method, "params": params }),
+            data,
             activity,
             summary: None,
             task_update,
@@ -1464,8 +1481,10 @@ fn control_invocation(method: &str, value: &Value) -> Result<Option<ControlToolI
 }
 
 fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
-    if event.kind == "assistant_message"
-        && let Some(id) = event.message_id()
+    if matches!(
+        event.kind.as_str(),
+        "assistant_message" | "reasoning_summary"
+    ) && let Some(id) = event.message_id()
         && let Some(previous) = output.event.iter_mut().rev().find(|previous| {
             previous.kind == event.kind
                 && previous.address == event.address
@@ -2035,6 +2054,61 @@ mod test {
     }
 
     use super::*;
+
+    #[tokio::test]
+    async fn separates_readable_reasoning_summaries_from_raw_reasoning() {
+        let event = |method: &str, summary_index: u64, delta: &str| {
+            json!({
+                "method": method,
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "itemId": "reasoning-1",
+                    "summaryIndex": summary_index,
+                    "delta": delta,
+                }
+            })
+        };
+        let mut output = BackendOutput::default();
+
+        normalize_event_in_workspace(
+            &event("item/reasoning/summaryTextDelta", 0, "Inspecting "),
+            &mut output,
+            None,
+            "",
+            false,
+        )
+        .await;
+        normalize_event_in_workspace(
+            &event("item/reasoning/summaryTextDelta", 0, "ownership"),
+            &mut output,
+            None,
+            "",
+            false,
+        )
+        .await;
+        normalize_event_in_workspace(
+            &event("item/reasoning/textDelta", 0, "private chain of thought"),
+            &mut output,
+            None,
+            "",
+            false,
+        )
+        .await;
+
+        assert_eq!(output.event.len(), 2);
+        assert_eq!(output.event[0].kind, "reasoning_summary");
+        assert_eq!(
+            output.event[0].text.as_deref(),
+            Some("Inspecting ownership")
+        );
+        assert_eq!(output.event[0].message_id(), Some("reasoning-1:summary:0"));
+        assert_eq!(output.event[1].kind, "reasoning");
+        assert_eq!(
+            output.event[1].text.as_deref(),
+            Some("private chain of thought")
+        );
+    }
 
     #[tokio::test]
     async fn lifecycle_events_cannot_poison_a_corrected_control_request() {

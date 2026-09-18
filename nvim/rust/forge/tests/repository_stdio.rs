@@ -186,6 +186,45 @@ impl Host {
     }
 }
 
+#[tokio::test]
+async fn reopening_large_harness_history_transfers_initialize_without_poisoning_host() {
+    let workspace = tempfile::tempdir().unwrap();
+    let data = tempfile::tempdir().unwrap();
+    let params = json!({
+        "workspace": workspace.path(), "data_root": data.path(), "client_id": "large-history",
+        "backend": {"kind":"mock", "command":[]}
+    });
+    let mut host = Host::start().await;
+    let initialized = host.request(2, "harness.initialize", params.clone()).await;
+    let session = &initialized["result"]["session"];
+    assert!(session["id"].is_string(), "{initialized}");
+    let session_id = session["id"].clone();
+    let agent_id = session["primary_agent_id"].clone();
+    host.stop().await;
+
+    let prompt = "Saved history ".repeat(50_000);
+    let exchange: forge_harness::exchange::Exchange = serde_json::from_value(json!({
+        "id":"large-history", "session_id":session_id, "agent_id":agent_id,
+        "ordinal":1, "prompt":prompt, "kind":"chat", "state":"complete",
+        "created_at_ms":1, "completed_at_ms":2,
+        "attributed_matches_checkpoint":false, "node_list":[]
+    })).unwrap();
+    {
+        let mut store = forge_harness::storage::SqliteStore::open(data.path()).unwrap();
+        store.save_exchange(&exchange).unwrap();
+    }
+    let mut host = Host::start().await;
+    let mut params = params;
+    params["session_id"] = session_id.clone();
+    let reopened = host.request(2, "harness.initialize", params).await;
+    assert_eq!(reopened["result"]["session"]["id"], session_id);
+    assert_eq!(reopened["result"]["exchange"][0]["prompt"], prompt);
+    assert!(serde_json::to_vec(&reopened).unwrap().len() > forge_protocol::MAX_FRAME_BYTES);
+    let subsequent = host.request(3, "repository.revisions", json!({"workspace":workspace.path()})).await;
+    assert_eq!(subsequent["error"]["message"], "revision completion requires a Git repository");
+    host.stop().await;
+}
+
 struct GhExecutable {
     _directory: tempfile::TempDir,
     search_path: std::path::PathBuf,

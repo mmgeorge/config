@@ -301,6 +301,7 @@ mod test {
             .initialize(vec![status(SessionPhase::Working {
                 started_at_ms: 10,
                 activity: WorkflowActivity::Working,
+                reasoning_summary: None,
             })])
             .unwrap();
 
@@ -339,6 +340,7 @@ mod test {
             .reconcile(vec![status(SessionPhase::Working {
                 started_at_ms: 5,
                 activity: WorkflowActivity::Working,
+                reasoning_summary: None,
             })])
             .unwrap();
 
@@ -367,6 +369,7 @@ mod test {
         history.push(status(SessionPhase::Working {
             started_at_ms: 1,
             activity: WorkflowActivity::Working,
+            reasoning_summary: None,
         }));
         stream.initialize(history).unwrap();
         let allocation = stream.value_list[500]["event"]["name"]
@@ -380,6 +383,7 @@ mod test {
                 SessionPhase::Working {
                     started_at_ms: 2,
                     activity: WorkflowActivity::Working,
+                    reasoning_summary: None,
                 },
             )
             .unwrap();
@@ -401,7 +405,8 @@ mod test {
                     None,
                     SessionPhase::Working {
                         started_at_ms: 2,
-                        activity: WorkflowActivity::Working
+                        activity: WorkflowActivity::Working,
+                        reasoning_summary: None,
                     }
                 )
                 .unwrap()

@@ -27,6 +27,7 @@ pub enum SessionPhase {
     Working {
         started_at_ms: i64,
         activity: WorkflowActivity,
+        reasoning_summary: Option<String>,
     },
     AwaitingInput {
         owner: ElicitationOwner,
@@ -58,7 +59,7 @@ impl SessionPhase {
         active_plan: Option<&PlanRecord>,
         active_elicitation: Option<&ActiveElicitation>,
         active_wait: Option<&ActiveWait>,
-        working: Option<(i64, WorkflowActivity)>,
+        working: Option<(i64, WorkflowActivity, Option<String>)>,
     ) -> Self {
         if let Some(plan) = active_plan.filter(|plan| plan.state == PlanState::Failed) {
             return Self::PlanningFailed {
@@ -79,18 +80,18 @@ impl SessionPhase {
                 revision: plan.model_revision,
             };
         }
-        if let (Some(plan), Some((started_at_ms, WorkflowActivity::Planning))) = (
+        if let (Some(plan), Some((started_at_ms, WorkflowActivity::Planning, _))) = (
             active_plan.filter(|plan| {
                 matches!(plan.state, PlanState::Generating | PlanState::Revising)
                     && plan.generation.budget.turn_count > 0
             }),
-            working,
+            working.as_ref(),
         ) {
             return Self::RetryingPlanGeneration {
                 plan_id: plan.id.clone(),
                 turn: plan.generation.budget.turn_count + 1,
                 max_turn: plan.generation.budget.max_turn_count,
-                started_at_ms,
+                started_at_ms: *started_at_ms,
             };
         }
         if let Some(wait) = active_wait {
@@ -98,10 +99,11 @@ impl SessionPhase {
                 agent_count: wait.agent_count,
             };
         }
-        if let Some((started_at_ms, activity)) = working {
+        if let Some((started_at_ms, activity, reasoning_summary)) = working {
             return Self::Working {
                 started_at_ms,
                 activity,
+                reasoning_summary,
             };
         }
         Self::Idle
@@ -149,10 +151,16 @@ mod test {
     #[test]
     fn working_phase_preempts_stale_waiting_state() {
         assert_eq!(
-            SessionPhase::resolve(None, None, None, Some((42, WorkflowActivity::Planning))),
+            SessionPhase::resolve(
+                None,
+                None,
+                None,
+                Some((42, WorkflowActivity::Planning, None)),
+            ),
             SessionPhase::Working {
                 started_at_ms: 42,
                 activity: WorkflowActivity::Planning,
+                reasoning_summary: None,
             }
         );
     }
@@ -190,7 +198,7 @@ mod test {
                 Some(&plan),
                 None,
                 None,
-                Some((42, WorkflowActivity::Planning))
+                Some((42, WorkflowActivity::Planning, None))
             ),
             SessionPhase::RetryingPlanGeneration {
                 plan_id: "plan".into(),

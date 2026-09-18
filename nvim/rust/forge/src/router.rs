@@ -1168,7 +1168,7 @@ impl HostRouter {
                     .harness
                     .open_session(request.id, serde_json::from_value(request.params)?)
                     .await?;
-                sink.send(Message::Response(response))?;
+                send_completed_response(sink, response).await?;
             }
             RoutedMethod::Revisions => {
                 let params: RevisionRequest = serde_json::from_value(request.params)?;
@@ -1301,7 +1301,13 @@ async fn send_completed_result(
     request_id: u64,
     result: impl Serialize,
 ) -> Result<()> {
-    let response = Message::Response(Response::success(request_id, result)?);
+    send_completed_response(sink, Response::success(request_id, result)?).await
+}
+
+/// Transfer a complete response without exceeding individual frame limits.
+async fn send_completed_response(sink: &MessageSender, response: Response) -> Result<()> {
+    let request_id = response.id;
+    let response = Message::Response(response);
     if forge_protocol::outbound::encode(&response, forge_protocol::MAX_FRAME_BYTES).is_ok() {
         sink.send_wait(response).await?;
         return Ok(());
