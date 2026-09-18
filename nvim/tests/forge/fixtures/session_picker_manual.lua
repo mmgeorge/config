@@ -9,6 +9,8 @@ local session_picker = require("forge.views.harness.session_picker")
 
 local function interaction(session_id, prompt)
   local interaction_id = session_id .. ":interaction"
+  local turn_id = interaction_id .. ":turn"
+  local message_id = turn_id .. ":message"
   return {
     id = interaction_id,
     session_id = session_id,
@@ -21,20 +23,22 @@ local function interaction(session_id, prompt)
     token_count = 10,
     node_list = {
       {
-        kind = "main_segment",
-        segment = {
-          id = interaction_id .. ":segment",
-          state = "complete",
-          started_at_ms = 1,
-          completed_at_ms = 2,
-          duration_ms = 1,
-          token_count = 10,
-          spawned_agent_count = 0,
-          thought = {},
-          response = "Timeline preview for " .. prompt,
-        },
+        kind = "turn_content",
+        id = message_id .. ":content",
+        turn_id = turn_id,
+        item = { kind = "message", id = message_id },
       },
     },
+    turn = { {
+      id = turn_id,
+      state = { kind = "finished", outcome = "completed" },
+      started_at_ms = 1,
+      completed_at_ms = 2,
+      token_count = 10,
+      tool = { order = {}, item = {} },
+      message = { { id = message_id, kind = "assistant", delivery = "final", text = "Timeline preview for " .. prompt } },
+      item = { { kind = "message", id = message_id } },
+    } },
   }
 end
 
@@ -42,8 +46,8 @@ local function snapshot(entry)
   local record = interaction(entry.id, entry.name == "" and "[unnamed]" or entry.name)
   return {
     session = entry,
-    interaction = { record },
-    timeline = { { kind = "interaction", id = record.id, created_at_ms = 1, interaction = record } },
+    exchange = { record },
+    timeline = { { kind = "exchange", id = record.id, created_at_ms = 1, exchange = record } },
     artifact = {},
     approval = {},
     capability = {},

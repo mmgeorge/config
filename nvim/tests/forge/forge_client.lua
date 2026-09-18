@@ -9,6 +9,33 @@ local launch_count = 0
 local finish_build
 
 local ok, failure = xpcall(function()
+  local original_start_harness, original_request = client.start_harness, client.request
+  local recovery_options, recovery_method
+  client.start_harness = function(callback, options)
+    recovery_options = options
+    callback({ initialized = true })
+  end
+  client.request = function(method, params, callback)
+    recovery_method = method
+    assert(params.session_id == "leased-session")
+    callback({ forked = true })
+  end
+  for _, action in ipairs({ "retry", "new", "fork" }) do
+    recovery_method = nil
+    local recovered
+    client.resolve_lease_conflict(action, { session_id = "leased-session" }, function(result, request_error)
+      assert(not request_error)
+      recovered = result
+    end)
+    assert(recovered)
+    if action == "retry" then
+      assert(recovery_options == nil, "retry replaced the leased session with a new session")
+    else
+      assert(recovery_options.lease_conflict_action == "new")
+    end
+    assert(recovery_method == (action == "fork" and "session.fork" or nil))
+  end
+  client.start_harness, client.request = original_start_harness, original_request
   builder.ensure = function(done) finish_build = done end
   client._set_launcher_for_test(function() launch_count = launch_count + 1 error("stopped build launched a host") end)
   local completed, rejected = 0, 0

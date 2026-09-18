@@ -6,22 +6,19 @@ local function assert_equals(actual, expected, message)
   end
 end
 
-local function segment(id, text, duration_ms)
+local function turn_content(id, text, duration_ms)
+  local message_id = id .. ":message"
   return {
-    kind = "main_segment",
-    segment = {
+    node = { kind = "turn_content", id = id .. ":content", turn_id = id, item = { kind = "message", id = message_id } },
+    turn = {
       id = id,
-      state = "complete",
+      state = { kind = "finished", outcome = "completed" },
       started_at_ms = 0,
       completed_at_ms = duration_ms,
-      duration_ms = duration_ms,
       token_count = 100,
-      spawned_agent_count = 0,
-      thought = { {
-        id = id .. ":thought",
-        text = text,
-        tool = {},
-      } },
+      tool = { order = {}, item = {} },
+      message = { { id = message_id, kind = "assistant", delivery = "commentary", text = text } },
+      item = { { kind = "message", id = message_id } },
     },
   }
 end
@@ -42,12 +39,14 @@ local ok, failure = pcall(function()
         title = "Add durable task state",
       },
       {
-        kind = "interaction",
-        interaction = {
+        kind = "exchange",
+        exchange = {
           id = "interaction-one",
           kind = "plan_execution",
           state = "complete",
-          node_list = { segment("turn-one", "First continuation", 1000) },
+          duration_ms = 1000,
+          node_list = { turn_content("turn-one", "First continuation", 1000).node },
+          turn = { turn_content("turn-one", "First continuation", 1000).turn },
           task = { current = { { status = "completed" }, { status = "pending" } } },
         },
       },
@@ -72,12 +71,14 @@ local ok, failure = pcall(function()
         title = "Render scheduler progress",
       },
       {
-        kind = "interaction",
-        interaction = {
+        kind = "exchange",
+        exchange = {
           id = "interaction-two",
           kind = "plan_execution",
           state = "complete",
-          node_list = { segment("turn-two", "Second continuation", 2000) },
+          duration_ms = 2000,
+          node_list = { turn_content("turn-two", "Second continuation", 2000).node },
+          turn = { turn_content("turn-two", "Second continuation", 2000).turn },
         },
       },
     },
@@ -86,9 +87,9 @@ local ok, failure = pcall(function()
   local summary_count = 0
   local text = table.concat(result.lines, "\n")
   for _, line in ipairs(result.lines) do
-    if line:find("▸ Executed plan", 1, true) then summary_count = summary_count + 1 end
+    if line:find("▾ Executed plan", 1, true) then summary_count = summary_count + 1 end
   end
-  assert_equals(summary_count, 2, "each execution interaction should retain its own turn summary")
+  assert_equals(summary_count, 2, "each expanded exchange should retain its own summary")
   assert_equals(text:find("First continuation", 1, true) ~= nil, true,
     "execution timeline should retain the first continuation")
   assert_equals(text:find("Second continuation", 1, true) ~= nil, true,

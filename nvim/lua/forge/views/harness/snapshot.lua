@@ -25,7 +25,7 @@ function HarnessSnapshot.apply(state, result)
   state.active_elicitation = result.active_elicitation
   state.active_wait = vim.deepcopy(result.active_wait)
   state.approval = vim.deepcopy(result.approval or {})
-  state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, turn = {} })
+  state.agent = vim.deepcopy(result.agent or { definition = {}, run = {}, exchange = {} })
   if state.selected_agent_run_id then
     local selected_exists = vim.iter(state.agent.run or {}):any(function(run)
       return run.id == state.selected_agent_run_id

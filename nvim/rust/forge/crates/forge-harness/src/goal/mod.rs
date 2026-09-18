@@ -10,6 +10,8 @@ pub enum GoalState {
     Paused,
     Complete,
     Blocked,
+    UsageLimited,
+    BudgetLimited,
     Stalled,
     Cleared,
 }
@@ -33,7 +35,8 @@ pub struct GoalRecord {
 pub struct TurnEvidence {
     pub workspace_changed: bool,
     pub tool_called: bool,
-    pub native_complete: bool,
+    #[serde(default)]
+    pub native_state: Option<GoalState>,
     pub structured_complete: bool,
     pub structured_blocked: bool,
 }
@@ -46,23 +49,32 @@ pub enum ContinuationDecision {
     Complete,
     Blocked,
     Stalled,
+    Settled,
     Stop,
 }
 
 impl GoalRecord {
     /// Resolve the next goal action from turn evidence and continuation guards.
     pub fn observe(&mut self, evidence: TurnEvidence, now_ms: i64) -> ContinuationDecision {
+        if self.state != GoalState::Active {
+            return ContinuationDecision::Stop;
+        }
         self.updated_at_ms = now_ms;
-        if evidence.native_complete || evidence.structured_complete {
+        if self.native
+            && let Some(state) = evidence
+                .native_state
+                .filter(|state| *state != GoalState::Active)
+        {
+            self.state = state;
+            return ContinuationDecision::Settled;
+        }
+        if evidence.structured_complete {
             self.state = GoalState::Complete;
             return ContinuationDecision::Complete;
         }
         if evidence.structured_blocked {
             self.state = GoalState::Blocked;
             return ContinuationDecision::Blocked;
-        }
-        if self.state != GoalState::Active {
-            return ContinuationDecision::Stop;
         }
         let progress = evidence.workspace_changed || evidence.tool_called;
         let may_continue = self.continuation.observe(progress);
@@ -148,5 +160,114 @@ mod test {
         assert_eq!(record.observe(progress, 1), ContinuationDecision::Continue);
         assert_eq!(record.observe(progress, 2), ContinuationDecision::Stalled);
         assert_eq!(record.continuation.turn_count, 2);
+    }
+
+    #[test]
+    fn native_settlement_overrides_progress_and_freezes_continuation() {
+        for state in [
+            GoalState::Paused,
+            GoalState::Complete,
+            GoalState::Blocked,
+            GoalState::UsageLimited,
+            GoalState::BudgetLimited,
+            GoalState::Cleared,
+        ] {
+            let mut record = goal();
+            record.native = true;
+            let evidence = TurnEvidence {
+                native_state: Some(state),
+                tool_called: true,
+                workspace_changed: true,
+                structured_complete: true,
+                ..TurnEvidence::default()
+            };
+            assert_eq!(record.observe(evidence, 20), ContinuationDecision::Settled);
+            assert_eq!(record.state, state);
+            assert_eq!(record.continuation.turn_count, 0);
+            assert_eq!(record.observe(evidence, 40), ContinuationDecision::Stop);
+            assert_eq!(record.updated_at_ms, 20);
+            if matches!(
+                state,
+                GoalState::Paused
+                    | GoalState::Blocked
+                    | GoalState::UsageLimited
+                    | GoalState::BudgetLimited
+            ) {
+                record.resume(50);
+                assert_eq!(
+                    record.observe(
+                        TurnEvidence {
+                            tool_called: true,
+                            ..TurnEvidence::default()
+                        },
+                        60
+                    ),
+                    ContinuationDecision::Continue
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn native_settlement_cannot_stop_harness_owned_plan_execution() {
+        let mut record = goal();
+        assert_eq!(
+            record.observe(
+                TurnEvidence {
+                    native_state: Some(GoalState::Cleared),
+                    tool_called: true,
+                    ..TurnEvidence::default()
+                },
+                20
+            ),
+            ContinuationDecision::Continue
+        );
+        assert_eq!(record.state, GoalState::Active);
+    }
+
+    #[test]
+    fn inactive_goals_preserve_state_and_time_until_explicit_resume() {
+        for state in [
+            GoalState::Paused,
+            GoalState::Complete,
+            GoalState::Blocked,
+            GoalState::Stalled,
+            GoalState::Cleared,
+        ] {
+            let mut record = goal();
+            record.state = state;
+            record.updated_at_ms = 10;
+            for evidence in [
+                TurnEvidence::default(),
+                TurnEvidence {
+                    native_state: Some(GoalState::Complete),
+                    ..TurnEvidence::default()
+                },
+                TurnEvidence {
+                    structured_complete: true,
+                    ..TurnEvidence::default()
+                },
+                TurnEvidence {
+                    structured_blocked: true,
+                    ..TurnEvidence::default()
+                },
+            ] {
+                assert_eq!(record.observe(evidence, 50), ContinuationDecision::Stop);
+                assert_eq!(record.state, state);
+                assert_eq!(record.updated_at_ms, 10);
+                assert_eq!(record.continuation.turn_count, 0);
+            }
+            if matches!(
+                state,
+                GoalState::Paused | GoalState::Blocked | GoalState::Stalled
+            ) {
+                record.resume(60);
+                assert_eq!(
+                    record.observe(TurnEvidence::default(), 70),
+                    ContinuationDecision::RetryNoProgress
+                );
+                assert_eq!(record.updated_at_ms, 70);
+            }
+        }
     }
 }

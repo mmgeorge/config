@@ -86,11 +86,39 @@ local function selected_agent_run(state)
   return nil
 end
 
+local function selected_agent_target(state)
+  local run = selected_agent_run(state)
+  if not run then return nil end
+  local exchange_list = timeline_cache.agent_exchange_list(state, run.id)
+  for exchange_index = #exchange_list, 1, -1 do
+    local exchange = exchange_list[exchange_index]
+    if exchange.agent_id == run.id and exchange.state == "running" then
+      for turn_index = #(exchange.turn or {}), 1, -1 do
+        local turn = exchange.turn[turn_index]
+        if type(turn.state) == "table" and turn.state.kind == "running" and turn.provider then
+          return {
+            thread_id = turn.provider.thread_id,
+            turn_id = turn.provider.turn_id,
+          }
+        end
+      end
+    end
+  end
+  return nil
+end
+
 ---@param state table
 ---@return string?
 local function goal_status_text(state)
+  local stopped_label = {
+    blocked = "blocked", stalled = "stalled", usage_limited = "usage limited",
+    budget_limited = "budget limited",
+  }
+  local reason = state.goal and stopped_label[state.goal.state]
+  if reason then return " • " .. (state.goal_execution and "Plan " or "Goal ") .. reason end
   local execution = state.goal_execution
   if execution and execution.created_at_ms then
+    if execution.state == "paused" then return " • Plan paused" end
     local terminal_at_ms = execution.state == "complete" and execution.completed_at_ms or nil
     local elapsed_ms = math.max(0, (terminal_at_ms or (os.time() * 1000)) - execution.created_at_ms)
     local elapsed_seconds = math.floor(elapsed_ms / 1000)
@@ -107,6 +135,7 @@ local function goal_status_text(state)
 
   local goal = state.goal
   if not goal or not goal.created_at_ms then return nil end
+  if goal.state == "paused" then return " • Goal paused" end
   local terminal_at_ms = goal.state == "complete" and goal.updated_at_ms or nil
   local elapsed_ms = math.max(0, (terminal_at_ms or (os.time() * 1000)) - goal.created_at_ms)
   local elapsed_seconds = math.floor(elapsed_ms / 1000)
@@ -149,9 +178,16 @@ local function composer_text(buf)
 end
 
 ---@param buf integer
+local function dismiss_composer_completion(buf)
+  local completion = package.loaded["blink.cmp"]
+  if completion and vim.api.nvim_get_current_buf() == buf then completion.hide() end
+end
+
+---@param buf integer
 ---@param text string
 local function set_composer_text(buf, text)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
+  dismiss_composer_completion(buf)
   vim.bo[buf].modifiable = true
   local last_row = vim.api.nvim_buf_line_count(buf) - 1
   local last = vim.api.nvim_buf_get_lines(buf, last_row, last_row + 1, false)[1]
@@ -256,7 +292,9 @@ function M.refresh_winbar()
     context_status.segment(state.session and state.session.context_usage)
   )
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
-    vim.wo[state.composer_win].winbar = ""
+    vim.wo[state.composer_win].winbar = keymaps.render_hintbar(
+      keymaps.view_hint_entries("harness", state.command_set, state, "composer"),
+      vim.api.nvim_win_get_width(state.composer_win))
   end
   render_queue()
 end
@@ -342,6 +380,7 @@ local function set_busy(busy)
     end)
   else
     state.working_started_ns = nil
+    state.cancel_requested = false
     if state.working_timer then
       state.working_timer:stop()
       state.working_timer:close()
@@ -377,19 +416,35 @@ local function reconcile_approval_presentation(state)
   state.presented_approval_id = nil
 end
 
----@param callback? function
+---@param callback? fun(result: table)
 local function synchronize_state(callback)
   local synchronized_state = harness_state()
-  if synchronized_state.state_sync_pending then return end
+  if callback then
+    synchronized_state.state_sync_callback = synchronized_state.state_sync_callback or {}
+    table.insert(synchronized_state.state_sync_callback, callback)
+  end
+  if synchronized_state.state_sync_pending then
+    synchronized_state.state_sync_again = true
+    return
+  end
   synchronized_state.state_sync_pending = true
   client.request("state.get", {}, function(result, request_error)
     synchronized_state.state_sync_pending = false
     if request_error then
+      synchronized_state.state_sync_callback = nil
+      synchronized_state.state_sync_again = nil
       notifications.error(request_error, "Harness state")
       return
     end
     if not result then
+      synchronized_state.state_sync_callback = nil
+      synchronized_state.state_sync_again = nil
       notifications.error("Harness broker returned an empty state snapshot", "Harness state")
+      return
+    end
+    if synchronized_state.state_sync_again then
+      synchronized_state.state_sync_again = nil
+      synchronize_state()
       return
     end
     local state = harness_state()
@@ -407,7 +462,9 @@ local function synchronize_state(callback)
     end
     if #state.approval > 0 then vim.schedule(M.present_approval) end
     M.render()
-    if callback then callback(result) end
+    local callbacks = synchronized_state.state_sync_callback or {}
+    synchronized_state.state_sync_callback = nil
+    for _, completed in ipairs(callbacks) do completed(result) end
   end)
 end
 
@@ -451,7 +508,14 @@ local function on_event(event, payload)
     end
     schedule_render()
   elseif event == "backend_event" then
-    if payload.kind == "composer_patch" then
+    if payload.kind == "execution_state" then
+      local execution = payload.data or {}
+      if type(execution.session) ~= "table" or not state.session or execution.session.id ~= state.session.id then return end
+      state.session = execution.session
+      state.goal = type(execution.goal) == "table" and execution.goal.state ~= "cleared" and execution.goal or nil
+      state.goal_execution = type(execution.goal_execution) == "table" and execution.goal_execution or nil
+      M.refresh_winbar()
+    elseif payload.kind == "composer_patch" then
       if state.presentation then state.presentation.receive(payload) end
     elseif payload.kind == "approval_requested" then
       local request = payload.data or payload
@@ -535,7 +599,7 @@ local function on_event(event, payload)
   then
     synchronize_state()
   elseif event == "goal_changed" or event == "goal_continue_requested" then
-    state.goal = payload.state == "cleared" and nil or payload
+    state.goal = payload.state ~= "cleared" and payload or nil
     if state.goal_execution then
       synchronize_state()
     else
@@ -579,7 +643,7 @@ local function on_event(event, payload)
     state.agent = vim.deepcopy(payload)
     require("forge.views.harness.agent_picker").refresh()
     schedule_render()
-  elseif event == "interaction_complete" or event == "interaction_updated" then
+  elseif event == "exchange_complete" or event == "exchange_updated" then
     synchronize_state()
   elseif event == "state_invalidated" then
     synchronize_state()
@@ -683,7 +747,7 @@ function M.present_plan_question(force)
           synchronize_state()
           return
         end
-        synchronize_state()
+        synchronize_state(M.drain)
       end)
     end,
     closed = function()
@@ -738,7 +802,7 @@ local function resume_mode_restart(mode)
     end
     state.session = session_result or state.session
     append_session_status("Execution mode changed to " .. label)
-    client.request("interaction.resume", {
+    client.request("exchange.resume", {
       text = "Continue the active task from the interrupted turn. Execution mode is now " .. label
         .. ". Preserve completed work and do not repeat finished actions.",
     }, function(result, resume_error)
@@ -772,7 +836,7 @@ local function maybe_resume_mcp_restart()
   set_busy(true)
   local change_summary = restart.error and ("The MCP change failed: " .. restart.error)
     or ("MCP server %s is now %s."):format(restart.name, restart.enabled and "enabled" or "disabled")
-  client.request("interaction.resume", {
+  client.request("exchange.resume", {
     text = "Continue the active task from the interrupted turn. " .. change_summary
       .. " Preserve completed work and do not repeat finished actions.",
   }, function(result, resume_error)
@@ -795,7 +859,7 @@ end
 ---@param text string
 begin_request = function(text, from_composer)
   local state = harness_state()
-  local selected_run = selected_agent_run(state)
+  if from_composer then dismiss_composer_completion(state.composer_buf) end
   state.cancel_requested = false
   set_busy(true)
   local goal_objective = text:match("^/goal%s+(.+)$")
@@ -803,8 +867,8 @@ begin_request = function(text, from_composer)
     state.goal = { objective = goal_objective, state = "active" }
   end
   M.render()
-  local method = selected_run and "agent.submit" or "prompt.submit"
-  local params = selected_run and { run_id = selected_run.id, text = text } or { text = text }
+  local method = "prompt.submit"
+  local params = { text = text }
   local function receive(result, request_error, error_detail)
     set_busy(false)
     state.cancel_requested = false
@@ -825,19 +889,17 @@ begin_request = function(text, from_composer)
           resume_mode_restart(state.pending_mode)
           return
         end
-        synchronize_state()
-        vim.schedule(M.drain)
+        synchronize_state(M.drain)
         return
       end
       notifications.error(request_error, "ForgeHarness")
-      M.render()
+      synchronize_state()
       return
     elseif result then
       state.session = result.session or (result.id and result) or state.session
       state.capability = result.capability or state.capability
     end
-    synchronize_state()
-    vim.schedule(M.drain)
+    synchronize_state(M.drain)
   end
   if from_composer then
     if state.presentation then state.presentation.submit(receive)
@@ -852,6 +914,11 @@ function M.cancel_turn()
     return
   end
   if state.cancel_requested then return end
+  local target = selected_agent_target(state)
+  if state.selected_agent_run_id and not target then
+    notifications.warn("The selected child has no active turn to cancel", "ForgeHarness")
+    return
+  end
   state.mode_restart_requested = false
   state.pending_mode = nil
   state.cancel_requested = true
@@ -860,11 +927,6 @@ function M.cancel_turn()
     and #(state.queue or {}) == 0
     and #(state.pending_steer or {}) == 0
     and composer_text(state.composer_buf) == ""
-  local selected_run = selected_agent_run(state)
-  local target = selected_run and selected_run.provider_thread_id and selected_run.active_turn_id and {
-    thread_id = selected_run.provider_thread_id,
-    turn_id = selected_run.active_turn_id,
-  } or nil
   client.request("turn.cancel", { restore_prompt_if_no_output = restore_prompt, target = target }, function(result, request_error)
     if request_error then
       state.cancel_requested = false
@@ -875,6 +937,9 @@ function M.cancel_turn()
     if not (result and result.cancel_requested) then
       state.cancel_requested = false
       notifications.warn("The Harness turn already finished", "ForgeHarness")
+      M.refresh_winbar()
+    elseif target then
+      state.cancel_requested = false
       M.refresh_winbar()
     end
   end)
@@ -906,7 +971,7 @@ end
 
 function M.drain()
   local state = harness_state()
-  if state.busy then return end
+  if state.busy or state.state_sync_pending then return end
   if #(state.pending_steer or {}) > 0 then return end
   if state.pending_backend then
     local pending_backend = state.pending_backend
@@ -931,6 +996,7 @@ function M.drain()
   if state.active_elicitation and state.active_elicitation.elicitation then
     return
   end
+  if state.status and state.status.kind == "finalizing" then return end
   local text = table.remove(state.queue, 1)
   if text then
     if text == "/compact" then M.compact() else begin_request(text) end
@@ -943,12 +1009,11 @@ function M.drain()
       set_busy(false)
       if request_error then
         notifications.error(request_error, "Harness Goal")
-        M.render()
+        synchronize_state()
         return
       end
       if result then state.session = result.session or state.session end
-      M.render()
-      vim.schedule(M.drain)
+      synchronize_state(M.drain)
     end)
   end
 end
@@ -1028,6 +1093,15 @@ function M.open_timeline_entry()
     if action.kind == "session" then session_navigation.open_parent(action.session_id)
     elseif action.kind == "agent" then M.select_agent(action.run_id)
     elseif action.kind == "url" then vim.ui.open(action.url)
+    elseif action.kind == "file" then
+      local path = vim.fs.joinpath(state.session.workspace, action.path)
+      if vim.fn.filereadable(path) ~= 1 then
+        notifications.warn("Changed file is no longer available: " .. path, "ForgeHarness")
+        return
+      end
+      local opened, failure = pcall(vim.cmd, "tabedit " .. vim.fn.fnameescape(path))
+      if not opened then notifications.error(failure, "ForgeHarness") return end
+      vim.api.nvim_win_set_cursor(0, { math.max(1, math.min(action.line or 1, vim.api.nvim_buf_line_count(0))), 0 })
     elseif action.kind == "plan" then
       client.request_for(state.session.id, "plan.activate", { plan_id = action.plan_id }, function(plan, failure)
         if failure then notifications.error(failure, "Harness artifact") return end
@@ -1091,18 +1165,18 @@ local function restore_interaction_prompt(interaction)
 end
 
 ---@param interaction ForgeRollbackInteraction
-local function rollback_interaction(interaction)
+local function rollback_exchange(interaction)
   local state = harness_state()
   if state.busy then
-    notifications.warn("Cancel or finish the active turn before undoing an interaction", "Harness undo")
+    notifications.warn("Cancel or finish the active turn before undoing an exchange", "Harness undo")
     return
   end
-  client.request("interaction.rollback", { interaction_id = interaction.id }, function(_, request_error)
+  client.request("exchange.rollback", { exchange_id = interaction.id }, function(_, request_error)
     if request_error then
       notifications.error(request_error, "Harness undo")
       return
     end
-    notifications.info("Rolled back to before Interaction " .. tostring(interaction.ordinal), "Harness undo")
+    notifications.info("Rolled back to before Exchange " .. tostring(interaction.ordinal), "Harness undo")
     synchronize_state()
     restore_interaction_prompt(interaction)
   end)
@@ -1113,18 +1187,18 @@ local function confirm_rollback(interaction)
   open_choice_picker(
     harness_state(),
     "Confirm rollback",
-    "Restore the worktree before Interaction " .. tostring(interaction.ordinal)
-      .. " and supersede every later interaction?",
+    "Restore the worktree before Exchange " .. tostring(interaction.ordinal)
+      .. " and supersede every later exchange?",
     {
       { label = "Cancel", detail = "Keep the current workspace.", value = false },
       {
-        label = "Rollback to before Interaction " .. tostring(interaction.ordinal),
+        label = "Rollback to before Exchange " .. tostring(interaction.ordinal),
         detail = "Restore its checkpoint and return the prompt to the composer.",
         value = true,
       },
     },
     function(confirmed)
-      if confirmed then rollback_interaction(interaction) end
+      if confirmed then rollback_exchange(interaction) end
     end
   )
 end
@@ -1133,40 +1207,42 @@ end
 function M.open_undo_picker()
   local state = harness_state()
   if state.busy then
-    notifications.warn("Cancel or finish the active turn before undoing an interaction", "Harness undo")
+    notifications.warn("Cancel or finish the active turn before undoing an exchange", "Harness undo")
     return
   end
   if state.no_checkpoint then
     notifications.warn("Undo is unavailable because this session has NO CHECKPOINT", "Harness undo")
     return
   end
-  client.request("interaction.list", {}, function(interaction_list, request_error)
+  client.request("exchange.list", {}, function(interaction_list, request_error)
     if request_error then
       notifications.error(request_error, "Harness undo")
       return
     end
-    local rollback_state = { complete = true, failed = true, cancelled = true }
+    local rollback_state = { complete = true, failed = true, cancelled = true, interrupted = true }
     local option_list = {}
     for index = #(interaction_list or {}), 1, -1 do
       local interaction = interaction_list[index]
-      if interaction.checkpoint_before and rollback_state[interaction.state] then
+      if interaction.checkpoint_before and rollback_state[interaction.state]
+        and interaction.disposition == "current"
+      then
         local prompt = vim.trim(tostring(interaction.prompt or ""):gsub("%s+", " "))
         option_list[#option_list + 1] = {
           id = interaction.id,
-          label = "Interaction " .. tostring(interaction.ordinal),
+          label = "Exchange " .. tostring(interaction.ordinal),
           detail = tostring(interaction.state) .. " · " .. (prompt ~= "" and prompt or "[empty prompt]"),
           value = interaction,
         }
       end
     end
     if #option_list == 0 then
-      notifications.info("This Harness session has no interactions available to undo", "Harness undo")
+      notifications.info("This Harness session has no exchanges available to undo", "Harness undo")
       return
     end
     open_choice_picker(
       state,
-      "Undo interaction",
-      "Select the interaction whose original prompt should be restored.",
+      "Undo exchange",
+      "Select the exchange whose original prompt should be restored.",
       option_list,
       confirm_rollback
     )
@@ -1180,7 +1256,7 @@ function M.select_agent(selector)
   if selector:lower() == "main" then
     state.selected_agent_run_id = nil
   else
-    local run, resolve_error = require("forge.views.harness.agent_catalog").resolve(state.agent, selector)
+    local run, resolve_error = require("forge.views.harness.agent_catalog").resolve(state, selector)
     if not run then
       notifications.warn(resolve_error or ("No child agent matches " .. selector), "Harness agent")
       return
@@ -1200,12 +1276,12 @@ function M.spawn_agent(definition, task)
     notifications.warn("The current backend does not expose spawnable child agents", "Harness agent")
     return
   end
+  if state.presentation then state.presentation.follow_tail() end
   set_busy(true)
   client.request("agent.start", { definition = definition, task = task }, function(_, request_error)
     set_busy(false)
     if request_error then notifications.error(request_error, "Harness agent") end
-    synchronize_state()
-    vim.schedule(M.drain)
+    synchronize_state(M.drain)
   end)
 end
 
@@ -1247,6 +1323,22 @@ function M.submit()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   prompt_history.record(text)
+  local goal_control = ({ ["/goal pause"] = "goal.pause", ["/goal clear"] = "goal.clear" })[text]
+  if goal_control then
+    local session_id = state.session.id
+    set_composer_text(state.composer_buf, "")
+    client.request_for(session_id, goal_control, {}, function(result, request_error)
+      if request_error then
+        notifications.error(request_error, "Harness goal")
+        return
+      end
+      if state.session and state.session.id == session_id then
+        state.goal = result.state ~= "cleared" and result or nil
+        M.refresh_winbar()
+      end
+    end)
+    return
+  end
   if vim.tbl_contains({ "/read", "/write", "/full", "/yolo" }, text) then
     set_composer_text(state.composer_buf, "")
     M.set_mode(text:sub(2))
@@ -1439,6 +1531,10 @@ function M.submit()
     notifications.warn("Use /fast on or /fast off", "ForgeHarness")
     return
   end
+  if state.selected_agent_run_id then
+    M.steer_submit()
+    return
+  end
   if state.busy then
     set_composer_text(state.composer_buf, "")
     if state.active_wait and not selected_agent_run(state)
@@ -1451,10 +1547,7 @@ function M.submit()
     M.refresh_winbar()
     return
   end
-  if selected_agent_run(state) then
-    set_composer_text(state.composer_buf, "")
-    begin_request(text)
-  else begin_request(text, true) end
+  begin_request(text, true)
 end
 
 local function remove_pending_steer(state, target)
@@ -1467,23 +1560,38 @@ local function remove_pending_steer(state, target)
 end
 
 submit_immediate = function(state, text, notify_success)
-  set_composer_text(state.composer_buf, "")
+  local selected_run = selected_agent_run(state)
+  local target = selected_agent_target(state)
+  if state.selected_agent_run_id then
+    if not selected_run or not target then
+      notifications.warn("The selected child has no active turn to steer", "ForgeHarness")
+      return
+    end
+  else
+    set_composer_text(state.composer_buf, "")
+  end
   local pending = { text = text }
   state.pending_steer = state.pending_steer or {}
   state.pending_steer[#state.pending_steer + 1] = pending
   M.refresh_winbar()
-  local selected_run = selected_agent_run(state)
-  local target = selected_run and selected_run.provider_thread_id and selected_run.active_turn_id and {
-    thread_id = selected_run.provider_thread_id,
-    turn_id = selected_run.active_turn_id,
-  } or nil
-  client.request("turn.steer", { text = text, target = target }, function(_, request_error)
+  client.request("turn.steer", { text = text, target = target }, function(result, request_error)
     if request_error then
       remove_pending_steer(state, pending)
-      state.queue[#state.queue + 1] = text
-      notifications.warn("Steering missed the active turn; queued as a follow-up", "ForgeHarness")
-    elseif notify_success then
-      notifications.info("Steered the active turn", "ForgeHarness")
+      if selected_run then
+        notifications.warn(request_error, "ForgeHarness")
+      else
+        state.queue[#state.queue + 1] = text
+        notifications.warn("Steering missed the active turn; queued as a follow-up", "ForgeHarness")
+      end
+    else
+      if selected_run and composer_text(state.composer_buf) == text then
+        set_composer_text(state.composer_buf, "")
+      end
+      if notify_success then
+        local message = result and result.delivery == "parent_mediated"
+          and "Sent the child correction to its parent for delivery" or "Steered the active turn"
+        notifications.info(message, "ForgeHarness")
+      end
     end
     M.refresh_winbar()
     vim.schedule(M.drain)

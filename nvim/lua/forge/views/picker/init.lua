@@ -126,8 +126,13 @@ local function render_view(instance)
   end
   frame.input_height = page.input_height or config.options.picker.input_height
   local height = math.min(#frame.lines, config.options.picker.max_height, math.max(4, bounds.height - 2))
+  local border_footer
+  if #frame.lines > height then
+    border_footer = vim.trim(table.remove(frame.lines, frame.footer_line))
+    frame.footer_line = nil
+  end
   instance.frame = frame
-  picker_window.resize(instance.win, instance.spec.host, width, height, title_chunks(instance))
+  picker_window.resize(instance.win, instance.spec.host, width, height, title_chunks(instance), border_footer)
   render.apply(instance.buf, frame)
   if valid_window(instance.search_win) then search_input.resize(instance.search_win, instance.win, frame) end
   if valid_window(instance.input_win) then input.resize(instance.input_win, instance.win, frame) end

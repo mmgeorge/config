@@ -34,7 +34,7 @@ local function question_page_list(elicitation, allow_ask)
     local selected_entry = entries[selected_index]
     page_list[#page_list + 1] = {
       id = question.id,
-      title = question.header or question.question or "Planning question",
+      title = question.header or question.question or "Harness question",
       subtitle = question.question ~= question.header and question.question or question.detail,
       option_list = options,
       selected_index = selected_index,
@@ -62,7 +62,7 @@ local function review_page(elicitation)
   return {
     id = "review",
     title = ("Review Harness answers (%d)"):format(model.question_count(elicitation)),
-    subtitle = "Confirm the answers that will continue planning.",
+    subtitle = "Confirm the answers to continue.",
     content_list = content_list,
     option_list = {
       { key = "y", label = "Submit answers", value = "submit", confirm_on_key = true },

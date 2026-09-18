@@ -94,7 +94,10 @@ impl MessageSender {
             match self.try_admit(&message, false, false) {
                 Ok(()) => return Ok(()),
                 Err(error) if error.kind() == io::ErrorKind::WouldBlock => {}
-                Err(error) => return Err(error),
+                Err(error) => {
+                    self.record_failure(&error);
+                    return Err(error);
+                }
             }
             tokio::select! {
                 _ = capacity.changed() => {},
@@ -131,15 +134,19 @@ impl MessageSender {
     fn admit(&self, message: impl Serialize, control: bool, terminal: bool) -> io::Result<()> {
         let result = self.try_admit(message, control, terminal);
         if let Err(error) = &result {
-            self.failure.send_if_modified(|failure| {
-                if failure.is_some() {
-                    return false;
-                }
-                *failure = Some(error.to_string());
-                true
-            });
+            self.record_failure(error);
         }
         result
+    }
+
+    fn record_failure(&self, error: &io::Error) {
+        self.failure.send_if_modified(|failure| {
+            if failure.is_some() {
+                return false;
+            }
+            *failure = Some(error.to_string());
+            true
+        });
     }
 
     fn try_admit(&self, message: impl Serialize, control: bool, terminal: bool) -> io::Result<()> {

@@ -151,6 +151,6 @@ async fn streams_one_native_copilot_sdk_turn_through_the_broker() {
     );
     let snapshot = broker.snapshot().unwrap();
     assert_eq!(snapshot.session.provider_label, "Copilot CLI");
-    let persisted = serde_json::to_string(&snapshot.interaction).unwrap();
+    let persisted = serde_json::to_string(&snapshot.exchange).unwrap();
     assert!(persisted.contains("COPILOT_OK"), "{persisted}");
 }

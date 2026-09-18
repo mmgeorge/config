@@ -6,6 +6,7 @@ pub mod display;
 pub mod edit;
 pub mod engine;
 pub mod intraline;
+pub mod patch;
 pub mod projection;
 pub mod raw;
 pub mod source;

@@ -1,5 +1,5 @@
 use crate::backend::approval::PermissionCoordinator;
-use crate::backend::steering::SteeringLane;
+use crate::backend::steering::{ActiveSteering, SteeringLane};
 use crate::backend::{
     Backend, BackendCapability, BackendCatalogRequest, BackendDescriptor, BackendEventSink,
     BackendForkRequest, BackendForkResult, BackendInput, BackendKind, BackendModel, BackendOutput,
@@ -16,7 +16,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::Instant;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, Notify};
 
 mod json_rpc;
 mod process;
@@ -39,6 +39,7 @@ pub struct CodexBackend {
     default_model: Mutex<Option<String>>,
     steering_by_session: Mutex<HashMap<String, SteeringLane>>,
     active_turn_by_session: Mutex<HashMap<String, CodexTurnState>>,
+    turn_started: Notify,
     connection_by_session: Mutex<HashMap<String, Arc<Mutex<CodexConnection>>>>,
     completed_turn_by_session: Mutex<HashMap<String, String>>,
     permission_coordinator: Arc<PermissionCoordinator>,
@@ -127,11 +128,27 @@ impl CodexBackend {
             default_model: Mutex::new(None),
             steering_by_session: Mutex::new(HashMap::new()),
             active_turn_by_session: Mutex::new(HashMap::new()),
+            turn_started: Notify::new(),
             connection_by_session: Mutex::new(HashMap::new()),
             completed_turn_by_session: Mutex::new(HashMap::new()),
             permission_coordinator,
             trace,
         })
+    }
+
+    /// Publish turn readiness only after its control receiver is registered.
+    async fn activate_turn_control(
+        &self,
+        session_id: &str,
+        event_sink: Option<BackendEventSink>,
+    ) -> Result<ActiveSteering> {
+        let active = self.steering_lane(session_id).await.activate(event_sink)?;
+        self.active_turn_by_session
+            .lock()
+            .await
+            .insert(session_id.to_owned(), CodexTurnState::Pending);
+        self.turn_started.notify_waiters();
+        Ok(active)
     }
 
     async fn connect(
@@ -616,12 +633,100 @@ impl CodexBackend {
         Self::notification_thread_turn_id(message, method, thread_id) == Some(turn_id)
     }
 
+    /// Resume native continuation on its owning reader and adopt the provider-started turn.
+    async fn resume_native_goal_turn(
+        &self,
+        process: &mut CodexJsonRpc,
+        output: &mut BackendOutput,
+        request: &BackendRequest,
+        thread_id: &str,
+    ) -> Result<Option<(Value, bool, Vec<Value>)>> {
+        process.set_activity_publication(true);
+        let request_id = process
+            .send_request(
+                "thread/goal/set",
+                json!({"threadId":thread_id,"status":"active"}),
+            )
+            .await?;
+        self.active_turn_by_session.lock().await.insert(
+            request.harness_session_id.clone(),
+            CodexTurnState::Submitted {
+                request: Box::new(request.clone()),
+                thread_id: thread_id.to_owned(),
+            },
+        );
+        let mut acknowledged = false;
+        let mut activated = false;
+        let mut turn = None;
+        let mut settled = false;
+        let mut observed_message_list = Vec::new();
+        loop {
+            let message = process.receive_message().await?;
+            if let Some(result) =
+                CodexJsonRpc::request_result(&message, request_id, "thread/goal/set")
+            {
+                let result = result?;
+                if let Some(state) = json_rpc::native_goal_state(
+                    &json!({
+                        "method":"thread/goal/updated", "params":{"threadId":thread_id,"goal":result.get("goal")}
+                    }),
+                    thread_id,
+                ) {
+                    self.trace.record(
+                        &request.harness_session_id,
+                        "goal.resume.admission",
+                        json!({"phase":"acknowledgment","status":state,"enabled":activated}),
+                    );
+                    activated = true;
+                    if !settled {
+                        settled = state != crate::goal::GoalState::Active;
+                        output.evidence.native_state = Some(state);
+                    }
+                }
+                acknowledged = true;
+            }
+            if message.pointer("/params/threadId").and_then(Value::as_str) == Some(thread_id)
+                && let Some(turn_id) = Self::notification_turn_id(&message, "turn/started")
+            {
+                activated = true;
+                turn.get_or_insert_with(|| json!({"turn":{"id":turn_id}}));
+            }
+            if let Some(state) = json_rpc::native_goal_state(&message, thread_id) {
+                self.trace.record(
+                    &request.harness_session_id,
+                    "goal.resume.admission",
+                    json!({"phase":"notification","status":state,"enabled":activated}),
+                );
+                if state == crate::goal::GoalState::Active {
+                    activated = true;
+                } else if !activated {
+                    continue;
+                }
+                settled = state != crate::goal::GoalState::Active;
+            }
+            if !activated {
+                continue;
+            }
+            process.publish_message(message.clone(), output).await?;
+            observed_message_list.push(message);
+            if acknowledged {
+                if let Some(turn) = turn {
+                    return Ok(Some((turn, true, observed_message_list)));
+                }
+                if settled {
+                    return Ok(None);
+                }
+            }
+        }
+    }
+
     async fn start_turn(
         &self,
         process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
         request: &BackendRequest,
         thread_id: &str,
+        continuing_exchange: bool,
         params: Value,
     ) -> Result<(Value, bool, Vec<Value>)> {
         let request_id = process.send_request("turn/start", params).await?;
@@ -632,13 +737,9 @@ impl CodexBackend {
                 thread_id: thread_id.to_owned(),
             },
         );
-        let mut started_turn_id = None;
         let mut observed_message_list = Vec::new();
         loop {
-            let message = process.read_message(output).await?;
-            if let Some(turn_id) = Self::notification_turn_id(&message, "turn/started") {
-                started_turn_id = Some(turn_id.to_owned());
-            }
+            let message = process.receive_message().await?;
             if let Some(response) = CodexJsonRpc::request_result(&message, request_id, "turn/start")
             {
                 let turn = response?;
@@ -648,9 +749,33 @@ impl CodexBackend {
                     .or_else(|| turn.get("turn_id"))
                     .and_then(Value::as_str)
                     .context("Codex turn/start response omitted turn id")?;
-                let provider_turn_started = started_turn_id.as_deref() == Some(turn_id);
-                observed_message_list.push(message);
-                return Ok((turn, provider_turn_started, observed_message_list));
+                let provider_turn_started = observed_message_list.iter().any(|message| {
+                    Self::notification_matches_turn(message, "turn/started", thread_id, turn_id)
+                });
+                process.set_activity_publication(true);
+                let mut admitted_message_list = Vec::new();
+                let mut admitted = continuing_exchange;
+                for message in observed_message_list {
+                    let message_turn = message
+                        .pointer("/params/turnId")
+                        .or_else(|| message.pointer("/params/turn/id"))
+                        .and_then(Value::as_str);
+                    let message_thread =
+                        message.pointer("/params/threadId").and_then(Value::as_str);
+                    if message_thread == Some(thread_id) && message_turn == Some(turn_id) {
+                        admitted = true;
+                    } else if !admitted
+                        || (message_thread == Some(thread_id) && message_turn.is_some())
+                    {
+                        process.set_activity_publication(false);
+                        process.publish_message(message, output).await?;
+                        process.set_activity_publication(true);
+                        continue;
+                    }
+                    process.publish_message(message.clone(), output).await?;
+                    admitted_message_list.push(message);
+                }
+                return Ok((turn, provider_turn_started, admitted_message_list));
             }
             observed_message_list.push(message);
         }
@@ -681,12 +806,9 @@ impl Backend for CodexBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
-        self.active_turn_by_session
-            .lock()
-            .await
-            .insert(request.harness_session_id.clone(), CodexTurnState::Pending);
-        let steering = self.steering_lane(&request.harness_session_id).await;
-        let mut active_steering = steering.activate(event_sink.clone())?;
+        let mut active_steering = self
+            .activate_turn_control(&request.harness_session_id, event_sink.clone())
+            .await?;
         let mut output = BackendOutput {
             capability: capability(),
             ..BackendOutput::default()
@@ -697,6 +819,7 @@ impl Backend for CodexBackend {
             .await?;
         let mut connection = connection.lock().await;
         let process = &mut connection.process;
+        process.set_activity_publication(false);
         let request_text = request.input.text();
         let mut control_context = request
             .control_context
@@ -730,13 +853,15 @@ impl Backend for CodexBackend {
                 process
                     .request(
                         "thread/resume",
-                        Self::secure(
+                        Self::with_model(Self::secure(
                             json!({
                                 "threadId": thread_id,
-                                "cwd": request.workspace
+                                "cwd": request.workspace,
+                                "config": { "model_reasoning_effort": request.effort },
+                                "serviceTier": if request.fast_mode { Value::String("fast".into()) } else { Value::Null }
                             }),
                             &request,
-                        ),
+                        ), &request.model),
                         &mut output,
                     )
                     .await?
@@ -801,18 +926,6 @@ impl Backend for CodexBackend {
             } else {
                 prompt = "Continue working toward the active goal.".into();
             }
-        } else if request.mode == PromptMode::ExecutePlan {
-            process
-                .request(
-                    "thread/goal/set",
-                    json!({
-                        "threadId": thread_id,
-                        "objective": "Complete the plan",
-                        "status": "active"
-                    }),
-                    &mut output,
-                )
-                .await?;
         }
         let mut input = vec![json!({ "type": "text", "text": prompt })];
         if let BackendInput::Skill { name, .. } = &request.input {
@@ -826,14 +939,20 @@ impl Backend for CodexBackend {
                 .with_context(|| format!("skill ${name} omitted its provider path"))?;
             input.push(json!({ "type": "skill", "name": name, "path": path }));
         }
-        let turn_id = {
-            let (turn, provider_turn_started, observed_message_list) = self
+        let native_resume =
+            request.mode == PromptMode::GoalContinuation && request_text.trim() == "/goal resume";
+        let admission = if native_resume {
+            self.resume_native_goal_turn(process, &mut output, &request, &thread_id)
+                .await?
+        } else {
+            Some(self
                 .start_turn(
                     process,
                     &mut output,
                     &request,
-                    &thread_id,
-                    Self::with_model(
+                        &thread_id,
+                        false,
+                        Self::with_model(
                         Self::secure(
                             json!({
                                 "threadId": thread_id,
@@ -847,7 +966,10 @@ impl Backend for CodexBackend {
                         &request.model,
                     ),
                 )
-                .await?;
+                .await?)
+        };
+        let turn_id = if let Some((turn, provider_turn_started, observed_message_list)) = admission
+        {
             let current_turn_id = turn
                 .pointer("/turn/id")
                 .or_else(|| turn.get("turnId"))
@@ -879,17 +1001,28 @@ impl Backend for CodexBackend {
                 !status.eq_ignore_ascii_case("failed"),
                 "Codex turn failed: {completed}"
             );
-            current_turn_id
+            Some(
+                completed
+                    .pointer("/turn/id")
+                    .or_else(|| completed.get("turnId"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+                    .unwrap_or(current_turn_id),
+            )
+        } else {
+            None
         };
         self.active_turn_by_session.lock().await.insert(
             request.harness_session_id.clone(),
             CodexTurnState::Completed,
         );
-        self.completed_turn_by_session
-            .lock()
-            .await
-            .insert(request.harness_session_id.clone(), turn_id.to_owned());
-        output.provider_checkpoint_id = Some(turn_id.to_owned());
+        if let Some(turn_id) = turn_id {
+            self.completed_turn_by_session
+                .lock()
+                .await
+                .insert(request.harness_session_id.clone(), turn_id.clone());
+            output.provider_checkpoint_id = Some(turn_id);
+        }
         Ok(output)
     }
 
@@ -962,24 +1095,22 @@ impl Backend for CodexBackend {
         self.steering_lane(session_id).await.steer(text).await
     }
 
-    async fn steer_target(&self, text: String, target: crate::backend::SteerTarget) -> Result<()> {
-        let steering_list = self
-            .steering_by_session
-            .lock()
+    async fn steer_target(
+        &self,
+        session_id: &str,
+        text: String,
+        target: crate::backend::SteerTarget,
+    ) -> Result<()> {
+        self.steering_lane(session_id)
             .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        for steering in steering_list {
-            if steering
-                .steer_target(text.clone(), target.clone())
-                .await
-                .is_ok()
-            {
-                return Ok(());
-            }
-        }
-        anyhow::bail!("Codex has no active turn for the requested target")
+            .steer_target(text, target.clone())
+            .await
+            .with_context(|| {
+                format!(
+                    "Codex could not steer target {}/{}",
+                    target.thread_id, target.turn_id
+                )
+            })
     }
 
     async fn interrupt_target(&self, target: crate::backend::SteerTarget) -> Result<()> {
@@ -990,12 +1121,30 @@ impl Backend for CodexBackend {
             .values()
             .cloned()
             .collect::<Vec<_>>();
+        let mut failure = Vec::new();
         for steering in steering_list {
-            if steering.interrupt_target(target.clone()).await.is_ok() {
-                return Ok(());
+            match steering.interrupt_target(target.clone()).await {
+                Ok(()) => return Ok(()),
+                Err(error) => failure.push(format!("{error:#}")),
             }
         }
-        anyhow::bail!("Codex has no active turn for the requested target")
+        anyhow::ensure!(
+            !failure.is_empty(),
+            "Codex has no active turn for the requested target"
+        );
+        anyhow::bail!(
+            "Codex could not settle target {}/{}: {}",
+            target.thread_id,
+            target.turn_id,
+            failure.join(" | ")
+        )
+    }
+
+    async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
+        self.steering_lane(session_id)
+            .await
+            .cleanup_execution()
+            .await
     }
 
     async fn active_session_id(&self) -> Option<String> {
@@ -1185,6 +1334,31 @@ impl Backend for CodexBackend {
             self.active_turn_by_session.lock().await.get(session_id),
             Some(CodexTurnState::Pending | CodexTurnState::Submitted { .. })
         )
+    }
+
+    async fn stop_goal_session(&self, session_id: &str, clear: bool) -> Result<()> {
+        loop {
+            let started = self.turn_started.notified();
+            tokio::pin!(started);
+            started.as_mut().enable();
+            if matches!(
+                self.active_turn_by_session.lock().await.get(session_id),
+                Some(CodexTurnState::Pending | CodexTurnState::Submitted { .. })
+            ) {
+                break;
+            }
+            started.await;
+        }
+        let result = self.steering_lane(session_id).await.stop_goal(clear).await;
+        if result.is_err()
+            && matches!(
+                self.active_turn_by_session.lock().await.get(session_id),
+                Some(CodexTurnState::Completed)
+            )
+        {
+            return Ok(());
+        }
+        result
     }
 
     async fn goal_status(
@@ -1421,6 +1595,331 @@ mod test {
             "parent-thread",
             "parent-turn"
         ));
+    }
+
+    #[tokio::test]
+    async fn explicit_turn_excludes_stale_activity_before_and_after_admission() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(fixture.path())?);
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["unused".into()],
+            permission.clone(),
+            trace.clone(),
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for method in ["thread/resume", "turn/start"] {
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(request["method"], method);
+                let mut messages = vec![
+                    json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"old","status":"inProgress"}}}),
+                    json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-answer","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
+                    json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"old","status":"completed"}}}),
+                ];
+                if method == "thread/resume" {
+                    messages.push(
+                        json!({"method":"thread/goal/cleared","params":{"threadId":"parent"}}),
+                    );
+                    messages.push(json!({"id":request["id"],"result":{"thread":{"id":"parent"}}}));
+                } else {
+                    messages.extend([
+                        json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"current","status":"inProgress"}}}),
+                        json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-before-ack","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
+                        json!({"id":request["id"],"result":{"turn":{"id":"current"}}}),
+                        json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-after-ack","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
+                        json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"old","status":"completed"}}}),
+                        json!({"method":"item/completed","params":{"threadId":"parent","turnId":"current","item":{"id":"new-answer","type":"agentMessage","phase":"final_answer","text":"CURRENT"}}}),
+                        json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"current","status":"completed"}}}),
+                    ]);
+                }
+                for message in messages {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            message.to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+            }
+            let _ = socket.next().await;
+        });
+        let process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            ExecutionMode::Read,
+            permission,
+            None,
+            trace,
+            "session".into(),
+        )
+        .await?;
+        backend.connection_by_session.lock().await.insert(
+            "session".into(),
+            Arc::new(Mutex::new(CodexConnection {
+                process,
+                timing: Vec::new(),
+            })),
+        );
+        let output = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            backend.prompt_stream(
+                BackendRequest {
+                    harness_session_id: "session".into(),
+                    workspace,
+                    input: BackendInput::from_text("new prompt"),
+                    mode: PromptMode::Chat,
+                    model: "gpt-5.6-terra".into(),
+                    effort: "medium".into(),
+                    context_window: None,
+                    fast_mode: false,
+                    execution_mode: ExecutionMode::Read,
+                    backend_session_id: Some("parent".into()),
+                    control_context: None,
+                },
+                None,
+            ),
+        )
+        .await??;
+        assert_eq!(output.provider_checkpoint_id.as_deref(), Some("current"));
+        assert_eq!(output.evidence.native_state, None);
+        let encoded = serde_json::to_string(&output.event)?;
+        assert!(encoded.contains("CURRENT"));
+        assert!(!encoded.contains("STALE"));
+        assert!(!encoded.contains("\"turn_id\":\"old\""));
+        drop(backend);
+        tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn native_resume_adopts_auto_started_turn_without_explicit_start() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        for (before_ack, starts_turn) in
+            [(true, true), (false, true), (true, false), (false, false)]
+        {
+            let fixture = tempfile::tempdir()?;
+            let workspace = fixture.path().to_string_lossy().into_owned();
+            let permission = PermissionCoordinator::transient(&workspace)?;
+            let trace = Arc::new(TraceStore::open(fixture.path())?);
+            let backend = CodexBackend::new_with_permission_coordinator(
+                vec!["unused".into()],
+                permission.clone(),
+                trace.clone(),
+            )?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("ws://{}", listener.local_addr()?);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(request["method"], "thread/resume");
+                assert_eq!(request["params"]["model"], "gpt-5.6-terra");
+                assert_eq!(
+                    request["params"]["config"]["model_reasoning_effort"],
+                    "medium"
+                );
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        json!({
+                            "id":request["id"],"result":{"thread":{"id":"parent"}}
+                        })
+                        .to_string()
+                        .into(),
+                    ))
+                    .await
+                    .unwrap();
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(
+                    request["method"], "thread/goal/set",
+                    "resume must not send turn/start"
+                );
+                assert_eq!(
+                    request["params"],
+                    json!({"threadId":"parent","status":"active"})
+                );
+                let acknowledgement =
+                    json!({"id":request["id"],"result":{"goal":{"status":"active"}}});
+                let mut messages = vec![
+                    json!({"method":"thread/goal/updated","params":{"threadId":"parent","goal":{"status":"paused"}}}),
+                    json!({"method":"thread/goal/updated","params":{"threadId":"parent","goal":{"status":"active"}}}),
+                ];
+                if !before_ack {
+                    messages.push(acknowledgement.clone());
+                }
+                if starts_turn {
+                    messages.extend([
+                        json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"resumed","status":"inProgress"}}}),
+                        json!({"method":"item/completed","params":{"threadId":"parent","turnId":"resumed","item":{"id":"answer","type":"agentMessage","phase":"final_answer","text":"RESUMED-ONCE"}}}),
+                        json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"resumed","status":"completed"}}}),
+                    ]);
+                }
+                messages.push(json!({"method":"thread/goal/updated","params":{"threadId":"parent","goal":{"status":"usageLimited"}}}));
+                if before_ack {
+                    messages.push(acknowledgement);
+                }
+                for message in messages {
+                    socket
+                        .send(tokio_tungstenite::tungstenite::Message::Text(
+                            message.to_string().into(),
+                        ))
+                        .await
+                        .unwrap();
+                }
+                if let Some(Ok(message)) = socket.next().await {
+                    assert!(
+                        !message.is_text(),
+                        "resume sent an additional provider request: {message}"
+                    );
+                }
+            });
+            let process = CodexJsonRpc::connect(
+                &endpoint,
+                &workspace,
+                ExecutionMode::Read,
+                permission,
+                None,
+                trace,
+                "session".into(),
+            )
+            .await?;
+            backend.connection_by_session.lock().await.insert(
+                "session".into(),
+                Arc::new(Mutex::new(CodexConnection {
+                    process,
+                    timing: Vec::new(),
+                })),
+            );
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                backend.prompt_stream(
+                    BackendRequest {
+                        harness_session_id: "session".into(),
+                        workspace,
+                        input: BackendInput::from_text("/goal resume"),
+                        mode: PromptMode::GoalContinuation,
+                        model: "gpt-5.6-terra".into(),
+                        effort: "medium".into(),
+                        context_window: None,
+                        fast_mode: false,
+                        execution_mode: ExecutionMode::Read,
+                        backend_session_id: Some("parent".into()),
+                        control_context: None,
+                    },
+                    None,
+                ),
+            )
+            .await??;
+            assert_eq!(
+                output.evidence.native_state,
+                Some(crate::goal::GoalState::UsageLimited)
+            );
+            assert_eq!(
+                output.provider_checkpoint_id.as_deref(),
+                starts_turn.then_some("resumed")
+            );
+            assert!(!backend.has_active_turn("session").await);
+            drop(backend);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn goal_control_waits_for_reader_registration() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["codex".into(), "app-server".into()],
+            PermissionCoordinator::transient(fixture.path())?,
+            Arc::new(TraceStore::open(fixture.path())?),
+        )?;
+        for clear in [false, true] {
+            let mut control = Box::pin(backend.stop_goal_session("session", clear));
+            assert!(
+                futures_util::poll!(control.as_mut()).is_pending(),
+                "goal control must wait for startup instead of reporting delivery"
+            );
+            let mut reader = backend.activate_turn_control("session", None).await?;
+            assert!(futures_util::poll!(control.as_mut()).is_pending());
+            let command = reader.receive().await.unwrap();
+            assert_eq!(
+                command.operation,
+                if clear {
+                    crate::backend::steering::ActiveTurnOperation::ClearGoal
+                } else {
+                    crate::backend::steering::ActiveTurnOperation::PauseGoal
+                }
+            );
+            command.complete(Ok(())).await;
+            control.await?;
+            backend
+                .active_turn_by_session
+                .lock()
+                .await
+                .insert("session".into(), CodexTurnState::Completed);
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn targeted_steering_preserves_provider_rejection() {
+        let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
+        let lane = SteeringLane::default();
+        let mut active = lane.activate(None).unwrap();
+        backend
+            .steering_by_session
+            .lock()
+            .await
+            .insert("session".into(), lane);
+        let other_lane = SteeringLane::default();
+        let mut other_active = other_lane.activate(None).unwrap();
+        backend
+            .steering_by_session
+            .lock()
+            .await
+            .insert("other-session".into(), other_lane);
+        let target = crate::backend::SteerTarget {
+            thread_id: "child".into(),
+            turn_id: "turn".into(),
+        };
+        let (result, ()) = tokio::join!(
+            backend.steer_target("session", "hello".into(), target),
+            async {
+                let command = active.receive().await.unwrap();
+                command
+                    .complete(Err(anyhow::anyhow!("provider rejected child steering")))
+                    .await;
+            }
+        );
+        let error = format!("{:#}", result.unwrap_err());
+        assert!(error.contains("child/turn"));
+        assert!(error.contains("provider rejected child steering"));
+        assert!(futures_util::poll!(Box::pin(other_active.receive()).as_mut()).is_pending());
+        let missing = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            backend.steer_target(
+                "missing-session",
+                "correction".into(),
+                crate::backend::SteerTarget {
+                    thread_id: "child".into(),
+                    turn_id: "turn".into(),
+                },
+            ),
+        )
+        .await
+        .expect("missing session must not probe another active session");
+        assert!(format!("{:#}", missing.unwrap_err()).contains("no active turn"));
     }
 
     #[tokio::test]

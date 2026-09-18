@@ -260,7 +260,7 @@ return {
       sources = {
         default = { 'lsp', 'path', 'custom_snippets', 'forge_reviewers', 'github_issues', 'spell' },
         per_filetype = {
-          HarnessInput = { 'harness_commands', 'harness_files' },
+          ForgeHarnessInput = { 'harness_commands', 'harness_files' },
         },
         -- default = { 'snippets', 'lsp', 'path', 'custom_snippets', 'spell' },
         -- min_keyword_length = 3,

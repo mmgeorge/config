@@ -33,7 +33,9 @@ function PickerRender.apply(buf, frame)
       vim.api.nvim_buf_add_highlight(buf, namespace, "ForgePickerText", line - 1, 0, -1)
     end
   end
-  vim.api.nvim_buf_add_highlight(buf, namespace, "ForgePickerHint", frame.footer_line - 1, 0, -1)
+  if frame.footer_line then
+    vim.api.nvim_buf_add_highlight(buf, namespace, "ForgePickerHint", frame.footer_line - 1, 0, -1)
+  end
 end
 
 return PickerRender

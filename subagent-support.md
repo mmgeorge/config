@@ -8,7 +8,7 @@ The central finding is that subagent support cannot live behind one lowest-commo
 
 ## Implemented Harness behavior
 
-The Harness needs to represent every parent and child execution as an identifiable agent run rather than flattening all activity into one transcript. That identity drives timeline selection, tool attribution, provider-reported file attribution, and cancellation.
+The Harness represents each provider identity as an `Agent`, each delegated task as a `Delegation`, each user request as an `Exchange`, and each provider invocation as a `Turn`. Those identities drive timeline selection, tool attribution, provider-reported file attribution, and cancellation.
 
 The Codex backend now provides:
 
@@ -44,14 +44,14 @@ Codex supports native child agents and preserves parent workspace and permission
 The Codex backend translates native child events into generic Harness records:
 
 ```text
-AgentRun
-├─ id
-├─ parent_thread_id
-├─ provider_thread_id
-├─ active_turn_id
-├─ definition and nickname
-├─ task and status
-└─ AgentTurnRecord 0..*
+Agent
+├─ id, definition, nickname, and provider_thread_id
+└─ Exchange 0..*
+   ├─ prompt, lifecycle, one summary, and one checkpoint
+   ├─ Turn 1..*
+   │  └─ ordered messages and tools
+   └─ Delegation 0..*
+      └─ parent agent, exchange, and turn -> child agent and exchange
 ```
 
 Codex children sharing the parent working directory also share its mutable filesystem. Permission inheritance prevents a child from gaining more authority than its parent, while Codex owns scheduling and patch-conflict behavior among those children. Harness attribution should consume structured child lifecycle and `fileChange` events rather than attempting to infer ownership from filesystem timing.
@@ -194,11 +194,13 @@ The UI should derive available actions from these capabilities. For example, `/a
 
 ## Timeline behavior
 
-Each parent interaction persists an ordered `InteractionNode` list. A `MainSegment` freezes one uninterrupted stretch of parent work, an `AgentReference` fixes a child at its spawn position, and a `SteeringPrompt` records acknowledged input where the user redirected the logical interaction. Child status updates replace the referenced `AgentRun` without moving its row. Final parent synthesis appends another `MainSegment`, so response streaming never pushes a completed child to a temporary tail position.
+Each parent `Exchange` persists an ordered `ExchangeNode` list. `TurnContent` references messages and tools owned by canonical `Turn` records, `AgentReference` fixes a `Delegation` at its spawn position, and `ExchangeInput` records acknowledged clarification or steering. Child status derives from the exact child Exchange named by the Delegation. Reusing an Agent for another request cannot change an earlier delegation row. Final parent synthesis creates another Turn in the same Exchange, so the UI renders one summary and one checkpoint for the complete request.
+
+Delegation admission commits the parent reference and a queued child Exchange in one transaction. Provider start evidence activates that queued Exchange. Recovery interrupts queued requests whose provider execution never became observable, preserving a complete ownership graph for checkpoint validation and rollback.
 
 Codex keeps one app-server process alive after an early parent `turn/completed` notification whenever descendant threads remain active. A logical-turn coordinator continues consuming child lifecycle events, accepts Ctrl-q steering as a new parent turn on the same thread, and starts a bounded final synthesis turn after the last descendant completes. `Waiting on N subagents` derives from transient coordinator state. It disappears when parent work resumes or every child finishes and never enters SQLite history.
 
-The Lua projection consumes only the ordered representation. Sessions carry an exact format version, and the store hides every noncurrent session instead of migrating or partially decoding its timeline.
+Rust projects the ordered representation into buffer documents. Lua owns Neovim buffers, windows, input, folds, and cursor behavior without reconstructing execution state. Sessions carry an exact format version, and the store hides every noncurrent session instead of migrating or partially decoding its timeline.
 
 The selector should show:
 

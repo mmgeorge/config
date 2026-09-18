@@ -21,15 +21,15 @@ local function invoke(key, mode, buf)
 end
 
 local function thought_with_tool(tool_list)
+  local item, order = {}, {}
+  for _, tool in ipairs(tool_list) do
+    item[tool.id] = tool
+    order[#order + 1] = tool.id
+  end
   return {
     id = "interaction",
-    node_list = {
-      {
-        segment = {
-          thought = { { text = "Inspecting", tool = tool_list } },
-        },
-      },
-    },
+    state = "running",
+    turn = { { state = { kind = "running" }, tool = { order = order, item = item } } },
   }
 end
 
@@ -46,6 +46,7 @@ local ok, failure = pcall(function()
     { id = "ok", status = "completed", output = "done" },
     { id = "failed", status = "failed", output = "denied" },
   })
+  local done_exchange = { id = "done", agent_id = "run-done", state = "complete", turn = {} }
   local state = {
     selected_agent_run_id = "run-zeta",
     agent = {
@@ -53,54 +54,49 @@ local ok, failure = pcall(function()
         {
           id = "run-zeta",
           definition = "zeta",
-          status = "running",
+          state = "ready",
           created_at_ms = os.time() * 1000 - 10000,
           updated_at_ms = os.time() * 1000,
         },
         {
           id = "run-done",
           definition = "explorer",
-          status = "completed",
+          state = "ready",
           created_at_ms = 1000,
           updated_at_ms = 61000,
         },
         {
           id = "run-alpha",
           definition = "alpha",
-          status = "waiting",
+          state = "starting",
           created_at_ms = os.time() * 1000 - 5000,
           updated_at_ms = os.time() * 1000,
         },
       },
-      turn = {
-        {
-          agent_run_id = "run-zeta",
-          interaction = zeta_interaction,
-        },
-      },
+      exchange = {},
     },
     timeline = {
       {
-        kind = "interaction",
+        kind = "exchange",
         id = "parent",
-        interaction = { id = "parent" },
+        exchange = { id = "parent" },
         agent_by_id = {
           ["run-zeta"] = {
             kind = "agent_lifecycle",
             run = { id = "run-zeta" },
-            interaction = { zeta_interaction },
+            exchange = { zeta_interaction },
             agent = {},
           },
           ["run-done"] = {
             kind = "agent_lifecycle",
             run = { id = "run-done" },
-            interaction = {},
+            exchange = { done_exchange },
             agent = {},
           },
           ["run-alpha"] = {
             kind = "agent_lifecycle",
             run = { id = "run-alpha" },
-            interaction = {},
+            exchange = {},
             agent = {},
           },
         },
@@ -108,13 +104,13 @@ local ok, failure = pcall(function()
     },
   }
 
-  local first_by_letter = agent_catalog.resolve(state.agent, "a")
-  local first_by_number = agent_catalog.resolve(state.agent, "0")
+  local first_by_letter = agent_catalog.resolve(state, "a")
+  local first_by_number = agent_catalog.resolve(state, "0")
   assert_equals(first_by_letter.id, "run-alpha", "letter aliases should sort running children alphabetically")
   assert_equals(first_by_number.id, "run-alpha", "numeric aliases should share the zero-based running order")
-  local missing_done_alias = agent_catalog.resolve(state.agent, "c")
+  local missing_done_alias = agent_catalog.resolve(state, "c")
   assert_equals(missing_done_alias, nil, "running aliases should never include completed children")
-  assert_equals(agent_catalog.resolve(state.agent, "explorer").id, "run-done",
+  assert_equals(agent_catalog.resolve(state, "explorer").id, "run-done",
     "unique child labels should resolve ended timelines")
 
   agent_picker.open({
@@ -139,7 +135,8 @@ local ok, failure = pcall(function()
   assert_equals(picker_state.selected_option(active.state, active.spec).value.run.id, "run-zeta",
     "the active child timeline should be selected initially")
 
-  state.agent.run[1].status = "completed"
+  zeta_interaction.state = "complete"
+  zeta_interaction.turn[1].state = { kind = "finished", outcome = "completed" }
   state.agent.run[1].updated_at_ms = state.agent.run[1].created_at_ms + 12000
   agent_picker.refresh()
   active = picker._state_for_test()

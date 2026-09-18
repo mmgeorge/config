@@ -7,7 +7,8 @@ local editable = require("forge.editable")
 function M.open(options, callback)
   local identity = "harness:" .. options.session_id .. ":" .. tostring(vim.uv.hrtime())
   local owner = { document = identity, composer_id = identity .. ":composer", closed = false, syncing = false, pending = false, output = {},
-    session_id = options.session_id, host_generation = client.host_generation(), views = {} }
+    session_id = options.session_id, host_generation = client.host_generation(), views = {},
+    timeline_key = "main", timeline_view = {} }
   local function alive()
     return not owner.closed and owner.host_generation == client.host_generation()
       and client.host_accepting() and options.is_alive()
@@ -47,7 +48,7 @@ function M.open(options, callback)
     if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= owner.transcript.buffer then return nil end
     local view = owner.views[window]
     if view then return view end
-    view = input.open(owner.transcript, window, { margin = 0 })
+    view = input.open(owner.transcript, window, { margin = 0, wrapping = { indent = true, options = "shift:0" } })
     owner.views[window] = view
     request({ operation = "open_view", document = identity, view = view.id,
       width = require("forge.width").capture(window) }, function(_, failure)
@@ -118,7 +119,7 @@ function M.open(options, callback)
       end)
       return true
     end } })
-  owner.view = input.open(owner.transcript, options.transcript_window, { margin = 0 })
+  owner.view = input.open(owner.transcript, options.transcript_window, { margin = 0, wrapping = { indent = true, options = "shift:0" } })
   owner.views[options.transcript_window] = owner.view
   request({ operation = "open", document = identity, composer = owner.composer_id, view = owner.view.id,
     width = require("forge.width").capture(options.transcript_window),
@@ -142,17 +143,29 @@ function M.open(options, callback)
     owner.ready = true
     vim.bo[options.composer_buffer].modifiable = true
     callback(owner)
+    if opened.syntax_pending then vim.schedule(function() owner.highlight() end) end
   end)
 
   function owner.sync()
     if not alive() or not owner.ready then return end
     owner.pending = true
-    if owner.syncing then return end
+    if owner.syncing or owner.selecting then return end
+    if owner.next_timeline and not owner.restore_timeline then
+      owner.select_agent(owner.next_timeline)
+      return
+    end
     owner.pending, owner.syncing = false, true
     request({ operation = "sync", document = identity, revision = owner.transcript.revision }, function(result, failure)
       owner.syncing = false
       if not alive() then return end
-      if failure then notice(failure) return end
+      if failure then
+        if owner.sync_failure ~= failure then
+          owner.sync_failure = failure
+          notice(failure)
+        end
+        return
+      end
+      owner.sync_failure = nil
       local follow = {}
       local previous_rows = vim.api.nvim_buf_line_count(options.transcript_buffer)
       for window in pairs(owner.views) do
@@ -172,8 +185,28 @@ function M.open(options, callback)
           vim.api.nvim_win_set_cursor(window, { vim.api.nvim_buf_line_count(options.transcript_buffer), 0 })
         end
       end
+      if owner.restore_timeline then
+        for window, saved in pairs(owner.timeline_view[owner.restore_timeline] or {}) do
+          if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
+            vim.api.nvim_win_call(window, function() vim.fn.winrestview(saved) end)
+          end
+        end
+        owner.restore_timeline = nil
+      end
       if options.on_update then options.on_update() end
+      if result.syntax_pending then owner.highlight() end
       if owner.pending then owner.sync() end
+    end)
+  end
+
+  function owner.highlight()
+    if not alive() or not owner.ready or owner.highlighting then return end
+    owner.highlighting = true
+    client.request_for(options.session_id, "harness.document", { operation = "highlight", document = identity }, function(_, failure)
+      owner.highlighting = false
+      if not alive() then return end
+      if failure then notice(failure) end
+      owner.sync()
     end)
   end
 
@@ -183,6 +216,7 @@ function M.open(options, callback)
     if not view then return end
     local captured, failure = input.capture(owner.transcript, view, "activate")
     if not captured then notice(failure) return end
+    if not captured.target then return end
     request({ operation = "input", input = captured }, function(action, action_error)
       if not alive() then return end
       if action_error then notice(action_error) return end
@@ -275,13 +309,40 @@ function M.open(options, callback)
     end)
   end
 
+  ---@param run_id string?
   function owner.select_agent(run_id)
     if not alive() or not owner.ready then return end
-    request({ operation = "select_agent", document = identity, run_id = run_id or vim.NIL }, function(_, failure)
+    local target = run_id or "main"
+    owner.next_timeline, owner.pending = target, true
+    if owner.syncing or owner.selecting then return end
+    owner.next_timeline = nil
+    if target == owner.timeline_key then owner.sync() return end
+    ---@type table<integer, table>
+    local saved = {}
+    for window in pairs(owner.views) do
+      if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
+        saved[window] = vim.api.nvim_win_call(window, vim.fn.winsaveview)
+      end
+    end
+    owner.timeline_view[owner.timeline_key] = saved
+    owner.selecting = true
+    request({ operation = "select_agent", document = identity, run_id = target ~= "main" and target or vim.NIL }, function(_, failure)
+      owner.selecting = false
       if not alive() then return end
       if failure then notice(failure) return end
+      owner.timeline_key, owner.restore_timeline = target, target
       owner.sync()
     end)
+  end
+
+  ---Resume transcript tail following for an explicit user action without changing focus.
+  function owner.follow_tail()
+    if not alive() or not owner.ready then return end
+    local window = owner.views[options.transcript_window] and options.transcript_window or next(owner.views)
+    if window and vim.api.nvim_win_is_valid(window)
+      and vim.api.nvim_win_get_buf(window) == owner.transcript.buffer then
+      vim.api.nvim_win_set_cursor(window, { vim.api.nvim_buf_line_count(owner.transcript.buffer), 0 })
+    end
   end
 
   function owner.submit(callback)
@@ -293,6 +354,7 @@ function M.open(options, callback)
       callback(nil, "Composer edit could not be sent")
       return
     end
+    owner.follow_tail()
     submit_ready()
   end
 

@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::{
     broker::{ActiveElicitation, ElicitationOwner},
-    interaction::ActiveWait,
+    exchange::ActiveWait,
     plan::{PlanRecord, PlanState},
 };
 
@@ -20,6 +20,10 @@ pub enum WorkflowActivity {
 pub enum SessionPhase {
     #[default]
     Idle,
+    Finalizing {
+        exchange_id: String,
+        error: Option<String>,
+    },
     Working {
         started_at_ms: i64,
         activity: WorkflowActivity,
@@ -27,7 +31,7 @@ pub enum SessionPhase {
     AwaitingInput {
         owner: ElicitationOwner,
         plan_id: Option<String>,
-        interaction_id: Option<String>,
+        exchange_id: Option<String>,
     },
     AwaitingPlanReview {
         plan_id: String,
@@ -66,7 +70,7 @@ impl SessionPhase {
             return Self::AwaitingInput {
                 owner: elicitation.owner,
                 plan_id: elicitation.plan_id.clone(),
-                interaction_id: elicitation.interaction_id.clone(),
+                exchange_id: elicitation.exchange_id.clone(),
             };
         }
         if let Some(plan) = active_plan.filter(|plan| plan.state == PlanState::AwaitingReview) {
@@ -164,7 +168,7 @@ mod test {
         let elicitation = ActiveElicitation {
             owner: ElicitationOwner::Plan,
             plan_id: Some(plan.id.clone()),
-            interaction_id: None,
+            exchange_id: None,
             elicitation: crate::plan::PlanElicitation::new(
                 crate::plan::PlanQuestionSet::freeform("Old question".into())
                     .normalize()

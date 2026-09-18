@@ -1,5 +1,5 @@
 use crate::backend::{ProviderChangeKind, ProviderFileChange};
-use crate::interaction::{CompletedTool, InteractionNode, InteractionRecord};
+use crate::exchange::{Exchange, ToolCall};
 use std::collections::BTreeSet;
 
 /// Stores normalized paths from successful provider-owned file changes.
@@ -10,18 +10,15 @@ pub struct ProviderChangeIndex {
 
 impl ProviderChangeIndex {
     /// Merge successful provider file changes from one interaction timeline.
-    pub fn record(&mut self, interaction: &InteractionRecord) {
-        for node in &interaction.node_list {
-            let InteractionNode::MainSegment { segment } = node else {
-                continue;
-            };
-            for thought in &segment.thought {
-                self.record_tool_list(&thought.tool);
+    pub fn record(&mut self, interaction: &Exchange) {
+        for turn in &interaction.turn {
+            for tool in turn.tools() {
+                self.record_tool_list(std::slice::from_ref(tool));
             }
         }
     }
 
-    fn record_tool_list(&mut self, tool_list: &[CompletedTool]) {
+    fn record_tool_list(&mut self, tool_list: &[ToolCall]) {
         for tool in tool_list {
             if !successful_file_change(tool) {
                 continue;
@@ -58,7 +55,7 @@ pub struct ProviderDiffBuilder;
 
 impl ProviderDiffBuilder {
     /// Build a unified operation diff from successful provider file-change tools.
-    pub fn build(tool_list: &[CompletedTool]) -> Option<String> {
+    pub fn build(tool_list: &[ToolCall]) -> Option<String> {
         let mut projection_list = Vec::<FileProjection>::new();
         for tool in tool_list {
             if !successful_file_change(tool) {
@@ -76,7 +73,7 @@ impl ProviderDiffBuilder {
     }
 }
 
-fn successful_file_change(tool: &CompletedTool) -> bool {
+fn successful_file_change(tool: &ToolCall) -> bool {
     tool.kind == "file_change" && !tool.failed && successful_status(&tool.status)
 }
 
@@ -225,10 +222,11 @@ fn render_projection(output: &mut String, projection: FileProjection) {
 mod test {
     use super::{ProviderChangeIndex, ProviderDiffBuilder};
     use crate::backend::{ProviderChangeKind, ProviderChangeSet, ProviderFileChange};
-    use crate::interaction::CompletedTool;
+    use crate::exchange::ToolCall;
 
-    fn file_tool(id: &str, status: &str, file: Vec<ProviderFileChange>) -> CompletedTool {
-        CompletedTool {
+    fn file_tool(id: &str, status: &str, file: Vec<ProviderFileChange>) -> ToolCall {
+        ToolCall {
+            task_id: None,
             id: id.into(),
             kind: "file_change".into(),
             title: "file changes".into(),
@@ -283,7 +281,8 @@ mod test {
                 diff: "@@ -0,0 +1 @@\n+failed".into(),
             }],
         );
-        let command = CompletedTool {
+        let command = ToolCall {
+            task_id: None,
             id: "command".into(),
             kind: "command".into(),
             title: "cargo fmt".into(),

@@ -60,6 +60,18 @@ local ok, failure = pcall(function()
   state.status = { kind = "planning_failed", plan_id = "plan-1", turn_count = 2 }
   assert_equals(status_view.resolve(state).text, "Plan generation stopped. Run /plan retry or /plan cancel",
     "failed planning should expose only the Rust-owned recovery commands")
+  state.status = { kind = "finalizing", exchange_id = "exchange-1" }
+  assert_equals(status_view.resolve(state), {
+    id = "finalizing",
+    kind = "working",
+    text = "Finalizing",
+  }, "active finalization should remain visible and animated")
+  state.status.error = "child cleanup timed out"
+  assert_equals(status_view.resolve(state), {
+    id = "finalizing",
+    kind = "error",
+    text = "Finalization failed: child cleanup timed out",
+  }, "failed finalization should expose its durable error")
   state.status = { kind = "idle" }
   assert_equals(status_view.resolve(state), nil, "structural idle status should remain invisible")
   state.busy = false

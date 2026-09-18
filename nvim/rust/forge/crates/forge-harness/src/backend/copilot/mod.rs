@@ -399,12 +399,14 @@ impl Backend for CopilotBackend {
             .and_then(Value::as_array)
             .is_some_and(|row_list| !row_list.is_empty())
         {
-            decoder.publish_task_snapshot(
-                initial_task_data,
-                "copilot-root".into(),
-                &mut output,
-                event_sink.as_ref(),
-            );
+            decoder
+                .publish_task_snapshot(
+                    initial_task_data,
+                    "copilot-root".into(),
+                    &mut output,
+                    event_sink.as_ref(),
+                )
+                .await;
         }
         let provider_text = match &request.input {
             BackendInput::Text { text } => text.clone(),
@@ -472,12 +474,12 @@ impl Backend for CopilotBackend {
                                 .unwrap_or_else(|| "copilot-root".into()),
                             &mut output,
                             event_sink.as_ref(),
-                        );
+                        ).await;
                         continue;
                     }
                     let terminal_error = provider_event.event_type == "session.error"
                         && !provider_event.is_transient_error();
-                    decoder.decode(&provider_event, &mut output, event_sink.as_ref());
+                    decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
                     if terminal_error {
                         let detail = provider_event
                             .data
@@ -495,7 +497,7 @@ impl Backend for CopilotBackend {
                             result.as_ref().err().map(|error| format!("{error:#}")),
                             &mut output,
                             event_sink.as_ref(),
-                        );
+                        ).await;
                         if let Err(error) = result {
                             output.control_error = Some(format!("{error:#}"));
                         }
@@ -505,12 +507,14 @@ impl Backend for CopilotBackend {
         }
         while let Ok(invocation) = control_stream.try_receive() {
             let result = apply_invocation(&invocation, &mut output);
-            control_stream.publish_completion(
-                invocation,
-                result.as_ref().err().map(|error| format!("{error:#}")),
-                &mut output,
-                event_sink.as_ref(),
-            );
+            control_stream
+                .publish_completion(
+                    invocation,
+                    result.as_ref().err().map(|error| format!("{error:#}")),
+                    &mut output,
+                    event_sink.as_ref(),
+                )
+                .await;
             if let Err(error) = result {
                 output.control_error = Some(format!("{error:#}"));
             }
@@ -838,7 +842,10 @@ impl Backend for CopilotBackend {
             .send(MessageOptions::new(text.clone()).with_mode(DeliveryMode::Immediate))
             .await
             .context("steer active Copilot turn")?;
-        self.turn_event(session_id).await.publish_steering(text)?;
+        self.turn_event(session_id)
+            .await
+            .publish_steering(text)
+            .await?;
         Ok(())
     }
 
@@ -888,7 +895,7 @@ impl CopilotTurnEvent {
     }
 
     /// Publish steering only after the Copilot SDK accepts the immediate message.
-    fn publish_steering(&self, text: String) -> Result<()> {
+    async fn publish_steering(&self, text: String) -> Result<()> {
         let event_sink = self
             .event_sink
             .lock()
@@ -896,7 +903,8 @@ impl CopilotTurnEvent {
             .clone();
         if let Some(event_sink) = event_sink {
             event_sink
-                .send(BackendEvent::steering_input(text))
+                .send_wait(BackendEvent::steering_input(text))
+                .await
                 .map_err(|_| anyhow::anyhow!("Copilot turn event receiver closed"))?;
         }
         Ok(())
@@ -1139,7 +1147,7 @@ impl ControlToolStream {
     }
 
     /// Publish one completed Harness control call through the shared tool timeline.
-    fn publish_completion(
+    async fn publish_completion(
         &mut self,
         invocation: ControlToolInvocation,
         error: Option<String>,
@@ -1148,6 +1156,8 @@ impl ControlToolStream {
     ) {
         self.next_activity_id += 1;
         let event = BackendEvent {
+            address: None,
+            turn_boundary: None,
             kind: "tool".into(),
             text: None,
             data: Value::Null,
@@ -1175,7 +1185,7 @@ impl ControlToolStream {
             task_update: None,
         };
         if let Some(event_sink) = event_sink {
-            let _ = event_sink.send(event.clone());
+            let _ = event_sink.send_wait(event.clone()).await;
         }
         output.event.push(event);
     }
@@ -1294,7 +1304,7 @@ impl PermissionHandler for CopilotPermissionHandler {
         match self
             .context
             .coordinator
-            .authorize(execution_mode, request, event_sink.as_ref())
+            .authorize(execution_mode, request, None, event_sink.as_ref())
             .await
         {
             Ok(
@@ -1496,8 +1506,8 @@ mod test {
         );
     }
 
-    #[test]
-    fn publishes_control_tools_through_the_shared_timeline() {
+    #[tokio::test]
+    async fn publishes_control_tools_through_the_shared_timeline() {
         let router = Arc::new(ControlToolRouter::default());
         let mut stream = router
             .activate(ControlTurnContext::inactive(PromptMode::Chat))
@@ -1505,15 +1515,17 @@ mod test {
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         let mut output = BackendOutput::default();
 
-        stream.publish_completion(
-            ControlToolInvocation {
-                name: "harness_plan_read".into(),
-                arguments: Value::Null,
-            },
-            None,
-            &mut output,
-            Some(&event_sink),
-        );
+        stream
+            .publish_completion(
+                ControlToolInvocation {
+                    name: "harness_plan_read".into(),
+                    arguments: Value::Null,
+                },
+                None,
+                &mut output,
+                Some(&event_sink),
+            )
+            .await;
 
         let activity = output.event[0].activity.as_ref().expect("tool activity");
         assert_eq!(activity.title, "harness_plan_read");
@@ -1609,19 +1621,22 @@ mod test {
         ));
     }
 
-    #[test]
-    fn publishes_steering_only_while_a_copilot_turn_is_active() {
+    #[tokio::test]
+    async fn publishes_steering_only_while_a_copilot_turn_is_active() {
         let turn_event = CopilotTurnEvent::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         let turn_guard = turn_event.activate(Some(event_sink)).unwrap();
 
-        turn_event.publish_steering("accepted".into()).unwrap();
+        turn_event
+            .publish_steering("accepted".into())
+            .await
+            .unwrap();
         let event = event_stream.try_recv().unwrap();
         assert_eq!(event.kind, "steering_input");
         assert_eq!(event.text.as_deref(), Some("accepted"));
 
         drop(turn_guard);
-        turn_event.publish_steering("late".into()).unwrap();
+        turn_event.publish_steering("late".into()).await.unwrap();
         assert!(event_stream.try_recv().is_err());
     }
 }

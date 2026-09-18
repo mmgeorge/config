@@ -164,7 +164,7 @@ local function new_harness_state()
   prompt_history = {},
   prompt_history_index = 0,
   prompt_history_draft = nil,
-  agent = { definition = {}, run = {}, turn = {} },
+  agent = { definition = {}, run = {}, exchange = {} },
   selected_agent_run_id = nil,
   }
 end

@@ -352,7 +352,7 @@ enum StatusContextRequest {
 pub(crate) enum RoutedMethod {
     Github(github_routes::GithubRoute),
     HarnessInitialize,
-    HarnessDocument,
+    TranscriptDocument,
     Revisions,
     RepositoryWrite,
     RepositoryGenerate,
@@ -432,7 +432,7 @@ fn decode_method(method: &str) -> Result<RoutedMethod> {
             github_routes::GithubRoute::ReviewDraftWrite,
         )),
         "harness.initialize" => Ok(RoutedMethod::HarnessInitialize),
-        "harness.document" => Ok(RoutedMethod::HarnessDocument),
+        "harness.document" => Ok(RoutedMethod::TranscriptDocument),
         "repository.revisions" => Ok(RoutedMethod::Revisions),
         "repository.write" => Ok(RoutedMethod::RepositoryWrite),
         "repository.generate" => Ok(RoutedMethod::RepositoryGenerate),
@@ -541,7 +541,7 @@ impl HostRouter {
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
-            RoutedMethod::HarnessDocument => {
+            RoutedMethod::TranscriptDocument => {
                 if request.params.get("operation").and_then(Value::as_str) == Some("open_diff") {
                     let HarnessSourceRequest::OpenDiff { document, input } =
                         serde_json::from_value(request.params)?;

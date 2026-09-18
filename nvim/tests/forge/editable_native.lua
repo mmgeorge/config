@@ -73,6 +73,38 @@ local ok, failure = xpcall(function()
   editable.detach(state)
   vim.api.nvim_buf_set_text(buffer, 0, 0, 0, 1, { "detached" })
   assert(state.sequence == sequence, "detached callback captured text")
+
+  state = editable.new("whole-line-delete")
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "draft" })
+  editable.register(state, "body", 0)
+  editable.attach(state, buffer, {
+    body = { start = { row = 0, column = 0 }, finish = { row = 0, column = 5 } },
+  }, { delay = 10, max_delay = 30, send = function() return true end })
+  vim.api.nvim_buf_call(buffer, function() vim.cmd("normal! ggdG") end)
+  assert(vim.wait(200, function() return not state.native.rejecting end, 1))
+  assert(not state.fault, state.fault)
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), { "" }),
+    "whole-line deletion restored the editable draft")
+  assert(vim.deep_equal(editable.recoverable_text(state, "body"), { "" }))
+  vim.api.nvim_buf_set_text(buffer, 0, 0, 0, 0, { "λ", "second", "🙂" })
+  assert(not state.fault, state.fault)
+  vim.api.nvim_buf_call(buffer, function() vim.cmd("normal! ggdG") end)
+  assert(vim.wait(200, function() return not state.native.rejecting end, 1))
+  assert(not state.fault, state.fault)
+  assert(vim.deep_equal(editable.recoverable_text(state, "body"), { "" }),
+    "multiline deletion failed to capture the empty draft")
+
+  editable.detach(state)
+  state = editable.new("protected-last-line")
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "Label: draft" })
+  editable.register(state, "body", 0)
+  editable.attach(state, buffer, {
+    body = { start = { row = 0, column = 7 }, finish = { row = 0, column = 12 } },
+  }, { delay = 10, max_delay = 30, send = function() return true end })
+  vim.api.nvim_buf_call(buffer, function() vim.cmd("normal! ggdG") end)
+  assert(vim.wait(200, function() return not state.native.rejecting end, 1))
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), { "Label: draft" }),
+    "whole-line deletion removed a protected prefix")
 end, debug.traceback)
 
 editable.detach(state)

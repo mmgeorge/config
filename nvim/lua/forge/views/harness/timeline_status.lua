@@ -49,6 +49,10 @@ end
 ---@return table?
 function M.resolve(state)
   local status = state.status or { kind = "idle" }
+  if status.kind == "finalizing" then
+    return { id = "finalizing", kind = status.error and "error" or "working",
+      text = status.error and ("Finalization failed: " .. status.error) or "Finalizing" }
+  end
   if status.kind == "awaiting_input" then
     local reopen_key = keymaps.view_keys_for("harness", "reopen_question")[1]
     local suffix = reopen_key and (" (press " .. reopen_key .. ")") or ""

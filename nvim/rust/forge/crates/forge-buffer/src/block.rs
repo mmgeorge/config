@@ -112,6 +112,66 @@ pub struct BufferBlock {
     pub metadata: BlockMetadata,
 }
 
+impl BlockMetadata {
+    /// Charge retained vector storage and nested strings without serializing metadata.
+    fn allocated_bytes(&self) -> usize {
+        use std::mem::size_of;
+        self.target.capacity() * size_of::<TargetRange>()
+            + self.decoration.capacity() * size_of::<Decoration>()
+            + self.visible_decoration.capacity() * size_of::<Decoration>()
+            + self.source_highlight.capacity() * size_of::<Decoration>()
+            + self.conceal.capacity() * size_of::<Conceal>()
+            + self.source_overlay.capacity() * size_of::<SourceOverlay>()
+            + self.editable_region.capacity() * size_of::<EditableRegion>()
+            + self.fold.capacity() * size_of::<FoldRange>()
+            + self.gutter.capacity() * size_of::<Gutter>()
+            + self
+                .target
+                .iter()
+                .map(|target| target.id.0.capacity())
+                .sum::<usize>()
+            + self
+                .decoration
+                .iter()
+                .chain(&self.visible_decoration)
+                .chain(&self.source_highlight)
+                .map(|span| span.capture.capacity())
+                .sum::<usize>()
+            + self
+                .conceal
+                .iter()
+                .map(|conceal| conceal.replacement.capacity())
+                .sum::<usize>()
+            + self
+                .source_overlay
+                .iter()
+                .map(|overlay| overlay.text.capacity() + overlay.capture.capacity())
+                .sum::<usize>()
+            + self
+                .editable_region
+                .iter()
+                .map(|region| region.id.0.capacity())
+                .sum::<usize>()
+            + self
+                .fold
+                .iter()
+                .map(|fold| fold.id.0.capacity() + fold.end.block.0.capacity())
+                .sum::<usize>()
+            + self
+                .gutter
+                .iter()
+                .map(|gutter| {
+                    gutter.chunk.capacity() * size_of::<TextChunk>()
+                        + gutter
+                            .chunk
+                            .iter()
+                            .map(|chunk| chunk.text.capacity() + chunk.capture.capacity())
+                            .sum::<usize>()
+                })
+                .sum::<usize>()
+    }
+}
+
 impl TextRange {
     pub fn validate(&self, text: &BufferText) -> Result<(), ContractError> {
         if self.start > self.end {
@@ -133,6 +193,14 @@ impl TextRange {
 }
 
 impl BufferBlock {
+    /// Charge one retained block and every allocation it owns, excluding allocator bookkeeping.
+    pub fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.id.0.capacity()
+            + self.text.allocated_bytes()
+            + self.metadata.allocated_bytes()
+    }
+
     pub fn validate(&self) -> Result<(), ContractError> {
         self.id.validate()?;
         for target in &self.metadata.target {

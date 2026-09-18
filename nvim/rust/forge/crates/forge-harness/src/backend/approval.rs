@@ -42,6 +42,8 @@ pub struct ApprovalChoice {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ApprovalRequestView {
     pub id: String,
+    pub exchange_id: Option<String>,
+    pub turn_id: Option<String>,
     pub provider: String,
     pub title: String,
     pub detail: String,
@@ -83,6 +85,7 @@ impl PermissionCoordinator {
         &self,
         execution_mode: ExecutionMode,
         request: PermissionRequest,
+        address: Option<crate::backend::ProviderAddress>,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalResolution> {
         if execution_mode == ExecutionMode::Yolo {
@@ -113,48 +116,89 @@ impl PermissionCoordinator {
                 },
             );
         if let Some(event_sink) = event_sink {
-            let _ = event_sink.send(BackendEvent {
-                kind: "approval_requested".into(),
-                text: None,
-                data: serde_json::to_value(&view)?,
-                activity: None,
-                summary: None,
-                task_update: None,
-            });
+            event_sink
+                .send_wait(BackendEvent {
+                    address,
+                    turn_boundary: None,
+                    kind: "approval_requested".into(),
+                    text: None,
+                    data: serde_json::to_value(&view)?,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                })
+                .await?;
         }
         receiver
             .await
             .with_context(|| format!("approval request {id} was cancelled"))
     }
 
-    pub fn resolve(
+    /// Attach canonical execution ownership before publishing or snapshotting an approval.
+    pub(crate) fn bind_owner(
+        &self,
+        id: &str,
+        exchange_id: &str,
+        turn_id: Option<&str>,
+    ) -> Result<ApprovalRequestView> {
+        let mut pending = self
+            .pending_map
+            .lock()
+            .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+        let approval = pending
+            .get_mut(id)
+            .context("approval request is no longer pending")?;
+        anyhow::ensure!(
+            approval
+                .view
+                .exchange_id
+                .as_deref()
+                .is_none_or(|owner| owner == exchange_id),
+            "approval cannot change its owning exchange"
+        );
+        approval.view.exchange_id = Some(exchange_id.to_owned());
+        anyhow::ensure!(
+            approval
+                .view
+                .turn_id
+                .as_deref()
+                .is_none_or(|owner| Some(owner) == turn_id),
+            "approval cannot change its owning turn"
+        );
+        approval.view.turn_id = turn_id.map(str::to_owned);
+        Ok(approval.view.clone())
+    }
+
+    pub async fn resolve(
         &self,
         approval_id: &str,
         choice_id: &str,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalRequestView> {
-        let mut pending_map = self
-            .pending_map
-            .lock()
-            .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
-        let pending = pending_map
-            .get(approval_id)
-            .with_context(|| format!("approval request is no longer pending: {approval_id}"))?;
-        let choice = pending
-            .view
-            .choice_list
-            .iter()
-            .find(|choice| choice.id == choice_id)
-            .cloned()
-            .with_context(|| format!("unknown approval choice: {choice_id}"))?;
-        anyhow::ensure!(
-            !pending.response.is_closed(),
-            "provider no longer waits for approval {approval_id}"
-        );
-        let pending = pending_map
-            .remove(approval_id)
-            .expect("validated approval must remain pending while locked");
-        drop(pending_map);
+        let (pending, choice) = {
+            let mut pending_map = self
+                .pending_map
+                .lock()
+                .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+            let pending = pending_map
+                .get(approval_id)
+                .with_context(|| format!("approval request is no longer pending: {approval_id}"))?;
+            let choice = pending
+                .view
+                .choice_list
+                .iter()
+                .find(|choice| choice.id == choice_id)
+                .cloned()
+                .with_context(|| format!("unknown approval choice: {choice_id}"))?;
+            anyhow::ensure!(
+                !pending.response.is_closed(),
+                "provider no longer waits for approval {approval_id}"
+            );
+            let pending = pending_map
+                .remove(approval_id)
+                .expect("validated approval must remain pending while locked");
+            (pending, choice)
+        };
         let persistent_decision = match choice.resolution {
             ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad => {
                 Some(PermissionDecision::Allow)
@@ -164,21 +208,23 @@ impl PermissionCoordinator {
             }
             _ => None,
         };
-        if let Some(decision) = persistent_decision
-            && let Err(error) = self
+        let persisted = match persistent_decision {
+            Some(decision) => self
                 .store
                 .write()
                 .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-                .set_rule_list(&choice.rule_list, decision)
-        {
-            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view)?;
+                .set_rule_list(&choice.rule_list, decision),
+            None => Ok(()),
+        };
+        if let Err(error) = persisted {
+            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
             return Err(error);
         }
         if pending.response.send(choice.resolution).is_err() {
-            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view)?;
+            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
             anyhow::bail!("provider no longer waits for approval {approval_id}");
         }
-        Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view)?;
+        Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
         Ok(pending.view)
     }
 
@@ -192,7 +238,7 @@ impl PermissionCoordinator {
             .collect())
     }
 
-    pub fn cancel_all(&self, event_sink: Option<&BackendEventSink>) -> Result<()> {
+    pub async fn cancel_all(&self, event_sink: Option<&BackendEventSink>) -> Result<()> {
         let pending_list = {
             let mut pending_map = self
                 .pending_map
@@ -204,25 +250,29 @@ impl PermissionCoordinator {
         };
         for pending in pending_list {
             let _ = pending.response.send(ApprovalResolution::Cancel);
-            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view)?;
+            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
         }
         Ok(())
     }
 
-    fn emit_lifecycle(
+    async fn emit_lifecycle(
         event_sink: Option<&BackendEventSink>,
         kind: &str,
         view: &ApprovalRequestView,
     ) -> Result<()> {
         if let Some(event_sink) = event_sink {
-            let _ = event_sink.send(BackendEvent {
-                kind: kind.into(),
-                text: None,
-                data: serde_json::to_value(view)?,
-                activity: None,
-                summary: None,
-                task_update: None,
-            });
+            let _ = event_sink
+                .send_wait(BackendEvent {
+                    address: None,
+                    turn_boundary: None,
+                    kind: kind.into(),
+                    text: None,
+                    data: serde_json::to_value(view)?,
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                })
+                .await;
         }
         Ok(())
     }
@@ -308,6 +358,8 @@ fn approval_view(request: &PermissionRequest) -> ApprovalRequestView {
     let broad_rule_list = target_rule_list(request, true);
     ApprovalRequestView {
         id: request.id.clone(),
+        exchange_id: None,
+        turn_id: None,
         provider: request.provider.clone(),
         title,
         detail,
@@ -679,14 +731,32 @@ mod test {
         let waiting_coordinator = Arc::clone(&coordinator);
         let waiting = tokio::spawn(async move {
             waiting_coordinator
-                .authorize(ExecutionMode::Read, request, Some(&waiting_event_sink))
+                .authorize(
+                    ExecutionMode::Read,
+                    request,
+                    None,
+                    Some(&waiting_event_sink),
+                )
                 .await
                 .unwrap()
         });
         let event = event_stream.recv().await.unwrap().unwrap();
         assert_eq!(event.kind, "approval_requested");
+        let owned = coordinator
+            .bind_owner("approval-one", "child-exchange", Some("child-turn"))
+            .unwrap();
+        assert_eq!(owned.exchange_id.as_deref(), Some("child-exchange"));
+        let snapshot = coordinator.pending_list().unwrap();
+        assert_eq!(snapshot[0].exchange_id, owned.exchange_id);
+        assert_eq!(snapshot[0].turn_id.as_deref(), Some("child-turn"));
+        assert!(
+            coordinator
+                .bind_owner("approval-one", "other-exchange", Some("other-turn"))
+                .is_err()
+        );
         coordinator
             .resolve("approval-one", "allow_broad", Some(&event_sink))
+            .await
             .unwrap();
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::AllowBroad);
         let resolved = event_stream.recv().await.unwrap().unwrap();
@@ -717,6 +787,7 @@ mod test {
                             command: "rg TODO src".into(),
                         }],
                     },
+                    None,
                     Some(&waiting_event_sink),
                 )
                 .await
@@ -728,6 +799,7 @@ mod test {
         );
         coordinator
             .resolve("approval-deny", "deny_broad", Some(&event_sink))
+            .await
             .unwrap();
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyBroad);
         assert_eq!(
@@ -754,6 +826,7 @@ mod test {
                             command: "rg TODO".into(),
                         }],
                     },
+                    None,
                     Some(&waiting_event_sink),
                 )
                 .await
@@ -763,7 +836,7 @@ mod test {
             event_stream.recv().await.unwrap().unwrap().kind,
             "approval_requested"
         );
-        coordinator.cancel_all(Some(&event_sink)).unwrap();
+        coordinator.cancel_all(Some(&event_sink)).await.unwrap();
         assert_eq!(
             event_stream.recv().await.unwrap().unwrap().kind,
             "approval_cancelled"

@@ -262,7 +262,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     assert_eq!(submitted_plan.question_ledger.resolution.len(), 1);
     assert_eq!(
         snapshot
-            .interaction
+            .exchange
             .iter()
             .filter(|interaction| interaction.prompt.starts_with("Planning feedback:"))
             .count(),

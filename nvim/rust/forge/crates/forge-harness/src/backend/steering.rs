@@ -45,7 +45,7 @@ pub struct SteerCommand {
     event_sink: Option<BackendEventSink>,
 }
 
-/// Identifies one provider thread and turn for direct child control.
+/// Identifies the provider child receiving steering or interruption.
 #[derive(Clone, Debug)]
 pub struct SteerTarget {
     pub thread_id: String,
@@ -57,9 +57,25 @@ pub struct SteerTarget {
 pub enum ActiveTurnOperation {
     Steer,
     Interrupt,
+    CleanupExecution,
+    PauseGoal,
+    ClearGoal,
 }
 
 impl SteeringLane {
+    /// Stop native goal continuation through the active provider reader.
+    pub async fn stop_goal(&self, clear: bool) -> Result<()> {
+        self.submit(
+            if clear {
+                ActiveTurnOperation::ClearGoal
+            } else {
+                ActiveTurnOperation::PauseGoal
+            },
+            String::new(),
+            None,
+        )
+        .await
+    }
     /// Attach a receiver to the active provider turn before accepting steering input.
     pub fn activate(&self, event_sink: Option<BackendEventSink>) -> Result<ActiveSteering> {
         let (sender, receiver) = mpsc::channel(MAX_STEERING_REQUESTS + 1);
@@ -97,6 +113,12 @@ impl SteeringLane {
             .await
     }
 
+    /// Interrupt the parent and descendants and wait for terminal provider evidence.
+    pub async fn cleanup_execution(&self) -> Result<()> {
+        self.submit(ActiveTurnOperation::CleanupExecution, String::new(), None)
+            .await
+    }
+
     async fn submit(
         &self,
         operation: ActiveTurnOperation,
@@ -122,8 +144,12 @@ impl SteeringLane {
             "steering target exceeds 4 KiB per identifier"
         );
         let admission = match operation {
-            ActiveTurnOperation::Steer => sender.ordinary,
-            ActiveTurnOperation::Interrupt => sender.interrupt,
+            ActiveTurnOperation::Steer
+            | ActiveTurnOperation::PauseGoal
+            | ActiveTurnOperation::ClearGoal => sender.ordinary,
+            ActiveTurnOperation::Interrupt | ActiveTurnOperation::CleanupExecution => {
+                sender.interrupt
+            }
         }
         .try_acquire_owned()
         .context("active turn control admission is full")?;
@@ -166,12 +192,14 @@ impl Drop for ActiveSteering {
 
 impl SteerCommand {
     /// Resolve the originating Harness request with the provider result.
-    pub fn complete(mut self, result: Result<()>) {
+    pub async fn complete(mut self, result: Result<()>) {
         if result.is_ok()
             && self.operation == ActiveTurnOperation::Steer
             && let Some(event_sink) = self.event_sink.take()
         {
-            let _ = event_sink.send(BackendEvent::steering_input(self.text.clone()));
+            let _ = event_sink
+                .send_wait(BackendEvent::steering_input(self.text.clone()))
+                .await;
         }
         if let Some(completion) = self.completion.take() {
             let _ = completion.send(result.map_err(|error| format!("{error:#}")));
@@ -222,13 +250,13 @@ mod test {
         for sequence in 1..super::MAX_STEERING_REQUESTS {
             let command = active.receive().await.unwrap();
             assert_eq!(command.text, sequence.to_string());
-            command.complete(Ok(()));
+            command.complete(Ok(())).await;
         }
         let command = active.receive().await.unwrap();
         assert_eq!(command.operation, super::ActiveTurnOperation::Interrupt);
-        command.complete(Ok(()));
+        command.complete(Ok(())).await;
         interrupt.await.unwrap();
-        first.complete(Ok(()));
+        first.complete(Ok(())).await;
         for request in pending {
             request.await.unwrap();
         }
@@ -262,7 +290,7 @@ mod test {
         assert!(active.receiver.try_recv().is_err());
         let mut request = Box::pin(lane.steer("valid".into()));
         assert!(futures_util::poll!(request.as_mut()).is_pending());
-        active.receive().await.unwrap().complete(Ok(()));
+        active.receive().await.unwrap().complete(Ok(())).await;
         request.await.unwrap();
     }
 
@@ -279,10 +307,10 @@ mod test {
 
         let first_command = active.receive().await.unwrap();
         assert_eq!(first_command.text, "first");
-        first_command.complete(Ok(()));
+        first_command.complete(Ok(())).await;
         let second_command = active.receive().await.unwrap();
         assert_eq!(second_command.text, "second");
-        second_command.complete(Ok(()));
+        second_command.complete(Ok(())).await;
 
         first.await.unwrap().unwrap();
         second.await.unwrap().unwrap();
@@ -304,7 +332,7 @@ mod test {
         let accepted_lane = lane.clone();
         let accepted = tokio::spawn(async move { accepted_lane.steer("accepted".into()).await });
         let accepted_command = active.receive().await.unwrap();
-        accepted_command.complete(Ok(()));
+        accepted_command.complete(Ok(())).await;
         accepted.await.unwrap().unwrap();
         let event = event_stream.recv().await.unwrap().expect("steering event");
         assert_eq!(event.kind, "steering_input");
@@ -313,7 +341,9 @@ mod test {
         let rejected_lane = lane.clone();
         let rejected = tokio::spawn(async move { rejected_lane.steer("rejected".into()).await });
         let rejected_command = active.receive().await.unwrap();
-        rejected_command.complete(Err(anyhow::anyhow!("provider rejected steering")));
+        rejected_command
+            .complete(Err(anyhow::anyhow!("provider rejected steering")))
+            .await;
         assert!(rejected.await.unwrap().is_err());
         assert!(event_stream.try_recv().is_err());
     }

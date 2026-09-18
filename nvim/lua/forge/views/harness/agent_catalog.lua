@@ -1,6 +1,7 @@
 local AgentCatalog = {}
 
 local agent_summary = require("forge.render.harness.agent_summary")
+local timeline_cache = require("forge.views.harness.timeline_cache")
 
 ---@param left table
 ---@param right table
@@ -15,24 +16,29 @@ local function run_before(left, right)
   return tostring(left.id or "") < tostring(right.id or "")
 end
 
----@param agent table?
+---@param state table
 ---@param active boolean
 ---@return table[]
-function AgentCatalog.run_list(agent, active)
+function AgentCatalog.run_list(state, active)
   local result = {}
+  local agent = state.agent
   for _, run in ipairs((agent and agent.run) or {}) do
-    if agent_summary.is_active(run.status) == active then result[#result + 1] = run end
+    local exchange_list = timeline_cache.agent_exchange_list(state, run.id)
+    if agent_summary.is_active(agent_summary.status(run, exchange_list)) == active then
+      result[#result + 1] = run
+    end
   end
   table.sort(result, run_before)
   return result
 end
 
----@param agent table?
+---@param state table
 ---@param selector string
 ---@return table? run
 ---@return string? error_message
-function AgentCatalog.resolve(agent, selector)
-  local active_run_list = AgentCatalog.run_list(agent, true)
+function AgentCatalog.resolve(state, selector)
+  local agent = state.agent
+  local active_run_list = AgentCatalog.run_list(state, true)
   local numeric_index = selector:match("^%d+$") and tonumber(selector) or nil
   local letter_index = selector:match("^[a-z]$") and (selector:byte() - string.byte("a")) or nil
   local zero_based_index = numeric_index or letter_index

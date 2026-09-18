@@ -11,8 +11,8 @@ local M = {}
 function M.append(result, entry, options, host)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
   for _, item in ipairs(entry.item or {}) do
-    if item.kind == "interaction" and item.interaction then
-      host.append_interaction(result, item.interaction, options)
+    if item.kind == "exchange" and item.exchange then
+      host.append_interaction(result, item.exchange, options)
     elseif item.kind == "task_started" then
       local label = ("Task %d/%d started: %s"):format(
         item.ordinal or 0,

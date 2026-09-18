@@ -1,5 +1,5 @@
-use crate::agent::{AgentRun, AgentTurnRecord};
-use crate::interaction::InteractionRecord;
+use crate::agent::Agent;
+use crate::exchange::Exchange;
 use crate::plan::{
     PlanAudit, PlanDeviation, PlanExecutionLifecycleEvent, PlanExecutionLifecycleRecord,
     PlanExecutionRecord, PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanRecord,
@@ -39,8 +39,8 @@ pub struct SessionEventRecord {
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PlanExecutionTimelineItem {
-    Interaction {
-        interaction: Box<InteractionRecord>,
+    Exchange {
+        exchange: Box<Exchange>,
     },
     TaskStarted {
         task_path: String,
@@ -59,16 +59,21 @@ pub enum PlanExecutionTimelineItem {
         deviation_id: String,
         summary: String,
     },
+    Resolution {
+        resolution: PlanResolutionRecord,
+        deviation: Vec<PlanDeviation>,
+        audit: Option<PlanAudit>,
+    },
 }
 
 /// Represents one fully resolved top-level Harness timeline entry.
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TimelineEntry {
-    Interaction {
+    Exchange {
         id: String,
         created_at_ms: i64,
-        interaction: InteractionRecord,
+        exchange: Exchange,
         agent_by_id: HashMap<String, TimelineEntry>,
     },
     PlanLifecycle {
@@ -94,8 +99,8 @@ pub enum TimelineEntry {
     AgentLifecycle {
         id: String,
         created_at_ms: i64,
-        run: AgentRun,
-        interaction: Vec<InteractionRecord>,
+        run: Agent,
+        exchange: Vec<Exchange>,
         agent: Vec<TimelineEntry>,
     },
     SessionEvent {
@@ -114,7 +119,7 @@ impl TimelineEntry {
     /// Return the stable identity used by incremental timeline reconciliation.
     pub fn id(&self) -> String {
         match self {
-            Self::Interaction { id, .. }
+            Self::Exchange { id, .. }
             | Self::PlanLifecycle { id, .. }
             | Self::PlanExecution { id, .. }
             | Self::PlanResolution { id, .. }
@@ -124,9 +129,114 @@ impl TimelineEntry {
         }
     }
 
+    /// Index each contained exchange by its retained top-level presentation owner.
+    fn index_exchanges(&self, owner: usize, index: &mut HashMap<String, usize>) {
+        match self {
+            Self::Exchange {
+                exchange,
+                agent_by_id,
+                ..
+            } => {
+                index.insert(exchange.id.clone(), owner);
+                for agent in agent_by_id.values() {
+                    agent.index_exchanges(owner, index);
+                }
+            }
+            Self::PlanExecution { item, .. } => {
+                for item in item {
+                    if let PlanExecutionTimelineItem::Exchange { exchange } = item {
+                        index.insert(exchange.id.clone(), owner);
+                    }
+                }
+            }
+            Self::AgentLifecycle {
+                exchange, agent, ..
+            } => {
+                for exchange in exchange {
+                    index.insert(exchange.id.clone(), owner);
+                }
+                for agent in agent {
+                    agent.index_exchanges(owner, index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Replace a contained exchange without changing its plan or agent ownership.
+    fn replace_exchange(&mut self, replacement: &Exchange) -> bool {
+        match self {
+            Self::Exchange {
+                exchange,
+                agent_by_id,
+                ..
+            } => {
+                if exchange.id == replacement.id {
+                    *exchange = replacement.clone();
+                    true
+                } else {
+                    agent_by_id
+                        .values_mut()
+                        .any(|agent| agent.replace_exchange(replacement))
+                }
+            }
+            Self::PlanExecution { item, .. } => item.iter_mut().any(|item| {
+                if let PlanExecutionTimelineItem::Exchange { exchange } = item
+                    && exchange.id == replacement.id
+                {
+                    **exchange = replacement.clone();
+                    return true;
+                }
+                false
+            }),
+            Self::AgentLifecycle {
+                exchange, agent, ..
+            } => {
+                if let Some(exchange) = exchange
+                    .iter_mut()
+                    .find(|exchange| exchange.id == replacement.id)
+                {
+                    *exchange = replacement.clone();
+                    true
+                } else {
+                    agent
+                        .iter_mut()
+                        .any(|agent| agent.replace_exchange(replacement))
+                }
+            }
+            _ => false,
+        }
+    }
+
+    /// Remove a nested exchange while retaining its plan or agent container.
+    fn remove_exchange(&mut self, id: &str) {
+        match self {
+            Self::Exchange { agent_by_id, .. } => {
+                for agent in agent_by_id.values_mut() {
+                    agent.remove_exchange(id);
+                }
+            }
+            Self::PlanExecution { item, .. } => {
+                item.retain(|item| {
+                    !matches!(item,
+                    PlanExecutionTimelineItem::Exchange { exchange } if exchange.id == id)
+                });
+            }
+            Self::AgentLifecycle {
+                exchange, agent, ..
+            } => {
+                exchange.retain(|exchange| exchange.id != id);
+                for agent in agent {
+                    agent.remove_exchange(id);
+                }
+            }
+            _ => {}
+        }
+    }
+
     fn created_at_ms(&self) -> i64 {
         match self {
-            Self::Interaction { created_at_ms, .. }
+            Self::Exchange { created_at_ms, .. }
             | Self::PlanLifecycle { created_at_ms, .. }
             | Self::PlanExecution { created_at_ms, .. }
             | Self::PlanResolution { created_at_ms, .. }
@@ -142,15 +252,15 @@ pub struct TimelineProjector;
 
 /// Owns one complete set of durable inputs for canonical timeline projection.
 pub struct TimelineProjection<'a> {
-    pub interaction_list: Vec<InteractionRecord>,
+    pub interaction_list: Vec<Exchange>,
     pub plan_list: &'a [PlanRecord],
     pub lifecycle_list: Vec<PlanLifecycleRecord>,
     pub execution_list: Vec<PlanExecutionRecord>,
     pub deviation_list: Vec<PlanDeviation>,
     pub audit_list: Vec<PlanAudit>,
     pub resolution_list: Vec<PlanResolutionRecord>,
-    pub agent_run_list: Vec<AgentRun>,
-    pub agent_turn_list: Vec<AgentTurnRecord>,
+    pub agent_run_list: Vec<Agent>,
+    pub agent_exchange_list: Vec<Exchange>,
     pub session_event_list: Vec<SessionEventRecord>,
     pub plan_file: &'a PlanFileStore,
 }
@@ -167,7 +277,7 @@ impl TimelineProjector {
             audit_list,
             resolution_list,
             agent_run_list,
-            agent_turn_list,
+            agent_exchange_list,
             session_event_list,
             plan_file: _,
         } = projection;
@@ -175,7 +285,7 @@ impl TimelineProjector {
             .iter()
             .map(|plan| (plan.id.as_str(), plan))
             .collect::<HashMap<_, _>>();
-        let mut interaction_by_execution = HashMap::<String, Vec<InteractionRecord>>::new();
+        let mut interaction_by_execution = HashMap::<String, Vec<Exchange>>::new();
         let mut result = Vec::new();
         for interaction in interaction_list {
             if let Some(execution_id) = interaction.execution_id.as_ref() {
@@ -184,11 +294,11 @@ impl TimelineProjector {
                     .or_default()
                     .push(interaction);
             } else {
-                result.push(TimelineEntry::Interaction {
+                result.push(TimelineEntry::Exchange {
                     id: interaction.id.clone(),
                     created_at_ms: interaction.created_at_ms,
-                    interaction,
-                    agent_by_id: HashMap::new(),
+                    exchange: interaction,
+                    agent_by_id: std::collections::HashMap::new(),
                 });
             }
         }
@@ -212,6 +322,13 @@ impl TimelineProjector {
                 lifecycle,
             });
         }
+        let mut resolution_by_execution = HashMap::<String, Vec<PlanResolutionRecord>>::new();
+        for resolution in resolution_list {
+            resolution_by_execution
+                .entry(resolution.execution_id.clone())
+                .or_default()
+                .push(resolution);
+        }
         for execution in execution_list {
             let Some(plan) = plan_by_id.get(execution.plan_id.as_str()) else {
                 continue;
@@ -219,7 +336,15 @@ impl TimelineProjector {
             let interaction_list = interaction_by_execution
                 .remove(&execution.id)
                 .unwrap_or_default();
-            let item = project_plan_execution_item(&execution, interaction_list);
+            let item = project_plan_execution_item(
+                &execution,
+                interaction_list,
+                resolution_by_execution
+                    .remove(&execution.id)
+                    .unwrap_or_default(),
+                &deviation_list,
+                &audit_list,
+            );
             result.push(TimelineEntry::PlanExecution {
                 id: execution.id.clone(),
                 created_at_ms: execution.created_at_ms,
@@ -228,13 +353,13 @@ impl TimelineProjector {
                 execution,
             });
         }
-        for resolution in resolution_list {
+        for resolution in resolution_by_execution.into_values().flatten() {
             result.push(TimelineEntry::PlanResolution {
                 id: resolution.id.clone(),
                 created_at_ms: resolution.resolved_at_ms,
                 deviation: deviation_list
                     .iter()
-                    .filter(|deviation| deviation.execution_id == resolution.execution_id)
+                    .filter(|deviation| resolution.deviation_ids.contains(&deviation.id))
                     .cloned()
                     .collect(),
                 audit: audit_list
@@ -244,7 +369,7 @@ impl TimelineProjector {
                 resolution,
             });
         }
-        project_agent_tree(&mut result, agent_run_list, agent_turn_list);
+        project_agent_tree(&mut result, agent_run_list, agent_exchange_list);
         for event in session_event_list {
             result.push(TimelineEntry::SessionEvent {
                 id: event.id.clone(),
@@ -259,7 +384,10 @@ impl TimelineProjector {
 
 fn project_plan_execution_item(
     execution: &PlanExecutionRecord,
-    mut interaction_list: Vec<InteractionRecord>,
+    mut interaction_list: Vec<Exchange>,
+    mut resolution_list: Vec<PlanResolutionRecord>,
+    deviation_list: &[PlanDeviation],
+    audit_list: &[PlanAudit],
 ) -> Vec<PlanExecutionTimelineItem> {
     interaction_list.sort_by_key(|interaction| interaction.ordinal);
     let interaction_id_set = interaction_list
@@ -267,36 +395,89 @@ fn project_plan_execution_item(
         .map(|interaction| interaction.id.clone())
         .collect::<HashSet<_>>();
     let mut lifecycle_list = execution.lifecycle.clone();
+    for record in &mut lifecycle_list {
+        if let PlanExecutionLifecycleEvent::TaskCompleted {
+            task_path,
+            elapsed_ms,
+            ..
+        } = &mut record.event
+        {
+            *elapsed_ms = execution.task_duration_ms(
+                task_path,
+                interaction_list.iter(),
+                record.occurred_at_ms,
+            );
+        }
+    }
     lifecycle_list.sort_by_key(|record| record.sequence);
     let mut item_list = Vec::new();
     append_plan_execution_lifecycle(
         &mut item_list,
         lifecycle_list
             .iter()
-            .filter(|record| record.after_interaction_id.is_none()),
+            .filter(|record| record.after_exchange_id.is_none()),
     );
-    for interaction in interaction_list {
+    resolution_list.sort_by_key(|resolution| resolution.resolved_at_ms);
+    let mut resolutions = resolution_list.into_iter().peekable();
+    let mut interactions = interaction_list.into_iter().peekable();
+    while let Some(interaction) = interactions.next() {
         let interaction_id = interaction.id.clone();
-        item_list.push(PlanExecutionTimelineItem::Interaction {
-            interaction: Box::new(interaction),
+        item_list.push(PlanExecutionTimelineItem::Exchange {
+            exchange: Box::new(interaction),
         });
         append_plan_execution_lifecycle(
             &mut item_list,
             lifecycle_list.iter().filter(|record| {
-                record.after_interaction_id.as_deref() == Some(interaction_id.as_str())
+                record.after_exchange_id.as_deref() == Some(interaction_id.as_str())
             }),
         );
+        while resolutions.peek().is_some_and(|resolution| {
+            interactions
+                .peek()
+                .is_none_or(|next| resolution.resolved_at_ms < next.created_at_ms)
+        }) {
+            let resolution = resolutions.next().unwrap();
+            item_list.push(project_plan_resolution(
+                resolution,
+                deviation_list,
+                audit_list,
+            ));
+        }
     }
     append_plan_execution_lifecycle(
         &mut item_list,
         lifecycle_list.iter().filter(|record| {
             record
-                .after_interaction_id
+                .after_exchange_id
                 .as_deref()
                 .is_some_and(|interaction_id| !interaction_id_set.contains(interaction_id))
         }),
     );
+    item_list.extend(
+        resolutions
+            .map(|resolution| project_plan_resolution(resolution, deviation_list, audit_list)),
+    );
     item_list
+}
+
+/// Attach only the audit and deviations that existed when a plan settled.
+fn project_plan_resolution(
+    resolution: PlanResolutionRecord,
+    deviation_list: &[PlanDeviation],
+    audit_list: &[PlanAudit],
+) -> PlanExecutionTimelineItem {
+    PlanExecutionTimelineItem::Resolution {
+        deviation: deviation_list
+            .iter()
+            .filter(|deviation| resolution.deviation_ids.contains(&deviation.id))
+            .cloned()
+            .collect(),
+        audit: audit_list
+            .iter()
+            .find(|audit| audit.id == resolution.audit_id)
+            .cloned(),
+        resolution,
+    }
 }
 
 fn append_plan_execution_lifecycle<'a>(
@@ -340,68 +521,71 @@ fn append_plan_execution_lifecycle<'a>(
 
 fn project_agent_tree(
     result: &mut Vec<TimelineEntry>,
-    agent_run_list: Vec<AgentRun>,
-    agent_turn_list: Vec<AgentTurnRecord>,
+    agent_run_list: Vec<Agent>,
+    agent_exchange_list: Vec<Exchange>,
 ) {
     let run_by_id = agent_run_list
         .iter()
         .map(|run| (run.id.clone(), run.clone()))
         .collect::<HashMap<_, _>>();
-    let run_id_by_thread = agent_run_list
-        .iter()
-        .filter_map(|run| {
-            run.provider_thread_id
-                .as_ref()
-                .map(|thread_id| (thread_id.clone(), run.id.clone()))
-        })
-        .collect::<HashMap<_, _>>();
-    let mut interaction_by_run_id = HashMap::<String, Vec<InteractionRecord>>::new();
-    for turn in agent_turn_list {
+    let mut interaction_by_run_id = HashMap::<String, Vec<Exchange>>::new();
+    for turn in agent_exchange_list {
         interaction_by_run_id
-            .entry(turn.agent_run_id)
+            .entry(turn.agent_id.clone())
             .or_default()
-            .push(turn.interaction);
+            .push(turn);
     }
-    let mut child_id_by_run_id = HashMap::<String, Vec<String>>::new();
-    let mut root_id_list = Vec::new();
-    for run in &agent_run_list {
-        if let Some(parent_id) = run
-            .parent_thread_id
-            .as_ref()
-            .and_then(|thread_id| run_id_by_thread.get(thread_id))
-        {
-            child_id_by_run_id
-                .entry(parent_id.clone())
-                .or_default()
-                .push(run.id.clone());
-        } else {
-            root_id_list.push(run.id.clone());
-        }
-    }
+    let delegated: std::collections::HashSet<_> = interaction_by_run_id
+        .values()
+        .flatten()
+        .flat_map(|exchange| &exchange.node_list)
+        .filter_map(|node| match node {
+            crate::exchange::ExchangeNode::AgentReference { agent } => {
+                Some(agent.child_agent_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let primary_child: std::collections::HashSet<_> = result
+        .iter()
+        .filter_map(|entry| match entry {
+            TimelineEntry::Exchange { exchange, .. } => Some(exchange),
+            _ => None,
+        })
+        .flat_map(|exchange| &exchange.node_list)
+        .filter_map(|node| match node {
+            crate::exchange::ExchangeNode::AgentReference { agent } => {
+                Some(agent.child_agent_id.clone())
+            }
+            _ => None,
+        })
+        .collect();
+    let root_id_list: Vec<_> = agent_run_list
+        .iter()
+        .filter(|agent| primary_child.contains(&agent.id) || !delegated.contains(&agent.id))
+        .map(|agent| agent.id.clone())
+        .collect();
 
     for run_id in root_id_list {
-        let Some(run) = run_by_id.get(&run_id) else {
-            continue;
-        };
         let entry = build_agent_entry(
             &run_id,
             &run_by_id,
             &interaction_by_run_id,
-            &child_id_by_run_id,
+            None,
+            &mut std::collections::HashSet::new(),
         );
         let mut attached = false;
-        if let Some(parent_interaction_id) = run.parent_interaction_id.as_deref() {
-            for timeline_entry in result.iter_mut() {
-                if let TimelineEntry::Interaction {
-                    interaction,
-                    agent_by_id,
-                    ..
-                } = timeline_entry
-                    && interaction.id == parent_interaction_id
-                {
+        for timeline_entry in result.iter_mut() {
+            if let TimelineEntry::Exchange {
+                exchange: interaction,
+                agent_by_id,
+                ..
+            } = timeline_entry
+            {
+                if interaction.node_list.iter().any(|node| matches!(node,
+                    crate::exchange::ExchangeNode::AgentReference { agent } if agent.child_agent_id == run_id)) {
                     agent_by_id.insert(run_id.clone(), entry.clone());
                     attached = true;
-                    break;
                 }
             }
         }
@@ -411,36 +595,57 @@ fn project_agent_tree(
     }
 }
 
+/// Project delegation edges by exchange identity rather than agent lifetime.
 fn build_agent_entry(
     run_id: &str,
-    run_by_id: &HashMap<String, AgentRun>,
-    interaction_by_run_id: &HashMap<String, Vec<InteractionRecord>>,
-    child_id_by_run_id: &HashMap<String, Vec<String>>,
+    run_by_id: &HashMap<String, Agent>,
+    interaction_by_run_id: &HashMap<String, Vec<Exchange>>,
+    exchange_id: Option<&str>,
+    visiting: &mut std::collections::HashSet<String>,
 ) -> TimelineEntry {
     let run = run_by_id
         .get(run_id)
-        .expect("agent tree references a known run")
+        .expect("agent tree references a known agent")
         .clone();
-    let agent = child_id_by_run_id
+    let interaction: Vec<_> = interaction_by_run_id
         .get(run_id)
         .into_iter()
         .flatten()
-        .map(|child_id| {
-            build_agent_entry(
-                child_id,
+        .filter(|exchange| exchange_id.is_none_or(|id| exchange.id == id))
+        .cloned()
+        .collect();
+    let mut agent = Vec::new();
+    for exchange in &interaction {
+        if !visiting.insert(exchange.id.clone()) {
+            continue;
+        }
+        for node in &exchange.node_list {
+            let crate::exchange::ExchangeNode::AgentReference { agent: delegation } = node else {
+                continue;
+            };
+            if visiting.contains(&delegation.child_exchange_id)
+                || !run_by_id.contains_key(&delegation.child_agent_id)
+            {
+                continue;
+            }
+            let mut child = build_agent_entry(
+                &delegation.child_agent_id,
                 run_by_id,
                 interaction_by_run_id,
-                child_id_by_run_id,
-            )
-        })
-        .collect();
+                Some(&delegation.child_exchange_id),
+                visiting,
+            );
+            if let TimelineEntry::AgentLifecycle { id, .. } = &mut child {
+                *id = delegation.id.clone();
+            }
+            agent.push(child);
+        }
+        visiting.remove(&exchange.id);
+    }
     TimelineEntry::AgentLifecycle {
         id: run.id.clone(),
         created_at_ms: run.created_at_ms,
-        interaction: interaction_by_run_id
-            .get(run_id)
-            .cloned()
-            .unwrap_or_default(),
+        exchange: interaction,
         run,
         agent,
     }
@@ -453,35 +658,42 @@ mod test {
         project_plan_execution_item,
     };
     use crate::{
-        agent::{AgentRun, AgentRunStatus, AgentTurnRecord},
-        interaction::{InteractionKind, InteractionRecord, InteractionState},
+        agent::{Agent, AgentState},
+        exchange::{Exchange, ExchangeKind, ExchangeState},
         plan::{
             PlanExecutionLifecycleEvent, PlanExecutionLifecycleRecord, PlanExecutionRecord,
             PlanExecutionState, PlanFileStore, PlanScheduler,
         },
     };
 
-    fn interaction(id: &str) -> InteractionRecord {
-        InteractionRecord {
+    fn interaction(id: &str) -> Exchange {
+        Exchange {
+            finalization_error: None,
+            finalization_outcome: None,
+            agent_id: "primary".into(),
             id: id.into(),
             session_id: "session".into(),
             ordinal: 1,
             prompt: "inspect".into(),
-            kind: InteractionKind::Chat,
+            kind: ExchangeKind::Chat,
             plan_id: None,
             execution_id: None,
-            state: InteractionState::Complete,
+            goal_id: None,
+            state: ExchangeState::Complete,
             checkpoint_before: None,
             checkpoint_after: None,
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            disposition: crate::exchange::HistoryDisposition::Current,
+            turn: Vec::new(),
             created_at_ms: 1,
             completed_at_ms: Some(2),
             node_list: Vec::new(),
             awaiting_input: false,
             elicitation: None,
             duration_ms: 1,
+            execution_started_at_ms: None,
             token_count: None,
             comment: Vec::new(),
             task: None,
@@ -490,44 +702,138 @@ mod test {
 
     fn run(
         id: &str,
-        parent_interaction_id: Option<&str>,
-        parent_thread_id: Option<&str>,
+        _parent_exchange_id: Option<&str>,
+        _parent_thread_id: Option<&str>,
         provider_thread_id: &str,
-    ) -> AgentRun {
-        AgentRun {
+    ) -> Agent {
+        Agent {
             id: id.into(),
             session_id: "session".into(),
-            parent_interaction_id: parent_interaction_id.map(str::to_owned),
-            parent_thread_id: parent_thread_id.map(str::to_owned),
             provider_thread_id: Some(provider_thread_id.into()),
-            active_turn_id: None,
             definition: "explorer".into(),
             nickname: None,
-            task: "inspect".into(),
-            status: AgentRunStatus::Completed,
+            state: AgentState::Ready,
             created_at_ms: 2,
             updated_at_ms: 3,
         }
     }
 
     #[test]
+    fn reused_agent_projects_later_exchange_without_recursing_into_earlier_exchange() {
+        use crate::exchange::{ExchangeNode, ExchangeState};
+        let first_agent = run("first-agent", None, None, "first-thread");
+        let second_agent = run("second-agent", None, None, "second-thread");
+        let mut first = interaction("first-exchange");
+        let mut second = interaction("second-exchange");
+        let mut later = interaction("later-exchange");
+        first.agent_id = first_agent.id.clone();
+        second.agent_id = second_agent.id.clone();
+        later.agent_id = first_agent.id.clone();
+        for (exchange, child, target) in [
+            (&mut first, "second-agent", "second-exchange"),
+            (&mut second, "first-agent", "later-exchange"),
+            (&mut later, "first-agent", "first-exchange"),
+        ] {
+            exchange.state = ExchangeState::Running;
+            exchange.completed_at_ms = None;
+            exchange
+                .append_delegation(child, "spawn", "task", 1)
+                .unwrap();
+            let ExchangeNode::AgentReference { agent } = &mut exchange.node_list[0] else {
+                unreachable!()
+            };
+            agent.child_exchange_id = target.into();
+            exchange.finish(ExchangeState::Complete, 2).unwrap();
+        }
+        let owners = std::collections::HashMap::from([
+            (first_agent.id.clone(), first_agent),
+            (second_agent.id.clone(), second_agent),
+        ]);
+        let records = std::collections::HashMap::from([
+            ("first-agent".into(), vec![first, later]),
+            ("second-agent".into(), vec![second]),
+        ]);
+        let entry = super::build_agent_entry(
+            "first-agent",
+            &owners,
+            &records,
+            Some("first-exchange"),
+            &mut std::collections::HashSet::new(),
+        );
+        let TimelineEntry::AgentLifecycle {
+            exchange: interaction,
+            agent,
+            ..
+        } = entry
+        else {
+            unreachable!()
+        };
+        assert_eq!(interaction.len(), 1);
+        assert_eq!(interaction[0].id, "first-exchange");
+        let TimelineEntry::AgentLifecycle {
+            exchange: interaction,
+            agent,
+            id,
+            ..
+        } = &agent[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(id, "first-exchange:agent:second-agent:spawn");
+        assert_eq!(interaction.len(), 1);
+        assert_eq!(interaction[0].id, "second-exchange");
+        let TimelineEntry::AgentLifecycle {
+            exchange: interaction,
+            agent,
+            ..
+        } = &agent[0]
+        else {
+            unreachable!()
+        };
+        assert_eq!(interaction.len(), 1);
+        assert_eq!(interaction[0].id, "later-exchange");
+        assert!(
+            agent.is_empty(),
+            "the repeated exchange must terminate projection"
+        );
+    }
+
+    #[test]
     fn projects_nested_agent_turns_under_their_spawning_interaction() {
-        let parent = interaction("parent");
+        let mut parent = interaction("parent");
+        parent.state = crate::exchange::ExchangeState::Running;
+        parent.completed_at_ms = None;
+        parent
+            .append_delegation("root-run", "spawn", "inspect", 1)
+            .unwrap();
+        parent
+            .finish(crate::exchange::ExchangeState::Complete, 3)
+            .unwrap();
         let child_interaction = interaction("child-turn");
         let root_run = run("root-run", Some("parent"), None, "root-thread");
+        let mut root_exchange = interaction("root-exchange");
+        root_exchange.agent_id = root_run.id.clone();
+        root_exchange.state = crate::exchange::ExchangeState::Running;
+        root_exchange.completed_at_ms = None;
+        root_exchange
+            .append_delegation("child-run", "spawn", "nested task", 2)
+            .unwrap();
+        root_exchange
+            .finish(crate::exchange::ExchangeState::Complete, 3)
+            .unwrap();
         let child_run = run(
             "child-run",
             Some("parent"),
-            Some("root-thread"),
+            Some("stale-provider-parent"),
             "child-thread",
         );
-        let child_turn = AgentTurnRecord {
-            id: "turn".into(),
-            session_id: "session".into(),
-            agent_run_id: child_run.id.clone(),
-            ordinal: 1,
-            interaction: child_interaction,
-        };
+        let mut child_turn = child_interaction;
+        if let crate::exchange::ExchangeNode::AgentReference { agent } =
+            &mut root_exchange.node_list[0]
+        {
+            agent.child_exchange_id = child_turn.id.clone();
+        }
+        child_turn.agent_id = child_run.id.clone();
         let directory = tempfile::tempdir().unwrap();
         let timeline = TimelineProjector::build(TimelineProjection {
             interaction_list: vec![parent],
@@ -538,13 +844,13 @@ mod test {
             audit_list: Vec::new(),
             resolution_list: Vec::new(),
             agent_run_list: vec![root_run, child_run],
-            agent_turn_list: vec![child_turn],
+            agent_exchange_list: vec![root_exchange, child_turn],
             session_event_list: Vec::new(),
             plan_file: &PlanFileStore::new(directory.path(), directory.path()),
         })
         .unwrap();
 
-        let TimelineEntry::Interaction { agent_by_id, .. } = &timeline[0] else {
+        let TimelineEntry::Exchange { agent_by_id, .. } = &timeline[0] else {
             panic!("parent interaction should remain the root timeline entry");
         };
         let TimelineEntry::AgentLifecycle { agent, .. } =
@@ -552,10 +858,126 @@ mod test {
         else {
             panic!("attached entry should be an agent lifecycle");
         };
-        let TimelineEntry::AgentLifecycle { interaction, .. } = &agent[0] else {
+        let TimelineEntry::AgentLifecycle {
+            exchange: interaction,
+            ..
+        } = &agent[0]
+        else {
             panic!("nested entry should be an agent lifecycle");
         };
         assert_eq!(interaction[0].id, "child-turn");
+    }
+
+    #[test]
+    fn delegation_links_attach_one_identity_to_each_causal_exchange() {
+        let mut first = interaction("first");
+        let mut second = interaction("second");
+        for exchange in [&mut first, &mut second] {
+            exchange.state = crate::exchange::ExchangeState::Running;
+            exchange.completed_at_ms = None;
+        }
+        first
+            .append_delegation("child", "spawn", "first task", 1)
+            .unwrap();
+        second
+            .append_delegation("child", "followup", "second task", 2)
+            .unwrap();
+        for exchange in [&mut first, &mut second] {
+            exchange
+                .finish(crate::exchange::ExchangeState::Complete, 3)
+                .unwrap();
+        }
+        let mut entries = vec![
+            TimelineEntry::Exchange {
+                id: first.id.clone(),
+                created_at_ms: 1,
+                exchange: first,
+                agent_by_id: std::collections::HashMap::new(),
+            },
+            TimelineEntry::Exchange {
+                id: second.id.clone(),
+                created_at_ms: 2,
+                exchange: second,
+                agent_by_id: std::collections::HashMap::new(),
+            },
+        ];
+        super::project_agent_tree(
+            &mut entries,
+            vec![run("child", Some("unrelated-parent"), None, "thread")],
+            Vec::new(),
+        );
+        assert_eq!(entries.len(), 2);
+        for entry in entries {
+            let TimelineEntry::Exchange { agent_by_id, .. } = entry else {
+                panic!("unexpected standalone agent")
+            };
+            assert!(agent_by_id.contains_key("child"));
+        }
+    }
+
+    #[test]
+    fn projects_task_duration_from_provider_intervals_without_waiting() {
+        let document = crate::plan::test_fixture("plan", "Overview");
+        let mut scheduler = PlanScheduler::activate(&document);
+        scheduler.next_task(&document, 20).unwrap();
+        let execution = PlanExecutionRecord {
+            id: "execution".into(),
+            session_id: "session".into(),
+            plan_id: "plan".into(),
+            goal_id: "goal".into(),
+            state: PlanExecutionState::Complete,
+            planning_backend_session_id: None,
+            execution_backend_session_id: None,
+            scheduler,
+            lifecycle: vec![PlanExecutionLifecycleRecord {
+                sequence: 1,
+                after_exchange_id: Some("second".into()),
+                occurred_at_ms: 120,
+                event: PlanExecutionLifecycleEvent::TaskCompleted {
+                    task_path: "/tasks/0".into(),
+                    ordinal: 1,
+                    total: 1,
+                    title: "Task".into(),
+                    elapsed_ms: 100,
+                },
+            }],
+            created_at_ms: 20,
+            completed_at_ms: Some(120),
+        };
+        let mut exchanges = Vec::new();
+        for (id, owner, start, end) in [
+            ("first", "execution", 10, 30),
+            ("second", "execution", 100, 130),
+            ("unrelated", "other", 20, 120),
+        ] {
+            let mut exchange = interaction(id);
+            exchange.execution_id = Some(owner.into());
+            let mut turn = crate::turn::Turn::new(
+                id.into(),
+                crate::backend::ProviderAddress {
+                    thread_id: "thread".into(),
+                    turn_id: id.into(),
+                },
+                start,
+            );
+            turn.finish(crate::turn::TurnOutcome::Completed, end)
+                .unwrap();
+            exchange.turn.push(turn);
+            exchanges.push(exchange);
+        }
+        assert_eq!(
+            execution.task_duration_ms("/tasks/0", exchanges.iter(), 120),
+            30
+        );
+        assert_eq!(
+            execution.task_duration_ms("/tasks/0", exchanges.iter(), 5),
+            0
+        );
+        let items = project_plan_execution_item(&execution, exchanges, Vec::new(), &[], &[]);
+        assert!(items.iter().any(|item| matches!(
+            item,
+            PlanExecutionTimelineItem::TaskCompleted { elapsed_ms: 30, .. }
+        )));
     }
 
     #[test]
@@ -577,7 +999,7 @@ mod test {
             lifecycle: vec![
                 PlanExecutionLifecycleRecord {
                     sequence: 1,
-                    after_interaction_id: None,
+                    after_exchange_id: None,
                     occurred_at_ms: 1,
                     event: PlanExecutionLifecycleEvent::TaskStarted {
                         task_path: "/tasks/0".into(),
@@ -588,7 +1010,7 @@ mod test {
                 },
                 PlanExecutionLifecycleRecord {
                     sequence: 2,
-                    after_interaction_id: Some("first".into()),
+                    after_exchange_id: Some("first".into()),
                     occurred_at_ms: 2,
                     event: PlanExecutionLifecycleEvent::TaskCompleted {
                         task_path: "/tasks/0".into(),
@@ -600,7 +1022,7 @@ mod test {
                 },
                 PlanExecutionLifecycleRecord {
                     sequence: 3,
-                    after_interaction_id: Some("first".into()),
+                    after_exchange_id: Some("first".into()),
                     occurred_at_ms: 2,
                     event: PlanExecutionLifecycleEvent::TaskStarted {
                         task_path: "/tasks/1".into(),
@@ -611,7 +1033,7 @@ mod test {
                 },
                 PlanExecutionLifecycleRecord {
                     sequence: 4,
-                    after_interaction_id: Some("second".into()),
+                    after_exchange_id: Some("second".into()),
                     occurred_at_ms: 3,
                     event: PlanExecutionLifecycleEvent::DeviationRecorded {
                         deviation_id: "deviation".into(),
@@ -623,14 +1045,20 @@ mod test {
             completed_at_ms: None,
         };
 
-        let item_list = project_plan_execution_item(&execution, vec![second, first]);
+        let item_list = project_plan_execution_item(
+            &execution,
+            vec![second.clone(), first.clone()],
+            Vec::new(),
+            &[],
+            &[],
+        );
         assert!(matches!(
             &item_list[0],
             PlanExecutionTimelineItem::TaskStarted { task_path, .. } if task_path == "/tasks/0"
         ));
         assert!(matches!(
             &item_list[1],
-            PlanExecutionTimelineItem::Interaction { interaction } if interaction.id == "first"
+            PlanExecutionTimelineItem::Exchange { exchange } if exchange.id == "first"
         ));
         assert!(matches!(
             &item_list[2],
@@ -642,12 +1070,65 @@ mod test {
         ));
         assert!(matches!(
             &item_list[4],
-            PlanExecutionTimelineItem::Interaction { interaction } if interaction.id == "second"
+            PlanExecutionTimelineItem::Exchange { exchange } if exchange.id == "second"
         ));
         assert!(matches!(
             &item_list[5],
             PlanExecutionTimelineItem::DeviationRecorded { deviation_id, .. }
                 if deviation_id == "deviation"
         ));
+        second.created_at_ms = 3;
+        let resolution = |id: &str, kind, resolved_at_ms| crate::plan::PlanResolutionRecord {
+            id: id.into(),
+            session_id: "session".into(),
+            plan_id: "plan".into(),
+            execution_id: "execution".into(),
+            accepted_revision: 1,
+            kind,
+            task_summary: crate::plan::PlanTaskSummary {
+                completed: 0,
+                blocked: 1,
+                total: 2,
+            },
+            test_summary: crate::plan::PlanTestSummary {
+                passed: 0,
+                failed: 0,
+                skipped: 0,
+                not_run: 0,
+            },
+            deviation_ids: Vec::new(),
+            audit_id: "audit".into(),
+            resolved_at_ms,
+        };
+        let blocked = resolution("blocked", crate::plan::PlanResolutionKind::Blocked, 2);
+        let complete = resolution("complete", crate::plan::PlanResolutionKind::Completed, 4);
+        let item_list = project_plan_execution_item(
+            &execution,
+            vec![second, first],
+            vec![complete.clone(), blocked.clone()],
+            &[],
+            &[],
+        );
+        assert!(
+            matches!(&item_list[4], PlanExecutionTimelineItem::Resolution { resolution, .. }
+            if resolution.id == "blocked")
+        );
+        assert!(
+            matches!(&item_list[5], PlanExecutionTimelineItem::Exchange { exchange }
+            if exchange.id == "second")
+        );
+        assert!(
+            matches!(&item_list[7], PlanExecutionTimelineItem::Resolution { resolution, .. }
+            if resolution.id == "complete")
+        );
+        let empty =
+            project_plan_execution_item(&execution, Vec::new(), vec![blocked, complete], &[], &[]);
+        assert_eq!(
+            empty
+                .iter()
+                .filter(|item| matches!(item, PlanExecutionTimelineItem::Resolution { .. }))
+                .count(),
+            2
+        );
     }
 }

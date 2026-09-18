@@ -37,6 +37,11 @@ impl BufferText {
         self.text.len()
     }
 
+    /// Charge owned storage, including spare capacity and the physical-row index.
+    pub fn allocated_bytes(&self) -> usize {
+        self.text.capacity() + self.row_offset.capacity() * std::mem::size_of::<usize>()
+    }
+
     pub fn row(&self, row: usize) -> Option<&str> {
         let start = *self.row_offset.get(row)?;
         let end = self

@@ -160,6 +160,8 @@ impl std::error::Error for SessionLeaseConflict {}
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessSession {
     pub id: String,
+    /// Stable owner of the session's primary timeline and exchanges.
+    pub primary_agent_id: String,
     pub name: String,
     pub workspace: String,
     pub backend: String,
@@ -213,6 +215,11 @@ pub struct ModelSetting {
 }
 
 impl HarnessSession {
+    /// Derive the persistent primary-agent identity from a session identity.
+    pub fn primary_agent_id(session_id: &str) -> String {
+        format!("{session_id}:agent:primary")
+    }
+
     /// Acquire or renew this session lease for one Neovim client.
     pub fn acquire_lease(&mut self, client_id: &str, now_ms: i64) -> Result<()> {
         let lease_active = self.lease_expires_at_ms.unwrap_or(0) > now_ms;

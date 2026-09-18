@@ -414,6 +414,7 @@ local function commit_patch(session, patch, adoption, projection)
     if not reconciled then return M.fail_apply(session, failure) end
   end
   local readonly = vim.bo[session.buffer].readonly
+  folds.capture(session)
   ok, prepared.failure = pcall(function()
     assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
     session.applying = true
@@ -535,6 +536,7 @@ function M.apply_snapshot(session, snapshot)
   end)
   if not ok then return M.fail_apply(session, prepared) end
   local readonly = vim.bo[session.buffer].readonly
+  folds.capture(session)
   ok, prepared.failure = pcall(function()
     assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
     editable.detach(session.editable)

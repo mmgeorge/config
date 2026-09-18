@@ -23,7 +23,7 @@ local ok, failure = xpcall(function()
         local request = vim.json.decode(bytes)
         if request.method == "transport.consumed" or request.method == "shutdown" then return end
         if request.method == "initialize" then
-          assert(request.params.protocol_version == 3)
+          assert(request.params.protocol_version == require("forge.protocol").VERSION)
           assert(request.params.backend == nil and request.params.data_root == nil)
           emit(request.id, { protocol_version = require("forge.protocol").VERSION })
         elseif request.method == "repository.revisions" then

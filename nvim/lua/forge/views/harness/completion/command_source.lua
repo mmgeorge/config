@@ -297,7 +297,7 @@ function CommandSource:get_completions(_, callback)
   local selector_start = prefix:match("^%s*/agent%s+()([^%s]*)$")
   if selector_start then
     local selector_list = { { selector = "main", detail = "Parent conversation" } }
-    for index, run in ipairs(agent_catalog.run_list(session.harness.agent, true)) do
+    for index, run in ipairs(agent_catalog.run_list(session.harness, true)) do
       if index > 26 then break end
       selector_list[#selector_list + 1] = {
         selector = string.char(string.byte("a") + index - 1),

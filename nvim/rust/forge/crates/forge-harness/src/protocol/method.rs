@@ -21,8 +21,6 @@ pub enum HarnessMethod {
     AgentList,
     #[serde(rename = "agent.start")]
     AgentStart,
-    #[serde(rename = "agent.submit")]
-    AgentSubmit,
     #[serde(rename = "permissions.open")]
     PermissionsOpen,
     #[serde(rename = "permissions.save")]
@@ -31,8 +29,8 @@ pub enum HarnessMethod {
     SessionExecutionMode,
     #[serde(rename = "session.mode")]
     SessionMode,
-    #[serde(rename = "interaction.resume")]
-    InteractionResume,
+    #[serde(rename = "exchange.resume")]
+    ExchangeResume,
     #[serde(rename = "prompt.submit")]
     PromptSubmit,
     #[serde(rename = "history.record")]
@@ -79,14 +77,14 @@ pub enum HarnessMethod {
     GoalClear,
     #[serde(rename = "goal.continue")]
     GoalContinue,
-    #[serde(rename = "interaction.list")]
-    InteractionList,
-    #[serde(rename = "interaction.comment.save")]
-    InteractionCommentSave,
-    #[serde(rename = "interaction.request_changes")]
-    InteractionRequestChanges,
-    #[serde(rename = "interaction.rollback")]
-    InteractionRollback,
+    #[serde(rename = "exchange.list")]
+    ExchangeList,
+    #[serde(rename = "exchange.comment.save")]
+    ExchangeCommentSave,
+    #[serde(rename = "exchange.request_changes")]
+    ExchangeRequestChanges,
+    #[serde(rename = "exchange.rollback")]
+    ExchangeRollback,
     #[serde(rename = "session.new")]
     SessionNew,
     #[serde(rename = "session.clear")]
@@ -138,8 +136,7 @@ impl HarnessMethod {
             self,
             Self::PromptSubmit
                 | Self::AgentStart
-                | Self::AgentSubmit
-                | Self::InteractionResume
+                | Self::ExchangeResume
                 | Self::PlanAccept
                 | Self::PlanRequestChanges
                 | Self::QuestionAsk
@@ -147,8 +144,30 @@ impl HarnessMethod {
                 | Self::GoalSet
                 | Self::GoalResume
                 | Self::GoalContinue
-                | Self::InteractionRequestChanges
+                | Self::ExchangeRequestChanges
                 | Self::SessionCompact
         )
+    }
+}
+
+#[cfg(test)]
+mod test {
+    #[test]
+    fn exchange_methods_replace_interaction_names_without_aliases() {
+        for suffix in [
+            "resume",
+            "list",
+            "comment.save",
+            "request_changes",
+            "rollback",
+        ] {
+            assert!(super::HarnessMethod::decode(&format!("exchange.{suffix}")).is_ok());
+            assert!(super::HarnessMethod::decode(&format!("interaction.{suffix}")).is_err());
+        }
+    }
+
+    #[test]
+    fn rejects_independent_child_submission() {
+        assert!(super::HarnessMethod::decode("agent.submit").is_err());
     }
 }

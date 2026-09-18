@@ -23,8 +23,10 @@ pub fn prepare_new_session(
         source.backend == configured_backend,
         "source session uses a different configured backend"
     );
+    let session_id = Uuid::new_v4().to_string();
     let child = HarnessSession {
-        id: Uuid::new_v4().to_string(),
+        primary_agent_id: HarnessSession::primary_agent_id(&session_id),
+        id: session_id,
         name: params
             .get("name")
             .and_then(Value::as_str)

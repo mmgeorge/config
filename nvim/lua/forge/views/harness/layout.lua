@@ -138,6 +138,8 @@ end
 function M.maximum_content_topline(transcript_buf, transcript_win)
   local line_count = vim.api.nvim_buf_line_count(transcript_buf)
   local window_height = vim.api.nvim_win_get_height(transcript_win)
+    - (vim.wo[transcript_win].winbar ~= "" and 1 or 0)
+  window_height = math.max(1, window_height)
   local function tail_height(start_row)
     local ok, height = pcall(vim.api.nvim_win_text_height, transcript_win, {
       start_row = start_row,
@@ -148,17 +150,17 @@ function M.maximum_content_topline(transcript_buf, transcript_win)
   if tail_height(0) <= window_height then return 1 end
   local low = 0
   local high = line_count - 1
-  local last_full_row = 0
+  local first_fitting_row = line_count - 1
   while low <= high do
     local middle = math.floor((low + high) / 2)
-    if tail_height(middle) >= window_height then
-      last_full_row = middle
+    if tail_height(middle) > window_height then
       low = middle + 1
     else
+      first_fitting_row = middle
       high = middle - 1
     end
   end
-  return last_full_row + 1
+  return first_fitting_row + 1
 end
 
 ---@param transcript_buf integer

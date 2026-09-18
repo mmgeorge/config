@@ -11,10 +11,7 @@ use forge_buffer::identity::{BlockId, FoldId, TargetId};
 use forge_buffer::width::WidthProfile;
 use serde::Serialize;
 
-use crate::interaction::{
-    InteractionKind, InteractionNode, InteractionRecord, InteractionState, MainSegment,
-    SegmentState,
-};
+use crate::exchange::{Exchange, ExchangeKind, ExchangeNode, ExchangeState};
 use crate::session::state_machine::SessionPhase;
 use crate::timeline::{PlanExecutionTimelineItem, SessionEventKind, TimelineEntry};
 
@@ -27,6 +24,7 @@ use super::transcript::TranscriptRenderer;
 pub enum TranscriptAction {
     Tool { call_id: String },
     Diff { text: String },
+    File { path: String, line: usize },
     Plan { plan_id: String },
     Agent { run_id: String },
     Session { session_id: String },
@@ -38,6 +36,7 @@ pub struct ProjectedEntry {
     pub prompt: Vec<BlockId>,
     pub action: HashMap<TargetId, TranscriptAction>,
     pub tool: HashMap<String, ToolOutputView>,
+    pub(crate) syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
 }
 
 impl ProjectedEntry {
@@ -45,8 +44,13 @@ impl ProjectedEntry {
         self.entry
             .block
             .iter()
-            .map(|block| block.text.byte_count())
+            .map(BufferBlock::retained_bytes)
             .sum::<usize>()
+            + self
+                .syntax
+                .values()
+                .map(super::syntax::MarkdownSyntax::retained_bytes)
+                .sum::<usize>()
             + self
                 .prompt
                 .iter()
@@ -68,13 +72,14 @@ impl ProjectedEntry {
     }
 }
 
-struct Projection<'profile> {
+struct TimelineRenderer<'profile> {
     renderer: TranscriptRenderer<'profile>,
     now_ms: i64,
     block: Vec<BufferBlock>,
     prompt: Vec<BlockId>,
     action: HashMap<TargetId, TranscriptAction>,
     tool: HashMap<String, ToolOutputView>,
+    syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
     bytes: usize,
     leading_separator: bool,
 }
@@ -103,13 +108,14 @@ fn project_at_with_separator(
     now_ms: i64,
     leading_separator: bool,
 ) -> Result<ProjectedEntry> {
-    let mut projection = Projection {
+    let mut projection = TimelineRenderer {
         renderer: TranscriptRenderer::new(width)?,
         now_ms,
         block: Vec::new(),
         prompt: Vec::new(),
         action: HashMap::new(),
         tool: HashMap::new(),
+        syntax: HashMap::new(),
         bytes: 0,
         leading_separator,
     };
@@ -125,15 +131,16 @@ fn project_at_with_separator(
         action: projection.action,
         prompt: projection.prompt,
         tool: projection.tool,
+        syntax: projection.syntax,
     })
 }
 
-impl Projection<'_> {
+impl TimelineRenderer<'_> {
     fn entry(&mut self, entry: &TimelineEntry, depth: usize) -> Result<()> {
         ensure!(depth <= 16, "agent transcript nesting exceeds 16 levels");
         match entry {
-            TimelineEntry::Interaction {
-                interaction,
+            TimelineEntry::Exchange {
+                exchange: interaction,
                 agent_by_id,
                 ..
             } => self.interaction(interaction, agent_by_id, depth)?,
@@ -152,6 +159,10 @@ impl Projection<'_> {
             TimelineEntry::Status { id, status, .. } => {
                 let text = match status {
                     SessionPhase::Idle => String::new(),
+                    SessionPhase::Finalizing { error, .. } => error.as_ref().map_or_else(
+                        || "Finalizing".into(),
+                        |error| format!("Finalization failed: {error}"),
+                    ),
                     SessionPhase::Working { started_at_ms, .. } => {
                         let elapsed_seconds =
                             self.now_ms.saturating_sub(*started_at_ms).max(0) / 1_000;
@@ -181,30 +192,15 @@ impl Projection<'_> {
             TimelineEntry::AgentLifecycle {
                 id,
                 run,
-                interaction,
+                exchange: interaction,
                 agent,
                 ..
             } => {
-                let heading_start = self.block.len();
-                self.literal(
-                    id,
-                    &agent_summary(run, self.now_ms),
-                    Some(TranscriptAction::Agent {
-                        run_id: run.id.clone(),
-                    }),
-                )?;
-                self.indent_range(heading_start, depth.saturating_sub(1));
-                let task_start = self.block.len();
-                self.literal(&format!("{id}:task"), &format!("  ↳ {}", run.task), None)?;
-                self.indent_range(task_start, depth.saturating_sub(1));
-                for interaction in interaction {
-                    let interaction_start = self.block.len();
-                    self.interaction(interaction, &HashMap::new(), depth + 1)?;
-                    self.indent_range(interaction_start, depth);
-                }
-                for agent in agent {
-                    self.entry(agent, depth + 1)?;
-                }
+                let task = interaction
+                    .first()
+                    .map(|exchange| exchange.prompt.as_str())
+                    .unwrap_or_default();
+                self.agent_entry(id, run, task, interaction, agent, None, depth)?;
             }
             TimelineEntry::PlanLifecycle {
                 id,
@@ -257,8 +253,8 @@ impl Projection<'_> {
                 )?;
                 for (index, item) in item.iter().enumerate() {
                     match item {
-                        PlanExecutionTimelineItem::Interaction { interaction } => {
-                            self.interaction(interaction, &HashMap::new(), depth)?
+                        PlanExecutionTimelineItem::Exchange { exchange } => {
+                            self.interaction(exchange, &HashMap::new(), depth)?
                         }
                         PlanExecutionTimelineItem::TaskStarted {
                             ordinal,
@@ -284,61 +280,122 @@ impl Projection<'_> {
                         PlanExecutionTimelineItem::DeviationRecorded { summary, .. } => {
                             self.markdown(&format!("{id}:deviation:{index}"), summary)?
                         }
+                        PlanExecutionTimelineItem::Resolution {
+                            resolution,
+                            deviation,
+                            audit,
+                        } => {
+                            self.plan_resolution(resolution, deviation, audit.as_ref())?;
+                        }
                     }
                 }
             }
             TimelineEntry::PlanResolution {
-                id,
                 resolution,
                 deviation,
                 audit,
                 ..
-            } => {
-                let tasks = &resolution.task_summary;
-                let tests = &resolution.test_summary;
-                self.literal(
-                    id,
-                    &format!(
-                        "Plan {:?} · {}/{} tasks completed · {} blocked",
-                        resolution.kind, tasks.completed, tasks.total, tasks.blocked
-                    ),
-                    Some(TranscriptAction::Plan {
-                        plan_id: resolution.plan_id.clone(),
-                    }),
-                )?;
-                self.literal(
-                    &format!("{id}:tests"),
-                    &format!(
-                        "Tests: {} passed, {} failed, {} skipped, {} not run",
-                        tests.passed, tests.failed, tests.skipped, tests.not_run
-                    ),
-                    None,
-                )?;
-                for deviation in deviation {
-                    self.markdown(
-                        &format!("{id}:deviation:{}", deviation.id),
-                        &format!("{}\n{}", deviation.summary, deviation.reason),
-                    )?;
-                }
-                if let Some(audit) = audit {
-                    self.literal(
-                        &format!("{id}:audit"),
-                        &format!(
-                            "Audit: {} unplanned paths, {} unchanged planned paths",
-                            audit.unplanned_paths.len(),
-                            audit.unchanged_planned_paths.len()
-                        ),
-                        None,
-                    )?;
-                }
-            }
+            } => self.plan_resolution(resolution, deviation, audit.as_ref())?,
+        }
+        Ok(())
+    }
+
+    /// Render a persisted plan settlement at its causal position in the execution.
+    fn plan_resolution(
+        &mut self,
+        resolution: &crate::plan::PlanResolutionRecord,
+        deviation: &[crate::plan::PlanDeviation],
+        audit: Option<&crate::plan::PlanAudit>,
+    ) -> Result<()> {
+        let id = &resolution.id;
+        let tasks = &resolution.task_summary;
+        let tests = &resolution.test_summary;
+        self.literal(
+            id,
+            &format!(
+                "Plan {:?} · {}/{} tasks completed · {} blocked",
+                resolution.kind, tasks.completed, tasks.total, tasks.blocked
+            ),
+            Some(TranscriptAction::Plan {
+                plan_id: resolution.plan_id.clone(),
+            }),
+        )?;
+        self.literal(
+            &format!("{id}:tests"),
+            &format!(
+                "Tests: {} passed, {} failed, {} skipped, {} not run",
+                tests.passed, tests.failed, tests.skipped, tests.not_run
+            ),
+            None,
+        )?;
+        for deviation in deviation {
+            self.markdown(
+                &format!("{id}:deviation:{}", deviation.id),
+                &format!("{}\n{}", deviation.summary, deviation.reason),
+            )?;
+        }
+        if let Some(audit) = audit {
+            self.literal(
+                &format!("{id}:audit"),
+                &format!(
+                    "Audit: {} unplanned paths, {} unchanged planned paths",
+                    audit.unplanned_paths.len(),
+                    audit.unchanged_planned_paths.len()
+                ),
+                None,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Render a child identity with the task owned by its causal delegation.
+    fn agent_entry(
+        &mut self,
+        id: &str,
+        run: &crate::agent::Agent,
+        task: &str,
+        interaction: &[Exchange],
+        agent: &[TimelineEntry],
+        exchange_id: Option<&str>,
+        depth: usize,
+    ) -> Result<()> {
+        let heading_start = self.block.len();
+        self.literal(
+            id,
+            &agent_summary(
+                run,
+                exchange_id.and_then(|id| interaction.iter().find(|exchange| exchange.id == id)),
+                self.now_ms,
+            ),
+            Some(TranscriptAction::Agent {
+                run_id: run.id.clone(),
+            }),
+        )?;
+        self.indent_range(heading_start, depth.saturating_sub(1));
+        let task_start = self.block.len();
+        self.literal(&format!("{id}:task"), &format!("  ↳ {}", task), None)?;
+        self.indent_range(task_start, depth.saturating_sub(1));
+        let children: HashMap<_, _> = agent
+            .iter()
+            .filter_map(|entry| match entry {
+                TimelineEntry::AgentLifecycle { id, .. } => Some((id.clone(), entry.clone())),
+                _ => None,
+            })
+            .collect();
+        for interaction in interaction
+            .iter()
+            .filter(|interaction| exchange_id.is_none_or(|id| interaction.id == id))
+        {
+            let interaction_start = self.block.len();
+            self.interaction(interaction, &children, depth + 1)?;
+            self.indent_range(interaction_start, depth);
         }
         Ok(())
     }
 
     fn interaction(
         &mut self,
-        interaction: &InteractionRecord,
+        interaction: &Exchange,
         agents: &HashMap<String, TimelineEntry>,
         depth: usize,
     ) -> Result<()> {
@@ -351,115 +408,168 @@ impl Projection<'_> {
         )?;
         self.prompt.push(prompt.id.clone());
         self.push(prompt)?;
+        let exchange_start = self.block.len();
+        let summary = exchange_summary(interaction, self.now_ms);
+        let mut heading =
+            self.renderer
+                .literal(BlockId(format!("{}:summary", interaction.id)), &summary, 2)?;
+        heading.metadata.decoration.push(Decoration {
+            range: TextRange {
+                start: TextPosition { row: 0, column: 0 },
+                end: TextPosition {
+                    row: heading.text.row_count(),
+                    column: 0,
+                },
+            },
+            capture: if interaction.completed_at_ms.is_some() {
+                "ForgeHarnessThought".into()
+            } else {
+                "ForgeHarnessThinking".into()
+            },
+            priority: 100,
+        });
+        self.push(heading)?;
         let mut response = Vec::new();
-        for node in &interaction.node_list {
+        let visible = interaction.node_list.iter().collect::<Vec<_>>();
+        let mut rendered_tool = std::collections::HashSet::new();
+        for (position, node) in visible.iter().enumerate() {
             match node {
-                InteractionNode::MainSegment { segment } => {
-                    let segment_start = self.block.len();
-                    let summary = segment_summary(interaction, segment, self.now_ms);
-                    let mut heading = self.renderer.literal(
-                        BlockId(format!("{}:summary", segment.id)),
-                        &summary,
-                        2,
-                    )?;
-                    heading.metadata.decoration.push(Decoration {
-                        range: TextRange {
-                            start: TextPosition { row: 0, column: 0 },
-                            end: TextPosition {
-                                row: heading.text.row_count(),
-                                column: 0,
-                            },
-                        },
-                        capture: if segment.state == SegmentState::Complete {
-                            "ForgeHarnessThought".into()
-                        } else {
-                            "ForgeHarnessThinking".into()
-                        },
-                        priority: 100,
-                    });
-                    self.push(heading)?;
-                    for thought in &segment.thought {
-                        let start = self.block.len();
-                        let commentary = self.renderer.commentary(
-                            BlockId(format!("{}:thought", thought.id)),
-                            &thought.text,
-                        )?;
-                        self.push(commentary)?;
-                        if !thought.tool.is_empty() {
-                            let tool_start = self.block.len();
-                            let failed = thought.tool.iter().filter(|tool| tool.failed).count();
-                            let count = thought.tool.len();
-                            let mut summary = format!(
+                ExchangeNode::TurnContent { id, turn_id, item } => {
+                    let turn = interaction
+                        .turn
+                        .iter()
+                        .find(|turn| turn.id() == turn_id)
+                        .context("timeline content references a missing provider turn")?;
+                    match item {
+                        crate::turn::TurnItem::Message { id: message_id } => {
+                            let message = turn
+                                .messages()
+                                .iter()
+                                .find(|message| message.id() == message_id)
+                                .context("timeline content references a missing message")?;
+                            if message.kind() == crate::turn::MessageKind::Reasoning {
+                                continue;
+                            }
+                            let final_message = interaction.completed_at_ms.is_some()
+                                && message.delivery() == crate::turn::MessageDelivery::Final;
+                            if final_message {
+                                response.push((id.clone(), message.text()));
+                            } else {
+                                let commentary = self
+                                    .renderer
+                                    .commentary(BlockId(id.clone()), message.text())?;
+                                self.push(commentary)?;
+                            }
+                        }
+                        crate::turn::TurnItem::Tool { .. } => {
+                            if rendered_tool.contains(id) {
+                                continue;
+                            }
+                            let group = visible.iter().skip(position).take_while(|node| matches!(node,
+                                ExchangeNode::TurnContent { turn_id: owner, item: crate::turn::TurnItem::Tool { .. }, .. } if owner == turn_id));
+                            let mut calls = Vec::new();
+                            for node in group {
+                                let ExchangeNode::TurnContent {
+                                    id,
+                                    item: crate::turn::TurnItem::Tool { id: tool_id },
+                                    ..
+                                } = node
+                                else {
+                                    unreachable!()
+                                };
+                                rendered_tool.insert(id.clone());
+                                let tool = turn
+                                    .tools()
+                                    .find(|tool| tool.id == *tool_id)
+                                    .context("timeline content references a missing tool")?;
+                                calls.push((id, tool));
+                            }
+                            let start = self.block.len();
+                            let count = calls.len();
+                            let failed = calls.iter().filter(|(_, tool)| tool.failed).count();
+                            let mut label = format!(
                                 "  ▸ Ran {count} {}",
                                 if count == 1 { "tool" } else { "tools" }
                             );
                             if failed > 0 {
-                                summary.push_str(&format!(" ({failed} failed)"));
+                                label.push_str(&format!(" ({failed} failed)"));
                             }
-                            self.literal(&format!("{}:tools", thought.id), &summary, None)?;
-                            for tool in &thought.tool {
-                                let tool_start = self.block.len();
-                                self.tool(&interaction.id, tool)?;
-                                self.fold(
-                                    tool_start,
-                                    &format!("{}:tool:{}", thought.id, tool.id),
-                                    true,
-                                );
+                            self.literal(&format!("{id}:tools"), &label, None)?;
+                            let settled = calls
+                                .iter()
+                                .all(|(_, tool)| tool.state() != crate::turn::ToolState::Running);
+                            for (id, tool) in calls {
+                                if tool.state() == crate::turn::ToolState::Running {
+                                    let preview = self.renderer.active_tool_preview(
+                                        BlockId(id.clone()),
+                                        &tool.kind,
+                                        &tool.status,
+                                        tool.failed,
+                                        &tool.title,
+                                        &tool.output,
+                                    )?;
+                                    self.push(preview)?;
+                                } else {
+                                    let tool_start = self.block.len();
+                                    self.tool(turn.id(), tool)?;
+                                    if let Some(diff) = crate::exchange::ProviderDiffBuilder::build(
+                                        std::slice::from_ref(tool),
+                                    ) {
+                                        self.diff(&format!("{id}:changes"), "Changed", &diff, "")?;
+                                    }
+                                    self.fold(tool_start, id, true);
+                                }
                             }
-                            self.fold(tool_start, &format!("{}:tools", thought.id), true);
+                            self.fold(start, &format!("{id}:tools"), settled);
                         }
-                        if let Some(diff) = &thought.diff_text {
-                            self.diff(&format!("{}:diff", thought.id), "Thought changes", diff)?;
-                        }
-                        self.fold(start, &format!("{}:thought", thought.id), false);
-                    }
-                    if let Some(active) = &segment.active {
-                        let commentary = self
-                            .renderer
-                            .commentary(BlockId(format!("{}:active", segment.id)), &active.text)?;
-                        self.push(commentary)?;
-                        if let Some(tool) = &active.latest_tool {
-                            let preview = self.renderer.active_tool_preview(
-                                BlockId(format!("{}:tool", segment.id)),
-                                &tool.kind,
-                                &tool.status,
-                                tool.failed,
-                                &tool.title,
-                                &tool.output,
-                            )?;
-                            self.push(preview)?;
-                        }
-                    }
-                    self.fold(
-                        segment_start,
-                        &format!("{}:segment", segment.id),
-                        segment.state == SegmentState::Complete,
-                    );
-                    if let Some(text) = &segment.response {
-                        response.push((format!("{}:response", segment.id), text));
                     }
                 }
-                InteractionNode::SteeringPrompt { prompt } => {
-                    let block = self
-                        .renderer
-                        .prompt(BlockId(format!("{}:prompt", prompt.id)), &prompt.text)?;
+                ExchangeNode::ExchangeInput { prompt } => {
+                    let label = match prompt.intent {
+                        crate::exchange::InputIntent::Steering => "Steering",
+                        crate::exchange::InputIntent::Clarification => "Clarification",
+                    };
+                    let block = self.renderer.prompt(
+                        BlockId(format!("{}:prompt", prompt.id)),
+                        &format!("{label}: {}", prompt.text),
+                    )?;
                     self.prompt.push(block.id.clone());
                     self.push(block)?;
                 }
-                InteractionNode::AgentReference { agent } => {
-                    if let Some(entry) = agents.get(&agent.agent_run_id) {
-                        self.entry(entry, depth + 1)?;
+                ExchangeNode::AgentReference { agent } => {
+                    if let Some(entry) = agents
+                        .get(&agent.id)
+                        .or_else(|| agents.get(&agent.child_agent_id))
+                    {
+                        if let TimelineEntry::AgentLifecycle {
+                            id: _,
+                            run,
+                            exchange: interaction,
+                            agent: child,
+                            ..
+                        } = entry
+                        {
+                            self.agent_entry(
+                                &agent.id,
+                                run,
+                                &agent.task,
+                                interaction,
+                                child,
+                                Some(&agent.child_exchange_id),
+                                depth + 1,
+                            )?;
+                        }
                     } else {
                         self.literal(
                             &agent.id,
                             "Agent",
                             Some(TranscriptAction::Agent {
-                                run_id: agent.agent_run_id.clone(),
+                                run_id: agent.child_agent_id.clone(),
                             }),
                         )?;
                     }
                 }
-                InteractionNode::PlanCommentResolution { resolution } => {
+                ExchangeNode::PlanCommentResolution { resolution } => {
                     for (index, annotation) in resolution.annotation.iter().enumerate() {
                         self.markdown(
                             &format!("{}:comment:{index}", resolution.id),
@@ -467,24 +577,35 @@ impl Projection<'_> {
                         )?;
                     }
                 }
-                InteractionNode::ArtifactChange { change } => {
-                    self.diff(&change.id, &change.path, &change.diff_text)?
+                ExchangeNode::ArtifactChange { change } => {
+                    self.diff(&change.id, "Changed", &change.diff_text, "")?
                 }
             }
         }
+        self.fold(
+            exchange_start,
+            &format!("{}:exchange", interaction.id),
+            interaction.completed_at_ms.is_some(),
+        );
         if let Some(diff) = &interaction.attributed_diff_text {
             self.diff(
                 &format!("{}:changes", interaction.id),
-                "Interaction changes",
+                "Changed",
                 diff,
+                if interaction.attributed_matches_checkpoint {
+                    " · checkpoint matched"
+                } else {
+                    ""
+                },
             )?;
         }
         if !interaction.attributed_matches_checkpoint {
             if let Some(diff) = &interaction.checkpoint_diff_text {
                 self.diff(
                     &format!("{}:checkpoint", interaction.id),
-                    "Checkpoint changes",
+                    "Checkpoint total:",
                     diff,
+                    "",
                 )?;
             }
         }
@@ -494,7 +615,7 @@ impl Projection<'_> {
         Ok(())
     }
 
-    fn tool(&mut self, interaction: &str, tool: &crate::interaction::CompletedTool) -> Result<()> {
+    fn tool(&mut self, interaction: &str, tool: &crate::exchange::ToolCall) -> Result<()> {
         let call_id = format!("{interaction}:{}", tool.id);
         ensure!(
             !self.tool.contains_key(&call_id),
@@ -531,7 +652,7 @@ impl Projection<'_> {
         self.push(block)
     }
 
-    fn diff(&mut self, id: &str, label: &str, text: &str) -> Result<()> {
+    fn diff(&mut self, id: &str, label: &str, text: &str, suffix: &str) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
@@ -540,15 +661,32 @@ impl Projection<'_> {
             "transcript diff exceeds 8 MiB"
         );
         self.bytes += text.len();
-        self.literal(
-            id,
-            label,
-            Some(TranscriptAction::Diff { text: text.into() }),
-        )
+        let tree = super::changes::ChangeTree::render(&self.renderer, id, label, suffix, text)?;
+        self.bytes += tree.bytes;
+        self.action.extend(tree.action);
+        for block in tree.block {
+            self.push(block)?;
+        }
+        Ok(())
     }
 
     fn markdown(&mut self, id: &str, text: &str) -> Result<()> {
-        let rendered = self.renderer.response(BlockId(id.into()), text)?;
+        let mut rendered = self.renderer.response(BlockId(id.into()), text)?;
+        rendered
+            .code
+            .retain(|code| forge_diff::syntax::SyntaxLanguage::from_name(&code.language).is_some());
+        if !rendered.code.is_empty() {
+            let target = TargetId(format!("{id}:markdown-syntax"));
+            self.syntax.insert(
+                target.clone(),
+                super::syntax::MarkdownSyntax {
+                    target,
+                    block: rendered.block.id.clone(),
+                    text: rendered.block.text.clone(),
+                    code: rendered.code,
+                },
+            );
+        }
         for link in rendered.link {
             self.action.insert(
                 link.target,
@@ -651,25 +789,47 @@ impl Projection<'_> {
     }
 }
 
-fn agent_summary(run: &crate::agent::AgentRun, now_ms: i64) -> String {
-    use crate::agent::AgentRunStatus;
+fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms: i64) -> String {
+    if let Some(exchange) = exchange {
+        use crate::exchange::ExchangeState;
+        let seconds = exchange.elapsed(now_ms) / 1_000;
+        let lifecycle = match exchange.state {
+            ExchangeState::Queued => "queued for",
+            ExchangeState::Running => {
+                if exchange.awaiting_input {
+                    "waiting for"
+                } else {
+                    "running for"
+                }
+            }
+            ExchangeState::Finalizing => "finalizing after",
+            ExchangeState::Complete => "completed in",
+            ExchangeState::Failed => "failed after",
+            ExchangeState::Cancelled => "cancelled after",
+            ExchangeState::Interrupted => "interrupted after",
+        };
+        return format!(
+            "▸ {}Agent {} {lifecycle} {seconds}s",
+            history_prefix(exchange.disposition),
+            run.label()
+        );
+    }
+
+    use crate::agent::AgentState;
 
     let elapsed_seconds = now_ms
         .min(run.updated_at_ms.max(run.created_at_ms))
         .saturating_sub(run.created_at_ms)
         .max(0)
         / 1_000;
-    let lifecycle = match run.status {
-        AgentRunStatus::Starting => format!("starting for {elapsed_seconds}s"),
-        AgentRunStatus::Running => {
+    let lifecycle = match run.state {
+        AgentState::Starting => format!("starting for {elapsed_seconds}s"),
+        AgentState::Ready => {
             let elapsed_seconds = now_ms.saturating_sub(run.created_at_ms).max(0) / 1_000;
-            format!("running for {elapsed_seconds}s")
+            format!("ready for {elapsed_seconds}s")
         }
-        AgentRunStatus::Waiting => format!("waiting for {elapsed_seconds}s"),
-        AgentRunStatus::Completed => format!("completed in {elapsed_seconds}s"),
-        AgentRunStatus::Failed => format!("failed after {elapsed_seconds}s"),
-        AgentRunStatus::Interrupted => format!("interrupted after {elapsed_seconds}s"),
-        AgentRunStatus::Closed => format!("closed after {elapsed_seconds}s"),
+        AgentState::Closing => format!("closing after {elapsed_seconds}s"),
+        AgentState::Closed => format!("closed after {elapsed_seconds}s"),
     };
     format!("▸ Agent {} {lifecycle}", run.label())
 }
@@ -691,35 +851,52 @@ fn session_event_text(event: &SessionEventKind) -> String {
     }
 }
 
-fn segment_summary(interaction: &InteractionRecord, segment: &MainSegment, now_ms: i64) -> String {
-    let complete = segment.state == SegmentState::Complete;
-    let duration = if complete {
-        segment.duration_ms
-    } else {
-        segment
-            .duration_ms
-            .max(now_ms.saturating_sub(segment.started_at_ms).max(0) as u64)
-    } / 1000;
-    let activity = if interaction.state == InteractionState::Cancelled {
+/// Distinguish workspace history from the preserved execution outcome.
+fn history_prefix(disposition: crate::exchange::HistoryDisposition) -> &'static str {
+    match disposition {
+        crate::exchange::HistoryDisposition::Current => "",
+        crate::exchange::HistoryDisposition::RolledBack => "Rolled back · ",
+        crate::exchange::HistoryDisposition::Superseded => "Superseded · ",
+    }
+}
+
+fn exchange_summary(interaction: &Exchange, now_ms: i64) -> String {
+    let complete = interaction.completed_at_ms.is_some();
+    let paused = interaction.state == ExchangeState::Running
+        && !complete
+        && interaction.execution_started_at_ms.is_none();
+    let duration = interaction.elapsed(now_ms) / 1000;
+    let activity = if interaction.state == ExchangeState::Cancelled {
         "Cancelled after"
+    } else if interaction.state == ExchangeState::Finalizing {
+        "Finalizing after"
+    } else if interaction.state == ExchangeState::Interrupted {
+        "Interrupted after"
+    } else if interaction.state == ExchangeState::Failed {
+        "Failed after"
     } else {
         match interaction.kind {
-            InteractionKind::PlanDraft | InteractionKind::PlanRevision
-                if complete && interaction.awaiting_input =>
+            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
+                if interaction.awaiting_input || paused =>
             {
                 "Planning paused after"
             }
-            InteractionKind::PlanDraft | InteractionKind::PlanRevision if complete => "Planned for",
-            InteractionKind::PlanDraft | InteractionKind::PlanRevision => "Planning for",
-            InteractionKind::PlanExecution if complete => "Executed plan for",
-            InteractionKind::PlanExecution => "Executing plan for",
-            InteractionKind::Chat if complete => "Thought for",
-            InteractionKind::Chat => "Thinking for",
+            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if complete => "Planned for",
+            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => "Planning for",
+            ExchangeKind::PlanExecution if complete => "Executed plan for",
+            ExchangeKind::PlanExecution if paused => "Plan execution paused after",
+            ExchangeKind::PlanExecution => "Executing plan for",
+            ExchangeKind::Chat if complete => "Thought for",
+            ExchangeKind::Chat if paused => "Paused after",
+            ExchangeKind::Chat => "Thinking for",
         }
     };
-    let mut summary = format!("▸ {activity} {duration}s");
-    if complete {
-        if let Some(tokens) = segment.token_count {
+    let mut summary = format!(
+        "▸ {}{activity} {duration}s",
+        history_prefix(interaction.disposition)
+    );
+    if complete || interaction.awaiting_input || paused {
+        if let Some(tokens) = interaction.token_count {
             let display = if tokens >= 1000 {
                 format!("{:.1}k", tokens as f64 / 1000.0)
             } else {
@@ -728,25 +905,26 @@ fn segment_summary(interaction: &InteractionRecord, segment: &MainSegment, now_m
             summary.push_str(&format!(", {display} tokens"));
         }
     }
-    let count = segment
-        .thought
+    let spawned = interaction
+        .node_list
         .iter()
-        .map(|thought| thought.tool.len())
-        .sum::<usize>()
-        + segment
-            .active
-            .as_ref()
-            .map_or(0, |active| active.tool_count);
-    let failed = segment
-        .thought
+        .filter_map(|node| match node {
+            ExchangeNode::AgentReference { agent } => Some(agent.child_agent_id.as_str()),
+            _ => None,
+        })
+        .collect::<std::collections::HashSet<_>>()
+        .len() as u64;
+    let count: usize = interaction
+        .turn
         .iter()
-        .flat_map(|thought| &thought.tool)
+        .map(|turn| turn.tools().count())
+        .sum();
+    let failed = interaction
+        .turn
+        .iter()
+        .flat_map(|turn| turn.tools())
         .filter(|tool| tool.failed)
-        .count()
-        + segment
-            .active
-            .as_ref()
-            .map_or(0, |active| active.failed_count);
+        .count();
     if count > 0 {
         summary.push_str(&format!(
             ", {count} {} called",
@@ -756,12 +934,15 @@ fn segment_summary(interaction: &InteractionRecord, segment: &MainSegment, now_m
             summary.push_str(&format!(" ({failed} failed)"));
         }
     }
-    if segment.spawned_agent_count > 0 {
-        let count = segment.spawned_agent_count;
+    if spawned > 0 {
+        let count = spawned;
         summary.push_str(&format!(
             ", {count} {} spawned",
             if count == 1 { "agent" } else { "agents" }
         ));
+    }
+    if let Some(error) = &interaction.finalization_error {
+        summary.push_str(&format!(" — {}", error.replace(['\n', '\r'], " ")));
     }
     summary
 }
@@ -774,10 +955,125 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::{
-        interaction::InteractionRecord,
+        exchange::Exchange,
         session::state_machine::{SessionPhase, WorkflowActivity},
         timeline::{SessionEventKind, TimelineEntry},
     };
+
+    #[test]
+    fn native_turn_content_renders_in_exchange_order_without_segment_content() {
+        use crate::backend::{
+            BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
+        };
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"native", "session_id":"session", "agent_id":"primary", "ordinal":1, "prompt":"Do the work",
+            "kind":"chat", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))
+        .unwrap();
+        exchange.resume(0).unwrap();
+        let mut event = BackendEvent {
+            address: Some(ProviderAddress {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+            }),
+            turn_boundary: Some(TurnBoundary::Started),
+            kind: "turn_started".into(),
+            text: None,
+            data: serde_json::Value::Null,
+            activity: None,
+            summary: None,
+            task_update: None,
+        };
+        exchange.observe_turn(&event, 0).unwrap();
+        event.turn_boundary = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("Inspecting ownership".into());
+        event.data = serde_json::json!({ "phase": "commentary" });
+        exchange.observe_turn(&event, 1).unwrap();
+        event.text = None;
+        event.kind = "tool".into();
+        event.activity = Some(ToolActivity {
+            id: "call".into(),
+            kind: ToolActivityKind::FileChange,
+            title: "inspect".into(),
+            output: Some("result".into()),
+            output_delta: false,
+            status: Some("completed".into()),
+            change: crate::backend::ProviderChangeSet {
+                file: vec![crate::backend::ProviderFileChange {
+                    path: "owned.rs".into(),
+                    move_path: None,
+                    kind: crate::backend::ProviderChangeKind::Add,
+                    diff: "@@ -0,0 +1 @@\n+owned\n".into(),
+                }],
+            },
+        });
+        exchange.observe_turn(&event, 2).unwrap();
+        exchange
+            .append_input(
+                crate::exchange::InputIntent::Steering,
+                "Also check tests".into(),
+                3,
+            )
+            .unwrap();
+        event.activity = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("Finished the work".into());
+        event.data = serde_json::json!({ "phase": "final_answer" });
+        exchange.observe_turn(&event, 4).unwrap();
+        event.text = None;
+        event.turn_boundary = Some(TurnBoundary::Finished {
+            outcome: crate::turn::TurnOutcome::Completed,
+        });
+        exchange.observe_turn(&event, 5).unwrap();
+        exchange
+            .finish(crate::exchange::ExchangeState::Complete, 5)
+            .unwrap();
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange,
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            5,
+        )
+        .unwrap();
+        let text = projected
+            .entry
+            .block
+            .iter()
+            .flat_map(|block| (0..block.text.row_count()).filter_map(|row| block.text.row(row)))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let commentary = text.find("Inspecting ownership").unwrap();
+        let tools = text.find("Ran 1 tool").unwrap();
+        let steering = text.find("Also check tests").unwrap();
+        let response = text.find("Finished the work").unwrap();
+        assert!(commentary < tools && tools < steering && steering < response);
+        assert_eq!(text.matches("Finished the work").count(), 1);
+        assert_eq!(projected.tool.len(), 1);
+        assert!(
+            projected.action.values().any(|action| matches!(action,
+            super::TranscriptAction::Diff { text } if text.contains("owned.rs"))),
+            "native tool lost its derived file diff"
+        );
+        let summary = projected
+            .entry
+            .block
+            .iter()
+            .find(|block| block.id.0 == "native:summary")
+            .unwrap();
+        assert!(summary.metadata.fold[0].closed);
+        let last = projected.entry.block.last().unwrap();
+        assert_ne!(summary.metadata.fold[0].end.block, last.id);
+        assert!(
+            last.metadata.fold.is_empty(),
+            "final response was folded with running activity"
+        );
+    }
 
     #[test]
     fn session_event_text_preserves_clear_and_fork_lineage() {
@@ -794,87 +1090,6 @@ mod tests {
             }),
             "Forked from session-1 (Architecture review)"
         );
-    }
-
-    #[test]
-    fn nested_agent_uses_legacy_lifecycle_task_and_child_indentation() {
-        use crate::agent::{AgentRun, AgentRunStatus};
-
-        let child_interaction = serde_json::from_value(json!({
-            "id":"child", "session_id":"session", "ordinal":1, "prompt":"Inspect child",
-            "kind":"chat", "state":"complete", "created_at_ms":1000, "completed_at_ms":2000,
-            "attributed_matches_checkpoint":false, "node_list":[{"kind":"main_segment","segment":{
-                "id":"child-segment", "state":"complete", "started_at_ms":1000,
-                "completed_at_ms":2000, "duration_ms":1000, "spawned_agent_count":0,
-                "thought":[], "response":"Child result."
-            }}]
-        }))
-        .unwrap();
-        let agent = TimelineEntry::AgentLifecycle {
-            id: "agent-run".into(),
-            created_at_ms: 1_000,
-            run: AgentRun {
-                id: "agent-run".into(),
-                session_id: "session".into(),
-                parent_interaction_id: Some("parent".into()),
-                parent_thread_id: None,
-                provider_thread_id: None,
-                active_turn_id: None,
-                definition: "explorer".into(),
-                nickname: None,
-                task: "Trace ownership.".into(),
-                status: AgentRunStatus::Completed,
-                created_at_ms: 1_000,
-                updated_at_ms: 2_000,
-            },
-            interaction: vec![child_interaction],
-            agent: Vec::new(),
-        };
-        let parent_interaction = serde_json::from_value(json!({
-            "id":"parent", "session_id":"session", "ordinal":1, "prompt":"Delegate",
-            "kind":"chat", "state":"complete", "created_at_ms":1000, "completed_at_ms":3000,
-            "attributed_matches_checkpoint":false,
-            "node_list":[{"kind":"agent_reference","agent":{
-                "id":"agent-reference", "agent_run_id":"agent-run", "created_at_ms":1000
-            }}]
-        }))
-        .unwrap();
-        let projection = project_at(
-            &TimelineEntry::Interaction {
-                id: "parent".into(),
-                created_at_ms: 1_000,
-                interaction: parent_interaction,
-                agent_by_id: HashMap::from([("agent-run".into(), agent)]),
-            },
-            &WidthProfile::default(),
-            3_000,
-        )
-        .unwrap();
-
-        let heading = projection
-            .entry
-            .block
-            .iter()
-            .find(|block| block.id.0 == "agent-run")
-            .unwrap();
-        assert_eq!(
-            heading.text.row(0),
-            Some("▸ Agent explorer completed in 1s")
-        );
-        let task = projection
-            .entry
-            .block
-            .iter()
-            .find(|block| block.id.0 == "agent-run:task")
-            .unwrap();
-        assert_eq!(task.text.row(0), Some("  ↳ Trace ownership."));
-        let response = projection
-            .entry
-            .block
-            .iter()
-            .find(|block| block.id.0 == "child-segment:response")
-            .unwrap();
-        assert_eq!(response.metadata.gutter[0].chunk[0].text, "  ▸ ");
     }
 
     #[test]
@@ -901,31 +1116,31 @@ mod tests {
 
     #[test]
     fn only_noninitial_top_level_interactions_own_a_separator() {
-        let interaction: InteractionRecord = serde_json::from_value(json!({
-            "id":"interaction", "session_id":"session", "ordinal":1, "prompt":"Inspect parser",
+        let interaction: Exchange = serde_json::from_value(json!({
+            "id":"interaction", "session_id":"session", "agent_id":"primary", "ordinal":1, "prompt":"Inspect parser",
             "kind":"chat", "state":"running", "created_at_ms":1000,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))
         .unwrap();
         let first = project_at(
-            &TimelineEntry::Interaction {
+            &TimelineEntry::Exchange {
                 id: "interaction".into(),
                 created_at_ms: 1_000,
-                interaction: interaction.clone(),
+                exchange: interaction.clone(),
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
             1_000,
         )
         .unwrap();
-        assert_eq!(first.entry.block.len(), 1);
+        assert_eq!(first.entry.block.len(), 2);
         assert_eq!(first.entry.block[0].id.0, "interaction:prompt");
 
         let projection = project_at_with_separator(
-            &TimelineEntry::Interaction {
+            &TimelineEntry::Exchange {
                 id: "interaction".into(),
                 created_at_ms: 1_000,
-                interaction,
+                exchange: interaction,
                 agent_by_id: HashMap::new(),
             },
             &WidthProfile::default(),
@@ -934,7 +1149,7 @@ mod tests {
         )
         .unwrap();
 
-        assert_eq!(projection.entry.block.len(), 2);
+        assert_eq!(projection.entry.block.len(), 3);
         assert_eq!(projection.entry.block[0].id.0, "interaction:separator");
         assert_eq!(projection.entry.block[0].text.wire_rows(), vec![""]);
         assert!(projection.entry.block[0].metadata.fold.is_empty());
@@ -942,181 +1157,129 @@ mod tests {
     }
 
     #[test]
-    fn completed_segments_keep_summary_thought_tool_folds_and_response_outside() {
-        let interaction = serde_json::from_value(json!({
-            "id":"interaction", "session_id":"session", "ordinal":1, "prompt":"Inspect parser",
-            "kind":"chat", "state":"complete", "created_at_ms":1000, "completed_at_ms":3500,
-            "attributed_matches_checkpoint":false, "node_list":[{"kind":"main_segment","segment":{
-                "id":"segment", "state":"complete", "started_at_ms":1000,"completed_at_ms":3500,
-                "duration_ms":2500,"token_count":128,"spawned_agent_count":0,
-                "thought":[{"id":"thought","text":"Inspect the boundary", "synthetic":false,
-                    "started_at_ms":1000,"completed_at_ms":2000,
-                    "tool":[{"id":"tool","kind":"command","title":"cargo test parser",
-                        "output":"first\nmiddle\nlast", "status":"completed","failed":false}]}],
-                "response":"The parser is correct.\n\n- Source remains available."
-            }}]
-        }))
-        .unwrap();
-        let entry = TimelineEntry::Interaction {
-            id: "interaction".into(),
-            created_at_ms: 1000,
-            interaction,
-            agent_by_id: HashMap::new(),
-        };
-        for columns in [1, 20, 100, 160] {
-            let projection = project_at(
-                &entry,
-                &WidthProfile {
-                    columns,
-                    ..WidthProfile::default()
-                },
-                3500,
-            )
-            .unwrap();
-            for block in &projection.entry.block {
-                block.validate().unwrap();
-            }
-            let summary = projection
-                .entry
-                .block
-                .iter()
-                .find(|block| block.id.0 == "segment:summary")
+    fn unsuccessful_exchange_summaries_preserve_outcome_and_frozen_duration() {
+        for (state, label) in [
+            (crate::exchange::ExchangeState::Interrupted, "Interrupted"),
+            (crate::exchange::ExchangeState::Failed, "Failed"),
+            (crate::exchange::ExchangeState::Cancelled, "Cancelled"),
+        ] {
+            for kind in ["chat", "plan_draft", "plan_execution"] {
+                let mut exchange: Exchange = serde_json::from_value(json!({
+                    "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1, "prompt":"Work",
+                    "kind":kind, "state":"running", "created_at_ms":1000,
+                    "attributed_matches_checkpoint":false, "node_list":[]
+                }))
                 .unwrap();
-            if columns >= 100 {
+                exchange.resume(1000).unwrap();
+                exchange.finish(state, 4000).unwrap();
                 assert_eq!(
-                    summary.text.row(0),
-                    Some("▸ Thought for 2s, 128 tokens, 1 tool called")
+                    super::exchange_summary(&exchange, 90_000),
+                    format!("▸ {label} after 3s")
                 );
             }
-            let fold = &summary.metadata.fold[0];
-            assert!(fold.closed);
-            assert_eq!(fold.end.block.0, "interaction:tool:tool");
-            let thought = projection
-                .entry
-                .block
-                .iter()
-                .find(|block| block.id.0 == "thought:thought")
-                .unwrap();
-            assert!(!thought.metadata.fold[0].closed);
-            let tools = projection
-                .entry
-                .block
-                .iter()
-                .find(|block| block.id.0 == "thought:tools")
-                .unwrap();
-            assert!(tools.metadata.fold[0].closed);
-            let tool = projection
-                .entry
-                .block
-                .iter()
-                .find(|block| block.id.0 == "interaction:tool:tool")
-                .unwrap();
-            assert!(tool.metadata.fold[0].closed);
-            assert_eq!(tool.metadata.fold[0].id.0, "thought:tool:tool");
-            if columns >= 100 {
-                assert_eq!(tool.text.row(0), Some("  • Ran cargo test parser"));
+        }
+    }
+
+    #[test]
+    fn paused_exchange_summary_freezes_until_execution_resumes() {
+        for (kind, paused, running) in [
+            ("chat", "Paused after", "Thinking for"),
+            ("plan_draft", "Planning paused after", "Planning for"),
+            ("plan_revision", "Planning paused after", "Planning for"),
+            (
+                "plan_execution",
+                "Plan execution paused after",
+                "Executing plan for",
+            ),
+        ] {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"exchange", "session_id":"session", "agent_id":"primary",
+                "ordinal":1, "prompt":"Work", "kind":kind, "state":"running",
+                "created_at_ms":1000, "attributed_matches_checkpoint":false, "node_list":[]
+            }))
+            .unwrap();
+            exchange.resume(1000).unwrap();
+            exchange.pause(4000);
+            for now in [4000, 90_000] {
+                assert_eq!(
+                    super::exchange_summary(&exchange, now),
+                    format!("▸ {paused} 3s")
+                );
             }
-            assert!(
-                tool.metadata
-                    .decoration
-                    .iter()
-                    .any(|decoration| decoration.capture == "ForgeHarnessCommand")
-            );
-            let response = projection.entry.block.last().unwrap();
-            assert_eq!(response.id.0, "segment:response");
-            assert!(response.metadata.fold.is_empty());
-            assert!(
-                projection
-                    .action
-                    .keys()
-                    .any(|target| target.0 == "interaction:tool:tool")
+            exchange.resume(90_000).unwrap();
+            assert_eq!(
+                super::exchange_summary(&exchange, 92_000),
+                format!("▸ {running} 5s")
             );
         }
     }
 
     #[test]
+    fn restored_history_is_visible_without_replacing_execution_outcomes() {
+        use crate::exchange::{ExchangeState, HistoryDisposition};
+        for (disposition, marker) in [
+            (HistoryDisposition::RolledBack, "Rolled back"),
+            (HistoryDisposition::Superseded, "Superseded"),
+        ] {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"history", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Work", "kind":"chat", "state":"running", "created_at_ms":1000,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))
+            .unwrap();
+            exchange.resume(1000).unwrap();
+            exchange.finish(ExchangeState::Failed, 4000).unwrap();
+            exchange.set_disposition(disposition).unwrap();
+            let entry = TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 1000,
+                exchange: exchange.clone(),
+                agent_by_id: HashMap::new(),
+            };
+            let projected = project_at(&entry, &WidthProfile::default(), 90_000).unwrap();
+            let summary = projected
+                .entry
+                .block
+                .iter()
+                .find(|block| block.id.0 == "history:summary")
+                .unwrap();
+            assert_eq!(
+                summary.text.wire_rows().join(""),
+                format!("▸ {marker} · Failed after 3s")
+            );
+            assert_eq!(exchange.state, ExchangeState::Failed);
+            assert_eq!(exchange.elapsed(90_000), 3000);
+        }
+    }
+
+    #[test]
     fn running_segment_summary_tracks_duration_and_completion_metadata() {
-        use crate::interaction::{InteractionKind, InteractionRecord, MainSegment};
-        let mut interaction: InteractionRecord = serde_json::from_value(json!({
-            "id":"interaction", "session_id":"session", "ordinal":1, "prompt":"Plan parser",
+        use crate::exchange::{Exchange, ExchangeKind};
+        let mut interaction: Exchange = serde_json::from_value(json!({
+            "id":"interaction", "session_id":"session", "agent_id":"primary", "ordinal":1, "prompt":"Plan parser",
             "kind":"plan_draft", "state":"running", "created_at_ms":1000,
             "attributed_matches_checkpoint":false,"node_list":[]
         }))
         .unwrap();
-        let mut segment = MainSegment::running("segment".into(), 1000);
+        interaction.resume(1000).unwrap();
         assert_eq!(
-            super::segment_summary(&interaction, &segment, 4200),
+            super::exchange_summary(&interaction, 4200),
             "▸ Planning for 3s"
         );
-        segment.complete(5500);
-        segment.token_count = Some(1280);
+        interaction.pause(5500);
+        interaction.token_count = Some(1280);
         interaction.awaiting_input = true;
         assert_eq!(
-            super::segment_summary(&interaction, &segment, 20000),
+            super::exchange_summary(&interaction, 20000),
             "▸ Planning paused after 4s, 1.3k tokens"
         );
-        interaction.kind = InteractionKind::Chat;
-        assert_eq!(
-            super::segment_summary(&interaction, &segment, 20000),
-            "▸ Thought for 4s, 1.3k tokens"
-        );
-    }
-
-    #[test]
-    fn active_tool_renders_live_heading_state_and_four_output_rows() {
-        let interaction = serde_json::from_value(json!({
-            "id":"interaction", "session_id":"session", "ordinal":1, "prompt":"Inspect parser",
-            "kind":"chat", "state":"running", "created_at_ms":1000,
-            "attributed_matches_checkpoint":false, "node_list":[{"kind":"main_segment","segment":{
-                "id":"segment", "state":"running", "started_at_ms":1000,
-                "duration_ms":0,"spawned_agent_count":0,"thought":[],
-                "active": {"interaction_id":"interaction", "thought_id":"thought", "text":"Inspecting",
-                    "synthetic":false,"tool_count":1,"failed_count":0,"revision":1,
-                    "latest_tool":{"id":"tool","kind":"command","title":"cargo test --lib parser",
-                        "output":"one\ntwo\nthree\nfour\nfive", "status":"in_progress","failed":false}}
-            }}]
-        }))
-        .unwrap();
-        let projection = project_at(
-            &TimelineEntry::Interaction {
-                id: "interaction".into(),
-                created_at_ms: 1_000,
-                interaction,
-                agent_by_id: HashMap::new(),
-            },
-            &WidthProfile::default(),
-            2_000,
-        )
-        .unwrap();
-        let tool = projection
-            .entry
-            .block
-            .iter()
-            .find(|block| block.id.0 == "segment:tool")
+        interaction.kind = ExchangeKind::Chat;
+        interaction
+            .finish(crate::exchange::ExchangeState::Complete, 5500)
             .unwrap();
-
         assert_eq!(
-            tool.text.wire_rows(),
-            vec![
-                "  • Ran cargo test --lib parser",
-                "    └ one",
-                "      two",
-                "      three",
-                "      four"
-            ]
-        );
-        assert!(tool.metadata.fold.is_empty());
-        assert!(
-            tool.metadata
-                .decoration
-                .iter()
-                .any(|decoration| decoration.capture == "ForgeHarnessCommand")
-        );
-        assert!(
-            tool.metadata
-                .decoration
-                .iter()
-                .any(|decoration| decoration.capture == "ForgeHarnessOutput")
+            super::exchange_summary(&interaction, 20000),
+            "▸ Thought for 4s, 1.3k tokens"
         );
     }
 }

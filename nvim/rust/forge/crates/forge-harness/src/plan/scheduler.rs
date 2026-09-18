@@ -121,6 +121,27 @@ impl PlanScheduler {
         document.tasks.get(task_index)
     }
 
+    /// Reactivate the blocked task while retaining its accumulated execution evidence.
+    pub fn resume_blocked_task(&mut self) {
+        if self
+            .task
+            .iter()
+            .any(|task| task.state == PlanTaskState::Active)
+        {
+            return;
+        }
+        let Some(task) = self
+            .task
+            .iter_mut()
+            .find(|task| task.state == PlanTaskState::Blocked)
+        else {
+            return;
+        };
+        task.state = PlanTaskState::Active;
+        task.completed_at_ms = None;
+        task.blocking_reason = None;
+    }
+
     /// Return whether every required task completed successfully.
     pub fn is_complete(&self) -> bool {
         !self.task.is_empty()
@@ -317,6 +338,48 @@ fn entity_pointer(entity_index: usize) -> String {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn resumption_reactivates_the_blocked_task_without_skipping_or_erasing_evidence() {
+        let mut document = super::super::document::test_fixture("plan", "Overview");
+        document.tasks.push(document.tasks[0].clone());
+        let mut scheduler = PlanScheduler::activate(&document);
+        scheduler.next_task(&document, 10).unwrap();
+        let mut report = PlanTaskReport {
+            execution_id: "execution".into(),
+            task_path: "/tasks/0".into(),
+            state: PlanTaskState::Blocked,
+            completed_subtask_paths: vec!["/tasks/0/files/0/subtasks/0".into()],
+            completed_entity_paths: vec!["/entity_changes/0".into()],
+            test_results: Vec::new(),
+            changed_paths: vec!["src/plan.rs".into()],
+            summary: Some("partial work".into()),
+            blocking_reason: Some("awaiting input".into()),
+        };
+        scheduler
+            .apply_report(&document, report.clone(), 20)
+            .unwrap();
+        scheduler.resume_blocked_task();
+        assert_eq!(scheduler.task[0].state, PlanTaskState::Active);
+        assert_eq!(scheduler.task[0].started_at_ms, Some(10));
+        assert_eq!(scheduler.task[0].completed_at_ms, None);
+        assert_eq!(scheduler.task[0].blocking_reason, None);
+        assert_eq!(
+            scheduler.task[0].completed_entity_paths,
+            report.completed_entity_paths
+        );
+        assert_eq!(scheduler.task[0].changed_paths, report.changed_paths);
+        assert_eq!(scheduler.task[0].summary, report.summary);
+        assert_eq!(scheduler.task[1].state, PlanTaskState::Pending);
+        report.state = PlanTaskState::Complete;
+        report.blocking_reason = None;
+        scheduler.apply_report(&document, report, 30).unwrap();
+        let settled = serde_json::to_value(&scheduler).unwrap();
+        scheduler.resume_blocked_task();
+        assert_eq!(serde_json::to_value(&scheduler).unwrap(), settled);
+        assert_eq!(scheduler.task[0].state, PlanTaskState::Complete);
+        assert_eq!(scheduler.task[1].state, PlanTaskState::Active);
+    }
 
     #[test]
     fn schedules_complete_tasks_while_retaining_leaf_evidence() {

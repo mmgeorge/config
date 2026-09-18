@@ -220,6 +220,7 @@ highlights.setup()
 ---@field keymap? "status"|"review"
 ---@field visual? boolean
 ---@field pinned boolean
+---@field hints? table<string, fun(context: table): string?>
 ---@field views? table<ForgeStatusViewKind, boolean>
 
 --- Initializes plugin configuration, highlights, and performance options.

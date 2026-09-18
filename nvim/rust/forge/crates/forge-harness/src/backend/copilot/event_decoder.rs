@@ -1,4 +1,4 @@
-use crate::agent::{AgentLifecycleEvent, AgentRunStatus};
+use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
 use crate::backend::{
     BackendEvent, BackendEventSink, BackendOutput, ProviderChangeKind, ProviderChangeSet,
     ProviderFileChange, ProviderTaskEntry, ProviderTaskUpdate, TaskStatus, ToolActivity,
@@ -14,7 +14,7 @@ pub struct CopilotEventDecoder;
 
 impl CopilotEventDecoder {
     /// Decode one SDK event and publish its normalized Harness update.
-    pub fn decode(
+    pub async fn decode(
         &self,
         provider_event: &SessionEvent,
         output: &mut BackendOutput,
@@ -24,6 +24,36 @@ impl CopilotEventDecoder {
             output.runtime.model = Some(model);
         }
         match provider_event.event_type.as_str() {
+            "assistant.turn_start" | "assistant.turn_end" => {
+                publish(
+                    BackendEvent {
+                        address: None,
+                        turn_boundary: Some(
+                            if provider_event.event_type == "assistant.turn_start" {
+                                crate::backend::TurnBoundary::Started
+                            } else {
+                                crate::backend::TurnBoundary::Finished {
+                                    outcome: crate::turn::TurnOutcome::Completed,
+                                }
+                            },
+                        ),
+                        kind: if provider_event.event_type == "assistant.turn_start" {
+                            "turn_started"
+                        } else {
+                            "turn_completed"
+                        }
+                        .into(),
+                        text: None,
+                        data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
+                        activity: None,
+                        summary: None,
+                        task_update: None,
+                    },
+                    output,
+                    event_sink,
+                )
+                .await;
+            }
             "assistant.reasoning_delta" => {
                 self.publish_text(
                     "reasoning",
@@ -31,7 +61,8 @@ impl CopilotEventDecoder {
                     provider_event,
                     output,
                     event_sink,
-                );
+                )
+                .await;
             }
             "assistant.message_delta" => {
                 self.publish_text(
@@ -40,7 +71,8 @@ impl CopilotEventDecoder {
                     provider_event,
                     output,
                     event_sink,
-                );
+                )
+                .await;
             }
             "assistant.reasoning" => {
                 self.publish_final_text(
@@ -49,7 +81,8 @@ impl CopilotEventDecoder {
                     provider_event,
                     output,
                     event_sink,
-                );
+                )
+                .await;
             }
             "assistant.message" => {
                 self.publish_final_text(
@@ -58,7 +91,8 @@ impl CopilotEventDecoder {
                     provider_event,
                     output,
                     event_sink,
-                );
+                )
+                .await;
             }
             "tool.execution_start"
             | "tool.execution_partial_result"
@@ -72,6 +106,8 @@ impl CopilotEventDecoder {
                 if let Some(activity) = activity {
                     publish(
                         BackendEvent {
+                            address: None,
+                            turn_boundary: None,
                             kind: "tool".into(),
                             text: None,
                             data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
@@ -81,7 +117,8 @@ impl CopilotEventDecoder {
                         },
                         output,
                         event_sink,
-                    );
+                    )
+                    .await;
                 }
             }
             "session.usage_info" => {
@@ -90,10 +127,11 @@ impl CopilotEventDecoder {
                 if let (Some(used), Some(size)) = (used, size)
                     && let Some(context_usage) = ContextUsage::reported(used, size)
                 {
-                    output.metrics.token_count = Some(used);
                     output.metrics.context_usage = Some(context_usage.clone());
                     publish(
                         BackendEvent {
+                            address: None,
+                            turn_boundary: None,
                             kind: "context_usage".into(),
                             text: None,
                             data: serde_json::to_value(context_usage).unwrap_or(Value::Null),
@@ -103,7 +141,8 @@ impl CopilotEventDecoder {
                         },
                         output,
                         event_sink,
-                    );
+                    )
+                    .await;
                 }
             }
             "assistant.usage" if output.metrics.token_count.is_none() => {
@@ -117,6 +156,8 @@ impl CopilotEventDecoder {
             "subagent.started" | "subagent.completed" | "subagent.failed" => {
                 publish(
                     BackendEvent {
+                        address: None,
+                        turn_boundary: None,
                         kind: "agent_lifecycle".into(),
                         text: None,
                         data: serde_json::to_value(agent_lifecycle(provider_event))
@@ -127,7 +168,8 @@ impl CopilotEventDecoder {
                     },
                     output,
                     event_sink,
-                );
+                )
+                .await;
             }
             "session.error" if !provider_event.is_transient_error() => {
                 self.publish_text(
@@ -136,14 +178,15 @@ impl CopilotEventDecoder {
                     provider_event,
                     output,
                     event_sink,
-                );
+                )
+                .await;
             }
             _ => {}
         }
     }
 
     /// Publish one complete Copilot todo snapshot after its signal-only change event.
-    pub fn publish_task_snapshot(
+    pub async fn publish_task_snapshot(
         &self,
         data: Value,
         scope_id: String,
@@ -155,6 +198,8 @@ impl CopilotEventDecoder {
         };
         publish(
             BackendEvent {
+                address: None,
+                turn_boundary: None,
                 kind: "plan".into(),
                 text: None,
                 data,
@@ -164,10 +209,11 @@ impl CopilotEventDecoder {
             },
             output,
             event_sink,
-        );
+        )
+        .await;
     }
 
-    fn publish_text(
+    async fn publish_text(
         &self,
         kind: &str,
         text: Option<String>,
@@ -180,6 +226,8 @@ impl CopilotEventDecoder {
         };
         publish(
             BackendEvent {
+                address: None,
+                turn_boundary: None,
                 kind: kind.into(),
                 text: Some(text),
                 data: serde_json::to_value(provider_event).unwrap_or(Value::Null),
@@ -189,10 +237,11 @@ impl CopilotEventDecoder {
             },
             output,
             event_sink,
-        );
+        )
+        .await;
     }
 
-    fn publish_final_text(
+    async fn publish_final_text(
         &self,
         kind: &str,
         text: Option<String>,
@@ -218,32 +267,64 @@ impl CopilotEventDecoder {
                     })
             });
         if !already_streamed {
-            self.publish_text(kind, text, provider_event, output, event_sink);
+            self.publish_text(kind, text, provider_event, output, event_sink)
+                .await;
         }
     }
 }
 
-fn publish(event: BackendEvent, output: &mut BackendOutput, event_sink: Option<&BackendEventSink>) {
+async fn publish(
+    mut event: BackendEvent,
+    output: &mut BackendOutput,
+    event_sink: Option<&BackendEventSink>,
+) {
+    if event.address.is_none() {
+        let thread_id = event
+            .data
+            .get("agentId")
+            .or_else(|| event.data.get("agent_id"))
+            .and_then(Value::as_str)
+            .map(str::to_owned)
+            .or_else(|| output.backend_session_id.clone());
+        if let Some(thread_id) = thread_id {
+            let turn_id = event
+                .data
+                .pointer("/data/turnId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .or_else(|| {
+                    output.event.iter().rev().find_map(|previous| {
+                        previous
+                            .address
+                            .as_ref()
+                            .filter(|address| address.thread_id == thread_id)
+                            .map(|address| address.turn_id.clone())
+                    })
+                });
+            event.address =
+                turn_id.map(|turn_id| crate::backend::ProviderAddress { thread_id, turn_id });
+        }
+    }
     if let Some(activity) = event.activity.as_ref()
         && let Some(previous) = output.event.iter_mut().find(|previous| {
-            previous
-                .activity
-                .as_ref()
-                .is_some_and(|existing| existing.id == activity.id)
+            previous.activity.as_ref().is_some_and(|existing| {
+                existing.id == activity.id && previous.address == event.address
+            })
         })
     {
         merge_activity(previous, event);
         if let Some(event_sink) = event_sink {
-            let _ = event_sink.send(previous.clone());
+            let _ = event_sink.send_wait(previous.clone()).await;
         }
         return;
     }
     if let Some(event_sink) = event_sink {
-        let _ = event_sink.send(event.clone());
+        let _ = event_sink.send_wait(event.clone()).await;
     }
     if matches!(event.kind.as_str(), "reasoning" | "assistant_message")
         && let Some(previous) = output.event.last_mut()
         && previous.kind == event.kind
+        && previous.address == event.address
         && previous.activity.is_none()
     {
         let incoming = event.text.unwrap_or_default();
@@ -418,9 +499,9 @@ fn task_update(data: &Value, scope_id: String) -> Option<ProviderTaskUpdate> {
 
 fn agent_lifecycle(provider_event: &SessionEvent) -> AgentLifecycleEvent {
     let status = match provider_event.event_type.as_str() {
-        "subagent.started" => AgentRunStatus::Running,
-        "subagent.completed" => AgentRunStatus::Completed,
-        _ => AgentRunStatus::Failed,
+        "subagent.started" => AgentExecutionState::Running,
+        "subagent.completed" => AgentExecutionState::Completed,
+        _ => AgentExecutionState::Failed,
     };
     AgentLifecycleEvent {
         operation: provider_event.event_type.clone(),
@@ -473,34 +554,40 @@ mod test {
         }
     }
 
-    #[test]
-    fn coalesces_streamed_message_and_tool_lifecycle_updates() {
+    #[tokio::test]
+    async fn coalesces_streamed_message_and_tool_lifecycle_updates() {
         let decoder = CopilotEventDecoder;
         let mut output = BackendOutput::default();
-        decoder.decode(
-            &event(
-                "assistant.message_delta",
-                json!({ "deltaContent": "Hello " }),
-            ),
-            &mut output,
-            None,
-        );
-        decoder.decode(
-            &event(
-                "assistant.message_delta",
-                json!({ "deltaContent": "world" }),
-            ),
-            &mut output,
-            None,
-        );
-        decoder.decode(
-            &event(
-                "tool.execution_start",
-                json!({ "toolCallId": "tool-1", "toolName": "grep" }),
-            ),
-            &mut output,
-            None,
-        );
+        decoder
+            .decode(
+                &event(
+                    "assistant.message_delta",
+                    json!({ "deltaContent": "Hello " }),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
+        decoder
+            .decode(
+                &event(
+                    "assistant.message_delta",
+                    json!({ "deltaContent": "world" }),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
+        decoder
+            .decode(
+                &event(
+                    "tool.execution_start",
+                    json!({ "toolCallId": "tool-1", "toolName": "grep" }),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
         decoder.decode(
             &event(
                 "tool.execution_complete",
@@ -508,7 +595,7 @@ mod test {
             ),
             &mut output,
             None,
-        );
+        ).await;
         assert_eq!(output.event[0].text.as_deref(), Some("Hello world"));
         assert_eq!(output.event.len(), 2);
         assert_eq!(output.event[1].activity.as_ref().unwrap().title, "grep");
@@ -518,36 +605,98 @@ mod test {
         );
     }
 
-    #[test]
-    fn maps_usage_tasks_and_subagent_events() {
+    #[tokio::test]
+    async fn normalizes_provider_turn_boundaries_without_counting_context_as_usage() {
+        let decoder = CopilotEventDecoder;
+        let mut output = BackendOutput {
+            backend_session_id: Some("session".into()),
+            ..BackendOutput::default()
+        };
+        decoder
+            .decode(
+                &event("assistant.turn_start", json!({"turnId":"turn-one"})),
+                &mut output,
+                None,
+            )
+            .await;
+        decoder
+            .decode(
+                &event("assistant.message_delta", json!({"deltaContent":"working"})),
+                &mut output,
+                None,
+            )
+            .await;
+        decoder
+            .decode(
+                &event(
+                    "session.usage_info",
+                    json!({"currentTokens":20,"tokenLimit":100}),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
+        decoder
+            .decode(
+                &event("assistant.turn_end", json!({"turnId":"turn-one"})),
+                &mut output,
+                None,
+            )
+            .await;
+        assert_eq!(output.metrics.token_count, None);
+        assert!(matches!(
+            output.event[0].turn_boundary,
+            Some(crate::backend::TurnBoundary::Started)
+        ));
+        assert_eq!(output.event[1].address, output.event[0].address);
+        assert!(matches!(
+            output.event.last().unwrap().turn_boundary,
+            Some(crate::backend::TurnBoundary::Finished {
+                outcome: crate::turn::TurnOutcome::Completed
+            })
+        ));
+        assert_eq!(
+            output.event[0].address.as_ref().unwrap().turn_id,
+            "turn-one"
+        );
+    }
+
+    #[tokio::test]
+    async fn maps_usage_tasks_and_subagent_events() {
         let decoder = CopilotEventDecoder;
         let mut output = BackendOutput::default();
-        decoder.decode(
-            &event(
-                "session.usage_info",
-                json!({ "currentTokens": 20, "tokenLimit": 100 }),
-            ),
-            &mut output,
-            None,
-        );
-        decoder.publish_task_snapshot(
-            json!({ "rows": [{ "id": "one", "title": "Inspect", "status": "completed" }] }),
-            "copilot-root".into(),
-            &mut output,
-            None,
-        );
-        decoder.decode(
-            &event(
-                "subagent.started",
-                json!({ "agentId": "child", "agentName": "explorer" }),
-            ),
-            &mut output,
-            None,
-        );
+        decoder
+            .decode(
+                &event(
+                    "session.usage_info",
+                    json!({ "currentTokens": 20, "tokenLimit": 100 }),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
+        decoder
+            .publish_task_snapshot(
+                json!({ "rows": [{ "id": "one", "title": "Inspect", "status": "completed" }] }),
+                "copilot-root".into(),
+                &mut output,
+                None,
+            )
+            .await;
+        decoder
+            .decode(
+                &event(
+                    "subagent.started",
+                    json!({ "agentId": "child", "agentName": "explorer" }),
+                ),
+                &mut output,
+                None,
+            )
+            .await;
         assert_eq!(output.metrics.context_usage.unwrap().remaining_percent, 80);
         assert!(output.event[1].task_update.as_ref().unwrap().complete);
         let lifecycle: AgentLifecycleEvent =
             serde_json::from_value(output.event[2].data.clone()).unwrap();
-        assert_eq!(lifecycle.status, AgentRunStatus::Running);
+        assert_eq!(lifecycle.status, AgentExecutionState::Running);
     }
 }

@@ -85,10 +85,18 @@ M.hint_command_ids_by_view = {
 ---@type table<string, ForgeStatusCommandSpec[]>
 M.view_specs = {
   harness = {
-    { id = "submit", label = "send", desc = "Submit the composer", modes = { "n", "i" }, pinned = true },
-    { id = "steer", label = "steer", desc = "Send the composer into the active provider turn", modes = { "n", "i" }, pinned = true },
-    { id = "cancel", label = "cancel", desc = "Cancel the active Harness turn", modes = { "n", "i" }, pinned = false },
-    { id = "edit_queued", label = "edit queued", desc = "Remove and edit the newest queued prompt", modes = { "n", "i" }, pinned = true },
+    { id = "submit", label = "send", desc = "Send the composer, queue while busy, or steer the selected child", modes = { "n", "i" }, pinned = true,
+      hints = { composer = function(state)
+        if state.selected_agent_run_id then return "steer child" end
+        if not state.busy then return "send" end
+        return state.active_wait and state.capability and state.capability.native_steer and "steer" or "queue"
+      end } },
+    { id = "steer", label = "steer", desc = "Send the composer into the active provider turn", modes = { "n", "i" }, pinned = true,
+      hints = { composer = function(state) if state.busy and state.capability and state.capability.native_steer then return "steer" end end } },
+    { id = "cancel", label = "cancel", desc = "Cancel the active Harness turn", modes = { "n", "i" }, pinned = false,
+      hints = { composer = function(state) if state.busy then return "cancel" end end } },
+    { id = "edit_queued", label = "edit queued", desc = "Remove and edit the newest queued prompt", modes = { "n", "i" }, pinned = true,
+      hints = { composer = function(state) if #(state.queue or {}) > 0 then return "edit queued" end end } },
     { id = "toggle_mode", label = "mode", desc = "Toggle Read and Write mode", modes = { "n", "i" }, pinned = true },
     { id = "previous_prompt", label = "previous", desc = "Jump to the previous user prompt", modes = "n", pinned = false },
     { id = "next_prompt", label = "next", desc = "Jump to the next user prompt", modes = "n", pinned = false },
@@ -104,7 +112,8 @@ M.view_specs = {
     { id = "effort_down", label = "effort-", desc = "Decrease reasoning effort", modes = "n", pinned = false },
     { id = "effort_up", label = "effort+", desc = "Increase reasoning effort", modes = "n", pinned = false },
     { id = "close", label = "close", desc = "Close Harness", modes = "n", pinned = true },
-    { id = "help", label = "help", desc = "Show Harness help", modes = "n", pinned = true },
+    { id = "help", label = "help", desc = "Show Harness help", modes = "n", pinned = true,
+      hints = { composer = function() return "help (normal)" end } },
   },
   plan_review = {
     { id = "toggle", label = "fold", desc = "Toggle the current plan task or subtask", modes = "n", pinned = true },

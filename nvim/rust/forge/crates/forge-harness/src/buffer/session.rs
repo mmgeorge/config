@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::editable::{LocalEdit, LocalEditResult};
@@ -10,7 +10,7 @@ use forge_buffer::patch::{BufferPatch, BufferSnapshot};
 use forge_buffer::width::WidthProfile;
 use serde::{Deserialize, Serialize};
 
-use crate::interaction::InteractionRecord;
+use crate::exchange::Exchange;
 use crate::session::state_machine::SessionPhase;
 use crate::timeline::{
     TimelineEntry,
@@ -18,7 +18,7 @@ use crate::timeline::{
 };
 
 use super::composer::{ComposerDocument, ComposerSubmission};
-use super::document::{HarnessDocument, TranscriptChange};
+use super::document::{TranscriptChange, TranscriptDocument};
 use super::output::OutputDocument;
 use super::projection::{ProjectedEntry, TranscriptAction, project};
 use super::tool::ToolOutputView;
@@ -34,9 +34,11 @@ pub struct SessionPresentation {
 }
 
 struct OpenPresentation {
+    syntax_done: HashSet<TargetId>,
+    syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
     agent_scope: Option<String>,
     last_width: WidthProfile,
-    transcript: HarnessDocument,
+    transcript: TranscriptDocument,
     transcript_id: DocumentId,
     composer: ComposerDocument,
     composer_id: DocumentId,
@@ -54,18 +56,21 @@ struct OpenPresentation {
 struct EntryPresentation {
     prompt: Vec<forge_buffer::identity::BlockId>,
     target: Vec<TargetId>,
+    syntax: Vec<TargetId>,
     tool: Vec<String>,
     bytes: usize,
 }
 
 #[derive(Serialize)]
 pub struct PresentationOpen {
+    pub syntax_pending: bool,
     pub transcript: BufferSnapshot,
     pub composer: BufferSnapshot,
 }
 
 #[derive(Serialize)]
 pub struct PresentationSync {
+    pub syntax_pending: bool,
     pub patch: Vec<BufferPatch>,
     pub snapshot: Option<BufferSnapshot>,
 }
@@ -73,6 +78,9 @@ pub struct PresentationSync {
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PresentationRequest {
+    Highlight {
+        document: DocumentId,
+    },
     PlanOpen {
         document: DocumentId,
         view: ViewId,
@@ -160,6 +168,9 @@ impl SessionPresentation {
     pub fn dispatch(&mut self, request: PresentationRequest) -> Result<serde_json::Value> {
         use serde_json::{json, to_value};
         match request {
+            PresentationRequest::Highlight { .. } => {
+                anyhow::bail!("syntax requires the asynchronous service owner")
+            }
             PresentationRequest::PlanOpen { .. }
             | PresentationRequest::PlanAction { .. }
             | PresentationRequest::PlanAddAnnotation { .. }
@@ -354,7 +365,7 @@ impl SessionPresentation {
 
     pub fn update_live(
         &mut self,
-        interaction: Option<&InteractionRecord>,
+        interaction: Option<&Exchange>,
         removed: Option<&str>,
         status: SessionPhase,
     ) -> Result<TimelinePatch> {
@@ -387,6 +398,7 @@ impl SessionPresentation {
             }
             open.input.entry(view).or_insert(InputSequence(0));
             return Ok(PresentationOpen {
+                syntax_pending: syntax_pending(open),
                 transcript: open.transcript.snapshot()?,
                 composer: open.composer.snapshot(),
             });
@@ -405,15 +417,17 @@ impl SessionPresentation {
         }
         let mut entry = HashMap::new();
         let mut action = HashMap::new();
+        let mut syntax = HashMap::new();
         let mut tool = HashMap::new();
         let mut block = Vec::new();
         for projected in projected {
             entry.insert(projected.entry.id.clone(), entry_presentation(&projected));
             block.push(projected.entry);
             action.extend(projected.action);
+            syntax.extend(projected.syntax);
             tool.extend(projected.tool);
         }
-        let mut transcript = HarnessDocument::initialize(
+        let mut transcript = TranscriptDocument::initialize(
             document.clone(),
             self.session_id.clone(),
             self.timeline.revision(),
@@ -421,10 +435,16 @@ impl SessionPresentation {
         )?;
         transcript.views.open(view.clone(), width.clone())?;
         let opened = PresentationOpen {
+            syntax_pending: !syntax.is_empty()
+                || action
+                    .values()
+                    .any(|action| matches!(action, TranscriptAction::Diff { .. })),
             transcript: transcript.snapshot()?,
             composer: composer_document.snapshot(),
         };
         self.open = Some(OpenPresentation {
+            syntax_done: HashSet::new(),
+            syntax,
             agent_scope: None,
             last_width: width,
             transcript,
@@ -453,18 +473,16 @@ impl SessionPresentation {
             matches!(
                 entry,
                 TimelineEntry::Status {
-                    status: SessionPhase::Working { .. },
+                    status: SessionPhase::Working { .. } | SessionPhase::WaitingForAgent { .. },
                     ..
                 }
             )
         }) {
-            let timeline = self.timeline.entry_list().to_vec();
-            let timeline_revision = self.timeline.revision();
             let open = self
                 .open
                 .as_mut()
                 .context("session presentation is not open")?;
-            reflow(open, &timeline, timeline_revision)?;
+            refresh_activity(open, self.timeline.entry_list())?;
         }
         let open = self.document(document)?;
         if let Some(failure) = &open.failure {
@@ -489,15 +507,131 @@ impl SessionPresentation {
         }
         if cursor == current {
             Ok(PresentationSync {
+                syntax_pending: syntax_pending(open),
                 patch,
                 snapshot: None,
             })
         } else {
             Ok(PresentationSync {
+                syntax_pending: syntax_pending(open),
                 patch: Vec::new(),
                 snapshot: Some(open.transcript.snapshot()?),
             })
         }
+    }
+
+    /// Capture one syntax source while keeping asynchronous work outside the presentation lock.
+    pub(crate) fn capture_syntax(
+        &mut self,
+        document: &DocumentId,
+    ) -> Result<Option<super::syntax::TranscriptSyntax>> {
+        self.document(document)?;
+        let open = self.open.as_mut().expect("validated document");
+        let selected = open
+            .action
+            .iter()
+            .find_map(|(target, action)| match action {
+                TranscriptAction::Diff { text } if !open.syntax_done.contains(target) => Some(
+                    super::syntax::TranscriptSyntax::Diff(super::syntax::SavedDiffSyntax {
+                        target: target.clone(),
+                        text: text.clone(),
+                    }),
+                ),
+                _ => None,
+            })
+            .or_else(|| {
+                open.syntax.iter().find_map(|(target, job)| {
+                    (!open.syntax_done.contains(target))
+                        .then(|| super::syntax::TranscriptSyntax::Markdown(job.clone()))
+                })
+            });
+        if let Some(job) = &selected {
+            open.syntax_done.insert(job.target().clone());
+        }
+        Ok(selected)
+    }
+
+    /// Publish highlight metadata only into the document and saved source that admitted analysis.
+    pub(crate) fn apply_syntax(
+        &mut self,
+        document: &DocumentId,
+        job: &super::syntax::TranscriptSyntax,
+        highlighted: Vec<forge_buffer::block::BufferBlock>,
+    ) -> Result<()> {
+        let Some(open) = self
+            .open
+            .as_mut()
+            .filter(|open| &open.transcript_id == document)
+        else {
+            return Ok(());
+        };
+        let current_source = match job {
+            super::syntax::TranscriptSyntax::Diff(job) => {
+                matches!(open.action.get(&job.target), Some(TranscriptAction::Diff { text }) if text == &job.text)
+            }
+            super::syntax::TranscriptSyntax::Markdown(job) => {
+                open.syntax.get(&job.target) == Some(job)
+            }
+        };
+        if !current_source {
+            return Ok(());
+        }
+        let mut edits = Vec::new();
+        let mut additional = 0;
+        for syntax in highlighted {
+            let Some(current) = open.transcript.document.block(&syntax.id) else {
+                return Ok(());
+            };
+            if current.text.row_count() != syntax.text.row_count() {
+                return Ok(());
+            }
+            ensure!(
+                current.metadata.decoration.len()
+                    + current.metadata.visible_decoration.len()
+                    + syntax.metadata.visible_decoration.len()
+                    <= 8192,
+                "transcript syntax block exceeds 8192 decorations"
+            );
+            let mut replacement = current.clone();
+            for mut span in syntax.metadata.visible_decoration {
+                let row = span.range.start.row;
+                let source = syntax.text.row(row).expect("syntax row");
+                let displayed = current.text.row(row).expect("retained row");
+                let Some(prefix) = displayed.strip_suffix(source) else {
+                    return Ok(());
+                };
+                span.range.start.column += prefix.len();
+                span.range.end.column += prefix.len();
+                replacement.metadata.visible_decoration.push(span);
+            }
+            additional += replacement
+                .retained_bytes()
+                .saturating_sub(current.retained_bytes());
+            let index = open
+                .transcript
+                .document
+                .block_index(&syntax.id)
+                .expect("retained block");
+            edits.push(forge_buffer::sequence::SequenceEdit {
+                range: index..index + 1,
+                block: vec![replacement],
+            });
+        }
+        ensure!(
+            open.retained_bytes + additional <= MAX_PROJECTED_BYTES,
+            "session syntax projection exceeds 64 MiB"
+        );
+        if let Some(patch) = open.transcript.document.edit_many(edits)? {
+            open.retained_bytes += additional;
+            if let Some(entry) = open.entry.values_mut().find(|entry| {
+                entry.target.contains(job.target()) || entry.syntax.contains(job.target())
+            }) {
+                entry.bytes += additional;
+            }
+            retain_patches(open, vec![patch])?;
+        }
+        open.syntax_done.insert(job.target().clone());
+        Ok(())
     }
 
     pub fn snapshot(&self, document: &DocumentId) -> Result<BufferSnapshot> {
@@ -762,10 +896,21 @@ impl SessionPresentation {
     }
 }
 
+/// Identify unanalysed sources without inspecting their potentially large bodies.
+fn syntax_pending(open: &OpenPresentation) -> bool {
+    open.action.iter().any(|(target, action)| {
+        matches!(action, TranscriptAction::Diff { .. }) && !open.syntax_done.contains(target)
+    }) || open
+        .syntax
+        .keys()
+        .any(|target| !open.syntax_done.contains(target))
+}
+
 fn entry_presentation(projected: &ProjectedEntry) -> EntryPresentation {
     EntryPresentation {
         prompt: projected.prompt.clone(),
         target: projected.action.keys().cloned().collect(),
+        syntax: projected.syntax.keys().cloned().collect(),
         tool: projected.tool.keys().cloned().collect(),
         bytes: projected.retained_bytes(),
     }
@@ -789,7 +934,7 @@ fn find_agent<'source>(
                     return Some(found);
                 }
             }
-            TimelineEntry::Interaction { agent_by_id, .. } => {
+            TimelineEntry::Exchange { agent_by_id, .. } => {
                 for attached in agent_by_id.values() {
                     if let Some(found) =
                         find_agent(std::slice::from_ref(attached), run_id, depth + 1)
@@ -804,6 +949,86 @@ fn find_agent<'source>(
     None
 }
 
+fn refresh_activity(open: &mut OpenPresentation, source: &[TimelineEntry]) -> Result<()> {
+    let width = open.transcript.views.profile().unwrap_or(&open.last_width);
+    let mut projected = Vec::new();
+    if let Some(agent_id) = open.agent_scope.as_deref() {
+        if let Some(TimelineEntry::AgentLifecycle {
+            exchange: interaction,
+            ..
+        }) = find_agent(source, agent_id, 0)
+        {
+            for (index, exchange) in interaction.iter().enumerate() {
+                if exchange.completed_at_ms.is_none() && exchange.execution_started_at_ms.is_some()
+                {
+                    let entry = TimelineEntry::Exchange {
+                        id: exchange.id.clone(),
+                        created_at_ms: exchange.created_at_ms,
+                        exchange: exchange.clone(),
+                        agent_by_id: HashMap::new(),
+                    };
+                    projected.push((index, project(&entry, width, index > 0)?));
+                }
+            }
+        }
+    } else {
+        for (index, entry) in source.iter().enumerate() {
+            let ticking = match entry {
+                TimelineEntry::Exchange {
+                    exchange: interaction,
+                    ..
+                } => {
+                    interaction.completed_at_ms.is_none()
+                        && interaction.execution_started_at_ms.is_some()
+                }
+                TimelineEntry::Status {
+                    status: SessionPhase::Working { .. },
+                    ..
+                } => true,
+                TimelineEntry::AgentLifecycle { run, .. } => run.state.is_open(),
+                _ => false,
+            };
+            if ticking {
+                projected.push((index, project(entry, width, index > 0)?));
+            }
+        }
+    }
+    let mut entries = Vec::new();
+    for (index, mut projection) in projected {
+        for block in &mut projection.entry.block {
+            if !open.syntax_done.iter().any(|target| {
+                block.id.0.starts_with(&format!("{}:file:", target.0))
+                    || open
+                        .syntax
+                        .get(target)
+                        .is_some_and(|job| job.block == block.id)
+            }) {
+                continue;
+            }
+            if let Some(current) = open.transcript.document.block(&block.id) {
+                if current.text == block.text {
+                    block.metadata.visible_decoration = current.metadata.visible_decoration.clone();
+                }
+            }
+        }
+        let info = entry_presentation(&projection);
+        let previous = open
+            .entry
+            .get(&projection.entry.id)
+            .context("ticking entry is missing")?;
+        let retained = open.retained_bytes.saturating_sub(previous.bytes) + info.bytes;
+        ensure!(
+            retained <= MAX_PROJECTED_BYTES,
+            "session projection exceeds 64 MiB"
+        );
+        open.retained_bytes = retained;
+        open.entry.insert(projection.entry.id.clone(), info);
+        entries.push((index, projection.entry));
+    }
+    let patches = open.transcript.refresh(entries)?;
+    retain_patches(open, patches)
+}
+
 fn reflow(
     open: &mut OpenPresentation,
     source: &[TimelineEntry],
@@ -815,13 +1040,13 @@ fn reflow(
             find_agent(source, run_id, 0)
                 .into_iter()
                 .flat_map(|entry| match entry {
-                    TimelineEntry::AgentLifecycle { interaction, .. } => interaction.iter(),
+                    TimelineEntry::AgentLifecycle { exchange, .. } => exchange.iter(),
                     _ => unreachable!("agent lookup returns an agent lifecycle"),
                 })
-                .map(|interaction| TimelineEntry::Interaction {
+                .map(|interaction| TimelineEntry::Exchange {
                     id: interaction.id.clone(),
                     created_at_ms: interaction.created_at_ms,
-                    interaction: interaction.clone(),
+                    exchange: interaction.clone(),
                     agent_by_id: HashMap::new(),
                 })
                 .collect::<Vec<_>>(),
@@ -846,11 +1071,13 @@ fn reflow(
     }
     let mut entry = HashMap::new();
     let mut action = HashMap::new();
+    let mut syntax = HashMap::new();
     let mut tool = HashMap::new();
     let mut blocks = Vec::new();
     for projection in projected {
         entry.insert(projection.entry.id.clone(), entry_presentation(&projection));
         action.extend(projection.action);
+        syntax.extend(projection.syntax);
         tool.extend(projection.tool);
         blocks.push(projection.entry);
     }
@@ -860,8 +1087,10 @@ fn reflow(
             *output = previous;
         }
     }
+    open.syntax_done.clear();
     open.entry = entry;
     open.action = action;
+    open.syntax = syntax;
     open.tool = tool;
     open.retained_bytes = retained;
     open.last_width = width;
@@ -888,7 +1117,13 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
                     "session projection exceeds 64 MiB"
                 );
                 let info = entry_presentation(&entry);
-                projected.push((entry.entry.id.clone(), info, entry.action, entry.tool));
+                projected.push((
+                    entry.entry.id.clone(),
+                    info,
+                    entry.action,
+                    entry.tool,
+                    entry.syntax,
+                ));
                 changed.push(if matches!(operation, TimelineOperation::Insert { .. }) {
                     TranscriptChange::Insert {
                         index: *index,
@@ -926,17 +1161,23 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
         };
         if let Some(previous) = open.entry.remove(&id) {
             for target in previous.target {
+                open.syntax_done.remove(&target);
                 open.action.remove(&target);
             }
             for call in previous.tool {
                 open.tool.remove(&call);
             }
+            for target in previous.syntax {
+                open.syntax_done.remove(&target);
+                open.syntax.remove(&target);
+            }
         }
     }
-    for (id, entry, action, tool) in projected {
+    for (id, entry, action, tool, syntax) in projected {
         open.entry.insert(id, entry);
         open.action.extend(action);
         open.tool.extend(tool);
+        open.syntax.extend(syntax);
     }
     open.retained_bytes = retained;
     retain_patches(open, patches)
@@ -967,60 +1208,302 @@ mod tests {
     use super::*;
     use forge_buffer::text::BufferText;
 
-    fn interaction_entry(identity: &str) -> TimelineEntry {
-        use crate::interaction::{
-            CompletedThought, CompletedTool, InteractionKind, InteractionNode, InteractionState,
-            MainSegment,
+    #[tokio::test]
+    async fn markdown_syntax_rejects_replaced_source_and_closed_documents() -> Result<()> {
+        use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
+        use forge_diff::syntax::{SyntaxEngine, SyntaxLimits};
+        use forge_diff::workers::{AnalysisPool, PoolLimits};
+        use std::sync::Arc;
+        let engine = SyntaxEngine::new(
+            Arc::new(AnalysisPool::new(PoolLimits {
+                workers: 1,
+                jobs: 2,
+                input_bytes: 1024 * 1024,
+            })),
+            SyntaxLimits::default(),
+        );
+        let entry_for = |body: &str| {
+            let mut entry = interaction_entry("markdown");
+            let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+                unreachable!()
+            };
+            exchange.turn.clear();
+            exchange.node_list.clear();
+            exchange.state = crate::exchange::ExchangeState::Running;
+            exchange.completed_at_ms = None;
+            exchange.execution_started_at_ms = Some(1);
+            let mut event = BackendEvent {
+                address: Some(ProviderAddress {
+                    thread_id: "thread".into(),
+                    turn_id: "markdown".into(),
+                }),
+                turn_boundary: Some(TurnBoundary::Started),
+                kind: "turn_started".into(),
+                text: None,
+                data: serde_json::Value::Null,
+                activity: None,
+                summary: None,
+                task_update: None,
+            };
+            exchange.observe_turn(&event, 1).unwrap();
+            event.turn_boundary = None;
+            event.kind = "assistant_message".into();
+            event.text = Some(body.into());
+            event.data = serde_json::json!({"phase":"final_answer"});
+            exchange.observe_turn(&event, 2).unwrap();
+            event.text = None;
+            event.turn_boundary = Some(TurnBoundary::Finished {
+                outcome: crate::turn::TurnOutcome::Completed,
+            });
+            exchange.observe_turn(&event, 3).unwrap();
+            exchange
+                .finish(crate::exchange::ExchangeState::Complete, 3)
+                .unwrap();
+            entry
         };
-        let mut segment = MainSegment::running(format!("{identity}:segment"), 0);
-        segment.thought.push(CompletedThought {
-            id: format!("{identity}:thought"),
-            text: "Completed thought\nwith details".into(),
-            synthetic: false,
-            tool: vec![CompletedTool {
-                id: "tool".into(),
-                kind: "command".into(),
-                title: "Read output".into(),
-                output: "first\nsecond\nthird".into(),
-                status: "completed".into(),
-                failed: false,
-                change: Default::default(),
-            }],
-            started_at_ms: 0,
-            completed_at_ms: 1,
-            diff_text: None,
-            task_id: None,
+        let entry = entry_for("```ts\nconst value: number = 1;\n```");
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![entry.clone()])?;
+        let document = DocumentId("transcript:markdown".into());
+        let opened = owner.open(
+            document.clone(),
+            DocumentId("composer:markdown".into()),
+            ViewId("markdown".into()),
+            WidthProfile::default(),
+            BufferText::from_rows([""])?,
+        )?;
+        assert!(opened.syntax_pending);
+        let job = owner
+            .capture_syntax(&document)?
+            .expect("fenced source admitted");
+        let block = job.analyze(&engine).await?;
+        let identity = block[0].id.clone();
+        owner.apply_syntax(&document, &job, block.clone())?;
+        let highlighted = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .transcript
+            .document
+            .block(&identity)
+            .unwrap()
+            .clone();
+        assert!(!highlighted.metadata.visible_decoration.is_empty());
+        refresh_activity(owner.open.as_mut().unwrap(), &[entry])?;
+        assert_eq!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .transcript
+                .document
+                .block(&identity)
+                .unwrap()
+                .metadata,
+            highlighted.metadata
+        );
+        assert!(owner.capture_syntax(&document)?.is_none());
+        owner.reconcile(vec![entry_for("```js\nconst value: number = 1;\n```")])?;
+        let language_changed = owner.snapshot(&document)?;
+        assert_eq!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .transcript
+                .document
+                .block(&identity)
+                .unwrap()
+                .text,
+            highlighted.text
+        );
+        owner.apply_syntax(&document, &job, block.clone())?;
+        assert_eq!(
+            owner.snapshot(&document)?,
+            language_changed,
+            "old language captures changed identical displayed text"
+        );
+        owner.reconcile(vec![entry_for(
+            "Text before code.\n\n```ts\nconst changed = 'new';\n```",
+        )])?;
+        let before = owner.snapshot(&document)?;
+        owner.apply_syntax(&document, &job, block.clone())?;
+        assert_eq!(
+            owner.snapshot(&document)?,
+            before,
+            "late captures changed replacement source"
+        );
+        assert!(
+            owner.capture_syntax(&document)?.is_some(),
+            "new source did not request fresh syntax"
+        );
+        owner.close(&document)?;
+        owner.apply_syntax(&document, &job, block)?;
+        assert!(owner.open.is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn saved_syntax_rejects_stale_and_closed_documents_and_survives_timer_refresh()
+    -> Result<()> {
+        use forge_diff::syntax::{SyntaxEngine, SyntaxLimits};
+        use forge_diff::workers::{AnalysisPool, PoolLimits};
+        use std::sync::Arc;
+        let engine = SyntaxEngine::new(
+            Arc::new(AnalysisPool::new(PoolLimits {
+                workers: 1,
+                jobs: 2,
+                input_bytes: 1024 * 1024,
+            })),
+            SyntaxLimits::default(),
+        );
+        let mut entry = interaction_entry("syntax");
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+            unreachable!()
+        };
+        exchange.attributed_diff_text = Some(
+            "--- a/test.mjs\n+++ b/test.mjs\n@@ -1 +1 @@\n-const old = 1;\n+const next = 2;\n"
+                .into(),
+        );
+        exchange.completed_at_ms = None;
+        exchange.execution_started_at_ms = Some(1);
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![entry.clone()])?;
+        let document = DocumentId("transcript:syntax".into());
+        owner.open(
+            document.clone(),
+            DocumentId("composer:syntax".into()),
+            ViewId("syntax".into()),
+            WidthProfile::default(),
+            BufferText::from_rows([""])?,
+        )?;
+        let job = owner.capture_syntax(&document)?.expect("saved diff work");
+        let blocks = job.analyze(&engine).await?;
+        let block_id = blocks[0].id.clone();
+        owner.apply_syntax(&document, &job, blocks.clone())?;
+        let highlighted = owner
+            .open
+            .as_ref()
+            .unwrap()
+            .transcript
+            .document
+            .block(&block_id)
+            .unwrap()
+            .clone();
+        assert!(!highlighted.metadata.visible_decoration.is_empty());
+        refresh_activity(owner.open.as_mut().unwrap(), &[entry.clone()])?;
+        assert_eq!(
+            owner
+                .open
+                .as_ref()
+                .unwrap()
+                .transcript
+                .document
+                .block(&block_id)
+                .unwrap()
+                .metadata,
+            highlighted.metadata
+        );
+        assert!(
+            owner.capture_syntax(&document)?.is_none(),
+            "timer must not restart parsing"
+        );
+        let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
+            unreachable!()
+        };
+        exchange.attributed_diff_text.as_mut().unwrap().push('\n');
+        owner.reconcile(vec![entry])?;
+        let before = owner.snapshot(&document)?;
+        owner.apply_syntax(&document, &job, blocks.clone())?;
+        assert_eq!(
+            owner.snapshot(&document)?,
+            before,
+            "stale completion changed the document"
+        );
+        owner.close(&document)?;
+        owner.apply_syntax(&document, &job, blocks)?;
+        assert!(owner.open.is_none());
+        Ok(())
+    }
+
+    fn interaction_entry(identity: &str) -> TimelineEntry {
+        use crate::backend::{
+            BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
+        };
+        use crate::exchange::{ExchangeKind, ExchangeState};
+        let address = ProviderAddress {
+            thread_id: "thread".into(),
+            turn_id: identity.into(),
+        };
+        let mut interaction = Exchange {
+            finalization_error: None,
+            finalization_outcome: None,
+            agent_id: "primary".into(),
+            id: identity.into(),
+            session_id: "session".into(),
+            ordinal: 1,
+            prompt: format!("Prompt {identity}"),
+            kind: ExchangeKind::Chat,
+            plan_id: None,
+            execution_id: None,
+            goal_id: None,
+            state: ExchangeState::Running,
+            checkpoint_before: None,
+            checkpoint_after: None,
+            attributed_diff_text: None,
+            checkpoint_diff_text: None,
+            attributed_matches_checkpoint: false,
+            disposition: crate::exchange::HistoryDisposition::Current,
+            turn: Vec::new(),
+            created_at_ms: 0,
+            completed_at_ms: None,
+            node_list: Vec::new(),
+            awaiting_input: false,
+            elicitation: None,
+            duration_ms: 1,
+            execution_started_at_ms: None,
+            token_count: None,
+            comment: Vec::new(),
+            task: None,
+        };
+        let mut event = BackendEvent {
+            address: Some(address),
+            turn_boundary: Some(TurnBoundary::Started),
+            kind: "turn_started".into(),
+            text: None,
+            data: serde_json::Value::Null,
+            activity: None,
+            summary: None,
+            task_update: None,
+        };
+        interaction.observe_turn(&event, 0).unwrap();
+        event.turn_boundary = None;
+        event.kind = "reasoning".into();
+        event.text = Some("Completed thought\nwith details".into());
+        interaction.observe_turn(&event, 0).unwrap();
+        event.text = None;
+        event.kind = "tool".into();
+        event.activity = Some(ToolActivity {
+            id: "tool".into(),
+            kind: ToolActivityKind::Command,
+            title: "Read output".into(),
+            output: Some("first\nsecond\nthird".into()),
+            output_delta: false,
+            status: Some("completed".into()),
+            change: Default::default(),
         });
-        TimelineEntry::Interaction {
+        interaction.observe_turn(&event, 1).unwrap();
+        event.activity = None;
+        event.turn_boundary = Some(TurnBoundary::Finished {
+            outcome: crate::turn::TurnOutcome::Completed,
+        });
+        interaction.observe_turn(&event, 1).unwrap();
+        interaction.finish(ExchangeState::Complete, 1).unwrap();
+        TimelineEntry::Exchange {
             id: identity.into(),
             created_at_ms: 0,
             agent_by_id: HashMap::new(),
-            interaction: InteractionRecord {
-                id: identity.into(),
-                session_id: "session".into(),
-                ordinal: 1,
-                prompt: format!("Prompt {identity}"),
-                kind: InteractionKind::Chat,
-                plan_id: None,
-                execution_id: None,
-                state: InteractionState::Complete,
-                checkpoint_before: None,
-                checkpoint_after: None,
-                attributed_diff_text: None,
-                checkpoint_diff_text: None,
-                attributed_matches_checkpoint: false,
-                created_at_ms: 0,
-                completed_at_ms: Some(1),
-                node_list: vec![InteractionNode::MainSegment {
-                    segment: Box::new(segment),
-                }],
-                awaiting_input: false,
-                elicitation: None,
-                duration_ms: 1,
-                token_count: None,
-                comment: Vec::new(),
-                task: None,
-            },
+            exchange: interaction,
         }
     }
 
@@ -1062,8 +1545,8 @@ mod tests {
         assert_eq!(moved["anchor"]["block"], "second:prompt");
         assert!(owner.navigate_prompt(input.clone(), false).is_err());
         input.sequence = InputSequence(2);
-        input.block = BlockId("first:tool:tool".into());
-        input.target = Some(TargetId("first:tool:tool".into()));
+        input.block = BlockId("first:turn:1:tool:tool".into());
+        input.target = Some(TargetId("first:turn:1:tool:tool".into()));
         input.action = "activate".into();
         let output = DocumentId("tool:actions".into());
         owner.dispatch(PresentationRequest::ToolOpen {
@@ -1082,29 +1565,177 @@ mod tests {
     }
 
     #[test]
+    fn continued_exchanges_keep_their_plan_and_agent_document_owner() -> Result<()> {
+        use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
+        use crate::exchange::ExchangeState;
+        use crate::timeline::PlanExecutionTimelineItem;
+
+        for nesting in ["plan", "agent", "nested-agent"] {
+            let TimelineEntry::Exchange { mut exchange, .. } = interaction_entry("continued")
+            else {
+                unreachable!()
+            };
+            exchange.state = ExchangeState::Running;
+            exchange.completed_at_ms = None;
+            let agent_entry =
+                |identity: &str, exchange: Vec<Exchange>, agent: Vec<TimelineEntry>| {
+                    TimelineEntry::AgentLifecycle {
+                        id: identity.into(),
+                        created_at_ms: 0,
+                        run: crate::agent::Agent {
+                            id: identity.into(),
+                            session_id: "session".into(),
+                            provider_thread_id: Some(identity.into()),
+                            definition: "reviewer".into(),
+                            nickname: None,
+                            state: crate::agent::AgentState::Ready,
+                            created_at_ms: 0,
+                            updated_at_ms: 0,
+                        },
+                        exchange,
+                        agent,
+                    }
+                };
+            let entry = if nesting == "plan" {
+                TimelineEntry::PlanExecution {
+                    id: "execution".into(),
+                    created_at_ms: 0,
+                    plan: serde_json::from_value(serde_json::json!({
+                        "id": "plan", "session_id": "session", "request": "two tasks",
+                        "title": "Two tasks", "state": "accepted", "working_path": "",
+                        "model_revision": 1, "user_revision": 1,
+                        "created_at_ms": 0, "updated_at_ms": 0,
+                    }))?,
+                    execution: crate::plan::PlanExecutionRecord {
+                        id: "execution".into(),
+                        session_id: "session".into(),
+                        plan_id: "plan".into(),
+                        goal_id: "goal".into(),
+                        state: crate::plan::PlanExecutionState::Active,
+                        planning_backend_session_id: None,
+                        execution_backend_session_id: None,
+                        scheduler: Default::default(),
+                        lifecycle: Vec::new(),
+                        created_at_ms: 0,
+                        completed_at_ms: None,
+                    },
+                    item: vec![PlanExecutionTimelineItem::Exchange {
+                        exchange: Box::new(exchange.clone()),
+                    }],
+                }
+            } else {
+                let child = agent_entry("child", vec![exchange.clone()], Vec::new());
+                if nesting == "agent" {
+                    child
+                } else {
+                    let mut parent = interaction_entry("parent");
+                    let TimelineEntry::Exchange { agent_by_id, .. } = &mut parent else {
+                        unreachable!()
+                    };
+                    agent_by_id.insert("root".into(), agent_entry("root", Vec::new(), vec![child]));
+                    parent
+                }
+            };
+            let owner_id = entry.id();
+            let mut owner = SessionPresentation::new("session".into());
+            owner.initialize(vec![entry])?;
+            let document = DocumentId(format!("transcript:{nesting}"));
+            let opened = owner.open(
+                document.clone(),
+                DocumentId(format!("composer:{nesting}")),
+                ViewId(format!("view:{nesting}")),
+                WidthProfile::default(),
+                BufferText::from_rows(["draft"])?,
+            )?;
+            let mut event = BackendEvent {
+                address: Some(ProviderAddress {
+                    thread_id: "thread".into(),
+                    turn_id: "second".into(),
+                }),
+                turn_boundary: Some(TurnBoundary::Started),
+                kind: "turn_started".into(),
+                text: None,
+                data: serde_json::Value::Null,
+                activity: None,
+                summary: None,
+                task_update: None,
+            };
+            exchange.observe_turn(&event, 2)?;
+            event.turn_boundary = None;
+            event.kind = "assistant_message".into();
+            event.text = Some("Second task is running".into());
+            exchange.observe_turn(&event, 3)?;
+            let patch = owner.update_live(Some(&exchange), None, SessionPhase::Idle)?;
+            assert_eq!(
+                owner.timeline.entry_list().len(),
+                1,
+                "{nesting} duplicated its exchange"
+            );
+            assert!(
+                matches!(&patch.operation[..], [TimelineOperation::Replace { entry, .. }] if entry.id() == owner_id)
+            );
+            owner.sync(&document, opened.transcript.revision)?;
+            let snapshot = owner.snapshot(&document)?;
+            let mut identities = std::collections::HashSet::new();
+            assert!(
+                snapshot
+                    .block
+                    .iter()
+                    .all(|block| identities.insert(block.id.clone()))
+            );
+            assert!(
+                serde_json::to_string(owner.timeline.entry_list())?
+                    .contains("Second task is running")
+            );
+            if nesting != "nested-agent" {
+                assert!(
+                    snapshot
+                        .block
+                        .iter()
+                        .any(|block| (0..block.text.row_count()).any(|row| block
+                            .text
+                            .row(row)
+                            .unwrap()
+                            .contains("Second task is running")))
+                );
+            }
+
+            owner.update_live(None, Some(&exchange.id), SessionPhase::Idle)?;
+            owner.sync(&document, snapshot.revision)?;
+            assert_eq!(owner.timeline.entry_list().len(), 1);
+            assert!(
+                !serde_json::to_string(owner.timeline.entry_list())?
+                    .contains("Second task is running")
+            );
+            assert_eq!(owner.timeline.entry_list()[0].id(), owner_id);
+        }
+        Ok(())
+    }
+
+    #[test]
     fn selected_agent_updates_keep_the_composer_and_document_lifetime() -> Result<()> {
-        use crate::agent::{AgentRun, AgentRunStatus};
-        let TimelineEntry::Interaction { interaction, .. } = interaction_entry("child") else {
+        use crate::agent::{Agent, AgentState};
+        let TimelineEntry::Exchange {
+            exchange: interaction,
+            ..
+        } = interaction_entry("child")
+        else {
             unreachable!()
         };
         let agent = TimelineEntry::AgentLifecycle {
             id: "agent:child".into(),
             created_at_ms: 0,
-            run: AgentRun {
+            run: Agent {
                 id: "child-run".into(),
                 session_id: "session".into(),
-                parent_interaction_id: None,
-                parent_thread_id: None,
                 provider_thread_id: None,
-                active_turn_id: None,
                 definition: "explorer".into(),
                 nickname: None,
-                task: "Inspect".into(),
-                status: AgentRunStatus::Completed,
+                state: AgentState::Ready,
                 created_at_ms: 0,
                 updated_at_ms: 1,
             },
-            interaction: vec![interaction],
+            exchange: vec![interaction],
             agent: Vec::new(),
         };
         let mut owner = SessionPresentation::new("session".into());
@@ -1151,6 +1782,47 @@ mod tests {
         );
         owner.close_all()?;
         assert!(owner.snapshot(&document).is_err());
+        Ok(())
+    }
+
+    #[test]
+    fn timer_refresh_retains_completed_entry_allocations() -> Result<()> {
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![
+            interaction_entry("completed"),
+            TimelineEntry::Status {
+                id: "status".into(),
+                created_at_ms: 0,
+                status: SessionPhase::Working {
+                    started_at_ms: 0,
+                    activity: crate::session::state_machine::WorkflowActivity::Working,
+                },
+            },
+        ])?;
+        let document = DocumentId("transcript:timer".into());
+        let opened = owner.open(
+            document.clone(),
+            DocumentId("composer:timer".into()),
+            ViewId("view:timer".into()),
+            WidthProfile::default(),
+            BufferText::from_rows(["draft"])?,
+        )?;
+        let open = owner.open.as_ref().unwrap();
+        let (entry_id, pointer) = open
+            .entry
+            .iter()
+            .find(|(_, entry)| !entry.prompt.is_empty())
+            .map(|(id, entry)| (id.clone(), entry.prompt.as_ptr()))
+            .unwrap();
+        let revision = owner.revision();
+        owner.sync(&document, opened.transcript.revision)?;
+        assert_eq!(owner.revision(), revision);
+        assert_eq!(
+            owner.open.as_ref().unwrap().entry[&entry_id]
+                .prompt
+                .as_ptr(),
+            pointer
+        );
         Ok(())
     }
 

@@ -28,16 +28,21 @@ local ok, failure = xpcall(function()
   }, function(value, error_message) assert(not error_message, error_message) attached = value end)
   local opened = requests[1].params
   assert(opened.initial[1] == "draft")
-  requests[1].callback({ transcript = snapshot(opened.document, "native transcript"), composer = snapshot(opened.composer, "draft", true) })
+  local history = snapshot(opened.document, "native transcript")
+  history.block[1].text = { "native transcript", "previous exchange", "previous answer" }
+  requests[1].callback({ transcript = history, composer = snapshot(opened.composer, "draft", true) })
   assert(attached == owner and owner.ready)
   assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "native transcript")
   assert(vim.bo[composer].modifiable and not vim.bo[transcript].modifiable)
+  owner.activate(function() error("plain transcript text was activated") end)
+  assert(#requests == 1, "plain transcript text dispatched an action without a target")
   owner.sync()
   owner.sync()
   assert(#requests == 2, "transcript sync requests were concurrent")
   requests[2].callback({ patch = {} })
   assert(#requests == 3)
   requests[3].callback({ patch = {} })
+  assert(vim.api.nvim_win_get_cursor(window)[1] == 1, "background sync moved a reader away from history")
   vim.api.nvim_buf_set_text(composer, 0, 0, 0, 5, { "first typed prompt" })
   require("forge.editable").flush(owner.composer.editable)
   local edit = requests[4].params.edit
@@ -53,7 +58,11 @@ local ok, failure = xpcall(function()
   })
   assert(owner.composer.revision == 1 and vim.bo[composer].modifiable)
   assert(vim.api.nvim_buf_get_changedtick(composer) == typed_tick, "composer acknowledgement rewrote typing")
+  owner.follow_tail()
+  assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit agent action did not follow the tail")
+  vim.api.nvim_win_set_cursor(window, { 1, 0 })
   owner.submit(function() end)
+  assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit submission did not resume following the transcript tail")
   assert(requests[5].method == "prompt.submit" and requests[5].params.composer.revision == 1)
   assert(not requests[5].params.text, "composer submitted independently parsed Lua text")
   local cleared_metadata = snapshot(opened.composer, "", true).block[1].metadata
@@ -87,6 +96,30 @@ local ok, failure = xpcall(function()
   assert(requests[8].params.operation == "close")
   vim.api.nvim_buf_delete(transcript, { force = true })
   vim.api.nvim_buf_delete(composer, { force = true })
+
+  transcript = vim.api.nvim_create_buf(false, true)
+  composer = vim.api.nvim_create_buf(false, true)
+  vim.api.nvim_win_set_buf(window, transcript)
+  local notices = {}
+  owner = require("forge.views.harness.presentation").open({ session_id = "test-session",
+    transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
+    is_alive = function() return true end, notice = function(message) notices[#notices + 1] = message end,
+  }, function(value, error_message) assert(value and not error_message) end)
+  local initial = requests[#requests]
+  initial.callback({ transcript = snapshot(initial.params.document, "retained history"),
+    composer = snapshot(initial.params.composer, "", true) })
+  for _ = 1, 3 do
+    owner.sync()
+    requests[#requests].callback(nil, "transcript projection requires reopening: duplicate block identity")
+  end
+  assert(#notices == 1, "repeated refresh failure flooded notifications")
+  assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "retained history")
+  owner.sync()
+  requests[#requests].callback({ patch = {} })
+  owner.sync()
+  requests[#requests].callback(nil, "transcript projection requires reopening: duplicate block identity")
+  assert(#notices == 2, "a failure after successful recovery was suppressed")
+  assert(owner.close())
 end, debug.traceback)
 client.request_for = original_request
 client.host_accepting = original_accepting

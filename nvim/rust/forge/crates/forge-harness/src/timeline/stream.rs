@@ -37,6 +37,7 @@ pub struct TimelineStream {
     entry_list: Vec<TimelineEntry>,
     value_list: Vec<Value>,
     entry_index: HashMap<String, usize>,
+    exchange_owner: HashMap<String, usize>,
 }
 
 impl TimelineStream {
@@ -48,6 +49,7 @@ impl TimelineStream {
             entry_list: Vec::new(),
             value_list: Vec::new(),
             entry_index: HashMap::new(),
+            exchange_owner: HashMap::new(),
         }
     }
 
@@ -74,7 +76,7 @@ impl TimelineStream {
     /// Updates only the active interaction and transient status without copying settled history.
     pub fn update_live(
         &mut self,
-        interaction: Option<&crate::interaction::InteractionRecord>,
+        interaction: Option<&crate::exchange::Exchange>,
         removed: Option<&str>,
         status: crate::session::state_machine::SessionPhase,
     ) -> Result<TimelinePatch> {
@@ -83,20 +85,17 @@ impl TimelineStream {
             "timeline revision exhausted"
         );
         let next_interaction = interaction.map(|interaction| {
-            let agent_by_id = self
-                .entry_index
-                .get(&interaction.id)
-                .and_then(|index| self.entry_list.get(*index))
-                .and_then(|entry| match entry {
-                    TimelineEntry::Interaction { agent_by_id, .. } => Some(agent_by_id.clone()),
-                    _ => None,
-                })
-                .unwrap_or_default();
-            TimelineEntry::Interaction {
+            if let Some(index) = self.exchange_owner.get(&interaction.id) {
+                let mut entry = self.entry_list[*index].clone();
+                let replaced = entry.replace_exchange(interaction);
+                debug_assert!(replaced, "exchange owner index must resolve its exchange");
+                return entry;
+            }
+            TimelineEntry::Exchange {
                 id: interaction.id.clone(),
                 created_at_ms: interaction.created_at_ms,
-                interaction: interaction.clone(),
-                agent_by_id,
+                exchange: interaction.clone(),
+                agent_by_id: HashMap::new(),
             }
         });
         let status_id = format!("{}:status", self.session_id);
@@ -113,11 +112,18 @@ impl TimelineStream {
             .transpose()?;
         let base_revision = self.revision;
         let mut operation = Vec::new();
-        if let Some(index) = removed.and_then(|id| self.entry_index.get(id)).copied() {
-            let id = self.entry_list.remove(index).id();
-            self.value_list.remove(index);
-            operation.push(TimelineOperation::Remove { index, id });
-            self.reindex();
+        if let Some(id) = removed {
+            if let Some(index) = self.entry_index.get(id).copied() {
+                let id = self.entry_list.remove(index).id();
+                self.value_list.remove(index);
+                operation.push(TimelineOperation::Remove { index, id });
+                self.reindex();
+            } else if let Some(index) = self.exchange_owner.get(id).copied() {
+                let mut entry = self.entry_list[index].clone();
+                entry.remove_exchange(id);
+                let value = serde_json::to_value(&entry)?;
+                self.upsert(entry, value, index, &mut operation);
+            }
         }
         if let Some((entry, value)) = next_interaction {
             let insertion = self
@@ -161,6 +167,7 @@ impl TimelineStream {
                 self.entry_list[index] = entry.clone();
                 self.value_list[index] = value;
                 operation.push(TimelineOperation::Replace { index, entry });
+                self.reindex();
             }
         } else {
             self.entry_list.insert(insertion, entry.clone());
@@ -180,6 +187,10 @@ impl TimelineStream {
             .enumerate()
             .map(|(index, entry)| (entry.id(), index))
             .collect();
+        self.exchange_owner.clear();
+        for (index, entry) in self.entry_list.iter().enumerate() {
+            entry.index_exchanges(index, &mut self.exchange_owner);
+        }
     }
 
     /// Reconcile one canonical projection into ordered top-level operations.

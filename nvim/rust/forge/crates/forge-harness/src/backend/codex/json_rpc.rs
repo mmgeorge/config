@@ -1,4 +1,4 @@
-use crate::agent::{AgentLifecycleEvent, AgentRunStatus};
+use crate::agent::{AgentExecutionState, AgentLifecycleEvent};
 use crate::backend::approval::{
     ApprovalResolution, PermissionCoordinator, codex_response, permission_from_provider,
     protected_target,
@@ -175,6 +175,7 @@ pub struct CodexJsonRpc {
     accepted_control_invocation_key_set: HashSet<String>,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
+    activity_publication: bool,
     trace: Arc<TraceStore>,
     session_id: String,
 }
@@ -205,6 +206,7 @@ impl CodexJsonRpc {
             accepted_control_invocation_key_set: HashSet::new(),
             permission_coordinator,
             event_sink,
+            activity_publication: true,
             trace,
             session_id,
         })
@@ -223,6 +225,11 @@ impl CodexJsonRpc {
         self.rendered_control_invocation_key_set.clear();
         self.accepted_control_invocation_key_set.clear();
         self.control_runtime = None;
+    }
+
+    /// Isolate preparation traffic until the current provider turn is admitted.
+    pub fn set_activity_publication(&mut self, enabled: bool) {
+        self.activity_publication = enabled;
     }
 
     /// Seed provider-visible control validation from one broker-owned turn snapshot.
@@ -267,6 +274,12 @@ impl CodexJsonRpc {
 
     /// Read and normalize one provider message while preserving request routing metadata.
     pub async fn read_message(&mut self, output: &mut BackendOutput) -> Result<Value> {
+        let message = self.receive_message().await?;
+        self.publish_message(message, output).await
+    }
+
+    /// Reads a provider frame without starting delivery that a competing command can cancel.
+    pub async fn receive_message(&mut self) -> Result<Value> {
         let encoded = loop {
             let frame = self
                 .socket
@@ -298,21 +311,39 @@ impl CodexJsonRpc {
             .with_context(|| format!("decode backend JSON-RPC message: {encoded}"))?;
         self.trace
             .record_ref(&self.session_id, "model.received", &message);
+        Ok(message)
+    }
+
+    /// Publishes one consumed frame completely before processing another provider command.
+    pub async fn publish_message(
+        &mut self,
+        message: Value,
+        output: &mut BackendOutput,
+    ) -> Result<Value> {
         let method = message
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
+        if !self.activity_publication && method.starts_with("item/") && message.get("id").is_some()
+        {
+            self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
+                "error":{"code":-32000,"message":"No Harness turn owns this provider request"}}))
+                .await?;
+            return Ok(message);
+        }
         let rejects_question_resolution =
             rejects_question_resolution(self.planning_feedback, method, &message);
-        let repeats_control_invocation = control_invocation_key(method, &message)
-            .is_some_and(|key| !self.rendered_control_invocation_key_set.insert(key));
+        let repeats_control_invocation = self.activity_publication
+            && control_invocation_key(method, &message)
+                .is_some_and(|key| !self.rendered_control_invocation_key_set.insert(key));
         let provider_request_success =
             if message.get("id").is_some() && message.get("method").is_some() {
                 Some(self.respond_to_provider_request(&message).await?)
             } else {
                 None
             };
-        if !rejects_question_resolution
+        if self.activity_publication
+            && !rejects_question_resolution
             && let Some(response_success) = provider_request_success
             && should_apply_control_request_semantics(
                 &message,
@@ -325,7 +356,8 @@ impl CodexJsonRpc {
         let completed_control_lifecycle = repeats_control_invocation
             && control_tool_name(method, message.get("params").unwrap_or(&Value::Null)).is_some()
             && method.eq_ignore_ascii_case("item/completed");
-        if !rejects_question_resolution
+        if self.activity_publication
+            && !rejects_question_resolution
             && (!repeats_control_invocation || completed_control_lifecycle)
         {
             normalize_event_in_workspace(
@@ -334,7 +366,8 @@ impl CodexJsonRpc {
                 self.event_sink.as_ref(),
                 &self.workspace,
                 false,
-            );
+            )
+            .await;
         }
         Ok(message)
     }
@@ -750,7 +783,23 @@ impl CodexJsonRpc {
         }
         let resolution = self
             .permission_coordinator
-            .authorize(self.execution_mode, request, self.event_sink.as_ref())
+            .authorize(
+                self.execution_mode,
+                request,
+                Some(crate::backend::ProviderAddress {
+                    thread_id: message
+                        .pointer("/params/threadId")
+                        .and_then(Value::as_str)
+                        .context("approval request omitted its provider thread")?
+                        .to_owned(),
+                    turn_id: message
+                        .pointer("/params/turnId")
+                        .and_then(Value::as_str)
+                        .context("approval request omitted its provider turn")?
+                        .to_owned(),
+                }),
+                self.event_sink.as_ref(),
+            )
             .await?;
         Ok(resolution)
     }
@@ -807,16 +856,44 @@ fn control_invocation_key(method: &str, value: &Value) -> Option<String> {
     Some(format!("{control_name}:{arguments}"))
 }
 
+/// Decode only the owning thread's native goal lifecycle notification.
+pub(super) fn native_goal_state(
+    message: &Value,
+    thread_id: &str,
+) -> Option<crate::goal::GoalState> {
+    use crate::goal::GoalState;
+    if message.pointer("/params/threadId").and_then(Value::as_str) != Some(thread_id) {
+        return None;
+    }
+    match message.get("method").and_then(Value::as_str)? {
+        "thread/goal/cleared" => Some(GoalState::Cleared),
+        "thread/goal/updated" => match message
+            .pointer("/params/goal/status")
+            .or_else(|| message.pointer("/params/status"))?
+            .as_str()?
+        {
+            "active" => Some(GoalState::Active),
+            "complete" => Some(GoalState::Complete),
+            "paused" => Some(GoalState::Paused),
+            "blocked" => Some(GoalState::Blocked),
+            "usageLimited" => Some(GoalState::UsageLimited),
+            "budgetLimited" => Some(GoalState::BudgetLimited),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
 #[cfg(test)]
-fn normalize_event(
+async fn normalize_event(
     message: &Value,
     output: &mut BackendOutput,
     event_sink: Option<&BackendEventSink>,
 ) {
-    normalize_event_in_workspace(message, output, event_sink, "", true);
+    normalize_event_in_workspace(message, output, event_sink, "", true).await;
 }
 
-fn normalize_event_in_workspace(
+async fn normalize_event_in_workspace(
     message: &Value,
     output: &mut BackendOutput,
     event_sink: Option<&BackendEventSink>,
@@ -828,10 +905,31 @@ fn normalize_event_in_workspace(
         .and_then(Value::as_str)
         .unwrap_or_default();
     let params = message.get("params").cloned().unwrap_or(Value::Null);
+    let address = pointer_string(
+        &params,
+        &[
+            "/threadId",
+            "/thread_id",
+            "/turn/threadId",
+            "/turn/thread_id",
+        ],
+    )
+    .zip(pointer_string(
+        &params,
+        &["/turnId", "/turn_id", "/turn/id"],
+    ))
+    .map(|(thread_id, turn_id)| crate::backend::ProviderAddress { thread_id, turn_id });
     let text = first_text(&params);
     let method_lower = method.to_ascii_lowercase();
     let encoded = params.to_string().to_ascii_lowercase();
     if method_lower == "turn/moderationmetadata" {
+        return;
+    }
+    if let Some(event) = normalize_message(method, &params, address.clone(), output) {
+        if let Some(event_sink) = event_sink {
+            let _ = event_sink.send_wait(event.clone()).await;
+        }
+        append_output_event(output, event);
         return;
     }
     if matches!(method_lower.as_str(), "turn/started" | "turn/completed")
@@ -847,6 +945,18 @@ fn normalize_event_in_workspace(
         .is_some()
     {
         let event = BackendEvent {
+            address,
+            turn_boundary: Some(if method_lower == "turn/started" {
+                crate::backend::TurnBoundary::Started
+            } else {
+                crate::backend::TurnBoundary::Finished {
+                    outcome: match params.pointer("/turn/status").and_then(Value::as_str) {
+                        Some("failed") => crate::turn::TurnOutcome::Failed,
+                        Some("interrupted") => crate::turn::TurnOutcome::Interrupted,
+                        _ => crate::turn::TurnOutcome::Completed,
+                    },
+                }
+            }),
             kind: method_lower.replace('/', "_"),
             text: None,
             data: json!({ "method": method, "params": params }),
@@ -855,7 +965,7 @@ fn normalize_event_in_workspace(
             task_update: None,
         };
         if let Some(event_sink) = event_sink {
-            let _ = event_sink.send(event.clone());
+            let _ = event_sink.send_wait(event.clone()).await;
         }
         append_output_event(output, event);
         return;
@@ -864,6 +974,8 @@ fn normalize_event_in_workspace(
     if !agent_lifecycle_list.is_empty() {
         for lifecycle in agent_lifecycle_list {
             let event = BackendEvent {
+                address: None,
+                turn_boundary: None,
                 kind: "agent_lifecycle".into(),
                 text: None,
                 data: serde_json::to_value(lifecycle).unwrap_or(Value::Null),
@@ -872,7 +984,7 @@ fn normalize_event_in_workspace(
                 task_update: None,
             };
             if let Some(event_sink) = event_sink {
-                let _ = event_sink.send(event.clone());
+                let _ = event_sink.send_wait(event.clone()).await;
             }
             append_output_event(output, event);
         }
@@ -889,6 +1001,8 @@ fn normalize_event_in_workspace(
         if let Some(context_usage) = context_usage(&params) {
             output.metrics.context_usage = Some(context_usage.clone());
             let event = BackendEvent {
+                address: None,
+                turn_boundary: None,
                 kind: "context_usage".into(),
                 text: None,
                 data: serde_json::to_value(context_usage).unwrap_or(Value::Null),
@@ -897,7 +1011,7 @@ fn normalize_event_in_workspace(
                 task_update: None,
             };
             if let Some(event_sink) = event_sink {
-                let _ = event_sink.send(event.clone());
+                let _ = event_sink.send_wait(event.clone()).await;
             }
             append_output_event(output, event);
         }
@@ -928,14 +1042,12 @@ fn normalize_event_in_workspace(
     {
         let _ = apply_invocation(&invocation, output);
     }
-    if method_lower.contains("goal")
-        && params
-            .pointer("/goal/status")
-            .or_else(|| params.get("status"))
-            .and_then(Value::as_str)
-            .is_some_and(|status| status.eq_ignore_ascii_case("complete"))
+    if let Some(state) = output
+        .backend_session_id
+        .as_deref()
+        .and_then(|thread_id| native_goal_state(message, thread_id))
     {
-        output.evidence.native_complete = true;
+        output.evidence.native_state = Some(state);
     }
     let user_message_item = params
         .pointer("/item/type")
@@ -957,6 +1069,8 @@ fn normalize_event_in_workspace(
             .then(|| normalize_task_update(method, &params))
             .flatten();
         let event = BackendEvent {
+            address,
+            turn_boundary: None,
             kind: kind.into(),
             text: activity.is_none().then_some(text).flatten(),
             data: json!({ "method": method, "params": params }),
@@ -965,21 +1079,76 @@ fn normalize_event_in_workspace(
             task_update,
         };
         if let Some(event_sink) = event_sink {
-            let _ = event_sink.send(event.clone());
+            let _ = event_sink.send_wait(event.clone()).await;
         }
         append_output_event(output, event);
     }
 }
 
-fn normalize_agent_status(status: &str) -> Option<AgentRunStatus> {
+/// Preserve message identity and phase across Codex item snapshots and text deltas.
+fn normalize_message(
+    method: &str,
+    params: &Value,
+    address: Option<crate::backend::ProviderAddress>,
+    output: &BackendOutput,
+) -> Option<BackendEvent> {
+    let delta = method.eq_ignore_ascii_case("item/agentMessage/delta");
+    let completed = method.eq_ignore_ascii_case("item/completed");
+    let lifecycle = (completed || method.eq_ignore_ascii_case("item/started"))
+        && params
+            .pointer("/item/type")
+            .and_then(Value::as_str)
+            .is_some_and(|kind| kind.eq_ignore_ascii_case("agentMessage"));
+    if !delta && !lifecycle {
+        return None;
+    }
+    let mut event = BackendEvent {
+        address,
+        turn_boundary: None,
+        kind: "assistant_message".into(),
+        text: if delta {
+            params
+                .get("delta")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else if completed {
+            params
+                .pointer("/item/text")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        } else {
+            None
+        },
+        data: json!({ "method": method, "params": params }),
+        activity: None,
+        summary: None,
+        task_update: None,
+    };
+    if event.message_phase().is_none()
+        && let Some(id) = event.message_id()
+        && let Some(phase) = output.event.iter().rev().find_map(|previous| {
+            (previous.address == event.address && previous.message_id() == Some(id))
+                .then(|| previous.message_phase())
+                .flatten()
+        })
+    {
+        event.data["params"]["phase"] = json!(phase);
+    }
+    if completed {
+        event.data["message_update"] = json!("snapshot");
+    }
+    Some(event)
+}
+
+fn normalize_agent_status(status: &str) -> Option<AgentExecutionState> {
     match status.to_ascii_lowercase().as_str() {
-        "pendinginit" => Some(AgentRunStatus::Starting),
-        "running" => Some(AgentRunStatus::Running),
-        "interrupted" | "cancelled" | "canceled" => Some(AgentRunStatus::Interrupted),
-        "completed" | "complete" | "done" => Some(AgentRunStatus::Completed),
-        "errored" | "failed" | "error" => Some(AgentRunStatus::Failed),
-        "shutdown" | "closed" | "notfound" => Some(AgentRunStatus::Closed),
-        "waiting" | "idle" => Some(AgentRunStatus::Waiting),
+        "pendinginit" => Some(AgentExecutionState::Starting),
+        "running" => Some(AgentExecutionState::Running),
+        "interrupted" | "cancelled" | "canceled" => Some(AgentExecutionState::Interrupted),
+        "completed" | "complete" | "done" => Some(AgentExecutionState::Completed),
+        "errored" | "failed" | "error" => Some(AgentExecutionState::Failed),
+        "shutdown" | "closed" | "notfound" => Some(AgentExecutionState::Closed),
+        "waiting" | "idle" => Some(AgentExecutionState::Waiting),
         _ => None,
     }
 }
@@ -1023,7 +1192,7 @@ fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifecycle
         let kind = first_string(item, &["kind"]).unwrap_or_default();
         let starts_child = kind.eq_ignore_ascii_case("started");
         let status = if starts_child {
-            AgentRunStatus::Running
+            AgentExecutionState::Running
         } else if let Some(status) = normalize_agent_status(&kind) {
             status
         } else {
@@ -1075,11 +1244,11 @@ fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifecycle
             .and_then(|status| normalize_agent_status(&status))
             .or_else(|| {
                 if operation.eq_ignore_ascii_case("spawnAgent") {
-                    Some(AgentRunStatus::Running)
+                    Some(AgentExecutionState::Running)
                 } else if operation.eq_ignore_ascii_case("closeAgent")
                     && method_lower.ends_with("/completed")
                 {
-                    Some(AgentRunStatus::Closed)
+                    Some(AgentExecutionState::Closed)
                 } else {
                     None
                 }
@@ -1109,9 +1278,9 @@ fn normalize_agent_lifecycle(method: &str, params: &Value) -> Vec<AgentLifecycle
             nickname,
             task,
             status: if status_text.eq_ignore_ascii_case("inProgress") {
-                AgentRunStatus::Starting
+                AgentExecutionState::Starting
             } else {
-                AgentRunStatus::Running
+                AgentExecutionState::Running
             },
         });
     }
@@ -1295,6 +1464,24 @@ fn control_invocation(method: &str, value: &Value) -> Result<Option<ControlToolI
 }
 
 fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
+    if event.kind == "assistant_message"
+        && let Some(id) = event.message_id()
+        && let Some(previous) = output.event.iter_mut().rev().find(|previous| {
+            previous.kind == event.kind
+                && previous.address == event.address
+                && previous.message_id() == Some(id)
+        })
+    {
+        if let Some(text) = event.text.as_deref() {
+            if event.message_snapshot() {
+                previous.text = Some(text.to_owned());
+            } else {
+                previous.text.get_or_insert_default().push_str(text);
+            }
+        }
+        previous.data = event.data;
+        return;
+    }
     if let Some(update) = event.task_update.as_ref()
         && let Some(index) = output.event.iter().rposition(|previous| {
             previous
@@ -1310,10 +1497,9 @@ fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
     }
     if let Some(activity) = event.activity.as_ref() {
         let exact_index = output.event.iter().rposition(|previous| {
-            previous
-                .activity
-                .as_ref()
-                .is_some_and(|previous_activity| previous_activity.id == activity.id)
+            previous.activity.as_ref().is_some_and(|previous_activity| {
+                previous_activity.id == activity.id && previous.address == event.address
+            })
         });
         let fallback_index = exact_index.or_else(|| {
             let meaningful_title =
@@ -1329,7 +1515,8 @@ fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
                 .enumerate()
                 .filter_map(|(index, previous)| {
                     let previous_activity = previous.activity.as_ref()?;
-                    (previous_activity.kind == activity.kind
+                    (previous.address == event.address
+                        && previous_activity.kind == activity.kind
                         && previous_activity.title == activity.title
                         && matches!(
                             previous_activity.status.as_deref(),
@@ -1354,6 +1541,10 @@ fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
         && let Some(text) = event.text.as_deref()
         && let Some(previous) = output.event.last_mut()
         && previous.kind == event.kind
+        && previous.address == event.address
+        && previous.message_id() == event.message_id()
+        && previous.message_phase() == event.message_phase()
+        && !event.message_snapshot()
         && let Some(previous_text) = previous.text.as_mut()
     {
         previous_text.push_str(text);
@@ -1816,10 +2007,37 @@ fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn native_goal_state_ignores_child_and_unknown_notifications() {
+        use crate::goal::GoalState;
+        let mut output = crate::backend::BackendOutput {
+            backend_session_id: Some("parent".into()),
+            ..Default::default()
+        };
+        for (thread, status, expected) in [
+            ("child", "blocked", None),
+            ("parent", "unknown", None),
+            ("parent", "usageLimited", Some(GoalState::UsageLimited)),
+            ("child", "complete", Some(GoalState::UsageLimited)),
+            ("parent", "active", Some(GoalState::Active)),
+            ("parent", "budgetLimited", Some(GoalState::BudgetLimited)),
+        ] {
+            super::normalize_event(
+                &serde_json::json!({
+                    "method":"thread/goal/updated", "params":{"threadId":thread,"status":status}
+                }),
+                &mut output,
+                None,
+            )
+            .await;
+            assert_eq!(output.evidence.native_state, expected);
+        }
+    }
+
     use super::*;
 
-    #[test]
-    fn lifecycle_events_cannot_poison_a_corrected_control_request() {
+    #[tokio::test]
+    async fn lifecycle_events_cannot_poison_a_corrected_control_request() {
         let invocation = |method: &str, overview: &str| {
             json!({
                 "method": method,
@@ -1851,14 +2069,16 @@ mod test {
             None,
             "",
             false,
-        );
+        )
+        .await;
         normalize_event_in_workspace(
             &invocation("item/completed", "rejected"),
             &mut output,
             None,
             "",
             false,
-        );
+        )
+        .await;
         assert!(output.plan_edit.is_empty());
 
         normalize_event_in_workspace(
@@ -1867,7 +2087,8 @@ mod test {
             None,
             "",
             false,
-        );
+        )
+        .await;
         apply_control_request_result(&request("rejected"), &mut output, false).unwrap();
         assert!(output.plan_edit.is_empty());
         apply_control_request_result(&request("corrected"), &mut output, true).unwrap();
@@ -1877,7 +2098,8 @@ mod test {
             None,
             "",
             false,
-        );
+        )
+        .await;
 
         assert_eq!(output.plan_edit.len(), 1);
         assert_eq!(
@@ -1890,8 +2112,8 @@ mod test {
         );
     }
 
-    #[test]
-    fn accepted_submit_remains_authoritative_across_lifecycle_replays() {
+    #[tokio::test]
+    async fn accepted_submit_remains_authoritative_across_lifecycle_replays() {
         let lifecycle = |method: &str| {
             json!({
                 "method": method,
@@ -1922,11 +2144,13 @@ mod test {
         });
         let mut output = BackendOutput::default();
 
-        normalize_event_in_workspace(&lifecycle("item/started"), &mut output, None, "", false);
+        normalize_event_in_workspace(&lifecycle("item/started"), &mut output, None, "", false)
+            .await;
         assert!(output.plan_submit.is_none());
 
         apply_control_request_result(&request, &mut output, true).unwrap();
-        normalize_event_in_workspace(&lifecycle("item/completed"), &mut output, None, "", false);
+        normalize_event_in_workspace(&lifecycle("item/completed"), &mut output, None, "", false)
+            .await;
 
         let submit = output.plan_submit.expect("accepted submit request");
         assert_eq!(submit.plan_id, "plan-1");
@@ -1967,8 +2191,8 @@ mod test {
         ));
     }
 
-    #[test]
-    fn extracts_structured_questions_from_dynamic_tool_arguments() {
+    #[tokio::test]
+    async fn extracts_structured_questions_from_dynamic_tool_arguments() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -1993,15 +2217,15 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        ).await;
         let question = output.plan_question.expect("structured planning question");
         assert_eq!(question.questions[0].header, "Migration");
         assert_eq!(question.questions[0].options[0].label, "Staged");
         assert!(output.event.is_empty());
     }
 
-    #[test]
-    fn extracts_answer_and_withdrawal_without_rendering_control_tools() {
+    #[tokio::test]
+    async fn extracts_answer_and_withdrawal_without_rendering_control_tools() {
         let mut answer_output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2017,7 +2241,8 @@ mod test {
             }),
             &mut answer_output,
             None,
-        );
+        )
+        .await;
         let answer = answer_output
             .question_answer
             .expect("structured question answer");
@@ -2036,7 +2261,8 @@ mod test {
             }),
             &mut withdrawal_output,
             None,
-        );
+        )
+        .await;
         assert_eq!(
             withdrawal_output.question_withdrawal.unwrap().reason,
             "Repository policy determines the choice."
@@ -2044,8 +2270,8 @@ mod test {
         assert!(withdrawal_output.event.is_empty());
     }
 
-    #[test]
-    fn replaces_task_state_across_lifecycle_events_without_creating_an_artifact() {
+    #[tokio::test]
+    async fn replaces_task_state_across_lifecycle_events_without_creating_an_artifact() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2054,7 +2280,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
         normalize_event(
             &json!({
                 "method": "turn/plan/completed",
@@ -2062,7 +2289,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
         assert!(output.plan_edit.is_empty());
         assert_eq!(output.event.len(), 1);
         let update = output.event[0].task_update.as_ref().unwrap();
@@ -2071,8 +2299,8 @@ mod test {
         assert_eq!(update.entry_list[0].content, "Inspect the change");
     }
 
-    #[test]
-    fn ignores_control_tool_names_inside_command_output() {
+    #[tokio::test]
+    async fn ignores_control_tool_names_inside_command_output() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2081,13 +2309,14 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
         assert!(output.evidence.tool_called);
         assert!(!output.evidence.structured_complete);
     }
 
-    #[test]
-    fn recognizes_exact_control_tool_calls() {
+    #[tokio::test]
+    async fn recognizes_exact_control_tool_calls() {
         let mut output = BackendOutput::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         normalize_event(
@@ -2100,7 +2329,8 @@ mod test {
             }),
             &mut output,
             Some(&event_sink),
-        );
+        )
+        .await;
         assert!(output.evidence.structured_complete);
         assert!(output.event.is_empty());
         assert!(event_stream.try_recv().is_err());
@@ -2164,8 +2394,8 @@ mod test {
         assert_eq!(context.request_id, "request-7");
     }
 
-    #[test]
-    fn renders_completed_control_calls_without_reapplying_their_semantic_effect() {
+    #[tokio::test]
+    async fn renders_completed_control_calls_without_reapplying_their_semantic_effect() {
         let mut output = BackendOutput::default();
         let completed = json!({
             "method": "item/completed",
@@ -2184,7 +2414,7 @@ mod test {
             } }
         });
 
-        normalize_event_in_workspace(&completed, &mut output, None, "", false);
+        normalize_event_in_workspace(&completed, &mut output, None, "", false).await;
 
         assert!(output.plan_edit.is_empty());
         let activity = output.event[0]
@@ -2296,8 +2526,85 @@ mod test {
         ));
     }
 
-    #[test]
-    fn coalesces_message_deltas_without_treating_prose_as_control_tools() {
+    #[tokio::test]
+    async fn message_lifecycle_preserves_phase_identity_and_authoritative_text() {
+        let mut output = BackendOutput::default();
+        let (sink, mut stream) = crate::backend::events::channel();
+        for (method, item) in [
+            (
+                "item/started",
+                json!({"item":{"type":"agentMessage","id":"one","phase":"commentary","text":""}}),
+            ),
+            (
+                "item/agentMessage/delta",
+                json!({"itemId":"one","delta":"Checking "}),
+            ),
+            (
+                "item/agentMessage/delta",
+                json!({"itemId":"one","delta":"files"}),
+            ),
+            (
+                "item/completed",
+                json!({"item":{"type":"agentMessage","id":"one","phase":"commentary","text":"Checking files."}}),
+            ),
+            (
+                "item/started",
+                json!({"item":{"type":"agentMessage","id":"two","phase":"final_answer","text":""}}),
+            ),
+            (
+                "item/agentMessage/delta",
+                json!({"itemId":"two","delta":"Done"}),
+            ),
+            (
+                "item/completed",
+                json!({"item":{"type":"agentMessage","id":"two","phase":"final_answer","text":"Done."}}),
+            ),
+        ] {
+            let mut params = item;
+            params["threadId"] = json!("parent");
+            params["turnId"] = json!("turn");
+            normalize_event(
+                &json!({"method":method,"params":params}),
+                &mut output,
+                Some(&sink),
+            )
+            .await;
+        }
+        assert_eq!(output.event.len(), 2);
+        assert_eq!(output.event[0].text.as_deref(), Some("Checking files."));
+        assert_eq!(output.event[0].message_phase(), Some("commentary"));
+        assert_eq!(output.event[1].text.as_deref(), Some("Done."));
+        assert_eq!(output.event[1].message_id(), Some("two"));
+        assert!(output.event.iter().all(BackendEvent::message_snapshot));
+        let mut delta = Vec::new();
+        while let Ok(event) = stream.try_recv() {
+            if event.text.is_some() && !event.message_snapshot() {
+                delta.push((event.text.unwrap(), event.data["params"]["phase"].clone()));
+            }
+        }
+        assert_eq!(
+            delta,
+            vec![
+                ("Checking ".into(), json!("commentary")),
+                ("files".into(), json!("commentary")),
+                ("Done".into(), json!("final_answer")),
+            ]
+        );
+        // The same provider item ID in another agent must not inherit the parent's phase.
+        normalize_event(
+            &json!({"method":"item/agentMessage/delta", "params":{
+                "threadId":"child","turnId":"turn","itemId":"one","delta":"Child"
+            }}),
+            &mut output,
+            None,
+        )
+        .await;
+        assert_eq!(output.event.len(), 3);
+        assert_eq!(output.event[2].message_phase(), None);
+    }
+
+    #[tokio::test]
+    async fn coalesces_message_deltas_without_treating_prose_as_control_tools() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2306,7 +2613,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
         normalize_event(
             &json!({
                 "method": "item/agentMessage/delta",
@@ -2314,7 +2622,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
         assert_eq!(output.event.len(), 1);
         assert_eq!(
             output.event[0].text.as_deref(),
@@ -2324,8 +2633,8 @@ mod test {
         assert_eq!(output.event[0].kind, "assistant_message");
     }
 
-    #[test]
-    fn ignores_codex_user_message_lifecycle_events() {
+    #[tokio::test]
+    async fn ignores_codex_user_message_lifecycle_events() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2339,12 +2648,13 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
         assert!(output.event.is_empty());
     }
 
-    #[test]
-    fn correlates_codex_command_lifecycle_into_one_activity() {
+    #[tokio::test]
+    async fn correlates_codex_command_lifecycle_into_one_activity() {
         let mut output = BackendOutput::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         normalize_event(
@@ -2361,7 +2671,8 @@ mod test {
             }),
             &mut output,
             Some(&event_sink),
-        );
+        )
+        .await;
         normalize_event(
             &json!({
                 "method": "item/commandExecution/outputDelta",
@@ -2369,7 +2680,8 @@ mod test {
             }),
             &mut output,
             Some(&event_sink),
-        );
+        )
+        .await;
         normalize_event(
             &json!({
                 "method": "item/completed",
@@ -2385,7 +2697,8 @@ mod test {
             }),
             &mut output,
             Some(&event_sink),
-        );
+        )
+        .await;
 
         assert_eq!(
             std::iter::from_fn(|| event_stream.try_recv().ok()).count(),
@@ -2405,8 +2718,8 @@ mod test {
         assert!(!activity.output_delta);
     }
 
-    #[test]
-    fn correlates_codex_mcp_lifecycle_into_one_activity() {
+    #[tokio::test]
+    async fn correlates_codex_mcp_lifecycle_into_one_activity() {
         let mut output = BackendOutput::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         normalize_event(
@@ -2429,7 +2742,8 @@ mod test {
             }),
             &mut output,
             Some(&event_sink),
-        );
+        )
+        .await;
         normalize_event(
             &json!({
                 "method": "item/mcpToolCall/progress",
@@ -2440,7 +2754,8 @@ mod test {
             }),
             &mut output,
             Some(&event_sink),
-        );
+        )
+        .await;
         normalize_event(
             &json!({
                 "method": "item/completed",
@@ -2467,7 +2782,8 @@ mod test {
             }),
             &mut output,
             Some(&event_sink),
-        );
+        )
+        .await;
 
         assert_eq!(
             std::iter::from_fn(|| event_stream.try_recv().ok()).count(),
@@ -2496,8 +2812,8 @@ mod test {
         assert!(output.evidence.tool_called);
     }
 
-    #[test]
-    fn normalizes_codex_mcp_failure_output() {
+    #[tokio::test]
+    async fn normalizes_codex_mcp_failure_output() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2515,7 +2831,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         let activity = output.event[0]
             .activity
@@ -2542,8 +2859,8 @@ mod test {
         );
     }
 
-    #[test]
-    fn does_not_classify_mcp_names_as_harness_control_tools() {
+    #[tokio::test]
+    async fn does_not_classify_mcp_names_as_harness_control_tools() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2561,7 +2878,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         assert!(!output.evidence.structured_complete);
         let activity = output.event[0]
@@ -2571,8 +2889,8 @@ mod test {
         assert_eq!(activity.title, "external-mcp.harness_goal_complete({})");
     }
 
-    #[test]
-    fn replaces_codex_patch_revisions_with_the_completed_change_set() {
+    #[tokio::test]
+    async fn replaces_codex_patch_revisions_with_the_completed_change_set() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2588,7 +2906,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
         normalize_event(
             &json!({
                 "method": "item/completed",
@@ -2607,7 +2926,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         assert_eq!(output.event.len(), 1);
         let activity = output.event[0].activity.as_ref().expect("file change");
@@ -2617,8 +2937,8 @@ mod test {
         assert!(output.evidence.workspace_changed);
     }
 
-    #[test]
-    fn normalizes_codex_absolute_paths_and_structured_change_kinds() {
+    #[tokio::test]
+    async fn normalizes_codex_absolute_paths_and_structured_change_kinds() {
         let mut output = BackendOutput::default();
         normalize_event_in_workspace(
             &json!({
@@ -2640,15 +2960,16 @@ mod test {
             None,
             "C:\\workspace",
             true,
-        );
+        )
+        .await;
 
         let change = &output.event[0].activity.as_ref().unwrap().change.file[0];
         assert_eq!(change.path, "src/main.rs");
         assert_eq!(change.kind, ProviderChangeKind::Add);
     }
 
-    #[test]
-    fn declined_file_changes_do_not_count_as_workspace_progress() {
+    #[tokio::test]
+    async fn declined_file_changes_do_not_count_as_workspace_progress() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2668,7 +2989,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         assert!(!output.evidence.workspace_changed);
         assert_eq!(
@@ -2677,8 +2999,8 @@ mod test {
         );
     }
 
-    #[test]
-    fn derives_codex_command_status_from_lifecycle_method() {
+    #[tokio::test]
+    async fn derives_codex_command_status_from_lifecycle_method() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2693,7 +3015,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
         normalize_event(
             &json!({
                 "method": "item/completed",
@@ -2708,7 +3031,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         let activity = output.event[0].activity.as_ref().unwrap();
         assert_eq!(activity.status.as_deref(), Some("completed"));
@@ -2718,8 +3042,8 @@ mod test {
         );
     }
 
-    #[test]
-    fn strips_terminal_controls_from_command_output() {
+    #[tokio::test]
+    async fn strips_terminal_controls_from_command_output() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2735,14 +3059,15 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         let activity = output.event[0].activity.as_ref().unwrap();
         assert_eq!(activity.output.as_deref(), Some("Mode  Name"));
     }
 
-    #[test]
-    fn ignores_codex_moderation_metadata_with_tool_named_fields() {
+    #[tokio::test]
+    async fn ignores_codex_moderation_metadata_with_tool_named_fields() {
         let mut output = BackendOutput::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         normalize_event(
@@ -2761,7 +3086,8 @@ mod test {
             }),
             &mut output,
             Some(&event_sink),
-        );
+        )
+        .await;
         assert!(output.event.is_empty());
         assert!(event_stream.try_recv().is_err());
     }
@@ -2774,8 +3100,8 @@ mod test {
         );
     }
 
-    #[test]
-    fn records_token_usage_without_emitting_interaction_noise() {
+    #[tokio::test]
+    async fn records_token_usage_without_emitting_interaction_noise() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2790,7 +3116,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
         normalize_event(
             &json!({
                 "method": "turn/started",
@@ -2798,7 +3125,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         assert_eq!(output.metrics.token_count, Some(2700));
         assert_eq!(
@@ -2813,8 +3141,8 @@ mod test {
         assert_eq!(output.event[0].kind, "context_usage");
     }
 
-    #[test]
-    fn normalizes_codex_spawn_activity_without_rendering_it_as_a_tool() {
+    #[tokio::test]
+    async fn normalizes_codex_spawn_activity_without_rendering_it_as_a_tool() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2836,7 +3164,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         assert_eq!(output.event.len(), 1);
         assert_eq!(output.event[0].kind, "agent_lifecycle");
@@ -2847,12 +3176,12 @@ mod test {
             Some("child-thread")
         );
         assert_eq!(lifecycle.definition.as_deref(), Some("explorer"));
-        assert_eq!(lifecycle.status, AgentRunStatus::Running);
+        assert_eq!(lifecycle.status, AgentExecutionState::Running);
         assert!(output.event[0].activity.is_none());
     }
 
-    #[test]
-    fn normalizes_each_codex_child_state_instead_of_the_wait_tool_state() {
+    #[tokio::test]
+    async fn normalizes_each_codex_child_state_instead_of_the_wait_tool_state() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2875,7 +3204,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         assert_eq!(output.event.len(), 2);
         let lifecycle_list = output
@@ -2883,16 +3213,16 @@ mod test {
             .iter()
             .map(|event| serde_json::from_value::<AgentLifecycleEvent>(event.data.clone()).unwrap())
             .collect::<Vec<_>>();
-        assert_eq!(lifecycle_list[0].status, AgentRunStatus::Completed);
-        assert_eq!(lifecycle_list[1].status, AgentRunStatus::Running);
+        assert_eq!(lifecycle_list[0].status, AgentExecutionState::Completed);
+        assert_eq!(lifecycle_list[1].status, AgentExecutionState::Running);
         assert_eq!(
             lifecycle_list[0].parent_thread_id.as_deref(),
             Some("parent-thread")
         );
     }
 
-    #[test]
-    fn ignores_a_codex_wait_without_child_state() {
+    #[tokio::test]
+    async fn ignores_a_codex_wait_without_child_state() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2910,13 +3240,14 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         assert!(output.event.is_empty());
     }
 
-    #[test]
-    fn normalizes_codex_subagent_activity_with_its_child_identity() {
+    #[tokio::test]
+    async fn normalizes_codex_subagent_activity_with_its_child_identity() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2933,7 +3264,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         let lifecycle: AgentLifecycleEvent =
             serde_json::from_value(output.event[0].data.clone()).unwrap();
@@ -2941,11 +3273,11 @@ mod test {
             lifecycle.provider_thread_id.as_deref(),
             Some("child-thread")
         );
-        assert_eq!(lifecycle.status, AgentRunStatus::Interrupted);
+        assert_eq!(lifecycle.status, AgentExecutionState::Interrupted);
     }
 
-    #[test]
-    fn ignores_codex_subagent_interaction_directed_at_the_parent() {
+    #[tokio::test]
+    async fn ignores_codex_subagent_interaction_directed_at_the_parent() {
         let mut output = BackendOutput::default();
         normalize_event(
             &json!({
@@ -2962,7 +3294,8 @@ mod test {
             }),
             &mut output,
             None,
-        );
+        )
+        .await;
 
         assert!(output.event.is_empty());
     }

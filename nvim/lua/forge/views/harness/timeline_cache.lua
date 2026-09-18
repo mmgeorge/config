@@ -135,12 +135,12 @@ function M.selected_agent_history(state)
   local agent_entry = find_agent(M.history(state), state.selected_agent_run_id)
   if not agent_entry then return {} end
   local timeline = {}
-  for _, interaction in ipairs(agent_entry.interaction or {}) do
+  for _, exchange in ipairs(agent_entry.exchange or {}) do
     timeline[#timeline + 1] = {
-      kind = "interaction",
-      id = interaction.id,
-      created_at_ms = interaction.created_at_ms,
-      interaction = interaction,
+      kind = "exchange",
+      id = exchange.id,
+      created_at_ms = exchange.created_at_ms,
+      exchange = exchange,
       agent_by_id = {},
     }
   end
@@ -150,9 +150,9 @@ end
 ---@param state ForgeHarnessPresentationState
 ---@param run_id string
 ---@return table[]
-function M.agent_interaction_list(state, run_id)
+function M.agent_exchange_list(state, run_id)
   local agent_entry = find_agent(M.history(state), run_id)
-  return agent_entry and agent_entry.interaction or {}
+  return agent_entry and agent_entry.exchange or {}
 end
 
 return M

@@ -2,6 +2,23 @@ local M = {}
 local sessions = setmetatable({}, { __mode = "v" })
 local window_state = {}
 
+---@alias ForgeFoldPreference 'auto'|'open'|'closed'
+---@class ForgeFoldView
+---@field applied boolean
+---@field preference ForgeFoldPreference
+
+---@param saved table
+---@param state table<string, boolean>
+local function retain_preferences(saved, state)
+  for id, closed in pairs(state) do
+    local view = saved.fold[id]
+    if view and closed ~= view.applied then
+      view.preference = closed and "closed" or "open"
+      view.applied = closed
+    end
+  end
+end
+
 local function fold_start(session, record)
   local _, start = session.sequence:position(record.owner)
   return start + record.fold.start.row + 1
@@ -166,6 +183,8 @@ function M.update(session, prepared, replace_all)
 end
 
 local function apply_defaults(session, window, saved, changed)
+  local recompute = next(changed) ~= nil
+  if recompute then changed = session.fold.record end
   local opened, closed = {}, {}
   for id in pairs(saved.fold) do
     if not session.fold.record[id] then saved.fold[id] = nil end
@@ -174,22 +193,32 @@ local function apply_defaults(session, window, saved, changed)
     local record = session.fold.record[id]
     if not record then
       saved.fold[id] = nil
-    elseif not saved.fold[id] then
+    else
       local _, start = session.sequence:position(record.owner)
       local _, finish = session.sequence:position(record.fold["end"].block)
       start = start + record.fold.start.row
       finish = finish + record.fold["end"].position.row + (record.fold["end"].position.column > 0 and 1 or 0)
       if finish > start + 1 then
-        saved.fold[id] = true
-        if record.fold.closed then closed[start + 1] = true else opened[start + 1] = true end
+        local view = saved.fold[id] or { preference = "auto" }
+        local target = view.preference == "closed"
+          or view.preference == "auto" and record.fold.closed
+        if recompute or view.applied == nil or view.applied ~= target then
+          if target then closed[start + 1] = true else opened[start + 1] = true end
+        end
+        view.applied = target
+        saved.fold[id] = view
       end
     end
   end
   local opening = vim.tbl_keys(opened)
   table.sort(opening)
   vim.api.nvim_win_call(window, function()
-    if next(opened) or next(closed) then vim.wo[window].foldexpr = vim.wo[window].foldexpr end
     local view = vim.fn.winsaveview()
+    if recompute then
+      vim.cmd("normal! zX")
+    elseif next(opened) or next(closed) then
+      vim.wo[window].foldexpr = vim.wo[window].foldexpr
+    end
     for _, row in ipairs(opening) do
       local ancestor = vim.fn.foldclosed(row)
       while ancestor >= 0 do
@@ -223,6 +252,7 @@ function M.capture(session)
     if saved.session == session and vim.api.nvim_win_is_valid(window)
       and vim.api.nvim_win_get_buf(window) == session.buffer then
       captured[window] = capture_window(session, window)
+      retain_preferences(saved, captured[window])
     end
   end
   return captured
@@ -237,6 +267,13 @@ function M.restore(session, captured)
       for id, was_closed in pairs(state) do
         local record = session.fold.record[id]
         if record then
+          local saved = window_state[window]
+          local view = saved and saved.fold[id]
+          if view then
+            was_closed = view.preference == "closed"
+              or view.preference == "auto" and record.fold.closed
+            view.applied = was_closed
+          end
           local row = fold_start(session, record)
           local target = was_closed and closed or opened
           target[#target + 1] = row
@@ -379,7 +416,9 @@ function M.release(window)
   if not saved then return end
   local session = saved.session
   if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == session.buffer then
-    local retained = { fold = vim.deepcopy(saved.fold), state = capture_window(session, window) }
+    local state = capture_window(session, window)
+    retain_preferences(saved, state)
+    local retained = { fold = vim.deepcopy(saved.fold), state = state }
     session.fold_view = session.fold_view or {}
     session.fold_view[window] = retained
   end

@@ -26,8 +26,8 @@ local function option_list(state, selected_run_id)
   }
   local now_ms = os.time() * 1000
   for _, group in ipairs({
-    { title = "Running", run_list = agent_catalog.run_list(state.agent, true) },
-    { title = "Done", run_list = agent_catalog.run_list(state.agent, false) },
+    { title = "Running", run_list = agent_catalog.run_list(state, true) },
+    { title = "Done", run_list = agent_catalog.run_list(state, false) },
   }) do
     for _, run in ipairs(group.run_list) do
       result[#result + 1] = {
@@ -36,7 +36,7 @@ local function option_list(state, selected_run_id)
         label = agent_summary.label(run),
         detail = agent_summary.status_detail(
           run,
-          timeline_cache.agent_interaction_list(state, run.id),
+          timeline_cache.agent_exchange_list(state, run.id),
           now_ms
         ),
         section = group.title,

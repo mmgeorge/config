@@ -20,6 +20,8 @@ end
 
 local function interaction(session_id, prompt)
   local interaction_id = session_id .. ":interaction"
+  local turn_id = interaction_id .. ":turn"
+  local message_id = turn_id .. ":message"
   local record = {
     id = interaction_id,
     session_id = session_id,
@@ -32,20 +34,27 @@ local function interaction(session_id, prompt)
     token_count = 10,
     node_list = {
       {
-        kind = "main_segment",
-        segment = {
-          id = interaction_id .. ":segment",
-          state = "complete",
-          started_at_ms = 1,
-          completed_at_ms = 2,
-          duration_ms = 1,
-          token_count = 10,
-          spawned_agent_count = 0,
-          thought = {},
-          response = "Preview response for " .. prompt,
-        },
+        kind = "turn_content",
+        id = message_id .. ":content",
+        turn_id = turn_id,
+        item = { kind = "message", id = message_id },
       },
     },
+    turn = { {
+      id = turn_id,
+      state = { kind = "finished", outcome = "completed" },
+      started_at_ms = 1,
+      completed_at_ms = 2,
+      token_count = 10,
+      tool = { order = {}, item = {} },
+      message = { {
+        id = message_id,
+        kind = "assistant",
+        delivery = "final",
+        text = "Preview response for " .. prompt,
+      } },
+      item = { { kind = "message", id = message_id } },
+    } },
   }
   return record
 end
@@ -54,8 +63,8 @@ local function snapshot(entry)
   local record = interaction(entry.id, "Preview " .. (entry.name == "" and "unnamed" or entry.name))
   return {
     session = entry,
-    interaction = { record },
-    timeline = { { kind = "interaction", id = record.id, created_at_ms = 1, interaction = record } },
+    exchange = { record },
+    timeline = { { kind = "exchange", id = record.id, created_at_ms = 1, exchange = record } },
     artifact = {},
     approval = {},
     capability = {},
@@ -143,7 +152,7 @@ local ok, failure = pcall(function()
     "initial selection should preview the active session timeline")
   local live_record = interaction("active", "Live update while preview is open")
   state.interaction = { live_record }
-  state.timeline = { { kind = "interaction", id = live_record.id, created_at_ms = 1, interaction = live_record } }
+  state.timeline = { { kind = "exchange", id = live_record.id, created_at_ms = 1, exchange = live_record } }
   controller.render(true)
   assert_true(vim.api.nvim_buf_is_valid(original_transcript_buf),
     "background Harness state updates should retain the hidden native transcript")

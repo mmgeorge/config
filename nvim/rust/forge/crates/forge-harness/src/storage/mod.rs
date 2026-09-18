@@ -1,9 +1,11 @@
 pub mod objects;
+mod ownership;
+mod recovery;
 
-use crate::agent::{AgentRun, AgentTurnRecord};
+use crate::agent::Agent;
 use crate::checkpoint::CheckpointRecord;
+use crate::exchange::{Exchange, ExchangeComment};
 use crate::goal::GoalRecord;
-use crate::interaction::{InteractionComment, InteractionRecord};
 use crate::plan::{PlanExecutionRecord, PlanLifecycleRecord, PlanRecord};
 use crate::session::{HarnessPreference, HarnessSession, SessionStore};
 use crate::timeline::SessionEventRecord;
@@ -15,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 26;
+const SESSION_FORMAT_VERSION: u32 = 28;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -60,20 +62,22 @@ impl SqliteStore {
             );
             CREATE INDEX IF NOT EXISTS session_workspace_activity
                 ON session_record(workspace, updated_at_ms DESC);
-            CREATE TABLE IF NOT EXISTS interaction_record (
+            CREATE TABLE IF NOT EXISTS exchange_record (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
+                agent_id TEXT,
                 ordinal INTEGER NOT NULL,
                 payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE,
+                FOREIGN KEY(agent_id) REFERENCES agent_run_record(id) ON DELETE CASCADE
             );
-            CREATE UNIQUE INDEX IF NOT EXISTS interaction_session_ordinal
-                ON interaction_record(session_id, ordinal);
-            CREATE TABLE IF NOT EXISTS interaction_comment (
+            CREATE UNIQUE INDEX IF NOT EXISTS exchange_session_ordinal
+                ON exchange_record(session_id, COALESCE(agent_id, ''), ordinal);
+            CREATE TABLE IF NOT EXISTS exchange_comment (
                 id TEXT PRIMARY KEY,
                 interaction_id TEXT NOT NULL,
                 payload TEXT NOT NULL,
-                FOREIGN KEY(interaction_id) REFERENCES interaction_record(id) ON DELETE CASCADE
+                FOREIGN KEY(interaction_id) REFERENCES exchange_record(id) ON DELETE CASCADE
             );
             CREATE TABLE IF NOT EXISTS plan_record (
                 id TEXT PRIMARY KEY,
@@ -134,17 +138,7 @@ impl SqliteStore {
                 payload TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
-            CREATE TABLE IF NOT EXISTS agent_turn_record (
-                id TEXT PRIMARY KEY,
-                session_id TEXT NOT NULL,
-                agent_run_id TEXT NOT NULL,
-                ordinal INTEGER NOT NULL,
-                payload TEXT NOT NULL,
-                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE,
-                FOREIGN KEY(agent_run_id) REFERENCES agent_run_record(id) ON DELETE CASCADE
-            );
-            CREATE UNIQUE INDEX IF NOT EXISTS agent_turn_run_ordinal
-                ON agent_turn_record(agent_run_id, ordinal);
+
             CREATE TABLE IF NOT EXISTS session_event_record (
                 id TEXT PRIMARY KEY,
                 session_id TEXT NOT NULL,
@@ -306,61 +300,106 @@ impl SqliteStore {
         Ok(())
     }
 
-    /// Write one interaction record into its session timeline.
-    pub fn save_interaction(&mut self, interaction: &InteractionRecord) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO interaction_record(id, session_id, ordinal, payload) VALUES(?1, ?2, ?3, ?4)\
-             ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal, payload=excluded.payload",
-            params![interaction.id, interaction.session_id, interaction.ordinal as i64, encode(interaction)?],
+    /// Persist an exchange and admit its delegated child requests atomically.
+    pub fn save_exchange(&mut self, interaction: &Exchange) -> Result<()> {
+        let transaction = self
+            .connection
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let belongs: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_run_record WHERE id=?1 AND session_id=?2)",
+            params![interaction.agent_id, interaction.session_id],
+            |row| row.get(0),
         )?;
+        anyhow::ensure!(belongs, "exchange agent does not belong to its session");
+        let written = transaction.execute(
+            "INSERT INTO exchange_record(id, session_id, agent_id, ordinal, payload) VALUES(?1, ?2, ?3, ?4, ?5)\
+             ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal, payload=excluded.payload \
+             WHERE exchange_record.session_id=excluded.session_id AND exchange_record.agent_id IS excluded.agent_id",
+            params![interaction.id, interaction.session_id, interaction.agent_id, interaction.ordinal as i64, encode(interaction)?],
+        )?;
+        anyhow::ensure!(
+            written == 1,
+            "an exchange cannot change its owning session or agent"
+        );
+        for node in &interaction.node_list {
+            let crate::exchange::ExchangeNode::AgentReference { agent } = node else {
+                continue;
+            };
+            let existing: Option<(String, String)> = transaction
+                .query_row(
+                    "SELECT session_id, agent_id FROM exchange_record WHERE id=?1",
+                    [&agent.child_exchange_id],
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )
+                .optional()?;
+            if let Some((session_id, agent_id)) = existing {
+                anyhow::ensure!(
+                    session_id == interaction.session_id && agent_id == agent.child_agent_id,
+                    "delegation cannot change its child exchange owner"
+                );
+                continue;
+            }
+            let belongs: bool = transaction.query_row(
+                "SELECT EXISTS(SELECT 1 FROM agent_run_record WHERE id=?1 AND session_id=?2)",
+                params![agent.child_agent_id, interaction.session_id],
+                |row| row.get(0),
+            )?;
+            anyhow::ensure!(belongs, "delegated agent does not belong to its session");
+            let ordinal: i64 = transaction.query_row(
+                "SELECT COALESCE(MAX(ordinal),0)+1 FROM exchange_record WHERE agent_id=?1",
+                [&agent.child_agent_id],
+                |row| row.get(0),
+            )?;
+            let child = Exchange::delegated(&interaction.session_id, agent, ordinal as u64);
+            transaction.execute(
+                "INSERT INTO exchange_record(id, session_id, agent_id, ordinal, payload) VALUES(?1,?2,?3,?4,?5)",
+                params![child.id, child.session_id, child.agent_id, ordinal, encode(&child)?],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
     /// Remove one provisional interaction after its provider turn is retracted.
-    pub fn delete_interaction(&mut self, interaction_id: &str) -> Result<()> {
-        self.connection.execute(
-            "DELETE FROM interaction_record WHERE id=?1",
-            [interaction_id],
-        )?;
+    pub fn delete_exchange(&mut self, interaction_id: &str) -> Result<()> {
+        self.connection
+            .execute("DELETE FROM exchange_record WHERE id=?1", [interaction_id])?;
         Ok(())
     }
 
     /// Load interactions in their admitted user-action order.
-    pub fn list_interaction(&self, session_id: &str) -> Result<Vec<InteractionRecord>> {
+    pub fn list_exchange(&self, session_id: &str) -> Result<Vec<Exchange>> {
         self.list_payload(
-            "SELECT payload FROM interaction_record WHERE session_id=?1 ORDER BY ordinal",
-            [session_id],
+            "SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal",
+            params![session_id, HarnessSession::primary_agent_id(session_id)],
         )
     }
 
     /// Load the latest interaction ordinal for one session.
-    pub fn next_interaction_ordinal(&self, session_id: &str) -> Result<u64> {
+    pub fn next_exchange_ordinal(&self, session_id: &str) -> Result<u64> {
         let ordinal: Option<i64> = self.connection.query_row(
-            "SELECT MAX(ordinal) FROM interaction_record WHERE session_id=?1",
-            [session_id],
+            "SELECT MAX(ordinal) FROM exchange_record WHERE session_id=?1 AND agent_id=?2",
+            params![session_id, HarnessSession::primary_agent_id(session_id)],
             |row| row.get(0),
         )?;
         Ok(ordinal.unwrap_or(0) as u64 + 1)
     }
 
     /// Write a diff annotation for later request-changes prompts.
-    pub fn save_interaction_comment(&mut self, comment: &InteractionComment) -> Result<()> {
+    pub fn save_exchange_comment(&mut self, comment: &ExchangeComment) -> Result<()> {
         self.connection.execute(
-            "INSERT INTO interaction_comment(id, interaction_id, payload) VALUES(?1, ?2, ?3)\
+            "INSERT INTO exchange_comment(id, interaction_id, payload) VALUES(?1, ?2, ?3)\
              ON CONFLICT(id) DO UPDATE SET payload=excluded.payload",
-            params![comment.id, comment.interaction_id, encode(comment)?],
+            params![comment.id, comment.exchange_id, encode(comment)?],
         )?;
         Ok(())
     }
 
     /// Load annotations for one historical interaction review.
-    pub fn list_interaction_comment(
-        &self,
-        interaction_id: &str,
-    ) -> Result<Vec<InteractionComment>> {
+    pub fn list_exchange_comment(&self, exchange_id: &str) -> Result<Vec<ExchangeComment>> {
         self.list_payload(
-            "SELECT payload FROM interaction_comment WHERE interaction_id=?1 ORDER BY rowid",
-            [interaction_id],
+            "SELECT payload FROM exchange_comment WHERE interaction_id=?1 ORDER BY rowid",
+            [exchange_id],
         )
     }
 
@@ -545,6 +584,45 @@ impl SqliteStore {
         )
     }
 
+    /// Publish a checkpoint and its owning exchange as one durable transition.
+    pub fn save_checkpoint_exchange(
+        &mut self,
+        checkpoint: &CheckpointRecord,
+        exchange: &Exchange,
+    ) -> Result<()> {
+        anyhow::ensure!(
+            checkpoint.session_id == exchange.session_id,
+            "checkpoint and exchange belong to different sessions"
+        );
+        let transaction = self
+            .connection
+            .transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let belongs: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_run_record WHERE id=?1 AND session_id=?2)",
+            params![exchange.agent_id, exchange.session_id],
+            |row| row.get(0),
+        )?;
+        anyhow::ensure!(belongs, "exchange agent does not belong to its session");
+        transaction.execute(
+            "INSERT INTO checkpoint_record(id, session_id, payload) VALUES(?1, ?2, ?3)\
+             ON CONFLICT(id) DO UPDATE SET payload=excluded.payload \
+             WHERE checkpoint_record.session_id=excluded.session_id",
+            params![checkpoint.id, checkpoint.session_id, encode(checkpoint)?],
+        )?;
+        let written = transaction.execute(
+            "INSERT INTO exchange_record(id, session_id, agent_id, ordinal, payload) VALUES(?1, ?2, ?3, ?4, ?5)\
+             ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal, payload=excluded.payload \
+             WHERE exchange_record.session_id=excluded.session_id AND exchange_record.agent_id IS excluded.agent_id",
+            params![exchange.id, exchange.session_id, exchange.agent_id, exchange.ordinal as i64, encode(exchange)?],
+        )?;
+        anyhow::ensure!(
+            written == 1,
+            "an exchange cannot change its owning session or agent"
+        );
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Load one workspace checkpoint by content digest.
     pub fn load_checkpoint(&self, checkpoint_id: &str) -> Result<Option<CheckpointRecord>> {
         self.load_payload(
@@ -583,39 +661,22 @@ impl SqliteStore {
     }
 
     /// Write one concrete child-agent run into its owning Harness session.
-    pub fn save_agent_run(&mut self, run: &AgentRun) -> Result<()> {
+    pub fn save_agent_run(&mut self, run: &Agent) -> Result<()> {
         self.save_scoped_payload("agent_run_record", &run.id, &run.session_id, run)
     }
 
     /// Load child-agent runs in creation order for one Harness session.
-    pub fn list_agent_run(&self, session_id: &str) -> Result<Vec<AgentRun>> {
+    pub fn list_agent_run(&self, session_id: &str) -> Result<Vec<Agent>> {
         self.list_payload(
             "SELECT payload FROM agent_run_record WHERE session_id=?1 ORDER BY rowid",
             [session_id],
         )
     }
 
-    /// Write one child-agent turn while preserving its run-local ordinal.
-    pub fn save_agent_turn(&mut self, turn: &AgentTurnRecord) -> Result<()> {
-        self.connection.execute(
-            "INSERT INTO agent_turn_record(id, session_id, agent_run_id, ordinal, payload) \
-             VALUES(?1, ?2, ?3, ?4, ?5) ON CONFLICT(id) DO UPDATE SET \
-             ordinal=excluded.ordinal, payload=excluded.payload",
-            params![
-                turn.id,
-                turn.session_id,
-                turn.agent_run_id,
-                turn.ordinal as i64,
-                encode(turn)?
-            ],
-        )?;
-        Ok(())
-    }
-
-    /// Load child-agent turns in their run-local interaction order.
-    pub fn list_agent_turn(&self, run_id: &str) -> Result<Vec<AgentTurnRecord>> {
+    /// Load exchanges in admission order for one child agent.
+    pub fn list_agent_exchange(&self, run_id: &str) -> Result<Vec<Exchange>> {
         self.list_payload(
-            "SELECT payload FROM agent_turn_record WHERE agent_run_id=?1 ORDER BY ordinal",
+            "SELECT payload FROM exchange_record WHERE agent_id=?1 ORDER BY ordinal",
             [run_id],
         )
     }
@@ -677,7 +738,13 @@ impl SqliteStore {
 
 impl SessionStore for SqliteStore {
     fn save_session(&mut self, session: &HarnessSession) -> Result<()> {
-        self.connection.execute(
+        let primary = Agent::primary(&session.id, session.created_at_ms);
+        anyhow::ensure!(
+            session.primary_agent_id == primary.id,
+            "session primary agent identity does not belong to this session"
+        );
+        let transaction = self.connection.transaction()?;
+        transaction.execute(
             "INSERT INTO session_record(id, workspace, updated_at_ms, payload) VALUES(?1, ?2, ?3, ?4)\
              ON CONFLICT(id) DO UPDATE SET workspace=excluded.workspace, updated_at_ms=excluded.updated_at_ms, payload=excluded.payload",
             params![
@@ -687,6 +754,11 @@ impl SessionStore for SqliteStore {
                 encode_session(session)?
             ],
         )?;
+        transaction.execute(
+            "INSERT INTO agent_run_record(id, session_id, payload) VALUES(?1, ?2, ?3) ON CONFLICT(id) DO NOTHING",
+            params![primary.id, primary.session_id, encode(&primary)?],
+        )?;
+        transaction.commit()?;
         Ok(())
     }
 
@@ -760,6 +832,7 @@ mod test {
     fn session(id: &str, workspace: &str) -> HarnessSession {
         HarnessSession {
             id: id.into(),
+            primary_agent_id: HarnessSession::primary_agent_id(id),
             name: id.into(),
             workspace: workspace.into(),
             backend: "copilot".into(),
@@ -817,64 +890,151 @@ mod test {
     }
 
     #[test]
-    fn persists_repeated_agent_runs_and_run_local_turns() {
+    fn recovery_is_atomic_and_preserves_waiting_exchanges() {
+        use crate::exchange::{ExchangeKind, ExchangeState, HistoryDisposition};
         let temporary = tempfile::tempdir().unwrap();
         let mut store = SqliteStore::open(temporary.path()).unwrap();
         store.save_session(&session("session", "D:/work")).unwrap();
-        let first = AgentRun::pending("session", "explorer", "inspect Bevy", 1);
-        let second = AgentRun::pending("session", "explorer", "inspect physics", 2);
-        store.save_agent_run(&first).unwrap();
-        store.save_agent_run(&second).unwrap();
-        let interaction = InteractionRecord {
-            id: "interaction".into(),
+        store.save_agent_run(&Agent::primary("session", 0)).unwrap();
+        let mut exchange = Exchange {
+            finalization_error: None,
+            finalization_outcome: None,
+            agent_id: "session:agent:primary".into(),
+            id: "active".into(),
             session_id: "session".into(),
             ordinal: 1,
-            prompt: "report".into(),
-            kind: crate::interaction::InteractionKind::Chat,
-            state: crate::interaction::InteractionState::Complete,
+            prompt: "work".into(),
+            kind: ExchangeKind::Chat,
+            state: ExchangeState::Running,
             plan_id: None,
             execution_id: None,
+            goal_id: None,
             checkpoint_before: None,
             checkpoint_after: None,
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
-            created_at_ms: 3,
-            completed_at_ms: Some(4),
-            node_list: vec![crate::interaction::InteractionNode::MainSegment {
-                segment: Box::new(crate::interaction::MainSegment {
-                    id: "interaction:segment:1".into(),
-                    state: crate::interaction::SegmentState::Complete,
-                    started_at_ms: 3,
-                    completed_at_ms: Some(4),
-                    duration_ms: 1,
-                    token_count: None,
-                    spawned_agent_count: 0,
-                    thought: Vec::new(),
-                    active: None,
-                    response: Some("done".into()),
-                }),
-            }],
+            disposition: HistoryDisposition::Current,
+            turn: Vec::new(),
+            created_at_ms: 10,
+            completed_at_ms: None,
+            node_list: Vec::new(),
             awaiting_input: false,
             elicitation: None,
-            duration_ms: 1,
+            duration_ms: 20,
+            execution_started_at_ms: Some(30),
             token_count: None,
             comment: Vec::new(),
             task: None,
         };
+        store.save_exchange(&exchange).unwrap();
+        exchange.id = "waiting".into();
+        exchange.ordinal = 2;
+        exchange.awaiting_input = true;
+        exchange.execution_started_at_ms = None;
+        store.save_exchange(&exchange).unwrap();
+        let child = Agent::pending("session", "reviewer", "review", 10);
+        store.save_agent_run(&child).unwrap();
         store
-            .save_agent_turn(&AgentTurnRecord {
-                id: "turn".into(),
-                session_id: "session".into(),
-                agent_run_id: first.id.clone(),
-                ordinal: 1,
-                interaction,
-            })
+            .connection
+            .execute(
+                "UPDATE agent_run_record SET payload='invalid' WHERE id=?1",
+                [&child.id],
+            )
             .unwrap();
+        assert!(store.interrupt_detached_execution("session").is_err());
+        let unchanged = store.list_exchange("session").unwrap();
+        assert!(
+            unchanged
+                .iter()
+                .all(|exchange| exchange.state == ExchangeState::Running)
+        );
+        assert_eq!(unchanged[0].execution_started_at_ms, Some(30));
+        store.save_agent_run(&child).unwrap();
+        store.interrupt_detached_execution("session").unwrap();
+        let recovered = store.list_exchange("session").unwrap();
+        assert_eq!(recovered[0].state, ExchangeState::Interrupted);
+        assert_eq!(recovered[0].elapsed(90_000), 20);
+        assert_eq!(recovered[1].state, ExchangeState::Running);
+        assert!(recovered[1].awaiting_input);
+        assert_eq!(recovered[1].elapsed(90_000), 20);
+        let snapshot = serde_json::to_value(&recovered).unwrap();
+        store.interrupt_detached_execution("session").unwrap();
+        assert_eq!(
+            serde_json::to_value(store.list_exchange("session").unwrap()).unwrap(),
+            snapshot
+        );
+    }
 
-        assert_eq!(store.list_agent_run("session").unwrap().len(), 2);
-        assert_eq!(store.list_agent_turn(&first.id).unwrap().len(), 1);
-        assert!(store.list_agent_turn(&second.id).unwrap().is_empty());
+    #[test]
+    fn persists_canonical_exchanges_with_immutable_agent_ownership() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open(temporary.path()).unwrap();
+        store.save_session(&session("session", "D:/work")).unwrap();
+        store.save_agent_run(&Agent::primary("session", 0)).unwrap();
+        let first = Agent::pending("session", "explorer", "inspect Bevy", 1);
+        let second = Agent::pending("session", "explorer", "inspect physics", 2);
+        store.save_agent_run(&first).unwrap();
+        store.save_agent_run(&second).unwrap();
+        let mut interaction = Exchange {
+            finalization_error: None,
+            finalization_outcome: None,
+            agent_id: "session:agent:primary".into(),
+            id: "interaction".into(),
+            session_id: "session".into(),
+            ordinal: 1,
+            prompt: "report".into(),
+            kind: crate::exchange::ExchangeKind::Chat,
+            state: crate::exchange::ExchangeState::Complete,
+            plan_id: None,
+            execution_id: None,
+            goal_id: None,
+            checkpoint_before: None,
+            checkpoint_after: None,
+            attributed_diff_text: None,
+            checkpoint_diff_text: None,
+            attributed_matches_checkpoint: false,
+            disposition: crate::exchange::HistoryDisposition::Current,
+            turn: Vec::new(),
+            created_at_ms: 3,
+            completed_at_ms: Some(4),
+            node_list: Vec::new(),
+            awaiting_input: false,
+            elicitation: None,
+            duration_ms: 1,
+            execution_started_at_ms: None,
+            token_count: None,
+            comment: Vec::new(),
+            task: None,
+        };
+        interaction.agent_id = first.id.clone();
+        store.save_exchange(&interaction).unwrap();
+
+        assert_eq!(store.list_agent_run("session").unwrap().len(), 3);
+        assert_eq!(store.list_agent_exchange(&first.id).unwrap().len(), 1);
+        assert!(store.list_agent_exchange(&second.id).unwrap().is_empty());
+        assert!(store.list_exchange("session").unwrap().is_empty());
+        let mut primary = interaction.clone();
+        primary.agent_id = "session:agent:primary".into();
+        primary.id = "primary".into();
+        store.save_exchange(&primary).unwrap();
+        assert_eq!(store.list_exchange("session").unwrap().len(), 1);
+        assert_eq!(store.next_exchange_ordinal("session").unwrap(), 2);
+        interaction.agent_id = second.id.clone();
+        assert!(
+            store.save_exchange(&interaction).is_err(),
+            "exchange owner changed"
+        );
+        assert!(store.list_agent_exchange(&second.id).unwrap().is_empty());
+        interaction.id = "foreign-owner".into();
+        interaction.session_id = "another-session".into();
+        store
+            .save_session(&session("another-session", "D:/work"))
+            .unwrap();
+        assert!(
+            store.save_exchange(&interaction).is_err(),
+            "cross-session child accepted"
+        );
     }
 
     #[test]

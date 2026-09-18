@@ -6,7 +6,7 @@ function M.key(active_elicitation)
   local elicitation = active_elicitation and active_elicitation.elicitation
   local question_set = elicitation and elicitation.question_set
   if not (active_elicitation and elicitation and question_set) then return nil end
-  local owner_id = active_elicitation.plan_id or active_elicitation.interaction_id or "unknown"
+  local owner_id = active_elicitation.plan_id or active_elicitation.exchange_id or "unknown"
   local revision = elicitation.revision or question_set.id or 1
   return table.concat({ active_elicitation.owner or "unknown", owner_id, tostring(revision) }, ":")
 end

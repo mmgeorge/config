@@ -2,7 +2,7 @@ use std::collections::hash_map::DefaultHasher;
 use std::hash::{Hash, Hasher};
 use std::ops::Range;
 
-use pulldown_cmark::{Event, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, Options, Parser, Tag, TagEnd};
 use unicode_segmentation::UnicodeSegmentation;
 
 use crate::ContractError;
@@ -20,6 +20,34 @@ pub struct RenderedMarkdown {
     pub block: BufferBlock,
     pub link: Vec<MarkdownLink>,
     pub source: Vec<MarkdownSourceRange>,
+    pub code: Vec<MarkdownCode>,
+}
+
+/// Literal code rows and their positions after Markdown container prefixes are rendered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownCode {
+    pub language: String,
+    pub row: Vec<MarkdownCodeRow>,
+}
+
+/// One physical code row, independent of native window wrapping.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MarkdownCodeRow {
+    pub position: TextPosition,
+    pub text: String,
+}
+
+impl MarkdownCode {
+    /// Charge retained source and row mapping storage to the presentation owner.
+    pub fn retained_bytes(&self) -> usize {
+        self.language.capacity()
+            + self.row.capacity() * std::mem::size_of::<MarkdownCodeRow>()
+            + self
+                .row
+                .iter()
+                .map(|row| row.text.capacity())
+                .sum::<usize>()
+    }
 }
 
 /// Zero-based source rows and the rendered rows that retain their content.
@@ -44,7 +72,9 @@ struct RenderState<'profile> {
     link: Vec<MarkdownLink>,
     active_link: Option<TargetId>,
     list: Vec<Option<u64>>,
+    quote_depth: usize,
     code: bool,
+    code_block: Vec<MarkdownCode>,
     bytes: usize,
     source_row: Range<usize>,
     source_output: Vec<Option<Range<usize>>>,
@@ -172,6 +202,7 @@ impl MarkdownRenderer {
             block,
             link,
             source,
+            code: Vec::new(),
         })
     }
 
@@ -206,7 +237,9 @@ impl MarkdownRenderer {
             link: Vec::new(),
             active_link: None,
             list: Vec::new(),
+            quote_depth: 0,
             code: false,
+            code_block: Vec::new(),
             bytes: 0,
             source_row: 0..1,
             source_output: vec![None; source_start.len()],
@@ -229,7 +262,12 @@ impl MarkdownRenderer {
             if first_source > scanned_source {
                 state.flush_source();
                 for row in scanned_source..first_source {
-                    if source_line[row].trim().is_empty()
+                    let blank = source_line[row].trim().is_empty()
+                        || (state.quote_depth > 0
+                            && source_line[row]
+                                .chars()
+                                .all(|character| character == '>' || character.is_whitespace()));
+                    if blank
                         && state.source_output[row].is_none()
                         && (state.row.len() > 1 || !state.row[0].is_empty())
                     {
@@ -254,9 +292,19 @@ impl MarkdownRenderer {
                         Tag::Emphasis => state.capture.push("@markup.italic"),
                         Tag::Strong => state.capture.push("@markup.strong"),
                         Tag::Strikethrough => state.capture.push("@markup.strikethrough"),
-                        Tag::CodeBlock(_) => {
+                        Tag::CodeBlock(kind) => {
                             state.break_row(false)?;
                             state.code = true;
+                            let language = match kind {
+                                CodeBlockKind::Fenced(info) => {
+                                    info.split_whitespace().next().unwrap_or("").to_owned()
+                                }
+                                CodeBlockKind::Indented => String::new(),
+                            };
+                            state.code_block.push(MarkdownCode {
+                                language,
+                                row: Vec::new(),
+                            });
                             state.capture.push("@markup.raw.block");
                         }
                         Tag::List(start) => {
@@ -283,7 +331,7 @@ impl MarkdownRenderer {
                         }
                         Tag::BlockQuote(_) => {
                             state.break_row(false)?;
-                            state.append("│ ", false)?;
+                            state.quote_depth += 1;
                         }
                         Tag::Link { dest_url, .. } | Tag::Image { dest_url, .. } => {
                             let mut hash = DefaultHasher::new();
@@ -319,11 +367,13 @@ impl MarkdownRenderer {
                         state.capture.pop();
                         state.active_link = None;
                     }
-                    TagEnd::Paragraph
-                    | TagEnd::Item
-                    | TagEnd::BlockQuote(_)
-                    | TagEnd::TableRow
-                    | TagEnd::TableHead => state.break_row(false)?,
+                    TagEnd::Paragraph | TagEnd::Item | TagEnd::TableRow | TagEnd::TableHead => {
+                        state.break_row(false)?
+                    }
+                    TagEnd::BlockQuote(_) => {
+                        state.break_row(false)?;
+                        state.quote_depth -= 1;
+                    }
                     TagEnd::List(_) => {
                         state.list.pop();
                         state.break_row(false)?;
@@ -354,6 +404,9 @@ impl MarkdownRenderer {
         if state.row.len() > 1 && state.row.last().is_some_and(String::is_empty) {
             state.row.pop();
         }
+        for code in &mut state.code_block {
+            code.row.retain(|row| row.position.row < state.row.len());
+        }
         state.flush_source();
         let source_map = state.finish_source_map();
         let block = BufferBlock {
@@ -366,6 +419,7 @@ impl MarkdownRenderer {
             block,
             link: state.link,
             source: source_map,
+            code: state.code_block,
         })
     }
 }
@@ -405,7 +459,10 @@ impl RenderState<'_> {
                     {
                         self.break_row(false)?;
                     }
-                    if self.profile.cells(part, 0)? > self.profile.columns {
+                    let prefix_cells = self.quote_depth * 2;
+                    if self.profile.cells(part, prefix_cells)?
+                        > self.profile.columns.saturating_sub(prefix_cells).max(1)
+                    {
                         for cluster in part.graphemes(true) {
                             let current = self.row.last().unwrap();
                             if !current.is_empty()
@@ -487,13 +544,40 @@ impl RenderState<'_> {
     }
 
     fn append_span(&mut self, text: &str) -> Result<(), ContractError> {
+        if self.code {
+            let row = self.row.len() - 1;
+            let column = if self.row[row].is_empty() {
+                self.quote_depth * "│ ".len()
+            } else {
+                self.row[row].len()
+            };
+            let code = self.code_block.last_mut().expect("active code block");
+            if let Some(previous) = code
+                .row
+                .last_mut()
+                .filter(|previous| previous.position.row == row)
+            {
+                previous.text.push_str(text);
+            } else {
+                code.row.push(MarkdownCodeRow {
+                    position: TextPosition { row, column },
+                    text: text.to_owned(),
+                });
+            }
+        }
         if text.is_empty() {
             return Ok(());
         }
         self.mark_source();
+        let prefix = if self.row.last().unwrap().is_empty() {
+            "│ ".repeat(self.quote_depth)
+        } else {
+            String::new()
+        };
         self.bytes = self
             .bytes
-            .checked_add(text.len())
+            .checked_add(prefix.len())
+            .and_then(|bytes| bytes.checked_add(text.len()))
             .ok_or(ContractError("Markdown size overflow"))?;
         if self.bytes > 16 * 1024 * 1024
             || self.metadata.decoration.len() + self.metadata.target.len() >= 65_536
@@ -502,6 +586,20 @@ impl RenderState<'_> {
         }
         let row = self.row.len() - 1;
         let output = self.row.last_mut().unwrap();
+        if !prefix.is_empty() {
+            output.push_str(&prefix);
+            self.metadata.decoration.push(Decoration {
+                range: TextRange {
+                    start: TextPosition { row, column: 0 },
+                    end: TextPosition {
+                        row,
+                        column: prefix.len(),
+                    },
+                },
+                capture: "@markup.quote".into(),
+                priority: 110,
+            });
+        }
         let start = output.len();
         output.push_str(text);
         let range = TextRange {
@@ -605,6 +703,47 @@ mod tests {
                 .decoration
                 .iter()
                 .any(|decoration| decoration.capture == "@markup.heading")
+        );
+    }
+
+    #[test]
+    fn quote_prefix_stays_with_content_across_blocks_and_wrapping() {
+        let paragraphs = MarkdownRenderer::render(
+            BlockId("paragraphs".into()),
+            "> first\n>\n> second",
+            &WidthProfile::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            paragraphs.block.text.wire_rows(),
+            vec!["│ first", "", "│ second"]
+        );
+        let profile = WidthProfile {
+            columns: 12,
+            ..WidthProfile::default()
+        };
+        let rendered = MarkdownRenderer::render(
+            BlockId("quote".into()),
+            "> abcdefghijkl\n>\n> > [café](https://example.test)\n>\n> ```ts\n> const x = 1;\n> ```\n\noutside",
+            &profile,
+        ).unwrap();
+        let rows = rendered.block.text.wire_rows();
+        assert!(rows.contains(&"│ abcdefghij"));
+        assert!(rows.contains(&"│ kl"));
+        assert!(rows.contains(&"│ │ café"));
+        assert!(rows.contains(&"│ const x = 1;"));
+        assert_eq!(rows.last(), Some(&"outside"));
+        assert!(!rows.iter().any(|row| *row == "│ " || *row == "│ │ "));
+        let target = &rendered.block.metadata.target[0];
+        assert_eq!(
+            &rows[target.range.start.row][target.range.start.column..target.range.end.column],
+            "café"
+        );
+        assert!(
+            rendered
+                .source
+                .iter()
+                .all(|mapping| mapping.output.end <= rows.len())
         );
     }
 

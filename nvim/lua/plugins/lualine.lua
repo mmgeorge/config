@@ -66,7 +66,7 @@ return {
               "snacks_picker_list",
               "snacks_layout_box",
               "NeogitStatus",
-              "HarnessInput",
+              "ForgeHarnessInput",
             },
             statusline = {
               -- "snacks_picker_input",

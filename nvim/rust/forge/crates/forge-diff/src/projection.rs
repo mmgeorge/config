@@ -6,6 +6,53 @@ use crate::syntax::{SyntaxCapture, SyntaxFamily, SyntaxHandle, SyntaxLanguage};
 
 const MAX_DECORATIONS: usize = 8192;
 
+/// Project a saved patch row through the standard diff gutters and side backgrounds.
+///
+/// Saved patches contain partial sources, so this does not claim full-file syntax or raw edit IDs.
+pub fn append_patch_row(
+    metadata: &mut BlockMetadata,
+    row: usize,
+    source: &crate::patch::PatchRow<'_>,
+    hunk: &crate::patch::PatchHunk<'_>,
+    emphasis: &[std::ops::Range<usize>],
+) -> Result<(), ContractError> {
+    use crate::source::{SourceCoordinate, SourceSide};
+    let display = DisplayRow {
+        group_index: 0,
+        text: source.text.trim_end_matches('\r').into(),
+        kind: source.kind,
+        old: source.old_line.map(|line| SourceCoordinate {
+            side: SourceSide::Old,
+            line,
+            byte_column: 0,
+        }),
+        new: source.new_line.map(|line| SourceCoordinate {
+            side: SourceSide::New,
+            line,
+            byte_column: 0,
+        }),
+        raw_id: None,
+        emphasis: if metadata.decoration.len()
+            + metadata.visible_decoration.len()
+            + emphasis.len()
+            + 1
+            <= MAX_DECORATIONS
+        {
+            emphasis.to_vec()
+        } else {
+            Vec::new()
+        },
+        emphasis_fallback: None,
+    };
+    let group = DisplayHunk {
+        raw_ids: Vec::new(),
+        old_lines: hunk.old_lines.clone(),
+        new_lines: hunk.new_lines.clone(),
+        raw_range: 0..0,
+    };
+    append_display_row(metadata, row, &display, &group, None, None)
+}
+
 pub fn append_source_syntax_row(
     metadata: &mut BlockMetadata,
     syntax: &SyntaxHandle,

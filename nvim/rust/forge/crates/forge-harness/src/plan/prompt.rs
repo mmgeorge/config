@@ -328,8 +328,13 @@ pub fn execution_prompt(
         "task": active_task,
         "entity_changes": active_entity_change,
     });
+    let recovery = if active_task.is_some() {
+        " The active task remains unfinished in Harness's persisted scheduler. If its workspace work and tests already finished, reuse that evidence and submit a fresh harness_plan_task_report for this task. A previous tool acknowledgment or final answer does not replace the persisted task state."
+    } else {
+        ""
+    };
     Ok(format!(
-        "{boundary} Execution ID: {execution_id}. Complete the active whole task before calling harness_plan_task_report with detailed subtask, entity, path, and test evidence. Address tasks, subtasks, entities, and tests by their JSON pointer paths in this exact plan version. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective canonical PlanDocument:\n```json\n{}\n```",
+        "{boundary} Execution ID: {execution_id}.{recovery} Complete the active whole task before calling harness_plan_task_report with detailed subtask, entity, path, and test evidence. Address tasks, subtasks, entities, and tests by their JSON pointer paths in this exact plan version. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective canonical PlanDocument:\n```json\n{}\n```",
         serde_json::to_string_pretty(&active_work)?,
         serde_json::to_string_pretty(document)?,
     ))
@@ -689,5 +694,9 @@ mod test {
         assert!(resumed.contains("Preserve completed workspace changes"));
         assert!(resumed.contains("Do not repeat finished actions"));
         assert!(resumed.contains("Continue the same active task"));
+        assert!(resumed.contains("unfinished in Harness's persisted scheduler"));
+        assert!(resumed.contains("reuse that evidence and submit a fresh harness_plan_task_report"));
+        let settled = execution_prompt(PlanExecutionPromptKind::Continue, "execution", None, &document).unwrap();
+        assert!(!settled.contains("unfinished in Harness's persisted scheduler"));
     }
 }

@@ -3,11 +3,13 @@ mod catalog;
 pub mod codex;
 pub mod copilot;
 pub mod events;
+mod execution;
 mod steering;
 pub use catalog::{
     BackendCatalogRequest, BackendInput, CatalogCapability, CatalogMutation, McpDefinition,
     McpStatus, McpToolDefinition, SkillDefinition,
 };
+pub use execution::{ProviderAddress, TurnBoundary};
 pub use steering::SteerTarget;
 
 use crate::agent::AgentCapability;
@@ -122,6 +124,12 @@ pub struct BackendRequest {
 /// Represents a streamed backend update normalized for the interaction reducer.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendEvent {
+    #[serde(default)]
+    /// Provider execution that owns this event, when exposed by the adapter.
+    pub address: Option<ProviderAddress>,
+    #[serde(default)]
+    /// Explicit execution admission or completion.
+    pub turn_boundary: Option<TurnBoundary>,
     pub kind: String,
     pub text: Option<String>,
     pub data: Value,
@@ -134,9 +142,45 @@ pub struct BackendEvent {
 }
 
 impl BackendEvent {
+    /// Borrow the provider message identity shared by lifecycle and delta events.
+    pub(crate) fn message_id(&self) -> Option<&str> {
+        [
+            "/params/item/id",
+            "/params/itemId",
+            "/params/item_id",
+            "/params/messageId",
+            "/params/message_id",
+            "/data/messageId",
+            "/data/message_id",
+            "/data/id",
+            "/id",
+        ]
+        .into_iter()
+        .find_map(|path| self.data.pointer(path).and_then(Value::as_str))
+    }
+
+    /// Borrow the provider delivery phase when the adapter has identified it.
+    pub(crate) fn message_phase(&self) -> Option<&str> {
+        [
+            "/params/item/phase",
+            "/params/phase",
+            "/data/phase",
+            "/phase",
+        ]
+        .into_iter()
+        .find_map(|path| self.data.pointer(path).and_then(Value::as_str))
+    }
+
+    /// Distinguish authoritative message text from incremental text delivery.
+    pub(crate) fn message_snapshot(&self) -> bool {
+        self.data.get("message_update").and_then(Value::as_str) == Some("snapshot")
+    }
+
     /// Build the canonical event for provider-acknowledged active-turn input.
     pub(crate) fn steering_input(text: String) -> Self {
         Self {
+            address: None,
+            turn_boundary: None,
             kind: "steering_input".into(),
             text: Some(text),
             data: Value::Null,
@@ -428,6 +472,12 @@ pub trait Backend: Send + Sync {
         false
     }
 
+    /// Stop native continuation through the active reader before acquiring the broker lock.
+    /// The caller races reader readiness against broker availability and may cancel this wait.
+    async fn stop_goal_session(&self, _session_id: &str, _clear: bool) -> Result<()> {
+        Ok(())
+    }
+
     /// Update a native provider goal when that backend owns goal persistence.
     async fn goal_status(
         &self,
@@ -453,14 +503,24 @@ pub trait Backend: Send + Sync {
         self.steer(text).await
     }
 
-    /// Append user input to one specific provider child turn.
-    async fn steer_target(&self, text: String, _target: SteerTarget) -> Result<()> {
-        self.steer(text).await
+    /// Deliver child input through its owning session using the advertised control mode.
+    async fn steer_target(
+        &self,
+        _session_id: &str,
+        _text: String,
+        _target: SteerTarget,
+    ) -> Result<()> {
+        anyhow::bail!("backend does not support targeted child steering")
     }
 
     /// Interrupt one specific provider child turn without cancelling its parent.
     async fn interrupt_target(&self, _target: SteerTarget) -> Result<()> {
         anyhow::bail!("backend does not support targeted child interruption")
+    }
+
+    /// Interrupt the parent and descendants for one session and await terminal evidence.
+    async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+        Ok(())
     }
 
     /// Stop the active provider transport after its prompt future is cancelled.
@@ -586,6 +646,8 @@ impl Backend for MockBackend {
         let mut active_steering = steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
         let event = BackendEvent {
+            address: None,
+            turn_boundary: None,
             kind: "assistant_message".into(),
             text: Some(format!("Mock response: {}", request.input.text())),
             data: Value::Null,
@@ -596,7 +658,7 @@ impl Backend for MockBackend {
         if self.emit_before_delay
             && let Some(event_sink) = event_sink.as_ref()
         {
-            let _ = event_sink.send(event.clone());
+            let _ = event_sink.send_wait(event.clone()).await;
         }
         if self.write_before_delay {
             std::fs::write(
@@ -612,7 +674,7 @@ impl Backend for MockBackend {
                     () = &mut delay => break,
                     Some(command) = active_steering.receive() => {
                         steering_text_list.push(command.text.clone());
-                        command.complete(Ok(()));
+                        command.complete(Ok(())).await;
                     }
                 }
             }
@@ -816,7 +878,7 @@ impl Backend for MockBackend {
         if !self.emit_before_delay
             && let Some(event_sink) = event_sink
         {
-            let _ = event_sink.send(event.clone());
+            let _ = event_sink.send_wait(event.clone()).await;
         }
         Ok(BackendOutput {
             backend_session_id: request

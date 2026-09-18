@@ -1,7 +1,7 @@
 use serde_json::{Value, json};
 use std::io::{BufRead, BufReader, Write};
 use std::path::Path;
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::process::{Child, ChildStdin, Command, Stdio};
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
@@ -238,7 +238,8 @@ async fn rejects_oversized_unterminated_request_before_initializing_a_provider()
 struct BrokerProcess {
     child: Child,
     stdin: ChildStdin,
-    stdout: BufReader<ChildStdout>,
+    stdout: std::sync::mpsc::Receiver<std::io::Result<String>>,
+    pending_response: std::collections::HashMap<u64, Value>,
     consumed_bytes: usize,
     consumed_frames: usize,
 }
@@ -252,11 +253,20 @@ impl BrokerProcess {
             .spawn()
             .unwrap();
         let stdin = child.stdin.take().unwrap();
-        let stdout = BufReader::new(child.stdout.take().unwrap());
+        let reader = BufReader::new(child.stdout.take().unwrap());
+        let (sender, stdout) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            for line in reader.lines() {
+                if sender.send(line).is_err() {
+                    break;
+                }
+            }
+        });
         let mut broker = Self {
             child,
             stdin,
             stdout,
+            pending_response: Default::default(),
             consumed_bytes: 0,
             consumed_frames: 0,
         };
@@ -276,10 +286,16 @@ impl BrokerProcess {
     }
 
     fn read_response(&mut self, request_id: u64) -> Vec<Value> {
+        if let Some(response) = self.pending_response.remove(&request_id) {
+            return vec![response];
+        }
         let mut message_list = Vec::new();
         loop {
             let message = self.read_message();
             let complete = message.get("id").and_then(Value::as_u64) == Some(request_id);
+            if !complete && let Some(id) = message.get("id").and_then(Value::as_u64) {
+                self.pending_response.insert(id, message.clone());
+            }
             message_list.push(message);
             if complete {
                 return message_list;
@@ -288,10 +304,13 @@ impl BrokerProcess {
     }
 
     fn read_message(&mut self) -> Value {
-        let mut line = String::new();
-        assert_ne!(self.stdout.read_line(&mut line).unwrap(), 0);
+        let line = self
+            .stdout
+            .recv_timeout(Duration::from_secs(30))
+            .expect("broker did not produce a JSONL message within 30 seconds")
+            .unwrap();
         let message = serde_json::from_str(&line).unwrap();
-        self.consumed_bytes += line.len();
+        self.consumed_bytes += line.len() + 1;
         self.consumed_frames += 1;
         let credit = json!({"id": 0, "method": "transport.consumed", "params": {
             "bytes": self.consumed_bytes, "frames": self.consumed_frames,
@@ -305,6 +324,11 @@ impl BrokerProcess {
     fn read_backend_event(&mut self, expected_kind: &str) -> Value {
         loop {
             let message = self.read_message();
+            if let Some(id) = message.get("id").and_then(Value::as_u64) {
+                panic!(
+                    "response {id} arrived before expected backend event {expected_kind}: {message}"
+                );
+            }
             if message.get("event").and_then(Value::as_str) == Some("backend_event")
                 && message.pointer("/payload/kind").and_then(Value::as_str) == Some(expected_kind)
             {
@@ -397,9 +421,9 @@ fn streams_mock_backend_events_before_the_jsonl_response() {
         .collect::<Vec<_>>();
     assert_eq!(
         backend_kind,
-        vec!["timeline_interaction_started", "timeline_node_updated"]
+        vec!["timeline_exchange_started", "assistant_message"]
     );
-    assert!(event_name.contains(&"interaction_complete"));
+    assert!(event_name.contains(&"exchange_complete"));
     assert!(event_name.contains(&"plan_created"));
     assert!(planned.last().unwrap().get("error").is_none());
 
@@ -497,7 +521,11 @@ fn opens_a_fork_before_provider_preparation_and_queues_only_the_child_prompt() {
         .any(|message| message.get("id").and_then(Value::as_u64) == Some(3));
     if !child_completed {
         let child_messages = broker.read_response(3);
-        assert!(child_messages.last().unwrap().get("error").is_none());
+        assert!(
+            child_messages.last().unwrap().get("error").is_none(),
+            "{:?}",
+            child_messages.last()
+        );
     }
 }
 
@@ -668,7 +696,7 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
     assert!(cancelled_turn.iter().any(|message| {
         message.get("event").and_then(Value::as_str) == Some("backend_event")
             && message.pointer("/payload/kind").and_then(Value::as_str)
-                == Some("timeline_interaction_cancelled")
+                == Some("timeline_exchange_cancelled")
     }));
 
     broker.request(json!({ "id": 4, "method": "state.get", "params": {} }));
@@ -677,7 +705,7 @@ fn cancels_a_running_turn_through_the_out_of_band_request_lane() {
         snapshot
             .last()
             .unwrap()
-            .pointer("/result/interaction/0/state")
+            .pointer("/result/exchange/0/state")
             .and_then(Value::as_str),
         Some("cancelled")
     );
@@ -707,7 +735,7 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
             Some(2),
             "first turn ended before shutdown: {event}"
         );
-        if event.pointer("/payload/kind").and_then(Value::as_str) == Some("timeline_node_updated") {
+        if event.pointer("/payload/kind").and_then(Value::as_str) == Some("assistant_message") {
             break;
         }
     }
@@ -729,8 +757,7 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
             "second turn ended before shutdown: {event}"
         );
         if event["session_id"].as_str() == Some(child)
-            && event.pointer("/payload/kind").and_then(Value::as_str)
-                == Some("timeline_node_updated")
+            && event.pointer("/payload/kind").and_then(Value::as_str) == Some("assistant_message")
         {
             break;
         }
@@ -748,7 +775,8 @@ fn shutdown_cancels_all_sessions_before_its_terminal_response() {
             .unwrap();
         assert_eq!(
             response.pointer("/error/code").and_then(Value::as_str),
-            Some("turn_cancelled")
+            Some("turn_cancelled"),
+            "{response}"
         );
     }
     assert!(broker.child.wait().unwrap().success());
@@ -802,7 +830,7 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
     let started = broker.read_message();
     assert_eq!(
         started.pointer("/payload/kind").and_then(Value::as_str),
-        Some("timeline_interaction_started")
+        Some("timeline_exchange_started")
     );
 
     broker.request(json!({
@@ -844,7 +872,7 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
     );
     broker.request(json!({
         "id": 5,
-        "method": "interaction.resume",
+        "method": "exchange.resume",
         "params": { "text": "continue in write mode" }
     }));
     assert!(
@@ -861,7 +889,7 @@ fn restarts_a_running_turn_in_write_mode_without_creating_another_interaction() 
     let interaction = snapshot
         .last()
         .unwrap()
-        .pointer("/result/interaction")
+        .pointer("/result/exchange")
         .and_then(Value::as_array)
         .unwrap();
     assert_eq!(interaction.len(), 1);
@@ -965,7 +993,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
     assert!(retracted.iter().any(|message| {
         message.get("event").and_then(Value::as_str) == Some("backend_event")
             && message.pointer("/payload/kind").and_then(Value::as_str)
-                == Some("timeline_interaction_retracted")
+                == Some("timeline_exchange_retracted")
     }));
 
     broker.request(json!({ "id": 5, "method": "state.get", "params": {} }));
@@ -974,7 +1002,7 @@ fn retracts_an_output_free_planning_turn_and_restores_control_state() {
         snapshot
             .last()
             .unwrap()
-            .pointer("/result/interaction")
+            .pointer("/result/exchange")
             .and_then(Value::as_array)
             .map(Vec::len),
         Some(0)
@@ -1038,8 +1066,8 @@ fn visible_output_prevents_cancelled_turn_retraction() {
         "method": "prompt.submit",
         "params": { "text": "show output before cancellation" }
     }));
-    broker.read_backend_event("timeline_interaction_started");
-    broker.read_backend_event("timeline_node_updated");
+    broker.read_backend_event("timeline_exchange_started");
+    broker.read_backend_event("assistant_message");
     broker.request(json!({
         "id": 3,
         "method": "turn.cancel",
@@ -1057,7 +1085,7 @@ fn visible_output_prevents_cancelled_turn_retraction() {
     );
     assert!(cancelled.iter().any(|message| {
         message.pointer("/payload/kind").and_then(Value::as_str)
-            == Some("timeline_interaction_cancelled")
+            == Some("timeline_exchange_cancelled")
     }));
 
     broker.request(json!({ "id": 4, "method": "shutdown", "params": {} }));
@@ -1105,7 +1133,7 @@ fn workspace_changes_prevent_cancelled_turn_retraction() {
     let started = broker.read_message();
     assert_eq!(
         started.pointer("/payload/kind").and_then(Value::as_str),
-        Some("timeline_interaction_started")
+        Some("timeline_exchange_started")
     );
     let changed_path = repository.path().join("mock-provider-change.txt");
     let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -1179,7 +1207,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
         "method": "prompt.submit",
         "params": { "text": "/plan refactor X" }
     }));
-    broker.read_backend_event("timeline_node_updated");
+    broker.read_backend_event("assistant_message");
     broker.request(json!({
         "id": 3,
         "method": "turn.steer",
@@ -1204,7 +1232,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
             && message
                 .pointer("/payload/data/node/kind")
                 .and_then(Value::as_str)
-                == Some("steering_prompt")
+                == Some("exchange_input")
     }) {
         event_list.push(broker.read_message());
     }
@@ -1216,7 +1244,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
                 && message
                     .pointer("/payload/data/node/kind")
                     .and_then(Value::as_str)
-                    == Some("steering_prompt")
+                    == Some("exchange_input")
         })
         .unwrap();
     assert_eq!(
@@ -1240,7 +1268,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
     let interaction = snapshot
         .last()
         .unwrap()
-        .pointer("/result/interaction")
+        .pointer("/result/exchange")
         .and_then(Value::as_array)
         .unwrap();
     assert_eq!(interaction.len(), 1);
@@ -1255,7 +1283,7 @@ fn persists_acknowledged_steering_on_the_active_interaction() {
         interaction[0]
             .pointer("/node_list/1/prompt/id")
             .and_then(Value::as_str),
-        Some(format!("{}:steering:1", interaction[0]["id"].as_str().unwrap()).as_str())
+        Some(format!("{}:input:1", interaction[0]["id"].as_str().unwrap()).as_str())
     );
 
     broker.request(json!({ "id": 6, "method": "shutdown", "params": {} }));
@@ -1423,7 +1451,7 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
     assert!(cancelled_turn.iter().any(|message| {
         message.get("event").and_then(Value::as_str) == Some("backend_event")
             && message.pointer("/payload/kind").and_then(Value::as_str)
-                == Some("timeline_interaction_cancelled")
+                == Some("timeline_exchange_cancelled")
     }));
 
     broker.request(json!({ "id": 4, "method": "state.get", "params": {} }));
@@ -1432,7 +1460,7 @@ fn full_request_admission_returns_busy_and_preserves_cancellation() {
         snapshot
             .last()
             .unwrap()
-            .pointer("/result/interaction/0/state")
+            .pointer("/result/exchange/0/state")
             .and_then(Value::as_str),
         Some("cancelled")
     );

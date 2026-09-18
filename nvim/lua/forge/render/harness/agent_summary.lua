@@ -5,8 +5,19 @@ local tool_render = require("forge.render.harness.tool")
 local active_status = {
   starting = true,
   running = true,
-  waiting = true,
+  finalizing = true,
 }
+
+local function execution_status(run, exchange_list)
+  local exchange = exchange_list and exchange_list[#exchange_list] or nil
+  if exchange and active_status[exchange.state] then return exchange.state end
+  if exchange and exchange.state then return exchange.state == "complete" and "completed" or exchange.state end
+  return run.state or "unknown"
+end
+
+function AgentSummary.status(run, exchange_list)
+  return execution_status(run, exchange_list)
+end
 
 --- Checks if an agent status string indicates active execution.
 ---@param status string? Status identifier string.
@@ -28,19 +39,14 @@ end
 ---@return integer failed_count Count of failed tool executions.
 function AgentSummary.tool_counts(interaction_list)
   local tool_count, failed_count = 0, 0
-  for _, interaction in ipairs(interaction_list or {}) do
-    for _, node in ipairs(interaction.node_list or {}) do
-      local segment = node.segment
-      if segment then
-        for _, thought in ipairs(segment.thought or {}) do
-          tool_count = tool_count + #(thought.tool or {})
-          for _, tool in ipairs(thought.tool or {}) do
-            if tool_render.failed(tool) then failed_count = failed_count + 1 end
-          end
-        end
-        if segment.active then
-          tool_count = tool_count + (segment.active.tool_count or 0)
-          failed_count = failed_count + (segment.active.failed_count or 0)
+  for _, exchange in ipairs(interaction_list or {}) do
+    for _, turn in ipairs(exchange.turn or {}) do
+      local store = turn.tool or {}
+      for _, id in ipairs(store.order or {}) do
+        local tool = (store.item or {})[id]
+        if tool then
+          tool_count = tool_count + 1
+          if tool_render.failed(tool) then failed_count = failed_count + 1 end
         end
       end
     end
@@ -56,7 +62,7 @@ end
 ---@param include_zero_tools? boolean True to include tool count when zero.
 ---@return string detail Formatted status description string.
 function AgentSummary.status_detail(run, interaction_list, now_ms, capitalize, include_zero_tools)
-  local status = run.status or "unknown"
+  local status = execution_status(run, interaction_list)
   local active = AgentSummary.is_active(status)
   local end_ms = active and now_ms or (run.updated_at_ms or now_ms)
   local duration_seconds = math.floor(math.max(0, end_ms - (run.created_at_ms or end_ms)) / 1000)

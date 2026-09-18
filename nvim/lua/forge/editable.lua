@@ -209,7 +209,8 @@ function M.guard_region(state, start, finish)
       owner = region
     end
   end
-  return owner, owner and nil or "edit crosses a read-only boundary"
+  if owner then return owner end
+  return nil, "edit crosses a read-only boundary"
 end
 
 function M.capture(state, region)
@@ -443,6 +444,16 @@ function M.attach(state, buffer, region_ranges, options)
       local finish = { row = row + old_rows, column = old_rows == 0 and column + old_column or old_column }
       local new_finish = { row = row + new_rows, column = new_rows == 0 and column + new_column or new_column }
       local owner, message = M.guard_region(state, start, finish)
+      if not owner and finish.row == #native.shadow and finish.column == 0
+        and new_finish.row == vim.api.nvim_buf_line_count(buffer) and new_finish.column == 0 then
+        local last_row = vim.api.nvim_buf_get_lines(buffer, -2, -1, false)[1]
+        local text_finish = { row = #native.shadow - 1, column = #native.shadow[#native.shadow] }
+        local text_new_finish = { row = new_finish.row - 1, column = #last_row }
+        owner, message = M.guard_region(state, start, text_finish)
+        if owner then
+          finish, new_finish = text_finish, text_new_finish
+        end
+      end
       if not owner then
         reject_edit(state, message, start, finish)
         return

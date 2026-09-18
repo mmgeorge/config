@@ -32,7 +32,8 @@ end
 ---@param width integer
 ---@param height integer
 ---@param title string|table
-function PickerWindow.resize(win, host, width, height, title)
+---@param footer string?
+function PickerWindow.resize(win, host, width, height, title, footer)
   if not vim.api.nvim_win_is_valid(win) then return end
   local bounds = picker_layout.host_bounds(host.window_list)
   local config = vim.api.nvim_win_get_config(win)
@@ -41,6 +42,8 @@ function PickerWindow.resize(win, host, width, height, title)
   config.width = width
   config.height = height
   config.title = title
+  config.footer = footer and { { " " .. footer .. " ", "ForgePickerHint" } } or ""
+  config.footer_pos = "left"
   vim.api.nvim_win_set_config(win, config)
 end
 

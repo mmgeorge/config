@@ -335,6 +335,29 @@ local ok, failure = pcall(function()
   assert_equals(vim.api.nvim_win_call(active.win, vim.fn.winsaveview).topline, 1,
     "an empty result set should reset the presentation view to its title content")
   picker.close(false)
+
+  local long_options = {}
+  for index = 1, 50 do long_options[index] = { label = "Option " .. index } end
+  local overflow_spec = {
+    owner = "overflow",
+    host = { window_list = { origin_win, composer_win }, control_win = composer_win },
+    page_list = { { id = "overflow", option_list = long_options, footer = "Enter insert  q close" } },
+  }
+  picker.open(overflow_spec)
+  active = picker._state_for_test()
+  assert_true(vim.api.nvim_win_get_config(active.win).footer[1][1]:find("Enter insert", 1, true),
+    "overflowing picker lost its visible controls")
+  assert_equals(active.frame.footer_line, nil, "overflowing picker duplicated its footer in scrollable content")
+  invoke("<Up>")
+  assert_equals(picker_state.selected_index(active.state, active.spec), 50)
+  assert_true(vim.api.nvim_win_get_config(active.win).footer[1][1]:find("q close", 1, true))
+  overflow_spec.page_list[1].option_list = { { label = "Only option" } }
+  picker.update(overflow_spec)
+  active = picker._state_for_test()
+  assert_true(active.frame.footer_line ~= nil, "short picker did not restore its inline footer")
+  assert_true(not vim.inspect(vim.api.nvim_win_get_config(active.win).footer):find("Enter insert", 1, true),
+    "short picker retained a stale border footer")
+  picker.close(false)
 end)
 
 if not ok then

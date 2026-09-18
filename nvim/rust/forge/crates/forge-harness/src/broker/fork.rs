@@ -68,6 +68,7 @@ pub fn prepare_provider_fork(
         .as_millis() as i64;
     let mut child = source.clone();
     child.id.clone_from(&target_session_id);
+    child.primary_agent_id = HarnessSession::primary_agent_id(&target_session_id);
     child.name = resolve_fork_name(params, &source.name, &existing_name_set);
     child.backend_session_id = None;
     child.provider_checkpoint_id = None;

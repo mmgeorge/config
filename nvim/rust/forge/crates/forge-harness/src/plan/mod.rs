@@ -330,7 +330,7 @@ impl PlanAcceptance {
                 },
                 PlanQuestionOption {
                     label: "Fresh context".into(),
-                    description: "execution without the planning conversation.".into(),
+                    description: "Execute the plan without the planning conversation.".into(),
                 },
             ],
             allow_freeform: false,
@@ -689,7 +689,7 @@ pub enum PlanExecutionLifecycleEvent {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanExecutionLifecycleRecord {
     pub sequence: u64,
-    pub after_interaction_id: Option<String>,
+    pub after_exchange_id: Option<String>,
     pub occurred_at_ms: i64,
     #[serde(flatten)]
     pub event: PlanExecutionLifecycleEvent,
@@ -716,10 +716,22 @@ pub struct PlanExecutionRecord {
 }
 
 impl PlanExecutionRecord {
+    /// Sum owning provider execution within a task, excluding gaps between turns.
+    pub(crate) fn task_duration_ms<'a>(&self, task_path: &str,
+        exchanges: impl Iterator<Item = &'a crate::exchange::Exchange>, end_ms: i64) -> i64 {
+        let Some(start_ms) = self.scheduler.task.iter()
+            .find(|task| task.task_path == task_path).and_then(|task| task.started_at_ms) else {
+            return 0;
+        };
+        exchanges.filter(|exchange| exchange.execution_id.as_deref() == Some(self.id.as_str()))
+            .flat_map(|exchange| &exchange.turn)
+            .fold(0i64, |duration, turn| duration.saturating_add(turn.duration_between(start_ms, end_ms)))
+    }
+
     /// Append one durable scheduler event after its causal interaction.
     pub fn append_lifecycle(
         &mut self,
-        after_interaction_id: Option<String>,
+        after_exchange_id: Option<String>,
         occurred_at_ms: i64,
         event: PlanExecutionLifecycleEvent,
     ) {
@@ -729,7 +741,7 @@ impl PlanExecutionRecord {
             .map_or(1, |record| record.sequence.saturating_add(1));
         self.lifecycle.push(PlanExecutionLifecycleRecord {
             sequence,
-            after_interaction_id,
+            after_exchange_id,
             occurred_at_ms,
             event,
         });

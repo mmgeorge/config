@@ -1,22 +1,10 @@
-local config = require("forge.infra.config")
+local keymaps = require("forge.shared.keymaps")
 local specs = require("forge.shared.command_specs")
-local popup = require("forge.infra.popup_window")
 local buffer = require("forge.buffer")
 local gutter = require("forge.gutter")
 
 local M = {}
 local window_owner = {}
-
-local function keys_for(spec, overrides)
-  local group = spec.keymap or "status"
-  local options = config.options or config.defaults
-  local configured = options.keymaps and options.keymaps[group] or {}
-  local value = configured[spec.id]
-  if value == nil then value = config.defaults.keymaps[group][spec.id] end
-  if overrides and overrides[spec.id] ~= nil then value = overrides[spec.id] end
-  if value == false or value == nil then return {} end
-  return type(value) == "table" and value or { value }
-end
 
 local function selected_rows(session)
   assert(session.status == "Applied" and not session.applying, "document changed during selection")
@@ -104,54 +92,21 @@ function M.attach(session, options)
       { buffer = session.buffer, silent = true, desc = "Copy selected source with gutters" })
   end
   handler.help = handler.help or function()
-    local line, key_width, width = {}, 0, 1
-    for _, binding in ipairs(owner.binding) do
-      key_width = math.max(key_width, vim.fn.strdisplaywidth(table.concat(binding.keys, ", ")))
-    end
-    for _, binding in ipairs(owner.binding) do
-      local keys = table.concat(binding.keys, ", ")
-      local padding = string.rep(" ", key_width - vim.fn.strdisplaywidth(keys) + 2)
-      line[#line + 1] = "  " .. keys .. padding .. binding.spec.desc
-      width = math.max(width, vim.fn.strdisplaywidth(line[#line]) + 2)
-    end
-    local help_buffer, window = popup.open({ title = "Forge Commands", relative = "editor",
-      width = math.max(1, math.min(width, vim.o.columns - 4)), height = math.max(1, math.min(#line, vim.o.lines - 4)),
-      filetype = "ForgeHelp" })
-    vim.api.nvim_buf_set_lines(help_buffer, 0, -1, true, line)
-    vim.bo[help_buffer].modifiable = false
-    vim.keymap.set("n", "q", function() popup.close(window) end, { buffer = help_buffer, silent = true, desc = "Close help" })
+    keymaps.show_bindings_help(owner.binding, "Forge Commands")
   end
-  local normal_keys = {}
+  local callbacks = {}
   for _, spec in ipairs(specs.specs) do
-    local modes = type(spec.modes) == "table" and spec.modes or { spec.modes }
-    if (not spec.views or spec.views[options.view]) and handler[spec.id] and vim.tbl_contains(modes, "n") then
-      vim.list_extend(normal_keys, keys_for(spec, options.keymaps))
-    end
-  end
-  for _, spec in ipairs(specs.specs) do
-    if (not spec.views or spec.views[options.view]) and handler[spec.id] then
-      local keys = keys_for(spec, options.keymaps)
-      if #keys > 0 then
-        owner.binding[#owner.binding + 1] = { spec = spec, keys = keys }
-        for _, key in ipairs(keys) do
-          local mapped = function()
-            if spec.id ~= "close" and spec.id ~= "help"
-              and (session.status ~= "Applied" or session.applying) then return end
-            local mode = vim.api.nvim_get_mode().mode
-            handler[spec.id](mode == "v" or mode == "V" or mode == "\22")
-          end
-          local modes = spec.modes
-          if type(modes) == "string" then modes = { modes } end
-          for _, mode in ipairs(modes) do
-            local prior = vim.api.nvim_buf_call(session.buffer, function() return vim.fn.maparg(key, mode, false, true) end)
-            owner.mapping[#owner.mapping + 1] = { key = key, mode = mode, callback = mapped, prior = prior, command = spec.id, active = true, desc = spec.desc, nowait = mode == "n" and not require("forge.shared.keymaps").is_prefix(key, normal_keys) }
-            vim.keymap.set(mode, key, mapped, { buffer = session.buffer, silent = true,
-              nowait = mode == "n" and not require("forge.shared.keymaps").is_prefix(key, normal_keys), desc = spec.desc })
-          end
-        end
+    if handler[spec.id] then
+      callbacks[spec.id] = function()
+        if spec.id ~= "close" and spec.id ~= "help"
+          and (session.status ~= "Applied" or session.applying) then return end
+        local mode = vim.api.nvim_get_mode().mode
+        handler[spec.id](mode == "v" or mode == "V" or mode == "\22")
       end
     end
   end
+  local bindings = keymaps.bind_commands(session.buffer, "status", specs.specs, callbacks, options)
+  owner.binding, owner.mapping = bindings.binding, bindings.mapping
   function owner.sync_editing()
     if not options.editable or owner.closed then return end
     local editing = options.editable()
@@ -190,35 +145,6 @@ function M.attach(session, options)
     owner.window[window] = nil
     if window_owner[window] == owner then window_owner[window] = nil end
   end
-  local function hint_winbar(window)
-    local title = options.title or "Forge"
-    local width = vim.api.nvim_win_get_width(window)
-    local total = vim.fn.strdisplaywidth(title) + 2
-    for index, entry in ipairs(hint) do
-      total = total + vim.fn.strdisplaywidth(entry.key .. " " .. entry.label) + (index > 1 and 3 or 0)
-    end
-    local narrow = total > width and type(options.narrow_title) == "string"
-    if total > width then title = options.narrow_title or "" end
-    local available = width - vim.fn.strdisplaywidth(title) - (title ~= "" and not narrow and 2 or 0)
-    local reserved = 0
-    for _, entry in ipairs(hint) do
-      if entry.id == "help" or entry.id == "close" then reserved = reserved + vim.fn.strdisplaywidth(entry.key .. " " .. entry.label) + 3 end
-    end
-    local parts = { "%#ForgeStatusLabel#", title:gsub("%%", "%%%%"), narrow and "%*" or "%*%<%=" }
-    local selected = 0
-    for _, entry in ipairs(hint) do
-      local entry_width = vim.fn.strdisplaywidth(entry.key .. " " .. entry.label)
-      local essential = entry.id == "help" or entry.id == "close"
-      if essential then reserved = reserved - entry_width - 3 end
-      if essential or entry_width + (selected > 0 and 3 or 0) + reserved <= available then
-        if selected > 0 then parts[#parts + 1] = "%#ForgeStatusHint# | %*" available = available - 3 end
-        parts[#parts + 1] = ("%%#ForgeStatusHintKey#%s%%*%%#ForgeStatusHint# %s%%*")
-          :format(entry.key:gsub("%%", "%%%%"), entry.label:gsub("%%", "%%%%"))
-        available, selected = available - entry_width, selected + 1
-      end
-    end
-    return table.concat(parts)
-  end
   local function update_winbar()
     if owner.closed or options.winbar == false or #hint == 0 then return end
     for window in pairs(owner.window) do
@@ -236,7 +162,8 @@ function M.attach(session, options)
         owner.window[window], window_owner[window] = previous, owner
       end
       if vim.wo[window].winbar == previous.value then
-        previous.value = hint_winbar(window)
+        previous.value = keymaps.render_hintbar(hint, vim.api.nvim_win_get_width(window),
+          { title = options.title or "Forge", narrow_title = options.narrow_title })
         vim.wo[window].winbar = previous.value
       end
     end
@@ -277,8 +204,6 @@ function M.attach(session, options)
     owner.mapping = {}
   end
   owner.sync_editing()
-  local clue = package.loaded["mini.clue"]
-  if clue and clue.ensure_buf_triggers then clue.ensure_buf_triggers(session.buffer) end
   return owner
 end
 

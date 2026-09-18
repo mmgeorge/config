@@ -17,10 +17,10 @@ local ok, failure = pcall(function()
   }
   cache.replace(state, {
     {
-      kind = "interaction",
+      kind = "exchange",
       id = "interaction-one",
       created_at_ms = 1,
-      interaction = { id = "interaction-one", prompt = "inspect", state = "running" },
+      exchange = { id = "interaction-one", prompt = "inspect", state = "running" },
       agent_by_id = {},
     },
     {

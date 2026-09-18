@@ -37,7 +37,7 @@ struct EntryPosition {
     blocks: usize,
 }
 
-pub struct HarnessDocument {
+pub struct TranscriptDocument {
     session_id: String,
     timeline_revision: u64,
     pub(super) document: BufferDocument,
@@ -46,7 +46,27 @@ pub struct HarnessDocument {
     pub views: DocumentViews,
 }
 
-impl HarnessDocument {
+impl TranscriptDocument {
+    /// Refresh time-dependent entries without advancing the durable timeline revision.
+    pub(super) fn refresh(
+        &mut self,
+        entry: Vec<(usize, TranscriptEntry)>,
+    ) -> Result<Vec<BufferPatch>> {
+        ensure!(self.synchronized, "transcript requires resynchronization");
+        let mut patches = Vec::new();
+        for (index, entry) in entry {
+            match self.apply_change(TranscriptChange::Replace { index, entry }) {
+                Ok(Some(patch)) => patches.push(patch),
+                Ok(None) => {}
+                Err(error) => {
+                    self.synchronized = false;
+                    return Err(error);
+                }
+            }
+        }
+        Ok(patches)
+    }
+
     pub fn initialize(
         document_id: DocumentId,
         session_id: String,
@@ -364,7 +384,7 @@ mod tests {
             id: "active".into(),
             block: vec![block("prompt", "> prompt"), block("thought", "first")],
         });
-        let mut document = HarnessDocument::initialize(
+        let mut document = TranscriptDocument::initialize(
             DocumentId("harness:session".into()),
             "session".into(),
             1,
@@ -394,7 +414,7 @@ mod tests {
 
     #[test]
     fn invalid_event_cannot_publish_a_partial_snapshot_or_accept_later_events() {
-        let mut document = HarnessDocument::initialize(
+        let mut document = TranscriptDocument::initialize(
             DocumentId("harness:session".into()),
             "session".into(),
             1,

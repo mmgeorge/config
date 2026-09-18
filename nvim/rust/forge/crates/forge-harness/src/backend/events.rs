@@ -1,4 +1,4 @@
-//! Bounded provider delivery reports saturation independently of callback return values.
+//! Bounded provider delivery waits for capacity and preserves event order.
 
 use std::{fmt, io};
 
@@ -32,7 +32,16 @@ pub fn channel() -> (BackendEventSink, BackendEventStream) {
 }
 
 impl BackendEventSink {
-    pub fn send(&self, event: BackendEvent) -> Result<(), EventDeliveryFailure> {
+    /// Waits for bounded queue capacity without treating a burst as delivery failure.
+    pub async fn send_wait(&self, event: BackendEvent) -> Result<(), EventDeliveryFailure> {
+        self.sender
+            .send_wait(event)
+            .await
+            .map_err(EventDeliveryFailure)
+    }
+
+    #[cfg(test)]
+    pub(crate) fn send(&self, event: BackendEvent) -> Result<(), EventDeliveryFailure> {
         self.sender.send(event).map_err(EventDeliveryFailure)
     }
 
@@ -79,6 +88,8 @@ mod tests {
 
     fn event(sequence: usize) -> BackendEvent {
         BackendEvent {
+            address: None,
+            turn_boundary: None,
             kind: "delta".into(),
             text: Some(sequence.to_string()),
             data: json!(sequence),
@@ -119,7 +130,52 @@ mod tests {
         let (sink, mut stream) = channel();
         let mut oversized = event(0);
         oversized.text = Some("x".repeat(forge_protocol::MAX_FRAME_BYTES));
-        assert!(sink.send(oversized).is_err());
+        assert!(sink.send_wait(oversized).await.is_err());
         assert!(stream.recv().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn burst_waits_for_capacity_and_preserves_every_event() {
+        let (sink, mut stream) = channel();
+        let producer = async move {
+            for sequence in 0..384 {
+                sink.send_wait(event(sequence)).await.unwrap();
+            }
+        };
+        let consumer = async move {
+            for sequence in 0..384 {
+                assert_eq!(stream.recv().await.unwrap().unwrap().data, json!(sequence));
+            }
+            assert!(stream.recv().await.unwrap().is_none());
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), async {
+            tokio::join!(producer, consumer);
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn closing_consumer_releases_a_waiting_producer() {
+        let (sink, stream) = channel();
+        for sequence in 0..96 {
+            sink.send_wait(event(sequence)).await.unwrap();
+        }
+        let waiting = sink.send_wait(event(96));
+        tokio::pin!(waiting);
+        assert!(
+            std::future::poll_fn(|context| {
+                std::task::Poll::Ready(std::future::Future::poll(waiting.as_mut(), context))
+            })
+            .await
+            .is_pending()
+        );
+        drop(stream);
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_secs(1), waiting)
+                .await
+                .unwrap()
+                .is_err()
+        );
     }
 }

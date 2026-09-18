@@ -484,107 +484,87 @@ local function append_active_thought(result, interaction, active, options)
   end
 end
 
---- Appends an interaction segment including thought summaries, tasks, and responses.
----@param result table Target render collection table.
----@param interaction table Interaction descriptor table.
----@param segment table Segment descriptor table.
----@param options table Render options table.
----@param defer_response? boolean True to defer rendering response line until after diff summaries.
-local function append_segment(result, interaction, segment, options, defer_response)
-  local segment_first = #result.lines + 1
-  local segment_interaction = {
-    id = interaction.id,
-    segment_id = segment.id,
-    ordinal = interaction.ordinal,
-    kind = interaction.kind,
-    state = segment.state == "complete" and "complete" or "running",
-    awaiting_input = interaction.awaiting_input,
-    thought = segment.thought or {},
-    active = segment.active,
-    task = interaction.task,
-    duration_ms = segment.duration_ms or 0,
-    token_count = segment.token_count,
-  }
-  local complete = segment.state == "complete"
-  local tool_count, failed_count = interaction_counts(segment_interaction)
-  local duration_ms = math.max(
-    segment.duration_ms or 0,
-    segment.presentation_duration_ms or 0,
-    complete and 0 or ((options.working_seconds or 0) * 1000)
-  )
-  local duration = math.floor(duration_ms / 1000)
-  local token_text = complete and format_token_count(segment.token_count) or nil
-  local summary
-  if interaction.state == "cancelled" then
-    summary = ("▸ Cancelled after %ds"):format(duration)
-  elseif interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
-    if complete and interaction.awaiting_input then
-      summary = ("▸ Planning paused after %ds"):format(duration)
-    else
-      summary = complete and ("▸ Planned for %ds"):format(duration) or ("▸ Planning for %ds"):format(duration)
+--- Indexes canonical turn content without creating a second execution model in Lua.
+---@param interaction table Exchange descriptor table.
+---@return table<string, table> turn_by_id
+local function index_turns(interaction)
+  local turn_by_id = {}
+  for _, turn in ipairs(interaction.turn or {}) do turn_by_id[turn.id] = turn end
+  return turn_by_id
+end
+
+--- Resolves a canonical message or tool reference retained by an exchange node.
+---@param turn table Provider turn descriptor table.
+---@param item table Ordered turn item reference.
+---@return table? content
+local function resolve_turn_item(turn, item)
+  if item.kind == "message" then
+    for _, message in ipairs(turn.message or {}) do
+      if message.id == item.id then return message end
     end
-  elseif interaction.kind == "plan_execution" then
-    summary = complete and ("▸ Executed plan for %ds"):format(duration)
-      or ("▸ Executing plan for %ds"):format(duration)
-  else
-    summary = complete and ("▸ Thought for %ds"):format(duration) or ("▸ Thinking for %ds"):format(duration)
+  elseif item.kind == "tool" then
+    return turn.tool and turn.tool.item and turn.tool.item[item.id] or nil
   end
+end
+
+--- Appends one exchange-level execution summary derived from all owned turns.
+---@param result table Target render collection table.
+---@param interaction table Exchange descriptor table.
+---@param options table Render options table.
+local function append_exchange_summary(result, interaction, options)
+  local complete = interaction.state ~= "running" and interaction.state ~= "finalizing"
+  local tool_count, failed_count, agent_count = 0, 0, 0
+  for _, turn in ipairs(interaction.turn or {}) do
+    for _, tool_id in ipairs((turn.tool and turn.tool.order) or {}) do
+      local tool = turn.tool.item and turn.tool.item[tool_id]
+      if tool then
+        tool_count = tool_count + 1
+        if tool_render.failed(tool) then failed_count = failed_count + 1 end
+      end
+    end
+  end
+  for _, node in ipairs(interaction.node_list or {}) do
+    if node.kind == "agent_reference" then agent_count = agent_count + 1 end
+  end
+  local duration_ms = interaction.duration_ms or 0
+  if interaction.state == "running" and interaction.execution_started_at_ms and options.now_ms then
+    duration_ms = duration_ms + math.max(0, options.now_ms - interaction.execution_started_at_ms)
+  end
+  local duration = math.floor(duration_ms / 1000)
+  local verb = complete and "Thought" or "Thinking"
+  if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
+    verb = complete and "Planned" or "Planning"
+  elseif interaction.kind == "plan_execution" then
+    verb = complete and "Executed plan" or "Executing plan"
+  elseif interaction.state == "cancelled" then
+    verb = "Cancelled"
+  end
+  local key = ("exchange:%s"):format(interaction.id or interaction.ordinal)
+  local expanded = not complete or result.expanded[key] == true
+  local summary = ("%s %s for %ds"):format(expanded and "▾" or "▸", verb, duration)
+  local token_text = complete and format_token_count(interaction.token_count) or nil
   if token_text then summary = summary .. ", " .. token_text .. " tokens" end
   if tool_count > 0 then
     summary = summary .. (", %d %s called"):format(tool_count, tool_count == 1 and "tool" or "tools")
     if failed_count > 0 then summary = summary .. (" (%d failed)"):format(failed_count) end
   end
-  local spawned_agent_count = segment.spawned_agent_count or 0
-  if spawned_agent_count > 0 then
-    summary = summary .. (", %d %s spawned"):format(
-      spawned_agent_count,
-      spawned_agent_count == 1 and "agent" or "agents"
-    )
+  if agent_count > 0 then
+    summary = summary .. (", %d %s spawned"):format(agent_count, agent_count == 1 and "agent" or "agents")
   end
-  local summary_line = #result.lines + 1
-  result.lines[summary_line] = summary
-  result.rows[summary_line] = {
+  local line = #result.lines + 1
+  result.lines[line] = summary
+  result.rows[line] = {
     kind = complete and "thought_summary" or "thinking_summary",
     interaction = interaction,
-    node_id = segment.id,
+    node_id = key,
+    expand_key = complete and key or nil,
   }
-  local summary_key = ("interaction:%s:segment:%s"):format(interaction.id or interaction.ordinal, segment.id)
-  if complete then result.rows[summary_line].expand_key = summary_key end
   result.highlights[#result.highlights + 1] = {
-    line = summary_line,
+    line = line,
     first = 0,
     last = -1,
     group = complete and "ForgeHarnessThought" or "ForgeHarnessThinking",
   }
-  local task_owns_active = task_tree.append(result, segment_interaction, options, complete, {
-    append_completed_thought = append_completed_thought,
-    append_active_thought = append_active_thought,
-  })
-  if (not complete or result.expanded[summary_key]) and not interaction.task then
-    for thought_index, thought in ipairs(segment.thought or {}) do
-      append_completed_thought(result, segment_interaction, thought, thought_index, options)
-    end
-  elseif result.expanded[summary_key] and interaction.task then
-    for thought_index, thought in ipairs(segment.thought or {}) do
-      if not thought.task_id then
-        append_completed_thought(result, segment_interaction, thought, thought_index, options)
-      end
-    end
-    task_tree.append_superseded(result, segment_interaction)
-  end
-  if segment.active and not task_owns_active then
-    append_active_thought(result, segment_interaction, segment.active, options)
-  end
-  if complete and not defer_response and type(segment.response) == "string" and segment.response ~= "" then
-    local response_line = #result.lines + 1
-    result.rows[response_line] = { kind = "response", interaction = interaction, node_id = segment.id }
-    append_timeline_response(result, segment.response)
-    result.markdown_ranges[#result.markdown_ranges + 1] = { first0 = response_line - 1, after0 = #result.lines }
-  end
-  for line = segment_first, #result.lines do
-    result.rows[line] = result.rows[line] or { kind = "segment_content", interaction = interaction }
-    result.rows[line].node_id = segment.id
-  end
 end
 
 --- Appends prompt, segment list, diff summaries, and response blocks for an interaction.
@@ -608,32 +588,47 @@ local function append_interaction(result, interaction, options, agent_by_id)
   end
   local complete = interaction.state == "complete" or interaction.state == "failed"
     or interaction.state == "cancelled" or interaction.state == "rolled_back"
-    or interaction.state == "superseded"
-  local deferred_response = nil
-  local final_response_segment_id = nil
-  if complete then
-    for node_index = #(interaction.node_list or {}), 1, -1 do
-      local node = interaction.node_list[node_index]
-      if node.kind == "main_segment" and node.segment
-        and type(node.segment.response) == "string" and node.segment.response ~= ""
-      then
-        final_response_segment_id = node.segment.id
-        break
-      end
-    end
-  end
+    or interaction.state == "superseded" or interaction.state == "interrupted"
+  local turn_by_id = index_turns(interaction)
+  local deferred_response = {}
+  append_exchange_summary(result, interaction, options)
+  local expanded = not complete or result.expanded[("exchange:%s"):format(interaction.id or interaction.ordinal)] == true
   for _, node in ipairs(interaction.node_list or {}) do
-    if node.kind == "main_segment" and node.segment then
-      local defer_response = complete and node.segment.id == final_response_segment_id
-      append_segment(result, interaction, node.segment, options, defer_response)
-      if defer_response then deferred_response = node.segment end
-    elseif node.kind == "steering_prompt" and node.prompt then
+    local node_turn = node.turn_id and turn_by_id[node.turn_id]
+    local node_content = node_turn and node.item and resolve_turn_item(node_turn, node.item)
+    local final_response = complete and node_content and node.item.kind == "message"
+      and node_content.kind == "assistant" and node_content.delivery == "final"
+    if expanded or final_response then
+    if node.kind == "turn_content" and node.item then
+      local turn = turn_by_id[node.turn_id]
+      local content = turn and resolve_turn_item(turn, node.item) or nil
+      if content and node.item.kind == "message" and content.kind == "assistant" then
+        if complete and content.delivery == "final" then
+          deferred_response[#deferred_response + 1] = { id = node.id, text = content.text }
+        else
+          local first = #result.lines + 1
+          append_wrapped(result, content.text, "↳ ", "  ", "ForgeHarnessCommentary", options.content_width)
+          for line = first, #result.lines do
+            result.rows[line] = { kind = "commentary", interaction = interaction, node_id = node.id }
+          end
+        end
+      elseif content and node.item.kind == "tool" then
+        local first = #result.lines + 1
+        append_tool(result, content, ("exchange:%s:turn:%s"):format(interaction.id, node.turn_id), first,
+          options.content_width)
+        for line = first, #result.lines do
+          result.rows[line].interaction = interaction
+          result.rows[line].node_id = node.id
+        end
+      end
+    elseif node.kind == "exchange_input" and node.prompt then
       local first = #result.lines + 1
-      append_wrapped(result, node.prompt.text, "▸ ", "  ", "ForgeHarnessPrompt", options.content_width)
+      local label = node.prompt.intent == "clarification" and "Clarification" or "Steering"
+      append_wrapped(result, label .. ": " .. node.prompt.text, "▸ ", "  ", "ForgeHarnessPrompt", options.content_width)
       result.prompt_lines[#result.prompt_lines + 1] = first
       for line = first, #result.lines do
         result.rows[line] = {
-          kind = "steering_prompt",
+          kind = "exchange_input",
           interaction = interaction,
           steering_input = node.prompt,
           node_id = node.prompt.id,
@@ -663,8 +658,12 @@ local function append_interaction(result, interaction, options, agent_by_id)
         expand_key = artifact_key,
       })
     elseif node.kind == "agent_reference" and node.agent then
-      local agent = agent_by_id and agent_by_id[node.agent.agent_run_id]
+      local agent = agent_by_id and (agent_by_id[node.agent.id] or agent_by_id[node.agent.child_agent_id])
       if agent then
+        agent = vim.deepcopy(agent)
+        agent.exchange = vim.tbl_filter(function(exchange)
+          return exchange.id == node.agent.child_exchange_id
+        end, agent.exchange or {})
         local first = #result.lines + 1
         agent_event.append(result, agent, options, 0, node.agent.id)
         for line = first, #result.lines do
@@ -672,6 +671,7 @@ local function append_interaction(result, interaction, options, agent_by_id)
           result.rows[line].node_id = node.agent.id
         end
       end
+    end
     end
   end
   if complete then
@@ -714,19 +714,21 @@ local function append_interaction(result, interaction, options, agent_by_id)
         })
       end
     end
-    if deferred_response then
+    if #deferred_response > 0 then
       local response_line = #result.lines + 1
       result.rows[response_line] = {
         kind = "response",
         interaction = interaction,
-        node_id = deferred_response.id .. ":response",
+        node_id = deferred_response[1].id .. ":response",
       }
-      append_timeline_response(result, deferred_response.response)
+      append_timeline_response(result, table.concat(vim.tbl_map(function(response)
+        return response.text
+      end, deferred_response), "\n"))
       for line = response_line + 1, #result.lines do
         result.rows[line] = {
           kind = "response_body",
           interaction = interaction,
-          node_id = deferred_response.id .. ":response",
+          node_id = deferred_response[1].id .. ":response",
         }
       end
       result.markdown_ranges[#result.markdown_ranges + 1] = {
@@ -757,8 +759,8 @@ function M.build(interactions, options)
     expanded = expanded,
   }
   for _, entry in ipairs(interactions or {}) do
-    if entry.kind == "interaction" and entry.interaction then
-      append_interaction(result, entry.interaction, options, entry.agent_by_id)
+    if entry.kind == "exchange" and entry.exchange then
+      append_interaction(result, entry.exchange, options, entry.agent_by_id)
     elseif entry.kind == "plan_lifecycle" then
       plan_event.append(result, entry, { append_response = append_response })
     elseif entry.kind == "plan_execution" then

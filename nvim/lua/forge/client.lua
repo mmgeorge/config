@@ -782,7 +782,7 @@ function M.resolve_lease_conflict(action, conflict, callback)
     else callback(nil, "Unknown Harness lease recovery action") end
     return
   end
-  local initialize_options = action == "retry" and nil or { lease_conflict_action = "new" }
+  local initialize_options = action ~= "retry" and { lease_conflict_action = "new" } or nil
   M.start_harness(function(result, start_error, error_detail)
     if start_error or action ~= "fork" then callback(result, start_error, error_detail) return end
     M.request("session.fork", { session_id = conflict.session_id }, callback)

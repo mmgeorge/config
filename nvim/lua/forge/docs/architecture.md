@@ -471,6 +471,15 @@ preempt retained transport activity. Active retries expose `RetryingPlanGenerati
 expose `PlanningFailed` with `/plan retry` and `/plan cancel` as the only recovery actions. A submitted plan therefore
 cannot reopen a stale question picker, and a failed generation turn cannot roll consumed feedback backward.
 
+Harness response text is published before fenced-code syntax analysis. `MarkdownRenderer` retains
+code languages, literal rows, and their rendered byte positions alongside the Markdown projection.
+`SessionPresentation` owns these sources independently from navigation actions. Its `TranscriptSyntax`
+jobs analyze saved diffs and Markdown code through the shared syntax engine outside the presentation
+lock. Completion must match the open document and retained source before adding viewport decorations.
+Replacement, reflow, and close invalidate obsolete work. Unknown fence languages retain plain text.
+Code source and coordinate maps count toward the 64 MiB presentation limit. Each syntax job has a
+10-second deadline and a 16 MiB result limit, and each decorated block admits at most 8192 spans.
+
 Each Rust session controller owns one `TimelineStream`. The stream compares stable top-level entry identities, advances
 its own monotonic revision, and emits ordered `insert`, `replace`, and `remove` operations. Provider lifecycle events
 remain transport evidence for approvals, context metadata, and diagnostics. They no longer mutate transcript records
@@ -1488,6 +1497,16 @@ press the commit key
 
 **Persist goals without hiding user prompts**
 
+Codex goal notifications use one owning-thread state decoder for both reader lifetime and
+`TurnEvidence`. Native goals preserve complete, paused, blocked, usage-limited, budget-limited,
+and cleared outcomes before considering tool activity or continuation budgets. Suspended goals
+require explicit resume. Harness-owned plan execution ignores native goal state and retains its
+own task-report and continuation policy. Pause acknowledgment accepts an already-paused goal.
+Native resume activates the goal through the exchange's provider reader and adopts the turn
+that Codex starts automatically. It does not also send `turn/start`. Preparation traffic cannot
+publish exchange activity. Explicit turn admission waits for the returned provider turn ID,
+filters prior main-turn events, and retains ongoing child activity within the same exchange.
+
 ```
 backend turn completes
   └─ GoalRecord observes { tool call, workspace change, structured/native terminal state }
@@ -1502,7 +1521,7 @@ backend turn completes
 
 ```
 /undo → newest-first interaction picker → confirmation picker
-  └─ interaction.rollback revalidates HEAD, index digest, and workspace digest
+  └─ exchange.rollback revalidates HEAD, index digest, and workspace digest
        ├─ restore worktree-only CAS objects or refuse without changing files
        └─ success → reconcile Harness → restore the selected prompt to HarnessInput
 ```
@@ -1510,7 +1529,7 @@ backend turn completes
 ### Harness broker boundary
 
 The feature-first Rust crate lives at `nvim/rust/forge/crates/forge-harness`. Its directories
-name capabilities rather than layers: `broker`, `session`, `plan`, `goal`, `interaction`, `timeline`,
+name capabilities rather than layers: `broker`, `session`, `plan`, `goal`, `exchange`, `turn`, `timeline`,
 `checkpoint`, `backend`, `storage`, `workspace`, `protocol`, and `control_tools`. `Backend` defines
 the complete provider contract once, while `CodexBackend` and `CopilotBackend` own their private
 transports and expose capability values that drive broker and editor behavior. `CodexJsonRpc`
@@ -1529,12 +1548,22 @@ session creation and `set_model`, while Codex exposes only the controls returned
 sees the prompt. `SkillDefinition` normalizes discovery and enabled state, while each `McpDefinition`
 owns its tool inventory so callers never issue a second tool-list operation against the backend.
 
-The broker runs once per Neovim process over JSONL stdio. Provider events cross a live
-channel into `TimelineReducer`, which owns one active thought inside the current `MainSegment`.
-`InteractionRecord` persists an ordered `InteractionNode` list containing main segments,
-child-agent references, and acknowledged steering prompts. Assistant commentary establishes thought
-boundaries. Tool events that arrive first create a synthetic `Working` thought. Stable tool
-identities merge start, output, and completion events into one completed tool record.
+The broker runs once per Neovim process over JSONL stdio. An `Agent` owns persistent provider
+identity, an `Exchange` owns one admitted request through resolution, and each actual provider
+invocation creates a `Turn` inside that exchange. `ExchangeNode` preserves the order of turn
+content, delegations, acknowledged clarification or steering, plan resolution, and artifact changes.
+Session creation commits the primary Agent together with the session. A fork assigns a new primary
+Agent identity. Delegation admission similarly commits the parent reference and queued child Exchange
+together, before provider start evidence activates the child. A Delegation always projects its named
+child Exchange, so later reuse of the Agent cannot change historical status.
+
+Mode restart interrupts provider Turns and pauses the existing Exchange. Resumption preserves its
+request, plan and goal associations, and initial checkpoint. Cancellation retains provider delivery
+while cleanup awaits terminal evidence. A 30-second cleanup failure remains retryable, with the
+Exchange finalizing and new request admission blocked. The terminal checkpoint and Exchange outcome
+commit together. Rollback changes history disposition while preserving execution outcomes.
+
+Stable tool identities merge start, output, and completion events into one canonical tool record.
 Codex `mcpToolCall` items follow that same path. `CodexJsonRpc` converts their app-server
 `server`, `tool`, and compact JSON arguments into one `server.tool(arguments)` title. Before that
 title enters durable timeline state, the transport recursively replaces values named `token`,
@@ -1543,8 +1572,8 @@ title enters durable timeline state, the transport recursively replaces values n
 `[REDACTED]`. It does not guess from value shape, preserving useful hashes and identifiers.
 `item/mcpToolCall/progress` replaces mutable previews, while completed result JSON is pretty
 printed before rendering. MCP payload details stop at the Codex transport boundary, so
-`ToolActivity`, `TimelineReducer`, and the Lua tree continue to represent every provider action as
-a generic tool.
+`ToolActivity`, `Turn`, and the Rust timeline projection represent every provider action as a
+generic tool.
 
 `trace::TraceStore` owns opt-in protocol diagnostics independently from timeline persistence. It
 stores the process-global enabled setting beside the Harness data root and appends unredacted JSONL
@@ -1554,15 +1583,15 @@ records to `harness-trace.jsonl` without an in-memory retention buffer. Every re
 and controls tracing through broker RPC methods. `:ForgeHarnessLog clear` remains the only retention
 operation.
 
-The Codex `CodexTurnCoordinator` treats one user request as a logical interaction that may outlive
+The Codex `CodexTurnCoordinator` treats one user request as an exchange that may outlive
 its first parent app-server turn. App-server can return a provisional ID from `turn/start`, then
 publish the authoritative provider ID through same-thread `turn/started`, especially after native
 goal activation. The coordinator adopts that notification ID before matching `turn/completed`, so
-the logical interaction terminates instead of waiting on an ID app-server never completes. It
+the exchange terminates instead of waiting on an ID app-server never completes. It
 retains the session's JSON-RPC connection while descendant threads remain active, accepts steering
 as another parent turn on the same thread, and starts a bounded synthesis turn after the final child
-completes. Child lifecycle updates replace `AgentRun` state behind the existing `AgentReference`, so
-they never move the child row. Codex `subAgentActivity` values enter that lifecycle only for explicit
+completes. Child lifecycle updates change the child agent's exchange behind the existing
+`AgentReference`, so they never move the child row. Codex `subAgentActivity` values enter that lifecycle only for explicit
 start or terminal states. Directed `interacted` activity carries messages between agents without
 creating a run, and the descendant tracker rejects the parent thread identity unconditionally.
 `ActiveWait` drives only the current
@@ -1590,8 +1619,8 @@ history while preserving the quick-regret workflow for a genuinely output-free t
 `turn.restart` uses that same out-of-band lane for an execution-mode change. Shift-Tab records the
 target mode in the Harness winbar, interrupts the active provider turn, persists the mode after
 the cancellation settles, then resumes the cancelled interaction on the retained provider
-conversation. The interrupted segment remains durable and the resumed provider work appends the
-next `MainSegment`, so one user action keeps one interaction checkpoint and one rollback boundary.
+conversation. The interrupted turn remains durable and the resumed provider work appends another
+`Turn` to the same `Exchange`, so one user action keeps one checkpoint and one rollback boundary.
 Codex exposes the submitted app-server thread for resumption, while Copilot exposes its retained
 SDK session. A restart failure preserves the partial transcript, keeps the selected execution mode,
 and notifies the user instead of silently replaying the original prompt.
@@ -2051,7 +2080,7 @@ because those notifications can precede validation or replay a rejected call aft
 A separate accepted-request identity set keeps successful provider request replays idempotent
 without allowing rejected requests to reserve that identity.
 The question tool also works during ordinary chat, goal, and execution turns. Those questions
-persist on their owning `InteractionRecord`, while planning questions remain on `PlanRecord`.
+persist on their owning `Exchange`, while planning questions remain on `PlanRecord`.
 `BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
 answer, skip, Ask, and continue reuse the shared bottom picker without creating a plan artifact.
 Submitting the review page consumes that question set before the provider continuation starts.
@@ -2260,10 +2289,10 @@ for that session. Git checkpoints include tracked and nonignored untracked files
 ignored files, and never mutate the index or history during rollback.
 
 Harness subagents follow the same Rust-state and Lua-presentation split. `AgentRegistry` owns
-Codex definition discovery, repeated run instances, provider thread identity, lifecycle state,
-parent interaction identity, and durable child turns. Every user-submitted parent or child interaction owns one Git baseline
-and terminal snapshot, while automatic provider child work remains inside its parent interaction.
-Child turns reuse `InteractionRecord`, `TimelineReducer`, and the shared interaction-tree renderer.
+Codex definition discovery, persistent agent identities, provider thread identity, lifecycle state,
+and transient execution addresses. `Delegation` owns the immutable parent exchange and turn link,
+the task, and the child exchange identity. Every parent or child exchange owns one Git baseline and
+terminal snapshot. Child turns reuse `Exchange`, `Turn`, and the shared Rust timeline projection.
 Definition discovery merges built-ins, `CODEX_HOME/agents`, and workspace `.codex/agents` with
 workspace definitions taking precedence. The home-directory `.codex/agents` path supplies the
 personal fallback when `CODEX_HOME` is unavailable.
@@ -2898,7 +2927,7 @@ Git allocations, allocator overhead, or memory retained after receipt adoption.
 
 The host passes its repository store into the shared Harness runtime, and every session controller
 retains that same store. Standalone Harness construction creates its own store with the centralized
-default limits. `interaction.rollback` now acquires the admitted worktree's index and file scopes
+default limits. `exchange.rollback` now acquires the admitted worktree's index and file scopes
 plus its shared-reference scope before executing checkpoint source validation or filesystem writes.
 
 `CheckpointRestore` retains the exact expected and target checkpoint records, repository lease,

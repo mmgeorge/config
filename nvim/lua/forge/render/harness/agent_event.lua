@@ -30,31 +30,28 @@ local function append_interaction_detail(result, interaction, width, indent)
   local thought_prefix = string.rep(" ", indent) .. "↳ "
   local continuation_prefix = string.rep(" ", indent + 2)
   local item_prefix = string.rep(" ", indent + 2)
+  local turn_by_id = {}
+  for _, turn in ipairs(interaction.turn or {}) do turn_by_id[turn.id] = turn end
   for _, node in ipairs(interaction.node_list or {}) do
-    local segment = node.segment
-    if segment then
-      for _, thought in ipairs(segment.thought or {}) do
-        append_wrapped(result, thought.text, thought_prefix, continuation_prefix, width)
-        local count = #(thought.tool or {})
-        if count > 0 then
-          result.lines[#result.lines + 1] = item_prefix
-            .. ("▸ Ran %d %s"):format(count, count == 1 and "tool" or "tools")
+    if node.kind == "turn_content" and node.item then
+      local turn = turn_by_id[node.turn_id]
+      if turn and node.item.kind == "message" then
+        local message = vim.iter(turn.message or {}):find(function(candidate) return candidate.id == node.item.id end)
+        if message and message.kind == "assistant" then
+          local prefix = message.delivery == "final" and (string.rep(" ", indent) .. "▸ ") or thought_prefix
+          for line_index, line in ipairs(vim.split(message.text, "\n", { plain = true })) do
+            local line_prefix = line_index == 1 and prefix or continuation_prefix
+            result.lines[#result.lines + 1] = line_prefix .. line
+          end
+        end
+      elseif turn and node.item.kind == "tool" then
+        local tool = turn.tool and turn.tool.item and turn.tool.item[node.item.id]
+        if tool then
+          result.lines[#result.lines + 1] = item_prefix .. "▸ Ran 1 tool"
         end
       end
-      if segment.active then
-        append_wrapped(result, segment.active.text, thought_prefix, continuation_prefix, width)
-        local count = segment.active.tool_count or 0
-        if count > 0 then
-          result.lines[#result.lines + 1] = item_prefix
-            .. ("▸ Running %d %s"):format(count, count == 1 and "tool" or "tools")
-        end
-      end
-      if type(segment.response) == "string" and segment.response ~= "" then
-        for line_index, line in ipairs(vim.split(segment.response, "\n", { plain = true })) do
-          local prefix = line_index == 1 and (string.rep(" ", indent) .. "▸ ") or continuation_prefix
-          result.lines[#result.lines + 1] = prefix .. line
-        end
-      end
+    elseif node.kind == "exchange_input" and node.prompt then
+      append_wrapped(result, node.prompt.text, thought_prefix, continuation_prefix, width)
     end
   end
 end
@@ -70,12 +67,12 @@ function M.append(result, entry, options, indent, node_id)
   indent = indent or 0
   local run = entry.run or {}
   local label = agent_summary.label(run)
-  local status = run.status or "unknown"
+  local status = agent_summary.status(run, entry.exchange)
   local key = "agent_lifecycle:" .. tostring(node_id or entry.id or run.id)
   local ended = status == "completed" or status == "failed" or status == "interrupted" or status == "closed"
   local status_text = agent_summary.status_detail(
     run,
-    entry.interaction,
+    entry.exchange,
     options.now_ms or run.updated_at_ms or 0,
     false,
     false
@@ -97,8 +94,8 @@ function M.append(result, entry, options, indent, node_id)
     group = ended and "ForgeHarnessThought" or "ForgeHarnessThinking",
   }
   if not result.expanded[key] then return end
-  for _, interaction in ipairs(entry.interaction or {}) do
-    append_interaction_detail(result, interaction, options.content_width, indent + 2)
+  for _, exchange in ipairs(entry.exchange or {}) do
+    append_interaction_detail(result, exchange, options.content_width, indent + 2)
   end
   for _, child in ipairs(entry.agent or {}) do
     M.append(result, child, options, indent + 2)

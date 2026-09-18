@@ -1,4 +1,3 @@
-use forge_harness::agent::AgentRunStatus;
 use forge_harness::backend::codex::CodexBackend;
 use forge_harness::backend::{
     Backend, BackendCatalogRequest, BackendForkRequest, BackendInput, BackendLaunch,
@@ -290,7 +289,10 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
         fs::read_to_string(repository.path().join("harness-integration.txt")).unwrap(),
         "verified\n"
     );
-    assert!(executed.evidence.structured_complete || executed.evidence.native_complete);
+    assert!(
+        executed.evidence.structured_complete
+            || executed.evidence.native_state == Some(forge_harness::goal::GoalState::Complete)
+    );
 
     execute.backend_session_id = executed.backend_session_id;
     eprintln!("codex_cli stage: goal pause started");
@@ -491,25 +493,34 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
     );
     let run = &snapshot.agent.run[0];
     assert_eq!(run.definition, "local-code-explorer");
-    assert_eq!(run.status, AgentRunStatus::Completed);
-    assert!(run.parent_interaction_id.is_some());
+    assert_eq!(run.state, forge_harness::agent::AgentState::Ready);
     assert!(run.provider_thread_id.is_some());
     assert_eq!(
-        snapshot.agent.turn.len(),
+        snapshot.agent.exchange.len(),
         1,
         "the child timeline must persist under its run"
     );
     let parent = snapshot
-        .interaction
+        .exchange
         .iter()
-        .find(|interaction| Some(&interaction.id) == run.parent_interaction_id.as_ref())
+        .find(|exchange| {
+            exchange.node_list.iter().any(|node| {
+                matches!(
+                    node,
+                    forge_harness::exchange::ExchangeNode::AgentReference { agent }
+                        if agent.child_agent_id == run.id
+                )
+            })
+        })
         .expect("the child run must reference its spawning parent interaction");
-    assert!(parent.node_list.iter().any(|node| match node {
-        forge_harness::interaction::InteractionNode::MainSegment { segment } =>
-            segment.response.as_deref().is_some_and(|response| {
-                response.contains("Broker child lifecycle")
-                    || response.contains("# Broker child lifecycle")
-            }),
-        _ => false,
-    }));
+    assert!(
+        parent
+            .turn
+            .iter()
+            .flat_map(|turn| turn.messages())
+            .any(|message| {
+                message.text().contains("Broker child lifecycle")
+                    || message.text().contains("# Broker child lifecycle")
+            })
+    );
 }
