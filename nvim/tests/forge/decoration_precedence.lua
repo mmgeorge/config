@@ -39,6 +39,43 @@ local succeeded, failure = xpcall(function()
   end
   gutter.highlight = original_highlight
   decorations.detach(session)
+
+  local captures = { 'ForgeAddBg', 'ForgeDeleteBg', 'ForgeInlineAddBg', 'ForgeInlineDeleteBg', 'String', 'RenderMarkdownCode' }
+  local expected = { true, true, false, false, false, true }
+  local backgrounds = {}
+  for index, capture in ipairs(captures) do
+    backgrounds[index] = { range = { start = { row = 0, column = 0 }, ['end'] = { row = 1, column = 0 } },
+      capture = capture, priority = 90 }
+  end
+  entry.metadata.visible_decoration = backgrounds
+  decorations.prepare(entry)
+  decorations.attach(session)
+  gutter.highlight = function() end
+  emitted = {}
+  vim.api.nvim_buf_set_extmark = function(_, _, _, _, options) emitted[#emitted + 1] = options end
+  provider.on_line(nil, 1000, session.buffer, 0)
+  for index, options in ipairs(emitted) do
+    assert(options.hl_eol == expected[index], 'viewport background width changed for ' .. captures[index])
+    assert(options.priority == 90, 'background width changed decoration precedence')
+  end
+  assert(#emitted == #captures)
+  gutter.highlight = original_highlight
+  decorations.detach(session)
+  vim.api.nvim_buf_set_extmark = original_extmark
+
+  local replica = require('forge.buffer')
+  local persistent = replica.open('full-width-diff')
+  local text = { 'short', '', string.rep('wrapped code ', 20) }
+  local metadata = { decoration = backgrounds, target = {}, editable_region = {} }
+  assert(replica.apply_snapshot(persistent, { document = persistent.document, revision = 0,
+    block = { { id = 'diff', text = text, metadata = metadata } } }).kind == 'Applied')
+  for index, handle in ipairs(persistent.marks.diff) do
+    local mark = vim.api.nvim_buf_get_extmark_by_id(persistent.buffer, persistent.namespace, handle, { details = true })
+    assert((mark[3].hl_eol or false) == expected[index], 'persistent background width changed for ' .. captures[index])
+  end
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(persistent.buffer, 0, -1, false), text),
+    'background rendering inserted padding into source text')
+  replica.close(persistent)
 end, debug.traceback)
 vim.api.nvim_buf_set_extmark = original_extmark
 if not succeeded then

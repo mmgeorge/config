@@ -1615,6 +1615,18 @@ function M.steer_submit()
   submit_immediate(state, text, true)
 end
 
+---Queue a follow-up independently of active waits and the selected child timeline.
+function M.queue_submit()
+  local state = harness_state()
+  local text = composer_text(state.composer_buf)
+  if text == "" then return end
+  prompt_history.record(text)
+  state.queue[#state.queue + 1] = text
+  set_composer_text(state.composer_buf, "")
+  M.refresh_winbar()
+  M.drain()
+end
+
 function M.edit_last_queued()
   local state = harness_state()
   local queued = table.remove(state.queue)
@@ -2015,6 +2027,7 @@ end
 function M.command_set()
   local set = command_set.new()
   command_set.register(set, "submit", M.submit)
+  command_set.register(set, "queue", M.queue_submit)
   command_set.register(set, "steer", M.steer_submit)
   command_set.register(set, "cancel", M.cancel_turn)
   command_set.register(set, "edit_queued", M.edit_last_queued)

@@ -50,7 +50,7 @@ local success, failure = xpcall(function()
   assert(vim.wait(1000, function() return state.presentation and state.presentation.ready end))
   assert(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)[1] == "Native transcript")
   assert(vim.wo[state.transcript_win].breakindent, "native attachment discarded Harness continuation indentation")
-  assert(vim.wo[state.composer_win].winbar:find("send", 1, true), "composer has no send hint")
+  assert(vim.wo[state.composer_win].winbar:find("submit", 1, true), "composer has no submit hint")
   state.busy = true
   controller.refresh_winbar()
   assert(vim.wo[state.composer_win].winbar:find("queue", 1, true), "busy composer has no queue hint")
@@ -180,6 +180,15 @@ local success, failure = xpcall(function()
   state.composer_buf = vim.api.nvim_create_buf(false, true)
   state.composer_win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(state.composer_win, state.composer_buf)
+  state.busy, state.active_wait, state.selected_agent_run_id = true, {}, "child"
+  state.queue = {}
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "explicit follow-up" })
+  require("forge.shared.keymaps").setup_view_keymaps(state.composer_buf, "harness", controller.command_set())
+  vim.fn.maparg("<C-q>", "i", false, true).callback()
+  assert(vim.deep_equal(state.queue, { "explicit follow-up" }), "queue key steered an active wait or selected child")
+  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
+  assert(vim.fn.maparg("<C-s>", "i", false, true).desc == "Submit the composer")
+  state.active_wait = nil
   state.selected_agent_run_id = nil
   state.busy = true
   state.queue = { "keep queued work" }

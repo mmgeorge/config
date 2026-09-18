@@ -62,6 +62,7 @@
 
 ---@class ForgeHarnessKeymapConfig
 ---@field submit ForgeKeymap
+---@field queue ForgeKeymap
 ---@field steer ForgeKeymap
 ---@field cancel ForgeKeymap
 ---@field edit_queued ForgeKeymap
@@ -242,7 +243,8 @@ M.defaults = {
     },
     harness = {
       submit = "<C-s>",
-      steer = "<C-q>",
+      queue = "<C-q>",
+      steer = false,
       cancel = "<C-c>",
       edit_queued = "<M-s>",
       toggle_mode = "<S-Tab>",

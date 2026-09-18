@@ -10,22 +10,22 @@ local ok, failure = xpcall(function()
       keymaps.view_hint_entries("harness", commands, state, "composer"), width or 140),
       { use_winbar = true, maxwidth = width or 140 }).str
   end
-  assert(display({}):find("<C-s> send", 1, true))
+  assert(display({}):find("<C-s> submit", 1, true))
   assert(display({}):find("? help (normal)", 1, true))
   local busy = { busy = true, capability = { native_steer = true }, queue = { "next" } }
   local text = display(busy)
-  for _, expected in ipairs({ "<C-s> queue", "<C-q> steer", "<C-c> cancel", "<M-s> edit queued" }) do
+  for _, expected in ipairs({ "<C-s> submit", "<C-q> queue", "<C-c> cancel", "<M-s> edit queued" }) do
     assert(text:find(expected, 1, true), text)
   end
-  assert(display(busy, 50):find("<C-q> steer", 1, true))
+  assert(display(busy, 50):find("<C-q> queue", 1, true))
   busy.active_wait = {}
-  assert(display(busy):find("<C-s> steer", 1, true))
+  assert(display(busy):find("<C-s> submit", 1, true))
   busy.selected_agent_run_id = "child"
-  assert(display(busy):find("<C-s> steer child", 1, true))
+  assert(display(busy):find("<C-s> submit", 1, true))
   config.options.keymaps.harness.submit = "<F5>"
-  config.options.keymaps.harness.steer = false
+  config.options.keymaps.harness.queue = false
   text = display(busy)
-  assert(text:find("<F5> steer child", 1, true))
+  assert(text:find("<F5> submit", 1, true))
   assert(not text:find("<C-q>", 1, true))
   keymaps.setup_view_keymaps(buffer, "harness", commands)
   vim.api.nvim_buf_call(buffer, function()

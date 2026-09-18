@@ -4,6 +4,13 @@ local sessions = setmetatable({}, { __mode = "v" })
 local namespace = vim.api.nvim_create_namespace("forge.visible.decorations")
 local code_info = {}
 
+---Identify background captures that fill the display row beyond its text.
+---@param capture string
+---@return boolean
+function M.full_width(capture)
+  return capture == "ForgeAddBg" or capture == "ForgeDeleteBg" or capture == "RenderMarkdownCode"
+end
+
 local function overlay_chunks(overlay)
   local language = overlay.capture:match("^RenderMarkdownCodeInfo:(.+)$")
   if not language then return { { overlay.text, overlay.capture } } end
@@ -38,7 +45,7 @@ local function emit(tree, buffer, row, relative)
     vim.api.nvim_buf_set_extmark(buffer, namespace, row, span.range.start.row == relative and span.range.start.column or 0, {
       end_row = finish.row > relative and row + 1 or row,
       end_col = finish.row > relative and 0 or finish.column,
-      hl_group = span.capture, hl_eol = span.capture == "RenderMarkdownCode",
+      hl_group = span.capture, hl_eol = M.full_width(span.capture),
       priority = span.priority, ephemeral = true,
     })
   end

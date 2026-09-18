@@ -85,12 +85,10 @@ M.hint_command_ids_by_view = {
 ---@type table<string, ForgeStatusCommandSpec[]>
 M.view_specs = {
   harness = {
-    { id = "submit", label = "send", desc = "Send the composer, queue while busy, or steer the selected child", modes = { "n", "i" }, pinned = true,
-      hints = { composer = function(state)
-        if state.selected_agent_run_id then return "steer child" end
-        if not state.busy then return "send" end
-        return state.active_wait and state.capability and state.capability.native_steer and "steer" or "queue"
-      end } },
+    { id = "submit", label = "submit", desc = "Submit the composer", modes = { "n", "i" }, pinned = true,
+      hints = { composer = function() return "submit" end } },
+    { id = "queue", label = "queue", desc = "Queue the composer as the next prompt", modes = { "n", "i" }, pinned = true,
+      hints = { composer = function() return "queue" end } },
     { id = "steer", label = "steer", desc = "Send the composer into the active provider turn", modes = { "n", "i" }, pinned = true,
       hints = { composer = function(state) if state.busy and state.capability and state.capability.native_steer then return "steer" end end } },
     { id = "cancel", label = "cancel", desc = "Cancel the active Harness turn", modes = { "n", "i" }, pinned = false,

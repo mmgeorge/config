@@ -340,7 +340,8 @@ local function install_metadata(session, prepared, replace_all)
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
           start_row + range.start.row, range.start.column, {
             end_row = start_row + range["end"].row, end_col = range["end"].column,
-            hl_group = decoration.capture, priority = decoration.priority, strict = true,
+            hl_group = decoration.capture, hl_eol = decorations.full_width(decoration.capture),
+            priority = decoration.priority, strict = true,
           })
       end
       for _, gutter in ipairs(entry.metadata.gutter or {}) do
