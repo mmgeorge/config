@@ -15,7 +15,7 @@ end
 ---@return boolean
 function M.should_present(state)
   local key = M.key(state.active_elicitation)
-  return key ~= nil and key ~= state.presented_question_key
+  return not state.busy and key ~= nil and key ~= state.presented_question_key
 end
 
 ---@param state ForgeHarnessPresentationState

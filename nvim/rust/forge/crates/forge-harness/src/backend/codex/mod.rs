@@ -20,7 +20,7 @@ use tokio::sync::{Mutex, Notify};
 
 mod json_rpc;
 mod process;
-mod recap;
+mod text_generation;
 mod runtime;
 mod security;
 mod turn_coordinator;
@@ -827,17 +827,19 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
-    async fn recap(
+    async fn generate_text(
         &self,
         request: BackendCatalogRequest,
+        purpose: super::TextGeneration,
         model: &str,
         history: &str,
     ) -> Result<String> {
         let (mut process, mut output) = self.catalog_process(&request).await?;
-        recap::generate(
+        text_generation::generate(
             &mut process,
             &mut output,
             &request.workspace,
+            purpose,
             model,
             history,
         )

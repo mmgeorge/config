@@ -26,6 +26,7 @@ local view_group = vim.api.nvim_create_augroup("ForgePopupView", { clear = false
 ---@field cursorline? boolean
 ---@field wrap? boolean
 ---@field linebreak? boolean
+---@field winfixbuf? boolean
 ---@field zindex? integer
 
 ---@type table<integer, ForgePopupOrigin>
@@ -111,6 +112,7 @@ function M.open(options)
   }
   if relative == "win" then window_config.win = options.win or options.parent_win end
   local popup_win = vim.api.nvim_open_win(buf, false, window_config)
+  vim.wo[popup_win].winfixbuf = options.winfixbuf == true
   origin_by_window[popup_win] = origin
   vim.wo[popup_win].cursorline = options.cursorline == true
   vim.wo[popup_win].wrap = options.wrap == true

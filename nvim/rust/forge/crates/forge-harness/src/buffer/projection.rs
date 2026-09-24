@@ -22,6 +22,9 @@ use super::transcript::TranscriptRenderer;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TranscriptAction {
+    Question {
+        question_set_id: String,
+    },
     Tool {
         call_id: String,
     },
@@ -271,9 +274,17 @@ impl TimelineRenderer<'_> {
                             revision: None,
                         },
                     );
-                } else if matches!(status, SessionPhase::Working { .. }) {
+                } else if matches!(
+                    status,
+                    SessionPhase::Working { .. } | SessionPhase::AwaitingInput { .. }
+                ) {
+                    let role = if matches!(status, SessionPhase::Working { .. }) {
+                        "working"
+                    } else {
+                        "question"
+                    };
                     block.metadata.target.push(TargetRange {
-                        id: TargetId(format!("{id}:working")),
+                        id: TargetId(format!("{id}:{role}")),
                         range: TextRange {
                             start: TextPosition { row: 1, column: 0 },
                             end: TextPosition {
@@ -359,6 +370,11 @@ impl TimelineRenderer<'_> {
         use crate::plan::{PlanEventContent, PlanExecutionLifecycleEvent, PlanLifecycleKind};
         match &event.content {
             PlanEventContent::Lifecycle { title, lifecycle } => {
+                if lifecycle.kind == PlanLifecycleKind::QuestionAsked {
+                    if let Some(question) = &lifecycle.question {
+                        return self.question(&event.id, question, lifecycle.answer.as_deref());
+                    }
+                }
                 let label = match lifecycle.kind {
                     PlanLifecycleKind::QuestionAsked => "Clarification requested",
                     PlanLifecycleKind::QuestionAnswered => "Clarification answered",
@@ -386,7 +402,7 @@ impl TimelineRenderer<'_> {
                         .trim()
                         .trim_start_matches("- ")
                         .replace("\n- ", ", ");
-                    format!("▸ Clarification: {answer}")
+                    format!("○ You answered: {answer}")
                 } else if question {
                     format!("▸ {label}")
                 } else {
@@ -404,7 +420,9 @@ impl TimelineRenderer<'_> {
                 if lifecycle.kind == PlanLifecycleKind::QuestionAnswered {
                     self.prompt.push(BlockId(event.id.clone()));
                 }
-                if let Some(question) = &lifecycle.question {
+                if let Some(question) = lifecycle.question.as_ref().filter(|_| !matches!(
+                    lifecycle.kind, PlanLifecycleKind::QuestionAnswered | PlanLifecycleKind::QuestionWithdrawn
+                )) {
                     for (index, question) in question.questions.iter().enumerate() {
                         self.markdown(
                             &format!("{}:question:{index}", event.id),
@@ -516,6 +534,26 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
+    fn question(&mut self, id: &str, question: &crate::plan::PlanQuestionSet, answer: Option<&str>) -> Result<()> {
+        let header = question.questions.iter().map(|question| question.header.as_str()).collect::<Vec<_>>().join(", ");
+        self.literal(id, &format!("▸ Question presented: {header}"), Some(TranscriptAction::Question {
+            question_set_id: question.id.clone(),
+        }))?;
+        let section = self.begin_section();
+        for (index, question) in question.questions.iter().enumerate() {
+            self.markdown(&format!("{id}:question:{index}"), &question.question, MarkdownRole::Detail)?;
+            for (option, value) in question.options.iter().enumerate() {
+                self.literal(&format!("{id}:question:{index}:option:{option}"),
+                    &format!("{}: {}", value.label, value.description), None)?;
+            }
+        }
+        if let Some(answer) = answer {
+            self.markdown(&format!("{id}:answer"), answer, MarkdownRole::Detail)?;
+        }
+        self.finish_section(section, id, true);
+        Ok(())
+    }
+
     fn interaction(
         &mut self,
         interaction: &Exchange,
@@ -569,6 +607,23 @@ impl TimelineRenderer<'_> {
         let section = self.begin_section();
         let mut response = Vec::new();
         let visible = interaction.node_list.iter().collect::<Vec<_>>();
+        let mut question_turn = std::collections::HashSet::new();
+        let mut preceding_turn = None;
+        for node in &visible {
+            if let ExchangeNode::TurnContent { turn_id, .. } = node {
+                preceding_turn = Some(turn_id.as_str());
+            }
+            let question = match node {
+                ExchangeNode::QuestionPresented { .. } => true,
+                ExchangeNode::PlanEvent { event } => matches!(&event.content,
+                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
+                        if lifecycle.kind == crate::plan::PlanLifecycleKind::QuestionAsked),
+                _ => false,
+            };
+            if question {
+                if let Some(turn_id) = preceding_turn { question_turn.insert(turn_id); }
+            }
+        }
         let final_position = interaction.completed_at_ms.and_then(|_| {
             visible.iter().rposition(|node| {
                 if let ExchangeNode::TurnContent {
@@ -588,7 +643,9 @@ impl TimelineRenderer<'_> {
                 } else {
                     false
                 }
-            })
+            }).filter(|position| !visible[position + 1..].iter().any(|node| matches!(node,
+                ExchangeNode::ExchangeInput { .. } | ExchangeNode::QuestionPresented { .. }
+            )))
         });
         let mut trailing_plan = Vec::new();
         let mut rendered_tool = std::collections::HashSet::new();
@@ -614,10 +671,11 @@ impl TimelineRenderer<'_> {
                             ) {
                                 continue;
                             }
-                            let final_message = interaction.completed_at_ms.is_some()
-                                && message.delivery() == crate::turn::MessageDelivery::Final;
-                            if final_message {
+                            let final_message = message.delivery() == crate::turn::MessageDelivery::Final;
+                            if final_message && Some(position) == final_position {
                                 response.push((id.clone(), message.text()));
+                            } else if final_message {
+                                self.markdown(id, message.text(), MarkdownRole::Response)?;
                             } else {
                                 let commentary = TranscriptRenderer::new(&self.content_width())?
                                     .commentary(BlockId(id.clone()), message.text())?;
@@ -631,7 +689,9 @@ impl TimelineRenderer<'_> {
                             let group = visible.iter().skip(position).take_while(|node| matches!(node,
                                 ExchangeNode::TurnContent { turn_id: owner, item: crate::turn::TurnItem::Tool { .. }, .. } if owner == turn_id));
                             let mut calls = Vec::new();
+                            let mut group_count = 0;
                             for node in group {
+                                group_count += 1;
                                 let ExchangeNode::TurnContent {
                                     id,
                                     item: crate::turn::TurnItem::Tool { id: tool_id },
@@ -645,14 +705,20 @@ impl TimelineRenderer<'_> {
                                     .tools()
                                     .find(|tool| tool.id == *tool_id)
                                     .context("timeline content references a missing tool")?;
-                                calls.push((id, tool));
+                                let question_control = tool.title.split('(').next().unwrap_or("").trim()
+                                    .ends_with("harness_question_ask");
+                                if !(question_control && question_turn.contains(turn_id.as_str()) && !tool.failed
+                                    && tool.state() == crate::turn::ToolState::Completed) {
+                                    calls.push((id, tool));
+                                }
                             }
+                            if calls.is_empty() { continue; }
                             let start = self.block.len();
                             let count = calls.len();
                             let settled = calls
                                 .iter()
                                 .all(|(_, tool)| tool.state() != crate::turn::ToolState::Running)
-                                && (position + count < visible.len()
+                                && (position + group_count < visible.len()
                                     || turn.state() != crate::turn::TurnState::Running);
                             let failed = calls.iter().filter(|(_, tool)| tool.failed).count();
                             let mut label = format!(
@@ -698,7 +764,7 @@ impl TimelineRenderer<'_> {
                     }
                 }
                 ExchangeNode::ExchangeInput { prompt } => {
-                    if prompt.intent == crate::exchange::InputIntent::Clarification
+                    if matches!(prompt.intent, crate::exchange::InputIntent::Clarification | crate::exchange::InputIntent::Answer)
                         && interaction.node_list.iter().any(|node| matches!(node,
                             ExchangeNode::PlanEvent { event } if matches!(&event.content,
                                 crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
@@ -708,12 +774,20 @@ impl TimelineRenderer<'_> {
                     }
                     let label = match prompt.intent {
                         crate::exchange::InputIntent::Steering => "Steering",
-                        crate::exchange::InputIntent::Clarification => "Clarification",
+                        crate::exchange::InputIntent::Clarification => "You asked",
+                        crate::exchange::InputIntent::Answer => "You answered",
                     };
-                    let block = TranscriptRenderer::new(&self.content_width())?.prompt(
-                        BlockId(format!("{}:prompt", prompt.id)),
-                        &format!("{label}: {}", prompt.text),
-                    )?;
+                    let text = if prompt.intent == crate::exchange::InputIntent::Answer {
+                        prompt.text.trim().strip_prefix("Planning feedback:").unwrap_or(&prompt.text)
+                            .trim().trim_start_matches("- ").replace("\n- ", ", ")
+                    } else { prompt.text.clone() };
+                    let width = self.content_width();
+                    let renderer = TranscriptRenderer::new(&width)?;
+                    let block = if prompt.intent == crate::exchange::InputIntent::Steering {
+                        renderer.prompt(BlockId(format!("{}:prompt", prompt.id)), &format!("{label}: {text}"))?
+                    } else {
+                        renderer.literal(BlockId(format!("{}:prompt", prompt.id)), &format!("○ {label}: {text}"), 2)?
+                    };
                     self.prompt.push(block.id.clone());
                     self.push(block)?;
                 }
@@ -749,6 +823,9 @@ impl TimelineRenderer<'_> {
                             }),
                         )?;
                     }
+                }
+                ExchangeNode::QuestionPresented { id, question, answer } => {
+                    self.question(id, question, answer.as_deref())?;
                 }
                 ExchangeNode::PlanCommentResolution { resolution } => {
                     for (index, annotation) in resolution.annotation.iter().enumerate() {
@@ -1430,6 +1507,110 @@ mod tests {
     }
 
     #[test]
+    fn question_clarification_preserves_turn_delivery_and_history() {
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary};
+        use crate::exchange::{ExchangeNode, ExchangeState};
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"question-flow", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Plan out a new one", "kind":"chat", "state":"running",
+            "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[]
+        })).unwrap();
+        exchange.resume(0).unwrap();
+        let mut event = BackendEvent {
+            address: Some(ProviderAddress { thread_id: "thread".into(), turn_id: "question-turn".into() }),
+            turn_boundary: Some(TurnBoundary::Started), kind: "turn_started".into(), text: None,
+            data: serde_json::Value::Null, activity: None, summary: None, task_update: None,
+        };
+        exchange.observe_turn(&event, 0).unwrap();
+        event.turn_boundary = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("The scope determines the implementation.".into());
+        event.data = json!({"phase":"commentary"});
+        exchange.observe_turn(&event, 1).unwrap();
+        event.kind = "tool".into();
+        event.text = None;
+        for (id, status) in [("failed-question", "failed"), ("accepted-question", "completed")] {
+            event.activity = Some(ToolActivity {
+                id: id.into(), kind: ToolActivityKind::Command, title: "harness_question_ask".into(),
+                output: Some(if status == "failed" { "Invalid options" } else { "Question set accepted" }.into()),
+                output_delta: false, status: Some(status.into()), change: Default::default(),
+            });
+            exchange.observe_turn(&event, 2).unwrap();
+        }
+        event.activity = None;
+        event.turn_boundary = Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Completed });
+        exchange.observe_turn(&event, 3).unwrap();
+        let question = crate::plan::PlanQuestionSet {
+            id: "scope-set".into(), questions: vec![crate::plan::PlanQuestion {
+                id: "scope".into(), header: "Migration scope".into(), question: "What should the replacement demonstrate?".into(),
+                options: vec![crate::plan::PlanQuestionOption { label: "Rust CLI".into(), description: "Replace the demo".into() }],
+                allow_freeform: true,
+            }],
+        };
+        exchange.node_list.push(ExchangeNode::QuestionPresented { id: "presented".into(), question: question.clone(), answer: None });
+        exchange.elicitation = Some(crate::plan::PlanElicitation::new(question));
+        exchange.awaiting_input = true;
+        exchange.append_input(crate::exchange::InputIntent::Clarification, "What do you mean?".into(), 4).unwrap();
+        event.address.as_mut().unwrap().turn_id = "explanation-turn".into();
+        event.turn_boundary = Some(TurnBoundary::Started);
+        exchange.observe_turn(&event, 4).unwrap();
+        event.turn_boundary = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("I mean a Rust CLI or a redesigned TypeScript demo.".into());
+        event.data = json!({"phase":"final_answer"});
+        exchange.observe_turn(&event, 5).unwrap();
+        event.text = None;
+        event.turn_boundary = Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Completed });
+        exchange.observe_turn(&event, 6).unwrap();
+        exchange.pause(6);
+        let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+        let projected = project_at(&TimelineEntry::Exchange {
+            id: restored.id.clone(), created_at_ms: 0, exchange: restored, agent_by_id: HashMap::new(),
+        }, &WidthProfile::default(), 6).unwrap();
+        let text = projected.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("○ You asked: What do you mean?"));
+        assert_eq!(text.matches("Question presented:").count(), 1);
+        assert!(!text.contains("Question set accepted"));
+        assert!(text.contains("Invalid options"));
+        assert_eq!(projected.tool.len(), 1, "successful question must not remain a raw tool");
+        assert!(text.find("Question presented:").unwrap() < text.find("You asked:").unwrap());
+        assert!(text.find("You asked:").unwrap() < text.find("I mean a Rust CLI").unwrap());
+        let answer = projected.entry.block.iter().find(|block| block.text.wire_rows().join("\n").contains("I mean a Rust CLI")).unwrap();
+        assert!(!answer.metadata.gutter.iter().flat_map(|gutter| &gutter.chunk).any(|chunk| chunk.text.contains('↳')));
+        assert!(projected.action.values().any(|action| matches!(action, super::TranscriptAction::Question { question_set_id } if question_set_id == "scope-set")));
+        let question_block = projected.entry.block.iter().find(|block| block.id.0 == "presented").unwrap();
+        assert!(question_block.metadata.fold[0].closed);
+        assert_ne!(question_block.metadata.fold[0].end.block, answer.id, "question folded the later explanation");
+        assert!(exchange.completed_at_ms.is_none() && exchange.checkpoint_after.is_none());
+        println!("QUESTION_FIXTURE:{}", serde_json::to_string(&projected.entry.block).unwrap());
+        exchange.append_input(crate::exchange::InputIntent::Answer, "Planning feedback:\n- Scope: Rust CLI".into(), 7).unwrap();
+        let mut cancelled = exchange.clone();
+        cancelled.finish(ExchangeState::Cancelled, 7).unwrap();
+        let cancelled = project_at(&TimelineEntry::Exchange {
+            id: cancelled.id.clone(), created_at_ms: 0, exchange: cancelled, agent_by_id: HashMap::new(),
+        }, &WidthProfile::default(), 7).unwrap();
+        let text = cancelled.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        assert!(text.find("I mean a Rust CLI").unwrap() < text.find("You answered: Scope: Rust CLI").unwrap());
+        exchange.resume(7).unwrap();
+        event.address.as_mut().unwrap().turn_id = "continuation-turn".into();
+        event.turn_boundary = Some(TurnBoundary::Started);
+        exchange.observe_turn(&event, 7).unwrap();
+        event.turn_boundary = None;
+        event.text = Some("Proceeding with Rust".into());
+        exchange.observe_turn(&event, 8).unwrap();
+        event.text = None;
+        event.turn_boundary = Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Completed });
+        exchange.observe_turn(&event, 9).unwrap();
+        exchange.finish(ExchangeState::Complete, 9).unwrap();
+        let completed = project_at(&TimelineEntry::Exchange {
+            id: exchange.id.clone(), created_at_ms: 0, exchange, agent_by_id: HashMap::new(),
+        }, &WidthProfile::default(), 9).unwrap();
+        let text = completed.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        assert!(text.find("I mean a Rust CLI").unwrap() < text.find("You answered: Scope: Rust CLI").unwrap());
+        assert!(text.find("You answered: Scope: Rust CLI").unwrap() < text.find("Proceeding with Rust").unwrap());
+    }
+
+    #[test]
     fn sequential_tools_keep_group_open_and_only_latest_preview_expanded() {
         use crate::backend::{
             BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
@@ -2053,6 +2234,36 @@ mod tests {
             projection.entry.block[0].text.wire_rows(),
             vec!["", "Working (3s · Inspecting repository structure befo…)"]
         );
+    }
+
+    #[test]
+    fn awaiting_input_status_exposes_question_hint_target() {
+        for owner in [
+            crate::broker::ElicitationOwner::Plan,
+            crate::broker::ElicitationOwner::Interaction,
+            crate::broker::ElicitationOwner::PlanAcceptance,
+        ] {
+            let projected = project_at(
+                &TimelineEntry::Status {
+                    id: "session:status".into(),
+                    created_at_ms: 0,
+                    status: SessionPhase::AwaitingInput {
+                        owner,
+                        plan_id: None,
+                        exchange_id: None,
+                    },
+                },
+                &WidthProfile::default(),
+                0,
+            )
+            .unwrap();
+            let block = &projected.entry.block[0];
+            assert_eq!(block.text.wire_rows(), vec!["", "Awaiting input"]);
+            assert_eq!(block.metadata.target[0].id.0, "session:status:question");
+            assert_eq!(block.metadata.target[0].range.start.row, 1);
+            assert!(block.metadata.fold.is_empty());
+            assert!(projected.action.is_empty());
+        }
     }
 
     #[test]

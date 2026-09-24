@@ -20,6 +20,7 @@ function PickerWindow.open(host, width, height, title, origin)
     title = title,
     title_pos = "left",
     filetype = "ForgePicker",
+    winfixbuf = true,
     focusable = true,
     enter = false,
     origin = origin,

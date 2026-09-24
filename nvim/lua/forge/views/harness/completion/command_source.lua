@@ -40,7 +40,7 @@ local command_list = {
   { label = "/new", detail = "Start a new session in another tab" },
   { label = "/compact", detail = "Compact provider-owned context", capability = "native_compact" },
   { label = "/fork", detail = "Fork the current session with provider-owned context", capability = "native_fork" },
-  { label = "/rename", detail = "Rename the current session" },
+  { label = "/rename", detail = "Generate a short session name, or set an explicit name" },
   { label = "/effort", detail = "Select reasoning effort", capability = "effort_selection" },
   { label = "/model", detail = "Select the backend model", capability = "model_selection" },
   { label = "/fast", detail = "Toggle backend fast mode", capability = "fast_mode" },

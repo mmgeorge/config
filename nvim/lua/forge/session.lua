@@ -106,6 +106,8 @@ M.empty_diff_rows = {}
 ---@field command_set ForgeViewCommandSet?
 ---@field goal table?
 ---@field pending_config table?
+---@field rename_revision integer?
+---@field rename_status string?
 ---@field pending_config_validate boolean?
 ---@field pending_backend string?
 ---@field pending_mode string?

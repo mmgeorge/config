@@ -137,7 +137,7 @@ pub(super) fn attach(
     }
 }
 
-/// Retain question identity while placing its resolved details beside the response.
+/// Retain question position and attach recorded answers without consuming the answer event.
 fn pair_questions(events: Vec<(i64, ExchangePlanEvent)>) -> Vec<ExchangePlanEvent> {
     let mut paired: Vec<ExchangePlanEvent> = Vec::new();
     for (_, event) in events {
@@ -151,9 +151,9 @@ fn pair_questions(events: Vec<(i64, ExchangePlanEvent)>) -> Vec<ExchangePlanEven
                         PlanEventContent::Lifecycle { lifecycle: asked, .. }
                         if asked.kind == PlanLifecycleKind::QuestionAsked && asked.question.as_ref().is_some_and(|asked|
                             asked.questions.iter().map(|question| &question.id).eq(question.questions.iter().map(|question| &question.id))))) {
-                        prior.node_count = event.node_count;
-                        prior.content = event.content;
-                        continue;
+                        if let PlanEventContent::Lifecycle { lifecycle: asked, .. } = &mut prior.content {
+                            asked.answer = lifecycle.answer.clone();
+                        }
                     }
                 }
             }
@@ -359,7 +359,7 @@ mod tests {
     }
 
     #[test]
-    fn answered_and_withdrawn_questions_render_once_at_the_response_position() {
+    fn resolved_questions_keep_their_original_position_and_record_answers() {
         for outcome in [
             PlanLifecycleKind::QuestionAnswered,
             PlanLifecycleKind::QuestionWithdrawn,
@@ -441,13 +441,14 @@ mod tests {
                     .any(|fold| fold.id.0 == "QuestionAsked" && fold.closed)
             );
             if outcome == PlanLifecycleKind::QuestionAnswered {
-                assert!(rendered.prompt.iter().any(|id| id.0 == "QuestionAsked"));
-                assert_eq!(text.matches("Clarification:").count(), 1);
-                assert!(text.contains("Clarification: Goal: Rust learning"));
-                assert!(text.find("Clarify the options first").unwrap() < text.find("Clarification: Goal").unwrap());
+                assert!(rendered.prompt.iter().any(|id| id.0 == "QuestionAnswered"));
+                assert_eq!(text.matches("You answered:").count(), 1);
+                assert!(text.contains("You answered: Goal: Rust learning"));
+                assert!(text.find("Clarify the options first").unwrap() < text.find("You answered: Goal").unwrap());
             } else {
                 assert!(text.contains("Clarification withdrawn"));
             }
+            assert!(text.find("Question presented: Goal").unwrap() < text.find("Clarify the options first").unwrap());
         }
     }
 

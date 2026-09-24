@@ -100,6 +100,15 @@ local during_work = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 
 assert(#during_work == 3, "recap replaced the working spinner or interrupt hint")
 transcript.recap = nil
 hint.render(transcript, command_set, 120)
+transcript.rename_status = "Generating session name…"
+hint.render(transcript, command_set, 120)
+local naming = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
+assert(#naming == 3, "naming replaced the main spinner or interrupt hint")
+local footer = vim.api.nvim_buf_get_extmark_by_id(transcript.buffer, namespace, 3, { details = true })
+assert(footer[3].virt_lines[1][1][1] == "Generating session name…")
+assert(footer[1] == 1, "naming status was not placed below Working")
+transcript.rename_status = nil
+hint.render(transcript, command_set, 120)
 assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working (2s · Inspecting repository structure)",
   "terminal status modified the exchange clock")
 assert(buffer.apply_snapshot(transcript, {
@@ -114,6 +123,12 @@ assert(#idle == 1 and idle[1][4].virt_lines[2][1][1] == "2 background terminals 
 transcript.background_terminals = { supported = true, terminal = {} }
 hint.render(transcript, command_set, 120)
 assert(#vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, {}) == 0)
+transcript.rename_status = "Generating session name…"
+hint.render(transcript, command_set, 120)
+local idle_naming = vim.api.nvim_buf_get_extmark_by_id(transcript.buffer, namespace, 3, { details = true })
+assert(idle_naming[3].virt_lines[1][1][1] == "Generating session name…", "idle session hid naming progress")
+transcript.rename_status = nil
+hint.render(transcript, command_set, 120)
 assert(vim.api.nvim_buf_get_lines(transcript.buffer, 0, 1, false)[1] == "Thought for 2s")
 transcript.recap = { text = "We fixed background terminal rendering and added the picker. Next we will validate provider cleanup." }
 hint.render(transcript, command_set, 45)
@@ -136,5 +151,31 @@ vim.wait(150, function() return false end, 25)
 assert(#vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, {}) == 0,
   "closed presentation retained its animation")
 buffer.close(transcript)
+local question_transcript = buffer.open("question-status-hint", {})
+commands.register(command_set, "reopen_question", function() end)
+assert(buffer.apply_snapshot(question_transcript, {
+  document = question_transcript.document, revision = 0, block = { {
+    id = "status", text = { "", "Awaiting input" },
+    metadata = { target = { { id = "status:question", range = {
+      start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
+    } } }, decoration = {}, fold = {}, editable_region = {} },
+  } },
+}).kind == "Applied")
+local original_question_key = config.options.keymaps.harness.reopen_question
+for _, key in ipairs({ "oe", "<F8>" }) do
+  config.options.keymaps.harness.reopen_question = key
+  hint.render(question_transcript, command_set, 120)
+  local mark = vim.api.nvim_buf_get_extmark_by_id(question_transcript.buffer, namespace, 2, { details = true })
+  local chunks = {}
+  for _, chunk in ipairs(mark[3].virt_text) do chunks[#chunks + 1] = chunk[1] end
+  assert(table.concat(chunks):find(key .. " open question", 1, true), "question hint ignored configured binding")
+  assert(mark[1] == 1 and mark[3].virt_text_pos == "eol", "question hint left the waiting row")
+end
+config.options.keymaps.harness.reopen_question = false
+hint.render(question_transcript, command_set, 120)
+assert(#vim.api.nvim_buf_get_extmarks(question_transcript.buffer, namespace, 0, -1, {}) == 0)
+config.options.keymaps.harness.reopen_question = original_question_key
+hint.clear(question_transcript.buffer)
+buffer.close(question_transcript)
 print("harness status hint passed")
 vim.cmd("qa!")

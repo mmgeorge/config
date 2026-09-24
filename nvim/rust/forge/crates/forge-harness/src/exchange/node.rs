@@ -6,6 +6,11 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExchangeNode {
+    QuestionPresented {
+        id: String,
+        question: crate::plan::PlanQuestionSet,
+        answer: Option<String>,
+    },
     PlanEvent { event: Box<crate::plan::ExchangePlanEvent> },
     TurnContent {
         id: String,
@@ -29,6 +34,7 @@ pub enum ExchangeNode {
 impl ExchangeNode {
     pub fn id(&self) -> &str {
         match self {
+            Self::QuestionPresented { id, .. } => id,
             Self::PlanEvent { event } => &event.id,
             Self::TurnContent { id, .. } => id,
             Self::AgentReference { agent } => &agent.id,
@@ -64,6 +70,7 @@ pub struct ArtifactChange {
 pub enum InputIntent {
     Steering,
     Clarification,
+    Answer,
 }
 
 /// Retains acknowledged user input in exchange order.

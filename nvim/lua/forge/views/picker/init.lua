@@ -26,12 +26,12 @@ local function title_chunks(instance, width)
       and (" %d/%d "):format(instance.state.page_index, #instance.spec.page_list)
     or ""
   local chunks = {
-    { " " .. title .. " ", "ForgePickerSection" },
+    { "  " .. title .. " ", "ForgePickerSection" },
     { counter, "ForgePickerHint" },
   }
   local right = page.header_right or instance.spec.header_right
   if right and right ~= "" then
-    local left_width = vim.fn.strdisplaywidth(" " .. title .. " " .. counter)
+    local left_width = vim.fn.strdisplaywidth("  " .. title .. " " .. counter)
     local available = math.max(0, width - left_width - 3)
     if available > 0 then
       if vim.fn.strdisplaywidth(right) > available then

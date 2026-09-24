@@ -51,6 +51,18 @@ local success, failure = xpcall(function()
   assert(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)[1] == "Native transcript")
   assert(vim.wo[state.transcript_win].breakindent, "native attachment discarded Harness continuation indentation")
   assert(vim.wo[state.composer_win].winbar:find("submit", 1, true), "composer has no submit hint")
+  state.session.name = "Parser 100% coverage"
+  controller.refresh_winbar()
+  local title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+    { use_winbar = true, maxwidth = 200 }).str
+  assert(title:find("Parser 100% coverage", 1, true), "session name missing or unescaped in top bar")
+  assert(title:find(" • Parser 100% coverage", 1, true) > title:find(" • Main", 1, true),
+    "session name must follow the Harness status")
+  assert(vim.wo[state.transcript_win].winbar:find("ForgeHarnessSessionName", 1, true),
+    "session name must have its own top bar highlight")
+  require("forge.infra.highlights").setup()
+  assert(vim.api.nvim_get_hl(0, { name = "ForgeHarnessSessionName", link = false }).italic,
+    "session name top bar highlight must be italic")
   state.busy = true
   state.recap = { text = "Old recap" }
   receive("backend_event", { kind = "turn_started" }, "native-controller")
@@ -178,6 +190,7 @@ local success, failure = xpcall(function()
   controller.cancel_turn()
   assert(#child_request == 2, "completed-child cancellation fell through to the parent")
   client.request = original_plain_request
+  require("forge.views.harness.workspace").release(state)
   state.presentation.close()
   state.presentation = nil
   state.composer_buf = vim.api.nvim_create_buf(false, true)

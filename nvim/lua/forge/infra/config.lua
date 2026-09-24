@@ -263,7 +263,7 @@ M.defaults = {
       model = "oM",
       effort_down = "<M-,>",
       effort_up = "<M-.>",
-      close = false,
+      close = "q",
       help = "?",
     },
     plan_review = {

@@ -25,6 +25,7 @@ function PickerInput.open(parent_win, frame, text, origin)
     title = "",
     border = "none",
     filetype = "ForgePickerInput",
+    winfixbuf = true,
     wrap = true,
     linebreak = true,
     zindex = 91,

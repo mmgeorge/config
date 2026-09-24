@@ -23,7 +23,7 @@ function M.open(options)
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     if owner.replica then
       for _, attached in ipairs(vim.fn.win_findbuf(owner.replica.buffer)) do
-        if vim.api.nvim_buf_is_valid(origin) then vim.api.nvim_win_set_buf(attached, origin) end
+        if vim.api.nvim_buf_is_valid(origin) then require("forge.views.harness.workspace").set_buffer(attached, origin) end
       end
       buffer.close(owner.replica)
     end
@@ -82,7 +82,7 @@ function M.open(options)
     if applied.kind ~= "Applied" then notice("Tool output could not be adopted: " .. tostring(applied.kind)) owner.close() return end
     owner.ready, owner.more = true, opened.more == true
     vim.api.nvim_buf_set_name(owner.replica.buffer, "ForgeToolOutput://" .. owner.document)
-    vim.api.nvim_win_set_buf(window, owner.replica.buffer)
+    require("forge.views.harness.workspace").set_buffer(window, owner.replica.buffer)
     owner.demand()
     if options.on_open then options.on_open(owner) end
   end)

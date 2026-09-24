@@ -63,12 +63,16 @@ impl HarnessService {
         let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
         let controller = registry.resolve(&session_id).await?;
         match &request {
-            crate::buffer::session::PresentationRequest::Recap { model } => {
+            crate::buffer::session::PresentationRequest::Recap { model }
+            | crate::buffer::session::PresentationRequest::SessionName { model } => {
+                let purpose = if matches!(&request, crate::buffer::session::PresentationRequest::SessionName { .. }) {
+                    crate::backend::TextGeneration::SessionName
+                } else { crate::backend::TextGeneration::Recap };
                 let history = controller.presentation.lock()
-                    .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?.recap_history()?;
+                    .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?.conversation_history()?;
                 let request = controller.catalog_request.read().await.clone();
-                let text = controller.backend.recap(request, model, &history).await?;
-                return Ok(json!({"text": crate::backend::recap::validate(&text)?}));
+                let text = controller.backend.generate_text(request, purpose, model, &history).await?;
+                return Ok(json!({"text": purpose.validate(&text)?}));
             }
             crate::buffer::session::PresentationRequest::TerminateTerminal { id } => {
                 let request = controller.catalog_request.read().await.clone();

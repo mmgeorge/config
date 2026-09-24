@@ -14,6 +14,7 @@ local timeline_status = require("forge.render.harness.timeline_status")
 ---@param entry table Session event entry record.
 local function append_session_event(result, entry)
   local event = entry.event or {}
+  if event.kind == "renamed" then return end
   local name = event.name or ""
   local text
   local target_session_id = nil
@@ -591,20 +592,38 @@ local function append_interaction(result, interaction, options, agent_by_id)
     or interaction.state == "superseded" or interaction.state == "interrupted"
   local turn_by_id = index_turns(interaction)
   local deferred_response = {}
+  local final_node
+  local question_turn = {}
+  local preceding_turn
+  local answered = {}
+  for _, node in ipairs(interaction.node_list or {}) do
+    local turn = node.turn_id and turn_by_id[node.turn_id]
+    local content = turn and node.item and resolve_turn_item(turn, node.item)
+    if content and node.item.kind == "message" and content.delivery == "final" then final_node = node end
+    if node.kind == "exchange_input" or node.kind == "question_presented" then final_node = nil end
+    local lifecycle = node.kind == "plan_event" and node.event.content.lifecycle
+    if node.turn_id then preceding_turn = node.turn_id end
+    if preceding_turn and (node.kind == "question_presented" or lifecycle and lifecycle.kind == "question_asked") then
+      question_turn[preceding_turn] = true
+    end
+    if lifecycle and lifecycle.kind == "question_answered" then answered[lifecycle.answer or ""] = true end
+  end
   append_exchange_summary(result, interaction, options)
   local expanded = not complete or result.expanded[("exchange:%s"):format(interaction.id or interaction.ordinal)] == true
   for _, node in ipairs(interaction.node_list or {}) do
     local node_turn = node.turn_id and turn_by_id[node.turn_id]
     local node_content = node_turn and node.item and resolve_turn_item(node_turn, node.item)
-    local final_response = complete and node_content and node.item.kind == "message"
+    local final_response = node_content and node.item.kind == "message"
       and node_content.kind == "assistant" and node_content.delivery == "final"
-    if expanded or final_response then
+    if expanded or final_response and node == final_node then
     if node.kind == "turn_content" and node.item then
       local turn = turn_by_id[node.turn_id]
       local content = turn and resolve_turn_item(turn, node.item) or nil
       if content and node.item.kind == "message" and content.kind == "assistant" then
-        if complete and content.delivery == "final" then
+        if complete and node == final_node then
           deferred_response[#deferred_response + 1] = { id = node.id, text = content.text }
+        elseif content.delivery == "final" then
+          append_response(result, content.text)
         else
           local first = #result.lines + 1
           append_wrapped(result, content.text, "↳ ", "  ", "ForgeHarnessCommentary", options.content_width)
@@ -613,6 +632,9 @@ local function append_interaction(result, interaction, options, agent_by_id)
           end
         end
       elseif content and node.item.kind == "tool" then
+        local question_control = (content.title or ""):match("^([^%(]+)") or ""
+        if not (question_turn[node.turn_id] and question_control:match("harness_question_ask%s*$")
+            and not content.failed and (content.status == "completed" or content.status == "success")) then
         local first = #result.lines + 1
         append_tool(result, content, ("exchange:%s:turn:%s"):format(interaction.id, node.turn_id), first,
           options.content_width)
@@ -620,11 +642,15 @@ local function append_interaction(result, interaction, options, agent_by_id)
           result.rows[line].interaction = interaction
           result.rows[line].node_id = node.id
         end
+        end
       end
     elseif node.kind == "exchange_input" and node.prompt then
+      if not answered[node.prompt.text] then
       local first = #result.lines + 1
-      local label = node.prompt.intent == "clarification" and "Clarification" or "Steering"
-      append_wrapped(result, label .. ": " .. node.prompt.text, "▸ ", "  ", "ForgeHarnessPrompt", options.content_width)
+      local label = ({ clarification = "You asked", answer = "You answered" })[node.prompt.intent] or "Steering"
+      local text = node.prompt.text
+      if node.prompt.intent == "answer" then text = text:gsub("^Planning feedback:%s*", ""):gsub("^%- ", ""):gsub("\n%- ", ", ") end
+      append_wrapped(result, label .. ": " .. text, node.prompt.intent == "steering" and "▸ " or "○ ", "  ", "ForgeHarnessPrompt", options.content_width)
       result.prompt_lines[#result.prompt_lines + 1] = first
       for line = first, #result.lines do
         result.rows[line] = {
@@ -634,6 +660,11 @@ local function append_interaction(result, interaction, options, agent_by_id)
           node_id = node.prompt.id,
         }
       end
+      end
+    elseif node.kind == "question_presented" then
+      plan_event.question(result, node.id, node.question, node.answer, { append_response = append_response })
+    elseif node.kind == "plan_event" and node.event.content.kind == "lifecycle" then
+      plan_event.append(result, { id = node.event.id, lifecycle = node.event.content.lifecycle }, { append_response = append_response })
     elseif node.kind == "plan_comment_resolution" and node.resolution then
       append_plan_comment_resolution(result, interaction, node.resolution, options)
     elseif node.kind == "artifact_change" and node.change then

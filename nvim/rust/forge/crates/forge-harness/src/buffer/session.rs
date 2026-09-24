@@ -81,6 +81,7 @@ pub struct PresentationSync {
 pub enum PresentationRequest {
     BackgroundTerminals,
     Recap { model: String },
+    SessionName { model: String },
     TerminateTerminal { id: String },
     Highlight {
         document: DocumentId,
@@ -181,9 +182,9 @@ pub enum PresentationRequest {
 }
 
 impl SessionPresentation {
-    /// Capture recap context without acquiring the active prompt broker.
-    pub(crate) fn recap_history(&self) -> Result<String> {
-        crate::backend::recap::history(self.timeline.entry_list())
+    /// Capture visible context without acquiring the active prompt broker.
+    pub(crate) fn conversation_history(&self) -> Result<String> {
+        crate::backend::text_generation::history(self.timeline.entry_list())
     }
     pub fn dispatch(&mut self, request: PresentationRequest) -> Result<serde_json::Value> {
         use serde_json::{json, to_value};
@@ -318,7 +319,7 @@ impl SessionPresentation {
             PresentationRequest::ToolExport { .. } => {
                 anyhow::bail!("tool export requires the initialized storage owner")
             }
-            PresentationRequest::BackgroundTerminals | PresentationRequest::TerminateTerminal { .. } | PresentationRequest::Recap { .. } => anyhow::bail!("provider operation requires the provider owner"),
+            PresentationRequest::BackgroundTerminals | PresentationRequest::TerminateTerminal { .. } | PresentationRequest::Recap { .. } | PresentationRequest::SessionName { .. } => anyhow::bail!("provider operation requires the provider owner"),
             PresentationRequest::Open {
                 document,
                 composer,

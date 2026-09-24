@@ -708,6 +708,7 @@ mod test {
                 ExchangeNode::ExchangeInput { .. } => "steering",
                 ExchangeNode::PlanCommentResolution { .. } => "resolution",
                 ExchangeNode::ArtifactChange { .. } => "artifact",
+                ExchangeNode::QuestionPresented { .. } => "question",
                 ExchangeNode::PlanEvent { .. } => "plan",
             })
             .collect::<Vec<_>>();

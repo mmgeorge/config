@@ -2280,9 +2280,16 @@ resumes, or reconfigures the active session. Before resolution, the winbar says 
 instead of presenting `default` as though it were a real model ID.
 
 `/rename <name>` routes directly to the broker's durable `session.rename` request rather
-than entering the model transcript. The broker records a durable session timeline event
-after the rename succeeds, so the transcript confirms completion immediately and after
-session reopen. `/rename` clears the optional display name. `SessionEventKind` distinguishes
+than entering the model transcript. The broker retains rename metadata without displaying a
+timeline message. The top bar displays the current session name. Bare `/rename` shows only
+`Generating session name…` until the name is persisted. It captures visible conversation history and generates a 2-6 word name
+in an isolated provider conversation using the selected model. Naming selects the lowest advertised
+reasoning effort for explicit models. Copilot Auto retains provider-managed reasoning. The request
+does not change the main conversation or its settings. Shared `TextGeneration` defines naming and recap
+instructions and output validation. Provider adapters own temporary conversation lifecycles. Generated names
+must fit 60 characters. The current name remains until generation and persistence succeed. Lua
+rejects superseded replies, and the broker checks the captured name before saving a generated result.
+`SessionEventKind` distinguishes
 rename events from fork lineage without inferring behavior from optional fields. The `/sessions`
 picker searches that name and substitutes `[unnamed]` for empty names,
 keeping storage semantics separate from presentation fallback text.

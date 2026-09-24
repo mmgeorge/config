@@ -31,6 +31,7 @@ function PickerSearchInput.open(parent_win, frame, text, origin, on_change)
     title = "",
     border = "none",
     filetype = "ForgePickerSearch",
+    winfixbuf = true,
     wrap = false,
     zindex = 91,
     origin = origin,

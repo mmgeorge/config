@@ -8,12 +8,18 @@ local request_for, subscribe = client.request_for, client.subscribe
 local render, refresh_winbar, open = controller.render, controller.refresh_winbar, question.open
 local receive, host, continuation, state_reply, submitted
 local goal_requests, snapshot_requests = 0, 0
+local question_requests, question_presentations = nil, 0
 controller.render = function() end
 controller.refresh_winbar = function() end
-question.open = function(_, value) host = value end
+question.open = function(elicitation, value)
+  question_presentations = question_presentations + 1
+  host = value
+  host.elicitation = elicitation
+end
 client.subscribe = function(callback) receive = callback return function() end end
 client.request_for = function(_, method, params, callback)
   if method == "question.continue" then continuation = callback
+  elseif method == "question.ask" then question_requests = callback
   elseif method == "state.get" then
     snapshot_requests = snapshot_requests + 1
     state_reply = callback
@@ -89,10 +95,53 @@ local success, failure = xpcall(function()
   assert(submitted == nil, "spawn drained input before its fresh snapshot")
   state_reply(snapshot())
   assert(submitted == "queued after child", "spawn stranded queued input")
+
+  state.busy, state.queue, state.goal = false, {}, nil
+  for _, owner in ipairs({ "plan", "interaction" }) do
+    for _, outcome in ipairs({ "retained", "replaced", "withdrawn" }) do
+      state.plan_question_open = false
+      state.active_elicitation = {
+        owner = owner, plan_id = owner == "plan" and "plan" or nil,
+        exchange_id = owner == "interaction" and "exchange" or nil,
+        elicitation = { revision = 1, current_index = 1,
+          answer = { { question_id = "first", response = { kind = "selected", option = "Rust" } } },
+          question_set = { id = "set", questions = {
+            { id = "first", question = "Language?", options = {} },
+            { id = "second", question = "Scope?", options = {} },
+          } },
+        },
+      }
+      controller.present_plan_question(true)
+      local count = question_presentations
+      host.ask({ question_id = "second", text = "What do you mean?" })
+      controller.present_plan_question(true)
+      assert(question_presentations == count and state.busy, "picker reopened during explanation")
+      local pending = vim.deepcopy(state.active_elicitation)
+      if outcome == "replaced" then pending.elicitation.revision = 2 end
+      if outcome == "withdrawn" then pending = nil end
+      question_requests({})
+      assert(question_presentations == count, "picker reopened before authoritative synchronization")
+      state_reply(snapshot(nil, pending))
+      vim.wait(30, function() return false end)
+      if pending then
+        assert(question_presentations == count + 1, "pending question did not reopen after explanation")
+        assert(vim.deep_equal(host.elicitation, pending.elicitation), "reopening lost answers or replacement")
+        host.closed()
+        assert(not state.plan_question_open)
+        controller.present_plan_question(false)
+        assert(question_presentations == count + 1, "dismissed question reopened without user action")
+        controller.reopen_question()
+        assert(question_presentations == count + 2, "reopen command did not restore pending question")
+      else
+        assert(question_presentations == count, "withdrawn question reopened")
+      end
+    end
+  end
 end, debug.traceback)
 
 if state.working_timer then state.working_timer:stop() state.working_timer:close() end
 if state.unsubscribe then state.unsubscribe() end
+require("forge.views.harness.workspace").release(state)
 client.request_for, client.subscribe = request_for, subscribe
 controller.render, controller.refresh_winbar, question.open = render, refresh_winbar, open
 assert(success, failure)

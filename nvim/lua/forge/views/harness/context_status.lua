@@ -21,7 +21,7 @@ function M.segment(context_usage)
   if not remaining_percent or not size or size <= 0 then return nil end
   return {
     {
-      text = ("%d%% context left (%s)"):format(remaining_percent, format_token_count(size)),
+      text = ("%d%% left (%s)"):format(remaining_percent, format_token_count(size)),
       group = "ForgeStatusHint",
     },
   }

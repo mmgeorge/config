@@ -1,3 +1,4 @@
+use crate::backend::TextGeneration;
 use anyhow::{Context, Result};
 use github_copilot_sdk::{
     CliProgram, Client, ClientMode, ClientOptions, MessageOptions, SessionConfig,
@@ -9,10 +10,11 @@ use std::{sync::Arc, time::Duration};
 pub(super) async fn generate(
     command: &[String],
     workspace: &str,
+    purpose: TextGeneration,
     model: &str,
     history: &str,
 ) -> Result<String> {
-    let directory = tempfile::Builder::new().prefix("forge-recap-").tempdir()?;
+    let directory = tempfile::Builder::new().prefix("forge-text-").tempdir()?;
     let mut options = ClientOptions::new()
         .with_cwd(workspace)
         .with_mode(ClientMode::Empty)
@@ -25,19 +27,36 @@ pub(super) async fn generate(
     }
     let client = tokio::time::timeout(Duration::from_secs(20), Client::start(options))
         .await
-        .context("Recap provider startup timed out")??;
-    let result = summarize(&client, workspace, model, history).await;
+        .context("Isolated provider startup timed out")??;
+    let result = summarize(&client, workspace, purpose, model, history).await;
     tokio::time::timeout(Duration::from_secs(8), client.stop())
         .await
-        .context("Recap provider shutdown timed out")?
+        .context("Isolated provider shutdown timed out")?
         .map_err(|error| anyhow::anyhow!(error.to_string()))?;
     result
 }
 
 /// Own the temporary session and remove its stored state before the isolated client stops.
-async fn summarize(client: &Client, workspace: &str, model: &str, history: &str) -> Result<String> {
+async fn summarize(
+    client: &Client,
+    workspace: &str,
+    purpose: TextGeneration,
+    model: &str,
+    history: &str,
+) -> Result<String> {
     let mut config = SessionConfig::default();
     config.model = (model != "default").then(|| model.to_owned());
+    if purpose == TextGeneration::SessionName && model != "default" && model != "auto" {
+        let catalog = tokio::time::timeout(Duration::from_secs(20), client.list_models())
+            .await
+            .context("Isolated model discovery timed out")??;
+        let descriptor = catalog
+            .into_iter()
+            .map(super::model_descriptor)
+            .find(|entry| entry.id == model)
+            .context("Selected model is missing from the Copilot model catalog")?;
+        config.reasoning_effort = crate::backend::text_generation::lowest_effort(&descriptor)?;
+    }
     config.streaming = Some(true);
     config.working_directory = Some(workspace.into());
     config.available_tools = Some(Vec::new());
@@ -51,7 +70,7 @@ async fn summarize(client: &Client, workspace: &str, model: &str, history: &str)
     config.system_message = Some(
         SystemMessageConfig::new()
             .with_mode("replace")
-            .with_content(crate::backend::recap::INSTRUCTIONS),
+            .with_content(purpose.instructions()),
     );
     let session = tokio::time::timeout(
         Duration::from_secs(20),
@@ -60,23 +79,24 @@ async fn summarize(client: &Client, workspace: &str, model: &str, history: &str)
         ),
     )
     .await
-    .context("Recap session creation timed out")??;
-    let result = session
-        .send_and_wait(MessageOptions::new(format!(
-            "Conversation to recap:\n{history}"
-        )))
-        .await
-        .context("Generate Copilot recap")
-        .and_then(|event| event.context("Recap completed without an assistant message"))
-        .and_then(|event| {
-            crate::backend::recap::validate(
-                event
-                    .data
-                    .get("content")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or_default(),
-            )
-        });
+    .context("Isolated session creation timed out")??;
+    let result = tokio::time::timeout(
+        Duration::from_secs(60),
+        session.send_and_wait(MessageOptions::new(format!("Conversation:\n{history}"))),
+    )
+    .await
+    .context("Isolated text generation timed out")
+    .and_then(|result| result.map_err(anyhow::Error::from))
+    .and_then(|event| event.context("Text generation completed without an assistant message"))
+    .and_then(|event| {
+        purpose.validate(
+            event
+                .data
+                .get("content")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or_default(),
+        )
+    });
     let cleanup = tokio::time::timeout(Duration::from_secs(8), async {
         let aborted = if result.is_err() {
             session.abort().await
@@ -88,7 +108,7 @@ async fn summarize(client: &Client, workspace: &str, model: &str, history: &str)
         deleted.and(disconnected).and(aborted)
     })
     .await
-    .context("Recap session cleanup timed out")?;
-    cleanup.context("Remove temporary recap session")?;
+    .context("Isolated session cleanup timed out")?;
+    cleanup.context("Remove temporary generation session")?;
     result
 }

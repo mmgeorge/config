@@ -2511,7 +2511,7 @@ impl HarnessBroker {
     }
 
     /// Record planning feedback only on the live exchange that owns the plan.
-    fn append_plan_feedback(&mut self, plan_id: &str, text: String) -> Result<()> {
+    fn append_plan_feedback(&mut self, plan_id: &str, text: String, intent: crate::exchange::InputIntent) -> Result<()> {
         let mut exchange = self
             .store
             .list_exchange(&self.session.id)?
@@ -2523,7 +2523,7 @@ impl HarnessBroker {
             "planning feedback does not target the active exchange"
         );
         exchange.append_input(
-            crate::exchange::InputIntent::Clarification,
+            intent,
             text,
             self.clock.now_ms(),
         )?;
@@ -2546,7 +2546,7 @@ impl HarnessBroker {
         elicitation.clarification_active = true;
         let elicitation_json = serde_json::to_string_pretty(&elicitation)?;
         plan.updated_at_ms = self.clock.now_ms();
-        self.append_plan_feedback(&plan.id, text.clone())?;
+        self.append_plan_feedback(&plan.id, text.clone(), crate::exchange::InputIntent::Clarification)?;
         self.store.save_plan(&plan)?;
         let (mut value, mut event) = self
             .run_interaction(
@@ -2582,7 +2582,6 @@ impl HarnessBroker {
                     .as_deref()
                     .unwrap_or("no material decision remains")
             );
-            self.append_plan_feedback(&plan.id, feedback.clone())?;
             let continuation = self
                 .run_planning_interaction(PlanPrompt::feedback(&plan.request, &feedback), None)
                 .await;
@@ -2664,7 +2663,7 @@ impl HarnessBroker {
             .context("active plan has no elicitation state")?;
         let answer = elicitation.feedback();
         let question = elicitation.question_set.clone();
-        self.append_plan_feedback(&plan.id, answer.clone())?;
+        self.append_plan_feedback(&plan.id, answer.clone(), crate::exchange::InputIntent::Answer)?;
         let now_ms = self.clock.now_ms();
         for pending_question in &elicitation.question_set.questions {
             let response = Some(
@@ -2740,8 +2739,15 @@ impl HarnessBroker {
             .context("active interaction has no elicitation state")?;
         let feedback = elicitation.feedback();
         interaction.awaiting_input = false;
+        for node in &mut interaction.node_list {
+            if let ExchangeNode::QuestionPresented { question, answer, .. } = node {
+                if question.id == elicitation.question_set.id {
+                    *answer = Some(feedback.clone());
+                }
+            }
+        }
         interaction.append_input(
-            crate::exchange::InputIntent::Clarification,
+            crate::exchange::InputIntent::Answer,
             feedback.clone(),
             self.clock.now_ms(),
         )?;
@@ -3496,6 +3502,13 @@ Planning continuation: turn {} of {}.",
         } else {
             if let Some(question) = output.plan_question.take() {
                 let question = question.normalize()?;
+                if !self.active_plan_awaits_input()? {
+                    interaction.node_list.push(ExchangeNode::QuestionPresented {
+                        id: format!("{}:question:{}", interaction.id, Uuid::new_v4()),
+                        question: question.clone(),
+                        answer: None,
+                    });
+                }
                 if !self.replace_active_elicitation(question.clone(), &mut event)? {
                     interaction.awaiting_input = true;
                     interaction.elicitation = Some(PlanElicitation::new(question.clone()));
@@ -6081,6 +6094,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .store
             .load_session(&session_id)?
             .context("session not found")?;
+        if let Some(expected) = params.get("expected_name").and_then(Value::as_str) {
+            anyhow::ensure!(session.name == expected, "Session name changed during generation");
+        }
         session.name = name;
         let created_at_ms = self.clock.now_ms();
         session.updated_at_ms = created_at_ms;
@@ -6097,18 +6113,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         if self.session.id == session.id {
             self.session = session.clone();
         }
-        let entry = TimelineEntry::SessionEvent {
-            id: timeline_event.id.clone(),
-            created_at_ms,
-            event: timeline_event,
-        };
-        Ok((
-            serde_json::to_value(session)?,
-            vec![self.event(
-                "backend_event",
-                json!({ "kind": "timeline_session_event", "data": entry }),
-            )?],
-        ))
+        Ok((serde_json::to_value(session)?, Vec::new()))
     }
 
     async fn configure_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -8734,6 +8739,14 @@ mod test {
         assert_eq!(completed[0].checkpoint_before, checkpoint_before);
         assert!(completed[0].checkpoint_after.is_some());
         assert_eq!(completed[0].state, ExchangeState::Complete);
+        assert!(completed[0].node_list.iter().any(|node| matches!(node,
+            ExchangeNode::QuestionPresented { question, answer: Some(answer), .. }
+                if question.questions[0].header == "Migration" && answer.contains("Staged"))));
+        assert!(completed[0].node_list.iter().any(|node| matches!(node,
+            ExchangeNode::ExchangeInput { prompt } if prompt.intent == crate::exchange::InputIntent::Answer)));
+        let rendered = timeline_text(&broker.snapshot().unwrap());
+        assert!(rendered.contains("Question presented: Migration"));
+        assert!(rendered.contains("You answered: Migration: Staged"));
     }
 
     #[tokio::test]
@@ -9126,11 +9139,15 @@ mod test {
             renamed.response.result().unwrap()["name"],
             "Architecture review"
         );
-        assert!(renamed.event.iter().any(|event| {
+        assert!(!renamed.event.iter().any(|event| {
             event.event == "backend_event"
                 && event.payload["kind"] == "timeline_session_event"
                 && event.payload["data"]["event"]["name"] == "Architecture review"
         }));
+        let stale = broker.rename_session(json!({ "session_id": session["id"],
+            "name": "Generated name", "expected_name": "Previous name" }));
+        assert!(stale.unwrap_err().to_string().contains("changed during generation"));
+        assert_eq!(broker.store.load_session(session["id"].as_str().unwrap()).unwrap().unwrap().name, "Architecture review");
         drop(broker);
 
         let resumed_session_id = session["id"].as_str().expect("new session id").to_owned();
@@ -9159,7 +9176,7 @@ mod test {
         assert!(restarted.session.fast_mode);
         assert_eq!(restarted.session.execution_mode, ExecutionMode::Full);
         assert!(
-            restarted
+            !restarted
                 .snapshot()
                 .unwrap()
                 .timeline
@@ -9169,7 +9186,7 @@ mod test {
                     TimelineEntry::SessionEvent { event, .. }
                         if matches!(
                             &event.detail,
-                            SessionEventKind::Renamed { name } if name == "Architecture review"
+                            SessionEventKind::Renamed { .. }
                         )
                 ))
         );
@@ -9440,7 +9457,7 @@ mod test {
         assert!(original_exchange.execution_started_at_ms.is_none());
         assert!(
             broker
-                .append_plan_feedback("unrelated-plan", "wrong owner".into())
+                .append_plan_feedback("unrelated-plan", "wrong owner".into(), crate::exchange::InputIntent::Clarification)
                 .is_err()
         );
         assert_eq!(
@@ -9532,7 +9549,7 @@ mod test {
         );
         let completed_snapshot = broker.snapshot().unwrap();
         let rendered = timeline_text(&completed_snapshot);
-        assert_eq!(rendered.matches("Clarification: Migration: Staged").count(), 1);
+        assert_eq!(rendered.matches("You answered: Migration: Staged").count(), 1);
         assert!(!rendered.contains("QuestionAsked"));
         let plan = completed_snapshot.active_plan.expect("submitted plan");
         assert_eq!(plan.state, PlanState::AwaitingReview);
@@ -9557,7 +9574,7 @@ mod test {
         assert!(completed_exchange.checkpoint_after.is_some());
         assert!(
             broker
-                .append_plan_feedback(&plan.id, "late feedback".into())
+                .append_plan_feedback(&plan.id, "late feedback".into(), crate::exchange::InputIntent::Clarification)
                 .is_err()
         );
         assert_eq!(completed_snapshot.exchange[0].plan_id, Some(plan.id));

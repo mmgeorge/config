@@ -6,7 +6,8 @@ pub mod copilot;
 pub mod events;
 mod execution;
 mod steering;
-pub(crate) mod recap;
+pub(crate) mod text_generation;
+pub use text_generation::TextGeneration;
 pub mod terminal;
 pub use catalog::{
     BackendCatalogRequest, BackendInput, CatalogCapability, CatalogMutation, McpDefinition,
@@ -446,9 +447,9 @@ pub trait Backend: Send + Sync {
         anyhow::bail!("backend does not support background terminal termination")
     }
 
-    /// Generate a transient recap in an isolated provider conversation.
-    async fn recap(&self, _request: BackendCatalogRequest, _model: &str, _history: &str) -> Result<String> {
-        anyhow::bail!("backend does not support isolated recaps")
+    /// Generate text independently of the main provider conversation.
+    async fn generate_text(&self, _request: BackendCatalogRequest, _purpose: TextGeneration, _model: &str, _history: &str) -> Result<String> {
+        anyhow::bail!("backend does not support isolated text generation")
     }
 
     /// List provider models for the Harness model picker.

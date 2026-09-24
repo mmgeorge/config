@@ -13,8 +13,12 @@ local animation = {}
 ---@param terminal_text string?
 local function render_footer(transcript, row, width, terminal_text)
   local lines = {}
+  if transcript.rename_status then
+    lines[#lines + 1] = { { transcript.rename_status, "ForgeStatusHint" } }
+  end
   if terminal_text then
-    lines = { { { "", "ForgeStatusHint" } }, { { terminal_text, "ForgeStatusHint" } } }
+    lines[#lines + 1] = { { "", "ForgeStatusHint" } }
+    lines[#lines + 1] = { { terminal_text, "ForgeStatusHint" } }
   end
   if transcript.recap then
     local text = transcript.recap.loading and "Loading..." or transcript.recap.text
@@ -52,11 +56,12 @@ function M.render(transcript, commands, width)
   local row = vim.api.nvim_buf_line_count(target_buffer) - 1
   local location = buffer.locate(transcript, row, 0)
   local working = location and location.target and location.target:match(":working$")
+  local question = location and location.target and location.target:match(":question$")
   local inventory = transcript.background_terminals
   local terminal_count = inventory and inventory.supported and #(inventory.terminal or {}) or 0
   local terminal_text = inventory and inventory.unavailable and "Background terminal status unavailable"
     or terminal_count > 0 and ("%d background terminal%s"):format(terminal_count, terminal_count == 1 and "" or "s") or nil
-  if not (working or location and location.target and location.target:match(":review%-plan$")) then
+  if not (working or question or location and location.target and location.target:match(":review%-plan$")) then
     M.clear(target_buffer)
     render_footer(transcript, row, width, terminal_text and (terminal_text .. (terminal_count > 0 and " running" or "")))
     return
@@ -87,7 +92,8 @@ function M.render(transcript, commands, width)
     M.clear(target_buffer)
   end
   render_footer(transcript, row, width)
-  local entries = keymaps.view_hint_entries("harness", commands, {}, working and "working_status" or "review_status")
+  local context = working and "working_status" or question and "question_status" or "review_status"
+  local entries = keymaps.view_hint_entries("harness", commands, {}, context)
   if #entries == 0 and not terminal_text then return end
   local formatted = keymaps.render_hintbar(entries, width, { inline = true })
   local evaluated = vim.api.nvim_eval_statusline(formatted, { maxwidth = width, highlights = true })

@@ -313,6 +313,11 @@ local function status_text()
       group = "ForgeHarnessToolFailure",
     }
   end
+  segment_list[#segment_list + 1] = { text = " • ", group = "ForgeStatusLabel" }
+  segment_list[#segment_list + 1] = {
+    text = active_session.name and active_session.name ~= "" and active_session.name:gsub("%s+", " ") or "[unnamed]",
+    group = "ForgeHarnessSessionName",
+  }
   return segment_list
 end
 
@@ -374,6 +379,7 @@ function M.render()
     on_update = function()
       if state.presentation and vim.api.nvim_win_is_valid(state.transcript_win) then
         state.presentation.transcript.recap = state.recap
+        state.presentation.transcript.rename_status = state.rename_status
         require("forge.views.harness.status_hint").render(state.presentation.transcript,
           M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
       end
@@ -774,6 +780,7 @@ function M.present_plan_question(force)
       set_busy(true)
       client.request("question.ask", params, function(_, request_error)
         set_busy(false)
+        question_presentation.reset(state)
         if request_error then
           notifications.error(request_error, "Planning clarification")
           synchronize_state()
@@ -811,9 +818,7 @@ function M.present_plan_question(force)
         end)
         return
       end
-      local reopen_key = keymaps.view_keys_for("harness", "reopen_question")[1]
-      local reopen_action = reopen_key and (reopen_key .. " or /questions") or "/questions"
-      vim.api.nvim_echo({ { ("Harness questions remain available with %s."):format(reopen_action) } }, false, {})
+      M.render()
     end,
   })
 end
@@ -1084,17 +1089,13 @@ end
 ---@param name string
 function M.rename_session(name)
   local state = harness_state()
-  local active_session = state.session
-  if not active_session or not active_session.id then
-    notifications.error("No active Harness session to rename", "ForgeHarness")
-    return
-  end
-  client.request("session.rename", { session_id = active_session.id, name = name }, function(result, request_error)
-    if request_error then
-      notifications.error(request_error, "ForgeHarness")
-      return
+  local model = selected_setting(state, "model")
+  require("forge.views.harness.session_name").rename(state, name, model, function()
+    if state.presentation and state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
+      state.presentation.transcript.rename_status = state.rename_status
+      require("forge.views.harness.status_hint").render(state.presentation.transcript,
+        state.command_set or M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
     end
-    if result then state.session = result end
     M.refresh_winbar()
   end)
 end
@@ -1153,7 +1154,14 @@ function M.open_timeline_entry()
   if not state.presentation then return end
   state.presentation.activate(function(action, captured)
     if state.presentation.open_output(action, captured) then return end
-    if action.kind == "session" then session_navigation.open_parent(action.session_id)
+    if action.kind == "question" then
+      local elicitation = state.active_elicitation and state.active_elicitation.elicitation
+      if elicitation and elicitation.question_set and elicitation.question_set.id == action.question_set_id then
+        M.present_plan_question(true)
+      else
+        require("forge.folds").toggle_heading(state.presentation.transcript, vim.api.nvim_get_current_win())
+      end
+    elseif action.kind == "session" then session_navigation.open_parent(action.session_id)
     elseif action.kind == "agent" then M.select_agent(action.run_id)
     elseif action.kind == "url" then vim.ui.open(action.url)
     elseif action.kind == "file" then
@@ -2212,12 +2220,28 @@ end
 
 local function close()
   local state = harness_state()
-  if state.presentation and not state.presentation.close() then return end
+  local workspace = require("forge.views.harness.workspace")
+  workspace.release(state)
+  if state.presentation then
+    local ok, closed = pcall(state.presentation.close)
+    if not ok or not closed then
+      workspace.attach(state)
+      if not ok then error(closed, 0) end
+      return
+    end
+  end
   state.presentation = nil
   recap.clear(state)
   timeline_status.stop(state)
   local tab_count = vim.fn.tabpagenr("$")
-  if tab_count > 1 then vim.cmd("tabclose") else vim.cmd("enew") end
+  if tab_count > 1 then
+    vim.cmd("tabclose")
+  else
+    if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
+      vim.api.nvim_win_close(state.composer_win, true)
+    end
+    vim.cmd("enew")
+  end
   state.transcript_win = nil
   state.composer_win = nil
 end
@@ -2278,11 +2302,11 @@ function M.attach()
   state.command_set = M.command_set()
   M.attach_transcript(state.transcript_buf)
   local composer_command_set = M.command_set()
-  command_set.unregister(composer_command_set, "close")
   command_set.unregister(composer_command_set, "open_timeline")
   command_set.register(composer_command_set, "history_previous", prompt_history.previous)
   command_set.register(composer_command_set, "history_next", prompt_history.next)
   keymaps.setup_view_keymaps(state.composer_buf, "harness", composer_command_set)
+  require("forge.views.harness.workspace").attach(state)
   prompt_history.attach(state.composer_buf)
   if state.unsubscribe then state.unsubscribe() end
   state.unsubscribe = client.subscribe(function(event, payload, event_session_id)

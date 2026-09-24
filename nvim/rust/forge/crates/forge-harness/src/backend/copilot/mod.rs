@@ -1,5 +1,5 @@
 mod event_decoder;
-mod recap;
+mod text_generation;
 
 use crate::agent::{AgentCapability, AgentControlMode};
 use crate::backend::approval::{
@@ -375,8 +375,8 @@ fn capability() -> BackendCapability {
 
 #[async_trait]
 impl Backend for CopilotBackend {
-    async fn recap(&self, request: BackendCatalogRequest, model: &str, history: &str) -> Result<String> {
-        recap::generate(&self.command, &request.workspace, model, history).await
+    async fn generate_text(&self, request: BackendCatalogRequest, purpose: super::TextGeneration, model: &str, history: &str) -> Result<String> {
+        text_generation::generate(&self.command, &request.workspace, purpose, model, history).await
     }
     async fn terminate_terminal(&self, request: BackendCatalogRequest, id: &str) -> Result<()> {
         let session = self.active_session(&request.harness_session_id).await

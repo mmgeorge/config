@@ -117,6 +117,7 @@ function M.activate(result, options)
     and source_state.timeline_tab
     and vim.api.nvim_tabpage_is_valid(source_state.timeline_tab)
   then
+    require("forge.views.harness.workspace").release(source_state)
     vim.api.nvim_tabpage_close(source_state.timeline_tab, false)
   end
 end

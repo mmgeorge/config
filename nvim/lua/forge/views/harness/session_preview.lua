@@ -21,7 +21,7 @@ function SessionPreview.open(transcript_win)
   vim.bo[preview_buf].swapfile = false
   vim.bo[preview_buf].filetype = "ForgeHarness"
   vim.bo[preview_buf].modifiable = false
-  vim.api.nvim_win_set_buf(transcript_win, preview_buf)
+  require("forge.views.harness.workspace").set_buffer(transcript_win, preview_buf)
   vim.wo[transcript_win].wrap = true
   vim.wo[transcript_win].linebreak = true
   vim.wo[transcript_win].breakindent = true
@@ -73,7 +73,7 @@ function SessionPreview.close()
   active = nil
   if not preview then return end
   if vim.api.nvim_win_is_valid(preview.transcript_win) and vim.api.nvim_buf_is_valid(preview.source_buf) then
-    vim.api.nvim_win_set_buf(preview.transcript_win, preview.source_buf)
+    require("forge.views.harness.workspace").set_buffer(preview.transcript_win, preview.source_buf)
     vim.api.nvim_win_call(preview.transcript_win, function()
       local line_count = math.max(1, vim.api.nvim_buf_line_count(preview.source_buf))
       preview.source_view.lnum = math.min(preview.source_view.lnum, line_count)
