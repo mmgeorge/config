@@ -66,8 +66,9 @@ end
 ---@param enabled boolean
 ---@param callback fun(result: table?, error: string?)
 function M.set_skill_enabled(name, enabled, callback)
+  local key = cache_key()
   client.request("backend.skills.set_enabled", { name = name, enabled = enabled }, function(result, request_error)
-    skill_cache[cache_key()] = nil
+    skill_cache[key] = nil
     callback(result, request_error)
   end)
 end
@@ -76,8 +77,9 @@ end
 ---@param enabled boolean
 ---@param callback fun(result: table?, error: string?)
 function M.set_mcp_enabled(name, enabled, callback)
+  local key = cache_key()
   client.request("backend.mcp.set_enabled", { name = name, enabled = enabled }, function(result, request_error)
-    mcp_cache[cache_key()] = nil
+    mcp_cache[key] = nil
     callback(result, request_error)
   end)
 end

@@ -12,12 +12,22 @@ local ok, failure = xpcall(function()
   end
   assert(display({}):find("<C-s> submit", 1, true))
   assert(display({}):find("? help (normal)", 1, true))
+  assert(not display({}):find("q close", 1, true))
+  assert(not display({}):find("edit queued", 1, true))
   local busy = { busy = true, capability = { native_steer = true }, queue = { "next" } }
   local text = display(busy)
   for _, expected in ipairs({ "<C-s> submit", "<C-q> queue", "<C-c> cancel", "<M-s> edit queued" }) do
     assert(text:find(expected, 1, true), text)
   end
-  assert(display(busy, 50):find("<C-q> queue", 1, true))
+  assert(display(busy, 50):find("<M-s> edit queued", 1, true), "queued editing must survive narrow composer hints")
+  busy.queue = {}
+  assert(not display(busy, 50):find("edit queued", 1, true), "empty queue must clear the editing hint")
+  busy.queue = { "next" }
+  config.options.keymaps.harness.edit_queued = "<M-Up>"
+  assert(display(busy, 50):find("<M-Up> edit queued", 1, true), "queue hint must use the configured binding")
+  config.options.keymaps.harness.edit_queued = false
+  assert(not display(busy):find("edit queued", 1, true), "disabled binding must hide the queue hint")
+  config.options.keymaps.harness.edit_queued = original.edit_queued
   busy.active_wait = {}
   assert(display(busy):find("<C-s> submit", 1, true))
   busy.selected_agent_run_id = "child"
@@ -29,6 +39,7 @@ local ok, failure = xpcall(function()
   assert(not text:find("<C-q>", 1, true))
   keymaps.setup_view_keymaps(buffer, "harness", commands)
   vim.api.nvim_buf_call(buffer, function()
+    assert(vim.fn.maparg("q", "n", false, true).buffer ~= 1)
     assert(vim.fn.maparg("<F5>", "i", false, true).buffer == 1)
     assert(vim.fn.maparg("<C-s>", "i", false, true).buffer ~= 1)
     assert(vim.fn.maparg("<C-q>", "i", false, true).buffer ~= 1)

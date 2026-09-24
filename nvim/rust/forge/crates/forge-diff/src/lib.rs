@@ -5,6 +5,7 @@ pub mod cache;
 pub mod display;
 pub mod edit;
 pub mod engine;
+pub mod file_header;
 pub mod intraline;
 pub mod patch;
 pub mod projection;

@@ -8,6 +8,7 @@ use forge_buffer::block::{
 use forge_buffer::identity::{BlockId, FoldId, TargetId};
 use forge_buffer::text::BufferText;
 use forge_diff::display::RowKind;
+use forge_diff::file_header::FileChange;
 use forge_diff::patch::UnifiedPatch;
 
 use super::projection::TranscriptAction;
@@ -92,25 +93,32 @@ impl ChangeTree {
                 .filter(|row| row.kind == RowKind::Removed)
                 .count();
             let status = if file.old_path.is_none() {
-                "A"
+                FileChange::Added
             } else if file.new_path.is_none() {
-                "D"
+                FileChange::Deleted
             } else if file.old_path != file.new_path {
-                "R"
+                FileChange::Renamed
             } else {
-                "M"
+                FileChange::Modified
             };
-            let display_path = if status == "R" {
+            let display_path = if matches!(status, FileChange::Renamed) {
                 format!("{} → {path}", file.old_path.as_deref().unwrap())
             } else {
                 path.clone()
             };
-            let mut heading = renderer.literal(
-                BlockId(file_id.clone()),
-                &format!("  ▸ {status} {display_path} +{added} -{removed}"),
-                6,
-            )?;
-            decorate_counts(&mut heading, added, removed);
+            let mut heading_text = String::from("  ▸ ");
+            let mut metadata = BlockMetadata::default();
+            for chunk in status.header(&display_path, Some((added as u64, removed as u64)), false) {
+                let column = heading_text.len();
+                heading_text.push_str(&chunk.text);
+                metadata.decoration.push(Decoration {
+                    range: TextRange { start: TextPosition { row: 0, column },
+                        end: TextPosition { row: 0, column: heading_text.len() } },
+                    capture: chunk.capture, priority: 100,
+                });
+            }
+            let heading = BufferBlock { id: BlockId(file_id.clone()),
+                text: BufferText::from_rows([heading_text])?, metadata };
             if let Some(path) = &file.new_path {
                 tree.push_action(
                     heading,
@@ -306,6 +314,25 @@ mod tests {
     use forge_buffer::identity::{DocumentId, DocumentRevision};
     use forge_buffer::patch::BufferSnapshot;
     use forge_buffer::width::WidthProfile;
+
+    #[test]
+    fn long_file_header_keeps_path_with_status_and_preserves_navigation() {
+        let path = format!("D:/.local/share/nvim-data/forge/harness/plans/{}/working 雪.md", "long-id/".repeat(12));
+        let diff = format!("--- {path}\n+++ {path}\n@@ -1 +1 @@\n-before\n+after\n");
+        for columns in [40, 80, 120] {
+            let width = WidthProfile { columns, ..WidthProfile::default() };
+            let renderer = TranscriptRenderer::new(&width).unwrap();
+            let tree = ChangeTree::render(&renderer, "changes", "Changed", "", &diff).unwrap();
+            let header = &tree.block[1];
+            assert_eq!(header.text.row_count(), 1);
+            assert_eq!(header.text.row(0), Some(format!("  ▸ Modified {path} +1 -1").as_str()));
+            for capture in ["ForgeStatusFileModified", "ForgeStatusPath", "ForgeAddRange", "ForgeDeleteRange"] {
+                assert!(header.metadata.decoration.iter().any(|span| span.capture == capture));
+            }
+            assert!(tree.action.values().any(|action| matches!(action,
+                TranscriptAction::File { path: target, line: 1 } if target == &path)));
+        }
+    }
 
     #[test]
     fn change_tree_preserves_counts_folds_gutters_and_source_actions() {

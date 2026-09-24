@@ -164,5 +164,78 @@ assert_true(vim.tbl_contains(request_method_list, "backend.mcp.set_enabled"),
 picker.close(false)
 client.request = original_request
 provider_catalog.clear()
+local initial_reply
+client.request = function(_, _, callback) initial_reply = callback end
+provider_picker.open_mcp({ host = host })
+mcp_picker = picker._state_for_test()
+assert_true(mcp_picker.frame.lines[1] ~= nil, "MCP picker must open before inventory arrives")
+assert_true(vim.iter(mcp_picker.frame.lines):any(function(line) return line:find("Loading MCP", 1, true) end),
+  "pending catalog should show loading feedback")
+picker.close(false)
+initial_reply({ { name = "late", enabled = true, status = "connected" } })
+assert_true(picker._state_for_test() == nil, "closed pending picker must not reopen after inventory arrives")
+provider_picker.open_mcp({ host = host })
+initial_reply(nil, "simulated initial failure")
+mcp_picker = picker._state_for_test()
+assert_true(vim.iter(mcp_picker.frame.lines):any(function(line) return line:find("simulated initial failure", 1, true) end),
+  "catalog failures must remain visible in the picker")
+picker.close(false)
+local catalog_reads = 0
+local pending_refresh
+client.request = function(method, _, callback)
+  assert_true(method == "backend.mcp", "loading refresh should only query MCP status")
+  catalog_reads = catalog_reads + 1
+  if catalog_reads == 1 then
+    callback({ { name = "starting-server", enabled = true, status = "loading" } })
+  else
+    pending_refresh = callback
+  end
+end
+provider_picker.open_mcp({ host = host })
+assert_true(vim.wait(3000, function() return pending_refresh ~= nil end, 20),
+  "starting servers should refresh their status without reopening the picker")
+vim.wait(2200, function() return false end, 20)
+assert_true(catalog_reads == 2, "status refreshes must not overlap")
+pending_refresh({ { name = "starting-server", enabled = true, status = "connected" } })
+mcp_picker = picker._state_for_test()
+mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
+assert_true(mcp_page.option_list[1].label == "✓ starting-server", "refresh should replace starting status")
+picker.close(false)
+catalog_reads = 0
+pending_refresh = nil
+provider_picker.open_mcp({ host = host })
+assert_true(vim.wait(3000, function() return pending_refresh ~= nil end, 20), "second picker should poll")
+picker.close(false)
+local old_refresh = pending_refresh
+client.request = function(_, _, callback)
+  callback({ { name = "replacement", enabled = true, status = "connected" } })
+end
+provider_picker.open_mcp({ host = host })
+old_refresh({ { name = "obsolete", enabled = true, status = "loading" } })
+mcp_picker = picker._state_for_test()
+mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
+assert_true(mcp_page.option_list[1].id == "replacement", "closed picker responses must not replace a newer picker")
+picker.close(false)
+mutation = nil
+local fail_refresh = false
+client.request = function(method, _, callback)
+  if method == "backend.mcp.set_enabled" then
+    fail_refresh = true
+    callback({ name = "server", enabled = true, restart_required = true })
+  elseif fail_refresh then
+    callback(nil, "simulated refresh failure")
+  else
+    callback({ { name = "server", enabled = false, status = "disabled" } })
+  end
+end
+provider_picker.open_mcp({ host = host, on_mutation = function(result) mutation = result end })
+mcp_picker = picker._state_for_test()
+mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
+mcp_picker.spec.action_list[1].callback({ option = mcp_page.option_list[1] })
+assert_true(mutation and mutation.restart_required,
+  "successful mutation must reach the restart coordinator even if status refresh fails")
+picker.close(false)
+client.request = original_request
+provider_catalog.clear()
 io.write("harness_provider_catalog OK\n")
 vim.cmd("qa!")

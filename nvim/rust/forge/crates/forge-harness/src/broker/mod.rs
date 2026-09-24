@@ -480,8 +480,6 @@ pub struct HarnessBroker {
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
     composer_admission: Option<(forge_buffer::identity::DocumentId, u64)>,
-    working_started_at_ms: Option<i64>,
-    working_activity: crate::session::state_machine::WorkflowActivity,
     active_wait_projection: Option<ActiveWait>,
     timeline_reconciled_after_dispatch: bool,
     turn_cancellation: Arc<TurnCancellation>,
@@ -656,8 +654,6 @@ impl HarnessBroker {
             child_exchange_runtime_by_agent: HashMap::new(),
             presentation,
             composer_admission: None,
-            working_started_at_ms: None,
-            working_activity: crate::session::state_machine::WorkflowActivity::Working,
             active_wait_projection: None,
             timeline_reconciled_after_dispatch: false,
             turn_cancellation: Arc::new(TurnCancellation::new()),
@@ -805,29 +801,11 @@ impl HarnessBroker {
                 .cloned()
         });
         let active_wait = self.active_wait_projection.clone();
-        let reasoning_summary = interaction
-            .iter()
-            .rev()
-            .find(|exchange| exchange.state == ExchangeState::Running)
-            .and_then(Exchange::latest_reasoning_summary)
-            .map(str::to_owned);
-        let status = if let Some(exchange) = interaction
-            .iter()
-            .find(|exchange| exchange.state == ExchangeState::Finalizing)
-        {
-            crate::session::state_machine::SessionPhase::Finalizing {
-                exchange_id: exchange.id.clone(),
-                error: exchange.finalization_error.clone(),
-            }
-        } else {
-            crate::session::state_machine::SessionPhase::resolve(
-                active_plan.as_ref(),
-                active_elicitation.as_ref(),
-                active_wait.as_ref(),
-                self.working_started_at_ms
-                    .map(|started_at_ms| (started_at_ms, self.working_activity, reasoning_summary)),
-            )
-        };
+        let status = crate::session::state_machine::SessionPhase::resolve(
+            active_plan.as_ref(),
+            active_wait.as_ref(),
+            interaction.last(),
+        );
         self.record_plan_trace(
             "status_projected",
             json!({ "session_id": self.session.id, "status": status }),
@@ -961,7 +939,6 @@ impl HarnessBroker {
         let outcome = self.dispatch_inner(method, request.params).await;
         match outcome {
             Ok((value, mut event)) => {
-                self.working_started_at_ms = None;
                 self.active_wait_projection = None;
                 let timeline_patch = match self.reconcile_after_dispatch() {
                     Ok(timeline_patch) => timeline_patch,
@@ -1018,7 +995,6 @@ impl HarnessBroker {
                 }
             }
             Err(error) => {
-                self.working_started_at_ms = None;
                 self.active_wait_projection = None;
                 let mut event = Vec::new();
                 if let Ok(timeline_patch) = self.reconcile_after_dispatch()
@@ -3051,7 +3027,7 @@ Planning continuation: turn {} of {}.",
         }
         let mut event = Vec::new();
         if new_interaction {
-            self.start_exchange_runtime(&mut interaction, mode, now_ms)
+            self.start_exchange_runtime(&mut interaction, now_ms)
                 .await?;
         } else if self
             .exchange_runtime
@@ -3182,7 +3158,6 @@ Planning continuation: turn {} of {}.",
                     interaction.pause_for_restart(self.clock.now_ms())?;
                     self.store.save_exchange(&interaction)?;
                     self.exchange_runtime = None;
-                    self.working_started_at_ms = None;
                     self.active_wait_projection = None;
                     self.save_session()?;
                     return Err(error);
@@ -3655,7 +3630,6 @@ Planning continuation: turn {} of {}.",
                     == Some(interaction.id.as_str())
             });
         if can_finalize_incrementally {
-            self.working_started_at_ms = None;
             self.active_wait_projection = None;
             let timeline_patch = self.reconcile_live_interaction(Some(&interaction), None)?;
             self.emit_timeline_patch(timeline_patch, &mut event).await?;
@@ -3703,7 +3677,6 @@ Planning continuation: turn {} of {}.",
         self.store.save_exchange(&interaction)?;
         self.pause_goal_after_turn_failure().await?;
         self.save_session()?;
-        self.working_started_at_ms = None;
         self.active_wait_projection = None;
         self.emit_live_interaction(
             BackendEvent {
@@ -3726,7 +3699,6 @@ Planning continuation: turn {} of {}.",
     async fn start_exchange_runtime(
         &mut self,
         interaction: &mut Exchange,
-        mode: PromptMode,
         now_ms: i64,
     ) -> Result<()> {
         if let WorkspaceKind::Git(workspace) = &self.workspace_kind {
@@ -3741,12 +3713,6 @@ Planning continuation: turn {} of {}.",
             self.store.save_checkpoint(&checkpoint)?;
             interaction.checkpoint_before = Some(checkpoint.id.clone());
         }
-        self.working_started_at_ms = Some(now_ms);
-        self.working_activity = if mode == PromptMode::Plan {
-            crate::session::state_machine::WorkflowActivity::Planning
-        } else {
-            crate::session::state_machine::WorkflowActivity::Working
-        };
         self.active_wait_projection = None;
         self.exchange_runtime = Some(ExchangeRuntime {
             exchange_id: interaction.id.clone(),
@@ -4228,6 +4194,9 @@ Planning continuation: turn {} of {}.",
         }
         if backend_event.turn_boundary.is_some() {
             self.store.save_exchange(interaction)?;
+            if backend_event.kind == "turn_started" {
+                self.emit_backend_event(backend_event, event).await?;
+            }
             return Ok(());
         }
         if backend_event.kind == "steering_input" {
@@ -4446,21 +4415,13 @@ Planning continuation: turn {} of {}.",
         interaction: Option<&Exchange>,
         removed_exchange_id: Option<&str>,
     ) -> Result<TimelinePatch> {
-        let status = if let Some(wait) = self.active_wait_projection.as_ref() {
-            crate::session::state_machine::SessionPhase::WaitingForAgent {
-                agent_count: wait.agent_count,
-            }
-        } else if let Some(started_at_ms) = self.working_started_at_ms {
-            crate::session::state_machine::SessionPhase::Working {
-                started_at_ms,
-                activity: self.working_activity,
-                reasoning_summary: interaction
-                    .and_then(Exchange::latest_reasoning_summary)
-                    .map(str::to_owned),
-            }
-        } else {
-            crate::session::state_machine::SessionPhase::Idle
-        };
+        let active_plan = self.session.active_plan_id.as_deref()
+            .map(|id| self.store.load_plan(id)).transpose()?.flatten();
+        let status = crate::session::state_machine::SessionPhase::resolve(
+            active_plan.as_ref(),
+            self.active_wait_projection.as_ref(),
+            interaction,
+        );
         self.presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
@@ -6594,7 +6555,7 @@ mod test {
     /// Render persisted timeline state through the native document projection.
     fn timeline_text(snapshot: &BrokerSnapshot) -> String {
         snapshot.timeline.iter().flat_map(|entry| {
-            let rendered = crate::buffer::projection::project(entry, &Default::default(), false).unwrap();
+            let rendered = crate::buffer::projection::project(entry, &Default::default(), false, &Default::default()).unwrap();
             rendered.entry.block.into_iter().flat_map(|block|
                 (0..block.text.row_count()).map(|row| block.text.row(row).unwrap().to_owned()).collect::<Vec<_>>()
             ).collect::<Vec<_>>()
@@ -7093,7 +7054,7 @@ mod test {
                 .await
                 .unwrap();
             broker
-                .start_exchange_runtime(&mut exchange, PromptMode::Chat, 100)
+                .start_exchange_runtime(&mut exchange, 100)
                 .await
                 .unwrap();
             std::fs::write(repository.path().join("seed.txt"), content).unwrap();
@@ -8740,6 +8701,9 @@ mod test {
             })
             .await;
         assert!(continued.response.error().is_none());
+        assert!(continued.event.iter().filter(|event| event.event == "timeline_patch")
+            .any(|event| event.payload.to_string().contains("\"kind\":\"working\"")),
+            "resuming a chat clarification must restore the Working footer in live patches");
         assert!(broker.snapshot().unwrap().active_elicitation.is_none());
         let completed = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(completed.len(), 1);
@@ -9530,6 +9494,13 @@ mod test {
                 .iter()
                 .any(|event| event.event == "plan_question_answered")
         );
+        assert!(completed.event.iter().filter(|event| event.event == "timeline_patch")
+            .any(|event| {
+                let payload = event.payload.to_string();
+                payload.contains("\"kind\":\"working\"")
+                    || payload.contains("\"kind\":\"retrying_plan_generation\"")
+            }),
+            "resuming plan feedback must restore an active footer in live patches");
         assert!(
             completed
                 .event
@@ -11186,12 +11157,11 @@ mod test {
             .await
             .unwrap();
         let error = broker
-            .start_exchange_runtime(&mut rejected, PromptMode::Chat, 300)
+            .start_exchange_runtime(&mut rejected, 300)
             .await
             .unwrap_err();
         assert!(error.to_string().contains("capacity is full"));
         assert!(rejected.checkpoint_before.is_none());
-        assert!(broker.working_started_at_ms.is_none());
         assert!(broker.exchange_runtime.is_none());
         assert!(
             broker

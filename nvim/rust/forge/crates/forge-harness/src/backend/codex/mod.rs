@@ -20,6 +20,7 @@ use tokio::sync::{Mutex, Notify};
 
 mod json_rpc;
 mod process;
+mod recap;
 mod runtime;
 mod security;
 mod turn_coordinator;
@@ -291,6 +292,41 @@ impl CodexBackend {
         Ok((process, output))
     }
 
+    /// Open an independent connection and load the thread that owns terminal state.
+    async fn terminal_connection(
+        &self,
+        mut request: BackendCatalogRequest,
+    ) -> Result<Option<(CodexJsonRpc, BackendOutput, String)>> {
+        request.backend_session_id = self
+            .active_session_id_for(&request.harness_session_id)
+            .await
+            .or(request.backend_session_id);
+        let Some(thread_id) = request.backend_session_id.clone() else {
+            return Ok(None);
+        };
+        let (mut process, mut output) = self.catalog_process(&request).await?;
+        Self::load_terminal_thread(&mut process, &mut output, &thread_id, &request.workspace)
+            .await?;
+        Ok(Some((process, output, thread_id)))
+    }
+
+    async fn load_terminal_thread(
+        process: &mut CodexJsonRpc,
+        output: &mut BackendOutput,
+        thread_id: &str,
+        workspace: &str,
+    ) -> Result<()> {
+        process
+            .request(
+                "thread/resume",
+                json!({ "threadId": thread_id, "cwd": workspace }),
+                output,
+            )
+            .await
+            .context("load Codex thread for background terminal request")?;
+        Ok(())
+    }
+
     async fn skill_catalog(
         process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
@@ -387,7 +423,9 @@ impl CodexBackend {
                     .to_owned();
                 let config = config_map.and_then(|config_map| config_map.get(&name));
                 let status_text = server
-                    .get("status")
+                    .get("runtimeStatus")
+                    .filter(|status| !status.is_null())
+                    .or_else(|| server.get("status"))
                     .and_then(|status| status.as_str().or_else(|| status.get("status")?.as_str()))
                     .unwrap_or_default()
                     .to_ascii_lowercase();
@@ -401,6 +439,11 @@ impl CodexBackend {
                     .or_else(|| server.get("enabled"))
                     .and_then(Value::as_bool)
                     .unwrap_or(!status_text.contains("disabled"));
+                let tool_error = server
+                    .get("toolsError")
+                    .or_else(|| server.get("toolError"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
                 let error = server
                     .get("error")
                     .and_then(|error| {
@@ -408,7 +451,8 @@ impl CodexBackend {
                             .as_str()
                             .or_else(|| error.get("message").and_then(Value::as_str))
                     })
-                    .map(str::to_owned);
+                    .map(str::to_owned)
+                    .or_else(|| tool_error.clone());
                 let tool_value = server.get("tools");
                 let status = if !enabled || status_text.contains("disabled") {
                     McpStatus::Disabled
@@ -422,6 +466,8 @@ impl CodexBackend {
                     || status_text.contains("error")
                 {
                     McpStatus::Failed
+                } else if status_text == "notstarted" || status_text == "cancelled" {
+                    McpStatus::Unavailable
                 } else if status_text.contains("start")
                     || status_text.contains("load")
                     || status_text.contains("pending")
@@ -505,10 +551,7 @@ impl CodexBackend {
                     token_count,
                     token_estimated: token_count.is_some(),
                     tools,
-                    tool_error: server
-                        .get("toolError")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned),
+                    tool_error,
                 })
             })
             .collect::<Vec<_>>();
@@ -784,6 +827,94 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
+    async fn recap(
+        &self,
+        request: BackendCatalogRequest,
+        model: &str,
+        history: &str,
+    ) -> Result<String> {
+        let (mut process, mut output) = self.catalog_process(&request).await?;
+        recap::generate(
+            &mut process,
+            &mut output,
+            &request.workspace,
+            model,
+            history,
+        )
+        .await
+    }
+    async fn terminate_terminal(&self, request: BackendCatalogRequest, id: &str) -> Result<()> {
+        let (mut process, mut output, thread_id) = self
+            .terminal_connection(request)
+            .await?
+            .context("Codex session has no active thread")?;
+        let result = process
+            .request(
+                "thread/backgroundTerminals/terminate",
+                json!({"threadId": thread_id, "processId": id}),
+                &mut output,
+            )
+            .await?;
+        anyhow::ensure!(
+            result.get("terminated").and_then(Value::as_bool) == Some(true),
+            "Background terminal is no longer running or could not be terminated"
+        );
+        Ok(())
+    }
+
+    async fn background_terminals(
+        &self,
+        request: BackendCatalogRequest,
+    ) -> Result<super::terminal::TerminalSnapshot> {
+        let Some((mut process, mut output, thread_id)) = self.terminal_connection(request).await?
+        else {
+            return Ok(super::terminal::TerminalSnapshot {
+                supported: true,
+                terminal: Vec::new(),
+            });
+        };
+        let mut snapshot = super::terminal::TerminalSnapshot {
+            supported: true,
+            terminal: Vec::new(),
+        };
+        let mut cursor: Option<String> = None;
+        let mut page_count = 0;
+        loop {
+            page_count += 1;
+            anyhow::ensure!(
+                page_count <= 16,
+                "background terminal pagination exceeds 16 pages"
+            );
+            let result = process
+                .request(
+                    "thread/backgroundTerminals/list",
+                    json!({"threadId": thread_id, "limit": 100, "cursor": cursor}),
+                    &mut output,
+                )
+                .await?;
+            snapshot
+                .terminal
+                .extend(super::terminal::TerminalSnapshot::parse(&result, false)?.terminal);
+            anyhow::ensure!(
+                snapshot.terminal.len() <= 1024,
+                "background terminal inventory exceeds 1024 entries"
+            );
+            let next = result
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if next.is_none() {
+                break;
+            }
+            anyhow::ensure!(
+                next != cursor,
+                "background terminal pagination did not advance"
+            );
+            cursor = next;
+        }
+        Ok(snapshot)
+    }
+
     async fn shutdown(&self) -> Result<()> {
         self.runtime.shutdown().await?;
         self.connection_by_session.lock().await.clear();
@@ -1257,15 +1388,46 @@ impl Backend for CodexBackend {
         })
     }
 
+    async fn mcp_configuration(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
+        let (mut process, mut output) = self.catalog_process(&request).await?;
+        let config = process.request(
+            "config/read",
+            json!({ "cwd": request.workspace, "includeLayers": false }),
+            &mut output,
+        ).await?;
+        Ok(Self::parse_mcp_catalog(&Value::Null, &config))
+    }
+
     async fn mcp_list(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
         let (mut process, mut output) = self.catalog_process(&request).await?;
-        let result = process
-            .request(
-                "mcpServerStatus/list",
-                json!({ "threadId": request.backend_session_id, "detail": "full" }),
-                &mut output,
-            )
-            .await?;
+        let mut server_list = Vec::new();
+        let mut cursor = None::<String>;
+        let mut cursor_set = HashSet::new();
+        loop {
+            let page = process
+                .request(
+                    "mcpServerStatus/list",
+                    json!({ "threadId": request.backend_session_id,
+                        "detail": "toolsAndAuthOnly", "cursor": cursor }),
+                    &mut output,
+                )
+                .await?;
+            server_list.extend(
+                page.get("data")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default(),
+            );
+            cursor = page
+                .get("nextCursor")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            let Some(next_cursor) = &cursor else { break };
+            anyhow::ensure!(
+                cursor_set.insert(next_cursor.clone()),
+                "MCP inventory repeated a pagination cursor"
+            );
+        }
         let config = process
             .request(
                 "config/read",
@@ -1273,7 +1435,10 @@ impl Backend for CodexBackend {
                 &mut output,
             )
             .await?;
-        Ok(Self::parse_mcp_catalog(&result, &config))
+        Ok(Self::parse_mcp_catalog(
+            &json!({ "data": server_list }),
+            &config,
+        ))
     }
 
     async fn set_mcp_enabled(
@@ -1428,6 +1593,81 @@ impl Backend for CodexBackend {
 mod test {
     use super::*;
 
+    #[tokio::test]
+    async fn loads_a_thread_before_using_a_secondary_terminal_connection() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(fixture.path())?);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let expected_workspace = workspace.clone();
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request: Value =
+                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                    .unwrap();
+            assert_eq!(request["method"], "thread/resume");
+            assert_eq!(request["params"]["threadId"], "provider-thread");
+            assert_eq!(request["params"]["cwd"], expected_workspace);
+            socket
+                .send(tokio_tungstenite::tungstenite::Message::Text(
+                    json!({
+                        "id": request["id"],
+                        "result": { "thread": { "id": "provider-thread" } }
+                    })
+                    .to_string()
+                    .into(),
+                ))
+                .await
+                .unwrap();
+        });
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            ExecutionMode::Read,
+            permission,
+            None,
+            trace,
+            "session".into(),
+        )
+        .await?;
+        CodexBackend::load_terminal_thread(
+            &mut process,
+            &mut BackendOutput::default(),
+            "provider-thread",
+            &workspace,
+        )
+        .await?;
+        tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+        Ok(())
+    }
+
+    #[tokio::test]
+    #[ignore = "requires the installed authenticated Codex CLI and configured MCP servers"]
+    async fn live_mcp_catalog() {
+        let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
+        let result = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            backend.mcp_list(BackendCatalogRequest {
+                harness_session_id: "mcp-catalog-test".into(),
+                workspace: std::env::current_dir()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned(),
+                backend_session_id: None,
+                execution_mode: ExecutionMode::Read,
+            }),
+        )
+        .await;
+        backend.shutdown().await.unwrap();
+        let inventory = result.expect("MCP inventory exceeded 30 seconds").unwrap();
+        eprintln!("MCP inventory: {} servers", inventory.len());
+    }
+
     #[test]
     fn omits_the_default_model_sentinel_from_codex_requests() {
         let default = CodexBackend::with_model(json!({ "cwd": "workspace" }), "default");
@@ -1551,6 +1791,31 @@ mod test {
             CodexBackend::notification_turn_id(&started, "turn/completed"),
             None
         );
+    }
+
+    #[test]
+    fn mcp_runtime_status_takes_precedence_over_an_empty_tool_catalog() {
+        for (runtime_status, expected) in [
+            ("notStarted", McpStatus::Unavailable),
+            ("starting", McpStatus::Loading),
+            ("connected", McpStatus::Connected),
+            ("authenticationRequired", McpStatus::NeedsAuthentication),
+            ("failed", McpStatus::Failed),
+            ("cancelled", McpStatus::Unavailable),
+            ("disabled", McpStatus::Disabled),
+        ] {
+            let catalog = CodexBackend::parse_mcp_catalog(
+                &json!({"data":[{"name":"server","runtimeStatus":runtime_status,"tools":{}}]}),
+                &json!({}),
+            );
+            assert_eq!(catalog[0].status, expected, "{runtime_status}");
+        }
+        let catalog = CodexBackend::parse_mcp_catalog(
+            &json!({"data":[{"name":"server","tools":{},"toolsError":"Discovery failed"}]}),
+            &json!({}),
+        );
+        assert_eq!(catalog[0].status, McpStatus::Failed);
+        assert_eq!(catalog[0].tool_error.as_deref(), Some("Discovery failed"));
     }
 
     #[test]

@@ -45,6 +45,7 @@ end
 local function comparison_snapshot(document, file)
   local snapshot = fixture.snapshot(document, { path = "a.txt", view = { kind = "comparison", title = "somebranch", path = file, worktree = true } })
   snapshot.file[1].stats = { state = "exact", added = 1, deleted = 1 }
+  snapshot.file[1].header = dofile("nvim/tests/forge/support/status_fixture.lua").header(snapshot.file[1].path, 1, 1)
   return snapshot
 end
 

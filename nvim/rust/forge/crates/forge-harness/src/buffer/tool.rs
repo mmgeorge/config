@@ -12,8 +12,7 @@ const MAX_OUTPUT_ROWS: usize = 262_144;
 
 #[derive(Debug, Serialize)]
 pub struct ToolOutputPreview<'a> {
-    pub first: Option<&'a str>,
-    pub last: Option<&'a str>,
+    pub row: Vec<&'a str>,
     pub hidden_rows: usize,
     pub total_rows: usize,
 }
@@ -92,12 +91,12 @@ impl ToolOutputView {
         })
     }
 
-    pub fn collapsed(&self) -> ToolOutputPreview<'_> {
+    pub fn preview(&self, expanded: bool) -> ToolOutputPreview<'_> {
+        let visible = if expanded { self.row.len() } else { 4 };
         ToolOutputPreview {
-            first: self.row.first().map(|range| &self.display[range.clone()]),
-            last: (self.row.len() > 1)
-                .then(|| &self.display[self.row.last().expect("nonempty rows").clone()]),
-            hidden_rows: self.row.len().saturating_sub(2),
+            row: self.row.iter().take(visible)
+                .map(|range| &self.display[range.clone()]).collect(),
+            hidden_rows: self.row.len().saturating_sub(visible),
             total_rows: self.row.len(),
         }
     }
@@ -248,12 +247,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn preview_keeps_first_four_lines_and_counts_only_remaining_lines() {
+        for count in 0usize..=6 {
+            let saved = (0..count).map(|index| format!("line {index}\n")).collect::<String>();
+            let view = ToolOutputView::new("call".into(), Arc::from(saved)).unwrap();
+            let preview = view.preview(false);
+            assert_eq!(preview.row, (0..count.min(4)).map(|index| format!("line {index}")).collect::<Vec<_>>());
+            assert_eq!(preview.hidden_rows, count.saturating_sub(4));
+        }
+    }
+
+    #[test]
     fn one_expansion_delivers_complete_output_and_collapse_preserves_loaded_rows() {
         let saved = (0..10000)
             .map(|row| format!("output {row}\n"))
             .collect::<String>();
         let mut view = ToolOutputView::new("call".into(), Arc::from(saved.as_str())).unwrap();
-        assert_eq!(view.collapsed().hidden_rows, 9998);
+        assert_eq!(view.preview(false).hidden_rows, 9996);
         view.expand();
         let first = view.next_batch(256, 65536).unwrap().unwrap();
         assert_eq!(view.next_batch(256, 65536).unwrap().unwrap().start_row, 0);
@@ -288,11 +298,10 @@ mod tests {
     fn display_strips_ansi_and_normalizes_terminal_controls_without_changing_export() {
         let saved = "\u{1b}[31mred\u{1b}[0m\r\nprogress\rdone\n\0tail\n";
         let view = ToolOutputView::new("call".into(), Arc::from(saved)).unwrap();
-        let collapsed = view.collapsed();
+        let collapsed = view.preview(false);
 
-        assert_eq!(collapsed.first, Some("red"));
-        assert_eq!(collapsed.last, Some("tail"));
-        assert_eq!(collapsed.hidden_rows, 1);
+        assert_eq!(collapsed.row, vec!["red", "progressdone", "tail"]);
+        assert_eq!(collapsed.hidden_rows, 0);
         assert_eq!(view.saved.as_ref(), saved);
     }
 

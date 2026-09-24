@@ -8,6 +8,7 @@ local replica = render.open("semantic-test", { notice = function(message) notice
 vim.api.nvim_win_set_buf(0, replica.buffer)
 local function record(id, path)
   return { id = id, generation = 1, section = "unstaged", change = "modified", path = path,
+    header = dofile("nvim/tests/forge/support/status_fixture.lua").header(path),
     untracked = false, stats = { state = "unknown" } }
 end
 local snapshot = { document = replica.document, revision = 0, view = { kind = "status" },
@@ -48,6 +49,7 @@ assert(#selected.target == 2 and selected.target[1].target == "group:10" and sel
 local body = replica.file[1].body
 local changed = record(1, "a.lua")
 changed.stats = { state = "exact", added = 2, deleted = 1 }
+changed.header = dofile("nvim/tests/forge/support/status_fixture.lua").header("a.lua", 2, 1)
 assert(render.apply_patch(replica, { document = replica.document, base = 0, next = 1, removed = {}, section = {}, file = { changed } }).kind == "Applied")
 assert(replica.file[1].body == body and lines()[4] == "Modified a.lua +2 -1", "count update lost body")
 local patch = { document = "body:1:1", base = 1, next = 2, base_rows = 3, next_rows = 4, base_blocks = 2, next_blocks = 3,

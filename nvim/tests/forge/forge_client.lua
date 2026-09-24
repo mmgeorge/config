@@ -201,8 +201,15 @@ local ok, failure = xpcall(function()
   end)
   assert(vim.wait(1000, function() return held_id ~= nil end, 1))
   local generation = client._client.generation
-  client.stop()
+  local stopped = false
+  client.stop(nil, function()
+    assert(client._client.process == nil and not client._client.draining,
+      "shutdown completion ran before process collection")
+    assert(settled and settled.posted, "shutdown completion discarded an admitted mutation")
+    stopped = true
+  end)
   assert(client._client.draining and client._client.generation == generation)
+  assert(not stopped, "shutdown completion must wait for the host")
   assert(not settled and client._client.pending[held_id], "drain discarded an admitted mutation")
   local rejected_drain
   client.request_host("state.get", {}, function(_, request_error) rejected_drain = request_error end)
@@ -214,6 +221,7 @@ local ok, failure = xpcall(function()
   collected({ code = 0 })
   assert(vim.wait(1000, function() return not client._client.draining end, 1))
   assert(client._client.process == nil and vim.tbl_isempty(client._client.pending))
+  assert(stopped, "shutdown completion must run after the host is collected")
 end, debug.traceback)
 
 builder.ensure = original_ensure

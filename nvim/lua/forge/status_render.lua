@@ -8,9 +8,6 @@ local empty_map = {}
 local maximum = 9007199254740991
 local section_order = { "unstaged", "staged", "conflicted", "ignored" }
 local section_label = { unstaged = "Unstaged changes", staged = "Staged changes", conflicted = "Conflicted files", ignored = "Ignored changes" }
-local change_label = { added = "New", deleted = "Deleted", renamed = "Renamed", copied = "Copied", conflicted = "Conflict", modified = "Modified" }
-local change_capture = { added = "ForgeStatusFileNew", deleted = "ForgeStatusFileDeleted", renamed = "ForgeStatusFileRenamed",
-  copied = "ForgeStatusFileNew", conflicted = "ForgeStatusFileDeleted", modified = "ForgeStatusFileModified" }
 
 ---@class ForgeStatusFileRecord
 ---@field id integer
@@ -21,6 +18,7 @@ local change_capture = { added = "ForgeStatusFileNew", deleted = "ForgeStatusFil
 ---@field origin? string
 ---@field untracked boolean
 ---@field stats {state: string, added?: integer, deleted?: integer}
+---@field header {text: string, capture: string}[]
 
 ---@class ForgeStatusFileModel
 ---@field record ForgeStatusFileRecord
@@ -92,20 +90,13 @@ local function file_header(record, body)
   counter(record.id)
   counter(record.generation)
   assert(type(record.path) == "string" and not record.path:find("[\n\r%z]"), "invalid status display path")
-  local label = assert(change_label[record.change], "unknown status change")
   assert(section_label[record.section] or record.section == "untracked", "unknown status section")
-  local chunk = { { label, change_capture[record.change] }, { string.rep(" ", 9 - #label) .. record.path, "ForgeStatusPath" } }
-  local stats = record.stats
-  assert(type(stats) == "table", "missing status statistics")
-  if stats.state == "exact" then
-    counter(stats.added) counter(stats.deleted)
-    chunk[#chunk + 1] = { " ", "ForgeStatusPath" }
-    chunk[#chunk + 1] = { "+" .. stats.added, "ForgeAddRange" }
-    chunk[#chunk + 1] = { " ", "ForgeStatusPath" }
-    chunk[#chunk + 1] = { "-" .. stats.deleted, "ForgeDeleteRange" }
-  else
-    assert(stats.state == "unknown" or stats.state == "exceeds_limit", "unknown statistics state")
-    if record.untracked then chunk[#chunk + 1] = { " new", "ForgeStatusPath" } end
+  assert(type(record.header) == "table" and #record.header > 0, "missing native file header")
+  local chunk = {}
+  for _, segment in ipairs(record.header) do
+    assert(type(segment.text) == "string" and not segment.text:find("[\n\r%z]"), "invalid file header text")
+    assert(type(segment.capture) == "string", "invalid file header highlight")
+    chunk[#chunk + 1] = { segment.text, segment.capture }
   end
   local parts = {}
   for index = 1, #chunk do parts[index] = chunk[index][1] end

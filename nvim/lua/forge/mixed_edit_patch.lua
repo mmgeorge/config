@@ -60,7 +60,19 @@ local function physical_map(session, pending)
     local offset = 0
     for _, entry in ipairs(mapped) do
       if row < entry.start then break end
-      if row < entry.start + entry.count then return entry.physical_start + math.min(row-entry.start,entry.next_count-1) end
+      if row < entry.start + entry.count then
+        local relative, shift = row - entry.start, 0
+        local next_region = {}
+        for _, region in ipairs(entry.entry.metadata.editable_region) do next_region[region.id] = region end
+        local preceding = -1
+        for _, region in ipairs(session.block[entry.id].metadata.editable_region) do
+          if relative > region.range["end"].row and region.range["end"].row > preceding then
+            preceding = region.range["end"].row
+            shift = assert(next_region[region.id]).range["end"].row - preceding
+          end
+        end
+        return entry.physical_start + relative + shift
+      end
       offset = offset + entry.next_count-entry.count
     end
     return row + offset

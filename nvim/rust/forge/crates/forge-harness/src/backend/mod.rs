@@ -1,10 +1,13 @@
 pub mod approval;
 mod catalog;
+pub(crate) mod mcp;
 pub mod codex;
 pub mod copilot;
 pub mod events;
 mod execution;
 mod steering;
+pub(crate) mod recap;
+pub mod terminal;
 pub use catalog::{
     BackendCatalogRequest, BackendInput, CatalogCapability, CatalogMutation, McpDefinition,
     McpStatus, McpToolDefinition, SkillDefinition,
@@ -433,6 +436,21 @@ pub trait Backend: Send + Sync {
         anyhow::bail!("backend does not support session fork")
     }
 
+    /// Query live provider shells independently of prompt execution and exchange completion.
+    async fn background_terminals(&self, _request: BackendCatalogRequest) -> Result<terminal::TerminalSnapshot> {
+        Ok(terminal::TerminalSnapshot::default())
+    }
+
+    /// Terminate one provider-owned background shell without interrupting its exchange.
+    async fn terminate_terminal(&self, _request: BackendCatalogRequest, _id: &str) -> Result<()> {
+        anyhow::bail!("backend does not support background terminal termination")
+    }
+
+    /// Generate a transient recap in an isolated provider conversation.
+    async fn recap(&self, _request: BackendCatalogRequest, _model: &str, _history: &str) -> Result<String> {
+        anyhow::bail!("backend does not support isolated recaps")
+    }
+
     /// List provider models for the Harness model picker.
     async fn model_list(&self, _request: BackendRequest) -> Result<Vec<BackendModel>> {
         Ok(Vec::new())
@@ -454,6 +472,11 @@ pub trait Backend: Send + Sync {
     }
 
     /// List complete provider MCP definitions including cached tool metadata.
+    /// List configured servers without waiting for their startup handshakes.
+    async fn mcp_configuration(&self, _request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
+        anyhow::bail!("backend does not expose MCP configuration")
+    }
+
     async fn mcp_list(&self, _request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
         Ok(Vec::new())
     }

@@ -66,6 +66,8 @@ local ok, failure = xpcall(function()
   item(complete(commands, "/"), "/plan")
   assert(vim.tbl_contains(sources.get_trigger_characters("default"), "/"))
   item(complete(commands, "/"), "/model")
+  item(complete(commands, "/b"), "/bg")
+  item(complete(commands, "/rec"), "/recap")
   item(complete(commands, "/mode "), "write")
   session.harness.agent = { run = { { id = "child", definition = "explorer", state = "ready" } }, exchange = {} }
   session.harness.timeline = { { kind = "agent_lifecycle", run = session.harness.agent.run[1],

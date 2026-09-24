@@ -1,4 +1,5 @@
 mod event_decoder;
+mod recap;
 
 use crate::agent::{AgentCapability, AgentControlMode};
 use crate::backend::approval::{
@@ -47,6 +48,59 @@ const SYSTEM_MESSAGE: &str = super::HARNESS_SYSTEM_MESSAGE;
 type SharedCopilotSession = Arc<github_copilot_sdk::session::Session>;
 type CopilotSessionSlot = Arc<Mutex<Option<SharedCopilotSession>>>;
 
+/// Retains terminal observations after the prompt event subscription ends.
+struct CopilotTerminalMonitor {
+    session: std::sync::Weak<github_copilot_sdk::session::Session>,
+    snapshot: tokio::sync::watch::Receiver<Option<std::result::Result<super::terminal::TerminalSnapshot, String>>>,
+    task: tokio::task::JoinHandle<()>,
+}
+
+impl Drop for CopilotTerminalMonitor {
+    fn drop(&mut self) { self.task.abort(); }
+}
+
+impl CopilotTerminalMonitor {
+    /// Subscribe before the first query so terminal transitions cannot be lost at attachment.
+    fn new(session: &SharedCopilotSession) -> Self {
+        let mut event = session.subscribe();
+        let session = Arc::downgrade(session);
+        let monitored_session = session.clone();
+        let (send, snapshot) = tokio::sync::watch::channel(None);
+        let task = tokio::spawn(async move {
+            loop {
+                let Some(session) = session.upgrade() else { return; };
+                let result = tokio::time::timeout(std::time::Duration::from_secs(6), async {
+                    session.rpc().tasks().refresh().await.context("refresh Copilot background terminals")?;
+                    let result = session.rpc().tasks().list().await.context("list Copilot background terminals")?;
+                    super::terminal::TerminalSnapshot::parse(&serde_json::to_value(result)?, true)
+                }).await.context("Copilot terminal query timed out").and_then(|result| result).map_err(|error: anyhow::Error| error.to_string());
+                let has_terminals = result.as_ref().is_ok_and(|snapshot| !snapshot.terminal.is_empty());
+                if send.send(Some(result)).is_err() { return; }
+                drop(session);
+                // Bound refresh-triggered notifications to one query per two seconds.
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                let delay = tokio::time::sleep(std::time::Duration::from_secs(if has_terminals { 2 } else { 10 }));
+                tokio::pin!(delay);
+                loop {
+                    tokio::select! {
+                        _ = &mut delay => break,
+                        update = event.recv() => match update {
+                            Ok(update) if update.event_type == "session.background_tasks_changed" => break,
+                            Ok(_) => {},
+                            Err(error) if matches!(error.kind(), github_copilot_sdk::subscription::RecvErrorKind::Lagged(_)) => break,
+                            Err(error) => {
+                                let _ = send.send(Some(Err(format!("Copilot terminal event stream closed: {error}"))));
+                                return;
+                            },
+                        }
+                    }
+                }
+            }
+        });
+        Self { session: monitored_session, snapshot, task }
+    }
+}
+
 enum ProviderShutdown {
     Idle,
     Running(tokio::task::JoinHandle<std::result::Result<(), String>>),
@@ -55,6 +109,7 @@ enum ProviderShutdown {
 
 /// Owns the native Copilot SDK client, session, event decoder, and Harness callbacks.
 pub struct CopilotBackend {
+    terminal_monitor: Mutex<HashMap<String, CopilotTerminalMonitor>>,
     command: Vec<String>,
     client: Mutex<Option<Client>>,
     client_start_count: AtomicU64,
@@ -81,6 +136,7 @@ impl CopilotBackend {
         permission_coordinator: Arc<PermissionCoordinator>,
     ) -> Result<Self> {
         Ok(Self {
+            terminal_monitor: Mutex::new(HashMap::new()),
             command,
             client: Mutex::new(None),
             client_start_count: AtomicU64::new(0),
@@ -319,8 +375,45 @@ fn capability() -> BackendCapability {
 
 #[async_trait]
 impl Backend for CopilotBackend {
+    async fn recap(&self, request: BackendCatalogRequest, model: &str, history: &str) -> Result<String> {
+        recap::generate(&self.command, &request.workspace, model, history).await
+    }
+    async fn terminate_terminal(&self, request: BackendCatalogRequest, id: &str) -> Result<()> {
+        let session = self.active_session(&request.harness_session_id).await
+            .context("Copilot session is not attached")?;
+        session.rpc().tasks().refresh().await?;
+        let inventory = session.rpc().tasks().list().await?;
+        let inventory = super::terminal::TerminalSnapshot::parse(&serde_json::to_value(inventory)?, true)?;
+        anyhow::ensure!(inventory.terminal.iter().any(|terminal| terminal.id == id),
+            "Background terminal is no longer running");
+        let result = session.rpc().tasks().cancel(github_copilot_sdk::rpc::TasksCancelRequest { id: id.into() }).await?;
+        anyhow::ensure!(result.cancelled, "Background terminal could not be cancelled");
+        self.terminal_monitor.lock().await.remove(&request.harness_session_id);
+        Ok(())
+    }
+
+    async fn background_terminals(&self, request: BackendCatalogRequest) -> Result<super::terminal::TerminalSnapshot> {
+        let session = match self.active_session(&request.harness_session_id).await {
+            Some(session) => session,
+            None if request.backend_session_id.is_some() => self.session(&Self::catalog_backend_request(&request)).await?,
+            None => return Ok(super::terminal::TerminalSnapshot { supported: true, terminal: Vec::new() }),
+        };
+        let mut monitor_store = self.terminal_monitor.lock().await;
+        let monitor = monitor_store.entry(request.harness_session_id)
+            .or_insert_with(|| CopilotTerminalMonitor::new(&session));
+        if monitor.task.is_finished() || !monitor.session.ptr_eq(&Arc::downgrade(&session)) {
+            *monitor = CopilotTerminalMonitor::new(&session);
+        }
+        let mut snapshot = monitor.snapshot.clone();
+        drop(monitor_store);
+        if snapshot.borrow().is_none() { snapshot.changed().await.context("Copilot terminal observer stopped")?; }
+        let result = snapshot.borrow().clone().context("Copilot terminal observer has no snapshot")?;
+        result.map_err(anyhow::Error::msg)
+    }
+
     async fn shutdown(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
+        self.terminal_monitor.lock().await.clear();
         let mut shutdown = self.shutdown.lock().await;
         if matches!(*shutdown, ProviderShutdown::Idle) {
             let client = self.client.lock().await.clone();
@@ -451,7 +544,7 @@ impl Backend for CopilotBackend {
             tokio::select! {
                 provider_event = subscription.recv() => {
                     let provider_event = provider_event.context("receive Copilot session event")?;
-                    if provider_event.event_type == "session.idle" {
+                    if completes_exchange(&provider_event) {
                         self.completed_event_by_harness
                             .lock()
                             .await
@@ -651,6 +744,28 @@ impl Backend for CopilotBackend {
             enabled,
             restart_required: false,
         })
+    }
+
+    async fn mcp_configuration(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
+        let client = self.client(&request.workspace).await?;
+        let discovery = client.rpc().mcp().discover(McpDiscoverRequest {
+            working_directory: Some(request.workspace),
+        }).await.context("discover configured Copilot MCP servers")?;
+        let mut servers = discovery.servers.into_iter().map(|server| McpDefinition {
+            name: server.name,
+            enabled: server.enabled,
+            transport: server.r#type.and_then(|transport| serde_json::to_value(transport).ok())
+                .and_then(|transport| transport.as_str().map(str::to_owned))
+                .unwrap_or_else(|| "unknown".into()),
+            status: if server.enabled { McpStatus::Loading } else { McpStatus::Disabled },
+            status_detail: None,
+            token_count: None,
+            token_estimated: false,
+            tools: Vec::new(),
+            tool_error: None,
+        }).collect::<Vec<_>>();
+        servers.sort_by(|left, right| left.name.cmp(&right.name));
+        Ok(servers)
     }
 
     async fn mcp_list(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
@@ -1318,6 +1433,12 @@ impl PermissionHandler for CopilotPermissionHandler {
     }
 }
 
+/// Finish the main agent independently from attached background work.
+fn completes_exchange(event: &github_copilot_sdk::SessionEvent) -> bool {
+    event.agent_id.is_none()
+        && matches!(event.event_type.as_str(), "assistant.idle" | "session.idle")
+}
+
 fn permission_kind(kind: Option<PermissionRequestKind>) -> &'static str {
     match kind {
         Some(PermissionRequestKind::Shell) => "shell",
@@ -1335,6 +1456,21 @@ fn permission_kind(kind: Option<PermissionRequestKind>) -> &'static str {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn main_agent_idle_finishes_without_waiting_for_background_session_idle() {
+        let mut event: github_copilot_sdk::SessionEvent = serde_json::from_value(serde_json::json!({
+            "id":"idle", "type":"assistant.idle", "timestamp":"2026-09-18T00:00:00Z", "data":{}
+        })).unwrap();
+        assert!(super::completes_exchange(&event));
+        event.agent_id = Some("child".into());
+        assert!(!super::completes_exchange(&event));
+        event.agent_id = None;
+        event.event_type = "assistant.turn_end".into();
+        assert!(!super::completes_exchange(&event));
+        event.event_type = "session.idle".into();
+        assert!(super::completes_exchange(&event));
+    }
+
     #[tokio::test]
     #[ignore = "requires the locally fetched pinned Copilot CLI, without authentication or prompts"]
     async fn default_cli_resolution_starts_and_collects_without_a_session() {

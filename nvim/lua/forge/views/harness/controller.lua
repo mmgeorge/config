@@ -18,13 +18,56 @@ local picker = require("forge.views.picker")
 local timeline_status = require("forge.views.harness.timeline_status")
 local timeline_cache = require("forge.views.harness.timeline_cache")
 local question_presentation = require("forge.views.harness.question_presentation")
+local recap = require("forge.views.harness.recap")
 local session_navigation = require("forge.views.harness.session_navigation")
 
 local queue_namespace = vim.api.nvim_create_namespace("ForgeHarnessQueue")
 local render_observer_for_test = nil
 local begin_request
 local submit_immediate
+local configure_now
 local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
+
+---@param state table
+---@param field string
+---@return string|boolean
+local function applied_setting(state, field)
+  if field == "fast_mode" then return state.session ~= nil and state.session.fast_mode == true end
+  return (state.session and state.session[field]) or config.options.harness[field]
+end
+
+---@param state table
+---@param field string
+---@return string|boolean
+local function selected_setting(state, field)
+  if state.pending_config and state.pending_config[field] ~= nil then return state.pending_config[field] end
+  if state.configuring_config and state.configuring_config[field] ~= nil then return state.configuring_config[field] end
+  return applied_setting(state, field)
+end
+
+---@param state table
+local function prune_pending_settings(state)
+  local pending = state.pending_config
+  if not pending then return end
+  for _, field in ipairs({ "effort", "fast_mode" }) do
+    local applied = applied_setting(state, field)
+    local inflight = state.configuring_config and state.configuring_config[field]
+    if pending[field] == applied and (inflight == nil or inflight == applied) then pending[field] = nil end
+  end
+  if not next(pending) then state.pending_config, state.pending_config_validate = nil, false end
+end
+
+---Parse model configuration separately from its optional queued prompt.
+local function model_command(text)
+  if not text:match("^/model%s") then return nil end
+  local model, remainder = text:match("^/model%s+(%S+)%s*(.*)$")
+  if not model then return nil end
+  local effort, prompt = remainder:match("^(%S+)%s*(.*)$")
+  if effort and not vim.tbl_contains(effort_list, effort) then
+    return nil, nil, "Unknown reasoning effort: " .. effort
+  end
+  return { model = model, effort = effort }, prompt or ""
+end
 
 ---@return table
 local function harness_state() return session.harness end
@@ -225,15 +268,17 @@ local function status_text()
     or backend
   local configured_model = active_session.model or config.options.harness.model
   local model = active_session.resolved_model or (configured_model == "default" and "resolving model" or configured_model)
-  local effort = active_session.effort or config.options.harness.effort
+  local effort = selected_setting(state, "effort")
   if state.pending_config and state.pending_config.model then model = state.pending_config.model .. "*" end
-  if state.pending_config and state.pending_config.effort then effort = state.pending_config.effort .. "*" end
+  if effort ~= (active_session.effort or config.options.harness.effort) then effort = effort .. "*" end
   local busy = state.cancel_requested and " • cancelling"
     or state.mode_restart_requested and " • restarting"
     or state.busy and " • running"
     or (#state.queue > 0 and (" • queued " .. #state.queue) or "")
   local goal = goal_status_text(state)
-  local fast = active_session.fast_mode and " fast" or ""
+  local fast_enabled = selected_setting(state, "fast_mode")
+  local fast = fast_enabled and " fast" or ""
+  if fast_enabled ~= (active_session.fast_mode == true) then fast = fast_enabled and " fast*" or " standard*" end
   local segment_list = {
     {
       text = mode,
@@ -275,6 +320,12 @@ local function status_text()
   end
   if busy ~= "" then
     segment_list[#segment_list + 1] = { text = busy, group = "ForgeStatusLabel" }
+  end
+  if state.configuration_error then
+    segment_list[#segment_list + 1] = {
+      text = " • Settings rejected: " .. state.configuration_error:gsub("%s+", " "),
+      group = "ForgeHarnessToolFailure",
+    }
   end
   return segment_list
 end
@@ -336,6 +387,7 @@ function M.render()
     notice = function(message) notifications.error(message, "ForgeHarness") end,
     on_update = function()
       if state.presentation and vim.api.nvim_win_is_valid(state.transcript_win) then
+        state.presentation.transcript.recap = state.recap
         require("forge.views.harness.status_hint").render(state.presentation.transcript,
           M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
       end
@@ -468,7 +520,8 @@ local function synchronize_state(callback)
     M.render()
     local callbacks = synchronized_state.state_sync_callback or {}
     synchronized_state.state_sync_callback = nil
-    for _, completed in ipairs(callbacks) do completed(result) end
+  for _, completed in ipairs(callbacks) do completed(result) end
+  if state.pending_config then vim.schedule(M.drain) end
   end)
 end
 
@@ -512,6 +565,7 @@ local function on_event(event, payload)
     end
     schedule_render()
   elseif event == "backend_event" then
+    if payload.kind == "turn_started" then recap.clear(state) end
     if payload.kind == "execution_state" then
       local execution = payload.data or {}
       if type(execution.session) ~= "table" or not state.session or execution.session.id ~= state.session.id then return end
@@ -624,6 +678,7 @@ local function on_event(event, payload)
   then
     local next_session = payload.session or payload
     if event == "session_changed" and state.session and next_session.id ~= state.session.id then
+      recap.clear(state)
       state.queue = {}
       state.goal = nil
       state.goal_execution = nil
@@ -863,6 +918,7 @@ end
 ---@param text string
 begin_request = function(text, from_composer)
   local state = harness_state()
+  recap.clear(state)
   if from_composer then dismiss_composer_completion(state.composer_buf) end
   state.cancel_requested = false
   set_busy(true)
@@ -975,8 +1031,9 @@ end
 
 function M.drain()
   local state = harness_state()
-  if state.busy or state.state_sync_pending then return end
+  if state.busy or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
   if #(state.pending_steer or {}) > 0 then return end
+  if state.status and state.status.kind == "finalizing" then return end
   if state.pending_backend then
     local pending_backend = state.pending_backend
     state.pending_backend = nil
@@ -994,15 +1051,28 @@ function M.drain()
     local validate_selection = state.pending_config_validate == true
     state.pending_config = nil
     state.pending_config_validate = false
-    M.configure(pending_config, validate_selection)
+    configure_now(pending_config, validate_selection)
     return
   end
   if state.active_elicitation and state.active_elicitation.elicitation then
     return
   end
-  if state.status and state.status.kind == "finalizing" then return end
-  local text = table.remove(state.queue, 1)
+  local entry = state.queue[1]
+  local text = type(entry) == "table" and entry.text or entry
   if text then
+    local next_config, prompt, failure = model_command(text)
+    if failure then report_configuration_error(failure) return end
+    if next_config then
+      if type(entry) == "table" then next_config = vim.tbl_extend("force", next_config, entry.config) end
+      M.configure(next_config, true, function(applied)
+        if not applied then return end
+        if state.queue[1] ~= entry then return end
+        table.remove(state.queue, 1)
+        if prompt ~= "" then begin_request(prompt) else M.drain() end
+      end)
+      return
+    end
+    table.remove(state.queue, 1)
     if text == "/compact" then M.compact() else begin_request(text) end
     return
   end
@@ -1322,10 +1392,59 @@ function M.open_session_picker()
   require("forge.views.harness.session_picker").open(picker_host(harness_state()))
 end
 
+---List provider-owned background shells and terminate only the selected shell.
+function M.open_background_picker()
+  local state = harness_state()
+  local session_id, generation = state.session.id, client.host_generation()
+  local function current()
+    return state.session and state.session.id == session_id and client.host_generation() == generation
+  end
+  client.request_for(session_id, "harness.document", { operation = "background_terminals" }, function(inventory, failure)
+    if not current() then return end
+    if failure then notifications.error(failure, "Background terminals") return end
+    if not inventory.supported then
+      notifications.info("The current backend does not support background terminals", "ForgeHarness")
+      return
+    end
+    local options = {}
+    for _, terminal in ipairs(inventory.terminal or {}) do
+      options[#options + 1] = { label = terminal.command:gsub("%s+", " "), detail = "Terminal " .. terminal.id, value = terminal.id }
+    end
+    if #options == 0 then notifications.info("No background terminals running", "ForgeHarness") return end
+    open_choice_picker(state, "Background terminals", "Select a terminal and press Enter to terminate it.", options, function(id)
+      if not current() then return end
+      client.request_for(session_id, "harness.document", { operation = "terminate_terminal", id = id }, function(_, terminate_failure)
+        if not current() then return end
+        if terminate_failure then notifications.error(terminate_failure, "Background terminals") end
+        if state.presentation and state.presentation.terminals then state.presentation.terminals.refresh() end
+      end)
+    end)
+  end)
+end
+
 function M.submit()
   local state = harness_state()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
+  if text == "/recap" then
+    set_composer_text(state.composer_buf, "")
+    recap.request(state, function()
+      if state.presentation and state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
+        state.presentation.transcript.recap = state.recap
+        require("forge.views.harness.status_hint").render(state.presentation.transcript,
+          M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
+      end
+    end)
+    return
+  end
+  if text == "/bg" then
+    set_composer_text(state.composer_buf, "")
+    M.open_background_picker()
+    return
+  end
+  local _, model_prompt, model_failure = model_command(text)
+  if model_failure then report_configuration_error(model_failure) return end
+  if model_prompt and model_prompt ~= "" then M.queue_submit() return end
   prompt_history.record(text)
   local goal_control = ({ ["/goal pause"] = "goal.pause", ["/goal clear"] = "goal.clear" })[text]
   if goal_control then
@@ -1522,24 +1641,20 @@ function M.submit()
   end
   if text == "/fast" then
     set_composer_text(state.composer_buf, "")
-    M.select_fast_mode()
+    M.toggle_fast_mode()
     return
   end
-  local fast_value = text:match("^/fast%s+(%S+)$")
-  if fast_value == "on" or fast_value == "off" then
+  if text:match("^/fast%s") then
     set_composer_text(state.composer_buf, "")
-    M.configure_fast_mode(fast_value == "on")
-    return
-  elseif fast_value then
-    set_composer_text(state.composer_buf, "")
-    notifications.warn("Use /fast on or /fast off", "ForgeHarness")
+    state.configuration_error = "Use /fast without arguments to toggle fast mode"
+    M.refresh_winbar()
     return
   end
   if state.selected_agent_run_id then
     M.steer_submit()
     return
   end
-  if state.busy then
+  if state.busy or state.configuring then
     set_composer_text(state.composer_buf, "")
     if state.active_wait and not selected_agent_run(state)
       and state.capability and state.capability.native_steer
@@ -1575,6 +1690,7 @@ submit_immediate = function(state, text, notify_success)
     set_composer_text(state.composer_buf, "")
   end
   local pending = { text = text }
+  recap.clear(state)
   state.pending_steer = state.pending_steer or {}
   state.pending_steer[#state.pending_steer + 1] = pending
   M.refresh_winbar()
@@ -1624,6 +1740,20 @@ function M.queue_submit()
   local state = harness_state()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
+  if text == "/bg" or text == "/recap" or text == "/mcp" or text == "/fast" or text:match("^/fast%s") then M.submit() return end
+  if text == "/model" then
+    M.select_model(function(next_config)
+      local command = "/model " .. next_config.model .. (next_config.effort and (" " .. next_config.effort) or "")
+      state.queue[#state.queue + 1] = { text = command, config = next_config }
+      prompt_history.record(command)
+      if composer_text(state.composer_buf) == text then set_composer_text(state.composer_buf, "") end
+      M.refresh_winbar()
+      M.drain()
+    end)
+    return
+  end
+  local _, _, failure = model_command(text)
+  if failure then report_configuration_error(failure) return end
   prompt_history.record(text)
   state.queue[#state.queue + 1] = text
   set_composer_text(state.composer_buf, "")
@@ -1633,6 +1763,7 @@ end
 
 function M.edit_last_queued()
   local state = harness_state()
+  if state.configuring and #state.queue == 1 then return end
   local queued = table.remove(state.queue)
   if not queued then
     notifications.warn("No queued prompt to edit", "ForgeHarness")
@@ -1640,7 +1771,7 @@ function M.edit_last_queued()
   end
   local draft = composer_text(state.composer_buf)
   if draft ~= "" then state.queue[#state.queue + 1] = draft end
-  set_composer_text(state.composer_buf, queued)
+  set_composer_text(state.composer_buf, type(queued) == "table" and queued.text or queued)
   if state.composer_win and vim.api.nvim_win_is_valid(state.composer_win) then
     vim.api.nvim_set_current_win(state.composer_win)
   end
@@ -1663,13 +1794,16 @@ function M.toggle_activity()
     if not (state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win)) then return end
     vim.api.nvim_set_current_win(state.transcript_win)
   end
-  if vim.fn.foldlevel(vim.fn.line(".")) > 0 then vim.cmd("normal! za") else M.open_timeline_entry() end
+  if vim.fn.foldclosed(vim.fn.line(".")) == -1 and state.presentation
+      and state.presentation.toggle_tool() then return end
+  if state.presentation and require("forge.folds").toggle_heading(state.presentation.transcript, vim.api.nvim_get_current_win()) then return end
+  if vim.fn.foldlevel(vim.fn.line(".")) == 0 then M.open_timeline_entry() end
 end
 
 ---@param direction integer
 function M.change_effort(direction)
   local state = harness_state()
-  local current = state.session and state.session.effort or config.options.harness.effort
+  local current = selected_setting(state, "effort")
   local index = 3
   for candidate_index, candidate in ipairs(effort_list) do if candidate == current then index = candidate_index end end
   index = math.max(1, math.min(#effort_list, index + direction))
@@ -1678,7 +1812,8 @@ end
 
 function M.select_effort()
   if harness_state().capability.effort_selection ~= true then
-    notifications.warn("The current backend does not support reasoning effort selection", "ForgeHarness")
+    harness_state().configuration_error = "The current backend does not support reasoning effort selection"
+    M.refresh_winbar()
     return
   end
   local detail_list = {
@@ -1700,27 +1835,20 @@ end
 function M.configure_fast_mode(enabled)
   local state = harness_state()
   if state.capability.fast_mode ~= true then
-    notifications.warn("The current backend does not support fast mode", "ForgeHarness")
+    state.configuration_error = "The current backend does not support fast mode"
+    M.refresh_winbar()
     return
   end
   M.configure({ fast_mode = enabled })
 end
 
-function M.select_fast_mode()
+function M.toggle_fast_mode()
   local state = harness_state()
-  local enabled = state.session and state.session.fast_mode == true
-  local next_enabled = not enabled
-  open_choice_picker(state, "Codex fast mode", "Choose whether Codex prioritizes faster inference.", {
-    {
-      label = next_enabled and "Enable fast mode" or "Disable fast mode",
-      detail = "Apply this setting at the next safe turn boundary.",
-      value = next_enabled,
-    },
-    { label = "Cancel", detail = "Keep the current setting.", value = nil },
-  }, function(choice) if choice ~= nil then M.configure_fast_mode(choice) end end)
+  M.configure_fast_mode(not selected_setting(state, "fast_mode"))
 end
 
-function M.select_model()
+function M.select_model(on_confirm)
+  on_confirm = type(on_confirm) == "function" and on_confirm or M.configure
   local state = harness_state()
   if state.capability.model_selection ~= true then
     notifications.warn("The current backend does not support model selection", "ForgeHarness")
@@ -1743,7 +1871,7 @@ function M.select_model()
             footer = "C-s apply  go options  q close",
           },
         },
-        on_confirm = function(result) M.configure({ model = result.text }) end,
+        on_confirm = function(result) on_confirm({ model = result.text }) end,
       })
       return
     end
@@ -1752,7 +1880,7 @@ function M.select_model()
       host = picker_host(state),
       model_list = model_list,
       current_model = state.session and (state.session.resolved_model or state.session.model),
-      on_confirm = M.configure,
+      on_confirm = on_confirm,
     })
   end
   local backend = state.session and state.session.backend
@@ -1782,13 +1910,20 @@ end
 
 function M.open_mcp_picker()
   local state = harness_state()
+  local session_id = state.session and state.session.id
+  local function owns_session()
+    local current = harness_state()
+    return current == state and (current.session and current.session.id) == session_id
+  end
   if not (state.capability.catalog and state.capability.catalog.mcp) then
     notifications.warn("The current backend does not advertise MCP management", "Harness MCP")
     return
   end
   provider_picker.open_mcp({
     host = picker_host(state),
+    is_current = owns_session,
     on_mutation_start = function(definition, enabled)
+      if not owns_session() then return end
       local current = harness_state()
       if current.busy and not current.capability.catalog.live_mcp_mutation then
         current.mcp_restart = {
@@ -1800,6 +1935,7 @@ function M.open_mcp_picker()
       end
     end,
     on_mutation = function(result)
+      if not owns_session() then return end
       local current = harness_state()
       append_session_status(("MCP server %s %s"):format(
         result.name or "server",
@@ -1818,6 +1954,7 @@ function M.open_mcp_picker()
       end
     end,
     on_mutation_error = function(mutation_error)
+      if not owns_session() then return end
       local current = harness_state()
       if not current.mcp_restart then return end
       current.mcp_restart.error = mutation_error
@@ -1980,31 +2117,84 @@ end
 
 ---@param next_config table
 ---@param validate_selection? boolean
-function M.configure(next_config, validate_selection)
+---@param completed? fun(applied: boolean)
+configure_now = function(next_config, validate_selection, completed)
   local state = harness_state()
-  if state.busy then
-    state.pending_config = vim.tbl_extend("force", state.pending_config or {}, next_config)
-    state.pending_config_validate = state.pending_config_validate == true or validate_selection == true
-    M.refresh_winbar()
-    notifications.info("Harness configuration will apply at the next safe boundary", "ForgeHarness")
-    return
-  end
   local request_config = vim.tbl_extend("force", {}, next_config, { validate = validate_selection == true })
+  state.configuring = true
+  state.configuring_config = request_config
+  M.refresh_winbar()
   client.request("session.configure", request_config, function(result, request_error)
-    if request_error then report_configuration_error(request_error) return end
+    if state.configuring_config ~= request_config then return end
+    state.configuring = false
+    state.configuring_config = nil
+    if request_error then
+      if next_config.model == nil and (next_config.effort ~= nil or next_config.fast_mode ~= nil) then
+        state.configuration_error = request_error
+      else
+        report_configuration_error(request_error)
+      end
+      M.refresh_winbar()
+      if completed then completed(false) end
+      if state.pending_config then vim.schedule(M.drain) end
+      return
+    end
     state.session = result
+    state.configuration_error = nil
+    prune_pending_settings(state)
     if next_config.model then append_session_status("Model changed to " .. next_config.model) end
-    if next_config.effort then append_session_status("Reasoning effort changed to " .. next_config.effort) end
     M.refresh_winbar()
     if next_config.model and not result.resolved_model then M.resolve_runtime_model() end
-    vim.schedule(M.drain)
+    if completed then completed(true) else vim.schedule(M.drain) end
   end)
+end
+
+---@param next_config table
+---@param validate_selection? boolean
+---@param completed? fun(applied: boolean)
+function M.configure(next_config, validate_selection, completed)
+  local state = harness_state()
+  local tuning_only = not completed and next(next_config) ~= nil
+  for field in pairs(next_config) do
+    if field ~= "effort" and field ~= "fast_mode" then tuning_only = false end
+  end
+  state.configuration_error = nil
+  if state.busy or state.configuring or tuning_only then
+    state.pending_config = vim.tbl_extend("force", state.pending_config or {}, next_config)
+    state.pending_config_validate = state.pending_config_validate == true or validate_selection == true
+    prune_pending_settings(state)
+    if tuning_only then
+      local revision = (state.configuration_revision or 0) + 1
+      state.configuration_revision = revision
+      state.configuration_debounce = true
+      local generation = client.host_generation()
+      local session_id = state.session and state.session.id
+      vim.defer_fn(function()
+        if state.configuration_revision ~= revision then return end
+        state.configuration_debounce = nil
+        if client.host_generation() ~= generation or (state.session and state.session.id) ~= session_id then return end
+        local previous = session.harness
+        session.activate_harness(state)
+        M.drain()
+        if previous ~= state then session.activate_harness(previous) end
+      end, 100)
+    end
+    M.refresh_winbar()
+    return
+  end
+  local merged = vim.tbl_extend("force", state.pending_config or {}, next_config)
+  validate_selection = validate_selection == true or state.pending_config_validate == true
+  state.pending_config, state.pending_config_validate = nil, false
+  state.configuration_revision = (state.configuration_revision or 0) + 1
+  state.configuration_debounce = nil
+  configure_now(merged, validate_selection, completed)
 end
 
 local function close()
   local state = harness_state()
   if state.presentation and not state.presentation.close() then return end
   state.presentation = nil
+  recap.clear(state)
   timeline_status.stop(state)
   local tab_count = vim.fn.tabpagenr("$")
   if tab_count > 1 then vim.cmd("tabclose") else vim.cmd("enew") end
@@ -2030,11 +2220,11 @@ end
 ---@return ForgeViewCommandSet
 function M.command_set()
   local set = command_set.new()
+  command_set.register(set, "edit_queued", M.edit_last_queued)
   command_set.register(set, "submit", M.submit)
   command_set.register(set, "queue", M.queue_submit)
   command_set.register(set, "steer", M.steer_submit)
   command_set.register(set, "cancel", M.cancel_turn)
-  command_set.register(set, "edit_queued", M.edit_last_queued)
   command_set.register(set, "toggle_mode", M.toggle_mode)
   command_set.register(set, "previous_prompt", function() M.jump_prompt(-1) end)
   command_set.register(set, "next_prompt", function() M.jump_prompt(1) end)

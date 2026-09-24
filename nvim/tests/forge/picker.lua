@@ -61,6 +61,24 @@ local ok, failure = pcall(function()
     option_list = { { key = "n", label = "A long option label", detail = "A long detail that cannot share a narrow row" } },
   }, 1, 24)
   assert_true(#stacked.lines >= 4, "narrow layouts should stack option details")
+  local command = "Write-Output FORGE-BG-AUDIT; Start-Sleep -Seconds 90"
+  local long_label = layout.build({
+    option_list = { { label = command, detail = "Terminal 98704" } },
+  }, 1, 120)
+  assert_true(long_label.lines[1]:find(command .. "  Terminal 98704", 1, true) ~= nil,
+    "labels wider than the preferred column must retain a separator before details")
+  local narrow_label = layout.build({
+    option_list = { { label = command, detail = "Terminal 98704" } },
+  }, 1, 60)
+  for _, line in ipairs(narrow_label.lines) do
+    assert_true(vim.fn.strdisplaywidth(line) <= 56, "long labels must not overflow narrow picker rows")
+  end
+  local failure_frame = layout.build({ option_list = {},
+    empty_text = "MCP status unavailable: MCP status did not finish within 30 seconds: deadline has elapsed",
+  }, 1, 60)
+  for _, line in ipairs(failure_frame.lines) do
+    assert_true(vim.fn.strdisplaywidth(line) <= 56, "empty and error messages must wrap within the picker")
+  end
 
   local input_page = {
     option_list = { { key = "n", label = "Choice" } },

@@ -14,6 +14,8 @@ local session = require("forge.session")
 local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
 
 local command_list = {
+  { label = "/recap", detail = "Summarize the conversation without changing agent history" },
+  { label = "/bg", detail = "List and terminate background terminals" },
   { label = "/agent", detail = "Switch between Main and child-agent timelines", capability = "agent_observe" },
   { label = "/spawn", detail = "Spawn a child agent", capability = "agent_catalog" },
   { label = "/plan", detail = "Create a reviewed plan" },
@@ -41,8 +43,6 @@ local command_list = {
   { label = "/effort", detail = "Select reasoning effort", capability = "effort_selection" },
   { label = "/model", detail = "Select the backend model", capability = "model_selection" },
   { label = "/fast", detail = "Toggle backend fast mode", capability = "fast_mode" },
-  { label = "/fast on", detail = "Enable backend fast mode", capability = "fast_mode" },
-  { label = "/fast off", detail = "Disable backend fast mode", capability = "fast_mode" },
 }
 
 ---@return ForgeHarnessCommandSource

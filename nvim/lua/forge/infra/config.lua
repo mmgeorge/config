@@ -261,7 +261,7 @@ M.defaults = {
       model = "oM",
       effort_down = "<M-,>",
       effort_up = "<M-.>",
-      close = "q",
+      close = false,
       help = "?",
     },
     plan_review = {
@@ -272,6 +272,7 @@ M.defaults = {
       rename_entity = "<Space>f",
       schema = "os",
       comment = "C",
+      delete = "J",
       accept = "oY",
       request_changes = "oN",
       close = "q",

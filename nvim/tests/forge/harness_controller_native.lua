@@ -52,6 +52,9 @@ local success, failure = xpcall(function()
   assert(vim.wo[state.transcript_win].breakindent, "native attachment discarded Harness continuation indentation")
   assert(vim.wo[state.composer_win].winbar:find("submit", 1, true), "composer has no submit hint")
   state.busy = true
+  state.recap = { text = "Old recap" }
+  receive("backend_event", { kind = "turn_started" }, "native-controller")
+  assert(state.recap == nil and state.busy, "provider continuation retained recap or changed busy state")
   controller.refresh_winbar()
   assert(vim.wo[state.composer_win].winbar:find("queue", 1, true), "busy composer has no queue hint")
   state.goal = { state = "paused", created_at_ms = 1000 }

@@ -4,6 +4,7 @@ local provider_catalog = require("forge.views.harness.provider_catalog")
 
 local M = {}
 local owner = "harness-provider-catalog"
+local mcp_generation = 0
 local loading_icon_list = { "○", "◔", "◑", "◕", "●", "◕", "◑", "◔" }
 
 ---@param value integer?
@@ -145,8 +146,28 @@ end
 
 ---@param options table
 function M.open_mcp(options)
+  mcp_generation = mcp_generation + 1
+  local generation = mcp_generation
+  local owner = owner .. "-mcp-" .. generation
+  local pending_spec = {
+    owner = owner,
+    host = options.host,
+    page_list = { {
+      id = "provider-mcp",
+      title = "MCP servers",
+      option_list = {},
+      empty_text = "Loading MCP servers...",
+      footer = "q close",
+    } },
+    on_confirm = function() return false end,
+  }
+  picker.open(pending_spec)
   provider_catalog.mcp(true, function(mcp_list, request_error)
+    if generation ~= mcp_generation or not picker.is_open(owner) then return end
+    if options.is_current and not options.is_current() then return end
     if request_error then
+      pending_spec.page_list[1].empty_text = "MCP status unavailable: " .. request_error
+      picker.update(pending_spec)
       notifications.error(request_error, "Harness MCP")
       return
     end
@@ -156,6 +177,9 @@ function M.open_mcp(options)
     local animation_index = 1
     local animation_timer = nil
     local busy = false
+    local closed = false
+    local refreshing = false
+    local refresh_ticks = 0
     local build_spec
     local start_animation
 
@@ -173,22 +197,22 @@ function M.open_mcp(options)
       animation_index = 1
     end
 
-    local function refresh(mutation_result)
+    local function refresh()
+      if closed or refreshing or not picker.is_open(owner) then return end
+      refreshing = true
       provider_catalog.mcp(true, function(refreshed, refresh_error)
+        refreshing = false
+        if closed or not picker.is_open(owner) then return end
         busy = false
         stop_animation()
         if refresh_error then
           notifications.error(refresh_error, "Harness MCP")
           if picker.is_open(owner) then picker.update(build_spec()) end
-          if mutation_result and options.on_mutation_error then
-            options.on_mutation_error("MCP changed but its refreshed status failed: " .. refresh_error)
-          end
           return
         end
         current_mcp_list = refreshed or {}
         if provider_is_loading() then start_animation(nil) end
         if picker.is_open(owner) then picker.update(build_spec()) end
-        if mutation_result and options.on_mutation then options.on_mutation(mutation_result) end
       end)
     end
 
@@ -198,12 +222,17 @@ function M.open_mcp(options)
       animation_index = 1
       animation_timer = vim.uv.new_timer()
       animation_timer:start(120, 120, vim.schedule_wrap(function()
-        if not picker.is_open(owner) then
+        if closed or not picker.is_open(owner) or (options.is_current and not options.is_current()) then
           stop_animation()
           return
         end
         animation_index = animation_index % #loading_icon_list + 1
         picker.update(build_spec())
+        refresh_ticks = refresh_ticks + 1
+        if refresh_ticks >= 17 and not busy and not refreshing then
+          refresh_ticks = 0
+          refresh()
+        end
       end))
     end
 
@@ -242,7 +271,8 @@ function M.open_mcp(options)
             desc = "Enable or disable MCP server",
             callback = function(context)
               local definition = context.option and context.option.value
-              if not definition or busy then return end
+              if not definition or busy or refreshing or closed then return end
+              if options.is_current and not options.is_current() then return end
               busy = true
               if options.on_mutation_start then options.on_mutation_start(definition, not definition.enabled) end
               start_animation(definition.name)
@@ -250,10 +280,11 @@ function M.open_mcp(options)
                 if toggle_error then
                   if options.on_mutation_error then options.on_mutation_error(toggle_error) end
                   notifications.error(toggle_error, "Harness MCP")
-                  refresh(nil)
+                  refresh()
                   return
                 end
-                refresh(result or {})
+                if options.on_mutation then options.on_mutation(result or {}) end
+                refresh()
               end)
             end,
           },
@@ -270,7 +301,10 @@ function M.open_mcp(options)
           },
         },
         on_confirm = function() return false end,
-        on_close = stop_animation,
+        on_close = function()
+          closed = true
+          stop_animation()
+        end,
       }
     end
     picker.open(build_spec())

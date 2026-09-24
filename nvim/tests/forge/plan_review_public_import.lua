@@ -37,7 +37,7 @@ local success, failure = xpcall(function()
   assert(vim.fs.normalize(vim.api.nvim_buf_get_name(review.buf)) == vim.fs.normalize(path))
   assert(vim.deep_equal(vim.fn.readfile(path), source),
     "public PlanReview import changed the physical plan source")
-  for _, command in ipairs({ "toggle", "open", "jump_entity", "entity_info", "rename_entity", "schema", "comment", "accept", "request_changes", "close", "help" }) do
+  for _, command in ipairs({ "toggle", "open", "jump_entity", "entity_info", "rename_entity", "schema", "comment", "delete", "accept", "request_changes", "close", "help" }) do
     assert(review.command_set.action_by_id[command], "public PlanReview command is missing: " .. command)
   end
 

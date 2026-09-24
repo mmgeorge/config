@@ -49,6 +49,7 @@ pub struct StatusSectionRecord {
 
 #[derive(Clone, Debug, PartialEq, Serialize)]
 pub struct StatusFile {
+    pub header: Vec<forge_buffer::block::TextChunk>,
     pub id: u64,
     pub section: StatusSection,
     pub change: &'static str,

@@ -70,9 +70,10 @@ function PickerLayout.build(page, selected_index, width, options)
     local detail = option.detail or ""
     local label = option.label or ""
     local first = #lines + 1
-    local two_column_width = vim.fn.strdisplaywidth(prefix) + label_width + 2 + vim.fn.strdisplaywidth(detail)
+    local row_label_width = math.max(label_width, vim.fn.strdisplaywidth(label))
+    local two_column_width = vim.fn.strdisplaywidth(prefix) + row_label_width + 2 + vim.fn.strdisplaywidth(detail)
     if detail ~= "" and two_column_width <= usable_width then
-      lines[#lines + 1] = prefix .. label .. string.rep(" ", label_width - vim.fn.strdisplaywidth(label) + 2) .. detail
+      lines[#lines + 1] = prefix .. label .. string.rep(" ", row_label_width - vim.fn.strdisplaywidth(label) + 2) .. detail
     else
       append(lines, wrap(label, usable_width, prefix))
       if detail ~= "" then append(lines, wrap(detail, usable_width, "      ")) end
@@ -85,7 +86,7 @@ function PickerLayout.build(page, selected_index, width, options)
     primary_range[index] = { first = first, last = primary_last }
     if primary_last < #lines then child_range[index] = { first = primary_last + 1, last = #lines } end
   end
-  if #page.option_list == 0 then lines[#lines + 1] = "  " .. (page.empty_text or "No matching options.") end
+  if #page.option_list == 0 then append(lines, wrap(page.empty_text or "No matching options.", usable_width, "  ")) end
 
   local input_start = nil
   if options.input_visible then

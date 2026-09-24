@@ -44,7 +44,8 @@ local function validate_metadata(entry, read_row, region_seen)
         assert(position.row < entry.row_count, "metadata outside block")
         local row = read_row(entry.start_row + position.row)
         local byte = row:byte(position.column + 1)
-        assert(position.column <= #row and (not byte or byte < 128 or byte >= 192), "metadata splits UTF-8")
+        assert(position.column <= #row and (not byte or byte < 128 or byte >= 192),
+          ("metadata splits UTF-8 at row %d column %d (row bytes %d)"):format(entry.start_row + position.row, position.column, #row))
       end
     end
   end
@@ -350,7 +351,7 @@ local function install_metadata(session, prepared, replace_all)
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
           start_row + gutter.position.row, gutter.position.column, {
             virt_text = text, virt_text_pos = "inline", hl_mode = "combine", priority = gutter.priority,
-            right_gravity = false, strict = true,
+            right_gravity = true, strict = true,
           })
       end
       for _, conceal in ipairs(entry.metadata.conceal or {}) do
@@ -397,7 +398,9 @@ local function attach_regions(session, prepared)
     end)
   else
     session.editable.region = region_state
-    editable.attach(session.editable, session.buffer, anchor, session.edit_options)
+    editable.attach(session.editable, session.buffer, anchor, vim.tbl_extend("force", session.edit_options, {
+      restored = function() session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer) end,
+    }))
   end
 end
 

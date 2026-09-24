@@ -17,6 +17,7 @@ pub(crate) fn project(
     width: &WidthProfile,
     annotation: &[ReviewAnnotation],
     revision: &HashMap<String, (RegionRevision, EditSequence)>,
+    focused: Option<&str>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     let rendered = MarkdownRenderer::source(
         BlockId("plan:markdown".into()),
@@ -78,7 +79,7 @@ pub(crate) fn project(
     }
     for row in 0..rows {
         row_block.push(block.len());
-        let text = rendered
+        let mut text = rendered
             .block
             .text
             .row(row)
@@ -91,6 +92,24 @@ pub(crate) fn project(
         }
         if let Some(anchor) = row_anchor.get(&row).filter(|_| !text.is_empty()) {
             append_semantic_style(&mut metadata, &anchor.target, text);
+            if let Some(overlay) = metadata.source_overlay.iter_mut().find(|overlay| {
+                overlay.capture == "ForgeRightAlignedOwner"
+                    && overlay.range.end.column == text.trim_end().len()
+            }) {
+                text = text[..overlay.range.start.column].trim_end();
+                overlay.range.start.column = text.len();
+                overlay.range.end.column = text.len();
+                for decoration in [
+                    &mut metadata.decoration,
+                    &mut metadata.visible_decoration,
+                    &mut metadata.source_highlight,
+                ] {
+                    decoration.retain_mut(|decoration| {
+                        decoration.range.end.column = decoration.range.end.column.min(text.len());
+                        decoration.range.start.column < decoration.range.end.column
+                    });
+                }
+            }
             let id = TargetId(format!("plan:source:{}:{row}", anchor.line));
             metadata.target.push(TargetRange {
                 id: id.clone(),
@@ -112,6 +131,8 @@ pub(crate) fn project(
         for annotation in insertion.remove(&row).unwrap_or_default() {
             block.push(annotation_block(
                 annotation,
+                width,
+                focused == Some(annotation.id.as_str()),
                 revision
                     .get(&annotation.id)
                     .copied()
@@ -272,8 +293,6 @@ fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget
                 },
                 0,
             );
-            append_inline_path(metadata, text);
-            append_owner_alignment(metadata, text);
         }
         PlanReviewTarget::EntityMember { member, .. } => {
             append_term(
@@ -287,8 +306,6 @@ fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget
                 },
                 0,
             );
-            append_inline_path(metadata, text);
-            append_owner_alignment(metadata, text);
         }
         PlanReviewTarget::EnumVariant { variant, .. } => {
             append_term(metadata, text, variant, "@variable", 0)
@@ -312,8 +329,6 @@ fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget
                 },
                 0,
             );
-            append_inline_path(metadata, text);
-            append_owner_alignment(metadata, text);
         }
         PlanReviewTarget::FlowEdge {
             callable_name,
@@ -335,7 +350,6 @@ fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget
             if *target_is_type {
                 append_last_term(metadata, text, target_name, "@type");
             }
-            append_inline_path(metadata, text);
         }
         PlanReviewTarget::FlowEdgeResult { type_name } => {
             append_last_term(metadata, text, type_name, "@type")
@@ -367,6 +381,14 @@ fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget
             append_term(metadata, text, name, "@function", 0);
         }
         _ => {}
+    }
+    if matches!(
+        target,
+        PlanReviewTarget::Entity { .. }
+            | PlanReviewTarget::FlowStep { .. }
+            | PlanReviewTarget::FlowEdge { .. }
+    ) {
+        append_owner_alignment(metadata, text);
     }
 }
 
@@ -428,20 +450,16 @@ fn append_declaration_keyword(metadata: &mut BlockMetadata, text: &str) {
     append_term(metadata, text, "extends", "@keyword", 0);
 }
 
-fn append_inline_path(metadata: &mut BlockMetadata, text: &str) {
-    if let Some(start) = text
-        .rfind('[')
-        .filter(|start| text[*start..].trim_end().ends_with(']'))
-    {
-        append_range(metadata, start, text.trim_end().len(), "ForgePlanMetadata");
-    }
-}
-
 fn append_owner_alignment(metadata: &mut BlockMetadata, text: &str) {
     let Some(path_start) = text.rfind('[') else {
         return;
     };
     let path_end = text.trim_end().len();
+    if !text[..path_end].ends_with(']')
+        || (!text[..path_start].trim().is_empty() && !text[..path_start].ends_with("  "))
+    {
+        return;
+    }
     metadata
         .source_overlay
         .push(forge_buffer::block::SourceOverlay {
@@ -567,27 +585,141 @@ fn task_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(usize, usize
 
 fn annotation_block(
     annotation: &ReviewAnnotation,
+    width: &WidthProfile,
+    focused: bool,
     version: (RegionRevision, EditSequence),
 ) -> Result<BufferBlock> {
-    let mut rows = vec!["Comment".to_owned()];
-    rows.extend(annotation.source.body.split('\n').map(str::to_owned));
+    let label = if annotation.source.start_line == annotation.source.end_line {
+        format!("line {}", annotation.source.start_line)
+    } else {
+        format!(
+            "lines {}-{}",
+            annotation.source.start_line, annotation.source.end_line
+        )
+    };
+    let mut rows = Vec::new();
+    if focused {
+        let right = format!(" {label} ");
+        let mut left = " Plan comment ".to_owned();
+        while !left.is_empty() && width.cells(&format!("{left}{right}"), 0)? > width.columns {
+            left.pop();
+        }
+        rows.push(format!(
+            "{left}{}{right}",
+            "-".repeat(
+                width
+                    .columns
+                    .saturating_sub(width.cells(&format!("{left}{right}"), 0)?)
+            )
+        ));
+        rows.extend(annotation.source.body.split('\n').map(str::to_owned));
+    } else {
+        let inner = width.columns.saturating_sub(7).clamp(4, 84);
+        let mut profile = width.clone();
+        profile.columns = inner.saturating_sub(2).max(1);
+        let heading = profile
+            .wrap_plain(&format!(" Plan comment • {label} "), 0)?
+            .remove(0);
+        rows.push(format!(
+            "  ╭─{heading}{}╮",
+            "─".repeat(inner.saturating_sub(width.cells(&heading, 0)? + 1))
+        ));
+        for line in profile.wrap_plain(&annotation.source.body, 0)? {
+            let fill = inner.saturating_sub(width.cells(&line, 0)? + 2);
+            rows.push(format!("  │ {line}{} │", " ".repeat(fill)));
+        }
+    }
     let end = TextPosition {
         row: rows.len() - 1,
         column: rows.last().context("annotation row is missing")?.len(),
     };
+    rows.push(if focused {
+        "-".repeat(width.columns)
+    } else {
+        format!(
+            "  ╰{}╯",
+            "─".repeat(width.columns.saturating_sub(7).clamp(4, 84))
+        )
+    });
+    let mut decoration: Vec<Decoration> = rows
+        .iter()
+        .enumerate()
+        .map(|(row, text)| Decoration {
+            range: TextRange {
+                start: TextPosition { row, column: 0 },
+                end: TextPosition {
+                    row,
+                    column: text.len(),
+                },
+            },
+            capture: if focused {
+                if row == 0 || row + 1 == rows.len() {
+                    "ForgeReviewCommentBoxHeader"
+                } else {
+                    "ForgeReviewCommentBox"
+                }
+            } else if row == 0 {
+                "ForgeWalkthroughItemTitle"
+            } else {
+                "ForgeWalkthroughComment"
+            }
+            .into(),
+            priority: 120,
+        })
+        .collect();
+    if !focused {
+        for (row, text) in rows.iter().enumerate() {
+            let (start, end) = if row == 0 {
+                ("  ╭─".len(), text.find('─').unwrap() + '─'.len_utf8())
+            } else {
+                ("  │ ".len(), text.len().saturating_sub(" │".len()))
+            };
+            if row + 1 == rows.len() {
+                decoration[row].capture = "FloatBorder".into();
+                continue;
+            }
+            let end = if row == 0 {
+                text[start..]
+                    .find('─')
+                    .map(|offset| start + offset)
+                    .unwrap_or(text.len() - '╮'.len_utf8())
+            } else {
+                end
+            };
+            decoration[row].capture = "FloatBorder".into();
+            decoration.push(Decoration {
+                range: TextRange {
+                    start: TextPosition { row, column: start },
+                    end: TextPosition { row, column: end },
+                },
+                capture: if row == 0 {
+                    "ForgeWalkthroughItemTitle"
+                } else {
+                    "ForgeWalkthroughComment"
+                }
+                .into(),
+                priority: 121,
+            });
+        }
+    }
     Ok(BufferBlock {
         id: BlockId(format!("plan:annotation:{}", annotation.id)),
         text: BufferText::from_rows(rows)?,
         metadata: BlockMetadata {
-            editable_region: vec![EditableRegion {
-                id: RegionId(annotation.id.clone()),
-                revision: version.0,
-                sequence: version.1,
-                range: TextRange {
-                    start: TextPosition { row: 1, column: 0 },
-                    end,
-                },
-            }],
+            decoration,
+            editable_region: if focused {
+                vec![EditableRegion {
+                    id: RegionId(annotation.id.clone()),
+                    revision: version.0,
+                    sequence: version.1,
+                    range: TextRange {
+                        start: TextPosition { row: 1, column: 0 },
+                        end,
+                    },
+                }]
+            } else {
+                Vec::new()
+            },
             ..Default::default()
         },
     })
@@ -760,6 +892,73 @@ mod tests {
     }
 
     #[test]
+    fn member_slice_types_remain_inline_without_path_styling() {
+        for text in [
+            "  + acquire_token_for_client(scopes: &[String]): AccessTokenResponse",
+            "  + scopes(): &[String]",
+            "  - scopes: [String]",
+            "    [String]): AccessTokenResponse",
+        ] {
+            let mut metadata = super::BlockMetadata::default();
+            super::append_semantic_style(
+                &mut metadata,
+                &super::PlanReviewTarget::EntityMember {
+                    entity: "AzureActiveDirectoryClient".into(),
+                    member: "scopes".into(),
+                },
+                text,
+            );
+            assert!(metadata.source_overlay.is_empty(), "{text}");
+            assert!(
+                metadata
+                    .visible_decoration
+                    .iter()
+                    .all(|decoration| decoration.capture != "ForgePlanMetadata"),
+                "{text}"
+            );
+        }
+    }
+
+    #[test]
+    fn flow_paths_share_declaration_owner_alignment() {
+        use super::super::PlanReviewReferenceKind;
+        let target = [
+            super::PlanReviewTarget::Entity {
+                name: "Queue".into(),
+            },
+            super::PlanReviewTarget::FlowStep {
+                reference_kind: PlanReviewReferenceKind::PlannedEntity,
+                target_name: "Queue".into(),
+                target_is_type: true,
+                workspace_path: None,
+                workspace_line: None,
+            },
+            super::PlanReviewTarget::FlowEdge {
+                callable_kind: None,
+                callable_name: None,
+                reference_kind: PlanReviewReferenceKind::PlannedEntity,
+                target_name: "Queue".into(),
+                target_is_type: true,
+                workspace_path: None,
+                workspace_line: None,
+            },
+        ];
+        for text in ["Queue                 [src/queue.rs]", "    [src/queue.rs]"] {
+            let overlay: Vec<_> = target
+                .iter()
+                .map(|target| {
+                    let mut metadata = super::BlockMetadata::default();
+                    super::append_semantic_style(&mut metadata, target, text);
+                    metadata.source_overlay
+                })
+                .collect();
+            assert_eq!(overlay[0].len(), 1);
+            assert_eq!(overlay[0], overlay[1]);
+            assert_eq!(overlay[0], overlay[2]);
+        }
+    }
+
+    #[test]
     fn file_tree_ranges_close_each_file_over_its_children() {
         let anchor = |line, target| super::PlanNavigationAnchor {
             line,
@@ -906,23 +1105,43 @@ mod tests {
             &width,
             &[annotation],
             &HashMap::from([("note".into(), (RegionRevision(7), EditSequence(9)))]),
+            Some("note"),
         )
         .unwrap();
         let projected_source: Vec<_> = block
             .iter()
             .filter(|block| block.id.0.starts_with("plan:row:"))
-            .flat_map(|block| block.text.wire_rows())
             .collect();
-        assert_eq!(
-            projected_source,
-            source
-                .rendered
-                .markdown
-                .strip_suffix('\n')
-                .unwrap_or(&source.rendered.markdown)
-                .split('\n')
-                .collect::<Vec<_>>()
-        );
+        let canonical_rows = source
+            .rendered
+            .markdown
+            .strip_suffix('\n')
+            .unwrap_or(&source.rendered.markdown)
+            .split('\n')
+            .collect::<Vec<_>>();
+        assert_eq!(projected_source.len(), canonical_rows.len());
+        let mut owner_count = 0;
+        for (block, canonical) in projected_source.iter().zip(canonical_rows) {
+            let text = block.text.row(0).unwrap();
+            if let Some(owner) = block
+                .metadata
+                .source_overlay
+                .iter()
+                .find(|overlay| overlay.capture == "ForgeRightAlignedOwner")
+            {
+                owner_count += 1;
+                assert_eq!(
+                    text,
+                    canonical.strip_suffix(&owner.text).unwrap().trim_end()
+                );
+                assert_eq!(owner.range.start.column, text.len());
+                assert_eq!(owner.range.start, owner.range.end);
+                assert!(!text.ends_with(' '));
+            } else {
+                assert_eq!(text, canonical);
+            }
+        }
+        assert!(owner_count > 0);
         for fold in block.iter().flat_map(|block| &block.metadata.fold) {
             if fold.id.0.starts_with("plan:task:") {
                 let endpoint = block
@@ -947,9 +1166,10 @@ mod tests {
             annotation.metadata.editable_region[0].sequence,
             EditSequence(9)
         );
+        assert!(annotation.text.row(0).unwrap().contains("line "));
         assert_eq!(
-            annotation.text.wire_rows(),
-            ["Comment", "literal **comment**", ""]
+            &annotation.text.wire_rows()[1..],
+            &["literal **comment**", "", "--------------------"]
         );
         assert_eq!(
             annotation.metadata.editable_region[0].revision,

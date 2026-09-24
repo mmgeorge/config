@@ -490,11 +490,15 @@ pub fn permission_from_copilot(
     params: Value,
     workspace: &str,
 ) -> PermissionRequest {
+    // Notifications wrap the same request that older RPC calls sent directly.
+    let params = params.get("permissionRequest").cloned().unwrap_or(params);
+    let kind = params.get("kind").and_then(Value::as_str).unwrap_or(kind);
     let encoded = params.to_string();
     let target_list = match kind {
         "shell" => vec![PermissionTarget::Command {
             command: params
-                .get("command")
+                .get("fullCommandText")
+                .or_else(|| params.get("command"))
                 .or_else(|| params.get("fullCommand"))
                 .or_else(|| params.get("full_command"))
                 .and_then(Value::as_str)
@@ -516,13 +520,19 @@ pub fn permission_from_copilot(
                 .to_owned(),
         }],
         "mcp" => vec![PermissionTarget::Mcp {
-            target: params
+            target: {
+                let tool = params
                 .get("toolName")
                 .or_else(|| params.get("tool_name"))
                 .or_else(|| params.get("name"))
                 .and_then(Value::as_str)
-                .unwrap_or("*")
-                .to_owned(),
+                .unwrap_or("*");
+                params.get("serverName").and_then(Value::as_str)
+                    .map_or_else(|| tool.to_owned(), |server| format!("{server}/{tool}"))
+            },
+        }],
+        "custom-tool" | "hook" => vec![PermissionTarget::Tool {
+            target: params.get("toolName").and_then(Value::as_str).unwrap_or(kind).to_owned(),
         }],
         _ => normalize_permission_payload(&params, &encoded),
     };
@@ -533,6 +543,8 @@ pub fn permission_from_copilot(
             .get("reason")
             .or_else(|| params.get("intention"))
             .or_else(|| params.get("warning"))
+            .or_else(|| params.get("hookMessage"))
+            .or_else(|| params.get("toolDescription"))
             .and_then(Value::as_str)
             .map(str::to_owned),
         target_list,
@@ -656,6 +668,29 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 mod test {
     use super::*;
     use crate::permissions::store::PermissionStore;
+
+    #[test]
+    fn unwraps_copilot_permission_notifications_before_matching_policy() {
+        let request = permission_from_copilot(
+            "shell-one".into(), "unknown",
+            json!({"permissionRequest": {
+                "kind":"shell", "fullCommandText":"Write-Output audit", "intention":"Run audit"
+            }, "requestId":"shell-one"}), "D:/repo",
+        );
+        assert_eq!(request.target_list, vec![PermissionTarget::Command {
+            command: "Write-Output audit".into(),
+        }]);
+        assert_eq!(request.reason.as_deref(), Some("Run audit"));
+        let mcp = permission_from_copilot("mcp".into(), "unknown", json!({
+            "permissionRequest":{"kind":"mcp", "serverName":"github", "toolName":"search"}
+        }), "D:/repo");
+        assert_eq!(mcp.target_list, vec![PermissionTarget::Mcp { target: "github/search".into() }]);
+        let custom = permission_from_copilot("custom".into(), "unknown", json!({
+            "permissionRequest":{"kind":"custom-tool", "toolName":"harness_question_ask", "toolDescription":"Ask a question"}
+        }), "D:/repo");
+        assert_eq!(custom.target_list, vec![PermissionTarget::Tool { target: "harness_question_ask".into() }]);
+        assert_eq!(custom.reason.as_deref(), Some("Ask a question"));
+    }
 
     #[test]
     fn maps_copilot_permission_kinds_into_shared_targets() {

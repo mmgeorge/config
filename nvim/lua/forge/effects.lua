@@ -10,6 +10,7 @@ local M = {}
 ---@field url? string
 ---@field block? string
 ---@field position? {row: integer, column: integer}
+---@field jump? boolean
 ---@field message? string
 ---@field level? integer
 ---@field path? string
@@ -53,6 +54,7 @@ function M.apply(session, view, effect)
       assert(position.column >= 0 and position.column <= #row and position.column == math.floor(position.column)
         and (not byte or byte < 128 or byte >= 192), "cursor column splits UTF-8")
       view.effect[effect.id] = true
+      if effect.jump then vim.api.nvim_win_call(view.window, function() vim.cmd("normal! m'") end) end
       vim.api.nvim_win_set_cursor(view.window, { start_row + position.row + 1, position.column })
       vim.api.nvim_win_call(view.window, function() vim.cmd("normal! zv") end)
       view.cursor = vim.api.nvim_win_get_cursor(view.window)

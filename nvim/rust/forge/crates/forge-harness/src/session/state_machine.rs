@@ -1,8 +1,8 @@
 use serde::Serialize;
 
 use crate::{
-    broker::{ActiveElicitation, ElicitationOwner},
-    exchange::ActiveWait,
+    broker::ElicitationOwner,
+    exchange::{ActiveWait, Exchange, ExchangeKind, ExchangeState},
     plan::{PlanRecord, PlanState},
 };
 
@@ -57,21 +57,44 @@ impl SessionPhase {
     /// Resolve one deterministic workflow phase from the session's durable owners.
     pub fn resolve(
         active_plan: Option<&PlanRecord>,
-        active_elicitation: Option<&ActiveElicitation>,
         active_wait: Option<&ActiveWait>,
-        working: Option<(i64, WorkflowActivity, Option<String>)>,
+        exchange: Option<&Exchange>,
     ) -> Self {
+        if let Some(exchange) =
+            exchange.filter(|exchange| exchange.state == ExchangeState::Finalizing)
+        {
+            return Self::Finalizing {
+                exchange_id: exchange.id.clone(),
+                error: exchange.finalization_error.clone(),
+            };
+        }
         if let Some(plan) = active_plan.filter(|plan| plan.state == PlanState::Failed) {
             return Self::PlanningFailed {
                 plan_id: plan.id.clone(),
                 turn_count: plan.generation.budget.turn_count,
             };
         }
-        if let Some(elicitation) = active_elicitation {
+        if let Some(plan) =
+            active_plan.filter(|plan| plan.acceptance.is_some() || plan.elicitation.is_some())
+        {
             return Self::AwaitingInput {
-                owner: elicitation.owner,
-                plan_id: elicitation.plan_id.clone(),
-                exchange_id: elicitation.exchange_id.clone(),
+                owner: if plan.acceptance.is_some() {
+                    ElicitationOwner::PlanAcceptance
+                } else {
+                    ElicitationOwner::Plan
+                },
+                plan_id: Some(plan.id.clone()),
+                exchange_id: None,
+            };
+        }
+        if let Some(exchange) = exchange.filter(|exchange| {
+            exchange.state == ExchangeState::Running
+                && (exchange.awaiting_input || exchange.elicitation.is_some())
+        }) {
+            return Self::AwaitingInput {
+                owner: ElicitationOwner::Interaction,
+                plan_id: exchange.plan_id.clone(),
+                exchange_id: Some(exchange.id.clone()),
             };
         }
         if let Some(plan) = active_plan.filter(|plan| plan.state == PlanState::AwaitingReview) {
@@ -80,6 +103,23 @@ impl SessionPhase {
                 revision: plan.model_revision,
             };
         }
+        let working = exchange
+            .filter(|exchange| exchange.state == ExchangeState::Running)
+            .map(|exchange| {
+                let activity = match exchange.kind {
+                    ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => {
+                        WorkflowActivity::Planning
+                    }
+                    ExchangeKind::Chat | ExchangeKind::PlanExecution => WorkflowActivity::Working,
+                };
+                (
+                    exchange
+                        .execution_started_at_ms
+                        .unwrap_or(exchange.created_at_ms),
+                    activity,
+                    exchange.latest_reasoning_summary().map(str::to_owned),
+                )
+            });
         if let (Some(plan), Some((started_at_ms, WorkflowActivity::Planning, _))) = (
             active_plan.filter(|plan| {
                 matches!(plan.state, PlanState::Generating | PlanState::Revising)
@@ -119,7 +159,8 @@ impl SessionPhase {
 mod test {
     use super::{SessionPhase, WorkflowActivity};
     use crate::{
-        broker::{ActiveElicitation, ElicitationOwner},
+        agent::Delegation,
+        exchange::{Exchange, ExchangeKind, ExchangeState},
         plan::{PlanRecord, PlanState},
     };
 
@@ -148,15 +189,30 @@ mod test {
         }
     }
 
+    fn exchange() -> Exchange {
+        let mut exchange = Exchange::delegated(
+            "session",
+            &Delegation {
+                id: "delegation".into(),
+                parent_exchange_id: "parent".into(),
+                parent_turn_id: None,
+                child_agent_id: "agent".into(),
+                child_exchange_id: "exchange".into(),
+                task: "task".into(),
+                created_at_ms: 42,
+            },
+            1,
+        );
+        exchange.state = ExchangeState::Running;
+        exchange.kind = ExchangeKind::PlanDraft;
+        exchange.resume(42).unwrap();
+        exchange
+    }
+
     #[test]
-    fn working_phase_preempts_stale_waiting_state() {
+    fn running_exchange_always_has_working_status() {
         assert_eq!(
-            SessionPhase::resolve(
-                None,
-                None,
-                None,
-                Some((42, WorkflowActivity::Planning, None)),
-            ),
+            SessionPhase::resolve(None, None, Some(&exchange()),),
             SessionPhase::Working {
                 started_at_ms: 42,
                 activity: WorkflowActivity::Planning,
@@ -172,19 +228,14 @@ mod test {
 
     #[test]
     fn planning_failure_preempts_stale_input_projection() {
-        let plan = plan(PlanState::Failed);
-        let elicitation = ActiveElicitation {
-            owner: ElicitationOwner::Plan,
-            plan_id: Some(plan.id.clone()),
-            exchange_id: None,
-            elicitation: crate::plan::PlanElicitation::new(
-                crate::plan::PlanQuestionSet::freeform("Old question".into())
-                    .normalize()
-                    .unwrap(),
-            ),
-        };
+        let mut plan = plan(PlanState::Failed);
+        plan.elicitation = Some(crate::plan::PlanElicitation::new(
+            crate::plan::PlanQuestionSet::freeform("Old question".into())
+                .normalize()
+                .unwrap(),
+        ));
         assert!(matches!(
-            SessionPhase::resolve(Some(&plan), Some(&elicitation), None, None),
+            SessionPhase::resolve(Some(&plan), None, None),
             SessionPhase::PlanningFailed { .. }
         ));
     }
@@ -194,12 +245,7 @@ mod test {
         let mut plan = plan(PlanState::Generating);
         plan.generation.budget.observe(false);
         assert_eq!(
-            SessionPhase::resolve(
-                Some(&plan),
-                None,
-                None,
-                Some((42, WorkflowActivity::Planning, None))
-            ),
+            SessionPhase::resolve(Some(&plan), None, Some(&exchange())),
             SessionPhase::RetryingPlanGeneration {
                 plan_id: "plan".into(),
                 turn: 2,
@@ -207,5 +253,56 @@ mod test {
                 started_at_ms: 42,
             }
         );
+    }
+
+    #[test]
+    fn clarification_resume_and_terminal_phases_follow_exchange_state() {
+        let mut exchange = exchange();
+        exchange.kind = ExchangeKind::Chat;
+        exchange.awaiting_input = true;
+        exchange.execution_started_at_ms = None;
+        assert!(matches!(
+            SessionPhase::resolve(None, None, Some(&exchange)),
+            SessionPhase::AwaitingInput { .. }
+        ));
+        exchange.resume(100).unwrap();
+        assert_eq!(
+            SessionPhase::resolve(None, None, Some(&exchange)),
+            SessionPhase::Working {
+                started_at_ms: 100,
+                activity: WorkflowActivity::Working,
+                reasoning_summary: None,
+            }
+        );
+        exchange.state = ExchangeState::Finalizing;
+        assert!(matches!(
+            SessionPhase::resolve(None, None, Some(&exchange)),
+            SessionPhase::Finalizing { .. }
+        ));
+        for state in [
+            ExchangeState::Complete,
+            ExchangeState::Failed,
+            ExchangeState::Cancelled,
+            ExchangeState::Interrupted,
+        ] {
+            exchange.state = state;
+            assert_eq!(
+                SessionPhase::resolve(None, None, Some(&exchange)),
+                SessionPhase::Idle
+            );
+        }
+    }
+
+    #[test]
+    fn running_exchange_without_timer_cannot_become_idle() {
+        let mut exchange = exchange();
+        exchange.execution_started_at_ms = None;
+        assert!(matches!(
+            SessionPhase::resolve(None, None, Some(&exchange)),
+            SessionPhase::Working {
+                started_at_ms: 42,
+                ..
+            }
+        ));
     }
 }

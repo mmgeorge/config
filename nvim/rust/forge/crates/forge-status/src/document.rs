@@ -95,13 +95,14 @@ impl FileTarget {
             StatusSection::Untracked => ChangeKind::Added,
             _ => record.unstaged,
         };
+        use forge_diff::file_header::FileChange;
         let change = match kind {
-            ChangeKind::Added => "added",
-            ChangeKind::Deleted => "deleted",
-            ChangeKind::Renamed => "renamed",
-            ChangeKind::Copied => "copied",
-            ChangeKind::Unmerged => "conflicted",
-            _ => "modified",
+            ChangeKind::Added => FileChange::Added,
+            ChangeKind::Deleted => FileChange::Deleted,
+            ChangeKind::Renamed => FileChange::Renamed,
+            ChangeKind::Copied => FileChange::Copied,
+            ChangeKind::Unmerged => FileChange::Conflicted,
+            _ => FileChange::Modified,
         };
         let stats = if self.section == StatusSection::Staged {
             record.staged_stats
@@ -122,13 +123,20 @@ impl FileTarget {
             } => Some(relocation.origin.display_label().replace(['\n', '\r'], " ")),
             _ => None,
         };
+        let path = record.path.display_label().replace(['\n', '\r'], " ");
+        let untracked = matches!(record.state, PathState::Untracked);
+        let counts = match stats {
+            StatusStatistics::Exact { added, deleted } => Some((added, deleted)),
+            _ => None,
+        };
         StatusFile {
+            header: change.header(&path, counts, untracked),
             id: self.id,
             section: self.section,
-            change,
-            path: record.path.display_label().replace(['\n', '\r'], " "),
+            change: change.name(),
+            path,
             origin,
-            untracked: matches!(record.state, PathState::Untracked),
+            untracked,
             stats,
             generation: self.generation,
         }

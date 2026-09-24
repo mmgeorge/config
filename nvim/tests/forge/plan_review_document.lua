@@ -47,13 +47,14 @@ local success, failure = xpcall(function()
   vim.api.nvim_win_set_buf(0, alternate)
   assert(not vim.wo.breakindent and vim.wo.breakindentopt == "shift:2", "plan review leaked indentation on release")
   vim.api.nvim_win_set_buf(0, native_buffer)
-  assert(vim.bo[native_buffer].modifiable and vim.fs.normalize(vim.api.nvim_buf_get_name(native_buffer)) == vim.fs.normalize(path))
+  assert(not vim.bo[native_buffer].modifiable and vim.fs.normalize(vim.api.nvim_buf_get_name(native_buffer)) == vim.fs.normalize(path))
   assert(vim.deep_equal(vim.fn.readfile(path), { "# Native plan", "", "Task" }), "projection overwrote its physical source")
   local selected
   owner.action("open", function(value) selected = value end)
   local action = requests[#requests]
   assert(action.params.input.target == "plan:source:1")
   assert(owner.is_current(action.params.input))
+  vim.bo[native_buffer].modifiable = true
   vim.api.nvim_buf_set_text(native_buffer, 0, 0, 0, 0, { "new " })
   assert(not owner.is_current(action.params.input), "follow-up effect retained authority after newer physical typing")
   action.callback({ json_path = "/title" })

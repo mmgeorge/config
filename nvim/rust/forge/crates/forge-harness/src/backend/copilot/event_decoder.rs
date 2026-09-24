@@ -308,7 +308,9 @@ async fn publish(
     if let Some(activity) = event.activity.as_ref()
         && let Some(previous) = output.event.iter_mut().find(|previous| {
             previous.activity.as_ref().is_some_and(|existing| {
-                existing.id == activity.id && previous.address == event.address
+                existing.id == activity.id
+                    && previous.address.as_ref().map(|address| &address.thread_id)
+                        == event.address.as_ref().map(|address| &address.thread_id)
             })
         })
     {
@@ -345,6 +347,12 @@ fn merge_activity(previous: &mut BackendEvent, incoming: BackendEvent) {
     let Some(update) = incoming.activity else {
         return;
     };
+    // Background output can arrive after the tool has returned its final result.
+    if matches!(existing.status.as_deref(), Some("completed" | "failed"))
+        && update.status.as_deref() == Some("in_progress")
+    {
+        return;
+    }
     if update.title != "Copilot tool" {
         existing.title = update.title;
     }
@@ -552,6 +560,33 @@ mod test {
             event_type: event_type.into(),
             data,
         }
+    }
+
+    #[tokio::test]
+    async fn retains_tool_identity_across_turns_and_ignores_late_background_output() {
+        let decoder = CopilotEventDecoder;
+        let mut output = BackendOutput {
+            backend_session_id: Some("session".into()),
+            ..BackendOutput::default()
+        };
+        for (kind, data) in [
+            ("assistant.turn_start", json!({"turnId":"one"})),
+            ("tool.execution_start", json!({"toolCallId":"shell", "toolName":"powershell"})),
+            ("tool.execution_partial_result", json!({"toolCallId":"shell", "partialOutput":"hello"})),
+            ("tool.execution_complete", json!({"toolCallId":"shell", "success":true, "result":{"content":"hello"}})),
+            ("assistant.turn_start", json!({"turnId":"two"})),
+            ("tool.execution_partial_result", json!({"toolCallId":"shell", "partialOutput":"hello"})),
+        ] {
+            decoder.decode(&event(kind, data), &mut output, None).await;
+        }
+        let tools = output.event.iter().filter(|event| event.activity.is_some()).collect::<Vec<_>>();
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0].address.as_ref().unwrap().turn_id, "one");
+        let activity = tools[0].activity.as_ref().unwrap();
+        assert_eq!(activity.title, "powershell");
+        assert_eq!(activity.status.as_deref(), Some("completed"));
+        assert_eq!(activity.output.as_deref(), Some("hello"));
+        assert!(!activity.output_delta);
     }
 
     #[tokio::test]

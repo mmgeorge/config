@@ -14,7 +14,7 @@ status._set_runner_for_test(function(method, params, callback)
     callback({ document = params.document, revision = 0, view = { kind = "status" },
       head = { state = "attached", reference = "main", object = "abc" }, context = vim.NIL,
       section = { { kind = "unstaged", file = { 1 } } },
-      file = { { id = 1, generation = 1, section = "unstaged", change = "modified", path = "source.txt", untracked = false, stats = { state = "unknown" } } } })
+      file = { dofile("nvim/tests/forge/support/status_fixture.lua").file("source.txt") } })
   elseif params.operation == "demand" then
     assert(params.input.location.kind == "file" and params.input.location.id == 1)
     assert(params.input.block == nil and params.input.position == nil)

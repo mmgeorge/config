@@ -14,7 +14,10 @@ function HarnessSnapshot.apply(state, result)
   then
     state.session.context_usage = previous_context_usage
   end
-  if previous_session_id ~= (result.session and result.session.id or nil) then state.activity_expanded = {} end
+  if previous_session_id ~= (result.session and result.session.id or nil) then
+    state.activity_expanded = {}
+    require("forge.views.harness.recap").clear(state)
+  end
   state.capability = result.capability or {}
   timeline_cache.replace(state, result.timeline or {}, result.timeline_revision or 0)
   state.artifact = vim.deepcopy(result.artifact or {})

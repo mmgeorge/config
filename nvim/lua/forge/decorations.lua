@@ -9,6 +9,7 @@ local code_info = {}
 ---@return boolean
 function M.full_width(capture)
   return capture == "ForgeAddBg" or capture == "ForgeDeleteBg" or capture == "RenderMarkdownCode"
+    or capture == "ForgeReviewCommentBox" or capture == "ForgeReviewCommentBoxHeader"
 end
 
 local function overlay_chunks(overlay)
@@ -81,7 +82,7 @@ vim.api.nvim_set_decoration_provider(namespace, {
       for _, overlay in ipairs(source_overlay or {}) do
         local right_aligned = overlay.capture == "ForgeRightAlignedOwner"
         if not reveal or right_aligned then
-          if right_aligned then
+          if right_aligned and overlay.range.start.column < overlay.range["end"].column then
             vim.api.nvim_buf_set_extmark(buffer, namespace, row, overlay.range.start.column, {
               virt_text = { { string.rep(" ", vim.fn.strdisplaywidth(overlay.text)), "Normal" } },
               virt_text_pos = "overlay", hl_mode = "replace",

@@ -63,6 +63,27 @@ impl HarnessService {
         let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
         let controller = registry.resolve(&session_id).await?;
         match &request {
+            crate::buffer::session::PresentationRequest::Recap { model } => {
+                let history = controller.presentation.lock()
+                    .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?.recap_history()?;
+                let request = controller.catalog_request.read().await.clone();
+                let text = controller.backend.recap(request, model, &history).await?;
+                return Ok(json!({"text": crate::backend::recap::validate(&text)?}));
+            }
+            crate::buffer::session::PresentationRequest::TerminateTerminal { id } => {
+                let request = controller.catalog_request.read().await.clone();
+                tokio::time::timeout(Duration::from_secs(8),
+                    controller.backend.terminate_terminal(request, id)).await
+                    .context("background terminal termination timed out")??;
+                return Ok(json!({}));
+            }
+            crate::buffer::session::PresentationRequest::BackgroundTerminals => {
+                let request = controller.catalog_request.read().await.clone();
+                let snapshot = tokio::time::timeout(Duration::from_secs(8),
+                    controller.backend.background_terminals(request)).await
+                    .context("background terminal query timed out")??;
+                return Ok(serde_json::to_value(snapshot)?);
+            }
             crate::buffer::session::PresentationRequest::Highlight { document } => {
                 let job = controller
                     .presentation
@@ -86,6 +107,7 @@ impl HarnessService {
                 digest,
                 width,
                 saved_source_digest,
+                focused_annotation,
             } => {
                 let admission = controller.plan_review.admit(document.clone())?;
                 let mut source = controller
@@ -122,6 +144,7 @@ impl HarnessService {
                     view.clone(),
                     source,
                     width.clone(),
+                    focused_annotation.clone(),
                 )?;
                 return controller.plan_review.insert(document, admission);
             }
@@ -130,8 +153,16 @@ impl HarnessService {
                     controller.plan_review.action(input.clone())?,
                 )?);
             }
-            crate::buffer::session::PresentationRequest::PlanAddAnnotation { input } => {
-                return controller.plan_review.add_annotation(input.clone());
+            crate::buffer::session::PresentationRequest::PlanAddAnnotation { input, end } => {
+                return controller
+                    .plan_review
+                    .add_annotation(input.clone(), end.clone());
+            }
+            crate::buffer::session::PresentationRequest::PlanFocusAnnotation { input } => {
+                return controller.plan_review.focus_annotation(input.clone());
+            }
+            crate::buffer::session::PresentationRequest::PlanDeleteAnnotation { input } => {
+                return controller.plan_review.delete_annotation(input.clone());
             }
             crate::buffer::session::PresentationRequest::PlanEdit { edit } => {
                 return Ok(match controller.plan_review.edit(edit.clone())? {
@@ -323,6 +354,7 @@ impl HarnessService {
                     .collect();
                 for controller in controller_list {
                     controller.plan_review.close_all()?;
+                    *controller.mcp_discovery.lock().await = Default::default();
                     controller.cancellation.request(false);
                     controller.permission.cancel_all(None).await?;
                 }
@@ -426,6 +458,7 @@ struct SessionController {
     cancellation: Arc<TurnCancellation>,
     backend: Arc<dyn crate::backend::Backend>,
     catalog_request: RwLock<crate::backend::BackendCatalogRequest>,
+    mcp_discovery: Mutex<crate::backend::mcp::McpDiscovery>,
     permission: Arc<crate::backend::approval::PermissionCoordinator>,
 }
 
@@ -453,6 +486,7 @@ impl SessionController {
             cancellation: broker.turn_cancellation(),
             backend: broker.backend_handle(),
             catalog_request: RwLock::new(catalog_request),
+            mcp_discovery: Mutex::new(crate::backend::mcp::McpDiscovery::default()),
             permission: broker.permission_coordinator(),
             broker: Mutex::new(broker),
         })
@@ -953,12 +987,8 @@ async fn route_control_request(
             )?)
         }
         HarnessMethod::BackendMcp => {
-            let server_list = tokio::time::timeout(
-                Duration::from_secs(30),
-                controller.backend.mcp_list(catalog_request.clone()),
-            )
-            .await
-            .context("MCP status did not finish within 30 seconds")??;
+            let server_list = controller.mcp_discovery.lock().await
+                .snapshot(controller.backend.clone(), catalog_request.clone()).await?;
             Some(Response::success(request.id, server_list)?)
         }
         HarnessMethod::BackendMcpSetEnabled => {
@@ -1001,6 +1031,7 @@ async fn route_control_request(
             .await
             .context("MCP startup did not finish within 30 seconds")??;
             mutation.restart_required |= interrupted;
+            *controller.mcp_discovery.lock().await = Default::default();
             Some(Response::success(request.id, mutation)?)
         }
         _ => None,

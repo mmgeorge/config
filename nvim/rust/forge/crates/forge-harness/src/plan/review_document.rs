@@ -39,7 +39,11 @@ impl PlanReviewStore {
         )
     }
 
-    pub(crate) fn add_annotation(&self, input: DocumentInput) -> Result<serde_json::Value> {
+    pub(crate) fn add_annotation(
+        &self,
+        input: DocumentInput,
+        end: Option<DocumentInput>,
+    ) -> Result<serde_json::Value> {
         let mut store = self
             .document
             .lock()
@@ -48,7 +52,33 @@ impl PlanReviewStore {
             .get_mut(&input.document)
             .context("plan review document is closed")?;
         admission.check()?;
-        document.add_annotation(input)
+        document.add_annotation(input, end)
+    }
+
+    /// Change the focused annotation only after validating its document input.
+    pub(crate) fn focus_annotation(&self, input: DocumentInput) -> Result<serde_json::Value> {
+        let mut store = self
+            .document
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store
+            .get_mut(&input.document)
+            .context("plan review document is closed")?;
+        admission.check()?;
+        document.focus_annotation(input)
+    }
+
+    /// Delete the annotation selected by a validated document input.
+    pub(crate) fn delete_annotation(&self, input: DocumentInput) -> Result<serde_json::Value> {
+        let mut store = self
+            .document
+            .lock()
+            .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store
+            .get_mut(&input.document)
+            .context("plan review document is closed")?;
+        admission.check()?;
+        document.delete_annotation(input)
     }
 
     pub(crate) fn edit(&self, edit: LocalEdit) -> Result<LocalEditResult> {
@@ -160,6 +190,14 @@ impl PlanReviewStore {
 }
 
 pub(crate) struct PlanReviewDocument {
+    focused_annotation: Option<String>,
+    annotation_revision: HashMap<
+        String,
+        (
+            forge_buffer::identity::RegionRevision,
+            forge_buffer::identity::EditSequence,
+        ),
+    >,
     annotation: ReviewAnnotationStore,
     width: WidthProfile,
     view_width: DocumentViews,
@@ -191,17 +229,45 @@ impl PlanReviewDocument {
             }
             _ => None,
         };
-        let entity_name = match &anchor.target {
-            PlanReviewTarget::Entity { name } | PlanReviewTarget::FileTreeEntity { name, .. } => {
-                Some(name.as_str())
-            }
-            PlanReviewTarget::EntityMember { entity, .. }
-            | PlanReviewTarget::EnumVariant { entity, .. }
-            | PlanReviewTarget::EnumVariantField { entity, .. } => Some(entity.as_str()),
-            PlanReviewTarget::FlowStep { target_name, .. }
-            | PlanReviewTarget::FlowEdge { target_name, .. } => Some(target_name.as_str()),
-            _ => None,
-        };
+        let cursor_entity = (action == "jump_entity")
+            .then(|| {
+                self.source
+                    .document
+                    .entity_changes
+                    .iter()
+                    .filter(|entity| {
+                        !entity.name.is_empty()
+                            && row.match_indices(&entity.name).any(|(start, name)| {
+                                let end = start + name.len();
+                                let identifier = |character: char| {
+                                    character.is_alphanumeric() || character == '_'
+                                };
+                                start <= column
+                                    && column < end
+                                    && !row[..start].chars().next_back().is_some_and(identifier)
+                                    && !row[end..].chars().next().is_some_and(identifier)
+                            })
+                    })
+                    .max_by_key(|entity| entity.name.len())
+            })
+            .flatten();
+        let entity_name =
+            cursor_entity
+                .map(|entity| entity.name.as_str())
+                .or_else(|| match &anchor.target {
+                    PlanReviewTarget::Entity { name }
+                    | PlanReviewTarget::FileTreeEntity { name, .. } => Some(name.as_str()),
+                    PlanReviewTarget::EntityMember { entity, .. }
+                    | PlanReviewTarget::EnumVariant { entity, .. }
+                    | PlanReviewTarget::EnumVariantField { entity, .. }
+                        if action != "jump_entity" =>
+                    {
+                        Some(entity.as_str())
+                    }
+                    PlanReviewTarget::FlowStep { target_name, .. }
+                    | PlanReviewTarget::FlowEdge { target_name, .. } => Some(target_name.as_str()),
+                    _ => None,
+                });
         let entity = entity_name.and_then(|name| {
             self.source
                 .document
@@ -215,7 +281,7 @@ impl PlanReviewDocument {
             _ => anchor.path.as_deref().map(|path| (path, 1)),
         }.map(|(path, line)| serde_json::json!({"path":self.source.workspace.join(path),"line":line,"column":1}));
         let entity_anchor = entity.and_then(|entity| self.source.rendered.navigation.anchor.iter().find(|candidate| {
-            if let Some(callable) = callable {
+            if let Some(callable) = callable.filter(|_| cursor_entity.is_none()) {
                 matches!(&candidate.target, PlanReviewTarget::EntityMember { entity: name, member } if name == &entity.name && member == callable)
             } else { matches!(&candidate.target, PlanReviewTarget::Entity { name } if name == &entity.name) }
         }));
@@ -227,9 +293,17 @@ impl PlanReviewDocument {
                         .get(&target.id)
                         .is_some_and(|candidate| candidate.json_path == entity_anchor.json_path)
                 }) {
+                    let mut position = target.range.start;
+                    if let Some(name) = entity_name {
+                        if let Some(column) = block.text.row(position.row).and_then(|row| {
+                            row.find(callable.filter(|_| cursor_entity.is_none()).unwrap_or(name))
+                        }) {
+                            position.column = column;
+                        }
+                    }
                     jump = Some(forge_buffer::block::BlockAnchor {
                         block: block.id,
-                        position: target.range.start,
+                        position,
                     });
                     break;
                 }
@@ -263,19 +337,36 @@ impl PlanReviewDocument {
         )
     }
 
-    fn add_annotation(&mut self, input: DocumentInput) -> Result<serde_json::Value> {
+    fn add_annotation(
+        &mut self,
+        input: DocumentInput,
+        end: Option<DocumentInput>,
+    ) -> Result<serde_json::Value> {
+        if let Some(end) = &end {
+            ensure!(
+                end.document == input.document
+                    && end.revision == input.revision
+                    && end.view == input.view,
+                "plan selection belongs to another document or view"
+            );
+        }
         let anchor = self.action(input)?;
+        let end_line = match end {
+            Some(end) => self.action(end)?.line,
+            None => anchor.line,
+        };
         let mut annotation = self.annotation.annotation().to_vec();
         annotation.retain(|annotation| !annotation.source.body.trim().is_empty());
         let id = uuid::Uuid::new_v4().to_string();
         annotation.push(ReviewAnnotation {
             id: id.clone(),
             source: super::PlanAnnotationInput {
-                start_line: anchor.line,
-                end_line: anchor.line,
+                start_line: anchor.line.min(end_line),
+                end_line: anchor.line.max(end_line),
                 body: String::new(),
             },
         });
+        self.retain_annotation_revision();
         let revision = self
             .document
             .snapshot()
@@ -284,16 +375,102 @@ impl PlanReviewDocument {
             .flat_map(|block| &block.metadata.editable_region)
             .map(|region| (region.id.0.clone(), (region.revision, region.sequence)))
             .collect();
-        let (block, target) =
-            super::review_projection::project(&self.source, &self.width, &annotation, &revision)?;
+        let (block, target) = super::review_projection::project(
+            &self.source,
+            &self.width,
+            &annotation,
+            &revision,
+            Some(&id),
+        )?;
         let mut candidate = self.document.clone();
         let patch = candidate.edit(0..candidate.block_count(), block)?;
         self.annotation.replace(annotation)?;
         self.document = candidate;
         self.target = target;
+        self.focused_annotation = Some(id.clone());
         Ok(
             serde_json::json!({"patch":patch, "region":id, "block":format!("plan:annotation:{id}"), "row":1}),
         )
+    }
+
+    /// Retain edit counters while compact comments have no editable regions.
+    fn retain_annotation_revision(&mut self) {
+        for block in &self.document.snapshot().block {
+            for region in &block.metadata.editable_region {
+                self.annotation_revision
+                    .insert(region.id.0.clone(), (region.revision, region.sequence));
+            }
+        }
+    }
+
+    /// Expand the selected comment or compact it and discard an abandoned empty draft.
+    fn focus_annotation(&mut self, input: DocumentInput) -> Result<serde_json::Value> {
+        let block_id = input.block.clone();
+        self.validate_input(input)?;
+        let focused = self
+            .annotation
+            .annotation()
+            .iter()
+            .find(|annotation| block_id.0 == format!("plan:annotation:{}", annotation.id))
+            .map(|annotation| annotation.id.clone());
+        if focused == self.focused_annotation {
+            return Ok(serde_json::json!({"patch":null,"focused":focused}));
+        }
+        self.retain_annotation_revision();
+        let mut annotation = self.annotation.annotation().to_vec();
+        annotation.retain(|annotation| {
+            Some(&annotation.id) == focused.as_ref() || !annotation.source.body.trim().is_empty()
+        });
+        let (block, target) = super::review_projection::project(
+            &self.source,
+            &self.width,
+            &annotation,
+            &self.annotation_revision,
+            focused.as_deref(),
+        )?;
+        let mut candidate = self.document.clone();
+        let patch = candidate.edit(0..candidate.block_count(), block)?;
+        self.annotation.replace(annotation)?;
+        self.document = candidate;
+        self.target = target;
+        self.focused_annotation = focused.clone();
+        Ok(serde_json::json!({"patch":patch,"focused":focused}))
+    }
+
+    /// Remove the selected annotation from durable review state and its projection.
+    fn delete_annotation(&mut self, input: DocumentInput) -> Result<serde_json::Value> {
+        let block_id = input.block.clone();
+        self.validate_input(input)?;
+        let id = self
+            .annotation
+            .annotation()
+            .iter()
+            .find(|annotation| block_id.0 == format!("plan:annotation:{}", annotation.id))
+            .map(|annotation| annotation.id.clone())
+            .context("selected plan row is not a comment")?;
+        self.retain_annotation_revision();
+        let annotation = self
+            .annotation
+            .annotation()
+            .iter()
+            .filter(|annotation| annotation.id != id)
+            .cloned()
+            .collect::<Vec<_>>();
+        self.annotation_revision.remove(&id);
+        let (block, target) = super::review_projection::project(
+            &self.source,
+            &self.width,
+            &annotation,
+            &self.annotation_revision,
+            None,
+        )?;
+        let mut candidate = self.document.clone();
+        let patch = candidate.edit(0..candidate.block_count(), block)?;
+        self.annotation.replace(annotation)?;
+        self.document = candidate;
+        self.target = target;
+        self.focused_annotation = None;
+        Ok(serde_json::json!({"patch":patch,"focused":null}))
     }
 
     fn edit(&mut self, edit: LocalEdit) -> Result<LocalEditResult> {
@@ -323,6 +500,7 @@ impl PlanReviewDocument {
         view: ViewId,
         source: PlanReviewSource,
         width: WidthProfile,
+        focused_annotation: Option<String>,
     ) -> Result<Self> {
         view.validate()?;
         let annotation = ReviewAnnotationStore::open(
@@ -334,11 +512,14 @@ impl PlanReviewDocument {
             &width,
             annotation.annotation(),
             &HashMap::new(),
+            focused_annotation.as_deref(),
         )?;
         let document = BufferDocument::new(id.clone(), block)?;
         let mut view_width = DocumentViews::default();
         view_width.open(view.clone(), width.clone())?;
         Ok(Self {
+            focused_annotation,
+            annotation_revision: HashMap::new(),
             id,
             source,
             document,
@@ -437,6 +618,7 @@ impl PlanReviewDocument {
                 &profile,
                 self.annotation.annotation(),
                 &revision,
+                self.focused_annotation.as_deref(),
             )?;
             let patch = self.document.edit(0..self.document.block_count(), block)?;
             self.target = target;
@@ -463,6 +645,102 @@ mod tests {
     use forge_buffer::text::BufferText;
 
     #[test]
+    fn signature_type_jump_resolves_cursor_entity_and_preserves_flow_navigation() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path(), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Initial");
+        let mut summary = canonical.entity_changes[0].clone();
+        summary.name = "DiagnosticSummary".into();
+        canonical.entity_changes.push(summary);
+        if let crate::plan::document::PlanSubtask::Work(subtask) =
+            &mut canonical.tasks[0].files[0].subtasks[0]
+        {
+            subtask.entities.push("DiagnosticSummary".into());
+        }
+        store
+            .write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (_, _, checksum) = store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let source = store
+            .capture_review_source("session", "plan", 1, &checksum)
+            .unwrap();
+        let document = PlanReviewDocument::new(
+            DocumentId("review".into()),
+            ViewId("view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        let mut anchor = document.source.rendered.navigation.anchor.iter().find(|anchor|
+            matches!(&anchor.target, super::super::PlanReviewTarget::Entity { name } if name == "PlanDocument")
+        ).unwrap().clone();
+        anchor.target = super::super::PlanReviewTarget::EntityMember {
+            entity: "PlanDocument".into(),
+            member: "run_diagnostics".into(),
+        };
+        for row in [
+            "  + run_diagnostics(): DiagnosticSummary",
+            "  + run(value: &DiagnosticSummary)",
+            "  - summary: DiagnosticSummary",
+        ] {
+            let result = document
+                .describe(
+                    anchor.clone(),
+                    "jump_entity",
+                    row,
+                    row.find("DiagnosticSummary").unwrap() + 4,
+                )
+                .unwrap();
+            assert_eq!(result["entity_name"], "DiagnosticSummary");
+            let jump: forge_buffer::block::BlockAnchor =
+                serde_json::from_value(result["jump"].clone()).unwrap();
+            let target = document
+                .document
+                .block(&jump.block)
+                .unwrap()
+                .text
+                .row(jump.position.row)
+                .unwrap();
+            assert!(target[jump.position.column..].starts_with("DiagnosticSummary"));
+        }
+        let row = "  + run(): DiagnosticSummaryExtra";
+        let result = document
+            .describe(
+                anchor.clone(),
+                "jump_entity",
+                row,
+                row.find("DiagnosticSummary").unwrap(),
+            )
+            .unwrap();
+        assert!(result["entity_name"].is_null());
+        assert!(result["jump"].is_null());
+        let row = "  + complete(message_id: &str): Result<(), QueueError>";
+        for name in ["QueueError", "Result", "str", "complete"] {
+            let result = document
+                .describe(anchor.clone(), "jump_entity", row, row.find(name).unwrap())
+                .unwrap();
+            assert!(result["jump"].is_null(), "unexpected jump for {name}");
+        }
+        let mut flow = anchor;
+        flow.target = super::super::PlanReviewTarget::FlowStep {
+            reference_kind: super::super::PlanReviewReferenceKind::PlannedEntity,
+            target_name: "PlanDocument".into(),
+            target_is_type: true,
+            workspace_path: None,
+            workspace_line: None,
+        };
+        assert!(
+            !document
+                .describe(flow, "jump_entity", "Capture", 1)
+                .unwrap()["jump"]
+                .is_null()
+        );
+    }
+
+    #[test]
     fn annotation_edit_publishes_only_after_durable_save_and_reopens_exact_text() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());
@@ -483,21 +761,25 @@ mod tests {
             ViewId("view".into()),
             source,
             WidthProfile::default(),
+            None,
         )
         .unwrap();
         let snapshot = document.snapshot();
         let target = snapshot.block[0].metadata.target[0].clone();
         let created = document
-            .add_annotation(DocumentInput {
-                document: snapshot.document,
-                revision: snapshot.revision,
-                view: ViewId("view".into()),
-                sequence: InputSequence(1),
-                action: "comment".into(),
-                block: snapshot.block[0].id.clone(),
-                position: target.range.start,
-                target: Some(target.id),
-            })
+            .add_annotation(
+                DocumentInput {
+                    document: snapshot.document,
+                    revision: snapshot.revision,
+                    view: ViewId("view".into()),
+                    sequence: InputSequence(1),
+                    action: "comment".into(),
+                    block: snapshot.block[0].id.clone(),
+                    position: target.range.start,
+                    target: Some(target.id),
+                },
+                None,
+            )
             .unwrap();
         let region = RegionId(created["region"].as_str().unwrap().into());
         let edit = LocalEdit {
@@ -523,22 +805,75 @@ mod tests {
         let source = store
             .capture_review_source("session", "plan", 1, &checksum)
             .unwrap();
-        let reopened = PlanReviewDocument::new(
+        let mut reopened = PlanReviewDocument::new(
             DocumentId("reopened".into()),
             ViewId("other".into()),
             source,
             WidthProfile::default(),
+            None,
         )
         .unwrap();
-        assert_eq!(
+        let block = BlockId(format!("plan:annotation:{}", region.0));
+        assert!(
             reopened
                 .document
-                .block(&BlockId(format!("plan:annotation:{}", region.0)))
+                .block(&block)
                 .unwrap()
                 .text
-                .wire_rows(),
-            ["Comment", "literal **comment**", ""]
+                .row(0)
+                .unwrap()
+                .contains("╭─")
         );
+        assert!(
+            reopened
+                .document
+                .block(&block)
+                .unwrap()
+                .metadata
+                .editable_region
+                .is_empty()
+        );
+        reopened
+            .focus_annotation(DocumentInput {
+                document: reopened.id.clone(),
+                revision: reopened.document.revision(),
+                view: ViewId("other".into()),
+                sequence: InputSequence(1),
+                action: "focus_annotation".into(),
+                block: block.clone(),
+                position: forge_buffer::block::TextPosition { row: 0, column: 0 },
+                target: None,
+            })
+            .unwrap();
+        assert_eq!(
+            &reopened.document.block(&block).unwrap().text.wire_rows()[1..3],
+            &["literal **comment**", ""]
+        );
+        reopened
+            .delete_annotation(DocumentInput {
+                document: reopened.id.clone(),
+                revision: reopened.document.revision(),
+                view: ViewId("other".into()),
+                sequence: InputSequence(2),
+                action: "delete".into(),
+                block: block.clone(),
+                position: forge_buffer::block::TextPosition { row: 1, column: 0 },
+                target: None,
+            })
+            .unwrap();
+        assert!(reopened.document.block(&block).is_none());
+        let source = store
+            .capture_review_source("session", "plan", 1, &checksum)
+            .unwrap();
+        let deleted = PlanReviewDocument::new(
+            DocumentId("deleted".into()),
+            ViewId("deleted-view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        assert!(deleted.document.block(&block).is_none());
     }
 
     #[tokio::test]
@@ -583,6 +918,7 @@ mod tests {
             ViewId("first".into()),
             source,
             WidthProfile::default(),
+            None,
         )
         .unwrap();
         let snapshot = document.snapshot();

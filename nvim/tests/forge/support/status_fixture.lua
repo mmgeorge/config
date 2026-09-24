@@ -2,7 +2,19 @@ local M = {}
 
 function M.file(path, id)
   return { id = id or 1, generation = 1, section = "unstaged", change = "modified", path = path or "source.txt",
+    header = M.header(path or "source.txt"),
     untracked = false, stats = { state = "unknown" } }
+end
+
+function M.header(path, added, removed)
+  local header = { { text = "Modified", capture = "ForgeStatusFileModified" },
+    { text = " " .. path, capture = "ForgeStatusPath" } }
+  if added then
+    vim.list_extend(header, { { text = " ", capture = "ForgeStatusPath" },
+      { text = "+" .. added, capture = "ForgeAddRange" }, { text = " ", capture = "ForgeStatusPath" },
+      { text = "-" .. removed, capture = "ForgeDeleteRange" } })
+  end
+  return header
 end
 
 function M.snapshot(document, options)

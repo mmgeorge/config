@@ -194,10 +194,10 @@ def --wrapped co [...args] {
         # --deny-tool 'shell(python:*)'
         # --disable-builtin-mcps
         # --allow-all-urls
-        --add-dir '/Users/matt9222/Developer'
-        --add-dir '/Users/matt9222/datasets'
-        --add-dir '/Users/matt9222/.cargo'
-        --add-dir '/Users/matt9222/Developer/maps/screenshots'
+        # --add-dir '/Users/matt9222/Developer'
+        # --add-dir '/Users/matt9222/datasets'
+        # --add-dir '/Users/matt9222/.cargo'
+        # --add-dir '/Users/matt9222/Developer/maps/screenshots'
         # --add-dir '/Users/matt9222/Developer/agents'
         # --add-dir '/Users/matt9222/config/copilot/.github/instructions'
     ]

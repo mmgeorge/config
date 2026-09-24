@@ -416,7 +416,7 @@ mod tests {
                 agent_by_id: HashMap::new(),
             };
             let rendered =
-                crate::buffer::projection::project(&entry, &Default::default(), false).unwrap();
+                crate::buffer::projection::project(&entry, &Default::default(), false, &Default::default()).unwrap();
             let text = rendered
                 .entry
                 .block

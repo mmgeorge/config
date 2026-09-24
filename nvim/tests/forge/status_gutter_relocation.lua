@@ -8,7 +8,8 @@ for _, moved_id in ipairs({ 1, 3 }) do
     vim.wo.wrap = true
 
     local function record(id, section)
-      return { id = id, generation = 1, section = section, change = "modified", path = "source_" .. id .. ".rs", untracked = false, stats = { state = "exact", added = 30, deleted = 0 } }
+      return { id = id, generation = 1, section = section, change = "modified", path = "source_" .. id .. ".rs", untracked = false, stats = { state = "exact", added = 30, deleted = 0 },
+        header = dofile("nvim/tests/forge/support/status_fixture.lua").header("source_" .. id .. ".rs", 30, 0) }
     end
 
     local function delivery(id)

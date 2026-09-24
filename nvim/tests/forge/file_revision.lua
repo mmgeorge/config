@@ -82,7 +82,10 @@ local function native_status_snapshot(document)
   local snapshot = fixture.snapshot(document)
   snapshot.file = { fixture.file("a.txt", 1), fixture.file("b.txt", 2), fixture.file("c.txt", 3) }
   snapshot.file[3].section = "staged"
-  for _, file in ipairs(snapshot.file) do file.stats = { state = "exact", added = 1, deleted = 1 } end
+  for _, file in ipairs(snapshot.file) do
+    file.stats = { state = "exact", added = 1, deleted = 1 }
+    file.header = dofile("nvim/tests/forge/support/status_fixture.lua").header(file.path, 1, 1)
+  end
   snapshot.section = { { kind = "unstaged", file = { 1, 2 } }, { kind = "staged", file = { 3 } } }
   return snapshot
 end

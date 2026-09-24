@@ -11,7 +11,7 @@ local function preview(text, width)
 end
 
 --- Builds virtual text line chunks representing pending steering inputs and queued follow-up prompts.
----@param queue string[] Array of queued prompt text strings.
+---@param queue (string|{text: string, config: table})[] Queued prompts and selected model commands.
 ---@param width integer Maximum column width.
 ---@param pending_steer table[]? Optional array of pending steering inputs.
 ---@return table[] lines Array of formatted chunk line tuples.
@@ -33,6 +33,7 @@ function M.build(queue, width, pending_steer)
     line_list[#line_list + 1] = { { "• Queued follow-up inputs", "ForgeStatusLabel" } }
   end
   for _, text in ipairs(queue) do
+    if type(text) == "table" then text = text.text end
     line_list[#line_list + 1] = { { "└ " .. preview(text, preview_width), "ForgeHarnessOutput" } }
   end
   return line_list, #line_list

@@ -22,6 +22,8 @@ local owner
 local success, failure = xpcall(function()
   owner = module.attach(options, function(_, error_message) assert(not error_message, error_message) end)
   respond(requests[1])
+  vim.api.nvim_win_set_cursor(window, { 2, 0 })
+  owner.sync_editability()
   vim.api.nvim_buf_set_text(native_buffer, 1, 0, 1, 5, { "unsent ** literal", "tail" })
   local recovery = assert(owner.recovery())
   assert(vim.deep_equal(recovery.draft.note, { "unsent ** literal", "tail" }))

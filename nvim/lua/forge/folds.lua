@@ -244,6 +244,22 @@ function M.register(session)
 end
 
 ---@param session table
+---@param window integer
+---@return boolean
+function M.toggle_heading(session, window)
+  if not session or session.status ~= "Applied" or not vim.api.nvim_win_is_valid(window)
+    or vim.api.nvim_win_get_buf(window) ~= session.buffer then return false end
+  local row = vim.api.nvim_win_get_cursor(window)[1]
+  for _, record in pairs(session.fold and session.fold.record or {}) do
+    if fold_start(session, record) == row then
+      vim.api.nvim_win_call(window, function() vim.cmd("normal! za") end)
+      return true
+    end
+  end
+  return false
+end
+
+---@param session table
 ---@return table<integer, table<string, boolean>>
 function M.capture(session)
   local captured = {}
@@ -319,6 +335,17 @@ function M.text()
   local _, start = session.sequence:position(node.id)
   local relative = vim.v.foldstart - 1 - start
   local boundary, spans = { [0] = true, [#text] = true }, {}
+  local gutter = {}
+  for _, item in ipairs(node.entry.metadata.gutter or {}) do
+    if item.position.row == relative then
+      local column = math.min(item.position.column, #text)
+      boundary[column] = true
+      gutter[column] = gutter[column] or {}
+      for _, chunk in ipairs(item.chunk) do
+        gutter[column][#gutter[column] + 1] = { chunk.text, chunk.capture }
+      end
+    end
+  end
   local decoration = vim.list_extend({}, node.entry.metadata.decoration or {})
   vim.list_extend(decoration, node.entry.metadata.visible_decoration or {})
   for _, span in ipairs(decoration) do
@@ -349,6 +376,7 @@ function M.text()
   local chunks = {}
   for index = 1, #column - 1 do
     local first, last = column[index], column[index + 1]
+    vim.list_extend(chunks, gutter[first] or {})
     local capture, priority = "Normal", -1
     for _, span in ipairs(spans) do
       if span.first <= first and span.last >= last and span.priority >= priority then
@@ -366,6 +394,7 @@ function M.text()
       if replacement ~= "" then chunks[#chunks + 1] = { replacement, capture } end
     end
   end
+  vim.list_extend(chunks, gutter[#text] or {})
   return chunks
 end
 

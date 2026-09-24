@@ -6,6 +6,7 @@ vim.api.nvim_win_set_buf(0, replica.buffer)
 local file = {}
 for id = 1, 3 do
   file[id] = { id = id, generation = 1, section = "unstaged", change = "modified",
+    header = dofile("nvim/tests/forge/support/status_fixture.lua").header("file_" .. id .. ".rs", 1, 1),
     path = "file_" .. id .. ".rs", untracked = false, stats = { state = "exact", added = 1, deleted = 1 } }
 end
 assert(render.apply_snapshot(replica, { document = replica.document, revision = 0, view = { kind = "status" },

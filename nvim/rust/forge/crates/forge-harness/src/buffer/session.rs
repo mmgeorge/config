@@ -34,6 +34,7 @@ pub struct SessionPresentation {
 }
 
 struct OpenPresentation {
+    expanded_tool: HashSet<String>,
     syntax_done: HashSet<TargetId>,
     syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
     agent_scope: Option<String>,
@@ -78,6 +79,9 @@ pub struct PresentationSync {
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PresentationRequest {
+    BackgroundTerminals,
+    Recap { model: String },
+    TerminateTerminal { id: String },
     Highlight {
         document: DocumentId,
     },
@@ -88,11 +92,19 @@ pub enum PresentationRequest {
         digest: String,
         width: WidthProfile,
         saved_source_digest: Option<String>,
+        focused_annotation: Option<String>,
     },
     PlanAction {
         input: DocumentInput,
     },
     PlanAddAnnotation {
+        input: DocumentInput,
+        end: Option<DocumentInput>,
+    },
+    PlanFocusAnnotation {
+        input: DocumentInput,
+    },
+    PlanDeleteAnnotation {
         input: DocumentInput,
     },
     PlanEdit {
@@ -155,6 +167,9 @@ pub enum PresentationRequest {
         input: DocumentInput,
         document: DocumentId,
     },
+    ToggleTool {
+        input: DocumentInput,
+    },
     ToolDemand {
         document: DocumentId,
         revision: DocumentRevision,
@@ -165,6 +180,10 @@ pub enum PresentationRequest {
 }
 
 impl SessionPresentation {
+    /// Capture recap context without acquiring the active prompt broker.
+    pub(crate) fn recap_history(&self) -> Result<String> {
+        crate::backend::recap::history(self.timeline.entry_list())
+    }
     pub fn dispatch(&mut self, request: PresentationRequest) -> Result<serde_json::Value> {
         use serde_json::{json, to_value};
         match request {
@@ -174,6 +193,8 @@ impl SessionPresentation {
             PresentationRequest::PlanOpen { .. }
             | PresentationRequest::PlanAction { .. }
             | PresentationRequest::PlanAddAnnotation { .. }
+            | PresentationRequest::PlanFocusAnnotation { .. }
+            | PresentationRequest::PlanDeleteAnnotation { .. }
             | PresentationRequest::PlanEdit { .. }
             | PresentationRequest::PlanView { .. }
             | PresentationRequest::PlanClose { .. } => {
@@ -222,6 +243,20 @@ impl SessionPresentation {
             }
             PresentationRequest::NavigatePrompt { input, previous } => {
                 self.navigate_prompt(input, previous)
+            }
+            PresentationRequest::ToggleTool { input } => {
+                let TranscriptAction::Tool { call_id } = self.action(input)? else {
+                    anyhow::bail!("transcript target is not a tool output");
+                };
+                let open = self.open.as_mut().context("session presentation is not open")?;
+                let expanded = !open.expanded_tool.remove(&call_id);
+                if expanded { open.expanded_tool.insert(call_id.clone()); }
+                if let Err(error) = reflow(open, self.timeline.entry_list(), self.timeline.revision()) {
+                    if expanded { open.expanded_tool.remove(&call_id); }
+                    else { open.expanded_tool.insert(call_id); }
+                    return Err(error);
+                }
+                Ok(json!({"expanded": expanded}))
             }
             PresentationRequest::ToolOpen { input, document } => {
                 document.validate()?;
@@ -282,6 +317,7 @@ impl SessionPresentation {
             PresentationRequest::ToolExport { .. } => {
                 anyhow::bail!("tool export requires the initialized storage owner")
             }
+            PresentationRequest::BackgroundTerminals | PresentationRequest::TerminateTerminal { .. } | PresentationRequest::Recap { .. } => anyhow::bail!("provider operation requires the provider owner"),
             PresentationRequest::Open {
                 document,
                 composer,
@@ -407,7 +443,7 @@ impl SessionPresentation {
         let mut projected = Vec::new();
         let mut retained_bytes = 0;
         for (index, entry) in self.timeline.entry_list().iter().enumerate() {
-            let entry = project(entry, &width, index > 0)?;
+            let entry = project(entry, &width, index > 0, &HashSet::new())?;
             retained_bytes += entry.retained_bytes();
             ensure!(
                 retained_bytes <= MAX_PROJECTED_BYTES,
@@ -443,6 +479,7 @@ impl SessionPresentation {
             composer: composer_document.snapshot(),
         };
         self.open = Some(OpenPresentation {
+            expanded_tool: HashSet::new(),
             syntax_done: HashSet::new(),
             syntax,
             agent_scope: None,
@@ -967,7 +1004,7 @@ fn refresh_activity(open: &mut OpenPresentation, source: &[TimelineEntry]) -> Re
                         exchange: exchange.clone(),
                         agent_by_id: HashMap::new(),
                     };
-                    projected.push((index, project(&entry, width, index > 0)?));
+                    projected.push((index, project(&entry, width, index > 0, &open.expanded_tool)?));
                 }
             }
         }
@@ -989,7 +1026,7 @@ fn refresh_activity(open: &mut OpenPresentation, source: &[TimelineEntry]) -> Re
                 _ => false,
             };
             if ticking {
-                projected.push((index, project(entry, width, index > 0)?));
+                projected.push((index, project(entry, width, index > 0, &open.expanded_tool)?));
             }
         }
     }
@@ -1061,7 +1098,7 @@ fn reflow(
     let mut projected = Vec::new();
     let mut retained = 0;
     for (index, entry) in source.iter().enumerate() {
-        let entry = project(entry, &width, index > 0)?;
+        let entry = project(entry, &width, index > 0, &open.expanded_tool)?;
         retained += entry.retained_bytes();
         ensure!(
             retained <= MAX_PROJECTED_BYTES,
@@ -1106,7 +1143,7 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
         match operation {
             TimelineOperation::Insert { index, entry }
             | TimelineOperation::Replace { index, entry } => {
-                let entry = project(entry, width, *index > 0)?;
+                let entry = project(entry, width, *index > 0, &open.expanded_tool)?;
                 retained = retained.saturating_sub(
                     open.entry
                         .get(&entry.entry.id)
@@ -1487,7 +1524,7 @@ mod tests {
             id: "tool".into(),
             kind: ToolActivityKind::Command,
             title: "Read output".into(),
-            output: Some("first\nsecond\nthird".into()),
+            output: Some("first\nsecond\nthird\nfourth\nfifth\nsixth".into()),
             output_delta: false,
             status: Some("completed".into()),
             change: Default::default(),
@@ -1505,6 +1542,36 @@ mod tests {
             agent_by_id: HashMap::new(),
             exchange: interaction,
         }
+    }
+
+    #[test]
+    fn tool_preview_expands_from_output_and_survives_reflow() -> Result<()> {
+        use forge_buffer::{block::TextPosition, identity::BlockId};
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![interaction_entry("first")])?;
+        let document = DocumentId("transcript:toggle".into());
+        let view = ViewId("view:toggle".into());
+        let opened = owner.open(document.clone(), DocumentId("composer:toggle".into()), view.clone(), WidthProfile::default(), BufferText::from_rows([""])?)?;
+        let block = BlockId("first:turn:1:tool:tool".into());
+        let mut input = DocumentInput {
+            document: document.clone(), revision: opened.transcript.revision, view: view.clone(),
+            sequence: InputSequence(1), action: "activate".into(), block: block.clone(),
+            position: TextPosition { row: 5, column: 6 }, target: Some(TargetId(block.0.clone())),
+        };
+        assert_eq!(owner.dispatch(PresentationRequest::ToggleTool { input: input.clone() })?["expanded"], true);
+        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: input.clone() }).is_err());
+        owner.dispatch(PresentationRequest::Resize { document: document.clone(), view, width: WidthProfile { columns: 65, ..WidthProfile::default() } })?;
+        let snapshot = owner.snapshot(&document)?;
+        let expanded = snapshot.block.iter().find(|candidate| candidate.id == block).unwrap();
+        assert!(expanded.text.wire_rows().contains(&"      sixth"));
+        input.revision = snapshot.revision;
+        input.sequence = InputSequence(2);
+        assert_eq!(owner.dispatch(PresentationRequest::ToggleTool { input })?["expanded"], false);
+        let snapshot = owner.snapshot(&document)?;
+        let collapsed = snapshot.block.iter().find(|candidate| candidate.id == block).unwrap();
+        assert!(collapsed.text.wire_rows().contains(&"      …(2 hidden)"));
+        assert!(!collapsed.text.wire_rows().contains(&"      sixth"));
+        Ok(())
     }
 
     #[test]
@@ -1597,8 +1664,10 @@ mod tests {
                 };
             let entry = if nesting == "plan" {
                 TimelineEntry::Exchange {
-                    id: exchange.id.clone(), created_at_ms: exchange.created_at_ms,
-                    exchange: exchange.clone(), agent_by_id: HashMap::new(),
+                    id: exchange.id.clone(),
+                    created_at_ms: exchange.created_at_ms,
+                    exchange: exchange.clone(),
+                    agent_by_id: HashMap::new(),
                 }
             } else {
                 let child = agent_entry("child", vec![exchange.clone()], Vec::new());
@@ -1679,9 +1748,17 @@ mod tests {
 
             owner.update_live(None, Some(&exchange.id), SessionPhase::Idle)?;
             owner.sync(&document, snapshot.revision)?;
-            assert_eq!(owner.timeline.entry_list().len(), if nesting == "plan" { 0 } else { 1 });
-            assert!(!serde_json::to_string(owner.timeline.entry_list())?.contains("Second task is running"));
-            if nesting != "plan" { assert_eq!(owner.timeline.entry_list()[0].id(), owner_id); }
+            assert_eq!(
+                owner.timeline.entry_list().len(),
+                if nesting == "plan" { 0 } else { 1 }
+            );
+            assert!(
+                !serde_json::to_string(owner.timeline.entry_list())?
+                    .contains("Second task is running")
+            );
+            if nesting != "plan" {
+                assert_eq!(owner.timeline.entry_list()[0].id(), owner_id);
+            }
         }
         Ok(())
     }

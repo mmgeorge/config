@@ -141,6 +141,13 @@ function M.open(options, callback)
       return
     end
     owner.ready = true
+    owner.terminals = require("forge.views.harness.terminals").watch({
+      session_id = options.session_id, alive = alive, notice = notice,
+      update = function(snapshot)
+        owner.transcript.background_terminals = snapshot
+        if options.on_update then options.on_update() end
+      end,
+    })
     vim.bo[options.composer_buffer].modifiable = true
     callback(owner)
     if opened.syntax_pending then vim.schedule(function() owner.highlight() end) end
@@ -208,6 +215,21 @@ function M.open(options, callback)
       if failure then notice(failure) end
       owner.sync()
     end)
+  end
+
+  ---@return boolean
+  function owner.toggle_tool()
+    if not alive() or not owner.ready then return false end
+    local view = action_view()
+    if not view then return false end
+    local captured, failure = input.capture(owner.transcript, view, "activate")
+    if not captured then notice(failure) return true end
+    if not captured.target or not captured.target:match(":tool$") then return false end
+    request({ operation = "toggle_tool", input = captured }, function(_, action_error)
+      if not alive() then return end
+      if action_error then notice(action_error) else owner.sync() end
+    end)
+    return true
   end
 
   function owner.activate(callback)
@@ -379,6 +401,7 @@ function M.open(options, callback)
       if composer and composer.kind == "Deferred" then return false end
     end
     owner.closed = true
+    if owner.terminals then owner.terminals.close() end
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     for _, output in ipairs(owner.output) do output.close() end
     require("forge.views.harness.status_hint").clear(options.transcript_buffer)

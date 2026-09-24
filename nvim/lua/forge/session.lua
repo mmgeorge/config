@@ -77,7 +77,12 @@ M.empty_diff_rows = {}
 ---@field render_namespace integer?
 ---@field render_initialized boolean
 ---@field render_fold_signature? string
----@field queue string[]
+---@field queue (string|{text: string, config: table})[]
+---@field configuring? boolean
+---@field configuring_config? table
+---@field configuration_revision? integer
+---@field configuration_debounce? boolean
+---@field configuration_error? string
 ---@field pending_steer table[]
 ---@field transcript_buf integer?
 ---@field transcript_win integer?

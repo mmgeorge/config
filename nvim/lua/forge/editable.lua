@@ -199,6 +199,9 @@ local function refresh_anchor(native, region)
 end
 
 function M.guard_region(state, start, finish)
+  if not state.native or not state.native.active then
+    return nil, "editable buffer attachment is not active"
+  end
   local owner
   for region in pairs(state.native.anchor) do
     local anchor = refresh_anchor(state.native, region)
@@ -346,6 +349,7 @@ local function reject_edit(state, message, start, finish)
         end
       end
       vim.bo[native.buffer].modified = modified
+      if native.restored then native.restored() end
     end)
     vim.bo[native.buffer].modifiable = modifiable
     native.rejecting = nil
@@ -413,12 +417,16 @@ function M.attach(state, buffer, region_ranges, options)
     anchor[region] = vim.deepcopy(positions)
   end
   local native = {
-    buffer = buffer, anchor = anchor, send = options.send, notice = options.notice,
+    buffer = buffer, anchor = anchor, send = options.send, notice = options.notice, restored = options.restored,
     delay = delay, max_delay = max_delay, timer = assert(vim.uv.new_timer()), active = true, generation = 0,
     shadow = vim.api.nvim_buf_get_lines(buffer, 0, -1, false), modified = vim.bo[buffer].modified,
   }
   state.native = native
   local attached = vim.api.nvim_buf_attach(buffer, false, {
+    on_changedtick = function()
+      if not native.active then return true end
+      if not native.applying and not native.rejecting and native.restored then native.restored() end
+    end,
     on_bytes = function(_, _, _, row, column, _, old_rows, old_column, _, new_rows, new_column)
       if not native.active then
         return true

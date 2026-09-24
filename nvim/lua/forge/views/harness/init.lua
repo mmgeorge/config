@@ -119,25 +119,27 @@ function M.switch_backend(backend)
   state.pending_steer = {}
   state.pending_config = nil
   state.pending_mode = nil
-  client.stop()
-  config.options.harness.backend = backend
-  client.start_harness(function(result, start_error, error_detail)
-    finish_start(state, result, start_error, error_detail, {
-      on_ready = function()
-        local saved, save_error = backend_preference.save(backend)
-        if not saved then
-          notifications.error(save_error or "Failed to save backend preference", "Harness backend")
-        end
-      end,
-      on_error = function(switch_error)
-        notifications.error("Failed to switch Harness backend: " .. switch_error, "Harness backend")
-        config.options.harness.backend = previous_backend
-        client.stop()
-        client.start_harness(function(previous_result, previous_error, previous_detail)
-          finish_start(state, previous_result, previous_error, previous_detail)
-        end)
-      end,
-    })
+  client.stop(nil, function()
+    config.options.harness.backend = backend
+    client.start_harness(function(result, start_error, error_detail)
+      finish_start(state, result, start_error, error_detail, {
+        on_ready = function()
+          local saved, save_error = backend_preference.save(backend)
+          if not saved then
+            notifications.error(save_error or "Failed to save backend preference", "Harness backend")
+          end
+        end,
+        on_error = function(switch_error)
+          notifications.error("Failed to switch Harness backend: " .. switch_error, "Harness backend")
+          config.options.harness.backend = previous_backend
+          client.stop(nil, function()
+            client.start_harness(function(previous_result, previous_error, previous_detail)
+              finish_start(state, previous_result, previous_error, previous_detail)
+            end)
+          end)
+        end,
+      })
+    end)
   end)
 end
 

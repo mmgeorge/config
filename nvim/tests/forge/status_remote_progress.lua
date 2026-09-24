@@ -17,6 +17,7 @@ local snapshot = { document = replica.document, revision = 0, view = { kind = "s
   head = { state = "attached", reference = "refs/heads/main", object = "abc123" }, context = info,
   section = { { kind = "unstaged", file = { 1 } } },
   file = { { id = 1, generation = 1, section = "unstaged", change = "modified", path = "sample.lua",
+    header = dofile("nvim/tests/forge/support/status_fixture.lua").header("sample.lua", 2, 1),
     untracked = false, stats = { state = "exact", added = 2, deleted = 1 } } } }
 assert(render.apply_snapshot(replica, snapshot).kind == "Applied")
 local view = require("forge.input").open(replica, vim.api.nvim_get_current_win())

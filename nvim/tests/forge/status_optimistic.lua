@@ -10,7 +10,8 @@ vim.api.nvim_win_set_buf(0, replica.buffer)
 ---@param section string
 ---@return table
 local function record(id, generation, section)
-  return { id = id, generation = generation, section = section, change = "modified", path = id == 2 and "unrelated.lua" or "sample.lua", untracked = false, stats = { state = "exact", added = 1, deleted = 1 } }
+  return { id = id, generation = generation, section = section, change = "modified", path = id == 2 and "unrelated.lua" or "sample.lua", untracked = false, stats = { state = "exact", added = 1, deleted = 1 },
+    header = dofile("nvim/tests/forge/support/status_fixture.lua").header(id == 2 and "unrelated.lua" or "sample.lua", 1, 1) }
 end
 
 ---@param target string

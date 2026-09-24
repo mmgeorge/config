@@ -42,6 +42,7 @@ local RESERVED_METHOD = {
 ---@field starting boolean
 ---@field draining boolean
 ---@field stop_reason string?
+---@field stop_callback (fun())[]
 ---@field start_callback ForgeCallback?
 ---@field start_started? integer
 ---@field initialize_callback ForgeCallback[]
@@ -78,6 +79,7 @@ local function state()
     ready = false,
     starting = false,
     draining = false,
+    stop_callback = {},
     initialize_callback = {},
     snapshot = nil,
     snapshot_by_id = {},
@@ -593,6 +595,9 @@ local function spawn(binary, callback, launch_token, lease)
       })
     end
     current.stop_reason = nil
+    local stopped = current.stop_callback or {}
+    current.stop_callback = {}
+    for _, finished in ipairs(stopped) do finished() end
   end
   local consumed_bytes, consumed_frames = 0, 0
   receiver = receive.new({
@@ -865,9 +870,16 @@ function M.subscribe_document(document, callback)
   return function() client.document_subscriber[subscriber_id] = nil end
 end
 
-function M.stop(reason)
+---Drain admitted requests and notify completion after the host process is collected.
+---@param reason string?
+---@param on_stopped fun()?
+function M.stop(reason, on_stopped)
   reason = reason or "Forge host stopped"
   local client = state()
+  if on_stopped then
+    client.stop_callback = client.stop_callback or {}
+    client.stop_callback[#client.stop_callback + 1] = protect_consumer(on_stopped, "shutdown")
+  end
   local process = client.process
   if client.draining then return end
   client.stop_reason = reason
@@ -926,6 +938,9 @@ function M.stop(reason)
   local callback_list = client.initialize_callback
   client.initialize_callback = {}
   for _, callback in ipairs(callback_list) do callback(nil, reason) end
+  local stopped = client.stop_callback or {}
+  client.stop_callback = {}
+  for _, finished in ipairs(stopped) do finished() end
 end
 
 function M.host_generation()

@@ -205,12 +205,19 @@ local function action(review, name)
     if name == "comment" then
       local _, row = review.owner.replica.sequence:position(result.block)
       local view = review.owner.current_view()
-      if row and view then vim.api.nvim_set_current_win(view.window) vim.api.nvim_win_set_cursor(view.window, { row + result.row + 1, 0 }) vim.cmd("startinsert") end
+      if row and view then
+        vim.api.nvim_set_current_win(view.window)
+        vim.api.nvim_win_set_cursor(view.window, { row + result.row + 1, 0 })
+        vim.cmd("silent! normal! zv")
+        vim.cmd("startinsert")
+      end
+    elseif name == "delete" then
+      return
     elseif name == "schema" then show_document(review, result.schema, "Canonical plan", "json")
     elseif name == "entity_info" then
       if type(result.info) == "table" then show_document(review, result.info, "Plan entity") else rustdoc(review, result, captured, false) end
     elseif name == "jump_entity" and type(result.jump) == "table" then
-      effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position })
+      effect(review, captured, { kind = "cursor", jump = true, block = result.jump.block, position = result.jump.position })
     elseif name == "open" and type(result.anchor) == "table" and type(result.anchor.target) == "table"
       and result.anchor.target.target_type == "dependency" then
       require("forge.views.plan_review.dependency_browser").open(result.anchor.target.name)
@@ -228,18 +235,23 @@ local function submit(review, method, params)
   review.owner.submit(method, params, function(result, failure)
     session.harness.busy = false
     controller.refresh_winbar()
-    if failure then notice(failure) return end
-    close_review(review)
+    if failure then
+      notice(failure)
+      if review.owner.closed and not session.harness.plan_review
+        and session.harness.session and session.harness.session.id == review.session_id then M.open(review.plan) end
+      return
+    end
+    if not review.owner.closed then close_review(review) end
     if result then controller.activate_snapshot(result) end
     controller.render()
     if method == "plan.acceptance.begin" then vim.schedule(function() controller.present_plan_question(true) end) end
-  end)
+  end, function() close_review(review) end)
 end
 
 local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review) end)
-  for _, name in ipairs({ "open", "jump_entity", "entity_info", "schema", "comment" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({ "open", "jump_entity", "entity_info", "schema", "comment", "delete" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "rename_entity", function()
     review.owner.action("rename_entity", function(result, failure, captured)
       if failure then notice(failure) return end
@@ -276,7 +288,7 @@ function M.open(plan)
   local previous = session.harness.plan_review
   local recovery
   if previous and previous.plan.id == plan.id and previous.plan.review_digest == plan.review_digest and vim.api.nvim_buf_is_valid(previous.buf) then
-    if previous.owner.generation == client.host_generation() and not previous.owner.closed then
+    if previous.owner.generation == client.host_generation() and not previous.owner.closed and previous.owner.attached() then
       local window = vim.fn.win_findbuf(previous.buf)[1]
       if window then vim.api.nvim_set_current_win(window) else vim.cmd("tabnew") vim.api.nvim_win_set_buf(0, previous.buf) end
       previous.win = vim.api.nvim_get_current_win()
