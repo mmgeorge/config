@@ -175,6 +175,10 @@ impl ParentTurn {
             self.completion = Some(message.get("params").cloned().unwrap_or(Value::Null));
             return true;
         }
+        if is_parent_activity_message(message, thread_id)
+            && message_turn_id(message) == Some(self.id.as_str()) {
+            self.provider_started = true;
+        }
         false
     }
 }
@@ -196,6 +200,7 @@ pub(super) struct CodexTurnCoordinator<'a> {
     cleanup: Option<DescendantCleanup>,
     stopping: bool,
     native_goal: NativeGoalLifetime,
+    provider_goal_active: bool,
 }
 
 impl<'a> CodexTurnCoordinator<'a> {
@@ -208,6 +213,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         request: &'a BackendRequest,
         thread_id: &'a str,
     ) -> Self {
+        let provider_goal_active = output.evidence.native_state == Some(crate::goal::GoalState::Active);
         Self {
             backend,
             process,
@@ -223,6 +229,7 @@ impl<'a> CodexTurnCoordinator<'a> {
             completed_turn: HashSet::new(),
             cleanup: None,
             stopping: false,
+            provider_goal_active,
             native_goal: if request.mode == crate::backend::PromptMode::GoalContinuation {
                 NativeGoalLifetime::Active
             } else {
@@ -245,7 +252,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         });
         for message in observed_message_list {
             self.descendant.observe(&message, self.thread_id);
-            self.native_goal.observe(&message, self.thread_id);
+            self.observe_goal(&message);
             if let Some(turn_id) =
                 CodexBackend::notification_thread_turn_id(&message, "turn/started", self.thread_id)
             {
@@ -302,7 +309,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                             continue;
                         }
                         let message = self.process.publish_message(message, self.output).await?;
-                        self.native_goal.observe(&message, self.thread_id);
+                        self.observe_goal(&message);
                         self.descendant.observe(&message, self.thread_id);
                         self.admit_cleanup_targets().await;
                         self.complete_pending_command(&message, &mut pending_command).await?;
@@ -321,7 +328,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                         if let Some(completion) = active.completion.take() {
                             last_completion = completion;
                             parent_turn = None;
-                            if self.descendant.active_count() == 0 && pending_command.is_empty() && (self.stopping || self.native_goal != NativeGoalLifetime::Active) {
+                            if self.descendant.active_count() == 0 && pending_command.is_empty() && self.cleanup.is_none() && (self.stopping || self.native_goal != NativeGoalLifetime::Active) {
                                 self.clear_wait().await;
                                 return Ok(last_completion);
                             }
@@ -371,7 +378,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                 }
                 message = self.process.receive_message() => {
                     let message = self.process.publish_message(message?, self.output).await?;
-                    self.native_goal.observe(&message, self.thread_id);
+                    self.observe_goal(&message);
                     let had_active = self.descendant.active_count() > 0;
                     self.descendant.observe(&message, self.thread_id);
                     self.admit_cleanup_targets().await;
@@ -598,7 +605,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         }
         let thread = self.descendant.active_thread_list();
         self.stopping = true;
-        if thread.is_empty() && parent_turn_id.is_none() {
+        if thread.is_empty() && parent_turn_id.is_none() && !self.provider_goal_active {
             command.complete(Ok(())).await;
             return;
         }
@@ -613,7 +620,27 @@ impl<'a> CodexTurnCoordinator<'a> {
                 turn_id: turn_id.to_owned(),
             }),
         });
+        if self.provider_goal_active {
+            match self.process.send_request("thread/goal/set", json!({
+                "threadId": self.thread_id, "status": "paused"
+            })).await {
+                Ok(request_id) => {
+                    self.cleanup.as_mut().expect("cleanup exists").pending_request.insert(request_id);
+                }
+                Err(error) => {
+                    self.cleanup.take().expect("cleanup exists").command.complete(Err(error)).await;
+                    return;
+                }
+            }
+        }
         self.admit_cleanup_targets().await;
+    }
+
+    fn observe_goal(&mut self, message: &Value) {
+        if let Some(state) = native_goal_state(message, self.thread_id) {
+            self.provider_goal_active = state == crate::goal::GoalState::Active;
+        }
+        self.native_goal.observe(message, self.thread_id);
     }
 
     async fn admit_cleanup_targets(&mut self) {
@@ -684,7 +711,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         let Some(cleanup) = self.cleanup.as_ref() else {
             return;
         };
-        if cleanup.parent.as_ref().is_none_or(|parent| {
+        if cleanup.pending_request.is_empty() && cleanup.parent.as_ref().is_none_or(|parent| {
             self.completed_turn
                 .contains(&(parent.thread_id.clone(), parent.turn_id.clone()))
         }) && cleanup.thread.iter().all(|thread_id| {
@@ -772,6 +799,67 @@ async fn settle_interruptions(
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[tokio::test]
+    async fn chat_cancellation_pauses_provider_goal_and_waits_for_acknowledgements() -> Result<()> {
+        use crate::backend::{BackendInput, PromptMode};
+        use crate::backend::steering::SteeringLane;
+        use crate::backend::approval::PermissionCoordinator;
+        use crate::session::ExecutionMode;
+        use crate::trace::TraceStore;
+        use futures_util::{SinkExt, StreamExt};
+        use std::sync::Arc;
+
+        let directory = tempfile::tempdir()?;
+        let workspace = directory.path().to_string_lossy().into_owned();
+        let permission = PermissionCoordinator::transient(&workspace)?;
+        let trace = Arc::new(TraceStore::open(directory.path())?);
+        let backend = CodexBackend::new_with_permission_coordinator(
+            vec!["unused".into()], permission.clone(), trace.clone(),
+        )?;
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let pause: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(pause["method"], "thread/goal/set");
+            assert_eq!(pause["params"]["status"], "paused");
+            let interrupt: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(interrupt["method"], "turn/interrupt");
+            for message in [
+                json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"current","status":"interrupted"}}}),
+                json!({"id":interrupt["id"],"result":{}}),
+                json!({"id":pause["id"],"result":{}}),
+            ] {
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.unwrap();
+            }
+            let _ = socket.next().await;
+        });
+        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, ExecutionMode::Read,
+            permission, None, trace, "session".into()).await?;
+        let request = BackendRequest {
+            harness_session_id: "session".into(), workspace,
+            input: BackendInput::from_text("plan out a new one"), mode: PromptMode::Chat,
+            model: "gpt-5.6-terra".into(), effort: "medium".into(), context_window: None,
+            fast_mode: false, execution_mode: ExecutionMode::Read,
+            backend_session_id: Some("parent".into()), control_context: None,
+        };
+        let lane = SteeringLane::default();
+        let mut steering = lane.activate(None)?;
+        let cleanup = tokio::spawn(async move { lane.cleanup_execution().await });
+        let mut output = BackendOutput::default();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(3),
+            CodexTurnCoordinator::new(&backend, &mut process, &mut output, &mut steering,
+                None, &request, "parent").run("current".into(), true, vec![
+                    json!({"method":"thread/goal/updated","params":{"threadId":"parent","goal":{"status":"active"}}})
+                ])).await??;
+        assert_eq!(result["turn"]["status"], "interrupted");
+        tokio::time::timeout(std::time::Duration::from_secs(3), cleanup).await???;
+        drop(process);
+        tokio::time::timeout(std::time::Duration::from_secs(3), server).await??;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn parent_restart_retains_child_progress_and_early_completion() -> Result<()> {
@@ -1255,6 +1343,21 @@ mod test {
         assert!(parent.provider_started);
         assert!(!parent.observe(&child, "parent-thread"));
         assert_eq!(parent.id, "authoritative-turn");
+    }
+
+    #[test]
+    fn acknowledged_turn_waits_for_matching_activity_before_accepting_steering() {
+        let mut parent = ParentTurn { id: "current".into(), provider_started: false, completion: None };
+        for (thread_id, turn_id) in [("child", "current"), ("parent", "cancelled")] {
+            parent.observe(&json!({"method":"item/started","params":{
+                "threadId":thread_id,"turnId":turn_id
+            }}), "parent");
+            assert!(!parent.provider_started);
+        }
+        parent.observe(&json!({"method":"item/started","params":{
+            "threadId":"parent","turnId":"current"
+        }}), "parent");
+        assert!(parent.provider_started);
     }
 }
 #[test]

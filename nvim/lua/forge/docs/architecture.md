@@ -1576,18 +1576,20 @@ printed before rendering. MCP payload details stop at the Codex transport bounda
 generic tool.
 
 `trace::TraceStore` owns opt-in protocol diagnostics independently from timeline persistence. It
-stores the process-global enabled setting beside the Harness data root and appends unredacted JSONL
-records to `harness-trace.jsonl` without an in-memory retention buffer. Every record carries a
-`session_id`. The broker records Lua RPC receipt, completion, failure, and Lua-facing events, while
-`CodexJsonRpc` records raw app-server frames before normalization. `:ForgeHarnessLog` opens that file
-and controls tracing through broker RPC methods. `:ForgeHarnessLog clear` remains the only retention
-operation.
+stores the process-global enabled setting beside the Harness data root and appends bounded metadata
+records to `harness-trace.jsonl` without retaining message bodies. Every record carries a
+`session_id`. Rejected provider events retain exchange, thread, and turn identities plus a rejection
+code. The broker records Lua RPC and event metadata, while `CodexJsonRpc` records frame sizes and
+method names before normalization. `:ForgeHarnessLog` opens that file and controls tracing through
+broker RPC methods. The store bounds file size, and `:ForgeHarnessLog clear` explicitly clears it.
 
 The Codex `CodexTurnCoordinator` treats one user request as an exchange that may outlive
-its first parent app-server turn. App-server can return a provisional ID from `turn/start`, then
-publish the authoritative provider ID through same-thread `turn/started`, especially after native
-goal activation. The coordinator adopts that notification ID before matching `turn/completed`, so
-the exchange terminates instead of waiting on an ID app-server never completes. It
+its first parent app-server turn. A `turn/start` acknowledgement admits its returned turn before
+content reaches the exchange. This also covers input attached to an already-running native-goal
+turn, where no second `turn/started` notification arrives. Admission excludes unrelated turn
+events so cancelled activity cannot populate a later exchange. Cancellation pauses an observed
+provider goal even when Harness did not create that goal, then waits for interruption evidence
+and cleanup acknowledgements. The coordinator
 retains the session's JSON-RPC connection while descendant threads remain active, accepts steering
 as another parent turn on the same thread, and starts a bounded synthesis turn after the final child
 completes. Child lifecycle updates change the child agent's exchange behind the existing
@@ -1634,9 +1636,10 @@ the owning interaction. The timeline renders that child with the same yellow pro
 prompt-navigation index as ordinary user input. Failed or late steering creates no timeline child
 and moves its text into the follow-up queue. The shared
 steering lane activates before transport startup, so input submitted during connection or
-`turn/start` setup waits for that same turn. Codex releases the buffered input only after the
-matching `turn/started` notification because the earlier `turn/start` response allocates an ID
-before the provider installs the active turn. Copilot maps the same lane to the SDK's immediate
+`turn/start` setup waits for that same turn. Codex releases buffered input after the matching
+`turn/started` notification or item activity confirms that the acknowledged turn is running.
+The acknowledgement alone admits timeline ownership without asserting steering readiness.
+Copilot maps the same lane to the SDK's immediate
 delivery mode on its active session, then publishes the canonical acknowledgement through a
 turn-scoped event sink only after the SDK accepts the message. Prompt mode does not gate the lane. Chat, `/plan`, goals, and
 accepted-plan execution therefore share one steering contract.

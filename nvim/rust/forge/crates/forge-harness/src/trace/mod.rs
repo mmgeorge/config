@@ -30,6 +30,9 @@ fn metadata_payload(payload: &Value) -> Value {
                 | "operation_id"
                 | "request_id"
                 | "session_id"
+                | "exchange_id"
+                | "thread_id"
+                | "turn_id"
                 | "provider"
                 | "event_type"
                 | "status"
@@ -239,6 +242,20 @@ mod test {
     use super::TraceStore;
     use serde_json::json;
     use tempfile::tempdir;
+
+    #[test]
+    fn rejection_metadata_preserves_execution_identity_without_message_content() {
+        let metadata = super::metadata_payload(&json!({
+            "exchange_id":"exchange", "thread_id":"thread", "turn_id":"turn",
+            "event_type":"assistant_message", "code":"execution_unknown_or_settled",
+            "text":"private response"
+        }));
+        assert_eq!(metadata["exchange_id"], "exchange");
+        assert_eq!(metadata["thread_id"], "thread");
+        assert_eq!(metadata["turn_id"], "turn");
+        assert_eq!(metadata["code"], "execution_unknown_or_settled");
+        assert!(metadata.get("text").is_none());
+    }
 
     #[test]
     fn bounds_metadata_and_truncates_before_crossing_file_limit() {

@@ -2543,7 +2543,7 @@ impl HarnessBroker {
                 || elicitation.question(&question_id).is_some(),
             "clarification does not target a pending planning question"
         );
-        elicitation.clarification_active = true;
+        elicitation.begin_clarification(&question_id)?;
         let elicitation_json = serde_json::to_string_pretty(&elicitation)?;
         plan.updated_at_ms = self.clock.now_ms();
         self.append_plan_feedback(&plan.id, text.clone(), crate::exchange::InputIntent::Clarification)?;
@@ -2627,7 +2627,7 @@ impl HarnessBroker {
                 || elicitation.question(&question_id).is_some(),
             "clarification does not target a pending Harness question"
         );
-        elicitation.clarification_active = true;
+        elicitation.begin_clarification(&question_id)?;
         let elicitation_json = serde_json::to_string_pretty(elicitation)?;
         interaction.append_input(
             crate::exchange::InputIntent::Clarification,
@@ -4161,8 +4161,11 @@ Planning continuation: turn {} of {}.",
                 &self.session.id,
                 "provider.event.rejected",
                 json!({
-                    "exchange_id": interaction.id, "address": backend_event.address,
-                    "reason": "execution is unknown or settled",
+                    "exchange_id": interaction.id,
+                    "thread_id": backend_event.address.as_ref().map(|address| &address.thread_id),
+                    "turn_id": backend_event.address.as_ref().map(|address| &address.turn_id),
+                    "event_type": backend_event.kind,
+                    "code": "execution_unknown_or_settled",
                 }),
             );
             return Ok(());
@@ -9903,6 +9906,34 @@ mod test {
         assert_eq!(elicitation.answer.len(), 1);
         assert_eq!(snapshot.active_elicitation.unwrap().plan_id, Some(plan.id));
         assert!(event.iter().any(|event| event.event == "plan_question"));
+    }
+
+    #[tokio::test]
+    async fn clarification_after_review_reopens_the_answer_without_continuing() {
+        for prompt in ["ask which migration to use", "/plan migrate the event format"] {
+            let repository = repository();
+            let data = tempfile::tempdir().unwrap();
+            let mut broker = mutable_question_broker(repository.path(), data.path());
+            let result = broker.dispatch(Request { id: 1, method: "prompt.submit".into(),
+                params: json!({"text": prompt}) }).await;
+            assert!(result.response.error().is_none());
+            let question_id = broker.snapshot().unwrap().active_elicitation.unwrap()
+                .elicitation.question_set.questions[0].id.clone();
+            let result = broker.dispatch(Request { id: 2, method: "question.answer".into(),
+                params: json!({"question_id":question_id, "response":{"kind":"selected","option":"Staged"}}) }).await;
+            assert!(result.response.error().is_none());
+            assert!(broker.snapshot().unwrap().active_elicitation.unwrap().elicitation.current_question().is_none());
+            let result = broker.dispatch(Request { id: 3, method: "question.ask".into(),
+                params: json!({"question_id":question_id,"text":"what do you mean?"}) }).await;
+            assert!(result.response.error().is_none(), "{:?}", result.response.error());
+            let snapshot = broker.snapshot().unwrap();
+            let elicitation = snapshot.active_elicitation.unwrap().elicitation;
+            assert!(elicitation.answer.is_empty());
+            assert_eq!(elicitation.current_question().unwrap().id, question_id);
+            assert_eq!(snapshot.exchange.len(), 1);
+            assert!(snapshot.exchange[0].completed_at_ms.is_none());
+            assert!(!result.event.iter().any(|event| event.event == "question_answered"));
+        }
     }
 
     #[tokio::test]

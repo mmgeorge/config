@@ -481,6 +481,23 @@ impl PlanElicitation {
             .find(|question| question.id == question_id)
     }
 
+    /// Reopen a reviewed decision without consuming its prior selection as user feedback.
+    pub fn begin_clarification(&mut self, question_id: &str) -> Result<()> {
+        let question_index = if question_id == self.question_set.id {
+            self.current_index.min(self.question_set.questions.len().saturating_sub(1))
+        } else {
+            self.question_set.questions.iter()
+                .position(|question| question.id == question_id)
+                .context("clarification question not found")?
+        };
+        let question = self.question_set.questions.get(question_index)
+            .context("clarification requires a question")?;
+        self.answer.retain(|answer| answer.question_id != question.id);
+        self.current_index = question_index;
+        self.clarification_active = true;
+        Ok(())
+    }
+
     /// Commit one response and advance presentation to the next question.
     pub fn answer(&mut self, question_id: &str, response: PlanQuestionResponse) -> Result<()> {
         let question_index = self
@@ -1485,6 +1502,28 @@ mod test {
         assert_eq!(elicitation.answer[0].question_id, "kept");
         assert_eq!(elicitation.current_question().unwrap().id, "invalid");
         assert!(!elicitation.clarification_active);
+    }
+
+    #[test]
+    fn clarification_reopens_only_the_question_being_reconsidered() {
+        let mut elicitation = PlanElicitation::new(PlanQuestionSet {
+            id: "set".into(),
+            questions: ["scope", "testing"].into_iter().map(|id| PlanQuestion {
+                id: id.into(), header: id.into(), question: id.into(),
+                options: Vec::new(), allow_freeform: true,
+            }).collect(),
+        });
+        for id in ["scope", "testing"] {
+            elicitation.answer(id, PlanQuestionResponse::Other { text: "chosen".into() }).unwrap();
+        }
+        assert!(elicitation.current_question().is_none());
+        elicitation.begin_clarification("scope").unwrap();
+        assert_eq!(elicitation.current_question().unwrap().id, "scope");
+        assert_eq!(elicitation.answer.len(), 1);
+        assert_eq!(elicitation.answer[0].question_id, "testing");
+        assert!(elicitation.clarification_active);
+        assert!(elicitation.begin_clarification("missing").is_err());
+        assert_eq!(elicitation.answer.len(), 1);
     }
 
     #[test]

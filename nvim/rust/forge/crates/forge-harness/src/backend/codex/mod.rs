@@ -792,10 +792,17 @@ impl CodexBackend {
                     .or_else(|| turn.get("turn_id"))
                     .and_then(Value::as_str)
                     .context("Codex turn/start response omitted turn id")?;
-                let provider_turn_started = observed_message_list.iter().any(|message| {
+                let mut provider_turn_started = observed_message_list.iter().any(|message| {
                     Self::notification_matches_turn(message, "turn/started", thread_id, turn_id)
                 });
                 process.set_activity_publication(true);
+                if !provider_turn_started {
+                    // Acknowledged input can join a turn whose start event preceded this request.
+                    process.publish_message(json!({
+                        "method": "turn/started",
+                        "params": { "threadId": thread_id, "turn": { "id": turn_id } }
+                    }), output).await?;
+                }
                 let mut admitted_message_list = Vec::new();
                 let mut admitted = continuing_exchange;
                 for message in observed_message_list {
@@ -807,6 +814,8 @@ impl CodexBackend {
                         message.pointer("/params/threadId").and_then(Value::as_str);
                     if message_thread == Some(thread_id) && message_turn == Some(turn_id) {
                         admitted = true;
+                        provider_turn_started |= message.get("method").and_then(Value::as_str)
+                            .is_some_and(|method| method.starts_with("item/"));
                     } else if !admitted
                         || (message_thread == Some(thread_id) && message_turn.is_some())
                     {
@@ -1867,102 +1876,136 @@ mod test {
     #[tokio::test]
     async fn explicit_turn_excludes_stale_activity_before_and_after_admission() -> Result<()> {
         use futures_util::{SinkExt, StreamExt};
-        let fixture = tempfile::tempdir()?;
-        let workspace = fixture.path().to_string_lossy().into_owned();
-        let permission = PermissionCoordinator::transient(&workspace)?;
-        let trace = Arc::new(TraceStore::open(fixture.path())?);
-        let backend = CodexBackend::new_with_permission_coordinator(
-            vec!["unused".into()],
-            permission.clone(),
-            trace.clone(),
-        )?;
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
-        let endpoint = format!("ws://{}", listener.local_addr()?);
-        let server = tokio::spawn(async move {
-            let (stream, _) = listener.accept().await.unwrap();
-            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            for method in ["thread/resume", "turn/start"] {
-                let request: Value =
-                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
-                        .unwrap();
-                assert_eq!(request["method"], method);
-                let mut messages = vec![
-                    json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"old","status":"inProgress"}}}),
-                    json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-answer","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
-                    json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"old","status":"completed"}}}),
-                ];
-                if method == "thread/resume" {
-                    messages.push(
-                        json!({"method":"thread/goal/cleared","params":{"threadId":"parent"}}),
-                    );
-                    messages.push(json!({"id":request["id"],"result":{"thread":{"id":"parent"}}}));
-                } else {
-                    messages.extend([
-                        json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"current","status":"inProgress"}}}),
-                        json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-before-ack","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
-                        json!({"id":request["id"],"result":{"turn":{"id":"current"}}}),
-                        json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-after-ack","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
+        for sends_started in [true, false] {
+            let fixture = tempfile::tempdir()?;
+            let workspace = fixture.path().to_string_lossy().into_owned();
+            let permission = PermissionCoordinator::transient(&workspace)?;
+            let trace = Arc::new(TraceStore::open(fixture.path())?);
+            let backend = CodexBackend::new_with_permission_coordinator(
+                vec!["unused".into()],
+                permission.clone(),
+                trace.clone(),
+            )?;
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+            let endpoint = format!("ws://{}", listener.local_addr()?);
+            let server = tokio::spawn(async move {
+                let (stream, _) = listener.accept().await.unwrap();
+                let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+                for method in ["thread/resume", "turn/start"] {
+                    let request: Value =
+                        serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                            .unwrap();
+                    assert_eq!(request["method"], method);
+                    let mut messages = vec![
+                        json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"old","status":"inProgress"}}}),
+                        json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-answer","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
                         json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"old","status":"completed"}}}),
-                        json!({"method":"item/completed","params":{"threadId":"parent","turnId":"current","item":{"id":"new-answer","type":"agentMessage","phase":"final_answer","text":"CURRENT"}}}),
-                        json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"current","status":"completed"}}}),
-                    ]);
+                    ];
+                    if method == "thread/resume" {
+                        messages.push(
+                            json!({"method":"thread/goal/cleared","params":{"threadId":"parent"}}),
+                        );
+                        messages.push(json!({"id":request["id"],"result":{"thread":{"id":"parent"}}}));
+                    } else {
+                        messages.extend([
+                            json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"current","status":"inProgress"}}}),
+                            json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-before-ack","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
+                            json!({"id":request["id"],"result":{"turn":{"id":"current"}}}),
+                            json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-after-ack","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
+                            json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"old","status":"completed"}}}),
+                            json!({"method":"item/completed","params":{"threadId":"parent","turnId":"current","item":{"id":"new-answer","type":"agentMessage","phase":"final_answer","text":"CURRENT"}}}),
+                            json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"current","status":"completed"}}}),
+                        ]);
+                    }
+                    for message in messages {
+                        if !sends_started && message["method"] == "turn/started"
+                            && message["params"]["turn"]["id"] == "current" {
+                            continue;
+                        }
+                        socket
+                            .send(tokio_tungstenite::tungstenite::Message::Text(
+                                message.to_string().into(),
+                            ))
+                            .await
+                            .unwrap();
+                    }
                 }
-                for message in messages {
-                    socket
-                        .send(tokio_tungstenite::tungstenite::Message::Text(
-                            message.to_string().into(),
-                        ))
-                        .await
-                        .unwrap();
-                }
-            }
-            let _ = socket.next().await;
-        });
-        let process = CodexJsonRpc::connect(
-            &endpoint,
-            &workspace,
-            ExecutionMode::Read,
-            permission,
-            None,
-            trace,
-            "session".into(),
-        )
-        .await?;
-        backend.connection_by_session.lock().await.insert(
-            "session".into(),
-            Arc::new(Mutex::new(CodexConnection {
-                process,
-                timing: Vec::new(),
-            })),
-        );
-        let output = tokio::time::timeout(
-            std::time::Duration::from_secs(2),
-            backend.prompt_stream(
-                BackendRequest {
-                    harness_session_id: "session".into(),
-                    workspace,
-                    input: BackendInput::from_text("new prompt"),
-                    mode: PromptMode::Chat,
-                    model: "gpt-5.6-terra".into(),
-                    effort: "medium".into(),
-                    context_window: None,
-                    fast_mode: false,
-                    execution_mode: ExecutionMode::Read,
-                    backend_session_id: Some("parent".into()),
-                    control_context: None,
-                },
+                let _ = socket.next().await;
+            });
+            let process = CodexJsonRpc::connect(
+                &endpoint,
+                &workspace,
+                ExecutionMode::Read,
+                permission,
                 None,
-            ),
-        )
-        .await??;
-        assert_eq!(output.provider_checkpoint_id.as_deref(), Some("current"));
-        assert_eq!(output.evidence.native_state, None);
-        let encoded = serde_json::to_string(&output.event)?;
-        assert!(encoded.contains("CURRENT"));
-        assert!(!encoded.contains("STALE"));
-        assert!(!encoded.contains("\"turn_id\":\"old\""));
-        drop(backend);
-        tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+                trace,
+                "session".into(),
+            )
+            .await?;
+            backend.connection_by_session.lock().await.insert(
+                "session".into(),
+                Arc::new(Mutex::new(CodexConnection {
+                    process,
+                    timing: Vec::new(),
+                })),
+            );
+            let output = tokio::time::timeout(
+                std::time::Duration::from_secs(2),
+                backend.prompt_stream(
+                    BackendRequest {
+                        harness_session_id: "session".into(),
+                        workspace,
+                        input: BackendInput::from_text("new prompt"),
+                        mode: PromptMode::Chat,
+                        model: "gpt-5.6-terra".into(),
+                        effort: "medium".into(),
+                        context_window: None,
+                        fast_mode: false,
+                        execution_mode: ExecutionMode::Read,
+                        backend_session_id: Some("parent".into()),
+                        control_context: None,
+                    },
+                    None,
+                ),
+            )
+            .await??;
+            assert_eq!(output.provider_checkpoint_id.as_deref(), Some("current"));
+            assert_eq!(output.evidence.native_state, None);
+            let encoded = serde_json::to_string(&output.event)?;
+            assert!(encoded.contains("CURRENT"));
+            assert!(!encoded.contains("STALE"));
+            assert!(!encoded.contains("\"turn_id\":\"old\""));
+            let start = output.event.iter().position(|event|
+                event.turn_boundary == Some(crate::backend::TurnBoundary::Started)).unwrap();
+            let answer = output.event.iter().position(|event|
+                event.text.as_deref() == Some("CURRENT")).unwrap();
+            assert!(start < answer, "acknowledged turns must own their response without another start notification");
+            let mut exchange: crate::exchange::Exchange = serde_json::from_value(json!({
+                "id":"after-cancel", "session_id":"session", "agent_id":"primary", "ordinal":2,
+                "prompt":"what is this repo?", "kind":"chat", "state":"running",
+                "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[]
+            }))?;
+            for event in &output.event {
+                assert!(exchange.observe_turn(event, 1)?);
+            }
+            assert_eq!(exchange.turn.len(), 1);
+            let saved = serde_json::to_string(&exchange)?;
+            assert!(saved.contains("CURRENT"));
+            assert!(!saved.contains("STALE"));
+            exchange.finish(crate::exchange::ExchangeState::Complete, 7000)?;
+            let rendered = crate::buffer::projection::project(
+                &crate::timeline::TimelineEntry::Exchange {
+                    id: exchange.id.clone(), created_at_ms: 0, exchange,
+                    agent_by_id: std::collections::HashMap::new(),
+                }, &forge_buffer::width::WidthProfile::default(), false, &std::collections::HashSet::new(),
+            )?;
+            assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter().any(|text| text.contains("CURRENT"))));
+            if !sends_started {
+                println!("ACKNOWLEDGED_TURN_FIXTURE:{}", serde_json::to_string(&rendered.entry.block)?);
+            }
+            drop(backend);
+            tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
+        }
         Ok(())
     }
 
