@@ -42,5 +42,13 @@ assert(detail(1):find("1/3", 1, true), "revision selector did not wrap")
 invoke("<CR>")
 assert(selected.plan_id == "first" and selected.revision == 1)
 assert(not picker.is_open())
+
+require("forge.views.harness.plan_picker").open({
+  host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() },
+  plan_list = {},
+  on_confirm = function() error("empty plan picker cannot confirm") end,
+})
+assert(picker._state_for_test().spec.page_list[1].empty_text == "This workspace has no submitted plans.")
+picker.close(false)
 datetime.now_override = nil
 print("harness_plan_picker: passed")

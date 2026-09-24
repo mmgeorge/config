@@ -96,8 +96,8 @@ function M.open_skills(options)
         page_list = {
           {
             id = "provider-skills",
-            title = "Provider skills",
-            subtitle = "Enable skills for future turns or insert an enabled skill invocation.",
+            title = "Manage Skills",
+            column_headers = { "Skill", "Description" },
             option_list = option_list,
             empty_text = "The provider advertised no user-invocable skills.",
             footer = "↑↓ select  Enter insert  Space enable/disable  q close",
@@ -154,7 +154,8 @@ function M.open_mcp(options)
     host = options.host,
     page_list = { {
       id = "provider-mcp",
-      title = "MCP servers",
+      title = "Manage MCP Servers",
+      column_headers = { "Server", "Transport", "Tokens", "Status" },
       option_list = {},
       empty_text = "Loading MCP servers...",
       footer = "q close",
@@ -248,6 +249,12 @@ function M.open_mcp(options)
             token_label(definition.token_count, definition.token_estimated),
             definition.name == loading_name and "starting" or mcp_status_label(definition),
           }, "  "),
+          columns = {
+            mcp_icon(definition, loading_name, animation_index) .. " " .. definition.name,
+            definition.transport or "unknown",
+            token_label(definition.token_count, definition.token_estimated),
+            definition.name == loading_name and "starting" or mcp_status_label(definition),
+          },
           child_line_list = expanded_by_name[definition.name] and tool_line_list(definition) or nil,
         }
       end
@@ -257,8 +264,8 @@ function M.open_mcp(options)
         page_list = {
           {
             id = "provider-mcp",
-            title = "MCP servers",
-            subtitle = "Provider-reported server state. Token counts prefixed with ~ are estimates.",
+            title = "Manage MCP Servers",
+            column_headers = { "Server", "Transport", "Tokens", "Status" },
             option_list = option_list,
             empty_text = "The provider advertised no MCP servers.",
             footer = "↑↓ select  Space enable/disable  Tab tools  q close",

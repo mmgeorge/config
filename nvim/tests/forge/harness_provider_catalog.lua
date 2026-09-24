@@ -141,6 +141,11 @@ provider_picker.open_mcp({
 local mcp_picker = picker._state_for_test()
 assert_true(mcp_picker ~= nil, "/mcp should open the shared picker")
 local mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
+assert_true(vim.deep_equal(mcp_page.column_headers, { "Server", "Transport", "Tokens", "Status" }),
+  "MCP picker should label each structured column")
+assert_true(mcp_page.option_list[1].columns[2] == "stdio"
+    and mcp_page.option_list[1].columns[3] == "~704 tokens",
+  "MCP transport and token values should occupy their labeled columns")
 assert_true(mcp_page.option_list[1].label == "○ github-mcp", "disabled MCPs should use the empty-circle icon")
 assert_true(mcp_page.option_list[1].detail:find("stdio", 1, true) ~= nil, "MCP rows should show transport")
 assert_true(mcp_page.option_list[1].detail:find("~704 tokens", 1, true) ~= nil,

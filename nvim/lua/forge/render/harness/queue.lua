@@ -36,6 +36,7 @@ function M.build(queue, width, pending_steer)
     if type(text) == "table" then text = text.text end
     line_list[#line_list + 1] = { { "└ " .. preview(text, preview_width), "ForgeHarnessOutput" } }
   end
+  if #queue > 0 then line_list[#line_list + 1] = { { " ", "ForgeHarnessOutput" } } end
   return line_list, #line_list
 end
 

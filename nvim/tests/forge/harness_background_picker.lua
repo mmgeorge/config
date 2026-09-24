@@ -32,7 +32,10 @@ requests[2].callback({})
 assert(refreshed == 1 and state.busy, "termination restarted or completed the exchange")
 controller.open_background_picker()
 requests[3].callback({ supported = true, terminal = {} })
-assert(messages[#messages] == "No background terminals running")
+assert(#opened.page_list[1].option_list == 0
+  and opened.page_list[1].empty_text == "No background terminals are running.",
+  "empty terminal inventory should appear in the picker")
+assert(#messages == 0, "ordinary terminal inventory and termination should not notify")
 controller.open_background_picker()
 state.session = { id = "different-session" }
 requests[4].callback({ supported = true, terminal = { { id = "stale", command = "old" } } })

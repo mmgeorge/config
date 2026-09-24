@@ -98,6 +98,10 @@ function PickerState.move(state, spec, delta)
   local page = PickerState.page(state, spec)
   if #page.option_list == 0 then return end
   local selected = PickerState.selected_index(state, spec)
+  if page.wrap_selection == false then
+    state.selected_index_by_page[page.id] = math.max(1, math.min(#page.option_list, selected + delta))
+    return
+  end
   state.selected_index_by_page[page.id] = ((selected - 1 + delta) % #page.option_list) + 1
 end
 

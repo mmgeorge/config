@@ -27,6 +27,7 @@ Read the relevant reference file in `references/` before modifying complex subsy
 - **Return Conventions:** Prefer a single return value. Return a table when returning multiple properties to prevent truncation during constructor evaluation.
 - **Explicit Nil Handling:** Distinguish between uninitialized keys and values explicitly set to `nil`. Use sentinel boolean values (`false`) for cached empty states.
 - **Error Handling:** Use `pcall` or `xpcall` for protected execution. Return `nil, err_msg` from fallible helper functions and evaluate the primary return value. Report user-facing failures via `vim.notify`.
+- **Notification Policy:** Use `vim.notify` only for failures and ongoing work that needs progress feedback. Do not notify for successful commands, ordinary mode or setting changes, empty lists, or other expected interactions. Show persistent state in the owning buffer, winbar, or picker. Use a transient message only when an immediate result has no persistent surface.
 - **LuaJIT Optimization:** Use numeric `for` loops in hot paths, maintain monomorphic function call sites, and avoid allocating closures inside loop iterations.
 
 ## Neovim Plugin Architecture

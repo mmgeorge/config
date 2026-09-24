@@ -4404,6 +4404,11 @@ Planning continuation: turn {} of {}.",
             interaction.resume(now_ms)?;
             return Ok((interaction, false));
         }
+        if interaction_list.is_empty() && self.session.name.trim().is_empty() {
+            self.session.name = text.split_whitespace().collect::<Vec<_>>().join(" ")
+                .chars().take(120).collect();
+            self.save_session()?;
+        }
         if let Some(previous) = interaction_list.last_mut()
             && previous.state == ExchangeState::Running
         {
@@ -7041,6 +7046,23 @@ mod test {
                 outcome: crate::turn::TurnOutcome::Interrupted,
             }
         );
+    }
+
+    #[tokio::test]
+    async fn first_prompt_names_unnamed_sessions_without_overwriting_explicit_names() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.session.name.clear();
+        broker.interaction_for_turn("  Explain\n this repository  ", true, 100).await.unwrap();
+        assert_eq!(broker.session.name, "Explain this repository");
+        assert_eq!(broker.store.load_session(&broker.session.id).unwrap().unwrap().name,
+            "Explain this repository");
+        broker.interaction_for_turn("Another prompt", true, 101).await.unwrap();
+        assert_eq!(broker.session.name, "Explain this repository");
+        broker.session.name = "My explicit name".into();
+        broker.interaction_for_turn("Do not replace this name", true, 102).await.unwrap();
+        assert_eq!(broker.session.name, "My explicit name");
     }
 
     #[tokio::test]

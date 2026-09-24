@@ -20,7 +20,7 @@ local function option(entry, scope)
   local label = current_session.id == entry.id and (name .. " (current)") or name
   local mode = entry.execution_mode == "yolo" and "YOLO"
     or ((entry.execution_mode or "read"):sub(1, 1):upper() .. (entry.execution_mode or "read"):sub(2))
-  local columns = { datetime.relative_ms(entry.created_at_ms), label, entry.backend or "", mode, entry.model or "" }
+  local columns = { datetime.relative_ms(entry.created_at_ms), label, entry.backend or "", mode }
   if scope == "all" then columns[#columns + 1] = entry.workspace or "" end
   return {
     id = entry.id,
@@ -88,10 +88,10 @@ end
 ---@param instance table
 ---@return table
 build_spec = function(instance)
-  local scope_label = instance.scope == "repo" and "current repository" or "all repositories"
-  local open_label = instance.open_mode == "tab" and "new tab" or "current tab"
+  local scope_label = instance.scope == "repo" and "Repository" or "All"
+  local open_label = instance.open_mode == "tab" and "New Tab" or "Current Tab"
   local option_list = vim.tbl_map(function(entry) return option(entry, instance.scope) end, instance.entry_list)
-  local column_headers = { "Created", "Session", "Harness", "Mode", "Model" }
+  local column_headers = { "Created", "Session", "Harness", "Mode" }
   if instance.scope == "all" then column_headers[#column_headers + 1] = "Workspace" end
   return {
     owner = "sessions",
@@ -99,13 +99,14 @@ build_spec = function(instance)
     page_list = {
       {
         id = "sessions",
-        title = "Harness sessions",
+        title = "Select Session",
         column_headers = column_headers,
-        subtitle = "Search " .. scope_label .. ". Open in " .. open_label .. ".",
+        header_right = "Search: " .. scope_label .. " | Open: " .. open_label,
         option_list = option_list,
+        wrap_selection = false,
         empty_text = "No matching Harness sessions.",
-        search = {},
-        footer = "↑↓ select  Enter open  Tab toggle tab  C-j delete  C-o scope  Esc normal",
+        search = { start_in_normal = true },
+        footer = "↑↓ select  / search  Enter open  Tab toggle tab  C-j delete  C-o scope  q close",
       },
     },
     action_list = {

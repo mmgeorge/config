@@ -59,6 +59,7 @@ local success, failure = xpcall(function()
   assert(#requests == 3 and #state.queue == 1, "picker applied the model during the active turn")
   local rows = require("forge.render.harness.queue").build(state.queue, 100)
   assert(rows[2][1][1]:find("/model picked high", 1, true), "queue preview lost the selected model")
+  assert(rows[#rows][1][1] == " ", "queued input should leave a blank row before the composer")
   state.busy = false
   controller.drain()
   assert(requests[4].params.model == "picked" and requests[4].params.context_window == 64000)

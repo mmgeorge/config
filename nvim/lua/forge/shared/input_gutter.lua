@@ -5,7 +5,7 @@ local presentation = {
   relativenumber = false,
   signcolumn = "no",
   foldcolumn = "2",
-  statuscolumn = "%#ForgeHarnessPrompt#%{v:lnum == 1 ? '❯ ' : '  '}%*",
+  statuscolumn = "%#ForgeHarnessPrompt#%{v:lnum == 1 && v:virtnum == 0 ? '❯ ' : '  '}%*",
 }
 local input_state = {}
 local group

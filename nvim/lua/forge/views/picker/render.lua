@@ -17,7 +17,7 @@ function PickerRender.apply(buf, frame)
       vim.api.nvim_buf_add_highlight(buf, namespace, content.group or "ForgePickerText", line - 1, 0, -1)
     end
   end
-  for index, range in ipairs(frame.primary_range or frame.option_range) do
+  for index, range in pairs(frame.primary_range or frame.option_range) do
     local group = index == frame.selected_index and "ForgePickerSelected"
       or frame.chosen_index_set and frame.chosen_index_set[index] and "ForgePickerChosen"
       or "ForgePickerOption"
@@ -26,6 +26,14 @@ function PickerRender.apply(buf, frame)
     end
     if index ~= frame.selected_index then
       vim.api.nvim_buf_add_highlight(buf, namespace, "ForgePickerKey", range.first - 1, 2, 3)
+    end
+    local highlight = frame.option_highlight_by_index and frame.option_highlight_by_index[index]
+    if highlight then
+      local start = (frame.lines[range.first] or ""):find(highlight.text, 1, true)
+      if start then
+        vim.api.nvim_buf_add_highlight(buf, namespace, highlight.group,
+          range.first - 1, start - 1, start - 1 + #highlight.text)
+      end
     end
   end
   for _, range in pairs(frame.child_range or {}) do

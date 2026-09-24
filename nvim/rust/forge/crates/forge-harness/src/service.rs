@@ -695,9 +695,7 @@ async fn route_request(
     if shutdown {
         message_sink.send_terminal(Message::Response(result.response))?;
     } else {
-        message_sink
-            .send_wait(Message::Response(result.response))
-            .await?;
+        message_sink.send_response(result.response).await?;
     }
     Ok(())
 }
@@ -727,7 +725,7 @@ async fn route_new_session(
     )?;
     let child_controller = registry.resolve(&child.id).await?;
     let snapshot = child_controller.broker.lock().await.snapshot()?;
-    message_sink.send(Message::Response(Response::success(request.id, snapshot)?))?;
+    message_sink.send_response(Response::success(request.id, snapshot)?).await?;
     message_sink.send(Message::Event(SessionEvent {
         session_id: child.id.clone(),
         event: "session_created".into(),
@@ -775,7 +773,7 @@ async fn route_session_fork(
         "timing": preparation.timing,
         "provider_pending": true,
     });
-    message_sink.send(Message::Response(Response::success(request.id, snapshot)?))?;
+    message_sink.send_response(Response::success(request.id, snapshot)?).await?;
     message_sink.send(Message::Event(SessionEvent {
         session_id: child_session_id.clone(),
         event: "session_created".into(),
@@ -832,7 +830,7 @@ async fn resume_session(
         .context("session.resume requires session_id")?;
     let controller = registry.resolve(target_session_id).await?;
     let snapshot = controller.broker.lock().await.snapshot()?;
-    message_sink.send(Message::Response(Response::success(request.id, snapshot)?))?;
+    message_sink.send_response(Response::success(request.id, snapshot)?).await?;
     Ok(())
 }
 
@@ -1050,7 +1048,7 @@ async fn route_control_request(
         ) {
             message_sink.send_control(Message::Response(response))?;
         } else {
-            message_sink.send(Message::Response(response))?;
+            message_sink.send_response(response).await?;
         }
         return Ok(true);
     }
@@ -1284,6 +1282,41 @@ mod tests {
         service.shutdown(Duration::from_secs(1)).await.unwrap();
         assert!(service.registry.lock().await.is_none());
         assert!(service.open_session(4, initialize).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn oversized_session_preview_uses_response_parts_and_keeps_broker_alive() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry.lock().await.clone().unwrap();
+        let controller = registry.resolve(&session_id).await.unwrap();
+        let name = "preview history ".repeat(40000);
+        let renamed = controller.broker.lock().await.dispatch(Request {
+            id: 2, method: "session.rename".into(),
+            params: json!({"session_id":session_id, "name":name}),
+        }).await;
+        assert!(renamed.response.error().is_none());
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        service.dispatch(None, Request { id: 3, method: "session.preview".into(),
+            params: json!({"session_id":session_id}) }, &sink).await.unwrap();
+        let mut encoded = String::new();
+        loop {
+            let frame = output.recv().await.unwrap().unwrap();
+            assert!(frame.bytes().len() <= forge_protocol::MAX_FRAME_BYTES);
+            let event: forge_protocol::message::RequestEvent = serde_json::from_slice(frame.bytes()).unwrap();
+            assert_eq!(event.request_id, 3);
+            if event.event == "result.complete" { break; }
+            let part: forge_protocol::transfer::JsonPart = serde_json::from_value(event.payload).unwrap();
+            encoded.push_str(&part.payload);
+        }
+        let response: Response = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(response.result().unwrap()["session"]["name"], name.trim());
+        service.dispatch(None, Request { id: 4, method: "history.record".into(),
+            params: json!({"text":"still alive"}) }, &sink).await.unwrap();
+        output.check().unwrap();
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
     #[tokio::test]

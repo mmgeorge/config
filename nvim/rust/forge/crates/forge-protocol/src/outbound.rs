@@ -3,7 +3,9 @@
 use std::io::{self, Write};
 use std::sync::{Arc, Mutex};
 
+use crate::message::{Message, RequestEvent, Response};
 use serde::Serialize;
+use serde_json::json;
 use tokio::sync::{mpsc, watch};
 
 use crate::{MAX_FRAME_BYTES, MAX_PENDING_FRAMES, MAX_QUEUED_BYTES, RESERVED_CONTROL_RECORDS};
@@ -75,6 +77,55 @@ pub fn encode(message: &impl Serialize, limit: usize) -> io::Result<Vec<u8>> {
 }
 
 impl MessageSender {
+    /// Transfer a complete response without exceeding individual frame limits.
+    pub async fn send_response(&self, response: Response) -> io::Result<()> {
+        let request_id = response.id;
+        let response = Message::Response(response);
+        if crate::outbound::encode(&response, crate::MAX_FRAME_BYTES).is_ok() {
+            self.send_wait(response).await?;
+            return Ok(());
+        }
+        let prepared = self.begin_transfer().and_then(|permit| {
+            crate::transfer::JsonTransfer::new(&response).map(|transfer| (permit, transfer))
+        });
+        let (_permit, transfer) =
+            match prepared {
+                Ok(prepared) => prepared,
+                Err(error) => {
+                    self.send_wait(Message::Response(Response::failure_with_data(
+                request_id,
+                if error.kind() == std::io::ErrorKind::WouldBlock {
+                    "result_transfer_busy"
+                } else {
+                    "result_too_large"
+                },
+                format!("Forge operation completed, but its result cannot be transferred: {error}"),
+                json!({"operation_completed": true}),
+            )))
+            .await?;
+                    return Ok(());
+                }
+            };
+        let complete =
+            json!({"part_count":transfer.part_count(), "total_bytes":transfer.total_bytes()});
+        for part in transfer {
+            self.send_wait(Message::RequestEvent(RequestEvent {
+                request_id,
+                event: "result.part".into(),
+                payload: serde_json::to_value(part).map_err(io::Error::other)?,
+            }))
+            .await?;
+            tokio::task::yield_now().await;
+        }
+        self.send_wait(Message::RequestEvent(RequestEvent {
+            request_id,
+            event: "result.complete".into(),
+            payload: complete,
+        }))
+        .await?;
+        Ok(())
+    }
+
     /// Reserves one of two encoded transfers before retaining up to 16 MiB of JSON.
     pub fn begin_transfer(&self) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
         self.transfer.clone().try_acquire_owned().map_err(|_| {
@@ -279,6 +330,36 @@ mod tests {
     use super::*;
     use std::future::{Future, poll_fn};
     use std::task::Poll;
+
+    #[tokio::test]
+    async fn large_responses_transfer_losslessly_and_leave_the_connection_usable() {
+        let (sender, mut receiver) = channel();
+        let payload = "preview界\n".repeat(MAX_FRAME_BYTES / 8);
+        let expected = Response::success(169, &payload).unwrap();
+        sender.send_response(expected.clone()).await.unwrap();
+        let mut encoded = String::new();
+        loop {
+            let frame = receiver.recv().await.unwrap().unwrap();
+            assert!(frame.bytes().len() <= MAX_FRAME_BYTES);
+            let event: RequestEvent = serde_json::from_slice(frame.bytes()).unwrap();
+            assert_eq!(event.request_id, 169);
+            if event.event == "result.complete" {
+                break;
+            }
+            let part: crate::transfer::JsonPart = serde_json::from_value(event.payload).unwrap();
+            encoded.push_str(&part.payload);
+        }
+        let restored: Response = serde_json::from_str(&encoded).unwrap();
+        assert_eq!(restored.result(), expected.result());
+        sender
+            .send_response(Response::success(170, "next preview").unwrap())
+            .await
+            .unwrap();
+        let next = receiver.recv().await.unwrap().unwrap();
+        let response: Response = serde_json::from_slice(next.bytes()).unwrap();
+        assert_eq!(response.id, 170);
+        receiver.check().unwrap();
+    }
 
     #[tokio::test]
     async fn waiting_sender_retains_fifo_and_waits_until_writer_releases_the_frame() {

@@ -19,16 +19,31 @@ local function valid_window(win)
   return win and vim.api.nvim_win_is_valid(win)
 end
 
-local function title_chunks(instance)
+local function title_chunks(instance, width)
   local page = picker_state.page(instance.state, instance.spec)
   local title = page.title or instance.spec.title or "Select"
   local counter = #instance.spec.page_list > 1
       and (" %d/%d "):format(instance.state.page_index, #instance.spec.page_list)
     or ""
-  return {
+  local chunks = {
     { " " .. title .. " ", "ForgePickerSection" },
     { counter, "ForgePickerHint" },
   }
+  local right = page.header_right or instance.spec.header_right
+  if right and right ~= "" then
+    local left_width = vim.fn.strdisplaywidth(" " .. title .. " " .. counter)
+    local available = math.max(0, width - left_width - 3)
+    if available > 0 then
+      if vim.fn.strdisplaywidth(right) > available then
+        local count = vim.fn.strchars(right)
+        repeat count = count - 1 until count == 0 or vim.fn.strdisplaywidth(vim.fn.strcharpart(right, 0, count)) <= available - 1
+        right = vim.fn.strcharpart(right, 0, count) .. "…"
+      end
+      chunks[#chunks + 1] = { string.rep("─", math.max(1, width - left_width - vim.fn.strdisplaywidth(right) - 2)), "FloatBorder" }
+      chunks[#chunks + 1] = { " " .. right .. " ", "ForgePickerHint" }
+    end
+  end
+  return chunks
 end
 
 local function input_footer()
@@ -116,13 +131,22 @@ local function render_view(instance)
   local input_visible = instance.input_visible == true
   local frame = layout.build(page, selected, width, {
     input_visible = input_visible,
+    search_visible = (not page.search or not page.search.start_in_normal
+      or instance.search_visible or valid_window(instance.search_win)) == true,
     footer = input_visible and input_footer() or nil,
   })
   frame.chosen_index_set = {}
+  frame.option_highlight_by_index = {}
   local selected_set = instance.state.selected_set_by_page[page.id] or {}
   for index, option in ipairs(page.option_list) do
     local option_id = tostring(option.id or option.value or index)
     if selected_set[option_id] then frame.chosen_index_set[index] = true end
+    if option.highlight_group then
+      frame.option_highlight_by_index[index] = {
+        group = option.highlight_group,
+        text = option.highlight_text or option.label,
+      }
+    end
   end
   frame.input_height = page.input_height or config.options.picker.input_height
   local height = math.min(#frame.lines, config.options.picker.max_height, math.max(4, bounds.height - 2))
@@ -131,8 +155,9 @@ local function render_view(instance)
     border_footer = vim.trim(table.remove(frame.lines, frame.footer_line))
     frame.footer_line = nil
   end
+  frame = layout.viewport(frame, height, instance.frame and instance.frame.viewport_top)
   instance.frame = frame
-  picker_window.resize(instance.win, instance.spec.host, width, height, title_chunks(instance), border_footer)
+  picker_window.resize(instance.win, instance.spec.host, width, height, title_chunks(instance, width), border_footer)
   render.apply(instance.buf, frame)
   if valid_window(instance.search_win) then search_input.resize(instance.search_win, instance.win, frame) end
   if valid_window(instance.input_win) then input.resize(instance.input_win, instance.win, frame) end
@@ -141,7 +166,7 @@ local function render_view(instance)
   local selected_range = frame.option_range[selected]
   if selected_range then
     vim.api.nvim_win_set_cursor(instance.win, { selected_range.first, 0 })
-    popup_window.clamp_view(instance.win, instance.buf)
+    vim.api.nvim_win_call(instance.win, function() vim.fn.winrestview({ topline = 1 }) end)
   else
     vim.api.nvim_win_set_cursor(instance.win, { 1, 0 })
     vim.api.nvim_win_call(instance.win, function()
@@ -362,6 +387,8 @@ local function install_action_keymaps(instance, buf, preserve)
   end
 end
 
+local open_search
+
 local function install_keymaps(instance)
   local set = command_set.new()
   command_set.register(set, "previous", function()
@@ -382,6 +409,19 @@ local function install_keymaps(instance)
     end
   end
   keymaps.setup_view_keymaps(instance.buf, "picker", set)
+  if picker_state.page(instance.state, instance.spec).search then
+    preserve_mapping(instance, instance.buf, "/")
+    vim.keymap.set("n", "/", function()
+      if not valid_window(instance.search_win) then
+        instance.search_visible = true
+        render_view(instance)
+        open_search(instance, true)
+        return
+      end
+      vim.api.nvim_set_current_win(instance.search_win)
+      enter_insert_mode(instance, instance.search_win)
+    end, { buffer = instance.buf, silent = true, nowait = true, desc = "Search picker options" })
+  end
   install_option_keymaps(instance, instance.buf, true)
   install_action_keymaps(instance, instance.buf, true)
 end
@@ -418,7 +458,7 @@ local function install_search_keymaps(instance)
 end
 
 ---@param instance table
-local function open_search(instance)
+open_search = function(instance, focus)
   local page = picker_state.page(instance.state, instance.spec)
   if not page.search then return end
   instance.search_buf, instance.search_win = search_input.open(
@@ -433,10 +473,31 @@ local function open_search(instance)
       render_view(instance)
     end
   )
+  if page.search.start_in_normal then
+    local search_buf = instance.search_buf
+    vim.api.nvim_create_autocmd("InsertLeave", {
+      buffer = search_buf,
+      callback = function()
+        vim.schedule(function()
+          if active ~= instance or instance.search_buf ~= search_buf then return end
+          if search_input.text(search_buf) ~= "" then return end
+          focus_picker(instance)
+          close_search(instance)
+          instance.search_visible = false
+          render_view(instance)
+        end)
+      end,
+      desc = "Hide empty picker search after leaving insert mode",
+    })
+  end
   install_search_keymaps(instance)
-  set_picker_cursor_hidden(instance, false)
-  vim.api.nvim_set_current_win(instance.search_win)
-  enter_insert_mode(instance, instance.search_win)
+  if focus ~= false then
+    set_picker_cursor_hidden(instance, false)
+    vim.api.nvim_set_current_win(instance.search_win)
+    enter_insert_mode(instance, instance.search_win)
+  else
+    focus_picker(instance)
+  end
 end
 
 ---@param spec table
@@ -450,7 +511,9 @@ function Picker.open(spec)
   local state = picker_state.new(spec)
   local bounds = layout.host_bounds(spec.host.window_list)
   local width = math.max(30, bounds.width - 2)
-  local initial_frame = layout.build(picker_state.page(state, spec), picker_state.selected_index(state, spec), width)
+  local initial_page = picker_state.page(state, spec)
+  local initial_frame = layout.build(initial_page, picker_state.selected_index(state, spec), width,
+    { search_visible = not initial_page.search or not initial_page.search.start_in_normal })
   local height = math.min(#initial_frame.lines, config.options.picker.max_height, math.max(4, bounds.height - 2))
   local instance = {
     spec = spec,
@@ -460,7 +523,7 @@ function Picker.open(spec)
     mapping_list = {},
     input_visible = false,
   }
-  instance.buf, instance.win = picker_window.open(spec.host, width, height, title_chunks(instance), origin)
+  instance.buf, instance.win = picker_window.open(spec.host, width, height, title_chunks(instance, width), origin)
   active = instance
   render_view(instance)
   install_keymaps(instance)
@@ -474,7 +537,9 @@ function Picker.open(spec)
   })
   focus_picker(instance)
   if picker_state.page(instance.state, instance.spec).search then
-    open_search(instance)
+    if not picker_state.page(instance.state, instance.spec).search.start_in_normal then
+      open_search(instance, true)
+    end
   elseif spec.initial_input_kind then
     open_input(instance, spec.initial_input_kind)
   end
@@ -484,6 +549,7 @@ end
 ---@param spec table
 function Picker.update(spec)
   if not active then return end
+  local search_focused = valid_window(active.search_win) and vim.api.nvim_get_current_win() == active.search_win
   local previous_page = picker_state.page(active.state, active.spec)
   local previous_option = picker_state.selected_option(active.state, active.spec)
   local previous_option_id = previous_option and tostring(previous_option.id or previous_option.value or "") or nil
@@ -514,9 +580,15 @@ function Picker.update(spec)
   if picker_state.page(active.state, active.spec).search then
     if valid_window(active.search_win) then
       install_search_keymaps(active)
-      vim.api.nvim_set_current_win(active.search_win)
+      if not picker_state.page(active.state, active.spec).search.start_in_normal or search_focused then
+        vim.api.nvim_set_current_win(active.search_win)
+      else
+        focus_picker(active)
+      end
     else
-      open_search(active)
+      if not picker_state.page(active.state, active.spec).search.start_in_normal then
+        open_search(active, true)
+      end
     end
   else
     close_search(active)

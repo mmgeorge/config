@@ -62,8 +62,8 @@ local function build_spec(instance)
     page_list = {
       {
         id = "agents",
-        title = "Harness timelines",
-        subtitle = "Switch between the parent conversation and existing child-agent timelines.",
+        title = "Select Timeline",
+        column_headers = { "Timeline", "Status" },
         option_list = entries,
         selected_index = initial,
         footer = "↑↓ select  Enter switch  q close",

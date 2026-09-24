@@ -73,18 +73,8 @@ end
 local function harness_state() return session.harness end
 
 ---@param message string
----@param severity? "status"|"error"
-local function append_session_status(message, severity)
-  if severity == "error" then
-    notifications.error(message, "ForgeHarness")
-  else
-    notifications.info(message, "ForgeHarness")
-  end
-end
-
----@param message string
 local function report_configuration_error(message)
-  append_session_status("Configuration rejected: " .. message, "error")
+  notifications.error("Configuration rejected: " .. message, "ForgeHarness")
 end
 
 local function picker_host(state)
@@ -102,7 +92,7 @@ local function picker_host(state)
   }
 end
 
-local function open_choice_picker(state, title, subtitle, option_list, callback)
+local function open_choice_picker(state, title, subtitle, option_list, callback, empty_text)
   for index, option in ipairs(option_list) do
     option.key = option.key or config.options.picker.choice_keys[index]
   end
@@ -113,7 +103,9 @@ local function open_choice_picker(state, title, subtitle, option_list, callback)
         id = title,
         title = title,
         subtitle = subtitle,
+        column_headers = { "Choice", "Details" },
         option_list = option_list,
+        empty_text = empty_text,
         footer = "↑↓ select  Enter confirm  q close",
       },
     },
@@ -534,7 +526,7 @@ local function present_scope_deviation(deviation)
     resolve_scope_deviation(deviation, true)
     return
   end
-  open_choice_picker(harness_state(), "Review scope deviation", deviation.reason or deviation.summary, {
+  open_choice_picker(harness_state(), "Review Scope Deviation", deviation.reason or deviation.summary, {
     { label = "Approve", detail = deviation.summary, value = true },
     { label = "Reject", detail = "Block execution without changing accepted intent.", value = false },
   }, function(approved) resolve_scope_deviation(deviation, approved) end)
@@ -821,7 +813,7 @@ function M.present_plan_question(force)
       end
       local reopen_key = keymaps.view_keys_for("harness", "reopen_question")[1]
       local reopen_action = reopen_key and (reopen_key .. " or /questions") or "/questions"
-      notifications.info(("Harness questions remain available with %s."):format(reopen_action), "ForgeHarness")
+      vim.api.nvim_echo({ { ("Harness questions remain available with %s."):format(reopen_action) } }, false, {})
     end,
   })
 end
@@ -854,7 +846,6 @@ local function resume_mode_restart(mode)
       return
     end
     state.session = session_result or state.session
-    append_session_status("Execution mode changed to " .. label)
     client.request("exchange.resume", {
       text = "Continue the active task from the interrupted turn. Execution mode is now " .. label
         .. ". Preserve completed work and do not repeat finished actions.",
@@ -1224,7 +1215,6 @@ function M.open_replan_picker()
   client.request_for(session_id, "plan.list", {}, function(plans, failure)
     if failure then notifications.error(failure, "Harness replan") return end
     if not state.session or state.session.id ~= session_id then return end
-    if #plans == 0 then notifications.info("This workspace has no submitted plans", "Harness replan") return end
     require("forge.views.harness.plan_picker").open({ host = picker_host(state), plan_list = plans,
       on_confirm = function(selection)
         if not state.session or state.session.id ~= session_id then return end
@@ -1240,15 +1230,11 @@ end
 function M.open_artifact_picker()
   local state = harness_state()
   local artifact_list = state.artifact or {}
-  if #artifact_list == 0 then
-    notifications.info("This Harness session has no artifacts", "ForgeHarness")
-    return
-  end
   local option_list = vim.tbl_map(function(artifact)
       local title = artifact.title and artifact.title ~= "" and artifact.title or "[unnamed plan]"
       return { label = title, detail = artifact.state or "unknown", value = artifact }
     end, artifact_list)
-  open_choice_picker(state, "Harness artifacts", "Open a plan created by this session.", option_list, function(artifact)
+  open_choice_picker(state, "Select Artifact", nil, option_list, function(artifact)
     if not artifact then return end
     client.request("plan.activate", { plan_id = artifact.id }, function(plan, request_error)
       if request_error then
@@ -1259,7 +1245,7 @@ function M.open_artifact_picker()
       require("forge.views.plan_review").open(plan)
       synchronize_state()
     end)
-  end)
+  end, "This session has no artifacts.")
 end
 
 ---@class ForgeRollbackInteraction
@@ -1300,7 +1286,6 @@ local function rollback_exchange(interaction)
       notifications.error(request_error, "Harness undo")
       return
     end
-    notifications.info("Rolled back to before Exchange " .. tostring(interaction.ordinal), "Harness undo")
     synchronize_state()
     restore_interaction_prompt(interaction)
   end)
@@ -1310,7 +1295,7 @@ end
 local function confirm_rollback(interaction)
   open_choice_picker(
     harness_state(),
-    "Confirm rollback",
+    "Confirm Rollback",
     "Restore the worktree before Exchange " .. tostring(interaction.ordinal)
       .. " and supersede every later exchange?",
     {
@@ -1359,16 +1344,13 @@ function M.open_undo_picker()
         }
       end
     end
-    if #option_list == 0 then
-      notifications.info("This Harness session has no exchanges available to undo", "Harness undo")
-      return
-    end
     open_choice_picker(
       state,
-      "Undo exchange",
-      "Select the exchange whose original prompt should be restored.",
+      "Select Exchange",
+      nil,
       option_list,
-      confirm_rollback
+      confirm_rollback,
+      "This session has no exchanges available to undo."
     )
   end)
 end
@@ -1451,24 +1433,23 @@ function M.open_background_picker()
   end
   client.request_for(session_id, "harness.document", { operation = "background_terminals" }, function(inventory, failure)
     if not current() then return end
-    if failure then notifications.error(failure, "Background terminals") return end
+    if failure then notifications.error(failure, "Select Background Terminal") return end
     if not inventory.supported then
-      notifications.info("The current backend does not support background terminals", "ForgeHarness")
+      notifications.warn("The current backend does not support background terminals", "ForgeHarness")
       return
     end
     local options = {}
     for _, terminal in ipairs(inventory.terminal or {}) do
       options[#options + 1] = { label = terminal.command:gsub("%s+", " "), detail = "Terminal " .. terminal.id, value = terminal.id }
     end
-    if #options == 0 then notifications.info("No background terminals running", "ForgeHarness") return end
-    open_choice_picker(state, "Background terminals", "Select a terminal and press Enter to terminate it.", options, function(id)
+    open_choice_picker(state, "Terminate Background Terminal", nil, options, function(id)
       if not current() then return end
       client.request_for(session_id, "harness.document", { operation = "terminate_terminal", id = id }, function(_, terminate_failure)
         if not current() then return end
-        if terminate_failure then notifications.error(terminate_failure, "Background terminals") end
+        if terminate_failure then notifications.error(terminate_failure, "Select Background Terminal") end
         if state.presentation and state.presentation.terminals then state.presentation.terminals.refresh() end
       end)
-    end)
+    end, "No background terminals are running.")
   end)
 end
 
@@ -1476,6 +1457,7 @@ function M.submit()
   local state = harness_state()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
+  if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
   if text == "/replan" then
     set_composer_text(state.composer_buf, "")
     M.open_replan_picker()
@@ -1719,7 +1701,7 @@ function M.submit()
     if state.active_wait and not selected_agent_run(state)
       and state.capability and state.capability.native_steer
     then
-      submit_immediate(state, text, false)
+      submit_immediate(state, text)
       return
     end
     state.queue[#state.queue + 1] = text
@@ -1738,7 +1720,7 @@ local function remove_pending_steer(state, target)
   end
 end
 
-submit_immediate = function(state, text, notify_success)
+submit_immediate = function(state, text)
   local selected_run = selected_agent_run(state)
   local target = selected_agent_target(state)
   if state.selected_agent_run_id then
@@ -1754,7 +1736,7 @@ submit_immediate = function(state, text, notify_success)
   state.pending_steer = state.pending_steer or {}
   state.pending_steer[#state.pending_steer + 1] = pending
   M.refresh_winbar()
-  client.request("turn.steer", { text = text, target = target }, function(result, request_error)
+  client.request("turn.steer", { text = text, target = target }, function(_, request_error)
     if request_error then
       remove_pending_steer(state, pending)
       if selected_run then
@@ -1766,11 +1748,6 @@ submit_immediate = function(state, text, notify_success)
     else
       if selected_run and composer_text(state.composer_buf) == text then
         set_composer_text(state.composer_buf, "")
-      end
-      if notify_success then
-        local message = result and result.delivery == "parent_mediated"
-          and "Sent the child correction to its parent for delivery" or "Steered the active turn"
-        notifications.info(message, "ForgeHarness")
       end
     end
     M.refresh_winbar()
@@ -1792,7 +1769,7 @@ function M.steer_submit()
     return
   end
   prompt_history.record(text)
-  submit_immediate(state, text, true)
+  submit_immediate(state, text)
 end
 
 ---Queue a follow-up independently of active waits and the selected child timeline.
@@ -1800,6 +1777,7 @@ function M.queue_submit()
   local state = harness_state()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
+  if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
   if text == "/bg" or text == "/recap" or text == "/mcp" or text == "/replan" or text == "/plan cancel" or text == "/fast" or text:match("^/fast%s") then M.submit() return end
   if text == "/model" then
     M.select_model(function(next_config)
@@ -1885,7 +1863,7 @@ function M.select_effort()
   local options = vim.tbl_map(function(effort)
     return { label = effort, detail = detail_list[effort], value = effort }
   end, effort_list)
-  open_choice_picker(harness_state(), "Select reasoning effort", "Applied at the next safe turn boundary.", options, function(effort)
+  open_choice_picker(harness_state(), "Select Reasoning Effort", nil, options, function(effort)
     M.configure({ effort = effort })
   end)
 end
@@ -1922,8 +1900,8 @@ function M.select_model(on_confirm)
         page_list = {
           {
             id = "custom-model",
-            title = "Harness model",
-            subtitle = "Enter a model identifier exposed by the current backend.",
+            title = "Enter Model",
+            column_headers = { "Model", "Details" },
             option_list = { { label = "Model", value = current, input_kind = "other" } },
             allow_input = true,
             input_height = 3,
@@ -1996,10 +1974,6 @@ function M.open_mcp_picker()
     on_mutation = function(result)
       if not owns_session() then return end
       local current = harness_state()
-      append_session_status(("MCP server %s %s"):format(
-        result.name or "server",
-        result.enabled and "enabled" or "disabled"
-      ))
       if result.restart_required then
         current.mcp_restart = current.mcp_restart or {
           name = result.name,
@@ -2038,7 +2012,7 @@ function M.select_backend()
     end
   end
   table.sort(option_list, function(left, right) return left.label < right.label end)
-  open_choice_picker(state, "Select Harness backend", "Switch the CLI used for this workspace.", option_list,
+  open_choice_picker(state, "Select Harness", nil, option_list,
     function(backend)
       if backend == current then return end
       if state.busy then
@@ -2078,20 +2052,17 @@ function M.set_mode(mode)
           return
         end
         state.session = result or state.session
-        append_session_status("Mode changed to Plan")
         M.refresh_winbar()
       end)
       return
     end
     if state.busy then
       if state.mode_restart_requested then
-        notifications.info("Harness is already restarting in the requested execution mode", "ForgeHarness")
         return
       end
       if selected_agent_run(state) then
         state.pending_mode = mode
         M.refresh_winbar()
-        notifications.info("Harness execution mode will change after the active child turn", "ForgeHarness")
         return
       end
       state.pending_mode = mode
@@ -2116,8 +2087,6 @@ function M.set_mode(mode)
         return
       end
       state.session = result or state.session
-      local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
-      append_session_status("Execution mode changed to " .. label)
       M.refresh_winbar()
       vim.schedule(M.drain)
     end)
@@ -2136,22 +2105,9 @@ end
 
 function M.toggle_mode()
   local state = harness_state()
-  local mode_list = (state.capability and state.capability.execution_mode_list) or {}
-  if #mode_list == 0 then mode_list = { "read", "write", "full", "yolo" } end
   local current_mode = state.pending_mode or (state.session and state.session.mode)
     or (state.session and state.session.execution_mode) or "read"
-  if current_mode == "plan" then
-    M.set_mode((state.session and state.session.execution_mode) or "read")
-    return
-  end
-  local current_index = 0
-  for index, candidate in ipairs(mode_list) do
-    if candidate == current_mode then
-      current_index = index
-      break
-    end
-  end
-  M.set_mode(mode_list[(current_index % #mode_list) + 1])
+  M.set_mode(current_mode == "read" and "write" or "read")
 end
 
 function M.select_mode()
@@ -2168,9 +2124,15 @@ function M.select_mode()
   local option_list = vim.tbl_map(function(mode)
     local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
     if mode == current_mode then label = label .. " (current)" end
-    return { label = label, detail = detail_list[mode], value = mode }
+    return {
+      label = label,
+      detail = detail_list[mode],
+      value = mode,
+      highlight_group = require("forge.infra.highlights").harness_mode(mode),
+      highlight_text = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2)),
+    }
   end, { "read", "write", "full", "yolo", "plan" })
-  open_choice_picker(state, "Select Harness mode", "Plan changes interaction directives without widening authorization.", option_list,
+  open_choice_picker(state, "Select Mode", nil, option_list,
     M.set_mode)
 end
 
@@ -2201,7 +2163,6 @@ configure_now = function(next_config, validate_selection, completed)
     state.session = result
     state.configuration_error = nil
     prune_pending_settings(state)
-    if next_config.model then append_session_status("Model changed to " .. next_config.model) end
     M.refresh_winbar()
     if next_config.model and not result.resolved_model then M.resolve_runtime_model() end
     if completed then completed(true) else vim.schedule(M.drain) end

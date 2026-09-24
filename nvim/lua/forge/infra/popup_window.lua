@@ -17,6 +17,7 @@ local view_group = vim.api.nvim_create_augroup("ForgePopupView", { clear = false
 ---@field width integer
 ---@field height integer
 ---@field title string|table
+---@field title_pos? "left"|"center"|"right"
 ---@field filetype? string
 ---@field focusable? boolean
 ---@field enter? boolean
@@ -104,7 +105,7 @@ function M.open(options)
     style = "minimal",
     border = options.border or "rounded",
     title = type(options.title) == "table" and options.title or (" " .. options.title .. " "),
-    title_pos = "center",
+    title_pos = options.title_pos or "center",
     focusable = options.focusable ~= false,
     zindex = options.zindex or 80,
   }

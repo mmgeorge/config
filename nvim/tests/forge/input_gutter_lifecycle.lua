@@ -15,6 +15,8 @@ local succeeded, failure = xpcall(function()
   vim.api.nvim_win_set_buf(first_window, input)
   gutter.apply(first_window)
   assert(vim.wo[first_window].statuscolumn:find("❯", 1, true))
+  assert(vim.wo[first_window].statuscolumn:find("v:virtnum == 0", 1, true),
+    "input prompt must not appear beside virtual queue rows")
   vim.api.nvim_win_set_buf(first_window, ordinary)
   assert(vim.wo[first_window].statuscolumn == "original", "input gutter leaked into ordinary buffer: " .. vim.inspect(vim.wo[first_window].statuscolumn))
   assert(vim.wo[first_window].number and vim.wo[first_window].relativenumber)

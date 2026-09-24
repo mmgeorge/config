@@ -18,6 +18,7 @@ function PickerWindow.open(host, width, height, title, origin)
     width = width,
     height = height,
     title = title,
+    title_pos = "left",
     filetype = "ForgePicker",
     focusable = true,
     enter = false,
@@ -42,6 +43,7 @@ function PickerWindow.resize(win, host, width, height, title, footer)
   config.width = width
   config.height = height
   config.title = title
+  config.title_pos = "left"
   config.footer = footer and { { " " .. footer .. " ", "ForgePickerHint" } } or ""
   config.footer_pos = "left"
   vim.api.nvim_win_set_config(win, config)

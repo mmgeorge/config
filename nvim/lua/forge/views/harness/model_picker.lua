@@ -155,12 +155,28 @@ function ModelPicker.open(options)
   local function build_spec()
     local selected_index = 1
     local option_list = {}
+    local column_headers = { "Model" }
+    if layout.reasoning.width > 0 then column_headers[#column_headers + 1] = "Reasoning" end
+    if layout.context_window.width > 0 then column_headers[#column_headers + 1] = "Context" end
+    if layout.vision.width > 0 then column_headers[#column_headers + 1] = "Vision" end
+    column_headers[#column_headers + 1] = "Description"
     for index, model in ipairs(model_list) do
       if model.id == selected_model_id then selected_index = index end
+      local active = model.id == selected_model_id and active_field(model) or nil
+      local columns = { model.id }
+      if layout.reasoning.width > 0 then
+        columns[#columns + 1] = padded_field(model.picker_reasoning, active == "reasoning", layout.reasoning)
+      end
+      if layout.context_window.width > 0 then
+        columns[#columns + 1] = padded_field(context_label(model), active == "context_window", layout.context_window)
+      end
+      if layout.vision.width > 0 then columns[#columns + 1] = model.vision and "Vision" or "" end
+      columns[#columns + 1] = model.description or ""
       option_list[#option_list + 1] = {
         id = model.id,
         label = model.id,
-        detail = model_detail(model, model.id == selected_model_id and active_field(model) or nil, layout),
+        detail = model_detail(model, active, layout),
+        columns = columns,
         value = model,
       }
     end
@@ -169,8 +185,8 @@ function ModelPicker.open(options)
       page_list = {
         {
           id = "model",
-          title = "Select model",
-          subtitle = "Choose the model, reasoning effort, and context window exposed by the active backend.",
+          title = "Select Model",
+          column_headers = column_headers,
           option_list = option_list,
           selected_index = selected_index,
           footer = "↑↓ model  ←→ value  Tab field  Enter confirm  q close",

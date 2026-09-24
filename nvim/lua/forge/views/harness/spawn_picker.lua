@@ -14,7 +14,7 @@ local function open_task(definition, options)
       {
         id = "spawn-task-" .. definition.name,
         title = "Task for " .. definition.name,
-        subtitle = definition.description,
+        column_headers = { "Task", "Description" },
         allow_input = true,
         input_height = 5,
         option_list = {
@@ -80,8 +80,8 @@ function SpawnPicker.open(options)
     page_list = {
       {
         id = "spawn-agent",
-        title = "Spawn child agent",
-        subtitle = "Filter the available agent definitions, then describe its task.",
+        title = "Select Agent",
+        column_headers = { "Agent", "Description" },
         option_list = option_list,
         empty_text = "No matching agent definitions.",
         search = { choice_keys = config.options.picker.session_keys },

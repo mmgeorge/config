@@ -53,8 +53,9 @@ local function finish_start(state, result, start_error, error_detail, callback)
       page_list = {
         {
           id = "lease-conflict",
-          title = "Session in use",
+          title = "Session in Use",
           subtitle = "Another Neovim instance controls this Harness session.",
+          column_headers = { "Action" },
           option_list = option_list,
           footer = "↑↓ select  Enter confirm  q close",
         },

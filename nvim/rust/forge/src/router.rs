@@ -1168,7 +1168,7 @@ impl HostRouter {
                     .harness
                     .open_session(request.id, serde_json::from_value(request.params)?)
                     .await?;
-                send_completed_response(sink, response).await?;
+                sink.send_response(response).await?;
             }
             RoutedMethod::Revisions => {
                 let params: RevisionRequest = serde_json::from_value(request.params)?;
@@ -1301,55 +1301,7 @@ async fn send_completed_result(
     request_id: u64,
     result: impl Serialize,
 ) -> Result<()> {
-    send_completed_response(sink, Response::success(request_id, result)?).await
-}
-
-/// Transfer a complete response without exceeding individual frame limits.
-async fn send_completed_response(sink: &MessageSender, response: Response) -> Result<()> {
-    let request_id = response.id;
-    let response = Message::Response(response);
-    if forge_protocol::outbound::encode(&response, forge_protocol::MAX_FRAME_BYTES).is_ok() {
-        sink.send_wait(response).await?;
-        return Ok(());
-    }
-    let prepared = sink.begin_transfer().and_then(|permit| {
-        forge_protocol::transfer::JsonTransfer::new(&response).map(|transfer| (permit, transfer))
-    });
-    let (_permit, transfer) = match prepared {
-        Ok(prepared) => prepared,
-        Err(error) => {
-            sink.send_wait(Message::Response(Response::failure_with_data(
-                request_id,
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    "result_transfer_busy"
-                } else {
-                    "result_too_large"
-                },
-                format!("Forge operation completed, but its result cannot be transferred: {error}"),
-                json!({"operation_completed": true}),
-            )))
-            .await?;
-            return Ok(());
-        }
-    };
-    let complete =
-        json!({"part_count":transfer.part_count(), "total_bytes":transfer.total_bytes()});
-    for part in transfer {
-        sink.send_wait(Message::RequestEvent(RequestEvent {
-            request_id,
-            event: "result.part".into(),
-            payload: serde_json::to_value(part)?,
-        }))
-        .await?;
-        tokio::task::yield_now().await;
-    }
-    sink.send_wait(Message::RequestEvent(RequestEvent {
-        request_id,
-        event: "result.complete".into(),
-        payload: complete,
-    }))
-    .await?;
-    Ok(())
+    Ok(sink.send_response(Response::success(request_id, result)?).await?)
 }
 
 fn revision_page(

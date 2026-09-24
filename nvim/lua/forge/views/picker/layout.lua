@@ -40,7 +40,7 @@ function PickerLayout.build(page, selected_index, width, options)
     lines[#lines + 1] = ""
   end
   local search_start = nil
-  if page.search then
+  if page.search and options.search_visible ~= false then
     search_start = #lines + 1
     lines[#lines + 1] = ""
     lines[#lines + 1] = ""
@@ -91,6 +91,7 @@ function PickerLayout.build(page, selected_index, width, options)
     lines[#lines + 1] = column_row(page.column_headers, string.rep(" ", prefix_width))
     section_line[#section_line + 1] = #lines
   end
+  local header_height = #lines
   local previous_section = nil
   for index, option in ipairs(page.option_list) do
     if option.section and option.section ~= previous_section then
@@ -114,6 +115,7 @@ function PickerLayout.build(page, selected_index, width, options)
   end
   if #page.option_list == 0 then append(lines, wrap(page.empty_text or "No matching options.", usable_width, "  ")) end
 
+  local body_end = #lines
   local input_start = nil
   if options.input_visible then
     lines[#lines + 1] = ""
@@ -126,6 +128,8 @@ function PickerLayout.build(page, selected_index, width, options)
   lines[#lines + 1] = "  " .. (options.footer or page.footer or "↑↓ select  Enter confirm  q close")
   return {
     lines = lines,
+    header_height = header_height,
+    body_end = body_end,
     option_range = option_range,
     primary_range = primary_range,
     child_range = child_range,
@@ -136,6 +140,56 @@ function PickerLayout.build(page, selected_index, width, options)
     input_start = input_start,
     footer_line = footer_line,
   }
+end
+
+---@param frame table
+---@param height integer
+---@param previous_top? integer
+---@return table
+function PickerLayout.viewport(frame, height, previous_top)
+  local header_height = frame.header_height
+  local suffix_height = #frame.lines - frame.body_end
+  local capacity = math.max(1, height - header_height - suffix_height)
+  local top = math.max(header_height + 1, previous_top or header_height + 1)
+  local selected = frame.option_range[frame.selected_index]
+  if selected then
+    if selected.first < top then top = selected.first end
+    if selected.first >= top + capacity then top = selected.first - capacity + 1 end
+  end
+  top = math.max(header_height + 1, math.min(top, frame.body_end - capacity + 1))
+  local last = math.min(frame.body_end, top + capacity - 1)
+  local projected = vim.deepcopy(frame)
+  projected.lines = {}
+  local row_map = {}
+  for row, line in ipairs(frame.lines) do
+    if row <= header_height or (row >= top and row <= last) or row > frame.body_end then
+      projected.lines[#projected.lines + 1] = line
+      row_map[row] = #projected.lines
+    end
+  end
+  for _, field in ipairs({ "option_range", "primary_range", "child_range", "content_range" }) do
+    projected[field] = {}
+    for index, range in pairs(frame[field]) do
+      local first, final
+      for row = range.first, range.last do
+        if row_map[row] then first = first or row_map[row] final = row_map[row] end
+      end
+      if first then
+        local mapped = vim.deepcopy(range)
+        mapped.first, mapped.last = first, final
+        projected[field][index] = mapped
+      end
+    end
+  end
+  projected.section_line = {}
+  for _, row in ipairs(frame.section_line) do
+    if row_map[row] then projected.section_line[#projected.section_line + 1] = row_map[row] end
+  end
+  for _, field in ipairs({ "search_start", "input_start", "footer_line" }) do
+    projected[field] = row_map[frame[field]]
+  end
+  projected.viewport_top = top
+  return projected
 end
 
 ---@param window_list integer[]

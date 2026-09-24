@@ -27,12 +27,13 @@ function Approval.open(request, host)
     page_list = {
       {
         id = request.id,
-        title = "Approval requested",
+        title = "Review Approval Request",
         subtitle = request.title,
         content_list = {
           { text = request.detail or "", group = "ForgePickerText" },
           request.reason and { text = "Reason: " .. request.reason, group = "ForgePickerText" } or nil,
         },
+        column_headers = { "Decision" },
         option_list = option_list(request),
         footer = "↑↓ select  Enter confirm  q close",
       },

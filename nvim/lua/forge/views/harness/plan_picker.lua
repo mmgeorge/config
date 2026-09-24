@@ -6,7 +6,7 @@ local datetime = require("forge.integrations.datetime")
 ---@param options table
 function M.open(options)
   local plans = options.plan_list
-  local selected = plans[1].id
+  local selected = plans[1] and plans[1].id
   local revision = {}
   for _, plan in ipairs(plans) do revision[plan.id] = plan.revision_count end
   local build_spec
@@ -44,9 +44,10 @@ function M.open(options)
     end
     return {
       host = options.host,
-      page_list = { { id = "replan", title = "Replan", subtitle = "Start a new plan from a saved revision.",
+      page_list = { { id = "replan", title = "Select Plan",
         column_headers = { "Created", "Plan", "Revision", "Status", "Session" },
         option_list = rows, selected_index = selected_index,
+        empty_text = "This workspace has no submitted plans.",
         footer = "↑↓ plan  ←→ revision  Enter start planning  q close" } },
       on_change = function(context)
         local plan = context.option and context.option.value

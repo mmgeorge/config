@@ -24,6 +24,20 @@ local ok, failure = pcall(function()
   local picker_input = require("forge.views.picker.input")
   local picker_state = require("forge.views.picker.state")
   local picker = require("forge.views.picker")
+  local rows = {}
+  for index = 1, 40 do rows[index] = { label = "Session " .. index, detail = "codex" } end
+  local scrolling_page = { subtitle = "Search current repository. Open in current tab.",
+    search = {}, column_headers = { "Session", "Harness" }, option_list = rows }
+  local first_frame = layout.viewport(layout.build(scrolling_page, 1, 100), 12)
+  local last_frame = layout.viewport(layout.build(scrolling_page, 40, 100), 12, first_frame.viewport_top)
+  assert_equals(#last_frame.lines, 12, "option viewport must fit the window")
+  for row = 1, first_frame.header_height do
+    assert_equals(last_frame.lines[row], first_frame.lines[row], "picker header must remain fixed")
+  end
+  assert_equals(last_frame.search_start, first_frame.search_start, "search must remain fixed")
+  assert_true(last_frame.option_range[40] ~= nil and last_frame.option_range[1] == nil,
+    "only visible options should receive projected row ranges")
+  assert_true(last_frame.lines[last_frame.option_range[40].first]:find("Session 40", 1, true) ~= nil)
 
   local spec = {
     page_list = {
@@ -38,6 +52,16 @@ local ok, failure = pcall(function()
   assert_true(not duplicate_ok, "picker state should reject duplicate page identities")
   picker_state.move(pure_state, spec, -1)
   assert_equals(picker_state.selected_index(pure_state, spec), 2, "selection should wrap")
+  local bounded_spec = { page_list = { { id = "bounded", wrap_selection = false,
+    option_list = { { label = "One" }, { label = "Two" } } } } }
+  local bounded_state = picker_state.new(bounded_spec)
+  picker_state.move(bounded_state, bounded_spec, -1)
+  assert_equals(picker_state.selected_index(bounded_state, bounded_spec), 1,
+    "bounded selection should stop at the first option")
+  picker_state.move(bounded_state, bounded_spec, 1)
+  picker_state.move(bounded_state, bounded_spec, 1)
+  assert_equals(picker_state.selected_index(bounded_state, bounded_spec), 2,
+    "bounded selection should stop at the last option")
   picker_state.move_page(pure_state, spec, 1)
   assert_equals(pure_state.page_index, 2, "page movement should clamp")
   picker_state.move_page(pure_state, spec, 1)
@@ -382,6 +406,39 @@ local ok, failure = pcall(function()
   assert_true(active.frame.footer_line ~= nil, "short picker did not restore its inline footer")
   assert_true(not vim.inspect(vim.api.nvim_win_get_config(active.win).footer):find("Enter insert", 1, true),
     "short picker retained a stale border footer")
+  picker.close(false)
+
+  require("forge.views.harness.model_picker").open({
+    host = { window_list = { origin_win, composer_win }, control_win = composer_win },
+    model_list = { { id = "example", reasoning = { "medium", "high" },
+      context_window = { { id = "small", token_limit = 100000 } }, description = "Example model" } },
+    current_model = "example",
+    on_confirm = function() end,
+  })
+  active = picker._state_for_test()
+  assert_equals(active.spec.page_list[1].column_headers,
+    { "Model", "Reasoning", "Context", "Description" }, "model picker should label each visible field")
+  assert_equals(active.spec.page_list[1].subtitle, nil, "model picker should omit the instructional subtitle")
+  assert_equals(#active.spec.page_list[1].option_list[1].columns, 4,
+    "model values should align with the visible headers")
+  picker.close(false)
+
+  picker.open({
+    host = { window_list = { origin_win, composer_win }, control_win = composer_win },
+    page_list = { { id = "mode-colors", option_list = {
+      { label = "Read (current)", detail = "Current mode", highlight_group = "ForgeHarnessRead", highlight_text = "Read" },
+      { label = "Full", detail = "Approval mode", highlight_group = "ForgeHarnessFull", highlight_text = "Full" },
+    } } },
+  })
+  active = picker._state_for_test()
+  local color_mark_set = {}
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(active.buf, -1, 0, -1, { details = true })) do
+    if mark[4].hl_group == "ForgeHarnessRead" or mark[4].hl_group == "ForgeHarnessFull" then
+      color_mark_set[mark[4].hl_group] = mark[4].end_col - mark[3]
+    end
+  end
+  assert_equals(color_mark_set, { ForgeHarnessRead = 4, ForgeHarnessFull = 4 },
+    "mode colors should cover only their labels in selected and unselected rows")
   picker.close(false)
 end)
 

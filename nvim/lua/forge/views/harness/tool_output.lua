@@ -58,7 +58,7 @@ function M.open(options)
       if owner.closed then return end
       if failure then notice(failure) return end
       if callback then callback(result.path)
-      else vim.notify("Complete tool output: " .. result.path, vim.log.levels.INFO, { title = "Forge tool output" }) end
+      else vim.api.nvim_echo({ { "Complete tool output: " .. result.path } }, false, {}) end
     end)
   end
   owner.replica = buffer.open(owner.document, { filetype = "ForgeHarnessTool", notice = notice })

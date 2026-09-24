@@ -46,6 +46,17 @@ local command_list = {
   { label = "/fast", detail = "Toggle backend fast mode", capability = "fast_mode" },
 }
 
+---@param text string
+---@return boolean
+function CommandSource.accepts_prompt(text)
+  local token = text:match("^%s*(%S+)")
+  if not token or token:sub(1, 1) ~= "/" then return true end
+  for _, command in ipairs(command_list) do
+    if command.label:match("^(%S+)") == token then return true end
+  end
+  return false
+end
+
 ---@return ForgeHarnessCommandSource
 function CommandSource.new()
   return setmetatable({
