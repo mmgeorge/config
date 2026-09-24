@@ -350,7 +350,8 @@ impl SqliteStore {
                 [&agent.child_agent_id],
                 |row| row.get(0),
             )?;
-            let child = Exchange::delegated(&interaction.session_id, agent, ordinal as u64);
+            let mut child = Exchange::delegated(&interaction.session_id, agent, ordinal as u64);
+            child.mode = interaction.mode;
             transaction.execute(
                 "INSERT INTO exchange_record(id, session_id, agent_id, ordinal, payload) VALUES(?1,?2,?3,?4,?5)",
                 params![child.id, child.session_id, child.agent_id, ordinal, encode(&child)?],
@@ -905,6 +906,7 @@ mod test {
             ordinal: 1,
             prompt: "work".into(),
             kind: ExchangeKind::Chat,
+            mode: None,
             state: ExchangeState::Running,
             plan_id: None,
             execution_id: None,
@@ -985,6 +987,7 @@ mod test {
             ordinal: 1,
             prompt: "report".into(),
             kind: crate::exchange::ExchangeKind::Chat,
+            mode: None,
             state: crate::exchange::ExchangeState::Complete,
             plan_id: None,
             execution_id: None,

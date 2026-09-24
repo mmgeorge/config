@@ -30,6 +30,10 @@ impl PlanReviewStore {
             .context("plan review document is closed")?;
         admission.check()?;
         document.validate_input(input)?;
+        ensure!(
+            !document.source.historical,
+            "historical plan revisions are read-only"
+        );
         Ok(
             serde_json::json!({"plan_id":document.source.document.plan_id,
             "digest":super::digest(&serde_json::to_vec(&document.source.document)?),
@@ -342,6 +346,10 @@ impl PlanReviewDocument {
         input: DocumentInput,
         end: Option<DocumentInput>,
     ) -> Result<serde_json::Value> {
+        ensure!(
+            !self.source.historical,
+            "historical plan revisions are read-only"
+        );
         if let Some(end) = &end {
             ensure!(
                 end.document == input.document
@@ -405,6 +413,10 @@ impl PlanReviewDocument {
 
     /// Expand the selected comment or compact it and discard an abandoned empty draft.
     fn focus_annotation(&mut self, input: DocumentInput) -> Result<serde_json::Value> {
+        ensure!(
+            !self.source.historical,
+            "historical plan revisions are read-only"
+        );
         let block_id = input.block.clone();
         self.validate_input(input)?;
         let focused = self
@@ -439,6 +451,10 @@ impl PlanReviewDocument {
 
     /// Remove the selected annotation from durable review state and its projection.
     fn delete_annotation(&mut self, input: DocumentInput) -> Result<serde_json::Value> {
+        ensure!(
+            !self.source.historical,
+            "historical plan revisions are read-only"
+        );
         let block_id = input.block.clone();
         self.validate_input(input)?;
         let id = self
@@ -475,6 +491,10 @@ impl PlanReviewDocument {
 
     fn edit(&mut self, edit: LocalEdit) -> Result<LocalEditResult> {
         ensure!(
+            !self.source.historical,
+            "historical plan revisions are read-only"
+        );
+        ensure!(
             edit.text.byte_count() <= 65536 && edit.text.row_count() <= 4096,
             "plan annotation edit exceeds 64 KiB or 4096 rows"
         );
@@ -503,10 +523,17 @@ impl PlanReviewDocument {
         focused_annotation: Option<String>,
     ) -> Result<Self> {
         view.validate()?;
-        let annotation = ReviewAnnotationStore::open(
-            source.path.with_extension("json"),
-            source.saved_digest.clone(),
-        )?;
+        let annotation_path = if source.historical {
+            source
+                .path
+                .parent()
+                .and_then(|directory| directory.parent())
+                .context("plan revision parent is missing")?
+                .join("working.json")
+        } else {
+            source.path.with_extension("json")
+        };
+        let annotation = ReviewAnnotationStore::open(annotation_path, source.saved_digest.clone())?;
         let (block, target) = super::review_projection::project(
             &source,
             &width,
@@ -643,6 +670,111 @@ mod tests {
     use crate::plan::PlanFileStore;
     use forge_buffer::identity::{BlockId, EditSequence, RegionId, RegionRevision};
     use forge_buffer::text::BufferText;
+
+    #[test]
+    fn historical_revision_retains_comments_after_working_plan_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path(), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Original overview");
+        store
+            .write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (_, _, checksum) = store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let source = store
+            .capture_review_source("session", "plan", 1, &checksum)
+            .unwrap();
+        let mut annotation =
+            ReviewAnnotationStore::open(source.path.with_extension("json"), source.saved_digest)
+                .unwrap();
+        annotation
+            .replace(vec![ReviewAnnotation {
+                id: "original-comment".into(),
+                source: crate::plan::PlanAnnotationInput {
+                    start_line: 1,
+                    end_line: 1,
+                    body: "Rename this configuration".into(),
+                },
+            }])
+            .unwrap();
+        canonical.overview = "Revised overview".into();
+        canonical.version = 2;
+        store
+            .write_working_document("session", "plan", &canonical)
+            .unwrap();
+        store
+            .submit_document_revision("session", "plan", 2, 2)
+            .unwrap();
+        let source = store.capture_revision_source("session", "plan", 1).unwrap();
+        assert_eq!(source.document.overview, "Original overview");
+        let mut historical = PlanReviewDocument::new(
+            DocumentId("history".into()),
+            ViewId("history-view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            historical.annotation.annotation()[0].source.body,
+            "Rename this configuration"
+        );
+        let snapshot = historical.snapshot();
+        assert!(
+            snapshot
+                .block
+                .iter()
+                .all(|block| block.metadata.editable_region.is_empty())
+        );
+        assert!(snapshot.block.iter().any(|block| {
+            block
+                .text
+                .wire_rows()
+                .join("\n")
+                .contains("Rename this configuration")
+        }));
+        let target = snapshot.block[0].metadata.target[0].clone();
+        let input = DocumentInput {
+            document: snapshot.document,
+            revision: snapshot.revision,
+            view: ViewId("history-view".into()),
+            sequence: InputSequence(1),
+            action: "comment".into(),
+            block: snapshot.block[0].id.clone(),
+            position: target.range.start,
+            target: Some(target.id),
+        };
+        assert!(
+            historical
+                .add_annotation(input.clone(), None)
+                .unwrap_err()
+                .to_string()
+                .contains("read-only")
+        );
+        assert!(historical.delete_annotation(input.clone()).is_err());
+        assert!(historical.focus_annotation(input.clone()).is_err());
+        let review = PlanReviewStore::default();
+        let admission = review.admit(historical.id.clone()).unwrap();
+        review.insert(historical, admission).unwrap();
+        assert!(
+            review
+                .submission(input)
+                .unwrap_err()
+                .to_string()
+                .contains("read-only")
+        );
+        let latest = store.capture_revision_source("session", "plan", 2).unwrap();
+        let latest = PlanReviewDocument::new(
+            DocumentId("latest".into()),
+            ViewId("latest-view".into()),
+            latest,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        assert!(latest.annotation.annotation().is_empty());
+    }
 
     #[test]
     fn signature_type_jump_resolves_cursor_entity_and_preserves_flow_navigation() {

@@ -378,6 +378,7 @@ mod test {
             ordinal: 1,
             prompt: "inspect".into(),
             kind: ExchangeKind::Chat,
+            mode: None,
             plan_id: None,
             execution_id: None,
             goal_id: None,

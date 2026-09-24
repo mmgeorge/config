@@ -22,13 +22,29 @@ use super::transcript::TranscriptRenderer;
 #[derive(Clone, Debug, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum TranscriptAction {
-    Tool { call_id: String },
-    Diff { text: String },
-    File { path: String, line: usize },
-    Plan { plan_id: String },
-    Agent { run_id: String },
-    Session { session_id: String },
-    Url { url: String },
+    Tool {
+        call_id: String,
+    },
+    Diff {
+        text: String,
+    },
+    File {
+        path: String,
+        line: usize,
+    },
+    Plan {
+        plan_id: String,
+        revision: Option<u32>,
+    },
+    Agent {
+        run_id: String,
+    },
+    Session {
+        session_id: String,
+    },
+    Url {
+        url: String,
+    },
 }
 
 pub struct ProjectedEntry {
@@ -89,6 +105,7 @@ struct TimelineRenderer<'profile> {
 enum MarkdownRole {
     Response,
     Detail,
+    Comment,
 }
 
 #[must_use]
@@ -225,6 +242,17 @@ impl TimelineRenderer<'_> {
                     0,
                 )?;
                 if let SessionPhase::AwaitingPlanReview { plan_id, .. } = status {
+                    block.metadata.decoration.push(Decoration {
+                        range: TextRange {
+                            start: TextPosition { row: 1, column: 0 },
+                            end: TextPosition {
+                                row: block.text.row_count(),
+                                column: 0,
+                            },
+                        },
+                        capture: "ForgeHarnessPlan".into(),
+                        priority: 100,
+                    });
                     let target = TargetId(format!("{id}:review-plan"));
                     block.metadata.target.push(TargetRange {
                         id: target.clone(),
@@ -240,6 +268,7 @@ impl TimelineRenderer<'_> {
                         target,
                         TranscriptAction::Plan {
                             plan_id: plan_id.clone(),
+                            revision: None,
                         },
                     );
                 } else if matches!(status, SessionPhase::Working { .. }) {
@@ -291,6 +320,7 @@ impl TimelineRenderer<'_> {
             ),
             Some(TranscriptAction::Plan {
                 plan_id: resolution.plan_id.clone(),
+                revision: None,
             }),
         )?;
         let section = self.begin_section();
@@ -367,6 +397,7 @@ impl TimelineRenderer<'_> {
                     &summary,
                     (!question).then(|| TranscriptAction::Plan {
                         plan_id: lifecycle.plan_id.clone(),
+                        revision: Some(lifecycle.model_revision),
                     }),
                 )?;
                 let section = self.begin_section();
@@ -407,7 +438,7 @@ impl TimelineRenderer<'_> {
                     self.markdown(
                         &format!("{}:annotation:{index}", event.id),
                         &format!("{}\n{}", annotation.label, annotation.body),
-                        MarkdownRole::Detail,
+                        MarkdownRole::Comment,
                     )?;
                 }
                 self.finish_section(section, &event.id, true);
@@ -514,7 +545,20 @@ impl TimelineRenderer<'_> {
                     column: 0,
                 },
             },
-            capture: if interaction.completed_at_ms.is_some() {
+            capture: if matches!(
+                interaction.kind,
+                ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
+            ) {
+                "ForgeHarnessPlan".into()
+            } else if let Some(mode) = interaction.mode {
+                format!(
+                    "ForgeHarness{}",
+                    match mode {
+                        crate::session::HarnessMode::Yolo => "Yolo",
+                        mode => mode.label(),
+                    }
+                )
+            } else if interaction.completed_at_ms.is_some() {
                 "ForgeHarnessThought".into()
             } else {
                 "ForgeHarnessThinking".into()
@@ -630,7 +674,13 @@ impl TimelineRenderer<'_> {
                                         std::slice::from_ref(tool),
                                     ) {
                                         let diff_start = self.block.len();
-                                        self.diff(&format!("{id}:changes"), "Changed", &diff, "")?;
+                                        self.diff(
+                                            &format!("{id}:changes"),
+                                            "Changed",
+                                            &diff,
+                                            "",
+                                            None,
+                                        )?;
                                         self.indent_range(diff_start, 2);
                                     }
                                     self.fold(tool_start, id, index + 1 < count);
@@ -714,7 +764,35 @@ impl TimelineRenderer<'_> {
                     }
                 }
                 ExchangeNode::ArtifactChange { change } => {
-                    self.diff(&change.id, "Changed", &change.diff_text, "")?
+                    let label = visible
+                        .iter()
+                        .skip(position + 1)
+                        .take_while(|node| !matches!(node, ExchangeNode::ArtifactChange { .. }))
+                        .find_map(|node| match node {
+                            ExchangeNode::PlanEvent { event } => match &event.content {
+                                crate::plan::PlanEventContent::Lifecycle { title, lifecycle }
+                                    if matches!(
+                                        lifecycle.kind,
+                                        crate::plan::PlanLifecycleKind::Created
+                                            | crate::plan::PlanLifecycleKind::RevisionCreated
+                                    ) =>
+                                {
+                                    Some(format!(
+                                        "Artifact: {title} (revision {})",
+                                        lifecycle.model_revision
+                                    ))
+                                }
+                                _ => None,
+                            },
+                            _ => None,
+                        });
+                    self.diff(
+                        &change.id,
+                        "Changed",
+                        &change.diff_text,
+                        "",
+                        label.as_deref().map(|label| (change.path.as_str(), label)),
+                    )?
                 }
             }
         }
@@ -733,6 +811,7 @@ impl TimelineRenderer<'_> {
                 } else {
                     ""
                 },
+                None,
             )?;
         }
         if !interaction.attributed_matches_checkpoint {
@@ -742,6 +821,7 @@ impl TimelineRenderer<'_> {
                     "Checkpoint total:",
                     diff,
                     "",
+                    None,
                 )?;
             }
         }
@@ -792,7 +872,14 @@ impl TimelineRenderer<'_> {
         self.push(block)
     }
 
-    fn diff(&mut self, id: &str, label: &str, text: &str, suffix: &str) -> Result<()> {
+    fn diff(
+        &mut self,
+        id: &str,
+        label: &str,
+        text: &str,
+        suffix: &str,
+        file_label: Option<(&str, &str)>,
+    ) -> Result<()> {
         if text.is_empty() {
             return Ok(());
         }
@@ -807,6 +894,7 @@ impl TimelineRenderer<'_> {
             label,
             suffix,
             text,
+            file_label,
         )?;
         self.bytes += tree.bytes;
         self.action.extend(tree.action);
@@ -817,15 +905,34 @@ impl TimelineRenderer<'_> {
     }
 
     fn markdown(&mut self, id: &str, text: &str, role: MarkdownRole) -> Result<()> {
-        let width = self.content_width();
+        let mut width = self.content_width();
+        let comment = matches!(role, MarkdownRole::Comment);
+        if comment {
+            width.columns = width.columns.saturating_sub(2).max(1);
+        }
         let mut rendered = match role {
             MarkdownRole::Response => {
                 TranscriptRenderer::new(&width)?.response(BlockId(id.into()), text)?
             }
-            MarkdownRole::Detail => {
+            MarkdownRole::Detail | MarkdownRole::Comment => {
                 forge_buffer::markdown::MarkdownRenderer::render(BlockId(id.into()), text, &width)?
             }
         };
+        if comment {
+            for row in 0..rendered.block.text.row_count() {
+                rendered.block.metadata.gutter.insert(
+                    row,
+                    Gutter {
+                        position: TextPosition { row, column: 0 },
+                        chunk: vec![TextChunk {
+                            text: if row == 0 { "◦ " } else { "  " }.into(),
+                            capture: "Normal".into(),
+                        }],
+                        priority: 200,
+                    },
+                );
+            }
+        }
         rendered
             .code
             .retain(|code| forge_diff::syntax::SyntaxLanguage::from_name(&code.language).is_some());
@@ -957,6 +1064,7 @@ impl TimelineRenderer<'_> {
             },
         };
         self.block[start].metadata.fold.push(FoldRange {
+            collapse_children: false,
             id: FoldId(identity.into()),
             start: TextPosition { row: 0, column: 0 },
             end: anchor,
@@ -1181,6 +1289,147 @@ mod tests {
     };
 
     #[test]
+    fn plan_annotations_have_neutral_hollow_bullets_and_hanging_continuations() {
+        let exchange = serde_json::from_value(json!({
+            "id":"review", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Request plan changes", "kind":"plan_revision", "state":"running",
+            "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[{
+                "kind":"plan_event", "event": {
+                    "id":"feedback", "node_count":0, "content": {
+                        "kind":"lifecycle", "title":"Migration", "lifecycle": {
+                            "id":"feedback", "session_id":"session", "plan_id":"plan",
+                            "kind":"changes_requested", "model_revision":3, "user_revision":1,
+                            "created_at_ms":0, "annotation":[
+                                {"subject":[], "label":"TelemetrySink", "body":"rename to TelemetryDongle and preserve all of the existing methods"},
+                                {"subject":[], "label":"Configuration", "body":"Keep the existing defaults"}
+                            ]
+                        }
+                    }
+                }
+            }]
+        })).unwrap();
+        let rendered = project_at(
+            &TimelineEntry::Exchange {
+                id: "review".into(),
+                created_at_ms: 0,
+                exchange,
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile {
+                columns: 40,
+                ..WidthProfile::default()
+            },
+            1000,
+        )
+        .unwrap();
+        for index in 0..2 {
+            let block = rendered
+                .entry
+                .block
+                .iter()
+                .find(|block| block.id.0 == format!("feedback:annotation:{index}"))
+                .unwrap();
+            assert!(
+                block.metadata.fold.is_empty(),
+                "comment bullet introduced a nested fold"
+            );
+            for row in 0..block.text.row_count() {
+                let gutter = block
+                    .metadata
+                    .gutter
+                    .iter()
+                    .find(|gutter| gutter.position.row == row)
+                    .unwrap();
+                assert_eq!(
+                    gutter.chunk[0].text,
+                    if row == 0 { "    ◦ " } else { "      " }
+                );
+                assert_eq!(gutter.chunk[0].capture, "Normal");
+            }
+            assert!(block.text.row_count() > 1, "fixture must exercise wrapping");
+        }
+    }
+
+    #[test]
+    fn activity_summary_uses_retained_mode_and_recognizes_legacy_planning() {
+        for (mode, capture) in [
+            ("read", "ForgeHarnessRead"),
+            ("write", "ForgeHarnessWrite"),
+            ("full", "ForgeHarnessFull"),
+            ("yolo", "ForgeHarnessYolo"),
+            ("plan", "ForgeHarnessPlan"),
+        ] {
+            for completed in [false, true] {
+                let exchange: Exchange = serde_json::from_value(json!({
+                    "id":"colored", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                    "prompt":"Inspect", "kind":"chat", "mode":mode, "state": if completed { "complete" } else { "running" },
+                    "created_at_ms":0, "completed_at_ms": if completed { Some(1000) } else { None },
+                    "attributed_matches_checkpoint":false, "node_list":[]
+                })).unwrap();
+                let restored: Exchange =
+                    serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+                assert_eq!(restored.mode, exchange.mode);
+                let rendered = project_at(
+                    &TimelineEntry::Exchange {
+                        id: "colored".into(),
+                        created_at_ms: 0,
+                        exchange: restored,
+                        agent_by_id: HashMap::new(),
+                    },
+                    &WidthProfile::default(),
+                    2000,
+                )
+                .unwrap();
+                let summary = rendered
+                    .entry
+                    .block
+                    .iter()
+                    .find(|block| block.id.0 == "colored:summary")
+                    .unwrap();
+                assert!(
+                    summary
+                        .metadata
+                        .decoration
+                        .iter()
+                        .any(|decoration| decoration.capture == capture)
+                );
+            }
+        }
+        for kind in ["plan_draft", "plan_revision"] {
+            let exchange = serde_json::from_value(json!({
+                "id":"legacy", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Plan", "kind":kind, "state":"complete", "created_at_ms":0,
+                "completed_at_ms":1000, "attributed_matches_checkpoint":false, "node_list":[]
+            }))
+            .unwrap();
+            let rendered = project_at(
+                &TimelineEntry::Exchange {
+                    id: "legacy".into(),
+                    created_at_ms: 0,
+                    exchange,
+                    agent_by_id: HashMap::new(),
+                },
+                &WidthProfile::default(),
+                2000,
+            )
+            .unwrap();
+            let summary = rendered
+                .entry
+                .block
+                .iter()
+                .find(|block| block.id.0 == "legacy:summary")
+                .unwrap();
+            assert!(
+                summary
+                    .metadata
+                    .decoration
+                    .iter()
+                    .any(|decoration| decoration.capture == "ForgeHarnessPlan")
+            );
+        }
+    }
+
+    #[test]
     fn sequential_tools_keep_group_open_and_only_latest_preview_expanded() {
         use crate::backend::{
             BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
@@ -1309,6 +1558,80 @@ mod tests {
                 .closed,
             "following commentary must close the group"
         );
+    }
+
+    #[test]
+    fn saved_plan_artifacts_use_their_revision_label_and_keep_real_file_targets() {
+        let path = "D:/forge/plans/session-guid/plan-guid/working.md";
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"revision", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Request plan changes", "kind":"plan_revision", "state":"running",
+            "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[]
+        }))
+        .unwrap();
+        for revision in [1, 2] {
+            exchange
+                .node_list
+                .push(crate::exchange::ExchangeNode::ArtifactChange {
+                    change: crate::exchange::ArtifactChange {
+                        id: format!("artifact-{revision}"),
+                        path: path.into(),
+                        created_at_ms: revision,
+                        diff_text: format!("--- {path}\n+++ {path}\n@@ -1 +1 @@\n-old\n+new\n"),
+                    },
+                });
+            let lifecycle = serde_json::from_value(json!({
+                "id":format!("event-{revision}"), "session_id":"session", "plan_id":"plan",
+                "title":"Migrate cloud diagnostics to Rust", "kind":"revision_created",
+                "model_revision":revision, "user_revision":0, "created_at_ms":revision
+            }))
+            .unwrap();
+            exchange
+                .node_list
+                .push(crate::exchange::ExchangeNode::PlanEvent {
+                    event: Box::new(crate::plan::ExchangePlanEvent {
+                        id: format!("event-{revision}"),
+                        node_count: exchange.node_list.len(),
+                        content: crate::plan::PlanEventContent::Lifecycle {
+                            title: "Migrate cloud diagnostics to Rust".into(),
+                            lifecycle,
+                        },
+                    }),
+                });
+        }
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: exchange.id.clone(),
+                created_at_ms: 0,
+                exchange,
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            10,
+        )
+        .unwrap();
+        for revision in [1, 2] {
+            let block = projected
+                .entry
+                .block
+                .iter()
+                .find(|block| block.id.0 == format!("artifact-{revision}:file:0"))
+                .unwrap();
+            assert_eq!(block.text.row(0), Some(format!(
+                "Modified Artifact: Migrate cloud diagnostics to Rust (revision {revision}) +1 -1"
+            ).as_str()));
+            assert!(
+                block
+                    .metadata
+                    .decoration
+                    .iter()
+                    .any(|span| span.capture == "ForgeStatusPath")
+            );
+        }
+        assert!(projected.action.values().any(|action| matches!(action,
+            super::TranscriptAction::File { path: target, line:1 } if target == path)));
+        assert!(projected.action.values().any(|action| matches!(action,
+            super::TranscriptAction::Diff { text } if text.contains(path))));
     }
 
     #[test]
@@ -1470,6 +1793,17 @@ mod tests {
                     );
                 }
                 assert_eq!(heading.metadata.fold.len(), 1);
+                if ![1, 2, 3].contains(&index) {
+                    assert!(matches!(
+                        projected
+                            .action
+                            .get(&forge_buffer::identity::TargetId(format!("event-{index}"))),
+                        Some(super::TranscriptAction::Plan {
+                            revision: Some(1),
+                            ..
+                        })
+                    ));
+                }
                 assert_eq!(heading.metadata.fold[0].end.block, detail.id);
                 assert_eq!(
                     heading.metadata.fold[0].end.position.row,
@@ -1744,8 +2078,16 @@ mod tests {
         let target = &block.metadata.target[0];
         assert_eq!(target.range.start.row, 1);
         assert_eq!(target.range.start.column, 0);
+        assert!(
+            block
+                .metadata
+                .decoration
+                .iter()
+                .any(|decoration| decoration.capture == "ForgeHarnessPlan"
+                    && decoration.range.start.row == 1)
+        );
         assert!(matches!(projected.action.get(&target.id),
-            Some(super::TranscriptAction::Plan { plan_id }) if plan_id == "pending-plan"));
+            Some(super::TranscriptAction::Plan { plan_id, .. }) if plan_id == "pending-plan"));
         assert!(block.metadata.fold.is_empty());
     }
 

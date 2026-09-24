@@ -848,6 +848,7 @@ fn fold(block: &mut [BufferBlock], header: usize, id: &str, closed: bool) {
     };
     let header = &mut block[header];
     header.metadata.fold.push(FoldRange {
+        collapse_children: false,
         id: FoldId(format!("walkthrough:{id}")),
         start: TextPosition {
             row: header.text.row_count().saturating_sub(1),

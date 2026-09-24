@@ -4,6 +4,14 @@
 
 local M = {}
 
+---Return the shared highlight group for a Harness interaction mode.
+---@param mode string?
+---@return string
+function M.harness_mode(mode)
+  return ({ read = "ForgeHarnessRead", write = "ForgeHarnessWrite", full = "ForgeHarnessFull",
+    yolo = "ForgeHarnessYolo", plan = "ForgeHarnessPlan" })[(mode or "read"):lower()] or "ForgeHarnessRead"
+end
+
 function M.setup()
   local palette = require("theme.palette")
   local function get_bg(name)

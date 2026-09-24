@@ -200,6 +200,7 @@ local function rustdoc(review, result, captured, source)
 end
 
 local function action(review, name)
+  if review.plan.historical_revision and (name == "comment" or name == "delete") then return end
   review.owner.action(name, function(result, failure, captured)
     if failure then notice(failure) return end
     if name == "comment" then
@@ -228,6 +229,7 @@ local function action(review, name)
 end
 
 local function submit(review, method, params)
+  if review.plan.historical_revision then return end
   if session.harness.busy then notifications.info("A Harness request is already running", "ForgePlanReview") return end
   session.harness.busy = true
   local controller = require("forge.views.harness.controller")
@@ -253,6 +255,7 @@ local function commands(review)
   command_set.register(set, "toggle", function() toggle_task_fold(review) end)
   for _, name in ipairs({ "open", "jump_entity", "entity_info", "schema", "comment", "delete" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "rename_entity", function()
+    if review.plan.historical_revision then return end
     review.owner.action("rename_entity", function(result, failure, captured)
       if failure then notice(failure) return end
       if not result.rename_allowed then notifications.info("Only added plan entities can be renamed", "ForgePlanReview") return end
@@ -268,7 +271,14 @@ local function commands(review)
     end)
   end)
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
+  command_set.register(set, "abort_plan", function()
+    if not review.plan.historical_revision and session.harness.active_plan
+      and session.harness.active_plan.id == review.plan.id then
+      require("forge.views.harness.controller").abort_plan()
+    end
+  end)
   command_set.register(set, "request_changes", function()
+    if review.plan.historical_revision then return end
     local tick = vim.api.nvim_buf_get_changedtick(review.buf)
     popup.input({ prompt = "Overall plan review comment (optional): " }, function(comment)
       if not comment then return end
@@ -287,7 +297,8 @@ function M.open(plan)
   assert(type(plan) == "table" and type(plan.working_path) == "string", "PlanReview requires a physical plan path")
   local previous = session.harness.plan_review
   local recovery
-  if previous and previous.plan.id == plan.id and previous.plan.review_digest == plan.review_digest and vim.api.nvim_buf_is_valid(previous.buf) then
+  if previous and previous.plan.id == plan.id and previous.plan.review_digest == plan.review_digest
+    and previous.plan.historical_revision == plan.historical_revision and vim.api.nvim_buf_is_valid(previous.buf) then
     if previous.owner.generation == client.host_generation() and not previous.owner.closed and previous.owner.attached() then
       local window = vim.fn.win_findbuf(previous.buf)[1]
       if window then vim.api.nvim_set_current_win(window) else vim.cmd("tabnew") vim.api.nvim_win_set_buf(0, previous.buf) end
@@ -331,7 +342,9 @@ function M.open(plan)
     local set = commands(review)
     review.command_set = set
     keymaps.setup_view_keymaps(native_buffer, "plan_review", set)
-    keymaps.apply_view_winbar(window, "PlanReview", "plan_review", set, "Awaiting review • read-only projection • C adds comments")
+    keymaps.apply_view_winbar(window, "PlanReview", "plan_review", set, plan.historical_revision
+      and ("Revision " .. plan.historical_revision .. " • historical • read-only")
+      or "Awaiting review • read-only projection • C adds comments")
     for _, warning in ipairs(plan.validation_warning or {}) do
       notifications.warn(("%s: %s"):format(warning.path or "Rust API", warning.message or "validation unavailable"), "PlanReview validation")
     end

@@ -100,7 +100,7 @@ function M.relative(value, opts)
   opts = opts or {}
   local text = vim.trim(tostring(value or ""))
   if text == "" then return "" end
-  local epoch = M.parse(text)
+  local epoch = type(value) == "number" and value or M.parse(text)
   if not epoch then return text end
 
   local now = M.now()
@@ -116,6 +116,14 @@ function M.relative(value, opts)
   if days >= 14 and days < 30 then return M.ago(days, "day") end
   if days >= 30 and days < 60 then return "Last month" end
   return M.absolute_date(epoch)
+end
+
+---@param epoch_ms number?
+---@param opts? { yesterday?: boolean }
+---@return string
+function M.relative_ms(epoch_ms, opts)
+  if type(epoch_ms) ~= "number" or epoch_ms <= 0 then return "" end
+  return M.relative(math.floor(epoch_ms / 1000), opts)
 end
 
 ---@param user string

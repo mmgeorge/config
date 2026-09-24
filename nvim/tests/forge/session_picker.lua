@@ -7,6 +7,7 @@ local layout = require("forge.views.harness.layout")
 local picker = require("forge.views.picker")
 local session = require("forge.session")
 local session_picker = require("forge.views.harness.session_picker")
+local datetime = require("forge.integrations.datetime")
 
 local function assert_true(value, message)
   if not value then error(message or "expected truthy value", 2) end
@@ -81,9 +82,11 @@ local ok, failure = pcall(function()
   controller.attach()
 
   local workspace = vim.fn.getcwd()
+  local now = 1700000000
+  datetime.now_override = function() return now end
   local entry_list = {
-    { id = "active", name = "Architecture review", workspace = workspace, backend = "mock", execution_mode = "read" },
-    { id = "beta", name = "Beta cleanup", workspace = workspace, backend = "mock", execution_mode = "write" },
+    { id = "active", name = "Architecture review", workspace = workspace, backend = "mock", execution_mode = "read", created_at_ms = (now - 2 * 86400) * 1000 },
+    { id = "beta", name = "Beta cleanup", workspace = workspace, backend = "mock", execution_mode = "write", created_at_ms = (now - 2 * 3600) * 1000 },
     { id = "gamma", name = "Gamma migration", workspace = workspace, backend = "mock", execution_mode = "read" },
     { id = "remote", name = "Remote review", workspace = workspace .. "-other", backend = "mock", execution_mode = "read" },
   }
@@ -144,6 +147,8 @@ local ok, failure = pcall(function()
   assert_true(picker.is_open("sessions"), "session search picker should open")
   assert_equals(request_list[1].params.scope, "repo", "session search should default to the current repository")
   local active_picker = picker._state_for_test()
+  assert_true(active_picker.spec.page_list[1].option_list[1].label:find("2 days ago", 1, true) == 1)
+  assert_true(active_picker.spec.page_list[1].option_list[2].label:find("2 hours ago", 1, true) == 1)
   assert_equals(vim.api.nvim_get_current_win(), active_picker.search_win, "session search should focus its input")
   assert_true(vim.api.nvim_win_get_buf(state.transcript_win) ~= original_transcript_buf,
     "session search should display a separate preview buffer")

@@ -105,16 +105,23 @@ impl HarnessService {
                 view,
                 plan_id,
                 digest,
+                revision,
                 width,
                 saved_source_digest,
                 focused_annotation,
             } => {
                 let admission = controller.plan_review.admit(document.clone())?;
-                let mut source = controller
-                    .broker
-                    .lock()
-                    .await
-                    .capture_plan_review(plan_id, digest)?;
+                let mut source = {
+                    let broker = controller.broker.lock().await;
+                    if let Some(revision) = revision {
+                        let source = broker.capture_plan_revision(plan_id, *revision)?;
+                        ensure!(crate::plan::digest(&serde_json::to_vec(&source.document)?) == *digest,
+                            "plan revision changed before opening");
+                        source
+                    } else {
+                        broker.capture_plan_review(plan_id, digest)?
+                    }
+                };
                 admission.check()?;
                 if let Some(expected) = saved_source_digest {
                     ensure!(

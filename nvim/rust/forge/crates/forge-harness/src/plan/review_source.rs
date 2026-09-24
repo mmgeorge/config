@@ -7,6 +7,7 @@ use std::path::Path;
 const SOURCE_CAPACITY: u64 = 8 * 1024 * 1024;
 
 pub(crate) struct PlanReviewSource {
+    pub historical: bool,
     pub path: std::path::PathBuf,
     pub workspace: std::path::PathBuf,
     pub document: PlanDocument,
@@ -16,6 +17,40 @@ pub(crate) struct PlanReviewSource {
 }
 
 impl PlanFileStore {
+    /// Capture a submitted revision independently of the mutable working document.
+    pub(crate) fn capture_revision_source(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+    ) -> Result<PlanReviewSource> {
+        anyhow::ensure!(revision > 0, "plan revision must be positive");
+        let path = self
+            .plan_dir(session_id, plan_id)
+            .join("revisions")
+            .join(format!("submitted-{revision:04}.json"));
+        let submitted = read_source(&path)?;
+        let document: PlanDocument = serde_json::from_slice(&submitted)?;
+        document.validate_for_submission()?;
+        anyhow::ensure!(
+            document.plan_id == plan_id,
+            "submitted plan identity changed"
+        );
+        let rendered = RenderedPlan {
+            markdown: String::from_utf8(read_source(&path.with_extension("md"))?)?,
+            navigation: serde_json::from_slice(&read_source(&path.with_extension("index.json"))?)?,
+        };
+        Ok(PlanReviewSource {
+            historical: true,
+            path: path.with_extension("md"),
+            workspace: self.workspace.clone(),
+            document,
+            rendered,
+            saved_digest: digest(&submitted),
+            syntax: None,
+        })
+    }
+
     pub(crate) fn capture_review_source(
         &self,
         session_id: &str,
@@ -53,6 +88,7 @@ impl PlanFileStore {
             "physical plan review changed after the submitted revision"
         );
         Ok(PlanReviewSource {
+            historical: false,
             path: directory.join("working.md"),
             workspace: self.workspace.clone(),
             document,

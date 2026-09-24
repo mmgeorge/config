@@ -19,6 +19,7 @@ local command_list = {
   { label = "/agent", detail = "Switch between Main and child-agent timelines", capability = "agent_observe" },
   { label = "/spawn", detail = "Spawn a child agent", capability = "agent_catalog" },
   { label = "/plan", detail = "Create a reviewed plan" },
+  { label = "/replan", detail = "Start planning from a saved plan revision" },
   { label = "/plan cancel", detail = "Cancel the active plan" },
   { label = "/sessions", detail = "Search, preview, resume, or delete a Harness session" },
   { label = "/undo", detail = "Roll back to an interaction and restore its prompt" },

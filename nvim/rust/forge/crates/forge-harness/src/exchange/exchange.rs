@@ -32,6 +32,9 @@ pub struct Exchange {
     #[serde(default)]
     pub kind: ExchangeKind,
     #[serde(default)]
+    /// Interaction mode retained independently of later session mode changes.
+    pub mode: Option<crate::session::HarnessMode>,
+    #[serde(default)]
     pub plan_id: Option<String>,
     #[serde(default)]
     pub execution_id: Option<String>,
@@ -89,6 +92,7 @@ impl Exchange {
             ordinal,
             prompt: delegation.task.clone(),
             kind: ExchangeKind::Chat,
+            mode: None,
             plan_id: None,
             execution_id: None,
             goal_id: None,
@@ -550,6 +554,7 @@ mod test {
             ordinal: 1,
             prompt: "inspect the repository".into(),
             kind: ExchangeKind::Chat,
+            mode: None,
             plan_id: None,
             execution_id: None,
             goal_id: None,

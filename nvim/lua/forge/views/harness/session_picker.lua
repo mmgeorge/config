@@ -1,7 +1,7 @@
 local SessionPicker = {}
 
 local client = require("forge.client")
-local config = require("forge.infra.config")
+local datetime = require("forge.integrations.datetime")
 local notifications = require("forge.infra.notifications")
 local picker = require("forge.views.picker")
 local session = require("forge.session")
@@ -17,21 +17,15 @@ local function option(entry, scope)
   local name = type(entry.name) == "string" and vim.trim(entry.name) or ""
   if name == "" then name = "[unnamed]" end
   local current_session = session.harness.session or {}
-  local active_marker = current_session.id == entry.id and "current" or nil
+  local label = current_session.id == entry.id and (name .. " (current)") or name
   local mode = entry.execution_mode == "yolo" and "YOLO"
     or ((entry.execution_mode or "read"):sub(1, 1):upper() .. (entry.execution_mode or "read"):sub(2))
-  local detail_list = vim.tbl_filter(function(value) return value and value ~= "" end, {
-    active_marker,
-    mode,
-    entry.backend,
-    entry.model,
-    entry.effort,
-    scope == "all" and entry.workspace or nil,
-  })
+  local columns = { datetime.relative_ms(entry.created_at_ms), label, entry.backend or "", mode, entry.model or "" }
+  if scope == "all" then columns[#columns + 1] = entry.workspace or "" end
   return {
     id = entry.id,
-    label = name,
-    detail = table.concat(detail_list, " · "),
+    label = ("%-24s  %s"):format(datetime.relative_ms(entry.created_at_ms), label),
+    columns = columns,
     search_text = name,
     value = entry,
   }
@@ -97,6 +91,8 @@ build_spec = function(instance)
   local scope_label = instance.scope == "repo" and "current repository" or "all repositories"
   local open_label = instance.open_mode == "tab" and "new tab" or "current tab"
   local option_list = vim.tbl_map(function(entry) return option(entry, instance.scope) end, instance.entry_list)
+  local column_headers = { "Created", "Session", "Harness", "Mode", "Model" }
+  if instance.scope == "all" then column_headers[#column_headers + 1] = "Workspace" end
   return {
     owner = "sessions",
     host = instance.host,
@@ -104,10 +100,11 @@ build_spec = function(instance)
       {
         id = "sessions",
         title = "Harness sessions",
+        column_headers = column_headers,
         subtitle = "Search " .. scope_label .. ". Open in " .. open_label .. ".",
         option_list = option_list,
         empty_text = "No matching Harness sessions.",
-        search = { choice_keys = config.options.picker.session_keys },
+        search = {},
         footer = "↑↓ select  Enter open  Tab toggle tab  C-j delete  C-o scope  Esc normal",
       },
     },

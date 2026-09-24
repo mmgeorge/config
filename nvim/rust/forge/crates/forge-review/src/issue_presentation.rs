@@ -114,6 +114,7 @@ pub fn project(
     )?;
     if !detail.comments.is_empty() {
         comments.metadata.fold.push(FoldRange {
+            collapse_children: false,
             id: FoldId("issue:comments".into()),
             start: TextPosition { row: 0, column: 0 },
             end: BlockAnchor {
@@ -183,6 +184,7 @@ pub fn project(
         let mut body = raw_comment_body(body_id.clone(), &comment.body)?;
         decorate_rows(&mut body, "ForgeReviewComment");
         heading.metadata.fold.push(FoldRange {
+            collapse_children: false,
             id: FoldId(format!("issue:comment:{index}")),
             start: TextPosition {
                 row: heading.text.row_count() - 1,

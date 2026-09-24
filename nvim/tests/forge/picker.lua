@@ -60,7 +60,14 @@ local ok, failure = pcall(function()
   local stacked = layout.build({
     option_list = { { key = "n", label = "A long option label", detail = "A long detail that cannot share a narrow row" } },
   }, 1, 24)
-  assert_true(#stacked.lines >= 4, "narrow layouts should stack option details")
+  assert_equals(stacked.option_range[1].last, stacked.option_range[1].first,
+    "narrow layouts should truncate cells without moving columns onto another row")
+  local aligned = layout.build({ option_list = {
+    { key = "a", label = "Short", detail = "first" },
+    { key = "long", label = "A considerably longer title", detail = "second" },
+  } }, 1, 100)
+  assert_equals(aligned.lines[1]:find("first", 1, true), aligned.lines[2]:find("second", 1, true),
+    "all picker detail columns must align across different label and key widths")
   local command = "Write-Output FORGE-BG-AUDIT; Start-Sleep -Seconds 90"
   local long_label = layout.build({
     option_list = { { label = command, detail = "Terminal 98704" } },

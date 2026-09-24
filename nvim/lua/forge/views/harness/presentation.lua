@@ -179,7 +179,7 @@ function M.open(options, callback)
         if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer
           and vim.api.nvim_win_get_cursor(window)[1] >= previous_rows then follow[#follow + 1] = window end
       end
-      if result.snapshot then replica.apply_snapshot(owner.transcript, result.snapshot)
+      if type(result.snapshot) == "table" then replica.apply_snapshot(owner.transcript, result.snapshot)
       else
         for _, patch in ipairs(result.patch or {}) do
           local applied = replica.apply_patch(owner.transcript, patch)

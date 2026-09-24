@@ -184,6 +184,7 @@ pub(crate) fn project(
             },
         };
         block[start_block].metadata.fold.push(FoldRange {
+            collapse_children: false,
             id: FoldId(format!("plan:heading:{source_row}")),
             start: TextPosition { row: 0, column: 0 },
             end,
@@ -221,6 +222,7 @@ pub(crate) fn project(
             .then_some(0)
             .unwrap_or(1);
         block[row_block[start]].metadata.fold.push(FoldRange {
+            collapse_children: false,
             id: FoldId(format!("plan:task:{source_start}")),
             start: TextPosition {
                 row: fold_start_row,
@@ -250,10 +252,16 @@ pub(crate) fn project(
         };
         block[row_block[start]].metadata.fold.push(FoldRange {
             id: FoldId(format!("plan:file-tree:{source_start}")),
+            collapse_children: false,
             start: TextPosition { row: 0, column: 0 },
             end: endpoint,
             closed: true,
         });
+    }
+    if source.historical {
+        for block in &mut block {
+            block.metadata.editable_region.clear();
+        }
     }
     Ok((block, target))
 }

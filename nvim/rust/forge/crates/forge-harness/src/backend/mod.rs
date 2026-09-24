@@ -726,7 +726,15 @@ impl Backend for MockBackend {
             let mut mutation = crate::plan::PlanMutation {
                 plan: Some(crate::plan::PlanFieldPatch {
                     title: Some("Implement the requested change".into()),
-                    overview: Some(planning_note.clone().unwrap_or_default()),
+                    overview: Some(format!(
+                        "{}\n{}",
+                        if document.prompt.is_empty() {
+                            &document.title
+                        } else {
+                            &document.prompt
+                        },
+                        steering_text_list.join("\n")
+                    )),
                     ..Default::default()
                 }),
                 ..Default::default()
@@ -1090,5 +1098,7 @@ mod test {
             .expect("mock planning should update the overview");
         assert!(text.contains("Refactor X"));
         assert!(text.contains("And be sure to modify Y"));
+        assert!(!text.contains("Active canonical PlanDocument"));
+        assert!(!text.contains("schema_version"));
     }
 }

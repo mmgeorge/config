@@ -157,6 +157,27 @@ local success, failure = xpcall(function()
   await(function() return state.plan_review and state.plan_review.owner.ready end, "native PlanReview did not reopen")
   assert(vim.deep_equal(vim.fn.readfile(plan.working_path, "b"), canonical))
   assert(table.concat(vim.api.nvim_buf_get_lines(state.plan_review.buf, 0, -1, false), "\n"):find(literal, 1, true), "saved annotation was lost on reopen")
+  state.plan_review.command_set.action_by_id.close.run({})
+  local historical = vim.deepcopy(plan)
+  historical.historical_revision = plan.model_revision
+  historical.working_path = vim.fs.joinpath(vim.fs.dirname(plan.working_path), "revisions",
+    ("submitted-%04d.md"):format(plan.model_revision))
+  require("forge.views.plan_review").open(historical)
+  await(function() return state.plan_review and state.plan_review.owner.ready end, "historical PlanReview did not open")
+  local historical_review = state.plan_review
+  assert(table.concat(vim.api.nvim_buf_get_lines(historical_review.buf, 0, -1, false), "\n"):find(literal, 1, true),
+    "historical revision lost its saved annotation")
+  local _, historical_row = historical_review.owner.replica.sequence:position("plan:annotation:" .. annotation.region)
+  vim.api.nvim_win_set_cursor(historical_review.win, { historical_row + 1, 0 })
+  historical_review.owner.sync_focus()
+  historical_review.owner.sync_editability()
+  assert(not vim.bo[historical_review.buf].modifiable, "historical annotation became editable")
+  historical_review.command_set.action_by_id.delete.run({})
+  historical_review.command_set.action_by_id.accept.run({})
+  assert(state.plan_review == historical_review and not state.busy, "historical review accepted or deleted state")
+  historical_review.command_set.action_by_id.close.run({})
+  require("forge.views.plan_review").open(plan)
+  await(function() return state.plan_review and state.plan_review.owner.ready end, "current review did not reopen after history")
   local deleted_block = "plan:annotation:" .. annotation.region
   local _, deleted_row = state.plan_review.owner.replica.sequence:position(deleted_block)
   vim.api.nvim_win_set_cursor(state.plan_review.win, { deleted_row + 1, 0 })

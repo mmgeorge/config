@@ -282,13 +282,7 @@ local function status_text()
   local segment_list = {
     {
       text = mode,
-      group = ({
-        read = "ForgeHarnessRead",
-        write = "ForgeHarnessWrite",
-        full = "ForgeHarnessFull",
-        yolo = "ForgeHarnessYolo",
-        plan = "ForgeHarnessPlan",
-      })[raw_mode:lower()] or "ForgeHarnessRead",
+      group = require("forge.infra.highlights").harness_mode(raw_mode),
     },
     {
       text = (" • %s • %s %s%s"):format(provider, model, effort, fast),
@@ -1031,6 +1025,7 @@ end
 
 function M.drain()
   local state = harness_state()
+  if state.aborting_plan then return end
   if state.busy or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
   if #(state.pending_steer or {}) > 0 then return end
   if state.status and state.status.kind == "finalizing" then return end
@@ -1054,7 +1049,10 @@ function M.drain()
     configure_now(pending_config, validate_selection)
     return
   end
-  if state.active_elicitation and state.active_elicitation.elicitation then
+  local next_entry = state.queue[1]
+  local next_text = type(next_entry) == "table" and next_entry.text or next_entry
+  if state.active_elicitation and state.active_elicitation.elicitation
+    and not (next_text and next_text:match("^/replan%s")) then
     return
   end
   local entry = state.queue[1]
@@ -1177,13 +1175,65 @@ function M.open_timeline_entry()
       if not opened then notifications.error(failure, "ForgeHarness") return end
       vim.api.nvim_win_set_cursor(0, { math.max(1, math.min(action.line or 1, vim.api.nvim_buf_line_count(0))), 0 })
     elseif action.kind == "plan" then
-      client.request_for(state.session.id, "plan.activate", { plan_id = action.plan_id }, function(plan, failure)
+      client.request_for(state.session.id, "plan.activate", { plan_id = action.plan_id, revision = action.revision }, function(plan, failure)
         if failure then notifications.error(failure, "Harness artifact") return end
-        state.active_plan = plan
+        if not plan.historical_revision then state.active_plan = plan end
         require("forge.views.plan_review").open(plan)
         synchronize_state()
       end)
     end
+  end)
+end
+
+function M.abort_plan()
+  local state = harness_state()
+  if state.aborting_plan or not state.session then return end
+  if not state.active_plan then
+    if state.session.mode == "plan" then M.set_mode(state.session.execution_mode or "read") end
+    return
+  end
+  local session_id = state.session.id
+  state.aborting_plan = true
+  local function cancel()
+    client.request_for(session_id, "plan.cancel", {}, function(_, failure)
+      state.aborting_plan = false
+      if failure then notifications.error(failure, "Harness plan") return end
+      if not state.session or state.session.id ~= session_id then return end
+      picker.close(false)
+      state.plan_question_open = false
+      if state.plan_review and state.plan_review.command_set then
+        state.plan_review.command_set.action_by_id.close.run({})
+      end
+      state.pending_mode, state.mode_restart_requested = nil, false
+      state.active_plan, state.active_elicitation = nil, nil
+      synchronize_state(M.drain)
+    end)
+  end
+  if state.busy then
+    client.request_for(session_id, "turn.cancel", {}, function(_, failure)
+      if failure then state.aborting_plan = false notifications.error(failure, "Harness plan") return end
+      cancel()
+    end)
+  else cancel() end
+end
+
+function M.open_replan_picker()
+  local state = harness_state()
+  if not state.session then return end
+  local session_id = state.session.id
+  client.request_for(session_id, "plan.list", {}, function(plans, failure)
+    if failure then notifications.error(failure, "Harness replan") return end
+    if not state.session or state.session.id ~= session_id then return end
+    if #plans == 0 then notifications.info("This workspace has no submitted plans", "Harness replan") return end
+    require("forge.views.harness.plan_picker").open({ host = picker_host(state), plan_list = plans,
+      on_confirm = function(selection)
+        if not state.session or state.session.id ~= session_id then return end
+        local text = ("/replan %s %d"):format(selection.plan_id, selection.revision)
+        state.queue[#state.queue + 1] = text
+        M.refresh_winbar()
+        M.drain()
+      end,
+    })
   end)
 end
 
@@ -1426,6 +1476,16 @@ function M.submit()
   local state = harness_state()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
+  if text == "/replan" then
+    set_composer_text(state.composer_buf, "")
+    M.open_replan_picker()
+    return
+  end
+  if text == "/plan cancel" then
+    set_composer_text(state.composer_buf, "")
+    M.abort_plan()
+    return
+  end
   if text == "/recap" then
     set_composer_text(state.composer_buf, "")
     recap.request(state, function()
@@ -1740,7 +1800,7 @@ function M.queue_submit()
   local state = harness_state()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
-  if text == "/bg" or text == "/recap" or text == "/mcp" or text == "/fast" or text:match("^/fast%s") then M.submit() return end
+  if text == "/bg" or text == "/recap" or text == "/mcp" or text == "/replan" or text == "/plan cancel" or text == "/fast" or text:match("^/fast%s") then M.submit() return end
   if text == "/model" then
     M.select_model(function(next_config)
       local command = "/model " .. next_config.model .. (next_config.effort and (" " .. next_config.effort) or "")
@@ -1797,7 +1857,6 @@ function M.toggle_activity()
   if vim.fn.foldclosed(vim.fn.line(".")) == -1 and state.presentation
       and state.presentation.toggle_tool() then return end
   if state.presentation and require("forge.folds").toggle_heading(state.presentation.transcript, vim.api.nvim_get_current_win()) then return end
-  if vim.fn.foldlevel(vim.fn.line(".")) == 0 then M.open_timeline_entry() end
 end
 
 ---@param direction integer
@@ -2230,6 +2289,7 @@ function M.command_set()
   command_set.register(set, "next_prompt", function() M.jump_prompt(1) end)
   command_set.register(set, "toggle_activity", M.toggle_activity)
   command_set.register(set, "open_artifact", M.open_artifact_picker)
+  command_set.register(set, "abort_plan", M.abort_plan)
   command_set.register(set, "agent", M.open_agent_picker)
   command_set.register(set, "sessions", M.open_session_picker)
   command_set.register(set, "open_timeline", M.open_timeline_entry)

@@ -220,6 +220,7 @@ impl WalkthroughService {
                             .context("missing review hunk")?,
                         old_syntax.as_ref(),
                         new_syntax.as_ref(),
+                        0,
                     )?;
                     if let Some(coordinate) = if old_side { display.old } else { display.new } {
                         source_target(&mut excerpt, &mut block, coordinate.line);

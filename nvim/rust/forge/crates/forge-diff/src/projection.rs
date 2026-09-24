@@ -1,10 +1,58 @@
 use forge_buffer::ContractError;
-use forge_buffer::block::{BlockMetadata, Decoration, Gutter, TextChunk, TextPosition, TextRange};
+use forge_buffer::block::{
+    BlockMetadata, BufferBlock, Decoration, Gutter, TextChunk, TextPosition, TextRange,
+};
+use forge_buffer::identity::BlockId;
+use forge_buffer::text::BufferText;
 
 use crate::display::{DisplayHunk, DisplayRow, RowKind};
 use crate::syntax::{SyntaxCapture, SyntaxFamily, SyntaxHandle, SyntaxLanguage};
 
 const MAX_DECORATIONS: usize = 8192;
+
+/// Build a file or hunk heading with an independent display margin and unchanged text coordinates.
+pub fn header(
+    id: BlockId,
+    chunk: Vec<TextChunk>,
+    indent: usize,
+) -> Result<BufferBlock, ContractError> {
+    id.validate()?;
+    if indent > 4096 {
+        return Err(ContractError("diff indentation exceeds 4096 cells"));
+    }
+    let mut text = String::new();
+    let mut metadata = BlockMetadata::default();
+    for chunk in chunk {
+        let column = text.len();
+        text.push_str(&chunk.text);
+        metadata.decoration.push(Decoration {
+            range: TextRange {
+                start: TextPosition { row: 0, column },
+                end: TextPosition {
+                    row: 0,
+                    column: text.len(),
+                },
+            },
+            capture: chunk.capture,
+            priority: 100,
+        });
+    }
+    if indent > 0 {
+        metadata.gutter.push(Gutter {
+            position: TextPosition { row: 0, column: 0 },
+            chunk: vec![TextChunk {
+                text: " ".repeat(indent),
+                capture: "Normal".into(),
+            }],
+            priority: 100,
+        });
+    }
+    Ok(BufferBlock {
+        id,
+        text: BufferText::from_rows([text])?,
+        metadata,
+    })
+}
 
 /// Project a saved patch row through the standard diff gutters and side backgrounds.
 ///
@@ -15,6 +63,7 @@ pub fn append_patch_row(
     source: &crate::patch::PatchRow<'_>,
     hunk: &crate::patch::PatchHunk<'_>,
     emphasis: &[std::ops::Range<usize>],
+    indent: usize,
 ) -> Result<(), ContractError> {
     use crate::source::{SourceCoordinate, SourceSide};
     let display = DisplayRow {
@@ -50,7 +99,7 @@ pub fn append_patch_row(
         new_lines: hunk.new_lines.clone(),
         raw_range: 0..0,
     };
-    append_display_row(metadata, row, &display, &group, None, None)
+    append_display_row(metadata, row, &display, &group, None, None, indent)
 }
 
 pub fn append_source_syntax_row(
@@ -290,7 +339,11 @@ pub fn append_display_row(
     group: &DisplayHunk,
     old_syntax: Option<&SyntaxHandle>,
     new_syntax: Option<&SyntaxHandle>,
+    indent: usize,
 ) -> Result<(), ContractError> {
+    if indent > 4096 {
+        return Err(ContractError("diff indentation exceeds 4096 cells"));
+    }
     if metadata.gutter.len() >= 256 {
         return Err(ContractError("diff row batch exceeds 256 gutters"));
     }
@@ -352,6 +405,15 @@ pub fn append_display_row(
         ],
         priority: 100,
     });
+    if indent > 0 {
+        metadata.gutter.last_mut().unwrap().chunk.insert(
+            0,
+            TextChunk {
+                text: " ".repeat(indent),
+                capture: "Normal".into(),
+            },
+        );
+    }
     if display.kind != RowKind::Context {
         admit_decoration(metadata)?;
         metadata.decoration.push(Decoration {
@@ -444,6 +506,54 @@ fn admit_decoration(metadata: &BlockMetadata) -> Result<(), ContractError> {
 mod tests {
     use super::*;
     use crate::source::{SourceCoordinate, SourceSide};
+
+    #[test]
+    fn shared_diff_margin_aligns_headers_and_preserves_source_coordinates() {
+        let patch = crate::patch::UnifiedPatch::parse(
+            "--- a/test.rs\n+++ b/test.rs\n@@ -1 +1 @@\n-old\n+new\n",
+        )
+        .unwrap();
+        let hunk = &patch.file[0].hunk[0];
+        for indent in [0, 3, 7] {
+            let file = header(
+                BlockId("file".into()),
+                crate::file_header::FileChange::Modified.header("test.rs", Some((1, 1)), false),
+                indent,
+            )
+            .unwrap();
+            let heading = header(
+                BlockId("hunk".into()),
+                vec![TextChunk {
+                    text: hunk.header.into(),
+                    capture: "ForgeHunkHeader".into(),
+                }],
+                indent,
+            )
+            .unwrap();
+            assert_eq!(file.text.row(0), Some("Modified test.rs +1 -1"));
+            assert_eq!(heading.text.row(0), Some("@@ -1 +1 @@"));
+            assert_eq!(file.metadata.gutter, heading.metadata.gutter);
+            let prefix = file
+                .metadata
+                .gutter
+                .iter()
+                .flat_map(|gutter| &gutter.chunk)
+                .map(|chunk| chunk.text.as_str())
+                .collect::<String>();
+            assert_eq!(prefix, " ".repeat(indent));
+            let mut metadata = BlockMetadata::default();
+            append_patch_row(&mut metadata, 0, &hunk.row[1], hunk, &[0..3], indent).unwrap();
+            let mut baseline = BlockMetadata::default();
+            append_patch_row(&mut baseline, 0, &hunk.row[1], hunk, &[0..3], 0).unwrap();
+            assert_eq!(metadata.decoration, baseline.decoration);
+            assert_eq!(metadata.visible_decoration, baseline.visible_decoration);
+            if indent > 0 {
+                assert_eq!(metadata.gutter[0].chunk.remove(0).text, prefix);
+            }
+            assert_eq!(metadata.gutter, baseline.gutter);
+            assert_eq!(hunk.row[1].new_line, Some(0));
+        }
+    }
 
     #[tokio::test]
     async fn source_markdown_projects_concealment_and_injected_syntax_without_changing_rows() {
@@ -572,7 +682,7 @@ mod tests {
             new_lines: 0..7,
             raw_range: 0..1,
         };
-        append_display_row(&mut metadata, 0, &row, &group, None, None).unwrap();
+        append_display_row(&mut metadata, 0, &row, &group, None, None, 0).unwrap();
         assert_eq!(row.text, "λnew");
         assert_eq!(
             metadata.gutter[0]
@@ -595,7 +705,8 @@ mod tests {
                 &invalid,
                 &group,
                 None,
-                None
+                None,
+                0,
             )
             .is_err()
         );
@@ -634,7 +745,7 @@ mod tests {
             new_lines: 0..1,
             raw_range: 0..1,
         };
-        assert!(append_display_row(&mut metadata, 0, &row, &group, None, None).is_err());
+        assert!(append_display_row(&mut metadata, 0, &row, &group, None, None, 0).is_err());
         assert_eq!(metadata.decoration.len(), MAX_DECORATIONS);
     }
 
@@ -670,7 +781,7 @@ mod tests {
                 emphasis_fallback: None,
             };
             let mut metadata = BlockMetadata::default();
-            append_display_row(&mut metadata, 0, &row, &group, None, None).unwrap();
+            append_display_row(&mut metadata, 0, &row, &group, None, None, 0).unwrap();
             assert_eq!(metadata.gutter[0].chunk[0].text.len(), 4);
             assert_eq!(metadata.gutter[0].chunk[2].text.len(), 3);
             assert_eq!(metadata.gutter[0].chunk[4].capture, number);

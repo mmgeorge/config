@@ -105,6 +105,7 @@ function M.attach(options, callback)
   end
   -- Focus changes wait for edit acknowledgements before replacing comment presentation.
   function owner.sync_focus()
+    if options.plan.historical_revision then return end
     if not alive() or not owner.ready or owner.focus_pending or owner.add_pending then return end
     if editable.suspend_generated_text(owner.replica.editable) then editable.flush(owner.replica.editable) return end
     local view = owner.current_view()
@@ -255,7 +256,7 @@ function M.attach(options, callback)
     return false
   end
   request({ operation = "plan_open", document = owner.document, view = owner.view.id,
-    plan_id = options.plan.id, digest = options.plan.review_digest,
+    plan_id = options.plan.id, digest = options.plan.review_digest, revision = options.plan.historical_revision,
     saved_source_digest = options.recovery and options.recovery.saved_source_digest or nil,
     focused_annotation = options.recovery and next(options.recovery.draft) or nil,
     width = require("forge.width").capture(options.window) }, function(opened, failure)

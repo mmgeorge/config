@@ -29,6 +29,7 @@ impl ChangeTree {
         label: &str,
         suffix: &str,
         text: &str,
+        file_label: Option<(&str, &str)>,
     ) -> Result<Self> {
         let mut tree = Self {
             block: Vec::new(),
@@ -101,24 +102,20 @@ impl ChangeTree {
             } else {
                 FileChange::Modified
             };
-            let display_path = if matches!(status, FileChange::Renamed) {
+            let display_path = if let Some((_, label)) = file_label
+                .filter(|(source, _)| source.replace('\\', "/") == path.replace('\\', "/"))
+            {
+                label.replace(['\n', '\r'], " ")
+            } else if matches!(status, FileChange::Renamed) {
                 format!("{} → {path}", file.old_path.as_deref().unwrap())
             } else {
                 path.clone()
             };
-            let mut heading_text = String::from("  ▸ ");
-            let mut metadata = BlockMetadata::default();
-            for chunk in status.header(&display_path, Some((added as u64, removed as u64)), false) {
-                let column = heading_text.len();
-                heading_text.push_str(&chunk.text);
-                metadata.decoration.push(Decoration {
-                    range: TextRange { start: TextPosition { row: 0, column },
-                        end: TextPosition { row: 0, column: heading_text.len() } },
-                    capture: chunk.capture, priority: 100,
-                });
-            }
-            let heading = BufferBlock { id: BlockId(file_id.clone()),
-                text: BufferText::from_rows([heading_text])?, metadata };
+            let heading = forge_diff::projection::header(
+                BlockId(file_id.clone()),
+                status.header(&display_path, Some((added as u64, removed as u64)), false),
+                0,
+            )?;
             if let Some(path) = &file.new_path {
                 tree.push_action(
                     heading,
@@ -136,25 +133,26 @@ impl ChangeTree {
                 } else {
                     "No textual diff"
                 };
-                tree.push(renderer.literal(
+                tree.push(forge_diff::projection::header(
                     BlockId(format!("{file_id}:empty")),
-                    &format!("    {label}"),
-                    4,
+                    vec![TextChunk {
+                        text: label.into(),
+                        capture: "Comment".into(),
+                    }],
+                    0,
                 )?)?;
             }
             for (hunk_index, hunk) in file.hunk.iter().enumerate() {
                 let hunk_start = tree.block.len();
                 let hunk_id = format!("{file_id}:hunk:{hunk_index}");
-                let mut heading = renderer.literal(
+                let heading = forge_diff::projection::header(
                     BlockId(hunk_id.clone()),
-                    &format!("    ▸ {}", hunk.header),
-                    6,
+                    vec![TextChunk {
+                        text: hunk.header.into(),
+                        capture: "ForgeHunkHeader".into(),
+                    }],
+                    0,
                 )?;
-                heading.metadata.decoration.push(Decoration {
-                    range: whole_block(&heading),
-                    capture: "ForgeHunkHeader".into(),
-                    priority: 100,
-                });
                 tree.push(heading)?;
                 let emphasis = forge_diff::intraline::patch_emphasis(
                     forge_diff::intraline::IntralinePolicy::default(),
@@ -177,14 +175,8 @@ impl ChangeTree {
                             row,
                             hunk,
                             &emphasis[batch_index * 128 + row_index],
-                        )?;
-                        block.metadata.gutter.last_mut().unwrap().chunk.insert(
                             0,
-                            TextChunk {
-                                text: "      ".into(),
-                                capture: "Normal".into(),
-                            },
-                        );
+                        )?;
                         if let (Some(path), Some(line)) = (&file.new_path, row.new_line) {
                             let target = TargetId(format!("{}:row:{row_index}", block.id.0));
                             block.metadata.target.push(TargetRange {
@@ -266,6 +258,7 @@ impl ChangeTree {
             },
         };
         self.block[start].metadata.fold.push(FoldRange {
+            collapse_children: start == 0,
             id: FoldId(id.into()),
             start: TextPosition { row: 0, column: 0 },
             end,
@@ -317,17 +310,38 @@ mod tests {
 
     #[test]
     fn long_file_header_keeps_path_with_status_and_preserves_navigation() {
-        let path = format!("D:/.local/share/nvim-data/forge/harness/plans/{}/working 雪.md", "long-id/".repeat(12));
+        let path = format!(
+            "D:/.local/share/nvim-data/forge/harness/plans/{}/working 雪.md",
+            "long-id/".repeat(12)
+        );
         let diff = format!("--- {path}\n+++ {path}\n@@ -1 +1 @@\n-before\n+after\n");
         for columns in [40, 80, 120] {
-            let width = WidthProfile { columns, ..WidthProfile::default() };
+            let width = WidthProfile {
+                columns,
+                ..WidthProfile::default()
+            };
             let renderer = TranscriptRenderer::new(&width).unwrap();
-            let tree = ChangeTree::render(&renderer, "changes", "Changed", "", &diff).unwrap();
+            let tree =
+                ChangeTree::render(&renderer, "changes", "Changed", "", &diff, None).unwrap();
             let header = &tree.block[1];
             assert_eq!(header.text.row_count(), 1);
-            assert_eq!(header.text.row(0), Some(format!("  ▸ Modified {path} +1 -1").as_str()));
-            for capture in ["ForgeStatusFileModified", "ForgeStatusPath", "ForgeAddRange", "ForgeDeleteRange"] {
-                assert!(header.metadata.decoration.iter().any(|span| span.capture == capture));
+            assert_eq!(
+                header.text.row(0),
+                Some(format!("Modified {path} +1 -1").as_str())
+            );
+            for capture in [
+                "ForgeStatusFileModified",
+                "ForgeStatusPath",
+                "ForgeAddRange",
+                "ForgeDeleteRange",
+            ] {
+                assert!(
+                    header
+                        .metadata
+                        .decoration
+                        .iter()
+                        .any(|span| span.capture == capture)
+                );
             }
             assert!(tree.action.values().any(|action| matches!(action,
                 TranscriptAction::File { path: target, line: 1 } if target == &path)));
@@ -345,6 +359,7 @@ mod tests {
             "Changed",
             " · checkpoint matched",
             diff,
+            None,
         )
         .unwrap();
         assert_eq!(
@@ -364,6 +379,14 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(folds.len(), 5);
         assert!(folds.iter().all(|fold| fold.closed));
+        assert!(tree.block[0].metadata.fold[0].collapse_children);
+        assert!(folds.iter().skip(1).all(|fold| !fold.collapse_children));
+        let file = &tree.block[1];
+        let hunk = &tree.block[2];
+        assert_eq!(file.text.row(0), Some("Modified test.rs +1 -1"));
+        assert_eq!(hunk.text.row(0), Some("@@ -10,2 +20,2 @@ fn test"));
+        assert_eq!(file.metadata.gutter, hunk.metadata.gutter);
+        assert_eq!(file.metadata.gutter, tree.block[0].metadata.gutter);
         let body = tree
             .block
             .iter()
@@ -409,7 +432,8 @@ mod tests {
         let width = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&width).unwrap();
         let source = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n";
-        let tree = ChangeTree::render(&renderer, "bad:changes", "Changed", "", source).unwrap();
+        let tree =
+            ChangeTree::render(&renderer, "bad:changes", "Changed", "", source, None).unwrap();
         assert!(
             tree.block[0]
                 .text
@@ -432,11 +456,12 @@ mod tests {
             "--- /dev/null\n+++ b/new.rs\n@@ -0,0 +1,300 @@\n{}",
             "+line\n".repeat(300)
         );
-        let tree = ChangeTree::render(&renderer, "large:changes", "Changed", "", &source).unwrap();
+        let tree =
+            ChangeTree::render(&renderer, "large:changes", "Changed", "", &source, None).unwrap();
         let rows = tree
             .block
             .iter()
-            .filter(|block| !block.metadata.gutter.is_empty())
+            .filter(|block| block.id.0.contains(":rows:"))
             .collect::<Vec<_>>();
         assert_eq!(
             rows.iter()
@@ -460,8 +485,15 @@ mod tests {
             "--- a/test.rs\n+++ b/test.rs\n@@ -1,128 +1,128 @@\n{}-const café = 1;\n+const café = 2;\n",
             " context\n".repeat(127)
         );
-        let tree =
-            ChangeTree::render(&renderer, "replacement:changes", "Changed", "", &source).unwrap();
+        let tree = ChangeTree::render(
+            &renderer,
+            "replacement:changes",
+            "Changed",
+            "",
+            &source,
+            None,
+        )
+        .unwrap();
         let mut found = Vec::new();
         for block in &tree.block {
             for decoration in &block.metadata.visible_decoration {

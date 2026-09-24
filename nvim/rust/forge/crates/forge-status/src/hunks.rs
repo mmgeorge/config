@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, ensure};
 use forge_buffer::{
     block::{
-        BlockAnchor, BlockMetadata, BufferBlock, Decoration, FoldRange, TextPosition, TextRange,
+        BlockAnchor, BlockMetadata, BufferBlock, Decoration, FoldRange, TargetRange, TextChunk,
+        TextPosition, TextRange,
     },
     identity::{BlockId, FoldId, TargetId},
     sequence::SequenceEdit,
@@ -11,7 +12,7 @@ use forge_diff::source::{SourceCoordinate, SourceSide};
 
 use crate::{
     StatusSection,
-    document::{DOCUMENT_BYTES, DisplayGroupTarget, FileTarget, HunkTarget, StatusDocument, label},
+    document::{DOCUMENT_BYTES, DisplayGroupTarget, FileTarget, HunkTarget, StatusDocument},
 };
 
 pub(crate) struct HunkProjection {
@@ -137,7 +138,18 @@ pub(crate) fn project(
                     target: group_target.clone(),
                 },
             );
-            let mut header = label(header, &text, "ForgeHunkHeader", Some(group_target))?;
+            let mut header = forge_diff::projection::header(
+                header,
+                vec![TextChunk { text, capture: "ForgeHunkHeader".into() }],
+                0,
+            )?;
+            header.metadata.target.push(TargetRange {
+                id: group_target,
+                range: TextRange {
+                    start: TextPosition { row: 0, column: 0 },
+                    end: TextPosition { row: 1, column: 0 },
+                },
+            });
             for (column, value, capture) in [
                 (3, addition.as_str(), "ForgeAddRange"),
                 (4 + addition.len(), deletion.as_str(), "ForgeDeleteRange"),
@@ -213,6 +225,7 @@ pub(crate) fn project(
         }
         let text = BufferText::from_rows(body.text.slice(range.clone())?)?;
         header.metadata.fold = vec![FoldRange {
+            collapse_children: false,
             id: FoldId(header.id.0.clone()),
             start: TextPosition { row: 0, column: 0 },
             end: BlockAnchor {

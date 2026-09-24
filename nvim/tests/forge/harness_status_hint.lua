@@ -32,6 +32,12 @@ assert(displayed():find("<F6> open plan", 1, true))
 config.options.keymaps.harness.open_artifact = false
 assert(displayed() == "", "disabled binding must not be advertised")
 config.options.keymaps.harness.open_artifact = original
+commands.register(command_set, "abort_plan", function() end)
+assert(displayed():find("or abort plan", 1, true), "review status omitted the configured abort hint")
+local review_hint = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
+for _, chunk in ipairs(review_hint[1][4].virt_text) do
+  assert(chunk[2] ~= "ForgeHarnessPlan", "review hints inherited the purple status text")
+end
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 1, block = { {
     id = "status", text = { "", "Working (1s)" },
@@ -62,6 +68,17 @@ assert(text:find("<C-c> to interrupt", 1, true), text)
 assert(#marks == 2 and marks[1][2] == 1 and marks[1][3] == 0)
 assert(marks[2][3] == #"Working (2s · Inspecting repository structure)" - 1)
 local first = marks[1][4].virt_text[1][1]
+local state = require("forge.session").harness
+local original_session = state.session
+for _, mode in ipairs({ "read", "write", "full", "yolo", "plan" }) do
+  state.session = { mode = mode }
+  hint.render(transcript, command_set, 120)
+  local _, colored = working_marks()
+  local capture = require("forge.infra.highlights").harness_mode(mode)
+  assert(colored[1][4].hl_group == capture, "Working text has the wrong mode color")
+  assert(colored[1][4].virt_text[1][2] == capture, "spinner differs from Working text")
+end
+state.session = original_session
 assert(vim.wait(500, function()
   local _, current = working_marks()
   return current[1][4].virt_text[1][1] ~= first

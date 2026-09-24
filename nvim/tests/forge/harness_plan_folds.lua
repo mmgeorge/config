@@ -27,12 +27,16 @@ local snapshot = { document = replica.document, revision = 0, block = {
   block("last-tool", { "• harness_plan_submit" }, 4),
   block("response", { "Resolved the configuration name." }, 0),
 } }
+snapshot.block[4].metadata.gutter[1].chunk[1].text = "    ◦ "
+assert(snapshot.block[4].metadata.gutter[1].chunk[1].capture == "Normal")
 assert(buffer.apply_snapshot(replica, snapshot).kind == "Applied")
 local window = vim.api.nvim_get_current_win()
 vim.api.nvim_win_set_buf(window, replica.buffer)
 folds.attach(replica, window)
 state.transcript_buf, state.transcript_win = replica.buffer, window
 state.presentation = { transcript = replica, toggle_tool = function() return false end }
+local opened = 0
+state.presentation.activate = function() opened = opened + 1 end
 local function tab(row)
   vim.api.nvim_win_set_cursor(window, { row, 0 })
   controller.toggle_activity()
@@ -54,6 +58,10 @@ assert(vim.fn.foldclosed(2) == 2 and vim.fn.foldclosedend(2) == 9, "exchange ran
 assert(vim.fn.foldclosed(10) == -1, "exchange swallowed final response")
 tab(2)
 local saved = folds.capture(replica)
+tab(10)
+assert(opened == 0, "Tab activated an unfolded timeline row")
+controller.open_timeline_entry()
+assert(opened == 1, "Enter action did not activate the selected timeline row")
 snapshot.revision = 1
 assert(buffer.apply_snapshot(replica, snapshot).kind == "Applied")
 folds.restore(replica, saved)

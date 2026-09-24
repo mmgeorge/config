@@ -1324,6 +1324,7 @@ impl StatusService {
                     .context("diff display group is missing")?,
                 file.old_syntax.as_ref(),
                 file.new_syntax.as_ref(),
+                0,
             ) {
                 file.state = BodyState::Unavailable(failure.to_string());
                 return self.deliver(document, target, file);

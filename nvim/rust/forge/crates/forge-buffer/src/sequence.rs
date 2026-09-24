@@ -759,6 +759,7 @@ mod tests {
         use crate::block::{BlockAnchor, FoldRange};
         let mut first = block(1, 1);
         first.metadata.fold.push(FoldRange {
+            collapse_children: false,
             id: FoldId("section".into()),
             start: TextPosition { row: 0, column: 0 },
             end: BlockAnchor {

@@ -70,6 +70,9 @@ pub struct FoldRange {
     pub start: TextPosition,
     pub end: BlockAnchor,
     pub closed: bool,
+    #[serde(default)]
+    /// Close descendant folds when this heading is explicitly opened.
+    pub collapse_children: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

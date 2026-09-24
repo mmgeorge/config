@@ -62,10 +62,14 @@ function M.render(transcript, commands, width)
     return
   end
   if working then
+    local session = require("forge.session").harness.session or {}
+    local capture = require("forge.infra.highlights").harness_mode(session.mode or session.execution_mode)
+    local text = vim.api.nvim_buf_get_lines(target_buffer, row, row + 1, false)[1]
     local function draw()
       if not vim.api.nvim_buf_is_valid(target_buffer) then M.clear(target_buffer) return end
       vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
-        id = 1, virt_text = { { spinner.frame_at(vim.uv.now()) .. " ", "ForgeTimelineStatusSpinner" } },
+        id = 1, virt_text = { { spinner.frame_at(vim.uv.now()) .. " ", capture } },
+        end_row = row, end_col = #text, hl_group = capture, priority = 110,
         virt_text_pos = "inline", hl_mode = "combine",
       })
     end

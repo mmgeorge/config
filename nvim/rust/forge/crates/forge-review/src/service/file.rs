@@ -599,6 +599,7 @@ fn project_next(file: &mut RetainedFile) -> Result<()> {
                 .context("diff display group is missing")?,
             file.old_syntax.as_ref(),
             file.new_syntax.as_ref(),
+            0,
         )?;
         decorations += metadata.decoration.len() + metadata.visible_decoration.len();
         ensure!(

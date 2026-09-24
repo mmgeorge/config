@@ -24,6 +24,12 @@ local function fold_start(session, record)
   return start + record.fold.start.row + 1
 end
 
+local function fold_end(session, record)
+  local _, finish = session.sequence:position(record.fold["end"].block)
+  return finish + record.fold["end"].position.row
+    + (record.fold["end"].position.column > 0 and 1 or 0)
+end
+
 local function close_open_fold(row)
   -- foldclosed() also returns -1 when the row has no native fold.
   if vim.fn.foldlevel(row) > 0 and vim.fn.foldclosed(row) < 0 then
@@ -36,9 +42,7 @@ local function capture_window(session, window)
     local view, state, opened = vim.fn.winsaveview(), {}, {}
     local record_list = {}
     for id, record in pairs(session.fold and session.fold.record or {}) do
-      local _, finish = session.sequence:position(record.fold["end"].block)
-      finish = finish + record.fold["end"].position.row
-        + (record.fold["end"].position.column > 0 and 1 or 0)
+      local finish = fold_end(session, record)
       record_list[#record_list + 1] = { id = id, row = fold_start(session, record), finish = finish }
     end
     table.sort(record_list, function(left, right)
@@ -103,6 +107,7 @@ function M.validate(sequence, changed, retired, state, read_row)
     assert(not seen[fold.id], "duplicate fold identity")
     seen[fold.id] = true
     assert(type(fold.closed) == "boolean", "invalid fold closed state")
+    assert(fold.collapse_children == nil or type(fold.collapse_children) == "boolean", "invalid fold child policy")
     local previous = state and state.record[fold.id]
     assert(not previous or previous.owner == owner or changed[previous.owner] or retired[previous.owner],
       "duplicate fold identity")
@@ -252,7 +257,19 @@ function M.toggle_heading(session, window)
   local row = vim.api.nvim_win_get_cursor(window)[1]
   for _, record in pairs(session.fold and session.fold.record or {}) do
     if fold_start(session, record) == row then
-      vim.api.nvim_win_call(window, function() vim.cmd("normal! za") end)
+      vim.api.nvim_win_call(window, function()
+        local opening = vim.fn.foldclosed(row) == row
+        vim.cmd("normal! za")
+        if opening and record.fold.collapse_children then
+          local finish, children = fold_end(session, record), {}
+          for _, child in pairs(session.fold.record) do
+            local start = fold_start(session, child)
+            if start > row and fold_end(session, child) <= finish then children[#children + 1] = start end
+          end
+          table.sort(children, function(left, right) return left > right end)
+          for _, start in ipairs(children) do close_open_fold(start) end
+        end
+      end)
       return true
     end
   end

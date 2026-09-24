@@ -73,6 +73,7 @@
 ---@field history_next ForgeKeymap
 ---@field toggle_activity ForgeKeymap
 ---@field open_artifact ForgeKeymap
+---@field abort_plan ForgeKeymap
 ---@field agent ForgeKeymap
 ---@field sessions ForgeKeymap
 ---@field open_timeline ForgeKeymap
@@ -254,6 +255,7 @@ M.defaults = {
       history_next = "<Down>",
       toggle_activity = { "oa", "<Tab>" },
       open_artifact = "op",
+      abort_plan = "or",
       agent = "og",
       sessions = "os",
       open_timeline = { "<CR>", "." },
@@ -275,6 +277,7 @@ M.defaults = {
       delete = "J",
       accept = "oY",
       request_changes = "oN",
+      abort_plan = "or",
       close = "q",
       help = "?",
     },

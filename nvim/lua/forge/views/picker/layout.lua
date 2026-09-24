@@ -52,11 +52,45 @@ function PickerLayout.build(page, selected_index, width, options)
   end
   if #(page.content_list or {}) > 0 and #page.option_list > 0 then lines[#lines + 1] = "" end
 
-  local label_width = 0
-  for _, option in ipairs(page.option_list) do
-    label_width = math.max(label_width, vim.fn.strdisplaywidth(option.label or ""))
+  local column_width = {}
+  for column, heading in ipairs(page.column_headers or {}) do
+    column_width[column] = vim.fn.strdisplaywidth(heading)
   end
-  label_width = math.min(label_width, math.max(12, math.floor(usable_width * 0.42)))
+  local prefix_width = 5
+  for _, option in ipairs(page.option_list) do
+    prefix_width = math.max(prefix_width, 2 + vim.fn.strdisplaywidth(option.key or " ") + 2)
+    for column, value in ipairs(option.columns or { option.label or "", option.detail or "" }) do
+      column_width[column] = math.max(column_width[column] or 0, vim.fn.strdisplaywidth(value))
+    end
+  end
+  local total = prefix_width + math.max(0, #column_width - 1) * 2
+  for _, size in ipairs(column_width) do total = total + size end
+  while total > usable_width do
+    local widest = nil
+    for column, size in ipairs(column_width) do
+      if size > 3 and (not widest or size > column_width[widest]) then widest = column end
+    end
+    if not widest then break end
+    column_width[widest] = column_width[widest] - 1
+    total = total - 1
+  end
+  local function column_row(values, prefix)
+    local cells = {}
+    for column, value in ipairs(values) do
+      local size = column_width[column]
+      if vim.fn.strdisplaywidth(value) > size then
+        local count = vim.fn.strchars(value)
+        repeat count = count - 1 until count == 0 or vim.fn.strdisplaywidth(vim.fn.strcharpart(value, 0, count)) <= size - 1
+        value = vim.fn.strcharpart(value, 0, count) .. "…"
+      end
+      cells[column] = value .. string.rep(" ", math.max(0, size - vim.fn.strdisplaywidth(value)))
+    end
+    return prefix .. table.concat(cells, "  "):gsub("%s+$", "")
+  end
+  if page.column_headers then
+    lines[#lines + 1] = column_row(page.column_headers, string.rep(" ", prefix_width))
+    section_line[#section_line + 1] = #lines
+  end
   local previous_section = nil
   for index, option in ipairs(page.option_list) do
     if option.section and option.section ~= previous_section then
@@ -67,17 +101,9 @@ function PickerLayout.build(page, selected_index, width, options)
     end
     local key = option.key and (option.key .. "  ") or "   "
     local prefix = "  " .. key
-    local detail = option.detail or ""
-    local label = option.label or ""
+    prefix = prefix .. string.rep(" ", prefix_width - vim.fn.strdisplaywidth(prefix))
     local first = #lines + 1
-    local row_label_width = math.max(label_width, vim.fn.strdisplaywidth(label))
-    local two_column_width = vim.fn.strdisplaywidth(prefix) + row_label_width + 2 + vim.fn.strdisplaywidth(detail)
-    if detail ~= "" and two_column_width <= usable_width then
-      lines[#lines + 1] = prefix .. label .. string.rep(" ", row_label_width - vim.fn.strdisplaywidth(label) + 2) .. detail
-    else
-      append(lines, wrap(label, usable_width, prefix))
-      if detail ~= "" then append(lines, wrap(detail, usable_width, "      ")) end
-    end
+    lines[#lines + 1] = column_row(option.columns or { option.label or "", option.detail or "" }, prefix)
     local primary_last = #lines
     for _, child in ipairs(option.child_line_list or {}) do
       append(lines, wrap(child, usable_width, "    ", "      "))

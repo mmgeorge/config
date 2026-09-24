@@ -1,5 +1,6 @@
 mod fork;
 mod new_session;
+mod replanning;
 
 pub use fork::{ForkPreparation, prepare_provider_fork};
 pub use new_session::prepare_new_session;
@@ -1098,6 +1099,7 @@ impl HarnessBroker {
             HarnessMethod::PlanRequestChanges => self.request_plan_changes(params).await,
             HarnessMethod::PlanCancel => self.cancel_plan(),
             HarnessMethod::PlanActivate => self.activate_plan(params),
+            HarnessMethod::PlanList => self.list_replanning_choices(),
             HarnessMethod::PlanScopeDeviationReview => self.select_scope_deviation_review(params),
             HarnessMethod::PlanDeviationResolve => self.resolve_plan_deviation(params).await,
             HarnessMethod::QuestionAnswer => self.answer_question(params),
@@ -1986,6 +1988,9 @@ impl HarnessBroker {
         if text == "/plan retry" {
             return self.retry_plan().await;
         }
+        if let Some(selection) = text.strip_prefix("/replan ") {
+            return self.replan(selection).await;
+        }
         let failed_plan_active = self
             .session
             .active_plan_id
@@ -1999,6 +2004,7 @@ impl HarnessBroker {
             "plan generation stopped; run /plan retry or /plan cancel"
         );
         anyhow::ensure!(text != "/plan", "usage: /plan <prompt>");
+        anyhow::ensure!(text != "/replan", "select a plan and revision with the /replan picker");
         let explicit_plan_request = text.strip_prefix("/plan ");
         let active_plan_controls = self
             .session
@@ -2024,8 +2030,6 @@ impl HarnessBroker {
         });
         if let Some(request) = plan_request {
             anyhow::ensure!(!request.trim().is_empty(), "usage: /plan <prompt>");
-            self.session.mode = HarnessMode::Plan;
-            let now_ms = self.clock.now_ms();
             let plan_id = Uuid::new_v4().to_string();
             let document = PlanDocument {
                 schema_version: crate::plan::PLAN_SCHEMA_VERSION,
@@ -2041,50 +2045,7 @@ impl HarnessBroker {
                 tasks: Vec::new(),
                 assumptions: Vec::new(),
             };
-            let working_path =
-                self.plan_file
-                    .write_working_document(&self.session.id, &plan_id, &document)?;
-            let plan = PlanRecord {
-                id: plan_id.clone(),
-                session_id: self.session.id.clone(),
-                request: request.to_owned(),
-                title: document.title.clone(),
-                state: PlanState::Generating,
-                working_path: working_path.to_string_lossy().into_owned(),
-                document_version: document.version,
-                model_revision: 0,
-                submitted_version: None,
-                accepted_revision: None,
-                user_revision: 0,
-                review_digest: None,
-                accepted_digest: None,
-                elicitation: None,
-                acceptance: None,
-                question_ledger: Default::default(),
-                generation: Default::default(),
-                validation_warning: Vec::new(),
-                created_at_ms: now_ms,
-                updated_at_ms: now_ms,
-            };
-            self.store.save_plan(&plan)?;
-            self.session.active_plan_id = Some(plan_id.clone());
-            self.save_session()?;
-            let mut leading_event = Vec::new();
-            if let Some(goal) = self.current_goal()?
-                && goal.state == GoalState::Active
-            {
-                let (_, pause_event) = self.pause_goal().await?;
-                leading_event.extend(pause_event);
-            }
-            let document_json = document.model_json()?;
-            let (result, mut event) = self
-                .run_planning_interaction(
-                    PlanPrompt::with_active_document(PlanPrompt::draft(request), &document_json),
-                    Some(ExchangeAdmission::plan(text, Some(plan_id), false)),
-                )
-                .await?;
-            leading_event.append(&mut event);
-            return Ok((result, leading_event));
+            return self.start_plan(request.to_owned(), text.clone(), document).await;
         }
         match text.as_str() {
             "/goal pause" => return self.pause_goal().await,
@@ -3000,6 +2961,7 @@ Planning continuation: turn {} of {}.",
         let (mut interaction, new_interaction) = self
             .interaction_for_turn(admitted_prompt, admission.is_some(), now_ms)
             .await?;
+        interaction.mode = Some(self.session.mode);
         if new_interaction && let Some(admission) = admission.as_ref() {
             interaction.kind = admission.kind;
             interaction.plan_id.clone_from(&admission.plan_id);
@@ -4462,6 +4424,7 @@ Planning continuation: turn {} of {}.",
                 ordinal: self.store.next_exchange_ordinal(&self.session.id)?,
                 prompt: text.to_owned(),
                 kind: ExchangeKind::Chat,
+                mode: Some(self.session.mode),
                 plan_id: None,
                 execution_id: None,
                 goal_id: None,
@@ -5002,13 +4965,14 @@ Planning continuation: turn {} of {}.",
         let plan_id = self
             .session
             .active_plan_id
-            .take()
+            .clone()
             .context("no plan awaits review")?;
         let mut plan = self
             .store
             .load_plan(&plan_id)?
             .context("active plan record is missing")?;
         PlanStateMachine::apply(&mut plan, PlanEvent::Cancelled, self.clock.now_ms())?;
+        plan.acceptance = None;
         self.store.save_plan(&plan)?;
         let lifecycle = PlanLifecycleRecord {
             title: plan.title.clone(),
@@ -5026,6 +4990,16 @@ Planning continuation: turn {} of {}.",
             created_at_ms: self.clock.now_ms(),
         };
         self.store.save_plan_lifecycle(&lifecycle)?;
+        for mut exchange in self.store.list_exchange(&self.session.id)? {
+            if exchange.plan_id.as_deref() == Some(&plan.id) && exchange.completed_at_ms.is_none() {
+                exchange.awaiting_input = false;
+                exchange.elicitation = None;
+                exchange.finish(ExchangeState::Cancelled, self.clock.now_ms())?;
+                self.store.save_exchange(&exchange)?;
+            }
+        }
+        self.session.active_plan_id = None;
+        self.session.mode = self.session.execution_mode.into();
         self.save_session()?;
         Ok((
             serde_json::to_value(&plan)?,
@@ -5074,6 +5048,18 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         .await
     }
 
+    /// Read a submitted revision after validating its owning session and revision range.
+    pub(crate) fn capture_plan_revision(
+        &self,
+        plan_id: &str,
+        revision: u32,
+    ) -> Result<crate::plan::review_source::PlanReviewSource> {
+        let plan = self.store.load_plan(plan_id)?.context("plan artifact not found")?;
+        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
+        anyhow::ensure!(revision > 0 && revision <= plan.model_revision, "plan revision is unavailable");
+        self.plan_file.capture_revision_source(&self.session.id, &plan.id, revision)
+    }
+
     fn activate_plan(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let plan_id = required_text(&params, "plan_id")?;
         let plan = self
@@ -5088,6 +5074,20 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             !plan.working_path.is_empty(),
             "plan artifact is not ready for review"
         );
+        if let Some(revision) = params.get("revision").filter(|value| !value.is_null()) {
+            let revision: u32 = serde_json::from_value(revision.clone())?;
+            if revision != plan.model_revision || plan.state != PlanState::AwaitingReview {
+                let source = self.capture_plan_revision(&plan.id, revision)?;
+                let mut historical = serde_json::to_value(&plan)?;
+                historical["title"] = serde_json::json!(source.document.title);
+                historical["working_path"] = serde_json::json!(source.path);
+                historical["document_version"] = serde_json::json!(source.document.version);
+                historical["model_revision"] = serde_json::json!(revision);
+                historical["historical_revision"] = serde_json::json!(revision);
+                historical["review_digest"] = serde_json::json!(crate::plan::digest(&serde_json::to_vec(&source.document)?));
+                return Ok((historical, Vec::new()));
+            }
+        }
         self.session.active_plan_id = Some(plan.id.clone());
         self.save_session()?;
         Ok((
@@ -6582,6 +6582,7 @@ mod test {
 
     fn completed_interaction(id: &str, session_id: &str, node_list: Vec<ExchangeNode>) -> Exchange {
         Exchange {
+            mode: None,
             finalization_error: None,
             finalization_outcome: None,
             agent_id: HarnessSession::primary_agent_id(session_id),
@@ -9694,6 +9695,71 @@ mod test {
     }
 
     #[tokio::test]
+    async fn abort_plan_clears_review_and_question_waits_and_restores_execution_mode() {
+        for structured in [false, true] {
+            let repository = repository();
+            let data = tempfile::tempdir().unwrap();
+            let mut broker = planning_question_broker(repository.path(), data.path(), structured);
+            broker.session.execution_mode = ExecutionMode::Full;
+            let planned = broker.dispatch(Request { id:1, method:"prompt.submit".into(),
+                params:json!({"text":"/plan migrate"}) }).await;
+            assert!(planned.response.error().is_none());
+            let plan = broker.snapshot().unwrap().active_plan.unwrap();
+            assert!(matches!(plan.state, PlanState::AwaitingInput | PlanState::AwaitingReview));
+            let cancelled = broker.dispatch(Request { id:2, method:"plan.cancel".into(), params:json!({}) }).await;
+            assert!(cancelled.response.error().is_none());
+            let snapshot = broker.snapshot().unwrap();
+            assert!(snapshot.active_plan.is_none());
+            assert_eq!(broker.session.mode, HarnessMode::Full);
+            assert!(snapshot.active_elicitation.is_none());
+            assert!(!snapshot.timeline.iter().any(|entry| matches!(entry, TimelineEntry::Status { .. })));
+            assert!(broker.store.list_exchange(&broker.session.id).unwrap().iter()
+                .filter(|exchange| exchange.plan_id.as_deref() == Some(&plan.id))
+                .all(|exchange| exchange.completed_at_ms.is_some() && !exchange.awaiting_input));
+        }
+    }
+
+    #[tokio::test]
+    async fn replan_uses_selected_snapshot_and_reports_completed_execution_only() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.dispatch(Request { id:1, method:"prompt.submit".into(), params:json!({"text":"/plan migrate"}) }).await;
+        let mut source = broker.snapshot().unwrap().active_plan.unwrap();
+        let original = broker.plan_file.read_submitted_document(&broker.session.id, &source.id, 1).unwrap();
+        let mut revised = original.clone();
+        revised.version += 1;
+        revised.assumptions = vec!["Only revision two contains this assumption".into()];
+        broker.plan_file.write_working_document(&broker.session.id, &source.id, &revised).unwrap();
+        let (_, _, checksum) = broker.plan_file.submit_document_revision(&broker.session.id, &source.id, 2, revised.version).unwrap();
+        source.model_revision = 2;
+        source.document_version = revised.version;
+        source.review_digest = Some(checksum);
+        broker.store.save_plan(&source).unwrap();
+        let (choices, _) = broker.list_replanning_choices().unwrap();
+        assert_eq!(choices[0]["revision_count"], 2);
+        assert_eq!(choices[0]["implemented"], false);
+        assert!(broker.replan(&format!("{} 99", source.id)).await.is_err());
+        assert_eq!(broker.session.active_plan_id.as_deref(), Some(source.id.as_str()));
+        broker.replan(&format!("{} 1", source.id)).await.unwrap();
+        let next = broker.snapshot().unwrap().active_plan.unwrap();
+        assert_ne!(next.id, source.id);
+        assert_eq!(next.model_revision, 1);
+        let seeded = broker.plan_file.read_submitted_document(&broker.session.id, &next.id, 1).unwrap();
+        assert_eq!(seeded.assumptions, original.assumptions);
+        assert_eq!(broker.plan_file.read_submitted_document(&broker.session.id, &source.id, 1).unwrap(), original);
+        broker.store.save_plan_execution(&PlanExecutionRecord {
+            id:"completed-source".into(), session_id:broker.session.id.clone(), plan_id:source.id.clone(),
+            goal_id:"goal".into(), state:PlanExecutionState::Complete, planning_backend_session_id:None,
+            execution_backend_session_id:None, scheduler:Default::default(), lifecycle:Vec::new(),
+            created_at_ms:0, completed_at_ms:Some(1),
+        }).unwrap();
+        let (choices, _) = broker.list_replanning_choices().unwrap();
+        assert!(choices.as_array().unwrap().iter().any(|choice| choice["id"] == source.id && choice["implemented"] == true));
+        assert!(choices.as_array().unwrap().iter().any(|choice| choice["id"] == next.id && choice["implemented"] == false));
+    }
+
+    #[tokio::test]
     async fn cancel_terminates_a_failed_plan_without_reopening_input() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -10132,6 +10198,22 @@ mod test {
             updated_plan.submitted_version,
             Some(updated_document.version)
         );
+        let active_before = broker.session.active_plan_id.clone();
+        let (historical, events) = broker.activate_plan(json!({
+            "plan_id": plan.id, "revision": plan.model_revision,
+        })).unwrap();
+        assert_eq!(historical["historical_revision"], plan.model_revision);
+        assert!(events.is_empty());
+        assert_eq!(broker.session.active_plan_id, active_before);
+        assert!(historical["working_path"].as_str().unwrap().contains("submitted-"));
+        let original = broker.capture_plan_revision(&plan.id, plan.model_revision).unwrap();
+        assert_eq!(original.document.entity_changes[0].name, "migrate");
+        assert!(broker.activate_plan(json!({"plan_id": plan.id, "revision": 999})).is_err());
+        let (current, _) = broker.activate_plan(json!({
+            "plan_id": plan.id, "revision": updated_plan.model_revision,
+        })).unwrap();
+        assert!(current.get("historical_revision").is_none());
+        assert_eq!(current["model_revision"], updated_plan.model_revision);
     }
 
     #[tokio::test]
