@@ -74,7 +74,7 @@ if vim.g.forge_markdown_layout_child then
       layout = { indent = vim.g.forge_markdown_layout_indent or 2, source_indent = source_indent },
     } },
   } }).kind == "Applied")
-  vim.api.nvim_win_set_cursor(0, {18, 5})
+  vim.api.nvim_win_set_cursor(0, {1, 0})
   require("forge.render.harness.markdown").render(owner.buffer, vim.api.nvim_get_current_win(), {
     { first0 = 2, after0 = 3 }, { first0 = 3, after0 = 4, indent = vim.g.forge_markdown_layout_indent or 2, source_indent = (vim.g.forge_markdown_layout_indent or 2) - 2 },
     { first0 = 4, after0 = #lines + 4, indent = vim.g.forge_markdown_layout_indent or 2, source_indent = (vim.g.forge_markdown_layout_indent or 2) - 2 },
@@ -148,8 +148,43 @@ local function verify_layout(width)
 end
 local passed, failure = pcall(function()
   for _, width in ipairs({ 120, 80, 100, 120 }) do verify_layout(width) end
+  local function expect_equation(row, source)
+    vim.rpcrequest(job, "nvim_exec_lua", "vim.api.nvim_win_set_cursor(0, {..., 0})", { row })
+    assert(vim.wait(3000, function()
+      local screen = table.concat(capture(), "\n")
+      local opening = screen:find("\\[", 1, true) ~= nil
+      local body = screen:find("\\int", 1, true) ~= nil
+      local closing = screen:find("\\]", 1, true) ~= nil
+      local rendered = screen:find("⌠", 1, true) ~= nil
+      return opening == source and body == source and closing == source and rendered ~= source
+    end, 20), "equation reveal was partial at source row " .. row)
+  end
+  for _, row in ipairs({6, 7, 8, 9, 10, 9, 8, 7, 6}) do
+    expect_equation(row, row >= 7 and row <= 9)
+  end
+  vim.rpcrequest(job, "nvim_exec_lua", "vim.api.nvim_win_set_cursor(0, {7, 0})", {})
+  assert(vim.wait(3000, function()
+    local screen = table.concat(capture(), "\n")
+    return screen:find("\\int", 1, true) and not screen:find("⌠", 1, true)
+  end, 20), "equation did not reveal its complete source on entry")
+  local previous = 7
+  for _ = 1, 12 do
+    local before = vim.rpcrequest(job, "nvim_win_get_cursor", 0)
+    vim.rpcrequest(job, "nvim_input", "t")
+    assert(vim.wait(3000, function()
+      return not vim.deep_equal(vim.rpcrequest(job, "nvim_win_get_cursor", 0), before)
+    end, 20), "down motion did not advance")
+    local current = vim.rpcrequest(job, "nvim_win_get_cursor", 0)[1]
+    assert(current >= previous and current <= previous + 1, "down motion skipped or revisited equation source")
+    previous = current
+    if current == 11 then break end
+  end
+  assert(previous == 11, "down motion did not leave the equation")
+  assert(vim.wait(3000, function()
+    return table.concat(capture(), "\n"):find("⌠", 1, true)
+  end, 20), "equation did not render again after leaving")
 end)
 vim.fn.jobstop(job)
 assert(passed, failure)
-print("harness_markdown_layout: headings, bullets, math, and cursor concealment passed at 120/80/100/120 columns")
+print("harness_markdown_layout: layout, equation source reveal, and mapped down navigation passed")
 vim.cmd("qa!")

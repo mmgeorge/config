@@ -14,6 +14,65 @@ local RequestContext = require("render-markdown.request.context")
 local output_cache = {}
 ---@type table<string, boolean>
 local notified_error = {}
+local reveal_state = {}
+
+---@param buffer integer
+---@param config table
+---@return integer?, integer?
+local function reveal_range(buffer, config)
+  local mode = environment.mode.get()
+  local policy = config.anti_conceal
+  if not policy.enabled or environment.mode.is(mode, policy.disabled_modes)
+    or environment.mode.is(mode, policy.ignore.latex or {})
+    or vim.api.nvim_get_current_buf() ~= buffer then return end
+  local row = vim.api.nvim_win_get_cursor(0)[1] - 1
+  if environment.mode.is(mode, { "v", "V", "\22" }) then
+    local anchor = vim.fn.getpos("v")[2] - 1
+    return math.min(row, anchor), math.max(row, anchor)
+  end
+  return row - policy.above, row + policy.below
+end
+
+---@param block MarkdownMathBlock
+---@param first integer?
+---@param last integer?
+---@return boolean
+local function revealed(block, first, last)
+  return first ~= nil and first < block.end_row and last >= block.start_row
+end
+
+---@param buffer integer
+---@param config table
+---@return string
+local function reveal_key(buffer, config)
+  local first, last = reveal_range(buffer, config)
+  local selected = {}
+  for _, block in ipairs(block_store.get(buffer)) do
+    if revealed(block, first, last) then selected[#selected + 1] = tostring(block.start_row) end
+  end
+  return table.concat(selected, ",")
+end
+
+---@param buffer integer
+local function track_reveal(buffer)
+  if reveal_state[buffer] then return end
+  local state = { key = "" }
+  reveal_state[buffer] = state
+  vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "ModeChanged", "BufEnter" }, {
+    buffer = buffer,
+    callback = function(event)
+      local config = require("render-markdown.state").get(buffer)
+      local key = reveal_key(buffer, config)
+      if key == state.key then return end
+      state.key = key
+      require("render-markdown.core.ui").update(buffer, vim.api.nvim_get_current_win(), event.event, true)
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufWipeout", {
+    buffer = buffer, once = true,
+    callback = function() reveal_state[buffer] = nil end,
+  })
+end
 
 ---@param message string
 local function notify_once(message)
@@ -60,9 +119,9 @@ local function add_marks(buffer, block, output, config, marks)
   for output_index = 2, #output do
     virtual_line_list[#virtual_line_list + 1] = { { block.indent .. output[output_index], config.highlight } }
   end
-  marks:add(config, "latex", block.start_row, 0, {
-    end_row = block.start_row,
-    end_col = #(vim.api.nvim_buf_get_lines(buffer, block.start_row, block.start_row + 1, false)[1] or ""),
+  marks:add(config, false, block.start_row, 0, {
+    end_row = block.end_row - 1,
+    end_col = #(vim.api.nvim_buf_get_lines(buffer, block.end_row - 1, block.end_row, false)[1] or ""),
     conceal = "",
     virt_text = { { block.indent .. output[1], config.highlight } },
     virt_text_pos = "inline",
@@ -70,7 +129,7 @@ local function add_marks(buffer, block, output, config, marks)
     virt_lines_above = false,
   })
   if block.end_row > block.start_row + 1 then
-    marks:add(config, "latex", block.start_row + 1, 0, {
+    marks:add(config, false, block.start_row + 1, 0, {
       end_row = block.end_row,
       end_col = 0,
       conceal_lines = "",
@@ -96,10 +155,15 @@ function module.parse(context)
 
   local request_context = RequestContext.get(context.buf)
   if not request_context then return builtin end
+  track_reveal(context.buf)
+  reveal_state[context.buf].key = reveal_key(context.buf, request_context.config)
+  local first, last = reveal_range(context.buf, request_context.config)
   local marks = Marks.new(request_context, false)
   for _, block in ipairs(block_list) do
-    local output = convert(block.input)
-    if output then add_marks(context.buf, block, output, request_context.config.latex, marks) end
+    if not revealed(block, first, last) then
+      local output = convert(block.input)
+      if output then add_marks(context.buf, block, output, request_context.config.latex, marks) end
+    end
   end
   vim.list_extend(builtin, marks:get())
   return builtin

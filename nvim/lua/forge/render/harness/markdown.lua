@@ -4,6 +4,7 @@ local failed = false
 local language_registered = false
 local layout_ranges = {}
 local layout_handlers = false
+local cursor_attached = {}
 
 --- Registers markdown Tree-sitter parser support for the Harness filetype.
 ---@return boolean registered True if registration succeeded.
@@ -153,6 +154,21 @@ function M.render(buf, win, range_list)
     end }
   end
   layout_ranges[buf] = range_list
+  if not cursor_attached[buf] then
+    cursor_attached[buf] = true
+    vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "ModeChanged", "BufEnter" }, {
+      buffer = buf,
+      callback = function(event)
+        if not layout_ranges[buf] or vim.api.nvim_get_current_buf() ~= buf then return end
+        require("render-markdown.core.ui").update(buf, vim.api.nvim_get_current_win(), event.event, false)
+      end,
+    })
+    vim.api.nvim_create_autocmd("BufWipeout", {
+      buffer = buf,
+      once = true,
+      callback = function() cursor_attached[buf] = nil end,
+    })
+  end
   if not layout_handlers then
     local state = require("render-markdown.state")
     for _, language in ipairs({ "markdown", "latex" }) do
@@ -169,7 +185,7 @@ function M.render(buf, win, range_list)
       enabled = true,
       render_modes = true,
       debounce = 0,
-      anti_conceal = { enabled = false },
+      anti_conceal = { enabled = true, above = 0, below = 0 },
       completions = { lsp = { enabled = false } },
       sign = { enabled = false },
       win_options = {
