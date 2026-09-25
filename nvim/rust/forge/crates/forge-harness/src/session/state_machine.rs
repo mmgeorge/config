@@ -60,6 +60,8 @@ impl SessionPhase {
         active_wait: Option<&ActiveWait>,
         exchange: Option<&Exchange>,
     ) -> Self {
+        let executing = exchange.is_some_and(|exchange| exchange.state == ExchangeState::Running
+            && exchange.execution_started_at_ms.is_some());
         if let Some(exchange) =
             exchange.filter(|exchange| exchange.state == ExchangeState::Finalizing)
         {
@@ -75,7 +77,7 @@ impl SessionPhase {
             };
         }
         if let Some(plan) =
-            active_plan.filter(|plan| plan.acceptance.is_some() || plan.elicitation.is_some())
+            active_plan.filter(|plan| !executing && (plan.acceptance.is_some() || plan.elicitation.is_some()))
         {
             return Self::AwaitingInput {
                 owner: if plan.acceptance.is_some() {
@@ -89,6 +91,7 @@ impl SessionPhase {
         }
         if let Some(exchange) = exchange.filter(|exchange| {
             exchange.state == ExchangeState::Running
+                && !executing
                 && (exchange.awaiting_input || exchange.elicitation.is_some())
         }) {
             return Self::AwaitingInput {
@@ -97,7 +100,7 @@ impl SessionPhase {
                 exchange_id: Some(exchange.id.clone()),
             };
         }
-        if let Some(plan) = active_plan.filter(|plan| plan.state == PlanState::AwaitingReview) {
+        if let Some(plan) = active_plan.filter(|plan| !executing && plan.state == PlanState::AwaitingReview) {
             return Self::AwaitingPlanReview {
                 plan_id: plan.id.clone(),
                 revision: plan.model_revision,
@@ -219,6 +222,32 @@ mod test {
                 reasoning_summary: None,
             }
         );
+    }
+
+    #[test]
+    fn question_wait_yields_to_execution_and_returns_after_the_reply() {
+        for planning in [false, true] {
+            let elicitation = crate::plan::PlanElicitation::new(
+                crate::plan::PlanQuestionSet::freeform("Which scope?".into()).normalize().unwrap());
+            let mut plan = plan(PlanState::AwaitingInput);
+            let mut exchange = exchange();
+            if planning { plan.elicitation = Some(elicitation); }
+            else { exchange.elicitation = Some(elicitation); }
+            let active_plan = planning.then_some(&plan);
+            exchange.awaiting_input = true;
+            exchange.pause(50);
+            assert!(matches!(SessionPhase::resolve(active_plan,None,Some(&exchange)),SessionPhase::AwaitingInput {..}));
+            exchange.resume(60).unwrap();
+            assert!(matches!(SessionPhase::resolve(active_plan,None,Some(&exchange)),SessionPhase::Working {started_at_ms:60,..}));
+            exchange.pause(70);
+            assert!(matches!(SessionPhase::resolve(active_plan,None,Some(&exchange)),SessionPhase::AwaitingInput {..}));
+        }
+        let plan = plan(PlanState::AwaitingReview);
+        let mut unrelated = exchange();
+        unrelated.kind = ExchangeKind::Chat;
+        assert!(matches!(SessionPhase::resolve(Some(&plan),None,Some(&unrelated)),SessionPhase::Working {..}));
+        unrelated.finish(ExchangeState::Complete,70).unwrap();
+        assert!(matches!(SessionPhase::resolve(Some(&plan),None,Some(&unrelated)),SessionPhase::AwaitingPlanReview {..}));
     }
 
     #[test]

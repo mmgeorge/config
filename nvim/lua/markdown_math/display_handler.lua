@@ -50,28 +50,22 @@ local function convert(input)
   return nil
 end
 
----@param context MarkdownMathHandlerContext
----@return boolean
-local function is_document_root(context)
-  local start_row, start_col, end_row, end_col = context.root:range()
-  if start_row ~= 0 or start_col ~= 0 then return false end
-  local line_count = vim.api.nvim_buf_line_count(context.buf)
-  local last_line = vim.api.nvim_buf_get_lines(context.buf, line_count - 1, line_count, false)[1] or ""
-  return end_row > line_count - 1 or (end_row == line_count - 1 and end_col >= #last_line)
-end
-
+---@param buffer integer
 ---@param block MarkdownMathBlock
 ---@param output string[]
 ---@param config render.md.latex.Config
 ---@param marks render.md.Marks
-local function add_marks(block, output, config, marks)
+local function add_marks(buffer, block, output, config, marks)
   local virtual_line_list = {}
   for output_index = 2, #output do
     virtual_line_list[#virtual_line_list + 1] = { { block.indent .. output[output_index], config.highlight } }
   end
   marks:add(config, "latex", block.start_row, 0, {
+    end_row = block.start_row,
+    end_col = #(vim.api.nvim_buf_get_lines(buffer, block.start_row, block.start_row + 1, false)[1] or ""),
+    conceal = "",
     virt_text = { { block.indent .. output[1], config.highlight } },
-    virt_text_pos = "overlay",
+    virt_text_pos = "inline",
     virt_lines = virtual_line_list,
     virt_lines_above = false,
   })
@@ -89,8 +83,10 @@ end
 ---@return render.md.Mark[]
 function module.parse(context)
   local builtin = require("render-markdown.handler.markdown").parse(context)
-  if not is_document_root(context) then return builtin end
-  local block_list = block_store.get(context.buf)
+  if context.root:type() ~= "document" then return builtin end
+  local first0, _, end_row, end_col = context.root:range()
+  local after0 = math.min(vim.api.nvim_buf_line_count(context.buf), end_row + (end_col > 0 and 1 or 0))
+  local block_list = block_store.get(context.buf, first0, after0)
   builtin = vim.tbl_filter(function(mark)
     for _, block in ipairs(block_list) do
       if mark.start_row >= block.start_row and mark.start_row < block.end_row then return false end
@@ -103,7 +99,7 @@ function module.parse(context)
   local marks = Marks.new(request_context, false)
   for _, block in ipairs(block_list) do
     local output = convert(block.input)
-    if output then add_marks(block, output, request_context.config.latex, marks) end
+    if output then add_marks(context.buf, block, output, request_context.config.latex, marks) end
   end
   vim.list_extend(builtin, marks:get())
   return builtin

@@ -60,6 +60,17 @@ local function validate_metadata(entry, read_row, region_seen)
       validate_range(decoration.range)
     end
   end
+  if entry.metadata.layout then
+    local layout = entry.metadata.layout
+    assert(counter(layout.indent) >= 2 and layout.indent <= 256, "invalid content indent")
+    assert(counter(layout.source_indent or 0) <= layout.indent - 2, "invalid materialized content indent")
+    if layout.marker and layout.marker ~= vim.NIL then
+      assert(type(layout.marker.text) == "string" and not layout.marker.text:find("[%c]")
+        and vim.fn.strchars(layout.marker.text) == 1 and vim.fn.strdisplaywidth(layout.marker.text) <= 2,
+        "invalid content marker")
+      identity(layout.marker.capture)
+    end
+  end
   for _, gutter in ipairs(array(entry.metadata.gutter or {})) do
     validate_range({ start = gutter.position, ["end"] = gutter.position })
     assert(gutter.position.row < entry.row_count, "gutter requires a physical row")
@@ -336,6 +347,10 @@ local function install_metadata(session, prepared, replace_all)
   for id in pairs(prepared.changed) do
       local entry, mark = prepared.block[id], {}
       local start_row = prepared.position[id]
+      if entry.metadata.layout then
+        vim.list_extend(mark, require("forge.content_layout").install(session.buffer, session.namespace,
+          start_row, entry.row_count, entry.metadata.layout))
+      end
       for _, decoration in ipairs(entry.metadata.decoration) do
         local range = decoration.range
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
@@ -348,11 +363,26 @@ local function install_metadata(session, prepared, replace_all)
       for _, gutter in ipairs(entry.metadata.gutter or {}) do
         local text = {}
         for _, chunk in ipairs(gutter.chunk) do text[#text + 1] = { chunk.text, chunk.capture } end
+        local options = { priority = gutter.priority, right_gravity = true, strict = true }
+        if gutter.placement == "sign" then
+          local label = table.concat(vim.tbl_map(function(chunk) return chunk[1] end, text))
+          local marker = vim.trim(label)
+          if marker ~= "" and vim.fn.strdisplaywidth(marker) <= 2 then
+            options.sign_text = marker
+            options.sign_hl_group = text[1] and text[1][2]
+            local indent = label:match("^ +")
+            if indent then
+              options.virt_text = { { indent, "Normal" } }
+              options.virt_text_pos, options.hl_mode = "inline", "combine"
+            end
+          elseif marker ~= "" then
+            options.virt_text, options.virt_text_pos, options.hl_mode = text, "inline", "combine"
+          end
+        else
+          options.virt_text, options.virt_text_pos, options.hl_mode = text, "inline", "combine"
+        end
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
-          start_row + gutter.position.row, gutter.position.column, {
-            virt_text = text, virt_text_pos = "inline", hl_mode = "combine", priority = gutter.priority,
-            right_gravity = true, strict = true,
-          })
+          start_row + gutter.position.row, gutter.position.column, options)
       end
       for _, conceal in ipairs(entry.metadata.conceal or {}) do
         local range = conceal.range

@@ -81,16 +81,43 @@ pub struct TextChunk {
     pub capture: String,
 }
 
-/// Inline virtual text preserves source-only buffer rows for native selection and search.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+/// Controls whether a marker enters text layout or occupies the reserved sign column.
+pub enum GutterPlacement {
+    #[default]
+    Inline,
+    Sign,
+}
+
+/// Positions a marker relative to a physical source row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Gutter {
+    #[serde(default)]
+    pub placement: GutterPlacement,
     pub position: TextPosition,
     pub chunk: Vec<TextChunk>,
     pub priority: u16,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// Resolves the content column independently of an optional leading marker.
+pub struct ContentLayout {
+    /// Content column measured from the window's left edge, including its reserved marker column.
+    pub indent: usize,
+    /// Optional marker occupying the final two cells before content.
+    pub marker: Option<TextChunk>,
+    #[serde(default)]
+    /// Projection-owned padding excluded from Markdown parser regions.
+    pub source_indent: usize,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout: Option<ContentLayout>,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub markdown: bool,
     pub target: Vec<TargetRange>,
     pub decoration: Vec<Decoration>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -120,6 +147,8 @@ impl BlockMetadata {
     fn allocated_bytes(&self) -> usize {
         use std::mem::size_of;
         self.target.capacity() * size_of::<TargetRange>()
+            + self.layout.as_ref().and_then(|layout| layout.marker.as_ref())
+                .map_or(0, |marker| marker.text.capacity() + marker.capture.capacity())
             + self.decoration.capacity() * size_of::<Decoration>()
             + self.visible_decoration.capacity() * size_of::<Decoration>()
             + self.source_highlight.capacity() * size_of::<Decoration>()
@@ -205,6 +234,17 @@ impl BufferBlock {
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
+        if let Some(layout) = &self.metadata.layout {
+            if !(2..=256).contains(&layout.indent) || layout.source_indent > layout.indent - 2 {
+                return Err(ContractError("content indent must contain 2..=256 cells"));
+            }
+            if let Some(marker) = &layout.marker {
+                if marker.text.chars().count() != 1 || marker.text.chars().any(char::is_control)
+                    || marker.capture.is_empty() || marker.capture.len() > 256 {
+                    return Err(ContractError("content marker requires one printable character and a capture"));
+                }
+            }
+        }
         self.id.validate()?;
         for target in &self.metadata.target {
             target.id.validate()?;

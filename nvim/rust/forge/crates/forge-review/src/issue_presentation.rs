@@ -222,6 +222,7 @@ fn readonly(id: &str, text: &str) -> Result<BufferBlock> {
 
 fn field_label(block: &mut BufferBlock, label: &str) {
     block.metadata.gutter.push(Gutter {
+        placement: Default::default(),
         position: TextPosition { row: 0, column: 0 },
         chunk: vec![TextChunk {
             text: label.into(),

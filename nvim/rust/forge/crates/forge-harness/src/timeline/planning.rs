@@ -134,6 +134,18 @@ pub(super) fn attach(
             events.sort_by_key(|(time, _)| *time);
             crate::plan::event::insert_events(exchange, pair_questions(events));
         }
+        // The timeline snapshot carries current selections without changing the durable plan owner.
+        if let Some(elicitation) = plans.iter()
+            .find(|plan| exchange.plan_id.as_deref() == Some(plan.id.as_str()))
+            .and_then(|plan| plan.elicitation.as_ref())
+            .filter(|elicitation| exchange.node_list.iter().any(|node| matches!(node,
+                crate::exchange::ExchangeNode::PlanEvent { event } if matches!(&event.content,
+                    PlanEventContent::Lifecycle { lifecycle, .. }
+                    if lifecycle.kind == PlanLifecycleKind::QuestionAsked
+                        && lifecycle.question.as_ref().is_some_and(|question| question.id == elicitation.question_set.id)))))
+        {
+            exchange.elicitation = Some(elicitation.clone());
+        }
     }
 }
 
@@ -441,14 +453,15 @@ mod tests {
                     .any(|fold| fold.id.0 == "QuestionAsked" && fold.closed)
             );
             if outcome == PlanLifecycleKind::QuestionAnswered {
-                assert!(rendered.prompt.iter().any(|id| id.0 == "QuestionAnswered"));
+                assert!(rendered.prompt.iter().any(|id| id.0.ends_with(":answer")));
                 assert_eq!(text.matches("You answered:").count(), 1);
-                assert!(text.contains("You answered: Goal: Rust learning"));
-                assert!(text.find("Clarify the options first").unwrap() < text.find("You answered: Goal").unwrap());
+                assert!(text.contains("You answered: Rust learning"));
+                assert!(text.find("You answered: Rust learning").unwrap() < text.find("Later commentary boundary").unwrap());
             } else {
                 assert!(text.contains("Clarification withdrawn"));
+                assert!(!text.contains("You answered:"), "withdrawal reason must not become a user answer");
             }
-            assert!(text.find("Question presented: Goal").unwrap() < text.find("Clarify the options first").unwrap());
+            assert!(text.find("Questions ·").unwrap() < text.find("Clarify the options first").unwrap());
         }
     }
 

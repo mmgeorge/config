@@ -1,6 +1,7 @@
 local M = {}
 local buffer = require("forge.status_render")
 local input = require("forge.input")
+local history = require("forge.status_history")
 local next_document = 0
 local runner_for_test
 local host_unavailable_message = "Forge host stopped or restarted; refresh or reopen this document"
@@ -39,7 +40,7 @@ local host_unavailable_message = "Forge host stopped or restarted; refresh or re
 ---@field active boolean
 ---@field pending boolean
 ---@field scheduled boolean
----@field done table<integer, boolean>
+---@field done table<integer|string, boolean>
 ---@field recovering? boolean
 ---@field body_started? table<integer, integer>
 ---@field width_owner? integer
@@ -133,6 +134,19 @@ local function request(state, params, callback, method)
   else start() end
 end
 
+local function recover_commit(state, owner)
+  if owner.recovering then return end
+  owner.recovering = true
+  request(state, { operation = "snapshot", document = owner.document }, function(snapshot, failure)
+    owner.recovering = nil
+    if failure or not snapshot then notice(failure or "Missing commit snapshot") return end
+    if state.replica.commit[owner.oid] ~= owner then return end
+    owner.snapshot = snapshot
+    buffer.apply_snapshot(state.replica, state.replica.inventory)
+    state.done = {}
+  end)
+end
+
 ---@param state ForgeNativeStatus
 local function recover(state)
   if state.recovering then return end
@@ -154,6 +168,13 @@ local function close_view(state, window, view)
     if state.width_owner and vim.api.nvim_win_is_valid(state.width_owner) then buffer.resize(state.replica, state.width_owner) end
   end
   if state.active and host_current(state) then
+    for _, owner in pairs(state.replica.commit) do
+      if owner.snapshot then
+        request(state, { operation = "close_view", document = owner.document, view = view.id }, function(_, failure)
+          if failure then notice(failure) end
+        end)
+      end
+    end
     request(state, { operation = "close_view", document = state.document, view = view.id }, function(patch, failure)
       if failure then notice(failure) return end
       if patch and patch ~= vim.NIL then buffer.apply_patch(state.replica, patch) end
@@ -177,7 +198,7 @@ local function view_for(state, window)
 end
 
 ---@param state ForgeNativeStatus
----@return ForgeStatusInput?
+---@return ForgeStatusInput|{commit: string}|nil
 local function visible_demand(state)
   for window, view in pairs(state.view) do
     if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then
@@ -197,15 +218,38 @@ local function visible_demand(state)
       local location = buffer.locate(state.replica, row, 0)
       local deferred_open = state.fold_open and location and location.block:match("^file:")
       local semantic = location and location.location
+      if (folded < row + 1 or state.fold_open) and semantic and semantic.kind == "context" and semantic.role:match("^recent:") then
+        local oid = semantic.role:sub(8)
+        if not state.replica.commit[oid] then return { commit = oid } end
+      end
       if (folded < row + 1 or deferred_open) and semantic and (semantic.kind == "file" or semantic.kind == "body") then
         local file = semantic.kind == "file" and semantic.id or semantic.file
         if not state.done[file] then
           view.sequence = view.sequence + 1
-          return { document = state.document, revision = state.replica.revision,
-            view = view.id, sequence = view.sequence, action = "demand", location = { kind = "file", id = file } }
+          return history.input(state.replica, { document = state.document, revision = state.replica.revision,
+            view = view.id, sequence = view.sequence, action = "demand", location = { kind = "file", id = file } })
         end
       end
       row = not state.fold_open and folded >= row + 1 and folded or row + 1
+    end
+  end
+end
+
+local function prune_commits(state)
+  local context = state.replica.inventory.context
+  local retained = {}
+  if type(context) == "table" then
+    for _, commit in ipairs(context.recent) do retained[commit.oid] = true end
+  end
+  for oid, owner in pairs(state.replica.commit) do
+    if not retained[oid] then
+      if owner.unsubscribe then owner.unsubscribe() end
+      state.replica.commit[oid] = nil
+      if owner.snapshot then
+        request(state, { operation = "close", document = owner.document }, function(_, failure)
+          if failure then notice(failure) end
+        end)
+      end
     end
   end
 end
@@ -219,6 +263,8 @@ function M.demand(state)
     state.scheduled = false
     if not host_current(state) then return end
     if not state.active or state.navigation or state.request_active or state.pending or state.replica.status ~= "Applied" then return end
+    prune_commits(state)
+    if state.request_active then return end
     local demand = visible_demand(state)
     if not demand then
       local fold_open = state.fold_open
@@ -233,17 +279,57 @@ function M.demand(state)
       return
     end
     if state.request_active then return end
+    if demand.commit then
+      local owner = history.new(state.document, demand.commit)
+      state.replica.commit[demand.commit] = owner
+      if not runner_for_test then
+        owner.unsubscribe = require("forge.client").subscribe_document(owner.document, function(event, update, generation)
+          vim.schedule(function()
+            if not state.active or state.replica.commit[owner.oid] ~= owner
+              or state.host_generation and generation ~= state.host_generation then return end
+            if event == "status.resync" or not owner.snapshot then recover_commit(state, owner)
+            elseif event == "status.update" then M.apply_update(state, update) end
+          end)
+        end)
+      end
+      request(state, { operation = "comparison", document = owner.document,
+        workspace = state.replica.inventory.context.workspace,
+        reference = owner.oid, worktree = false }, function(result, failure)
+        if failure or not result then
+          owner.failure = failure or "Missing commit comparison"
+          if owner.unsubscribe then owner.unsubscribe() owner.unsubscribe = nil end
+          notice(owner.failure)
+        else owner.snapshot = result end
+        buffer.apply_snapshot(state.replica, state.replica.inventory)
+      end)
+      return
+    end
     state.pending = true
     request(state, { operation = "demand", input = demand }, function(result, failure)
       state.pending = false
       if failure or not result then
-        state.done[demand.location.id] = true
+        local key = demand.location.id
+        for _, owner in pairs(state.replica.commit) do
+          if owner.document == demand.document then key = history.file_key(owner, key) break end
+        end
+        state.done[key] = true
         notice(failure or "Missing status body delivery")
         return
       end
+      local owner = history.owner(state.replica, result.document)
+      result = history.delivery(state.replica, result)
       local applied = buffer.apply_body(state.replica, result)
       if applied.kind == "Desynchronized" then return end
-      if applied.kind == "Discarded" then M.demand(state) return end
+      if applied.kind == "Discarded" then
+        state.done[result.file] = true
+        if owner then recover_commit(state, owner) else recover(state) end
+        return
+      end
+      local model = state.replica.file[result.file]
+      if model and not model.body and result.state and result.state.state == "ready" then
+        model.recovering = true
+        state.replica.recover_body(result.file, result.generation)
+      end
       local started = state.body_started and state.body_started[result.file]
       if started and applied.kind == "Applied" then
         state.body_started[result.file] = nil
@@ -376,7 +462,7 @@ function M.action(state, action, visual)
     local anchor = vim.fn.getpos("v")[2] - 1
     local cursor = vim.api.nvim_win_get_cursor(window)[1] - 1
     local ok, result = pcall(buffer.selection, state.replica, math.min(anchor, cursor), math.max(anchor, cursor))
-    if not ok then notice(result) return end
+    if not ok then notice(tostring(result)) return end
     selection = result
   end
   local captured, failure = buffer.capture(state.replica, view, action, selection)
@@ -391,7 +477,7 @@ function M.action(state, action, visual)
   if action == "open" then
     request(state, { operation = "open_target", input = captured }, function(effect, request_failure)
       if request_failure or not effect then notice(request_failure or "Missing file target") return end
-      require("forge.effects").apply(state.replica, view, effect)
+      buffer.apply_effect(state.replica, view, effect)
     end)
     return
   end
@@ -460,22 +546,28 @@ end
 ---@param update table
 function M.apply_update(state, update)
   if not state.active or not host_current(state) then return end
+  local owner = history.owner(state.replica, update.document)
   if update.resync then
     if update.phase == "accepted" then
       for _, diagnostic in ipairs(update.diagnostic or {}) do notice(diagnostic) end
     end
-    recover(state)
+    if owner then recover_commit(state, owner) else recover(state) end
     return
   end
   local result = buffer.apply_update(state.replica, update)
-  if result.kind == "Desynchronized" then recover(state) return end
+  if result.kind == "Desynchronized" then
+    if owner then recover_commit(state, owner) else recover(state) end
+    return
+  end
   if result.kind ~= "Applied" then return end
   require("forge.startup_log").watch_redraw(state.replica.buffer, state.document, vim.uv.hrtime(),
     "status.update.redraw", { operation = update.operation_id, phase = update.phase })
   state.applied_operation = state.applied_operation or {}
   if update.phase == "accepted" then state.applied_operation[update.operation_id] = vim.uv.hrtime() end
   state.done = {}
-  for _, delivery in ipairs(update.body or {}) do state.done[delivery.file] = delivery.more ~= true end
+  for _, delivery in ipairs(update.body or {}) do
+    state.done[owner and history.file_key(owner, delivery.file) or delivery.file] = delivery.more ~= true
+  end
   M.demand(state)
 end
 
@@ -500,7 +592,10 @@ function M.open(options)
   state.replica = buffer.open(document, { filetype = options.filetype or "forge", notice = notice, recover = function() recover(state) end })
   state.replica.width = math.max(1, vim.api.nvim_win_get_width(opening_window))
   state.replica.recover_body = function(file, generation)
-    request(state, { operation = "body_snapshot", document = document, file = file, generation = generation }, function(result, failure)
+    local model = state.replica.file[file]
+    local owner = model and model.owner
+    request(state, { operation = "body_snapshot", document = owner and owner.document or document,
+      file = model and model.record.id or file, generation = generation }, function(result, failure)
       if failure or not result then notice(failure or "Missing status body snapshot") return end
       local applied = buffer.apply_body(state.replica, result)
       if applied.kind ~= "Applied" then return end
@@ -588,6 +683,11 @@ function M.open(options)
       local cursor = vim.api.nvim_win_get_cursor(0)
       local located = buffer.locate(state.replica, cursor[1] - 1, cursor[2])
       local location = located and located.location
+      if location and location.kind == "context" and location.role:match("^recent:") and vim.fn.foldclosed(cursor[1]) == -1 then
+        local oid = location.role:sub(8)
+        local owner = state.replica.commit[oid]
+        if owner and owner.failure then state.replica.commit[oid] = nil end
+      end
       if location and location.kind == "file" and not state.done[location.id] and vim.fn.foldclosed(cursor[1]) == -1 then
         state.body_started = state.body_started or {}
         state.body_started[location.id] = started
@@ -774,6 +874,14 @@ function M.close(state, on_closed)
   if state.context then state.context.close() end
   for window, view in pairs(state.view) do close_view(state, window, view) end
   if state.group ~= 0 then vim.api.nvim_del_augroup_by_id(state.group) end
+  for _, owner in pairs(state.replica.commit) do
+    if owner.unsubscribe then owner.unsubscribe() end
+    if not owner.failure then
+      request(state, { operation = "close", document = owner.document }, function(_, failure)
+        if failure then notice(failure) end
+      end)
+    end
+  end
   request(state, { operation = "close", document = state.document }, function(_, failure)
     if failure and not (state.opening_failed and failure == "unknown status document") then notice(failure) end
     if on_closed then on_closed(failure) end

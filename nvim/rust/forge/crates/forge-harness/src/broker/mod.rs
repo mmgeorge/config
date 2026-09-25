@@ -2511,7 +2511,7 @@ impl HarnessBroker {
     }
 
     /// Record planning feedback only on the live exchange that owns the plan.
-    fn append_plan_feedback(&mut self, plan_id: &str, text: String, intent: crate::exchange::InputIntent) -> Result<()> {
+    fn append_plan_feedback(&mut self, plan_id: &str, text: String, intent: crate::exchange::InputIntent, question: Option<crate::exchange::QuestionInput>) -> Result<()> {
         let mut exchange = self
             .store
             .list_exchange(&self.session.id)?
@@ -2522,11 +2522,11 @@ impl HarnessBroker {
                 && exchange.state == ExchangeState::Running,
             "planning feedback does not target the active exchange"
         );
-        exchange.append_input(
-            intent,
-            text,
-            self.clock.now_ms(),
-        )?;
+        if let Some(question) = question {
+            exchange.append_question_input(intent, text, question, self.clock.now_ms())?;
+        } else {
+            exchange.append_input(intent, text, self.clock.now_ms())?;
+        }
         self.store.save_exchange(&exchange)
     }
 
@@ -2545,8 +2545,14 @@ impl HarnessBroker {
         );
         elicitation.begin_clarification(&question_id)?;
         let elicitation_json = serde_json::to_string_pretty(&elicitation)?;
+        let target = crate::exchange::QuestionInput {
+            set_id: elicitation.question_set.id.clone(),
+            question_id: Some(elicitation.question(&question_id).or_else(|| elicitation.current_question())
+                .context("clarification has no pending question")?.id.clone()),
+            answer: Vec::new(),
+        };
         plan.updated_at_ms = self.clock.now_ms();
-        self.append_plan_feedback(&plan.id, text.clone(), crate::exchange::InputIntent::Clarification)?;
+        self.append_plan_feedback(&plan.id, text.clone(), crate::exchange::InputIntent::Clarification, Some(target))?;
         self.store.save_plan(&plan)?;
         let (mut value, mut event) = self
             .run_interaction(
@@ -2629,10 +2635,14 @@ impl HarnessBroker {
         );
         elicitation.begin_clarification(&question_id)?;
         let elicitation_json = serde_json::to_string_pretty(elicitation)?;
-        interaction.append_input(
-            crate::exchange::InputIntent::Clarification,
-            text.clone(),
-            self.clock.now_ms(),
+        let target = crate::exchange::QuestionInput {
+            set_id: elicitation.question_set.id.clone(),
+            question_id: Some(elicitation.question(&question_id).or_else(|| elicitation.current_question())
+                .context("clarification has no pending question")?.id.clone()),
+            answer: Vec::new(),
+        };
+        interaction.append_question_input(
+            crate::exchange::InputIntent::Clarification, text.clone(), target, self.clock.now_ms(),
         )?;
         self.store.save_exchange(&interaction)?;
         let (mut value, mut event) = self
@@ -2663,7 +2673,9 @@ impl HarnessBroker {
             .context("active plan has no elicitation state")?;
         let answer = elicitation.feedback();
         let question = elicitation.question_set.clone();
-        self.append_plan_feedback(&plan.id, answer.clone(), crate::exchange::InputIntent::Answer)?;
+        self.append_plan_feedback(&plan.id, answer.clone(), crate::exchange::InputIntent::Answer, Some(crate::exchange::QuestionInput {
+            set_id: question.id.clone(), question_id: None, answer: elicitation.answer.clone(),
+        }))?;
         let now_ms = self.clock.now_ms();
         for pending_question in &elicitation.question_set.questions {
             let response = Some(
@@ -2746,9 +2758,12 @@ impl HarnessBroker {
                 }
             }
         }
-        interaction.append_input(
+        interaction.append_question_input(
             crate::exchange::InputIntent::Answer,
             feedback.clone(),
+            crate::exchange::QuestionInput {
+                set_id: elicitation.question_set.id.clone(), question_id: None, answer: elicitation.answer.clone(),
+            },
             self.clock.now_ms(),
         )?;
         self.store.save_exchange(&interaction)?;
@@ -8748,8 +8763,8 @@ mod test {
         assert!(completed[0].node_list.iter().any(|node| matches!(node,
             ExchangeNode::ExchangeInput { prompt } if prompt.intent == crate::exchange::InputIntent::Answer)));
         let rendered = timeline_text(&broker.snapshot().unwrap());
-        assert!(rendered.contains("Question presented: Migration"));
-        assert!(rendered.contains("You answered: Migration: Staged"));
+        assert!(rendered.contains("Questions · 1/1 answered"));
+        assert!(rendered.contains("You answered: Staged"));
     }
 
     #[tokio::test]
@@ -9460,7 +9475,7 @@ mod test {
         assert!(original_exchange.execution_started_at_ms.is_none());
         assert!(
             broker
-                .append_plan_feedback("unrelated-plan", "wrong owner".into(), crate::exchange::InputIntent::Clarification)
+                .append_plan_feedback("unrelated-plan", "wrong owner".into(), crate::exchange::InputIntent::Clarification, None)
                 .is_err()
         );
         assert_eq!(
@@ -9552,7 +9567,7 @@ mod test {
         );
         let completed_snapshot = broker.snapshot().unwrap();
         let rendered = timeline_text(&completed_snapshot);
-        assert_eq!(rendered.matches("You answered: Migration: Staged").count(), 1);
+        assert_eq!(rendered.matches("You answered: Staged").count(), 1);
         assert!(!rendered.contains("QuestionAsked"));
         let plan = completed_snapshot.active_plan.expect("submitted plan");
         assert_eq!(plan.state, PlanState::AwaitingReview);
@@ -9577,7 +9592,7 @@ mod test {
         assert!(completed_exchange.checkpoint_after.is_some());
         assert!(
             broker
-                .append_plan_feedback(&plan.id, "late feedback".into(), crate::exchange::InputIntent::Clarification)
+                .append_plan_feedback(&plan.id, "late feedback".into(), crate::exchange::InputIntent::Clarification, None)
                 .is_err()
         );
         assert_eq!(completed_snapshot.exchange[0].plan_id, Some(plan.id));
@@ -9932,6 +9947,13 @@ mod test {
             assert_eq!(elicitation.current_question().unwrap().id, question_id);
             assert_eq!(snapshot.exchange.len(), 1);
             assert!(snapshot.exchange[0].completed_at_ms.is_none());
+            let input = snapshot.exchange[0].node_list.iter().find_map(|node| match node {
+                ExchangeNode::ExchangeInput { prompt } if prompt.intent == crate::exchange::InputIntent::Clarification => Some(prompt),
+                _ => None,
+            }).unwrap();
+            let target = input.question.as_ref().expect("clarification must retain its question target");
+            assert_eq!(target.question_id.as_deref(),Some(question_id.as_str()));
+            assert_eq!(target.set_id,elicitation.question_set.id);
             assert!(!result.event.iter().any(|event| event.event == "question_answered"));
         }
     }

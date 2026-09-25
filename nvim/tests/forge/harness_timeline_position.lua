@@ -31,6 +31,10 @@ local success, failure = xpcall(function()
     transcript_window = window, is_alive = function() return true end,
     notice = function(message) error(message) end,
   }, function(value, message) assert(value and not message) end)
+  assert(vim.wo[window].signcolumn == "yes:1" and vim.wo[window].statuscolumn == "%s",
+    "initial transcript must reserve the same marker gutter as attached views")
+  assert(vim.fn.getwininfo(window)[1].textoff == 2,
+    "plain response text must start after the two-column presentation gutter")
   local opening = take("open")
   opening.callback({ transcript = snapshot(opening.params.document, 0, 80),
     composer = snapshot(opening.params.composer, 0, 1) })

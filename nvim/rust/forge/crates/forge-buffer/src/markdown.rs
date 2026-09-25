@@ -252,7 +252,9 @@ impl MarkdownRenderer {
             | Options::ENABLE_MATH;
         let source_line: Vec<&str> = source.split('\n').collect();
         let mut scanned_source = 0;
+        let mut paragraph_continues_item = false;
         for (event, source_range) in Parser::new_ext(source, options).into_offset_iter() {
+            let starts_item = matches!(&event, Event::Start(Tag::Item));
             let first_source = source_start
                 .partition_point(|start| *start <= source_range.start)
                 .saturating_sub(1);
@@ -284,7 +286,11 @@ impl MarkdownRenderer {
                 Event::Start(tag) => {
                     state.source_row = first_source..first_source + 1;
                     match tag {
-                        Tag::Paragraph => state.break_row(false)?,
+                        Tag::Paragraph => {
+                            if !paragraph_continues_item {
+                                state.break_row(false)?;
+                            }
+                        }
                         Tag::Heading { .. } => {
                             state.break_row(false)?;
                             state.capture.push("@markup.heading");
@@ -400,6 +406,7 @@ impl MarkdownRenderer {
                 }
                 Event::FootnoteReference(label) => state.append(&format!("[{label}]"), true)?,
             }
+            paragraph_continues_item = starts_item;
         }
         if state.row.len() > 1 && state.row.last().is_some_and(String::is_empty) {
             state.row.pop();
@@ -704,6 +711,30 @@ mod tests {
                 .iter()
                 .any(|decoration| decoration.capture == "@markup.heading")
         );
+    }
+
+    #[test]
+    fn loose_list_markers_stay_with_first_paragraphs() {
+        for (source, expected) in [
+            (
+                "- **First:** text\n\n- Second",
+                vec!["• First: text", "", "• Second"],
+            ),
+            ("3. First\n\n4. Second", vec!["3. First", "", "4. Second"]),
+            (
+                "- First\n\n  Another paragraph\n\n- Second",
+                vec!["• First", "", "Another paragraph", "", "• Second"],
+            ),
+            (
+                "- Parent\n\n  - Child\n\n  - Next",
+                vec!["• Parent", "", "  • Child", "", "  • Next"],
+            ),
+        ] {
+            let rendered =
+                MarkdownRenderer::render(BlockId("list".into()), source, &WidthProfile::default())
+                    .unwrap();
+            assert_eq!(rendered.block.text.wire_rows(), expected, "{source}");
+        }
     }
 
     #[test]

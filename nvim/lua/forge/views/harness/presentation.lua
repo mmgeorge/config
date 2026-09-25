@@ -3,6 +3,12 @@ local client = require("forge.client")
 local replica = require("forge.buffer")
 local input = require("forge.input")
 local editable = require("forge.editable")
+local transcript_options = {
+  margin = 0,
+  conceal = { level = 3, cursor = "nvic" },
+  columns = { signcolumn = "yes:1", statuscolumn = "%s" },
+  wrapping = { indent = true, options = "shift:0" },
+}
 
 function M.open(options, callback)
   local identity = "harness:" .. options.session_id .. ":" .. tostring(vim.uv.hrtime())
@@ -17,6 +23,18 @@ function M.open(options, callback)
     if options.notice then options.notice(message) end
   end
   local queued, active = {}, false
+  local markdown = require("forge.render.harness.markdown")
+  local function render_markdown(force)
+    if owner.transcript.status ~= "Applied" then return end
+    if not force and owner.markdown_revision == owner.transcript.revision then return end
+    local range_list = markdown.ranges(owner.transcript)
+    for window in pairs(owner.views) do
+      if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
+        markdown.render(options.transcript_buffer, window, range_list)
+      end
+    end
+    owner.markdown_revision = owner.transcript.revision
+  end
   local function dispatch_next()
     if active or #queued == 0 then return end
     active = true
@@ -48,8 +66,9 @@ function M.open(options, callback)
     if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= owner.transcript.buffer then return nil end
     local view = owner.views[window]
     if view then return view end
-    view = input.open(owner.transcript, window, { margin = 0, wrapping = { indent = true, options = "shift:0" } })
+    view = input.open(owner.transcript, window, transcript_options)
     owner.views[window] = view
+    if owner.ready then render_markdown(true) end
     request({ operation = "open_view", document = identity, view = view.id,
       width = require("forge.width").capture(window) }, function(_, failure)
       if not alive() then return end
@@ -119,7 +138,7 @@ function M.open(options, callback)
       end)
       return true
     end } })
-  owner.view = input.open(owner.transcript, options.transcript_window, { margin = 0, wrapping = { indent = true, options = "shift:0" } })
+  owner.view = input.open(owner.transcript, options.transcript_window, transcript_options)
   owner.views[options.transcript_window] = owner.view
   request({ operation = "open", document = identity, composer = owner.composer_id, view = owner.view.id,
     width = require("forge.width").capture(options.transcript_window),
@@ -141,6 +160,7 @@ function M.open(options, callback)
       return
     end
     owner.ready = true
+    render_markdown()
     owner.terminals = require("forge.views.harness.terminals").watch({
       session_id = options.session_id, alive = alive, notice = notice,
       update = function(snapshot)
@@ -192,6 +212,7 @@ function M.open(options, callback)
           vim.api.nvim_win_set_cursor(window, { vim.api.nvim_buf_line_count(options.transcript_buffer), 0 })
         end
       end
+      local switched_timeline = owner.restore_timeline ~= nil
       if owner.restore_timeline then
         for window, saved in pairs(owner.timeline_view[owner.restore_timeline] or {}) do
           if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
@@ -200,6 +221,7 @@ function M.open(options, callback)
         end
         owner.restore_timeline = nil
       end
+      render_markdown(switched_timeline)
       if options.on_update then options.on_update() end
       if result.syntax_pending then owner.highlight() end
       if owner.pending then owner.sync() end
@@ -269,6 +291,7 @@ function M.open(options, callback)
   function owner.resize()
     if not alive() or not owner.ready then return end
     owner.refresh_views()
+    render_markdown(true)
     owner.pending_width = owner.pending_width or {}
     for window, view in pairs(owner.views) do
       owner.pending_width[view.id] = { view = view.id, width = require("forge.width").capture(window) }

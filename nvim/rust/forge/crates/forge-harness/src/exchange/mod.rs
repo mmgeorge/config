@@ -7,7 +7,7 @@ pub use change::ProviderChangeIndex;
 pub(crate) use change::ProviderDiffBuilder;
 pub use exchange::{Exchange, ExchangeComment, ExchangeKind, ExchangeState, HistoryDisposition};
 pub use node::{
-    ActiveWait, ArtifactChange, ExchangeInput, ExchangeNode, InputIntent, PlanCommentResolution,
+    ActiveWait, ArtifactChange, ExchangeInput, ExchangeNode, InputIntent, PlanCommentResolution, QuestionInput,
 };
 pub use task::{TaskItem, TaskSnapshot, TaskTracker};
 

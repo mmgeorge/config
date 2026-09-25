@@ -932,6 +932,7 @@ fn region_block(
             priority: 100,
         });
         metadata.gutter.push(Gutter {
+            placement: Default::default(),
             position: TextPosition { row: 0, column: 0 },
             chunk: vec![TextChunk {
                 text: if region.region.0 == "title" {

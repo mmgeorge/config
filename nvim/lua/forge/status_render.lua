@@ -3,6 +3,7 @@ local buffer = require("forge.buffer")
 local Sequence = require("forge.block_sequence")
 local folds = require("forge.folds")
 local decorations = require("forge.decorations")
+local history = require("forge.status_history")
 local empty_metadata = { target = {}, decoration = {}, editable_region = {} }
 local empty_map = {}
 local maximum = 9007199254740991
@@ -25,6 +26,7 @@ local section_label = { unstaged = "Unstaged changes", staged = "Staged changes"
 ---@field header table
 ---@field body? ForgeBufferFragment
 ---@field recovering? boolean
+---@field owner? ForgeStatusCommitComparison
 
 ---@class ForgeStatusInput
 ---@field document string
@@ -39,11 +41,12 @@ local section_label = { unstaged = "Unstaged changes", staged = "Staged changes"
 ---@field buffer integer
 ---@field revision? integer
 ---@field status string
----@field file table<integer, ForgeStatusFileModel>
+---@field file table<integer|string, ForgeStatusFileModel>
+---@field commit table<string, ForgeStatusCommitComparison>
 ---@field root ForgeBlockSequence
 ---@field sequence table
 ---@field block table<string, table>
----@field body_owner table<string, integer>
+---@field body_owner table<string, integer|string>
 ---@field inventory table
 ---@field presentation table
 ---@field width integer
@@ -56,7 +59,7 @@ local section_label = { unstaged = "Unstaged changes", staged = "Staged changes"
 ---@field marks table<string, integer[]>
 ---@field sentinel? integer
 ---@field notice fun(message: string)
----@field recover_body? fun(file: integer, generation: integer)
+---@field recover_body? fun(file: integer|string, generation: integer)
 ---@field applying? boolean
 ---@field fold_pending? table[]
 ---@field fold_pending_index? integer
@@ -72,7 +75,8 @@ local function counter(value)
 end
 
 local function optional(value) return value ~= vim.NIL and value or nil end
-local function file_key(id) return string.format("file:%.0f", id) end
+local function identity_text(id) return type(id) == "number" and string.format("%.0f", id) or id end
+local function file_key(id) return "file:" .. identity_text(id) end
 
 local function elapsed(started) return math.floor((vim.uv.hrtime() - started) / 1000) end
 
@@ -86,7 +90,7 @@ local function entry(text, chunk, location, kind)
     metadata = empty_metadata, gutter_row = empty_map, source_overlay_row = empty_map }
 end
 
-local function file_header(record, body)
+local function file_header(record, body, key)
   counter(record.id)
   counter(record.generation)
   assert(type(record.path) == "string" and not record.path:find("[\n\r%z]"), "invalid status display path")
@@ -100,8 +104,8 @@ local function file_header(record, body)
   end
   local parts = {}
   for index = 1, #chunk do parts[index] = chunk[index][1] end
-  local header = entry({ table.concat(parts) }, { chunk }, { kind = "file", id = record.id }, "file")
-  header.file = record.id
+  local header = entry({ table.concat(parts) }, { chunk }, { kind = "file", id = key or record.id }, "file")
+  header.file = key or record.id
   header.row_count = body and body.row_count > 0 and 1 + body.row_count or 2
   return header
 end
@@ -276,6 +280,15 @@ local function prepare(session, snapshot, checkpoint)
     if checkpoint and index % 64 == 0 then checkpoint() end
   end
   local seen = {}
+  local function push_file(key, model)
+    local node = push(file_key(key), model.header)
+    fold(file_key(key), node, 0, node, model.header.row_count, true)
+    if model.body then
+      for body_id, value in pairs(model.body.block) do block[body_id], body_owner[body_id] = value, key end
+      for fold_id, value in pairs(model.body.fold.record) do record[fold_id] = value end
+    end
+    return node
+  end
   for _, section in ipairs(snapshot.section) do
     assert(section_label[section.kind] and not seen[section.kind] and #section.file > 0, "invalid status section")
     seen[section.kind] = true
@@ -289,13 +302,8 @@ local function prepare(session, snapshot, checkpoint)
     for _, id in ipairs(section.file) do
       local model = assert(file[id], "section refers to missing file")
       assert(model.record.section == section.kind or (section.kind == "unstaged" and model.record.section == "untracked"), "file belongs to another section")
-      endpoint = push(file_key(id), model.header)
+      endpoint = push_file(id, model)
       if checkpoint and #entries % 64 == 0 then checkpoint() end
-      fold(file_key(id), endpoint, 0, endpoint, model.header.row_count, true)
-      if model.body then
-        for body_id, value in pairs(model.body.block) do block[body_id], body_owner[body_id] = value, id end
-        for fold_id, value in pairs(model.body.fold.record) do record[fold_id] = value end
-      end
     end
     fold(section_node.id, section_node, 1, endpoint, endpoint.entry.row_count, false)
   end
@@ -307,7 +315,26 @@ local function prepare(session, snapshot, checkpoint)
     local label = "Recent Commits (" .. #context.recent .. "):"
     local header = push("status:context:recent-title", entry({ "", label }, { {}, { { label, "ForgeStatusHeader" } } }, nil, "label"))
     local endpoint = header
-    for _, value in ipairs(recent) do endpoint = push(value.id, value.entry) end
+    for _, value in ipairs(recent) do
+      local commit = push(value.id, value.entry)
+      local owner = session.commit[value.entry.location.role:sub(8)]
+      endpoint = commit
+      if owner and owner.snapshot and #owner.snapshot.file > 0 then
+        for _, record_value in ipairs(owner.snapshot.file) do
+          local key = history.file_key(owner, record_value.id)
+          local previous = session.file[key]
+          local body = previous and previous.record.generation == record_value.generation and previous.body or nil
+          local model = { record = record_value, body = body, owner = owner, header = file_header(record_value, body, key) }
+          file[key] = model
+          endpoint = push_file(key, model)
+        end
+      else
+        local text = owner and owner.failure and ("Unable to load commit: " .. owner.failure:gsub("[\r\n]", " "))
+          or owner and owner.snapshot and "No changed files" or "Loading…"
+        endpoint = push(value.id .. ":placeholder", entry({ text }, { { { text, "Comment" } } }, nil, "label"))
+      end
+      fold(value.id, commit, 0, endpoint, endpoint.entry.row_count, true)
+    end
     fold("status:context:recent", header, 1, endpoint, endpoint.entry.row_count, true)
   end
   local built = vim.uv.hrtime()
@@ -437,7 +464,7 @@ end
 ---@return ForgeStatusReplica
 function M.open(document, options)
   local session = buffer.open(document, options)
-  session.file, session.body_owner, session.root = {}, {}, Sequence.new()
+  session.file, session.body_owner, session.root, session.commit = {}, {}, Sequence.new(), {}
   session.presentation, session.width, session.generation = { pr = { state = "fetching" }, about = { state = "none" } }, 80, 0
   session.sequence = facade(session)
   session.locate = function(row, column) return M.locate(session, row, column) end
@@ -504,14 +531,14 @@ function M.apply_snapshot(session, snapshot, callback)
   return resume()
 end
 
----@param session ForgeStatusReplica
+---@param inventory table
 ---@param delta table
 ---@return table
-local function delta_snapshot(session, delta)
-    assert(delta.document == session.document and delta.base == session.revision and delta.next == delta.base + 1, "status delta revision differs")
-    local snapshot = vim.tbl_extend("force", session.inventory, { revision = counter(delta.next) })
+local function delta_snapshot(inventory, delta)
+    assert(delta.document == inventory.document and delta.base == inventory.revision and delta.next == delta.base + 1, "status delta revision differs")
+    local snapshot = vim.tbl_extend("force", inventory, { revision = counter(delta.next) })
     local file = {}
-    for id, value in pairs(session.file) do file[id] = value.record end
+    for _, value in ipairs(inventory.file) do file[value.id] = value end
     for _, id in ipairs(delta.removed) do file[id] = nil end
     for _, value in ipairs(delta.file) do file[value.id] = value end
     local section = {}
@@ -536,7 +563,7 @@ end
 ---@return table
 function M.apply_patch(session, delta)
   local ok, result = pcall(function()
-    local snapshot = delta_snapshot(session, delta)
+    local snapshot = delta_snapshot(session.inventory, delta)
     adopt(session, prepare(session, snapshot))
     return { kind = "Applied", revision = session.revision }
   end)
@@ -548,24 +575,30 @@ end
 ---@param update table
 ---@return table
 function M.apply_update(session, update)
-  if session.status == "Closed" or update.document ~= session.document then return { kind = "Discarded" } end
-  if update.delta.next <= session.revision then return { kind = "Discarded" } end
+  local owner = history.owner(session, update.document)
+  if session.status == "Closed" or update.document ~= session.document and not owner then return { kind = "Discarded" } end
+  if owner and not owner.snapshot then return { kind = "Discarded" } end
+  local source = owner and owner.snapshot or session.inventory
+  if update.delta.next <= source.revision then return { kind = "Discarded" } end
   local previous_file = session.file
+  local previous_snapshot = owner and owner.snapshot
   local candidate_file
   local ok, result = pcall(function()
-    local snapshot = delta_snapshot(session, update.delta)
+    local snapshot = delta_snapshot(source, update.delta)
+    if owner then owner.snapshot = snapshot end
     local file = vim.tbl_extend("force", {}, previous_file)
     candidate_file = file
     local record = {}
-    for _, value in ipairs(snapshot.file) do record[value.id] = value end
-    for _, delivery in ipairs(update.body) do
+    for _, value in ipairs(snapshot.file) do record[owner and history.file_key(owner, value.id) or value.id] = value end
+    for _, native_delivery in ipairs(update.body) do
+      local delivery = history.delivery(session, native_delivery)
       local value = assert(record[delivery.file], "status update body has no file")
       assert(delivery.generation == value.generation, "status update body generation differs")
-      assert(delivery.snapshot and delivery.snapshot.document == string.format("body:%.0f:%.0f", delivery.file, delivery.generation), "status update body identity differs")
+      assert(delivery.snapshot and delivery.snapshot.document == "body:" .. identity_text(delivery.file) .. ":" .. identity_text(delivery.generation), "status update body identity differs")
       file[delivery.file] = { record = value, body = buffer.fragment(delivery.snapshot) }
     end
     session.file = file
-    local prepared = prepare(session, snapshot)
+    local prepared = prepare(session, owner and session.inventory or snapshot)
     session.file = previous_file
     local buffer_us, edits = adopt(session, prepared)
     trace(session, "status.optimistic.applied", { operation = update.operation_id, phase = update.phase, edits = #edits, buffer_us = buffer_us,
@@ -573,6 +606,7 @@ function M.apply_update(session, update)
     return { kind = "Applied", revision = session.revision }
   end)
   if not ok then
+    if owner then owner.snapshot = previous_snapshot end
     if session.file == candidate_file then session.file = previous_file end
     return buffer.fail_apply(session, result)
   end
@@ -583,6 +617,7 @@ end
 ---@param delivery table
 ---@return table
 function M.apply_body(session, delivery)
+  delivery = history.delivery(session, delivery)
   if delivery.document ~= session.document or session.status ~= "Applied" then return { kind = "Discarded" } end
   local model = session.file[delivery.file]
   if not model or model.record.generation ~= delivery.generation then return { kind = "Discarded" } end
@@ -598,7 +633,7 @@ function M.apply_body(session, delivery)
     local _, start = session.root:position(key)
     local prepared, body, edits
     if optional(delivery.snapshot) then
-      assert(delivery.snapshot.document == string.format("body:%.0f:%.0f", delivery.file, delivery.generation), "status body identity differs")
+      assert(delivery.snapshot.document == "body:" .. identity_text(delivery.file) .. ":" .. identity_text(delivery.generation), "status body identity differs")
       assert(not previous or delivery.snapshot.revision >= previous.revision, "stale status body snapshot")
       body = buffer.fragment(delivery.snapshot)
       prepared = { block = body.block, changed = {}, retired = {}, position = {} }
@@ -619,19 +654,17 @@ function M.apply_body(session, delivery)
       end
     else return { kind = "Applied" } end
     model.body = body
-    model.header = file_header(model.record, body)
+    model.header = file_header(model.record, body, delivery.file)
     session.block[key] = model.header
     session.root:update(key, model.header)
-    session.root:fold_boundary(key, "end:" .. key, model.header.row_count, -1)
-    session.fold.record[key].fold["end"].position.row = model.header.row_count
-    local section = model.record.section == "untracked" and "unstaged" or model.record.section
-    local section_key = "section:" .. section
-    local section_fold = session.fold.record[section_key]
-    if section_fold.fold["end"].block == key then
-      section_fold.fold["end"].position.row = model.header.row_count
-      session.root:fold_boundary(key, "end:" .. section_key, model.header.row_count, -1)
+    session.fold.changed = {}
+    for id, record in pairs(session.fold.record) do
+      if record.fold["end"].block == key then
+        record.fold["end"].position.row = model.header.row_count
+        session.root:fold_boundary(key, "end:" .. id, model.header.row_count, -1)
+        session.fold.changed[id] = true
+      end
     end
-    session.fold.changed = { [key] = true, [section_key] = true }
     for id in pairs(prepared.retired) do session.block[id], session.body_owner[id] = nil, nil end
     for id, value in pairs(prepared.block) do
       session.block[id], session.body_owner[id] = value, delivery.file
@@ -712,10 +745,14 @@ function M.capture(session, view, action, selection)
       or { kind = "boundary", after_files = located.block == "status:context:recent-title" }
   end
   if not location then return nil, "status row has no target" end
+  local model = session.file[location.kind == "file" and location.id or location.file]
+  if model and model.owner and action ~= "open" and action ~= "navigate" and action ~= "demand" then
+    return nil, "Historical commit diffs are read-only"
+  end
   assert(view.sequence < maximum, "input sequence exhausted")
   view.sequence, view.cursor, view.effect = view.sequence + 1, cursor, {}
-  return { document = session.document, revision = session.revision, view = view.id, sequence = view.sequence,
-    action = action, location = location }
+  return history.input(session, { document = session.document, revision = session.revision, view = view.id, sequence = view.sequence,
+    action = action, location = location })
 end
 
 ---@param session ForgeStatusReplica
@@ -728,6 +765,8 @@ function M.selection(session, first, last)
     local located = M.locate(session, row, 0)
     if located and located.target and located.location then
       local location = located.location
+      local model = session.file[location.kind == "file" and location.id or location.file]
+      assert(not model or not model.owner, "Historical commit diffs are read-only")
       local endpoint = row == first or row == last
       candidates[#candidates + 1] = { location = location, target = located.target, endpoint = endpoint }
       if location.kind == "body" then
@@ -832,6 +871,7 @@ end
 ---@param view ForgeInputView
 ---@param effect table
 function M.apply_effect(session, view, effect)
+  effect = history.effect(session, effect)
   local location = effect.location
   if location and effect.kind == "cursor" then
     if location.kind == "body" then

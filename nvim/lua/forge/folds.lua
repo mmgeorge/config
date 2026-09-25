@@ -353,8 +353,11 @@ function M.text()
   local relative = vim.v.foldstart - 1 - start
   local boundary, spans = { [0] = true, [#text] = true }, {}
   local gutter = {}
+  if node.entry.metadata.layout then
+    gutter[0] = require("forge.content_layout").prefix(node.entry.metadata.layout, relative == 0)
+  end
   for _, item in ipairs(node.entry.metadata.gutter or {}) do
-    if item.position.row == relative then
+    if item.placement ~= "sign" and item.position.row == relative then
       local column = math.min(item.position.column, #text)
       boundary[column] = true
       gutter[column] = gutter[column] or {}

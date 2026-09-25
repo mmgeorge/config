@@ -1,12 +1,13 @@
 use anyhow::{Result, ensure};
 use forge_buffer::block::{
-    BlockMetadata, BufferBlock, Decoration, Gutter, TargetRange, TextChunk, TextPosition, TextRange,
+    BlockMetadata, BufferBlock, Conceal, ContentLayout, Decoration, TargetRange, TextChunk, TextPosition, TextRange,
 };
 use forge_buffer::identity::{BlockId, TargetId};
 use forge_buffer::markdown::{MarkdownRenderer, RenderedMarkdown};
 use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 
+use super::markdown_math;
 use super::tool::ToolOutputPreview;
 
 pub struct TranscriptRenderer<'profile> {
@@ -36,33 +37,34 @@ impl<'profile> TranscriptRenderer<'profile> {
             capture: "ForgeHarnessPrompt".into(),
             priority: 100,
         });
+        Self::heading_marker(&mut block, "ForgeHarnessPrompt");
         Ok(block)
     }
 
     pub fn response(&self, id: BlockId, source: &str) -> Result<RenderedMarkdown> {
-        let mut profile = self.profile.clone();
-        let margin = 2.min(profile.columns - 1);
-        profile.columns -= margin;
-        let mut rendered = MarkdownRenderer::render(id, source, &profile)?;
-        for row in 0..rendered.block.text.row_count() {
-            rendered.block.metadata.gutter.push(Gutter {
-                position: TextPosition { row, column: 0 },
-                chunk: vec![TextChunk {
-                    text: if row == 0 && margin == 2 {
-                        "▸ ".into()
-                    } else {
-                        " ".repeat(margin)
-                    },
-                    capture: "ForgeHarnessResponse".into(),
-                }],
-                priority: 100,
-            });
-        }
+        let source = markdown_math::normalize(source);
+        let mut rendered = MarkdownRenderer::source(id, &source, self.profile)?;
+        rendered.block.metadata.markdown = true;
+        rendered.block.metadata.layout = Some(ContentLayout {
+            indent: 2, marker: None, source_indent: 0,
+        });
         Ok(rendered)
     }
 
-    pub fn commentary(&self, id: BlockId, source: &str) -> Result<BufferBlock> {
-        let mut block = self.literal(id, &format!("↳ {source}"), 2)?;
+    pub fn commentary(&self, id: BlockId, source: &str) -> Result<RenderedMarkdown> {
+        let source = markdown_math::normalize(source);
+        let mut rendered = MarkdownRenderer::source(id, &source, self.profile)?;
+        let block = &mut rendered.block;
+        block.metadata.markdown = true;
+        block.metadata.decoration.clear();
+        block.metadata.layout = Some(ContentLayout {
+            indent: 2,
+            source_indent: 0,
+            marker: Some(TextChunk {
+                text: "↳".into(),
+                capture: "ForgeHarnessCommentary".into(),
+            }),
+        });
         block.metadata.decoration.push(Decoration {
             range: TextRange {
                 start: TextPosition { row: 0, column: 0 },
@@ -72,21 +74,37 @@ impl<'profile> TranscriptRenderer<'profile> {
                 },
             },
             capture: "ForgeHarnessCommentary".into(),
-            priority: 100,
+            priority: 50,
         });
-        Ok(block)
+        Ok(rendered)
     }
 
     pub fn literal(&self, id: BlockId, source: &str, indent: usize) -> Result<BufferBlock> {
         id.validate()?;
-        Ok(BufferBlock {
+        let block = BufferBlock {
             id,
             text: BufferText::from_rows(
                 self.profile
                     .wrap_plain(source, indent.min(self.profile.columns - 1))?,
             )?,
             metadata: BlockMetadata::default(),
-        })
+        };
+        Ok(block)
+    }
+
+    pub fn heading_marker(block: &mut BufferBlock, capture: &str) {
+        if block.text.row(0).is_some_and(|row| row.starts_with("▸ ")) {
+            block.metadata.layout = Some(ContentLayout {
+                indent: 2,
+                source_indent: 0,
+                marker: Some(TextChunk { text: "▸".into(), capture: capture.into() }),
+            });
+            block.metadata.conceal.push(Conceal {
+                range: TextRange { start: TextPosition { row: 0, column: 0 },
+                    end: TextPosition { row: 0, column: "▸ ".len() } },
+                replacement: String::new(), line: false, priority: 100,
+            });
+        }
     }
 
     pub fn tool_preview(
@@ -652,7 +670,7 @@ mod test {
     }
 
     #[test]
-    fn response_margin_preserves_link_byte_targets_and_wrap_capacity() -> Result<()> {
+    fn response_preserves_markdown_source_for_neovim_renderer() -> Result<()> {
         let profile = WidthProfile {
             columns: 14,
             ..WidthProfile::default()
@@ -661,21 +679,48 @@ mod test {
             BlockId("response".into()),
             "A [界 link](https://example.test).\n\nMore text wraps.",
         )?;
-        assert_eq!(rendered.block.metadata.gutter[0].chunk[0].text, "▸ ");
-        assert!(
-            rendered
-                .block
-                .metadata
-                .gutter
-                .iter()
-                .skip(1)
-                .all(|gutter| gutter.chunk[0].text == "  ")
-        );
+        assert!(rendered.block.metadata.gutter.is_empty());
+        assert_eq!(rendered.block.metadata.layout.as_ref().unwrap().indent, 2);
+        assert!(rendered.block.metadata.layout.as_ref().unwrap().marker.is_none());
+        assert!(rendered.block.metadata.markdown);
         assert_eq!(rendered.block.metadata.target[0].range.start.column, 2);
-        for row in rendered.block.text.wire_rows() {
-            assert!(profile.cells(&row, 2)? <= 12);
-        }
+        assert_eq!(rendered.block.text.wire_rows(), vec![
+            "A [界 link](https://example.test).", "", "More text wraps."
+        ]);
         rendered.block.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn response_normalizes_latex_before_markdown_presentation() -> Result<()> {
+        let rendered = TranscriptRenderer::new(&WidthProfile::default())?.response(
+            BlockId("equation".into()),
+            "\\[\nL_o(x,\\omega_o)\n=\nL_e(x,\\omega_o) + \\int_{\\Omega} L_i\n\\]\n\nHere \\(L_o\\) is outgoing radiance.",
+        )?;
+        assert_eq!(
+            rendered.block.text.wire_rows(),
+            vec![
+                "\\[",
+                "L_o(x,\\omega_o) = L_e(x,\\omega_o) + \\int_{\\Omega} L_i",
+                "\\]",
+                "",
+                "Here $L_o$ is outgoing radiance.",
+            ]
+        );
+        assert!(rendered.block.metadata.markdown);
+        Ok(())
+    }
+
+    #[test]
+    fn commentary_preserves_markdown_and_its_link_target() -> Result<()> {
+        let rendered = TranscriptRenderer::new(&WidthProfile::default())?.commentary(
+            BlockId("commentary".into()),
+            "**Review** [details](https://example.test)",
+        )?;
+        assert!(rendered.block.metadata.markdown);
+        assert_eq!(rendered.block.text.wire_rows(), vec!["**Review** [details](https://example.test)"]);
+        assert_eq!(rendered.block.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "↳");
+        assert_eq!(rendered.link[0].destination, "https://example.test");
         Ok(())
     }
 }

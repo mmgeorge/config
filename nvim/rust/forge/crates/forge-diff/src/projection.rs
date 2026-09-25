@@ -39,6 +39,7 @@ pub fn header(
     }
     if indent > 0 {
         metadata.gutter.push(Gutter {
+            placement: Default::default(),
             position: TextPosition { row: 0, column: 0 },
             chunk: vec![TextChunk {
                 text: " ".repeat(indent),
@@ -366,6 +367,7 @@ pub fn append_display_row(
         RowKind::Context => ("ForgeContextBg", "ForgeContextLineNr", "ForgeContextBg"),
     };
     metadata.gutter.push(Gutter {
+        placement: Default::default(),
         position: TextPosition { row, column: 0 },
         chunk: vec![
             TextChunk {

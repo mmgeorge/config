@@ -76,10 +76,21 @@ pub enum InputIntent {
 /// Retains acknowledged user input in exchange order.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ExchangeInput {
+    #[serde(default)]
+    pub question: Option<QuestionInput>,
     pub intent: InputIntent,
     pub id: String,
     pub text: String,
     pub created_at_ms: i64,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Retains the question identity and submitted decisions independently of picker focus.
+pub struct QuestionInput {
+    pub set_id: String,
+    pub question_id: Option<String>,
+    #[serde(default)]
+    pub answer: Vec<crate::plan::PlanQuestionAnswer>,
 }
 
 /// Tracks transient waiting chrome without adding it to durable history.

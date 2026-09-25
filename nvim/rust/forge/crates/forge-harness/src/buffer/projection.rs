@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
-    BlockAnchor, BufferBlock, Decoration, FoldRange, Gutter, TargetRange, TextChunk, TextPosition,
+    BlockAnchor, BufferBlock, ContentLayout, Decoration, FoldRange, TargetRange, TextChunk, TextPosition,
     TextRange,
 };
 use forge_buffer::identity::{BlockId, FoldId, TargetId};
@@ -107,6 +107,8 @@ struct TimelineRenderer<'profile> {
 
 enum MarkdownRole {
     Response,
+    Commentary,
+    Message,
     Detail,
     Comment,
 }
@@ -115,6 +117,7 @@ enum MarkdownRole {
 struct Section {
     start: usize,
     margin: usize,
+    child_indent: usize,
 }
 
 pub fn project(
@@ -163,6 +166,11 @@ fn project_at_with_separator(
         expanded_tool,
     };
     projection.entry(entry, 0)?;
+    for block in &mut projection.block {
+        super::layout::materialize(block)?;
+    }
+    ensure!(projection.block.iter().map(|block| block.text.byte_count()).sum::<usize>() <= 32 * 1024 * 1024,
+        "materialized transcript exceeds native capacity");
     ensure!(projection.margin == 0, "timeline section was not finished");
     if projection.block.is_empty() {
         projection.literal(&format!("{}:empty", entry.id()), "", None)?;
@@ -334,7 +342,7 @@ impl TimelineRenderer<'_> {
                 revision: None,
             }),
         )?;
-        let section = self.begin_section();
+        let section = self.begin_section(2);
         self.literal(
             &format!("{id}:tests"),
             &format!(
@@ -416,7 +424,7 @@ impl TimelineRenderer<'_> {
                         revision: Some(lifecycle.model_revision),
                     }),
                 )?;
-                let section = self.begin_section();
+                let section = self.begin_section(2);
                 if lifecycle.kind == PlanLifecycleKind::QuestionAnswered {
                     self.prompt.push(BlockId(event.id.clone()));
                 }
@@ -515,7 +523,7 @@ impl TimelineRenderer<'_> {
                 run_id: run.id.clone(),
             }),
         )?;
-        let section = self.begin_section();
+        let section = self.begin_section(2);
         self.literal(&format!("{id}:task"), &format!("↳ {}", task), None)?;
         let children: HashMap<_, _> = agent
             .iter()
@@ -539,7 +547,7 @@ impl TimelineRenderer<'_> {
         self.literal(id, &format!("▸ Question presented: {header}"), Some(TranscriptAction::Question {
             question_set_id: question.id.clone(),
         }))?;
-        let section = self.begin_section();
+        let section = self.begin_section(2);
         for (index, question) in question.questions.iter().enumerate() {
             self.markdown(&format!("{id}:question:{index}"), &question.question, MarkdownRole::Detail)?;
             for (option, value) in question.options.iter().enumerate() {
@@ -603,13 +611,64 @@ impl TimelineRenderer<'_> {
             },
             priority: 100,
         });
+        let capture = heading.metadata.decoration[0].capture.clone();
+        TranscriptRenderer::heading_marker(&mut heading, &capture);
         self.push(heading)?;
-        let section = self.begin_section();
+        let section = self.begin_section(0);
+        let questions = super::question::QuestionHistory::new(interaction);
+        let visible = interaction.node_list.iter().filter(|node| !questions.nested.contains(node.id())).collect::<Vec<_>>();
+        let (response, trailing_plan) = self.content(interaction, agents, depth, &visible, Some(&questions), true)?;
+        self.finish_section(
+            section,
+            &format!("{}:exchange", interaction.id),
+            interaction.completed_at_ms.is_some(),
+        );
+        if let Some(diff) = &interaction.attributed_diff_text {
+            self.diff(
+                &format!("{}:changes", interaction.id),
+                "Changed",
+                diff,
+                if interaction.attributed_matches_checkpoint {
+                    " · checkpoint matched"
+                } else {
+                    ""
+                },
+                None,
+            )?;
+        }
+        if !interaction.attributed_matches_checkpoint {
+            if let Some(diff) = &interaction.checkpoint_diff_text {
+                self.diff(
+                    &format!("{}:checkpoint", interaction.id),
+                    "Checkpoint total:",
+                    diff,
+                    "",
+                    None,
+                )?;
+            }
+        }
+        for (id, text) in response {
+            self.markdown(&id, text, MarkdownRole::Response)?;
+        }
+        for event in trailing_plan {
+            self.plan_event(event)?;
+        }
+        Ok(())
+    }
+
+    fn content<'exchange>(
+        &mut self,
+        interaction: &'exchange Exchange,
+        agents: &HashMap<String, TimelineEntry>,
+        depth: usize,
+        visible: &[&'exchange ExchangeNode],
+        questions: Option<&super::question::QuestionHistory<'exchange>>,
+        defer_final: bool,
+    ) -> Result<(Vec<(String, &'exchange str)>, Vec<&'exchange crate::plan::ExchangePlanEvent>)> {
         let mut response = Vec::new();
-        let visible = interaction.node_list.iter().collect::<Vec<_>>();
         let mut question_turn = std::collections::HashSet::new();
         let mut preceding_turn = None;
-        for node in &visible {
+        for node in interaction.node_list.iter() {
             if let ExchangeNode::TurnContent { turn_id, .. } = node {
                 preceding_turn = Some(turn_id.as_str());
             }
@@ -624,7 +683,7 @@ impl TimelineRenderer<'_> {
                 if let Some(turn_id) = preceding_turn { question_turn.insert(turn_id); }
             }
         }
-        let final_position = interaction.completed_at_ms.and_then(|_| {
+        let final_position = defer_final.then_some(()).and_then(|_| {
             visible.iter().rposition(|node| {
                 if let ExchangeNode::TurnContent {
                     turn_id,
@@ -650,6 +709,10 @@ impl TimelineRenderer<'_> {
         let mut trailing_plan = Vec::new();
         let mut rendered_tool = std::collections::HashSet::new();
         for (position, node) in visible.iter().enumerate() {
+            if let Some(group) = questions.and_then(|history| history.group.get(node.id())) {
+                self.question_group(group, interaction, agents, depth)?;
+                continue;
+            }
             match node {
                 ExchangeNode::TurnContent { id, turn_id, item } => {
                     let turn = interaction
@@ -675,11 +738,9 @@ impl TimelineRenderer<'_> {
                             if final_message && Some(position) == final_position {
                                 response.push((id.clone(), message.text()));
                             } else if final_message {
-                                self.markdown(id, message.text(), MarkdownRole::Response)?;
+                                self.markdown(id, message.text(), if defer_final { MarkdownRole::Response } else { MarkdownRole::Message })?;
                             } else {
-                                let commentary = TranscriptRenderer::new(&self.content_width())?
-                                    .commentary(BlockId(id.clone()), message.text())?;
-                                self.push(commentary)?;
+                                self.markdown(id, message.text(), MarkdownRole::Commentary)?;
                             }
                         }
                         crate::turn::TurnItem::Tool { .. } => {
@@ -747,7 +808,7 @@ impl TimelineRenderer<'_> {
                                             "",
                                             None,
                                         )?;
-                                        self.indent_range(diff_start, 2);
+                                        self.offset_layout(diff_start, 2);
                                     }
                                     self.fold(tool_start, id, index + 1 < count);
                                 }
@@ -758,7 +819,7 @@ impl TimelineRenderer<'_> {
                 }
                 ExchangeNode::PlanEvent { event } => {
                     if final_position.is_some_and(|final_position| position > final_position) {
-                        trailing_plan.push(event);
+                        trailing_plan.push(event.as_ref());
                     } else {
                         self.plan_event(event)?;
                     }
@@ -831,7 +892,7 @@ impl TimelineRenderer<'_> {
                     for (index, annotation) in resolution.annotation.iter().enumerate() {
                         let identity = format!("{}:comment:{index}", resolution.id);
                         self.literal(&identity, &format!("▸ Resolved {}", annotation.label), None)?;
-                        let section = self.begin_section();
+                        let section = self.begin_section(2);
                         self.markdown(
                             &format!("{identity}:body"),
                             &annotation.body,
@@ -873,41 +934,76 @@ impl TimelineRenderer<'_> {
                 }
             }
         }
-        self.finish_section(
-            section,
-            &format!("{}:exchange", interaction.id),
-            interaction.completed_at_ms.is_some(),
-        );
-        if let Some(diff) = &interaction.attributed_diff_text {
-            self.diff(
-                &format!("{}:changes", interaction.id),
-                "Changed",
-                diff,
-                if interaction.attributed_matches_checkpoint {
-                    " · checkpoint matched"
-                } else {
-                    ""
-                },
-                None,
-            )?;
-        }
-        if !interaction.attributed_matches_checkpoint {
-            if let Some(diff) = &interaction.checkpoint_diff_text {
-                self.diff(
-                    &format!("{}:checkpoint", interaction.id),
-                    "Checkpoint total:",
-                    diff,
-                    "",
-                    None,
-                )?;
+        Ok((response, trailing_plan))
+    }
+
+    fn question_group(
+        &mut self,
+        group: &super::question::QuestionGroup<'_>,
+        exchange: &Exchange,
+        agents: &HashMap<String, TimelineEntry>,
+        depth: usize,
+    ) -> Result<()> {
+        let answered = group.branch.iter().filter(|branch| branch.answer.is_some()).count();
+        let label = if group.withdrawal.is_some() { "▸ Questions · Withdrawn".into() }
+            else { format!("▸ Questions · {answered}/{} answered", group.branch.len()) };
+        self.literal(group.id, &label,
+            Some(TranscriptAction::Question { question_set_id: group.set.id.clone() }))?;
+        let section = self.begin_section(2);
+        for branch in &group.branch {
+            let id = format!("{}:question:{}", group.id, branch.question.id);
+            let status = branch.answer.as_deref().unwrap_or(if group.withdrawal.is_some() { "Withdrawn" }
+                else if group.resolved { "Resolved" } else { "Awaiting answer" });
+            self.literal(&id, &format!("▸ {} · {status}", branch.question.question),
+                Some(TranscriptAction::Question { question_set_id: group.set.id.clone() }))?;
+            let question_section = self.begin_section(2);
+            for (index, option) in branch.question.options.iter().enumerate() {
+                self.literal(&format!("{id}:option:{index}"), &format!("○ {}: {}", option.label, option.description), None)?;
             }
+            for (index, clarification) in branch.clarification.iter().enumerate() {
+                self.clarification(clarification, exchange, agents, depth,
+                    group.resolved || index + 1 < branch.clarification.len())?;
+            }
+            if let Some(answer) = &branch.answer {
+                let mut block = TranscriptRenderer::new(&self.content_width())?.literal(
+                    BlockId(format!("{id}:answer")), &format!("○ You answered: {answer}"), 2)?;
+                block.metadata.decoration.push(Decoration {
+                    range: TextRange { start: TextPosition { row: 0, column: 0 },
+                        end: TextPosition { row: block.text.row_count(), column: 0 } },
+                    capture: "ForgeHarnessPrompt".into(), priority: 100,
+                });
+                self.prompt.push(block.id.clone());
+                self.push(block)?;
+            }
+            self.finish_section(question_section, &id, group.resolved);
         }
-        for (id, text) in response {
-            self.markdown(&id, text, MarkdownRole::Response)?;
+        for clarification in &group.clarification {
+            self.clarification(clarification, exchange, agents, depth, group.resolved)?;
         }
-        for event in trailing_plan {
-            self.plan_event(event)?;
+        if let Some(reason) = group.withdrawal {
+            self.markdown(&format!("{}:withdrawal", group.id),
+                &format!("Clarification withdrawn: {reason}"), MarkdownRole::Detail)?;
         }
+        self.finish_section(section, group.id, group.resolved);
+        Ok(())
+    }
+
+    fn clarification(
+        &mut self,
+        clarification: &super::question::Clarification<'_>,
+        exchange: &Exchange,
+        agents: &HashMap<String, TimelineEntry>,
+        depth: usize,
+        closed: bool,
+    ) -> Result<()> {
+        let id = format!("{}:prompt", clarification.prompt.id);
+        let block = TranscriptRenderer::new(&self.content_width())?.prompt(
+            BlockId(id.clone()), &format!("You asked: {}", clarification.prompt.text))?;
+        self.prompt.push(block.id.clone());
+        self.push(block)?;
+        let section = self.begin_section(2);
+        self.content(exchange, agents, depth, &clarification.content, None, false)?;
+        self.finish_section(section, &id, closed);
         Ok(())
     }
 
@@ -991,24 +1087,25 @@ impl TimelineRenderer<'_> {
             MarkdownRole::Response => {
                 TranscriptRenderer::new(&width)?.response(BlockId(id.into()), text)?
             }
+            MarkdownRole::Commentary => {
+                TranscriptRenderer::new(&width)?.commentary(BlockId(id.into()), text)?
+            }
+            MarkdownRole::Message => {
+                let mut rendered = forge_buffer::markdown::MarkdownRenderer::source(BlockId(id.into()), text, &width)?;
+                rendered.block.metadata.markdown = true;
+                rendered
+            }
             MarkdownRole::Detail | MarkdownRole::Comment => {
                 forge_buffer::markdown::MarkdownRenderer::render(BlockId(id.into()), text, &width)?
             }
         };
+        if rendered.block.metadata.markdown && !matches!(role, MarkdownRole::Commentary) {
+            rendered.block.metadata.decoration.clear();
+        }
         if comment {
-            for row in 0..rendered.block.text.row_count() {
-                rendered.block.metadata.gutter.insert(
-                    row,
-                    Gutter {
-                        position: TextPosition { row, column: 0 },
-                        chunk: vec![TextChunk {
-                            text: if row == 0 { "◦ " } else { "  " }.into(),
-                            capture: "Normal".into(),
-                        }],
-                        priority: 200,
-                    },
-                );
-            }
+            rendered.block.metadata.layout = Some(ContentLayout {
+                indent: 4, marker: Some(TextChunk { text: "◦".into(), capture: "Normal".into() }), source_indent: 0,
+            });
         }
         rendered
             .code
@@ -1039,6 +1136,7 @@ impl TimelineRenderer<'_> {
     fn literal(&mut self, id: &str, text: &str, action: Option<TranscriptAction>) -> Result<()> {
         let mut block =
             TranscriptRenderer::new(&self.content_width())?.literal(BlockId(id.into()), text, 2)?;
+        TranscriptRenderer::heading_marker(&mut block, "Normal");
         if let Some(action) = action {
             let target = TargetId(id.into());
             block.metadata.target.push(TargetRange {
@@ -1056,7 +1154,8 @@ impl TimelineRenderer<'_> {
         self.push(block)
     }
 
-    fn push(&mut self, block: BufferBlock) -> Result<()> {
+    fn push(&mut self, mut block: BufferBlock) -> Result<()> {
+        block.metadata.layout.get_or_insert(ContentLayout { indent: 2, marker: None, source_indent: 0 });
         self.bytes += block.text.byte_count();
         ensure!(
             self.bytes <= 32 * 1024 * 1024 && self.block.len() < 65536,
@@ -1066,38 +1165,9 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn indent_range(&mut self, start: usize, depth: usize) {
-        let prefix = "  ".repeat(depth);
-        if prefix.is_empty() {
-            return;
-        }
+    fn offset_layout(&mut self, start: usize, depth: usize) {
         for block in &mut self.block[start..] {
-            for row in 0..block.text.row_count() {
-                if let Some(gutter) = block
-                    .metadata
-                    .gutter
-                    .iter_mut()
-                    .find(|gutter| gutter.position.row == row && gutter.position.column == 0)
-                {
-                    if let Some(chunk) = gutter.chunk.first_mut() {
-                        chunk.text.insert_str(0, &prefix);
-                    } else {
-                        gutter.chunk.push(TextChunk {
-                            text: prefix.clone(),
-                            capture: "Normal".into(),
-                        });
-                    }
-                } else {
-                    block.metadata.gutter.push(Gutter {
-                        position: TextPosition { row, column: 0 },
-                        chunk: vec![TextChunk {
-                            text: prefix.clone(),
-                            capture: "Normal".into(),
-                        }],
-                        priority: 200,
-                    });
-                }
-            }
+            block.metadata.layout.as_mut().expect("projected block layout").indent += depth * 2;
         }
     }
 
@@ -1107,18 +1177,19 @@ impl TimelineRenderer<'_> {
         width
     }
 
-    fn begin_section(&mut self) -> Section {
+    fn begin_section(&mut self, child_indent: usize) -> Section {
         let section = Section {
             start: self.block.len() - 1,
             margin: self.margin,
+            child_indent,
         };
-        self.margin += 2;
+        self.margin += child_indent;
         section
     }
 
     fn finish_section(&mut self, section: Section, identity: &str, closed: bool) {
         self.margin = section.margin;
-        self.indent_range(section.start + 1, 1);
+        self.offset_layout(section.start + 1, section.child_indent / 2);
         self.fold(section.start, identity, closed);
     }
 
@@ -1410,19 +1481,10 @@ mod tests {
                 block.metadata.fold.is_empty(),
                 "comment bullet introduced a nested fold"
             );
-            for row in 0..block.text.row_count() {
-                let gutter = block
-                    .metadata
-                    .gutter
-                    .iter()
-                    .find(|gutter| gutter.position.row == row)
-                    .unwrap();
-                assert_eq!(
-                    gutter.chunk[0].text,
-                    if row == 0 { "    ◦ " } else { "      " }
-                );
-                assert_eq!(gutter.chunk[0].capture, "Normal");
-            }
+            let layout = block.metadata.layout.as_ref().unwrap();
+            assert_eq!(layout.indent, 6);
+            assert_eq!(layout.marker.as_ref().unwrap().text, "◦");
+            assert!(block.metadata.gutter.is_empty());
             assert!(block.text.row_count() > 1, "fixture must exercise wrapping");
         }
     }
@@ -1507,6 +1569,107 @@ mod tests {
     }
 
     #[test]
+    fn question_branches_keep_targets_responses_and_folds_across_reload() {
+        use forge_buffer::block::BufferBlock;
+        use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
+        use crate::exchange::{ExchangeKind, ExchangeNode, ExchangeState, InputIntent, QuestionInput};
+        for planning in [false, true] {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"nested", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Plan a replacement", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            })).unwrap();
+            let set: crate::plan::PlanQuestionSet = serde_json::from_value(json!({
+                "id":"set", "questions":[
+                    {"id":"scope", "header":"Scope", "question":"What should replace the repository?",
+                        "options":[{"label":"Rust CLI","description":"Preserve the demo"}], "allow_freeform":true},
+                    {"id":"azure", "header":"Azure", "question":"Include real Azure services?",
+                        "options":[{"label":"Simulation","description":"Keep everything local"}], "allow_freeform":true}
+                ]
+            })).unwrap();
+            exchange.node_list.push(if planning {
+                exchange.kind = ExchangeKind::PlanDraft;
+                serde_json::from_value(json!({"kind":"plan_event", "event":{
+                    "id":"presented", "node_count":0, "content":{"kind":"lifecycle", "title":"Replacement", "lifecycle":{
+                        "id":"presented", "session_id":"session", "plan_id":"plan", "kind":"question_asked",
+                        "model_revision":0,"user_revision":0,"annotation":[],"question":set,"created_at_ms":0
+                    }}
+                }})).unwrap()
+            } else {
+                ExchangeNode::QuestionPresented { id:"presented".into(), question:set.clone(), answer:None }
+            });
+            for (index, (target, prompt, reply)) in [
+                ("scope", "What does Rust include?", "It preserves the simulation."),
+                ("azure", "Would this require credentials?", "Azure connections require credentials."),
+                ("scope", "Can I retain the same workflow?", "Yes, the workflow remains the same."),
+            ].into_iter().enumerate() {
+                exchange.append_question_input(InputIntent::Clarification, prompt.into(), QuestionInput {
+                    set_id: "set".into(), question_id: Some(target.into()), answer:Vec::new(),
+                }, index as i64).unwrap();
+                let mut event = BackendEvent {
+                    address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:format!("turn-{index}") }),
+                    turn_boundary:Some(TurnBoundary::Started), kind:"turn_started".into(), text:None,
+                    data:serde_json::Value::Null, activity:None,summary:None,task_update:None,
+                };
+                exchange.observe_turn(&event,index as i64).unwrap();
+                event.turn_boundary=None;
+                event.kind="assistant_message".into();
+                event.text=Some(reply.into());
+                event.data=json!({"phase":"final_answer"});
+                exchange.observe_turn(&event,index as i64).unwrap();
+                event.text=None;
+                event.turn_boundary=Some(TurnBoundary::Finished {outcome:crate::turn::TurnOutcome::Completed});
+                exchange.observe_turn(&event,index as i64).unwrap();
+            }
+            let selected = crate::plan::PlanQuestionAnswer {
+                question_id:"scope".into(), response:crate::plan::PlanQuestionResponse::Selected {
+                    option:"Rust CLI".into(),feedback:None,
+                },
+            };
+            let mut elicitation = crate::plan::PlanElicitation::new(set);
+            elicitation.answer.push(selected.clone());
+            exchange.elicitation=Some(elicitation);
+            exchange.awaiting_input=true;
+            exchange.pause(3);
+            let render = |exchange: Exchange| project_at(&TimelineEntry::Exchange {
+                id:exchange.id.clone(),created_at_ms:0,exchange,agent_by_id:HashMap::new(),
+            }, &WidthProfile::default(), 4).unwrap();
+            let restored = serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+            let projected = render(restored);
+            let blocks = &projected.entry.block;
+            let text = blocks.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+            assert!(text.contains("Questions · 1/2 answered"));
+            let position = |id: &str| blocks.iter().position(|block| block.id.0 == id).unwrap();
+            let scope = position("presented:question:scope");
+            let azure = position("presented:question:azure");
+            for (input, start, end) in [(1,scope,azure),(2,azure,blocks.len()),(3,scope,azure)] {
+                let heading = position(&format!("nested:input:{input}:prompt"));
+                let block = &blocks[heading];
+                assert!(start < heading && heading < end);
+                assert!(block.metadata.decoration.iter().any(|decoration| decoration.capture == "ForgeHarnessPrompt"));
+                let fold = &block.metadata.fold[0];
+                let reply = position(&fold.end.block.0);
+                assert_eq!(reply, heading + 1, "clarification folded a sibling input");
+                assert!(reply < end);
+                assert!(!blocks[reply].metadata.gutter.iter().flat_map(|gutter| &gutter.chunk)
+                    .any(|chunk| chunk.text.contains('↳')));
+                let indent = |block: &BufferBlock| block.metadata.layout.as_ref().unwrap().indent;
+                assert_eq!(indent(&blocks[reply]),indent(block)+2);
+            }
+            if planning { println!("NESTED_QUESTION_FIXTURE:{}",serde_json::to_string(blocks).unwrap()); }
+            exchange.append_question_input(InputIntent::Answer,"Scope: Rust CLI".into(),QuestionInput {
+                set_id:"set".into(),question_id:None,answer:vec![selected],
+            },4).unwrap();
+            exchange.finish(ExchangeState::Cancelled,5).unwrap();
+            let cancelled = render(exchange);
+            assert!(cancelled.entry.block.iter().find(|block| block.id.0=="presented").unwrap().metadata.fold[0].closed);
+            let text = cancelled.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+            assert_eq!(text.matches("Azure connections require credentials.").count(),1);
+            assert_eq!(text.matches("Yes, the workflow remains the same.").count(),1);
+        }
+    }
+
+    #[test]
     fn question_clarification_preserves_turn_delivery_and_history() {
         use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary};
         use crate::exchange::{ExchangeNode, ExchangeState};
@@ -1568,19 +1731,19 @@ mod tests {
             id: restored.id.clone(), created_at_ms: 0, exchange: restored, agent_by_id: HashMap::new(),
         }, &WidthProfile::default(), 6).unwrap();
         let text = projected.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
-        assert!(text.contains("○ You asked: What do you mean?"));
-        assert_eq!(text.matches("Question presented:").count(), 1);
+        assert!(text.contains("▸ You asked: What do you mean?"));
+        assert_eq!(text.matches("▸ Questions ·").count(), 1);
         assert!(!text.contains("Question set accepted"));
         assert!(text.contains("Invalid options"));
         assert_eq!(projected.tool.len(), 1, "successful question must not remain a raw tool");
-        assert!(text.find("Question presented:").unwrap() < text.find("You asked:").unwrap());
+        assert!(text.find("▸ Questions ·").unwrap() < text.find("You asked:").unwrap());
         assert!(text.find("You asked:").unwrap() < text.find("I mean a Rust CLI").unwrap());
         let answer = projected.entry.block.iter().find(|block| block.text.wire_rows().join("\n").contains("I mean a Rust CLI")).unwrap();
         assert!(!answer.metadata.gutter.iter().flat_map(|gutter| &gutter.chunk).any(|chunk| chunk.text.contains('↳')));
         assert!(projected.action.values().any(|action| matches!(action, super::TranscriptAction::Question { question_set_id } if question_set_id == "scope-set")));
         let question_block = projected.entry.block.iter().find(|block| block.id.0 == "presented").unwrap();
-        assert!(question_block.metadata.fold[0].closed);
-        assert_ne!(question_block.metadata.fold[0].end.block, answer.id, "question folded the later explanation");
+        assert!(!question_block.metadata.fold[0].closed);
+        assert_eq!(question_block.metadata.fold[0].end.block, answer.id, "question owns the clarification response");
         assert!(exchange.completed_at_ms.is_none() && exchange.checkpoint_after.is_none());
         println!("QUESTION_FIXTURE:{}", serde_json::to_string(&projected.entry.block).unwrap());
         exchange.append_input(crate::exchange::InputIntent::Answer, "Planning feedback:\n- Scope: Rust CLI".into(), 7).unwrap();
@@ -1860,9 +2023,9 @@ mod tests {
             ("parent-agent", 0),
             ("parent:prompt", 2),
             ("parent:summary", 2),
-            ("delegation", 4),
-            ("nested:prompt", 6),
-            ("nested:summary", 6),
+            ("delegation", 2),
+            ("nested:prompt", 4),
+            ("nested:summary", 4),
         ] {
             let block = projected
                 .entry
@@ -1870,14 +2033,7 @@ mod tests {
                 .iter()
                 .find(|block| block.id.0 == identity)
                 .unwrap();
-            let prefix = block
-                .metadata
-                .gutter
-                .iter()
-                .filter(|gutter| gutter.position.row == 0 && gutter.position.column == 0)
-                .flat_map(|gutter| &gutter.chunk)
-                .map(|chunk| chunk.text.as_str())
-                .collect::<String>();
+            let prefix = " ".repeat(block.metadata.layout.as_ref().unwrap().indent - 2);
             assert_eq!(
                 prefix,
                 " ".repeat(spaces),
@@ -1946,15 +2102,8 @@ mod tests {
             )
             .unwrap();
             let blocks = &projected.entry.block;
-            let indentation = |block: &forge_buffer::block::BufferBlock, row| {
-                block
-                    .metadata
-                    .gutter
-                    .iter()
-                    .filter(|gutter| gutter.position.row == row && gutter.position.column == 0)
-                    .flat_map(|gutter| &gutter.chunk)
-                    .map(|chunk| chunk.text.as_str())
-                    .collect::<String>()
+            let indentation = |block: &forge_buffer::block::BufferBlock, _row| {
+                " ".repeat(block.metadata.layout.as_ref().unwrap().indent - 2)
             };
             for index in 0..8 {
                 let heading = blocks
@@ -1965,11 +2114,11 @@ mod tests {
                     .iter()
                     .find(|block| block.id.0 == format!("event-{index}:comment"))
                     .unwrap();
-                assert_eq!(indentation(heading, 0), "  ");
+                assert_eq!(indentation(heading, 0), "");
                 for row in 0..detail.text.row_count() {
                     assert_eq!(
                         indentation(detail, row),
-                        "    ",
+                        "  ",
                         "detail acquired a response marker"
                     );
                 }
@@ -2078,6 +2227,23 @@ mod tests {
         event.text = Some("Finished the work".into());
         event.data = serde_json::json!({ "phase": "final_answer" });
         exchange.observe_turn(&event, 4).unwrap();
+        let streaming = project_at(
+            &TimelineEntry::Exchange {
+                id: exchange.id.clone(), created_at_ms: 0,
+                exchange: exchange.clone(), agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(), 4,
+        ).unwrap();
+        let streaming_response = streaming.entry.block.iter()
+            .find(|block| block.text.row(0) == Some("Finished the work")).unwrap();
+        let streaming_commentary = streaming.entry.block.iter()
+            .find(|block| block.text.row(0) == Some("Inspecting ownership")).unwrap();
+        assert_eq!(streaming_commentary.metadata.layout.as_ref().unwrap().indent, 2,
+            "fold ownership must not indent commentary");
+        assert!(streaming_commentary.metadata.gutter.is_empty(),
+            "resolved content layout must not acquire another gutter");
+        assert_eq!(streaming_response.metadata.layout.as_ref().unwrap().indent, 2,
+            "streaming final response must not inherit activity indentation");
         event.text = None;
         event.turn_boundary = Some(TurnBoundary::Finished {
             outcome: crate::turn::TurnOutcome::Completed,
@@ -2104,6 +2270,10 @@ mod tests {
             .flat_map(|block| (0..block.text.row_count()).filter_map(|row| block.text.row(row)))
             .collect::<Vec<_>>()
             .join("\n");
+        let completed_response = projected.entry.block.iter()
+            .find(|block| block.text.row(0) == Some("Finished the work")).unwrap();
+        assert_eq!(streaming_response.metadata.layout, completed_response.metadata.layout,
+            "completion must not change final response indentation");
         let commentary = text.find("Inspecting ownership").unwrap();
         let tools = text.find("Ran 1 tool").unwrap();
         let steering = text.find("Also check tests").unwrap();

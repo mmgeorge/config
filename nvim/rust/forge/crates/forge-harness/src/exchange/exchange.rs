@@ -456,6 +456,7 @@ impl Exchange {
             .count()
             + 1;
         let prompt = ExchangeInput {
+            question: None,
             intent,
             id: format!("{}:input:{prompt_ordinal}", self.id),
             text,
@@ -465,6 +466,27 @@ impl Exchange {
             prompt: prompt.clone(),
         });
         Ok(prompt)
+    }
+
+    /// Admit question feedback with a durable target before the provider can produce a reply.
+    pub(crate) fn append_question_input(
+        &mut self,
+        intent: InputIntent,
+        text: String,
+        question: QuestionInput,
+        now_ms: i64,
+    ) -> anyhow::Result<()> {
+        anyhow::ensure!(matches!(intent, InputIntent::Clarification | InputIntent::Answer),
+            "question feedback requires clarification or answer intent");
+        anyhow::ensure!(!question.set_id.is_empty()
+            && (intent != InputIntent::Clarification || question.question_id.is_some()),
+            "question clarification requires a durable question target");
+        self.append_input(intent, text, now_ms)?;
+        let Some(ExchangeNode::ExchangeInput { prompt }) = self.node_list.last_mut() else {
+            unreachable!("input admission appends an input node")
+        };
+        prompt.question = Some(question);
+        Ok(())
     }
 
     /// Attribute provider usage to the most recently admitted turn.

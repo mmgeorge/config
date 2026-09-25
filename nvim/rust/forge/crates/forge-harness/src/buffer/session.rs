@@ -1248,19 +1248,8 @@ mod tests {
     use forge_buffer::text::BufferText;
 
     #[tokio::test]
-    async fn markdown_syntax_rejects_replaced_source_and_closed_documents() -> Result<()> {
+    async fn markdown_responses_keep_source_without_native_syntax_jobs() -> Result<()> {
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
-        use forge_diff::syntax::{SyntaxEngine, SyntaxLimits};
-        use forge_diff::workers::{AnalysisPool, PoolLimits};
-        use std::sync::Arc;
-        let engine = SyntaxEngine::new(
-            Arc::new(AnalysisPool::new(PoolLimits {
-                workers: 1,
-                jobs: 2,
-                input_bytes: 1024 * 1024,
-            })),
-            SyntaxLimits::default(),
-        );
         let entry_for = |body: &str| {
             let mut entry = interaction_entry("markdown");
             let TimelineEntry::Exchange { exchange, .. } = &mut entry else {
@@ -1311,73 +1300,17 @@ mod tests {
             WidthProfile::default(),
             BufferText::from_rows([""])?,
         )?;
-        assert!(opened.syntax_pending);
-        let job = owner
-            .capture_syntax(&document)?
-            .expect("fenced source admitted");
-        let block = job.analyze(&engine).await?;
-        let identity = block[0].id.clone();
-        owner.apply_syntax(&document, &job, block.clone())?;
-        let highlighted = owner
-            .open
-            .as_ref()
-            .unwrap()
-            .transcript
-            .document
-            .block(&identity)
-            .unwrap()
-            .clone();
-        assert!(!highlighted.metadata.visible_decoration.is_empty());
-        refresh_activity(owner.open.as_mut().unwrap(), &[entry])?;
-        assert_eq!(
-            owner
-                .open
-                .as_ref()
-                .unwrap()
-                .transcript
-                .document
-                .block(&identity)
-                .unwrap()
-                .metadata,
-            highlighted.metadata
-        );
+        assert!(!opened.syntax_pending);
         assert!(owner.capture_syntax(&document)?.is_none());
-        owner.reconcile(vec![entry_for("```js\nconst value: number = 1;\n```")])?;
-        let language_changed = owner.snapshot(&document)?;
-        assert_eq!(
-            owner
-                .open
-                .as_ref()
-                .unwrap()
-                .transcript
-                .document
-                .block(&identity)
-                .unwrap()
-                .text,
-            highlighted.text
-        );
-        owner.apply_syntax(&document, &job, block.clone())?;
-        assert_eq!(
-            owner.snapshot(&document)?,
-            language_changed,
-            "old language captures changed identical displayed text"
-        );
-        owner.reconcile(vec![entry_for(
-            "Text before code.\n\n```ts\nconst changed = 'new';\n```",
-        )])?;
         let before = owner.snapshot(&document)?;
-        owner.apply_syntax(&document, &job, block.clone())?;
-        assert_eq!(
-            owner.snapshot(&document)?,
-            before,
-            "late captures changed replacement source"
-        );
-        assert!(
-            owner.capture_syntax(&document)?.is_some(),
-            "new source did not request fresh syntax"
-        );
+        assert!(before.block.iter().any(|block| block.metadata.markdown
+            && block.text.wire_rows().contains(&"```ts")));
+        owner.reconcile(vec![entry_for("```js\nconst value: number = 1;\n```")])?;
+        let after = owner.snapshot(&document)?;
+        assert!(after.block.iter().any(|block| block.metadata.markdown
+            && block.text.wire_rows().contains(&"```js")));
+        assert!(owner.capture_syntax(&document)?.is_none());
         owner.close(&document)?;
-        owner.apply_syntax(&document, &job, block)?;
         assert!(owner.open.is_none());
         Ok(())
     }

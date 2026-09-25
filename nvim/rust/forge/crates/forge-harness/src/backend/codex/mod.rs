@@ -1069,6 +1069,11 @@ impl Backend for CodexBackend {
                 prompt = "Continue working toward the active goal.".into();
             }
         }
+        if request.backend_session_id.is_some() {
+            prompt = format!(
+                "Use Markdown for user-facing responses unless the user requests another format. Use fenced code blocks with language tags for code and inline code for identifiers and commands. Do not wrap the entire response in a code fence. Keep structured tool arguments in their required schema.\n\n{prompt}"
+            );
+        }
         let mut input = vec![json!({ "type": "text", "text": prompt })];
         if let BackendInput::Skill { name, .. } = &request.input {
             let skill = Self::skill_catalog(process, &mut output, &request.workspace, true)
