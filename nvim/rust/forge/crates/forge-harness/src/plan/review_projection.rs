@@ -314,12 +314,14 @@ fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget
                 },
                 0,
             );
+            append_signature_style(metadata, text, member);
         }
         PlanReviewTarget::EnumVariant { variant, .. } => {
             append_term(metadata, text, variant, "@variable", 0)
         }
         PlanReviewTarget::EnumVariantField { field, .. } => {
-            append_term(metadata, text, field, "@variable.member", 0)
+            append_term(metadata, text, field, "@variable.member", 0);
+            append_signature_style(metadata, text, field);
         }
         PlanReviewTarget::FlowStep {
             target_name,
@@ -397,6 +399,33 @@ fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget
             | PlanReviewTarget::FlowEdge { .. }
     ) {
         append_owner_alignment(metadata, text);
+    }
+}
+
+fn append_signature_style(metadata: &mut BlockMetadata, text: &str, member: &str) {
+    let mut cursor = 0;
+    while cursor < text.len() {
+        let Some(relative) = text[cursor..].find(|character: char| character.is_alphabetic() || character == '_') else {
+            break;
+        };
+        let start = cursor + relative;
+        let end = text[start..]
+            .find(|character: char| !character.is_alphanumeric() && character != '_')
+            .map_or(text.len(), |length| start + length);
+        cursor = end;
+        let identifier = &text[start..end];
+        if identifier == member || text[..start].ends_with('\'') {
+            continue;
+        }
+        let suffix = text[end..].trim_start();
+        let capture = if matches!(identifier, "mut" | "dyn" | "impl" | "const" | "fn" | "unsafe" | "extern") {
+            "@keyword.modifier"
+        } else if suffix.starts_with(':') && !suffix.starts_with("::") {
+            "@variable.parameter"
+        } else {
+            "@type"
+        };
+        append_range(metadata, start, end, capture);
     }
 }
 
@@ -925,6 +954,37 @@ mod tests {
                 "{text}"
             );
         }
+    }
+
+    #[test]
+    fn member_signatures_highlight_types_parameters_and_nested_generics() {
+        for (text, member, expected) in [
+            ("  - velocity: Vec2", "velocity", vec!["Vec2"]),
+            ("  - velocity_value(): Vec2", "velocity_value", vec!["Vec2"]),
+            ("  - animate_shape(time: Res<Time>, shapes: Query<(&ShapeMotion, &mut Transform)>)",
+                "animate_shape", vec!["Res", "Time", "Query", "ShapeMotion", "Transform"]),
+            ("  + complete(message_id: &str): Result<(), QueueError>",
+                "complete", vec!["str", "Result", "QueueError"]),
+            ("    [String]): AccessTokenResponse", "scopes", vec!["String", "AccessTokenResponse"]),
+            ("  - résumé: Vec2", "résumé", vec!["Vec2"]),
+        ] {
+            let mut metadata = super::BlockMetadata::default();
+            super::append_semantic_style(&mut metadata, &super::PlanReviewTarget::EntityMember {
+                entity: "SceneSystems".into(), member: member.into(),
+            }, text);
+            let types: Vec<_> = metadata.visible_decoration.iter()
+                .filter(|decoration| decoration.capture == "@type")
+                .map(|decoration| &text[decoration.range.start.column..decoration.range.end.column])
+                .collect();
+            assert_eq!(types, expected, "{text}");
+            assert!(metadata.source_overlay.is_empty(), "signature type became an owner path");
+        }
+        let text = "  + shape: Option<Vec2>";
+        let mut metadata = super::BlockMetadata::default();
+        super::append_semantic_style(&mut metadata, &super::PlanReviewTarget::EnumVariantField {
+            entity: "Event".into(), variant: "Moved".into(), field: "shape".into(),
+        }, text);
+        assert_eq!(metadata.visible_decoration.iter().filter(|decoration| decoration.capture == "@type").count(), 2);
     }
 
     #[test]
