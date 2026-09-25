@@ -5,6 +5,7 @@ local input = require("forge.input")
 local editable = require("forge.editable")
 local transcript_options = {
   margin = 0,
+  scrolloff = 3,
   conceal = { level = 3, cursor = "nvic" },
   columns = { signcolumn = "yes:1", statuscolumn = "%s" },
   wrapping = { indent = true, options = "shift:0" },

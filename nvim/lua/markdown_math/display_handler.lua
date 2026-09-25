@@ -130,8 +130,8 @@ local function add_marks(buffer, block, output, config, marks)
   })
   if block.end_row > block.start_row + 1 then
     marks:add(config, false, block.start_row + 1, 0, {
-      end_row = block.end_row,
-      end_col = 0,
+      end_row = block.end_row - 1,
+      end_col = #(vim.api.nvim_buf_get_lines(buffer, block.end_row - 1, block.end_row, false)[1] or ""),
       conceal_lines = "",
     })
   end

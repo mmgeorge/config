@@ -162,6 +162,18 @@ local passed, failure = pcall(function()
   for _, row in ipairs({6, 7, 8, 9, 10, 9, 8, 7, 6}) do
     expect_equation(row, row >= 7 and row <= 9)
   end
+  expect_equation(10, false)
+  local after_equation = vim.rpcrequest(job, "nvim_exec_lua", [[
+    local cursor = vim.api.nvim_win_get_cursor(0)
+    local position = vim.fn.screenpos(0, cursor[1], cursor[2] + 1)
+    return { row = position.row, column = position.col }
+  ]], {})
+  local after_screen = capture()
+  assert(after_screen[after_equation.row]:match("^%s*$"), "line after equation was concealed into its rendering")
+  vim.rpcrequest(job, "nvim_input", "s")
+  assert(vim.wait(3000, function()
+    return table.concat(capture(), "\n"):find("\\int", 1, true)
+  end, 20), "mapped upward entry did not reveal equation")
   vim.rpcrequest(job, "nvim_exec_lua", "vim.api.nvim_win_set_cursor(0, {7, 0})", {})
   assert(vim.wait(3000, function()
     local screen = table.concat(capture(), "\n")

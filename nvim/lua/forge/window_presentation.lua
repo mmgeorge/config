@@ -2,7 +2,7 @@ local M = {}
 local window_owner = {}
 local option = { "number", "relativenumber", "signcolumn", "foldcolumn", "statuscolumn",
   "foldmethod", "foldexpr", "foldenable", "foldlevel", "foldtext", "fillchars", "virtualedit",
-  "wrap", "linebreak", "breakindent", "breakindentopt", "conceallevel", "concealcursor" }
+  "wrap", "linebreak", "breakindent", "breakindentopt", "conceallevel", "concealcursor", "scrolloff" }
 
 ---@param window integer
 ---@return table<string, string|boolean|number>
