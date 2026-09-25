@@ -27,6 +27,7 @@ local begin_request
 local submit_immediate
 local configure_now
 local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
+local queue_only_commands = { ["/plan"] = true }
 
 ---@param state table
 ---@param field string
@@ -1698,6 +1699,10 @@ function M.submit()
     set_composer_text(state.composer_buf, "")
     state.configuration_error = "Use /fast without arguments to toggle fast mode"
     M.refresh_winbar()
+    return
+  end
+  if state.busy and queue_only_commands[text:match("^%s*(%S+)")] then
+    M.queue_submit()
     return
   end
   if state.selected_agent_run_id then
