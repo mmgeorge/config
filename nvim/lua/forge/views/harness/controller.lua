@@ -1706,7 +1706,7 @@ function M.submit()
   end
   if state.busy or state.configuring then
     set_composer_text(state.composer_buf, "")
-    if state.active_wait and not selected_agent_run(state)
+    if state.busy and not selected_agent_run(state)
       and state.capability and state.capability.native_steer
     then
       submit_immediate(state, text)
