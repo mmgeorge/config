@@ -31,7 +31,7 @@ for _, pane in ipairs({ "transcript_win", "composer_win" }) do
   assert(not vim.bo[state.transcript_buf].modifiable)
   assert(vim.bo[state.composer_buf].modifiable)
   assert(not pcall(vim.cmd, "enew"), "pinned pane allowed replacement")
-  for _, keys in ipairs({ "gks", "gkb", "<C-w>c", "<C-w>o", ":close<CR>", ":only<CR>", ":bd<CR>" }) do
+  for _, keys in ipairs({ "gks", "gkb", ":close<CR>", ":only<CR>", ":bd<CR>" }) do
     input(keys)
     intact()
   end

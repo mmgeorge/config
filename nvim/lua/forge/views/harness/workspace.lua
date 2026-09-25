@@ -42,7 +42,7 @@ function M.attach(state)
   local owner = { window = {}, mapping = {} }
   owner.group = vim.api.nvim_create_augroup("ForgeHarnessWorkspace" .. state.transcript_buf, { clear = true })
   owner_by_state[state] = owner
-  local keys = { "<C-w>c", "<C-w>q", "<C-w>o", "<C-w><C-c>", "<C-w><C-q>", "<C-w><C-o>", "ZZ", "ZQ" }
+  local keys = { "ZZ", "ZQ" }
   for _, mapping in ipairs(vim.api.nvim_get_keymap("n")) do
     local command = (mapping.rhs or ""):match("^<[Cc][Mm][Dd]>(.-)<[Cc][Rr]>$")
     if command and blocked(command) then keys[#keys + 1] = mapping.lhs end
@@ -65,7 +65,10 @@ function M.attach(state)
     end
     vim.api.nvim_create_autocmd({ "BufUnload", "BufWipeout" }, {
       group = owner.group, buffer = buffer,
-      callback = function() error("Harness buffer is locked. Press q to exit Harness.", 0) end,
+      callback = function()
+        if owner.exiting then return end
+        error("Harness buffer is locked. Press q to exit Harness.", 0)
+      end,
     })
   end
   vim.api.nvim_create_autocmd("CmdlineLeave", {
@@ -79,6 +82,15 @@ function M.attach(state)
         vim.cmd("let v:event.abort = v:true")
         vim.schedule(notice)
       end
+    end,
+  })
+  vim.api.nvim_create_autocmd("ExitPre", {
+    group = owner.group,
+    callback = function()
+      owner.exiting = true
+      vim.schedule(function()
+        if owner_by_state[state] == owner then owner.exiting = false end
+      end)
     end,
   })
   vim.api.nvim_create_autocmd("VimLeavePre", {
