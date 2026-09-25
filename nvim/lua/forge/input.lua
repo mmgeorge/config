@@ -7,7 +7,7 @@ local window_view = {}
 local window_baseline = {}
 local presentation = require("forge.window_presentation")
 local native_option = { number = false, relativenumber = false, signcolumn = "no", foldcolumn = "0",
-  statuscolumn = " ", virtualedit = "all", wrap = true, linebreak = true, breakindent = false, conceallevel = 0, concealcursor = "" }
+  statuscolumn = " ", virtualedit = "", wrap = true, linebreak = true, breakindent = false, conceallevel = 0, concealcursor = "" }
 
 local function release_window(view)
   if view.document_folds then

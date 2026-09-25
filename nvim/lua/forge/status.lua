@@ -188,7 +188,7 @@ end
 local function view_for(state, window)
   local view = state.view[window]
   if not view or not view.active then
-    local attached = input.open(state.replica, window, { margin = 0 })
+    local attached = input.open(state.replica, window, { margin = 0, virtualedit = "all" })
     ---@cast attached ForgeStatusView
     view = attached
     state.view[window] = view

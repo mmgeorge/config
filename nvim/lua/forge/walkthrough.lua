@@ -41,7 +41,7 @@ end
 local function attach(state, window)
   local view = state.view[window]
   if not view then
-    view = input.open(state.replica, window)
+    view = input.open(state.replica, window, { virtualedit = "all" })
     view.original_wrap, view.original_linebreak = vim.wo[window].wrap, vim.wo[window].linebreak
     state.view[window] = view
   end
@@ -136,7 +136,7 @@ function M.open_change(state)
     end
     for _, attached in ipairs(vim.fn.win_findbuf(owner.annotation.buffer)) do
       local annotation_view = owner.annotation_view[attached]
-      if not annotation_view then annotation_view = input.open(owner.annotation, attached) owner.annotation_view[attached] = annotation_view end
+      if not annotation_view then annotation_view = input.open(owner.annotation, attached, { virtualedit = "all" }) owner.annotation_view[attached] = annotation_view end
       vim.wo[attached].wrap, vim.wo[attached].linebreak = true, true
       local width = require("forge.width").capture(attached)
       if not vim.deep_equal(annotation_view.width, width) then

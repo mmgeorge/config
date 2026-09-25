@@ -21,6 +21,7 @@ local function original(attached)
   for name, value in pairs(baseline) do assert(vim.wo[attached][name] == value, name .. " did not restore") end
 end
 local function native(attached)
+  assert(vim.wo[attached].virtualedit == "", "default view permits cursor positions beyond text")
   assert(not vim.wo[attached].number and not vim.wo[attached].relativenumber)
   assert(vim.wo[attached].signcolumn == "no" and vim.wo[attached].foldcolumn == "0")
   assert(vim.wo[attached].foldmethod == "expr" and vim.wo[attached].wrap and vim.wo[attached].linebreak)

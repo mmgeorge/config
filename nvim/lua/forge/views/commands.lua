@@ -227,7 +227,7 @@ function M.open_compact_preview(opts)
 
       require("forge.window_presentation").attach(buf, {
         number = false, relativenumber = false, signcolumn = "no", foldcolumn = "0", statuscolumn = " ",
-        virtualedit = "all", wrap = true, linebreak = true, breakindent = false,
+        virtualedit = "", wrap = true, linebreak = true, breakindent = false,
         conceallevel = 0, concealcursor = "", foldenable = true, foldlevel = 99, foldmethod = "manual",
       })
 
