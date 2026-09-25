@@ -128,8 +128,8 @@ local function draw(state)
   vim.api.nvim_buf_clear_namespace(buf, namespace, 0, -1)
   if state.timeline_status_animated == false then return end
   vim.api.nvim_buf_set_extmark(buf, namespace, line - 1, 0, {
-    virt_text = { { render.frame_at(vim.uv.now()), "ForgeTimelineStatusSpinner" } },
-    virt_text_pos = "overlay",
+    virt_text = { { " " .. render.frame_at(vim.uv.now()), "ForgeTimelineStatusSpinner" } },
+    virt_text_pos = "eol",
     hl_mode = "combine",
   })
 end
