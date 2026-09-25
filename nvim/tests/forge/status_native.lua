@@ -52,8 +52,13 @@ status._set_runner_for_test(function(method, params, callback)
 end)
 
 vim.wo.number, vim.wo.wrap, vim.wo.conceallevel, vim.wo.foldcolumn = true, false, 2, "1"
+vim.wo.virtualedit = "all"
 local state = status.open({ workspace = cwd, keymaps = { discard = false } })
 assert(vim.wait(3000, function() return state.ready end))
+assert(vim.wo.virtualedit == "", "Status permits virtual cursor columns")
+vim.api.nvim_win_set_cursor(0, { 3, 0 })
+vim.cmd("normal! 100|")
+assert(vim.fn.virtcol(".") == #vim.api.nvim_get_current_line(), "Status cursor escaped the heading text")
 vim.api.nvim_win_set_cursor(0, { 4, 0 })
 vim.cmd("normal! za")
 status.demand(state)
@@ -70,6 +75,7 @@ assert(vim.wo.number and not vim.wo.wrap and vim.wo.conceallevel == 2 and vim.wo
 vim.api.nvim_win_set_buf(0, state.replica.buffer)
 status.demand(state)
 assert(vim.wait(1000, function() return not vim.wo.number end))
+assert(vim.wo.virtualedit == "", "Status reentry restored virtual cursor columns")
 for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(state.replica.buffer, "n")) do
   assert(mapping.lhs ~= "D", "disabled buffer keymap was installed")
 end
