@@ -73,9 +73,8 @@ function M.render(transcript, commands, width)
     local function draw()
       if not vim.api.nvim_buf_is_valid(target_buffer) then M.clear(target_buffer) return end
       vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
-        id = 1, virt_text = { { spinner.frame_at(vim.uv.now()) .. " ", capture } },
+        id = 1, sign_text = spinner.frame_at(vim.uv.now()), sign_hl_group = capture,
         end_row = row, end_col = #text, hl_group = capture, priority = 110,
-        virt_text_pos = "inline", hl_mode = "combine",
       })
     end
     draw()

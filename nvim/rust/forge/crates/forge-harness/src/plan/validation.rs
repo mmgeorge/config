@@ -775,6 +775,19 @@ impl<'a> PlanValidator<'a> {
     }
 
     fn validate_submission_flow_edge(&mut self, edge: &PlanFlowEdge, edge_path: &str) {
+        if let (EntityReference::PlannedEntity { entity }, Some(callable)) =
+            (&edge.target, &edge.callable)
+        {
+            if self.graph.entity(entity).is_some() && !self.declares_callable(entity, callable) {
+                self.push(
+                    &format!("{edge_path}.callable"),
+                    &format!(
+                        "planned entity `{entity}` has no surviving {:?} member `{}` declared on itself or its planned parents/contracts",
+                        callable.kind, callable.name,
+                    ),
+                );
+            }
+        }
         if !edge.expansion.is_empty() && !flow_expansion_has_material_work(&edge.expansion) {
             self.push(
                 &format!("{edge_path}.expansion"),
@@ -795,6 +808,39 @@ impl<'a> PlanValidator<'a> {
                 );
             }
         }
+    }
+
+    fn declares_callable(&self, entity: &str, callable: &PlanCallable) -> bool {
+        let mut pending = vec![entity];
+        let mut visited = HashSet::new();
+        while let Some(name) = pending.pop() {
+            if !visited.insert(name) {
+                continue;
+            }
+            let Some(owner) = self.graph.entity(name) else {
+                continue;
+            };
+            if owner.action == EntityChangeAction::Remove {
+                continue;
+            }
+            if owner.members.iter().any(|member| {
+                member.name == callable.name
+                    && member.action != ChangeAction::Remove
+                    && matches!(
+                        (member.kind, callable.kind),
+                        (super::MemberKind::Method, super::PlanCallableKind::Method)
+                            | (super::MemberKind::Function, super::PlanCallableKind::Function)
+                    )
+            }) {
+                return true;
+            }
+            for parent in owner.extends.iter().chain(&owner.conforms_to) {
+                if let EntityReference::PlannedEntity { entity } = parent {
+                    pending.push(entity);
+                }
+            }
+        }
+        false
     }
 
     fn validate_render(&mut self) {
@@ -1029,6 +1075,66 @@ mod test {
 
         let error = document.validate().unwrap_err().to_string();
         assert!(error.contains("rename source and destination must differ"));
+    }
+
+    #[test]
+    fn submission_resolves_nested_flow_callables_against_declared_members() {
+        let mut document = test_fixture("plan", "Validate member references.");
+        document.entity_changes[0].members.push(serde_json::from_value(serde_json::json!({
+            "action":"add", "kind":"method", "name":"setup_scene",
+            "description":"Create the scene.", "visibility":"private",
+            "parameters":[]
+        })).unwrap());
+        let call: super::PlanFlowEdge = serde_json::from_value(serde_json::json!({
+            "relation":"call", "target":{"kind":"planned_entity","entity":"PlanDocument"},
+            "callable":{"kind":"method","name":"initialize"}, "expansion":[], "branches":[]
+        })).unwrap();
+        document.flows[0].edges[0].expansion = vec![call.clone()];
+        document.flows[0].edges[0].branches = vec![super::PlanFlowBranch {
+            condition: "When startup completes".into(), edges: vec![call],
+        }];
+        super::validate_plan_edit(&document).unwrap();
+        let error = super::validate_plan_submission(&document).unwrap_err();
+        let error = error.downcast_ref::<super::PlanValidationError>().unwrap();
+        for path in [
+            "flows[0].edges[0].expansion[0].callable",
+            "flows[0].edges[0].branches[0].edges[0].callable",
+        ] {
+            assert!(error.violation.iter().any(|violation| violation.path == path
+                && violation.message.contains("initialize")), "{error}");
+        }
+        document.flows[0].edges[0].branches.clear();
+        document.flows[0].edges[0].expansion[0].callable.as_mut().unwrap().name = "setup_scene".into();
+        super::validate_plan_submission(&document).unwrap();
+        document.entity_changes[0].members[0].kind = MemberKind::Function;
+        assert!(super::validate_plan_submission(&document).unwrap_err().to_string().contains("setup_scene"));
+        document.entity_changes[0].members[0].kind = MemberKind::Method;
+        document.entity_changes[0].members[0].action = ChangeAction::Remove;
+        assert!(super::validate_plan_submission(&document).is_err());
+    }
+
+    #[test]
+    fn flow_callables_resolve_planned_contracts_without_looping_on_cycles() {
+        let mut document = test_fixture("plan", "Validate contract references.");
+        let mut contract = document.entity_changes[0].clone();
+        contract.name = "SceneContract".into();
+        contract.kind = super::EntityKind::Trait;
+        contract.members.push(serde_json::from_value(serde_json::json!({
+            "action":"add", "kind":"method", "name":"setup_scene",
+            "description":"Create the scene.", "visibility":"public", "parameters":[]
+        })).unwrap());
+        contract.extends = Some(super::EntityReference::PlannedEntity { entity: "PlanDocument".into() });
+        document.entity_changes[0].conforms_to.push(super::EntityReference::PlannedEntity {
+            entity: contract.name.clone(),
+        });
+        document.entity_changes.push(contract);
+        let validator = super::PlanValidator::new(&document, super::PlanValidationPhase::Submission);
+        assert!(validator.declares_callable("PlanDocument", &PlanCallable {
+            kind: PlanCallableKind::Method, name: "setup_scene".into(),
+        }));
+        assert!(!validator.declares_callable("PlanDocument", &PlanCallable {
+            kind: PlanCallableKind::Method, name: "initialize".into(),
+        }));
     }
 
     #[test]

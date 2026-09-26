@@ -1835,7 +1835,13 @@ members, and inheritance or conformance references. Enum cases live only in the
 owning enum's dedicated `variants` collection. Variant fields form their own typed child collection,
 so they cannot acquire callable properties. They accept optional `visibility` metadata for shape
 symmetry, but Harness deliberately ignores that value during validation and rendering because the
-owning enum controls payload accessibility. Members, variants, variant
+owning enum controls payload accessibility. Submission resolves every flow callable on a planned
+entity against its surviving members and recursively referenced planned parents and contracts.
+The callable name and kind must match. Nested expansions and branches use the same validation,
+with violations pointing to the exact callable path. Draft edits and rendering permit temporary
+disagreement while the model replaces member and flow arrays. Workspace and external targets
+remain outside this declaration check because the plan does not own their member inventories.
+Members, variants, variant
 payload fields, and concrete tests share nested rename semantics: `action: "rename"` requires the
 old identifier in `renamed_from` and keeps the destination in `name`, while every other action omits
 `renamed_from`. Their `description` fields remain optional and feed the PlanReview info popup instead of the Markdown projection. Variant payload
@@ -2084,6 +2090,15 @@ A separate accepted-request identity set keeps successful provider request repla
 without allowing rejected requests to reserve that identity.
 The question tool also works during ordinary chat, goal, and execution turns. Those questions
 persist on their owning `Exchange`, while planning questions remain on `PlanRecord`.
+After submission, a normal prompt in Plan mode creates a plan-associated discussion exchange.
+`PromptMode::PlanDiscussion` supplies the canonical document and instructions to answer questions
+without editing or resubmitting. Discussion questions remain on that exchange, and clarification
+and answer continuations retain its planning context. Reading leaves `AwaitingReview` unchanged.
+A successful version-checked edit applies `ChangesRequested`, changes the exchange to
+`PlanRevision`, and clears pending acceptance. The planning loop then requires submission or a
+new question before completion. A rejected edit does not start a revision. Tool authorization
+allows discussion reads and edits but rejects resubmission without an edit and rejects editing
+while a question remains unresolved. These transitions retain the selected execution authorization.
 `BrokerSnapshot.active_elicitation` projects either owner through one question UI contract, so
 answer, skip, Ask, and continue reuse the shared bottom picker without creating a plan artifact.
 Submitting the review page consumes that question set before the provider continuation starts.
@@ -2284,7 +2299,7 @@ instead of presenting `default` as though it were a real model ID.
 
 `/rename <name>` routes directly to the broker's durable `session.rename` request rather
 than entering the model transcript. The broker retains rename metadata without displaying a
-timeline message. The top bar displays the current session name. Bare `/rename` shows only
+timeline message. The Harness tab displays up to 30 characters of the current session name. Bare `/rename` shows only
 `Generating session name…` until the name is persisted. It captures visible conversation history and generates a 2-6 word name
 in an isolated provider conversation using the selected model. Naming selects the lowest advertised
 reasoning effort for explicit models. Copilot Auto retains provider-managed reasoning. The request

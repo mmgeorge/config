@@ -418,6 +418,18 @@ Semantic annotations:
     pub fn with_active_document(prompt: String, document_json: &str) -> String {
         format!("Active canonical PlanDocument:\n```json\n{document_json}\n```\n\n{prompt}")
     }
+
+    /// Keep review discussion read-only until the user requests a canonical plan revision.
+    pub fn discussion(prompt: &str) -> String {
+        format!(
+            "Continue discussing the active canonical plan in Harness Plan mode. \
+Answer questions without editing or resubmitting the plan. When the user requests changes, \
+revise the existing plan through harness_plan_edit, then submit the resulting plan ID and version \
+through harness_plan_submit. A successful edit starts a revision of the same plan. \
+Ask for clarification when the requested change is unclear. Resolve pending questions before editing. \
+Do not implement the plan or modify project files.\n\n{prompt}"
+        )
+    }
 }
 
 fn mutable_elicitation_prompt(

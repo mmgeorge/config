@@ -122,7 +122,9 @@ impl ControlToolRuntime {
                 })
             }
             "harness_plan_edit" => {
-                self.require_editable_plan()?;
+                self.require_readable_plan()?;
+                anyhow::ensure!(!self.context.has_active_elicitation,
+                    "resolve the pending Harness questions before editing the plan");
                 let request = output
                     .plan_edit
                     .pop()
@@ -132,6 +134,9 @@ impl ControlToolRuntime {
                     .as_ref()
                     .context("plan edit has no active canonical document")?;
                 self.plan_document = Some(apply_plan_edit(document, request)?.document);
+                if self.context.plan_state == Some(PlanState::AwaitingReview) {
+                    self.context.plan_state = Some(PlanState::Revising);
+                }
                 Ok(ControlToolResult {
                     invocation: Some(invocation),
                     message: format!(
@@ -141,7 +146,7 @@ impl ControlToolRuntime {
                 })
             }
             "harness_plan_read" => {
-                self.require_editable_plan()?;
+                self.require_readable_plan()?;
                 let document = self
                     .plan_document
                     .as_ref()
@@ -225,7 +230,9 @@ impl ControlToolRuntime {
                     return Ok(ControlToolResult { invocation: None, message: "Those questions were already consumed. Continue planning without reopening feedback.".into() });
                 }
                 anyhow::ensure!(
-                    !self.context.has_active_elicitation,
+                    !self.context.has_active_elicitation
+                        || (matches!(self.context.mode, PromptMode::Chat | PromptMode::PlanDiscussion)
+                            && !self.context.planning_feedback),
                     "a Harness question set is already pending"
                 );
                 self.terminal = true;
@@ -236,7 +243,8 @@ impl ControlToolRuntime {
             }
             "harness_question_answer" | "harness_question_withdraw" => {
                 anyhow::ensure!(
-                    self.context.mode == PromptMode::Chat && !self.context.planning_feedback,
+                    matches!(self.context.mode, PromptMode::Chat | PromptMode::PlanDiscussion)
+                        && !self.context.planning_feedback,
                     "question resolution is unavailable during planning feedback"
                 );
                 anyhow::ensure!(
@@ -283,16 +291,25 @@ impl ControlToolRuntime {
     }
 
     fn require_editable_plan(&self) -> Result<()> {
+        self.require_readable_plan()?;
         anyhow::ensure!(
-            self.context.mode == PromptMode::Plan,
+            matches!(self.context.plan_state, Some(PlanState::Generating | PlanState::Revising)),
+            "plan submission requires a generating or revising plan"
+        );
+        Ok(())
+    }
+
+    fn require_readable_plan(&self) -> Result<()> {
+        anyhow::ensure!(
+            matches!(self.context.mode, PromptMode::Plan | PromptMode::PlanDiscussion),
             "plan controls require Harness Plan mode"
         );
         anyhow::ensure!(
             matches!(
                 self.context.plan_state,
-                Some(PlanState::Generating | PlanState::Revising)
+                Some(PlanState::Generating | PlanState::Revising | PlanState::AwaitingReview)
             ),
-            "plan controls require a generating or revising plan"
+            "plan controls require an active draft or submitted plan"
         );
         Ok(())
     }
@@ -339,6 +356,37 @@ mod test {
                 .unwrap(),
             )),
         }
+    }
+
+    #[tokio::test]
+    async fn discussion_reads_reviewed_plan_and_only_successful_edits_enable_submission() {
+        let mut context = planning_context();
+        context.mode = PromptMode::PlanDiscussion;
+        context.plan_state = Some(PlanState::AwaitingReview);
+        let mut runtime = ControlToolRuntime::new(context);
+        runtime.invoke(ControlToolInvocation {
+            name: "harness_plan_read".into(), arguments: json!({"plan_id":"plan"}),
+        }).await.unwrap();
+        let submit = ControlToolInvocation {
+            name: "harness_plan_submit".into(), arguments: json!({"plan_id":"plan", "expected_version":1}),
+        };
+        assert!(runtime.invoke(submit.clone()).await.is_err());
+        assert!(runtime.invoke(ControlToolInvocation {
+            name: "harness_plan_edit".into(),
+            arguments: json!({"plan_id":"plan", "expected_version":99, "plan":{"overview":"Changed"}}),
+        }).await.is_err());
+        assert!(runtime.invoke(submit).await.is_err());
+        runtime.context.has_active_elicitation = true;
+        let edit = ControlToolInvocation {
+            name: "harness_plan_edit".into(),
+            arguments: json!({"plan_id":"plan", "expected_version":1, "plan":{"overview":"Changed"}}),
+        };
+        assert!(runtime.invoke(edit.clone()).await.is_err());
+        runtime.context.has_active_elicitation = false;
+        runtime.invoke(edit).await.unwrap();
+        runtime.invoke(ControlToolInvocation {
+            name: "harness_plan_submit".into(), arguments: json!({"plan_id":"plan", "expected_version":2}),
+        }).await.unwrap();
     }
 
     #[tokio::test]

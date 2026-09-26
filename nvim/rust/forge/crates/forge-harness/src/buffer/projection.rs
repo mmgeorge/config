@@ -4,7 +4,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
-    BlockAnchor, BufferBlock, Conceal, ContentLayout, Decoration, FoldRange, Gutter, GutterPlacement, TargetRange, TextChunk, TextPosition,
+    BlockAnchor, BufferBlock, ContentLayout, Decoration, FoldRange, TargetRange, TextChunk, TextPosition,
     TextRange,
 };
 use forge_buffer::identity::{BlockId, FoldId, TargetId};
@@ -252,28 +252,6 @@ impl TimelineRenderer<'_> {
                     &text,
                     0,
                 )?;
-                if let Some(prefix) = block.text.row(1).and_then(|row| row.get(..2)) {
-                    let capture = if matches!(status, SessionPhase::AwaitingPlanReview { .. }) {
-                        "ForgeHarnessPlan"
-                    } else {
-                        "Normal"
-                    };
-                    block.metadata.gutter.push(Gutter {
-                        placement: GutterPlacement::Sign,
-                        position: TextPosition { row: 1, column: 0 },
-                        chunk: vec![TextChunk { text: prefix.into(), capture: capture.into() }],
-                        priority: 100,
-                    });
-                    block.metadata.conceal.push(Conceal {
-                        range: TextRange {
-                            start: TextPosition { row: 1, column: 0 },
-                            end: TextPosition { row: 1, column: 2 },
-                        },
-                        replacement: String::new(),
-                        line: false,
-                        priority: 100,
-                    });
-                }
                 if let SessionPhase::AwaitingPlanReview { plan_id, .. } = status {
                     block.metadata.decoration.push(Decoration {
                         range: TextRange {
@@ -1448,7 +1426,7 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        project_at, project_at_with_separator, session_event_text, GutterPlacement, TextPosition,
+        project_at, project_at_with_separator, session_event_text,
     };
     use forge_buffer::width::WidthProfile;
     use serde_json::json;
@@ -2403,10 +2381,8 @@ mod tests {
             vec!["", "Working (3s)"]
         );
         let status = &projection.entry.block[0].metadata;
-        assert_eq!(status.gutter[0].placement, GutterPlacement::Sign);
-        assert_eq!(status.gutter[0].position, TextPosition { row: 1, column: 0 });
-        assert_eq!(status.gutter[0].chunk[0].text, "Wo");
-        assert_eq!(status.conceal[0].range.end, TextPosition { row: 1, column: 2 });
+        assert!(status.gutter.is_empty(), "status text must not be split into the sign column");
+        assert!(status.conceal.is_empty(), "status text must remain intact for inline hints");
     }
 
     #[test]

@@ -41,6 +41,21 @@ local success, failure = xpcall(function()
   submit("/plan build the feature")
   await(function() return not state.busy and state.active_plan and state.active_plan.model_revision == 1 end, "initial plan missing")
   local source = vim.deepcopy(state.active_plan)
+  submit("Why did you choose this design?")
+  local discussion
+  await(function()
+    for _, entry in ipairs(state.timeline or {}) do
+      if entry.exchange and entry.exchange.prompt == "Why did you choose this design?" then
+        discussion = entry.exchange
+      end
+    end
+    return not state.busy and discussion and discussion.state == "complete"
+  end, "discussion did not finish")
+  assert(state.session.mode == "plan", "discussion left Plan mode")
+  assert(state.active_plan.id == source.id and state.active_plan.model_revision == source.model_revision,
+    "discussion changed the submitted plan")
+  assert(discussion.plan_id == source.id and discussion.kind == "chat",
+    "discussion lost its plan association")
   local revision_path = vim.fs.joinpath(vim.fs.dirname(source.working_path), "revisions", "submitted-0001.json")
   local original = vim.fn.readfile(revision_path, "b")
   local response
@@ -79,7 +94,11 @@ local success, failure = xpcall(function()
   assert(vim.deep_equal(vim.fn.readfile(revision_path, "b"), original), "replan modified the source revision")
   controller.abort_plan()
   await(function() return not state.aborting_plan and not state.active_plan end, "replanned plan did not abort")
-  await(function() return state.presentation.close() end, "presentation did not finish pending edits")
+  vim.api.nvim_set_current_win(state.transcript_win)
+  await(function()
+    if state.presentation then invoke("q") end
+    return state.presentation == nil
+  end, "Harness did not exit")
 end, debug.traceback)
 picker.close(false)
 client.stop()

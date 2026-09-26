@@ -1419,9 +1419,10 @@ impl HarnessBroker {
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => PromptMode::Plan,
             ExchangeKind::PlanExecution => PromptMode::ExecutePlan,
             ExchangeKind::Chat if interaction.goal_id.is_some() => PromptMode::GoalContinuation,
+            ExchangeKind::Chat if interaction.plan_id.is_some() => PromptMode::PlanDiscussion,
             ExchangeKind::Chat => PromptMode::Chat,
         };
-        if mode == PromptMode::Plan {
+        if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion) {
             self.run_planning_interaction(text, None).await
         } else {
             self.run_interaction(text, mode, None).await
@@ -2101,6 +2102,13 @@ impl HarnessBroker {
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
             .flatten();
+        if self.session.mode == HarnessMode::Plan
+            && let Some(plan) = active_plan.as_ref().filter(|plan| plan.state == PlanState::AwaitingReview)
+        {
+            let mut admission = ExchangeAdmission::chat(text.clone());
+            admission.plan_id = Some(plan.id.clone());
+            return self.run_planning_interaction(text, Some(admission)).await;
+        }
         let prompt = match active_plan.as_ref() {
             Some(plan) if !plan.working_path.is_empty() => {
                 let document = self
@@ -2648,7 +2656,10 @@ impl HarnessBroker {
         let (mut value, mut event) = self
             .run_interaction(
                 PlanPrompt::question_follow_up(&elicitation_json, &text),
-                PromptMode::Chat,
+                if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some()
+                    && interaction.mode == Some(HarnessMode::Plan) {
+                    PromptMode::PlanDiscussion
+                } else { PromptMode::Chat },
                 None,
             )
             .await?;
@@ -2767,15 +2778,15 @@ impl HarnessBroker {
             self.clock.now_ms(),
         )?;
         self.store.save_exchange(&interaction)?;
-        let (value, mut event) = self
-            .run_interaction(
-                format!(
-                    "The user answered the pending Harness questions. Continue the original request using these responses.\n\n{feedback}"
-                ),
-                PromptMode::Chat,
-                None,
-            )
-            .await?;
+        let prompt = format!(
+            "The user answered the pending Harness questions. Continue the original request using these responses.\n\n{feedback}"
+        );
+        let (value, mut event) = if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some()
+            && interaction.mode == Some(HarnessMode::Plan) {
+            self.run_planning_interaction(prompt, None).await?
+        } else {
+            self.run_interaction(prompt, PromptMode::Chat, None).await?
+        };
         event.insert(
             0,
             self.event(
@@ -2834,8 +2845,14 @@ impl HarnessBroker {
                 .plan_file
                 .read_working_document(&self.session.id, &plan_id)?;
             let before_digest = plan_digest(&serde_json::to_vec(&before_document)?);
+            let discussion = self.store.load_plan(&plan_id)?
+                .is_some_and(|plan| plan.state == PlanState::AwaitingReview);
             let result = self
-                .run_interaction(prompt, PromptMode::Plan, admission.take())
+                .run_interaction(
+                    prompt,
+                    if discussion { PromptMode::PlanDiscussion } else { PromptMode::Plan },
+                    admission.take(),
+                )
                 .await;
             let (value, mut event) = match result {
                 Ok(result) => result,
@@ -2868,6 +2885,9 @@ impl HarnessBroker {
                 .store
                 .load_plan(&plan_id)?
                 .context("planning continuation lost its plan record")?;
+            if discussion && plan.state == PlanState::AwaitingReview {
+                return Ok((value, accumulated_event));
+            }
             let after_document = self
                 .plan_file
                 .read_working_document(&self.session.id, &plan_id)?;
@@ -3073,7 +3093,16 @@ Planning continuation: turn {} of {}.",
             activity: None, summary: None, task_update: None,
         }, &mut event).await?;
 
-        if mode == PromptMode::Plan && !input.text().contains("Active canonical PlanDocument:") {
+        if mode == PromptMode::PlanDiscussion {
+            input = match input {
+                BackendInput::Text { text } => BackendInput::from_text(PlanPrompt::discussion(&text)),
+                BackendInput::Skill { name, arguments } => BackendInput::Skill {
+                    name, arguments: PlanPrompt::discussion(&arguments),
+                },
+            };
+        }
+        if matches!(mode, PromptMode::Plan | PromptMode::PlanDiscussion)
+            && !input.text().contains("Active canonical PlanDocument:") {
             let plan_id = self
                 .session
                 .active_plan_id
@@ -3112,6 +3141,7 @@ Planning continuation: turn {} of {}.",
             )?;
         if let Some(context) = &mut backend_request.control_context {
             context.repository = Some(repository_scope);
+            context.has_active_elicitation |= interaction.elicitation.is_some();
         }
         self.trace.record(
             &self.session.id,
@@ -3299,7 +3329,8 @@ Planning continuation: turn {} of {}.",
             );
         }
 
-        if mode == PromptMode::Plan {
+        if mode == PromptMode::Plan || (mode == PromptMode::PlanDiscussion
+            && (!output.plan_edit.is_empty() || output.plan_submit.is_some())) {
             let mut plan = self
                 .session
                 .active_plan_id
@@ -3311,6 +3342,7 @@ Planning continuation: turn {} of {}.",
                     matches!(
                         plan.state,
                         PlanState::Generating | PlanState::Revising | PlanState::AwaitingInput
+                            | PlanState::AwaitingReview
                     )
                 })
                 .context("planning turn has no active canonical plan")?;
@@ -3333,6 +3365,13 @@ Planning continuation: turn {} of {}.",
                 let result = self
                     .plan_file
                     .edit_working_document(&self.session.id, edit_request)?;
+                if plan.state == PlanState::AwaitingReview {
+                    PlanStateMachine::apply(&mut plan, PlanEvent::ChangesRequested, self.clock.now_ms())?;
+                    plan.acceptance = None;
+                    plan.user_revision += 1;
+                    plan.generation.reset();
+                    interaction.kind = ExchangeKind::PlanRevision;
+                }
                 plan.document_version = result.version;
                 plan.title = result.document.title;
                 plan.updated_at_ms = self.clock.now_ms();
@@ -4436,9 +4475,16 @@ Planning continuation: turn {} of {}.",
             return Ok((interaction, false));
         }
         if interaction_list.is_empty() && self.session.name.trim().is_empty() {
-            self.session.name = text.split_whitespace().collect::<Vec<_>>().join(" ")
-                .chars().take(120).collect();
-            self.save_session()?;
+            let words = text.split_whitespace().collect::<Vec<_>>();
+            let title = if words.first().is_some_and(|word| word.starts_with('/')) {
+                words[1..].join(" ")
+            } else {
+                words.join(" ")
+            };
+            if !title.is_empty() {
+                self.session.name = title.chars().take(120).collect();
+                self.save_session()?;
+            }
         }
         if let Some(previous) = interaction_list.last_mut()
             && previous.state == ExchangeState::Running
@@ -7089,6 +7135,18 @@ mod test {
     }
 
     #[tokio::test]
+    async fn first_slash_prompt_names_session_from_its_request() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.session.name.clear();
+        broker.interaction_for_turn("/plan  design a thing", true, 100).await.unwrap();
+        assert_eq!(broker.session.name, "design a thing");
+        assert_eq!(broker.store.load_session(&broker.session.id).unwrap().unwrap().name,
+            "design a thing");
+    }
+
+    #[tokio::test]
     async fn consecutive_rollbacks_follow_restored_workspace_history() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
@@ -7343,6 +7401,94 @@ mod test {
     }
 
     struct RepeatedPlanEditBackend;
+
+    struct PlanDiscussionBackend {
+        turn: std::sync::atomic::AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for PlanDiscussionBackend {
+        async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>)
+            -> Result<crate::backend::BackendOutput> {
+            use crate::control_tools::{ControlToolInvocation, ControlToolRuntime, apply_invocation};
+            let turn = self.turn.fetch_add(1, Ordering::SeqCst);
+            assert_eq!(request.mode, if turn == 4 { PromptMode::Plan } else { PromptMode::PlanDiscussion });
+            assert_eq!(request.execution_mode, ExecutionMode::Read);
+            if turn < 4 {
+                assert!(request.input.text().contains("Answer questions without editing or resubmitting"));
+            }
+            let context = request.control_context.clone().unwrap();
+            let document = context.plan_document.as_ref().unwrap().clone();
+            let mut runtime = ControlToolRuntime::new(context);
+            let mut output = crate::backend::BackendOutput::default();
+            let read = runtime.invoke(ControlToolInvocation {
+                name: "harness_plan_read".into(), arguments: json!({"plan_id":document.plan_id}),
+            }).await?;
+            apply_invocation(&read.invocation.unwrap(), &mut output)?;
+            match turn {
+                0 | 2 => {}
+                1 => output.plan_question = Some(PlanQuestionSet::freeform("Which controls?".into())),
+                3 => {
+                    let edit = runtime.invoke(ControlToolInvocation {
+                        name: "harness_plan_edit".into(),
+                        arguments: json!({"plan_id":document.plan_id, "expected_version":document.version,
+                            "plan":{"overview":"Add keyboard movement and screen bounds."}}),
+                    }).await?;
+                    apply_invocation(&edit.invocation.unwrap(), &mut output)?;
+                }
+                4 => {
+                    let submit = runtime.invoke(ControlToolInvocation {
+                        name: "harness_plan_submit".into(),
+                        arguments: json!({"plan_id":document.plan_id, "expected_version":document.version}),
+                    }).await?;
+                    apply_invocation(&submit.invocation.unwrap(), &mut output)?;
+                }
+                _ => panic!("unexpected planning continuation {turn}"),
+            }
+            Ok(output)
+        }
+    }
+
+    #[tokio::test]
+    async fn submitted_plan_discussion_preserves_review_then_resumes_revision_after_questions() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.submit_prompt_inner(json!({"text":"/plan build a scene"})).await.unwrap();
+        let before = broker.snapshot().unwrap().active_plan.unwrap();
+        let backend = Arc::new(PlanDiscussionBackend { turn: std::sync::atomic::AtomicUsize::new(0) });
+        broker.backend = backend.clone();
+        broker.submit_prompt_inner(json!({"text":"Why this design?"})).await.unwrap();
+        let snapshot = broker.snapshot().unwrap();
+        let discussed = snapshot.active_plan.unwrap();
+        assert_eq!(discussed.state, PlanState::AwaitingReview);
+        assert_eq!(discussed.model_revision, before.model_revision);
+        assert_eq!(discussed.document_version, before.document_version);
+        assert_eq!(discussed.review_digest, before.review_digest);
+        assert_eq!(snapshot.exchange.last().unwrap().plan_id.as_deref(), Some(before.id.as_str()));
+        assert_eq!(snapshot.exchange.last().unwrap().kind, ExchangeKind::Chat);
+
+        broker.submit_prompt_inner(json!({"text":"Add interactive controls"})).await.unwrap();
+        let interaction = broker.active_interaction_elicitation().unwrap();
+        let question_id = interaction.elicitation.as_ref().unwrap().question_set.questions[0].id.clone();
+        broker.ask_question(json!({"question_id":question_id,"text":"What do you recommend?"})).await.unwrap();
+        assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().state, PlanState::AwaitingReview);
+        broker.answer_question(json!({"question_id":question_id,
+            "response":{"kind":"other","text":"Keyboard controls"}})).unwrap();
+        broker.continue_question().await.unwrap();
+        let snapshot = broker.snapshot().unwrap();
+        let revised = snapshot.active_plan.unwrap();
+        assert_eq!(revised.id, before.id);
+        assert_eq!(revised.state, PlanState::AwaitingReview);
+        assert_eq!(revised.model_revision, before.model_revision + 1);
+        assert_eq!(revised.document_version, before.document_version + 1);
+        let exchange = snapshot.exchange.last().unwrap();
+        assert_eq!(exchange.id, interaction.id);
+        assert_eq!(exchange.kind, ExchangeKind::PlanRevision);
+        assert_eq!(exchange.state, ExchangeState::Complete);
+        assert!(!exchange.awaiting_input);
+        assert_eq!(backend.turn.load(Ordering::SeqCst), 5);
+    }
 
     fn submit_test_plan(
         request: &BackendRequest,

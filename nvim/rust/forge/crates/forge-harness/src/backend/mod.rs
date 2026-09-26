@@ -105,6 +105,7 @@ pub struct BackendLaunch {
 pub enum PromptMode {
     Chat,
     Plan,
+    PlanDiscussion,
     ExecutePlan,
     GoalContinuation,
     RequestChanges,

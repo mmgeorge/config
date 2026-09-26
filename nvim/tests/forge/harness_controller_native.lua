@@ -55,14 +55,16 @@ local success, failure = xpcall(function()
   controller.refresh_winbar()
   local title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str
-  assert(title:find("Parser 100% coverage", 1, true), "session name missing or unescaped in top bar")
-  assert(title:find(" • Parser 100% coverage", 1, true) > title:find(" • Main", 1, true),
-    "session name must follow the Harness status")
-  assert(vim.wo[state.transcript_win].winbar:find("ForgeHarnessSessionName", 1, true),
-    "session name must have its own top bar highlight")
-  require("forge.infra.highlights").setup()
-  assert(vim.api.nvim_get_hl(0, { name = "ForgeHarnessSessionName", link = false }).italic,
-    "session name top bar highlight must be italic")
+  assert(not title:find("Parser 100% coverage", 1, true), "session name remains in top bar")
+  local tab_title = vim.api.nvim_eval_statusline(vim.o.tabline,
+    { use_tabline = true, maxwidth = 200 }).str
+  assert(tab_title:find("Parser 100% coverage", 1, true), "session name missing from tab")
+  state.session.name = "123456789012345678901234567890 extra"
+  controller.refresh_winbar()
+  tab_title = vim.api.nvim_eval_statusline(vim.o.tabline,
+    { use_tabline = true, maxwidth = 200 }).str
+  assert(tab_title:find("123456789012345678901234567890", 1, true) and not tab_title:find("extra", 1, true),
+    "tab must show only the first 30 session-name characters")
   state.busy = true
   state.recap = { text = "Old recap" }
   receive("backend_event", { kind = "turn_started" }, "native-controller")

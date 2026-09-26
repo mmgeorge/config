@@ -20,6 +20,7 @@ local timeline_cache = require("forge.views.harness.timeline_cache")
 local question_presentation = require("forge.views.harness.question_presentation")
 local recap = require("forge.views.harness.recap")
 local session_navigation = require("forge.views.harness.session_navigation")
+local tabline = require("forge.views.harness.tabline")
 
 local queue_namespace = vim.api.nvim_create_namespace("ForgeHarnessQueue")
 local render_observer_for_test = nil
@@ -266,7 +267,7 @@ local function status_text()
   if effort ~= (active_session.effort or config.options.harness.effort) then effort = effort .. "*" end
   local busy = state.cancel_requested and " • cancelling"
     or state.mode_restart_requested and " • restarting"
-    or state.busy and " • running"
+    or state.busy and ""
     or (#state.queue > 0 and (" • queued " .. #state.queue) or "")
   local goal = goal_status_text(state)
   local fast_enabled = selected_setting(state, "fast_mode")
@@ -314,17 +315,13 @@ local function status_text()
       group = "ForgeHarnessToolFailure",
     }
   end
-  segment_list[#segment_list + 1] = { text = " • ", group = "ForgeStatusLabel" }
-  segment_list[#segment_list + 1] = {
-    text = active_session.name and active_session.name ~= "" and active_session.name:gsub("%s+", " ") or "[unnamed]",
-    group = "ForgeHarnessSessionName",
-  }
   return segment_list
 end
 
 function M.refresh_winbar()
   local state = harness_state()
   if not state.command_set then return end
+  tabline.set_session_name(state.timeline_tab, state.session and state.session.name)
   keymaps.apply_view_winbar(
     state.transcript_win,
     "",
@@ -2239,6 +2236,7 @@ local function close()
   recap.clear(state)
   timeline_status.stop(state)
   local tab_count = vim.fn.tabpagenr("$")
+  tabline.clear(state.timeline_tab)
   if tab_count > 1 then
     vim.cmd("tabclose")
   else

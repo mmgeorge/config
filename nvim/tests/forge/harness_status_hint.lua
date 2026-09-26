@@ -58,8 +58,12 @@ local function working_marks()
   local marks = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
   local text = {}
   for _, mark in ipairs(marks) do
-    assert(mark[4].virt_text_pos == "inline")
-    for _, chunk in ipairs(mark[4].virt_text) do text[#text + 1] = chunk[1] end
+    if mark[4].sign_text then
+      assert(not mark[4].virt_text, "spinner inserted into status text")
+    else
+      assert(mark[4].virt_text_pos == "inline")
+      for _, chunk in ipairs(mark[4].virt_text) do text[#text + 1] = chunk[1] end
+    end
   end
   return table.concat(text), marks
 end
@@ -67,7 +71,7 @@ local text, marks = working_marks()
 assert(text:find("<C-c> to interrupt", 1, true), text)
 assert(#marks == 2 and marks[1][2] == 1 and marks[1][3] == 0)
 assert(marks[2][3] == #"Working (2s · Inspecting repository structure)" - 1)
-local first = marks[1][4].virt_text[1][1]
+local first = marks[1][4].sign_text
 local state = require("forge.session").harness
 local original_session = state.session
 for _, mode in ipairs({ "read", "write", "full", "yolo", "plan" }) do
@@ -76,12 +80,12 @@ for _, mode in ipairs({ "read", "write", "full", "yolo", "plan" }) do
   local _, colored = working_marks()
   local capture = require("forge.infra.highlights").harness_mode(mode)
   assert(colored[1][4].hl_group == capture, "Working text has the wrong mode color")
-  assert(colored[1][4].virt_text[1][2] == capture, "spinner differs from Working text")
+  assert(colored[1][4].sign_hl_group == capture, "spinner differs from Working text")
 end
 state.session = original_session
 assert(vim.wait(500, function()
   local _, current = working_marks()
-  return current[1][4].virt_text[1][1] ~= first
+  return current[1][4].sign_text ~= first
 end, 20), "spinner did not animate")
 config.options.keymaps.harness.cancel = "<F7>"
 hint.render(transcript, command_set, 120)
@@ -111,8 +115,24 @@ transcript.rename_status = nil
 hint.render(transcript, command_set, 120)
 assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working (2s · Inspecting repository structure)",
   "terminal status modified the exchange clock")
+for revision, phase in ipairs({ "review-plan", "working" }) do
+  local label = phase == "working" and "Working (1s)" or "Awaiting plan review"
+  assert(buffer.apply_snapshot(transcript, {
+    document = transcript.document, revision = revision + 2, block = { {
+      id = "status", text = { "", label },
+      metadata = { target = { { id = "status:" .. phase, range = {
+        start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
+      } } }, decoration = {}, fold = {}, editable_region = {} },
+    } },
+  }).kind == "Applied")
+  hint.render(transcript, command_set, 120)
+end
+local _, resumed = working_marks()
+assert(resumed[1][4].sign_text and not resumed[1][4].virt_text,
+  "resumed planning inserted its spinner inside the status label")
+assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working (1s)")
 assert(buffer.apply_snapshot(transcript, {
-  document = transcript.document, revision = 3, block = { {
+  document = transcript.document, revision = 5, block = { {
     id = "finished", text = { "Thought for 2s", "Finished response" },
     metadata = { target = {}, decoration = {}, fold = {}, editable_region = {} },
   } },
