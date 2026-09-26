@@ -485,7 +485,16 @@ local function send_harness_initialize(callback, initialize_options)
       end
       client.harness_ready = true
       session.harness.ready = true
-      finish_harness_start(callback, result, nil)
+      M.request_host("trace.configure", { enabled = config.options.harness_logging == true, default_only = true }, function(status, failure)
+        if failure then
+          client.harness_ready = false
+          session.harness.ready = false
+          finish_harness_start(callback, nil, failure)
+          return
+        end
+        require("forge.views.harness.settings").adopt(status)
+        finish_harness_start(callback, result, nil)
+      end)
     end)
   end
   local params = {

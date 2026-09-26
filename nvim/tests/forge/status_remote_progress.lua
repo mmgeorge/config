@@ -30,6 +30,7 @@ assert(render.apply_body(replica, { document = replica.document, file = 1, gener
 local body = replica.file[1].body
 local owner = context.attach({ document_id = replica.document, workspace = "fixture",
   is_alive = function() return true end, capture_input = function() end, is_input_current = function() return true end,
+  get_about_source = function() return { file = {} } end,
   present = function(presentation) render.present_context(replica, presentation) end })
 local handlers = context.producer_handlers({ workspace = "fixture", context = function() return owner end,
   is_alive = function() return true end, refresh_status = function() refreshes = refreshes + 1 end })

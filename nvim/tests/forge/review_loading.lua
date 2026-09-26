@@ -10,6 +10,7 @@ local owner = require("forge.views.status.status_context").attach({
   present = function() end, is_alive = function() return true end,
   capture_input = function() return {} end, is_input_current = function() return true end,
   get_info = function() return {} end,
+  get_about_source = function() return { file = {} } end,
 })
 owner.refresh()
 owner.open_pull_request(window)

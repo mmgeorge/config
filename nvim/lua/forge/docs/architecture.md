@@ -1239,7 +1239,12 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
   describing net HEAD changes from staged, unstaged, and untracked files, excluding
   Git ignores and the Status Ignore category. Rust enumerates changes once and
   builds bounded diff context without comparison fingerprints or before/after
-  repository snapshots. File acquisition retains its local read-safety checks.
+  repository snapshots. Status retains the HEAD object and nonignored file
+  generations used for that draft. On refocus, Status refreshes its native
+  snapshot and regenerates once when those sources changed. A clean snapshot
+  clears About. A successful commit clears the displayed draft and shared
+  commit-editor cache before returning to Status. Failed and aborted commits
+  retain the draft. File acquisition retains its local read-safety checks.
   The commit editor reuses the ready or pending About draft without inspecting
   repository state or automatically generating a replacement. Opening without an
   About draft leaves the message unchanged. Ctrl-A in normal or insert mode
@@ -1575,13 +1580,17 @@ printed before rendering. MCP payload details stop at the Codex transport bounda
 `ToolActivity`, `Turn`, and the Rust timeline projection represent every provider action as a
 generic tool.
 
-`trace::TraceStore` owns opt-in protocol diagnostics independently from timeline persistence. It
-stores the process-global enabled setting beside the Harness data root and appends bounded metadata
-records to `harness-trace.jsonl` without retaining message bodies. Every record carries a
-`session_id`. Rejected provider events retain exchange, thread, and turn identities plus a rejection
-code. The broker records Lua RPC and event metadata, while `CodexJsonRpc` records frame sizes and
-method names before normalization. `:ForgeHarnessLog` opens that file and controls tracing through
-broker RPC methods. The store bounds file size, and `:ForgeHarnessLog clear` explicitly clears it.
+`trace::TraceStore` owns opt-in protocol diagnostics independently from timeline persistence.
+The persisted global preference overrides the initial `harness_logging` default. `/log on`,
+`/log off`, and the `/config` Logging toggle use the same service routes and also set Lua
+performance logging. Trace controls bypass the broker's active-turn lock.
+The aggregate `harness-trace.jsonl` retains bounded metadata. Detailed `logs/<session-id>.jsonl`
+files retain request and response payloads with named credential fields redacted, including
+Codex protocol frames and Copilot session configuration, prompt, event, and isolated-generation
+records. Each file rotates at 15 MiB and retains three older segments. Oversized individual
+records contain an explicit omission with their encoded byte count. Session-independent events
+use the global log. `/log`, `/log open`, and `:ForgeHarnessLog` open the current session file in
+a reusable read-only tab. The Configuration picker displays the provider CLI as read-only context.
 
 The Codex `CodexTurnCoordinator` treats one user request as an exchange that may outlive
 its first parent app-server turn. A `turn/start` acknowledgement admits its returned turn before

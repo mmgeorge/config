@@ -1702,6 +1702,13 @@ function M.submit()
     M.queue_submit()
     return
   end
+  if text == "/config" or text == "/log" or text:match("^/log%s") then
+    set_composer_text(state.composer_buf, "")
+    local settings = require("forge.views.harness.settings")
+    if text == "/config" then settings.open(state, picker_host(state))
+    else settings.log(state.session.id, text:match("^/log%s+(.+)$")) end
+    return
+  end
   if state.selected_agent_run_id then
     M.steer_submit()
     return
@@ -1788,6 +1795,7 @@ function M.queue_submit()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
+  if text == "/config" or text == "/log" or text:match("^/log%s") then M.submit() return end
   if text == "/bg" or text == "/recap" or text == "/mcp" or text == "/replan" or text == "/plan cancel" or text == "/fast" or text:match("^/fast%s") then M.submit() return end
   if text == "/model" then
     M.select_model(function(next_config)

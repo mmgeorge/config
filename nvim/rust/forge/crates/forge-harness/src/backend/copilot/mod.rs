@@ -34,7 +34,7 @@ use github_copilot_sdk::{
     PermissionRequestKind, RequestId, ResumeSessionConfig, SessionConfig, SessionId,
     SetModelOptions, SystemMessageConfig, Tool, ToolInvocation, ToolResult,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{
@@ -109,6 +109,7 @@ enum ProviderShutdown {
 
 /// Owns the native Copilot SDK client, session, event decoder, and Harness callbacks.
 pub struct CopilotBackend {
+    trace: Arc<crate::trace::TraceStore>,
     terminal_monitor: Mutex<HashMap<String, CopilotTerminalMonitor>>,
     command: Vec<String>,
     client: Mutex<Option<Client>>,
@@ -127,15 +128,18 @@ impl CopilotBackend {
     /// Build a Copilot backend with an isolated conservative permission registry.
     pub fn new(command: Vec<String>) -> Result<Self> {
         let permission_coordinator = PermissionCoordinator::transient(".")?;
-        Self::new_with_permission_coordinator(command, permission_coordinator)
+        Self::new_with_permission_coordinator(command, permission_coordinator,
+            Arc::new(crate::trace::TraceStore::open(std::path::Path::new("."))?))
     }
 
     /// Build a Copilot backend with the shared Harness permission coordinator.
     pub fn new_with_permission_coordinator(
         command: Vec<String>,
         permission_coordinator: Arc<PermissionCoordinator>,
+        trace: Arc<crate::trace::TraceStore>,
     ) -> Result<Self> {
         Ok(Self {
+            trace,
             terminal_monitor: Mutex::new(HashMap::new()),
             command,
             client: Mutex::new(None),
@@ -225,6 +229,11 @@ impl CopilotBackend {
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(true);
             config.enable_skills = Some(true);
+            self.trace.record(&request.harness_session_id, "copilot.session.resume", json!({
+                "session_id":session_id, "model":config.model, "reasoning_effort":config.reasoning_effort,
+                "context_tier":config.context_tier, "system_message":SYSTEM_MESSAGE,
+                "workspace":request.workspace, "streaming":true, "enable_config_discovery":true, "enable_skills":true,
+            }));
             client
                 .resume_session(config.with_permission_handler(permission_handler))
                 .await
@@ -241,6 +250,11 @@ impl CopilotBackend {
             config.include_sub_agent_streaming_events = Some(true);
             config.enable_config_discovery = Some(true);
             config.enable_skills = Some(true);
+            self.trace.record(&request.harness_session_id, "copilot.session.create", json!({
+                "model":config.model, "reasoning_effort":config.reasoning_effort,
+                "context_tier":config.context_tier, "system_message":SYSTEM_MESSAGE,
+                "workspace":request.workspace, "streaming":true, "enable_config_discovery":true, "enable_skills":true,
+            }));
             client
                 .create_session(config.with_permission_handler(permission_handler))
                 .await
@@ -376,7 +390,14 @@ fn capability() -> BackendCapability {
 #[async_trait]
 impl Backend for CopilotBackend {
     async fn generate_text(&self, request: BackendCatalogRequest, purpose: super::TextGeneration, model: &str, history: &str) -> Result<String> {
-        text_generation::generate(&self.command, &request.workspace, purpose, model, history).await
+        self.trace.record(&request.harness_session_id, "copilot.generation.request", json!({
+            "purpose": if purpose == super::TextGeneration::SessionName { "session_name" } else { "recap" },
+            "model":model,"instructions":purpose.instructions(),"history":history}));
+        let result = text_generation::generate(&self.command, &request.workspace, purpose, model, history).await;
+        self.trace.record(&request.harness_session_id, "copilot.generation.result", match &result {
+            Ok(text) => json!({"text":text}), Err(error) => json!({"error":error.to_string()}),
+        });
+        result
     }
     async fn terminate_terminal(&self, request: BackendCatalogRequest, id: &str) -> Result<()> {
         let session = self.active_session(&request.harness_session_id).await
@@ -536,6 +557,7 @@ impl Backend for CopilotBackend {
             "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_question_ask with the complete question set. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work outside planning. Do not claim control actions through prose.\n\n{}",
             provider_text
         );
+        self.trace.record(&request.harness_session_id, "copilot.session.send", json!({"session_id":session.id().to_string(),"prompt":prompt}));
         session
             .send(MessageOptions::new(prompt))
             .await
@@ -544,6 +566,7 @@ impl Backend for CopilotBackend {
             tokio::select! {
                 provider_event = subscription.recv() => {
                     let provider_event = provider_event.context("receive Copilot session event")?;
+                    self.trace.record(&request.harness_session_id, "copilot.session.event", serde_json::to_value(&provider_event)?);
                     if completes_exchange(&provider_event) {
                         self.completed_event_by_harness
                             .lock()
@@ -949,6 +972,7 @@ impl Backend for CopilotBackend {
     }
 
     async fn steer_session(&self, session_id: &str, text: String) -> Result<()> {
+        self.trace.record(session_id, "copilot.session.steer", json!({"text":text}));
         let session = self
             .active_session(session_id)
             .await

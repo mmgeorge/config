@@ -600,6 +600,7 @@ pub fn build(
             copilot::CopilotBackend::new_with_permission_coordinator(
                 launch.command,
                 permission_coordinator,
+                trace,
             )?,
         )),
         BackendKind::Mock => Ok(Box::new(MockBackend {

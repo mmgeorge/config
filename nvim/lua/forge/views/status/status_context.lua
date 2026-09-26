@@ -124,7 +124,11 @@ function M.producer_handlers(options)
   return {
     commit = function()
       if options.is_alive() then
-        require("forge.integrations.commit").commit({ win = window(), workspace = options.workspace, on_done = refresh })
+        require("forge.integrations.commit").commit({ win = window(), workspace = options.workspace,
+          on_done = refresh, on_success = function()
+            local context = options.context and options.context()
+            if context then context.clear_about() end
+          end })
       end
     end,
     push = function() remote("push") end,
@@ -152,6 +156,7 @@ function M.attach(options)
   assert(type(options.document_id) == "string" and type(options.workspace) == "string", "missing Status context identity")
   assert(type(options.present) == "function" and type(options.is_alive) == "function", "missing Status context owner")
   assert(type(options.capture_input) == "function" and type(options.is_input_current) == "function", "missing Status input owner")
+  assert(type(options.get_about_source) == "function", "missing Status About source")
   local owner = { closed = false, revision = 0,
     presentation = { pr = { state = "fetching", text = "" }, about = { state = "none", text = "" } } }
   local function alive(revision)
@@ -177,6 +182,7 @@ function M.attach(options)
   function owner.generate_about(force)
     if not alive() then return end
     owner.about_started = true
+    owner.about_source = options.get_about_source()
     owner.about_revision = (owner.about_revision or 0) + 1
     local revision = owner.about_revision
     local function accept_about(result)
@@ -189,6 +195,31 @@ function M.attach(options)
     local first_request = not owner.about_requested
     owner.about_requested = true
     ai_commit.ensure(options.workspace, { ref = "HEAD", force = force == true or first_request, ignored_paths = options.ignored_paths and options.ignored_paths() or {}, on_start = accept_about }, accept_about)
+  end
+
+  function owner.clear_about()
+    if not alive() then return end
+    owner.about_started = true
+    owner.about_revision = (owner.about_revision or 0) + 1
+    owner.about = nil
+    owner.presentation.about = { state = "none", text = "" }
+    ai_commit.clear(options.workspace)
+    publish()
+  end
+
+  function owner.refocus()
+    if not alive() or not owner.about_started then return end
+    local config = require("forge.infra.config")
+    local settings = config.options or config.defaults
+    if settings.about_auto_generate == false then return end
+    local source = options.get_about_source()
+    if vim.deep_equal(source, owner.about_source) then return end
+    if #source.file == 0 then
+      owner.clear_about()
+      owner.about_source = source
+    else
+      owner.generate_about(true)
+    end
   end
 
   local function open_commit(action, _, captured)

@@ -624,6 +624,22 @@ async fn route_request(
     method: HarnessMethod,
     message_sink: &MessageSender,
 ) -> Result<()> {
+    if matches!(method, HarnessMethod::TraceStatus | HarnessMethod::TraceConfigure | HarnessMethod::TraceToggle | HarnessMethod::TraceClear) {
+        let trace = registry.runtime.trace();
+        match method {
+            HarnessMethod::TraceConfigure => {
+                let enabled = request.params.get("enabled").and_then(Value::as_bool).context("trace enabled is required")?;
+                if request.params.get("default_only").and_then(Value::as_bool) == Some(true) {
+                    trace.configure_default(enabled)?;
+                } else { trace.configure(enabled)?; }
+            }
+            HarnessMethod::TraceToggle => { trace.toggle()?; }
+            HarnessMethod::TraceClear => { trace.clear()?; }
+            _ => {}
+        }
+        message_sink.send_response(Response::success(request.id, serde_json::to_value(trace.session_status(&session_id))?)?).await?;
+        return Ok(());
+    }
     if method == HarnessMethod::SessionResume {
         return resume_session(registry, request, message_sink).await;
     }
@@ -1286,6 +1302,33 @@ mod tests {
         service.shutdown(Duration::from_secs(1)).await.unwrap();
         assert!(service.registry.lock().await.is_none());
         assert!(service.open_session(4, initialize).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn trace_controls_complete_while_a_turn_owns_the_broker() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry.lock().await.clone().unwrap();
+        let controller = registry.resolve(&session_id).await.unwrap();
+        let owner = controller.broker.lock().await;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        for (id, method, params) in [
+            (2, "trace.configure", json!({"enabled":true})),
+            (3, "trace.status", json!({})),
+            (4, "trace.configure", json!({"enabled":false})),
+        ] {
+            tokio::time::timeout(Duration::from_secs(1),
+                service.dispatch(Some(session_id.clone()), Request { id, method:method.into(), params }, &sink)
+            ).await.expect("trace control waited for the broker").unwrap();
+            let frame = output.recv().await.unwrap().unwrap();
+            let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+            assert_eq!(value["result"]["enabled"], id != 4);
+            assert!(value["result"]["path"].as_str().unwrap().contains(&session_id));
+        }
+        drop(owner);
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
     #[tokio::test]

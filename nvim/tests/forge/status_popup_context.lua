@@ -20,6 +20,7 @@ local owner = context.attach({ document_id = "popup-context", workspace = vim.fn
   window = origin, is_alive = function() return true end, present = function() end,
   capture_input = function() return {} end, is_input_current = function() return true end,
   get_info = function() return { branch = "main" } end,
+  get_about_source = function() return { file = {} } end,
 })
 local function press(key)
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes(key, true, false, true), "xt", false)

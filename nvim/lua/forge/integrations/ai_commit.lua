@@ -128,7 +128,7 @@ function M.ensure(cwd, opts, cb)
   local waiters = current and current.state == "generating" and current.waiters or {}
   if cb then waiters[#waiters + 1] = cb end
   local key = state_key(cwd, ref)
-  M._request_ids[key] = (M._request_ids[key] or 0) + 1
+  M._request_ids[key] = nil
   local request_id = M._request_ids[key]
   local state = { state = "generating", cwd = cwd, ref = ref, waiters = waiters }
   if not set_state(cwd, ref, state) then M._request_ids[key] = nil notify_waiters(state) return end
@@ -148,6 +148,21 @@ end
 function M.state(cwd, ref)
   if cwd and ref then return get_state(cwd, ref) end
   return M._state
+end
+
+---@param cwd string
+---@param ref? string
+function M.clear(cwd, ref)
+  ref = ref or "HEAD"
+  local key = state_key(cwd, ref)
+  local current = get_state(cwd, ref)
+  M._request_ids[key] = (M._request_ids[key] or 0) + 1
+  M._states[key] = nil
+  if ref == "HEAD" then M._state = nil end
+  if current and current.state == "generating" then
+    current.state, current.message = "none", nil
+    notify_waiters(current)
+  end
 end
 
 ---@param message string?

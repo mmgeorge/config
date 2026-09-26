@@ -33,6 +33,8 @@ local ok, error_message = xpcall(function()
           emit({ id = request.id, result = { session = { id = "receive-test" } } })
         elseif request.method == "plan.scope_deviation_review" then
           emit({ id = request.id, result = {} })
+        elseif request.method == "trace.configure" then
+          emit({ id = request.id, result = { enabled = request.params.enabled } })
         elseif request.method == "receive.test" then
           for sequence = 1, 40 do
             emit({ session_id = "receive-test", event = "receive_test", payload = { sequence = sequence } })

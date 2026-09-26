@@ -16,6 +16,7 @@ local function attach()
     window = vim.api.nvim_get_current_win(), is_alive = function() return true end,
     present = function(value) shown = value.pr end,
     get_info = function() return { branch = branch } end,
+    get_about_source = function() return { file = {} } end,
     capture_input = function() return {} end, is_input_current = function() return true end })
 end
 local first = attach()

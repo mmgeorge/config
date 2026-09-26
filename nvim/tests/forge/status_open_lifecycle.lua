@@ -12,7 +12,7 @@ local context_attachment = {}
 package.loaded["forge.views.status.status_context"] = {
   attach = function(options)
     context_attachment[#context_attachment + 1] = options
-    return { refresh = function() end, close = function() end }
+    return { refresh = function() end, refocus = function() end, close = function() end }
   end,
   producer_handlers = function() return {} end,
 }

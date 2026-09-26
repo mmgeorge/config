@@ -10,9 +10,11 @@ notifications.error = function(message) errors[#errors + 1] = message end
 local original_auto = config.options.about_auto_generate
 local original_lookup, original_lookup_delay = config.options.pr_lookup_mode, config.options.pr_mock_delay_ms
 assert(config.options.about_auto_generate ~= false, "automatic About must be enabled by default")
-local original_request, original_ai, original_pr = client.request_host, ai.ensure, gh.current_pr_async
+local original_request, original_ai, original_clear, original_pr = client.request_host, ai.ensure, ai.clear, gh.current_pr_async
 local ok, failure = xpcall(function()
   local updates, generation, pull_request, presentation = {}, {}, {}, {}
+  local about_source = { head = "old-head", file = { { id = 1, generation = 1, section = "unstaged" } } }
+  local cleared = 0
   client.request_host = function(method, params, callback)
     assert(method == "status.context")
     updates[#updates + 1] = { params = params, callback = callback }
@@ -21,6 +23,7 @@ local ok, failure = xpcall(function()
     assert(options.ignored_paths[1] == "excluded.txt", "About omitted Status Ignore selection")
     generation[#generation + 1] = callback
   end
+  ai.clear = function() cleared = cleared + 1 end
   gh.current_pr_async = function(_, callback) pull_request[#pull_request + 1] = callback end
   local applied, opened, current = 0, nil, true
   local owner = require("forge.views.status.status_context").attach({ document_id = "fixture", workspace = "fixture", window = vim.api.nvim_get_current_win(),
@@ -28,6 +31,7 @@ local ok, failure = xpcall(function()
     is_input_current = function() return current end,
     is_alive = function() return true end,
     get_info = function() return { workspace = "fixture" } end,
+    get_about_source = function() return vim.deepcopy(about_source) end,
     ignored_paths = function() return { "excluded.txt" } end,
     present = function(value) applied = applied + 1; presentation[#presentation + 1] = value end,
     open_commit = function(action) opened = action.oid end })
@@ -43,6 +47,17 @@ local ok, failure = xpcall(function()
   assert(#updates == 0 and applied == 4)
   assert(presentation[#presentation].about.text == "current message")
   assert(presentation[#presentation].pr.text == "current PR")
+  owner.refocus()
+  assert(#generation == 1, "unchanged refocus restarted About")
+  about_source.file[1].generation = 2
+  owner.refocus()
+  owner.refocus()
+  assert(#generation == 2, "changed refocus did not generate exactly once")
+  about_source.file = {}
+  owner.refocus()
+  assert(cleared == 1 and presentation[#presentation].about.state == "none", "clean refocus retained About")
+  generation[2]({ state = "ready", message = "obsolete draft" })
+  assert(presentation[#presentation].about.text == "", "late generation restored a cleared About")
   owner.activate("status:context:head")
   updates[1].callback({ kind = "commit", oid = string.rep("a", 40) })
   assert(opened == string.rep("a", 40))
@@ -56,6 +71,9 @@ local ok, failure = xpcall(function()
   assert(#generation == generation_count, "disabled automatic About started generation")
   owner.generate_about(true)
   assert(#generation == generation_count + 1, "explicit About did not generate when automatic mode was disabled")
+  about_source.file = { { id = 2, generation = 1, section = "staged" } }
+  owner.refocus()
+  assert(#generation == generation_count + 1, "disabled automatic About regenerated on refocus")
   config.options.pr_lookup_mode, config.options.pr_mock_delay_ms = "mock-delay", 1000
   local lookup_count = #pull_request
   owner.refresh({ info_loaded = true })
@@ -67,10 +85,10 @@ local ok, failure = xpcall(function()
   local closed_about = owner.about
   owner.close()
   assert(not owner.pr_timer, "closed Status retained its mock PR timer")
-  generation[2]({ state = "ready", message = "late message" })
+  generation[generation_count + 1]({ state = "ready", message = "late message" })
   assert(owner.about == closed_about, "closed context adopted generation")
 end, debug.traceback)
-client.request_host, ai.ensure, gh.current_pr_async = original_request, original_ai, original_pr
+client.request_host, ai.ensure, ai.clear, gh.current_pr_async = original_request, original_ai, original_clear, original_pr
 notifications.error = original_error
 config.options.about_auto_generate = original_auto
 config.options.pr_lookup_mode, config.options.pr_mock_delay_ms = original_lookup, original_lookup_delay

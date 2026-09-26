@@ -644,7 +644,9 @@ function M.open(options)
   vim.api.nvim_create_autocmd({ "BufEnter", "FocusGained" }, { group = state.group, callback = function()
     if require("forge.infra.popup_window").restoring_origin then return end
     if state.ready and state.active and host_current(state) and vim.api.nvim_get_current_buf() == state.replica.buffer then
-      M.refresh(state)
+      M.refresh(state, function(success)
+        if success and state.context then state.context.refocus() end
+      end)
     end
   end })
   vim.api.nvim_create_autocmd({ "CursorMoved", "WinScrolled", "BufWinEnter" }, {
@@ -780,6 +782,16 @@ function M.open(options)
             if file.section == "ignored" then paths[#paths + 1] = file.path end
           end
           return paths
+        end,
+        get_about_source = function()
+          local inventory = state.replica.inventory
+          local source = { head = inventory.head and inventory.head.object, file = {} }
+          for _, file in ipairs(inventory.file) do
+            if file.section ~= "ignored" then
+              source.file[#source.file + 1] = { id = file.id, generation = file.generation, section = file.section }
+            end
+          end
+          return source
         end,
         present = function(presentation) buffer.present_context(state.replica, presentation) end,
         request = function(params, callback) request(state, params, callback, "status.context") end,

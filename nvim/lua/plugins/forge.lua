@@ -44,37 +44,15 @@ return {
         forge.new_harness_session()
       end, { desc = "Create a fresh Harness session" })
       vim.api.nvim_create_user_command("ForgeHarnessLog", function(command)
-        local client = require("forge.client")
-        local action = command.args
-        local method = ({ on = "trace.configure", off = "trace.configure", toggle = "trace.toggle", clear = "trace.clear" })[action]
-        if action ~= "" and not method then
-          vim.notify("Usage: ForgeHarnessLog [on|off|toggle|clear]", vim.log.levels.WARN, { title = "ForgeHarness" })
+        local active = require("forge.session").harness.session
+        if not active then
+          vim.notify("Open a Harness session first", vim.log.levels.ERROR, { title = "ForgeHarness" })
           return
         end
-        local function open_trace(status, request_error)
-          if request_error then
-            vim.notify(request_error, vim.log.levels.ERROR, { title = "ForgeHarness" })
-            return
-          end
-          vim.cmd.edit(vim.fn.fnameescape(status.path))
-          vim.bo.readonly = true
-          vim.bo.modifiable = false
-        end
-        if action == "" then
-          client.request("trace.status", {}, open_trace)
-          return
-        end
-        local params = action == "on" and { enabled = true } or action == "off" and { enabled = false } or {}
-        client.request(method, params, function(status, request_error)
-          if request_error then
-            vim.notify(request_error, vim.log.levels.ERROR, { title = "ForgeHarness" })
-            return
-          end
-          vim.notify("Harness trace " .. (status.enabled and "enabled" or "disabled"), vim.log.levels.INFO, { title = "ForgeHarness" })
-        end)
+        require("forge.views.harness.settings").log(active.id, command.args)
       end, {
         nargs = "?",
-        complete = function() return { "on", "off", "toggle", "clear" } end,
+        complete = function() return { "on", "off", "open" } end,
         desc = "Open or control the Harness protocol trace",
       })
       vim.api.nvim_create_user_command("ForgePermissions", function()

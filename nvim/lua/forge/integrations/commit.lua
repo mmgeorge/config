@@ -228,6 +228,11 @@ function M._finish(code)
   winbar(st.win, st.prev_winbar or "")
 
   if code == 0 or st.aborted then
+    if code == 0 then
+      if st.on_success then pcall(st.on_success) end
+      local ai_commit = require("forge.integrations.ai_commit")
+      if ai_commit.state(st.root, "HEAD") then ai_commit.clear(st.root) end
+    end
     vim.notify(code == 0 and "Commit complete" or "Commit aborted", vim.log.levels.INFO)
     if st.console and vim.api.nvim_buf_is_valid(st.console) then
       pcall(vim.api.nvim_buf_delete, st.console, { force = true })
@@ -262,7 +267,7 @@ end
 --- Run `git commit` with the fake editor, reusing `opts.win` (the diff-preview
 --- window). `opts.list_win` is the Trouble window; `opts.on_done` refreshes the
 --- list and restores the preview after the window is handed back.
----@param opts { win: number, workspace?: string, list_win?: number, on_done?: function }
+---@param opts { win: number, workspace?: string, list_win?: number, on_done?: function, on_success?: function }
 function M.commit(opts)
   opts = opts or {}
   local win = opts.win
@@ -313,6 +318,7 @@ function M.commit(opts)
           prev_winbar = vim.wo[win].winbar,
           console = console,
           on_done = opts.on_done,
+          on_success = opts.on_success,
           aborted = false,
           root = root,
         }

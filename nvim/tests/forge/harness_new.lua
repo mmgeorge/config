@@ -79,6 +79,8 @@ local function fake_launcher(_, options, _)
       end
     elseif request.method == "plan.scope_deviation_review" then
       emit(options, { id = request.id, result = { policy = request.params.policy } })
+    elseif request.method == "trace.configure" then
+      emit(options, { id = request.id, result = { enabled = request.params.enabled } })
     elseif request.method == "shutdown" then
       emit(options, { id = request.id, result = { shutdown = true } })
     else
