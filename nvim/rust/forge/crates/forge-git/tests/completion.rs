@@ -47,7 +47,7 @@ async fn local_remote_ambiguous_and_symbolic_candidates_match_git() {
     expected.sort_unstable();
     assert_eq!(candidates.values, expected);
     assert!(!candidates.truncated);
-    assert_eq!(candidates.backend, RevisionBackend::GitForEachRef);
+    assert_eq!(candidates.backend, RevisionBackend::Gix);
     assert!(Arc::ptr_eq(
         &candidates,
         &repository.current_revisions().unwrap()
@@ -85,16 +85,12 @@ async fn failed_refresh_preserves_previously_accepted_candidates() {
         .refresh_revisions(&store, CandidateLimits::default())
         .await
         .unwrap();
-    fs::write(root.join(".git/config"), b"[invalid\n").unwrap();
+    fs::write(root.join(".git/refs/heads/broken"), b"not-an-object\n").unwrap();
     let failure = repository
         .refresh_revisions(&store, CandidateLimits::default())
         .await
         .unwrap_err();
-    assert!(
-        failure
-            .to_string()
-            .contains("Git revision enumeration failed")
-    );
+    assert!(failure.to_string().contains("enumerate revision reference"));
     assert!(Arc::ptr_eq(
         &accepted,
         &repository.current_revisions().unwrap()

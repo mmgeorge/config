@@ -208,7 +208,8 @@ async fn reopening_large_harness_history_transfers_initialize_without_poisoning_
         "ordinal":1, "prompt":prompt, "kind":"chat", "state":"complete",
         "created_at_ms":1, "completed_at_ms":2,
         "attributed_matches_checkpoint":false, "node_list":[]
-    })).unwrap();
+    }))
+    .unwrap();
     {
         let mut store = forge_harness::storage::SqliteStore::open(data.path()).unwrap();
         store.save_exchange(&exchange).unwrap();
@@ -220,8 +221,17 @@ async fn reopening_large_harness_history_transfers_initialize_without_poisoning_
     assert_eq!(reopened["result"]["session"]["id"], session_id);
     assert_eq!(reopened["result"]["exchange"][0]["prompt"], prompt);
     assert!(serde_json::to_vec(&reopened).unwrap().len() > forge_protocol::MAX_FRAME_BYTES);
-    let subsequent = host.request(3, "repository.revisions", json!({"workspace":workspace.path()})).await;
-    assert_eq!(subsequent["error"]["message"], "revision completion requires a Git repository");
+    let subsequent = host
+        .request(
+            3,
+            "repository.revisions",
+            json!({"workspace":workspace.path()}),
+        )
+        .await;
+    assert_eq!(
+        subsequent["error"]["message"],
+        "revision completion requires a Git repository"
+    );
     host.stop().await;
 }
 
@@ -244,20 +254,13 @@ fn gh_executable() -> &'static std::path::Path {
                 include_str!("../crates/forge-github/tests/fixtures/gh.rs"),
             )
             .unwrap();
-            let compiled = forge_git::command::read_command(
-                std::process::Command::new("rustup")
-                    .args(["run", "1.94.0", "rustc", "--edition=2024"])
-                    .arg(source)
-                    .arg("-o")
-                    .arg(output),
-                forge_git::command::CommandLimits {
-                    stdout_bytes: 64 * 1024,
-                    stderr_bytes: 64 * 1024,
-                    timeout: Duration::from_secs(30),
-                },
-                || Ok(()),
-            )
-            .unwrap();
+            let compiled = std::process::Command::new("rustup")
+                .args(["run", "1.94.0", "rustc", "--edition=2024"])
+                .arg(source)
+                .arg("-o")
+                .arg(output)
+                .output()
+                .unwrap();
             assert!(
                 compiled.status.success(),
                 "{}",
@@ -288,20 +291,13 @@ fn commit_editor_executable() -> &'static std::path::Path {
                 "commit-editor"
             });
             std::fs::write(&source, include_str!("fixtures/commit_editor.rs")).unwrap();
-            let compiled = forge_git::command::read_command(
-                std::process::Command::new("rustup")
-                    .args(["run", "1.94.0", "rustc", "--edition=2024"])
-                    .arg(source)
-                    .arg("-o")
-                    .arg(&output),
-                forge_git::command::CommandLimits {
-                    stdout_bytes: 64 * 1024,
-                    stderr_bytes: 64 * 1024,
-                    timeout: Duration::from_secs(30),
-                },
-                || Ok(()),
-            )
-            .unwrap();
+            let compiled = std::process::Command::new("rustup")
+                .args(["run", "1.94.0", "rustc", "--edition=2024"])
+                .arg(source)
+                .arg("-o")
+                .arg(&output)
+                .output()
+                .unwrap();
             assert!(
                 compiled.status.success(),
                 "{}",
@@ -1800,19 +1796,12 @@ async fn harness_documents_keep_composer_revisions_and_close_lifetimes_separate(
 }
 
 fn git(root: &std::path::Path, arguments: &[&str]) -> Vec<u8> {
-    let output = forge_git::command::read_command(
-        std::process::Command::new("git")
-            .arg("-C")
-            .arg(root)
-            .args(arguments),
-        forge_git::command::CommandLimits {
-            stdout_bytes: 4096,
-            stderr_bytes: 4096,
-            timeout: Duration::from_secs(10),
-        },
-        || Ok(()),
-    )
-    .unwrap();
+    let output = std::process::Command::new("git")
+        .arg("-C")
+        .arg(root)
+        .args(arguments)
+        .output()
+        .unwrap();
     assert!(
         output.status.success(),
         "{}",

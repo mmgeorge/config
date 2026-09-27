@@ -1,15 +1,16 @@
-//! Bounded command output remains owned until the direct child exits and both readers finish.
+//! Bounded native commands own their process group until output collection completes.
 
-use std::io::{self, Read, Write};
-use std::process::{Child, Command, ExitStatus, Output, Stdio};
-use std::sync::Arc;
+use std::io;
+use std::process::{Command, ExitStatus, Output, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
+use process_wrap::tokio::{CommandWrap, KillOnDrop};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWriteExt};
 
-/// Independent stream capacities and the deadline for requesting direct-child termination.
+/// Independent stream capacities and the command deadline.
 #[derive(Clone, Copy, Debug)]
 pub struct CommandLimits {
     pub stdout_bytes: usize,
@@ -17,17 +18,14 @@ pub struct CommandLimits {
     pub timeout: Duration,
 }
 
-struct CommandOwner {
-    child: Child,
-    reaped: bool,
-}
-
+/// A native output stream.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum CommandStream {
     Stdout,
     Stderr,
 }
 
+/// One bounded progress update from a native command.
 #[derive(Debug)]
 pub struct CommandProgress {
     pub stream: CommandStream,
@@ -35,18 +33,13 @@ pub struct CommandProgress {
     pub bytes: Vec<u8>,
 }
 
+/// Receives admitted progress chunks.
 pub type CommandProgressSink = Arc<dyn Fn(CommandProgress) -> Result<()> + Send + Sync>;
 
-/// Reads bounded stdout and stderr concurrently without invoking a shell.
+/// Collects a command from a blocking repository worker.
 ///
-/// The caller owns job admission and must run this blocking function outside an async executor.
-/// `check` rejects pre-start or active cancellation. A stream overflow, cancellation, timeout,
-/// reader failure, or callback unwind terminates and reaps the direct child before releasing
-/// ownership. Nonzero exit status remains available in `Output` for caller classification.
-///
-/// The command receives null stdin and piped output. A zero timeout rejects before spawning.
-/// The timeout requests termination, but cannot bound an operating-system wait or inherited pipe
-/// held by a descendant. This function does not establish process-tree containment.
+/// The caller owns admission and must not call this function on a Tokio executor thread.
+/// Cancellation, timeout, and stream failures terminate the group or job before releasing it.
 pub fn read_command(
     command: &mut Command,
     limits: CommandLimits,
@@ -55,7 +48,7 @@ pub fn read_command(
     progress_command(command, limits, None, None, check)
 }
 
-/// Writes admitted input concurrently with bounded output collection and retains it until reaping.
+/// Writes input while collecting bounded output.
 pub fn write_command(
     command: &mut Command,
     limits: CommandLimits,
@@ -65,7 +58,7 @@ pub fn write_command(
     progress_command(command, limits, Some(input), None, check)
 }
 
-/// Publishes bounded chunks in independent stream order while retaining complete bounded output.
+/// Publishes bounded chunks in independent stream order.
 pub fn progress_command(
     command: &mut Command,
     limits: CommandLimits,
@@ -76,8 +69,7 @@ pub fn progress_command(
     collect_command(command, limits, input, progress, false, check)
 }
 
-/// Drains diagnostic output to EOF without treating capture truncation as command failure.
-/// Retains a bounded tail and publishes a bounded prefix with an explicit truncation notice.
+/// Retains a bounded diagnostic tail while draining both streams to completion.
 pub fn diagnostic_command(
     command: &mut Command,
     limits: CommandLimits,
@@ -101,227 +93,213 @@ fn collect_command(
         "command timeout must be positive"
     );
     check()?;
-    let started = Instant::now();
-    let reader_failed = AtomicBool::new(false);
-    thread::scope(|scope| {
-        // Drop the child owner before the scope joins readers on any early-return or unwind path.
-        let mut owner = CommandOwner {
-            child: command
-                .stdin(if input.is_some() {
-                    Stdio::piped()
-                } else {
-                    Stdio::null()
-                })
-                .stdout(Stdio::piped())
-                .stderr(Stdio::piped())
-                .spawn()
-                .context("start bounded command")?,
-            reaped: false,
-        };
-        let stdout = owner
-            .child
-            .stdout
-            .take()
-            .context("command stdout is missing")?;
-        let stderr = owner
-            .child
-            .stderr
-            .take()
-            .context("command stderr is missing")?;
-        let failure = &reader_failed;
-        let input_writer = if let Some(input) = input {
-            let mut stdin = owner
-                .child
-                .stdin
-                .take()
-                .context("command stdin is missing")?;
-            Some(
-                thread::Builder::new()
-                    .name("forge-git-stdin".into())
-                    .spawn_scoped(scope, move || {
-                        let result = stdin.write_all(input).context("write command input");
-                        if result.is_err() {
-                            failure.store(true, Ordering::Release);
-                        }
-                        result
-                    })
-                    .context("start command input writer")?,
-            )
-        } else {
-            None
-        };
-        let stdout_reader = thread::Builder::new()
-            .name("forge-git-stdout".into())
-            .spawn_scoped(scope, move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let read = if diagnostic {
-                        read_diagnostic_stream
-                    } else {
-                        read_stream_progress
-                    };
-                    read(stdout, limits.stdout_bytes, CommandStream::Stdout, progress)
-                }))
-                .unwrap_or_else(|_| {
-                    Err(anyhow::anyhow!("command stdout progress reader panicked"))
-                });
-                if result.is_err() {
-                    failure.store(true, Ordering::Release);
-                }
-                result
+    static RUNTIME: OnceLock<std::result::Result<tokio::runtime::Runtime, String>> =
+        OnceLock::new();
+    let current = tokio::runtime::Handle::try_current().ok();
+    let runtime = match current {
+        Some(handle) => handle,
+        None => RUNTIME
+            .get_or_init(|| {
+                tokio::runtime::Builder::new_multi_thread()
+                    .worker_threads(1)
+                    .enable_all()
+                    .build()
+                    .map_err(|error| error.to_string())
             })
-            .context("start command stdout reader")?;
-        let stderr_reader = thread::Builder::new()
-            .name("forge-git-stderr".into())
-            .spawn_scoped(scope, move || {
-                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    let read = if diagnostic {
-                        read_diagnostic_stream
-                    } else {
-                        read_stream_progress
-                    };
-                    read(stderr, limits.stderr_bytes, CommandStream::Stderr, progress)
-                }))
-                .unwrap_or_else(|_| {
-                    Err(anyhow::anyhow!("command stderr progress reader panicked"))
-                });
-                if result.is_err() {
-                    failure.store(true, Ordering::Release);
-                }
-                result
-            })
-            .context("start command stderr reader")?;
-
-        let (status, stopped) = loop {
-            let stopped = check().err().or_else(|| {
-                (started.elapsed() >= limits.timeout)
-                    .then(|| anyhow::anyhow!("command exceeded {:?} deadline", limits.timeout))
-            });
-            if stopped.is_some() || reader_failed.load(Ordering::Acquire) {
-                break (owner.terminate_and_reap()?, stopped);
-            }
-            if let Some(status) = owner.child.try_wait().context("observe command exit")? {
-                owner.reaped = true;
-                break (status, None);
-            }
-            thread::sleep(Duration::from_millis(5));
-        };
-        let stdout = stdout_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("command stdout reader panicked"))?;
-        let stderr = stderr_reader
-            .join()
-            .map_err(|_| anyhow::anyhow!("command stderr reader panicked"))?;
-        let written = input_writer
-            .map(|writer| {
-                writer
-                    .join()
-                    .map_err(|_| anyhow::anyhow!("command input writer panicked"))
-            })
-            .transpose()?;
-        if let Some(error) = stopped {
-            return Err(error);
-        }
-        check()?;
-        if status.success() {
-            written.transpose()?;
-        }
-        Ok(Output {
-            status,
-            stdout: stdout?,
-            stderr: stderr?,
-        })
+            .as_ref()
+            .map_err(|error| anyhow::anyhow!("start native command runtime: {error}"))?
+            .handle()
+            .clone(),
+    };
+    let command = std::mem::replace(command, Command::new(""));
+    let input = input.map(ToOwned::to_owned);
+    let progress = progress.cloned();
+    runtime.block_on(async move {
+        collect_async(command, limits, input, progress, diagnostic, &mut check).await
     })
 }
 
-impl CommandOwner {
-    fn terminate_and_reap(&mut self) -> Result<ExitStatus> {
-        // A concurrent natural exit can make kill fail. wait still establishes the final status.
-        let _ = self.child.kill();
-        let status = self.child.wait().context("reap bounded command")?;
-        self.reaped = true;
-        Ok(status)
+async fn collect_async(
+    command: Command,
+    limits: CommandLimits,
+    input: Option<Vec<u8>>,
+    progress: Option<CommandProgressSink>,
+    diagnostic: bool,
+    check: &mut impl FnMut() -> Result<()>,
+) -> Result<Output> {
+    let started = Instant::now();
+    let mut wrapped = CommandWrap::from(tokio::process::Command::from(command));
+    wrapped
+        .command_mut()
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    wrapped.wrap(KillOnDrop);
+    #[cfg(windows)]
+    {
+        wrapped.wrap(process_wrap::tokio::JobObject);
+        wrapped.wrap(process_wrap::tokio::CreationFlags(
+            windows::Win32::System::Threading::PROCESS_CREATION_FLAGS(0x0800_0000),
+        ));
     }
-}
+    #[cfg(unix)]
+    wrapped.wrap(process_wrap::tokio::ProcessGroup::leader());
 
-impl Drop for CommandOwner {
-    fn drop(&mut self) {
-        if !self.reaped {
-            let _ = self.terminate_and_reap();
+    let mut child = wrapped.spawn().context("start bounded command")?;
+    let stdout = child.stdout().take().context("command stdout is missing")?;
+    let stderr = child.stderr().take().context("command stderr is missing")?;
+    let failed = Arc::new(AtomicBool::new(false));
+    let stdout_reader = spawn_reader(
+        stdout,
+        limits.stdout_bytes,
+        CommandStream::Stdout,
+        progress.clone(),
+        diagnostic,
+        Arc::clone(&failed),
+    );
+    let stderr_reader = spawn_reader(
+        stderr,
+        limits.stderr_bytes,
+        CommandStream::Stderr,
+        progress,
+        diagnostic,
+        Arc::clone(&failed),
+    );
+    let input_writer = input.map(|input| {
+        let mut stdin = child.stdin().take().expect("piped command stdin");
+        let failed = Arc::clone(&failed);
+        tokio::spawn(async move {
+            let result = stdin.write_all(&input).await.context("write command input");
+            if result.is_err() {
+                failed.store(true, Ordering::Release);
+            }
+            result
+        })
+    });
+
+    let mut exit_status: Option<ExitStatus> = None;
+    let stopped = loop {
+        if let Err(error) = check() {
+            break Some(error);
         }
-    }
-}
-
-fn read_stream_progress(
-    mut source: impl Read,
-    limit: usize,
-    stream: CommandStream,
-    progress: Option<&CommandProgressSink>,
-) -> Result<Vec<u8>> {
-    let stream_name = match stream {
-        CommandStream::Stdout => "stdout",
-        CommandStream::Stderr => "stderr",
+        if started.elapsed() >= limits.timeout {
+            break Some(anyhow::anyhow!(
+                "command exceeded {:?} deadline",
+                limits.timeout
+            ));
+        }
+        if failed.load(Ordering::Acquire) {
+            break None;
+        }
+        let streams_finished = stdout_reader.is_finished() && stderr_reader.is_finished();
+        if exit_status.is_none() && (cfg!(windows) || streams_finished) {
+            match child.try_wait().context("observe command exit") {
+                Ok(status) => exit_status = status,
+                Err(error) => break Some(error),
+            }
+        }
+        if exit_status.is_some()
+            && streams_finished
+            && input_writer
+                .as_ref()
+                .is_none_or(tokio::task::JoinHandle::is_finished)
+        {
+            break None;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
     };
-    let mut output = Vec::new();
-    let mut chunk = [0; 8192];
-    let mut sequence = 0;
-    loop {
-        let available = limit - output.len();
-        let requested = chunk.len().min(available.saturating_add(1));
-        let received = match source.read(&mut chunk[..requested]) {
-            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => result.with_context(|| format!("read command {stream_name}"))?,
-        };
-        if received == 0 {
-            return Ok(output);
-        }
-        ensure!(
-            received <= available,
-            "command {stream_name} exceeds {limit} bytes"
-        );
-        let required = output.len() + received;
-        if required > output.capacity() {
-            let capacity = output.capacity().saturating_mul(2).max(required).min(limit);
-            output
-                .try_reserve_exact(capacity - output.len())
-                .context("reserve command output")?;
-            ensure!(
-                output.capacity() <= limit,
-                "command {stream_name} allocation exceeds {limit} bytes"
-            );
-        }
-        output.extend_from_slice(&chunk[..received]);
-        if let Some(progress) = progress {
-            progress(CommandProgress {
-                stream,
-                sequence,
-                bytes: chunk[..received].to_vec(),
-            })?;
-            sequence += 1;
-        }
+
+    if exit_status.is_none() || failed.load(Ordering::Acquire) || stopped.is_some() {
+        #[cfg(unix)]
+        let _ = child.signal(libc::SIGKILL);
+        #[cfg(windows)]
+        let _ = child.start_kill();
+        child.wait().await.context("reap bounded command")?;
     }
+    let stdout = stdout_reader
+        .await
+        .context("command stdout reader panicked")?;
+    let stderr = stderr_reader
+        .await
+        .context("command stderr reader panicked")?;
+    let written = match input_writer {
+        Some(writer) => Some(writer.await.context("command input writer panicked")?),
+        None => None,
+    };
+    if let Some(error) = stopped {
+        return Err(error);
+    }
+    let stdout = stdout?;
+    let stderr = stderr?;
+    let status = exit_status.context("command stopped before exit")?;
+    check()?;
+    if status.success() {
+        written.transpose()?;
+    }
+    Ok(Output {
+        status,
+        stdout,
+        stderr,
+    })
 }
 
-fn read_diagnostic_stream(
-    mut source: impl Read,
+fn spawn_reader(
+    source: impl AsyncRead + Unpin + Send + 'static,
+    limit: usize,
+    stream: CommandStream,
+    progress: Option<CommandProgressSink>,
+    diagnostic: bool,
+    failed: Arc<AtomicBool>,
+) -> tokio::task::JoinHandle<Result<Vec<u8>>> {
+    tokio::spawn(async move {
+        let result = read_stream(source, limit, stream, progress.as_ref(), diagnostic).await;
+        if result.is_err() {
+            failed.store(true, Ordering::Release);
+        }
+        result
+    })
+}
+
+async fn read_stream(
+    mut source: impl AsyncRead + Unpin,
     limit: usize,
     stream: CommandStream,
     progress: Option<&CommandProgressSink>,
+    diagnostic: bool,
 ) -> Result<Vec<u8>> {
     let notice = b"\n[Command output truncated]\n";
     let notice = &notice[..notice.len().min(limit)];
-    let capacity = limit - notice.len();
-    let mut output = Vec::with_capacity(capacity);
+    let capacity = if diagnostic {
+        limit - notice.len()
+    } else {
+        limit
+    };
+    let mut output = if diagnostic {
+        Vec::with_capacity(capacity)
+    } else {
+        Vec::new()
+    };
     let mut chunk = [0; 8192];
     let mut published = 0;
     let mut sequence = 0;
     let mut truncated = false;
     loop {
-        let received = match source.read(&mut chunk) {
+        let available = capacity.saturating_sub(output.len());
+        let requested = if diagnostic {
+            chunk.len()
+        } else {
+            chunk.len().min(available.saturating_add(1)).max(1)
+        };
+        let received = match source.read(&mut chunk[..requested]).await {
             Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
-            result => result.context("read command diagnostics")?,
+            result => result.context("read command output")?,
         };
         if received == 0 {
-            if truncated {
+            if diagnostic && truncated {
                 let mut retained = Vec::with_capacity(limit);
                 retained.extend_from_slice(notice);
                 retained.extend(output);
@@ -329,87 +307,72 @@ fn read_diagnostic_stream(
             }
             return Ok(output);
         }
-        let retained = received.min(capacity);
-        let removed = (output.len() + retained).saturating_sub(capacity);
-        output.drain(..removed);
-        output.extend_from_slice(&chunk[received - retained..received]);
-        let visible = received.min(capacity - published);
+        if !diagnostic {
+            let name = match stream {
+                CommandStream::Stdout => "stdout",
+                CommandStream::Stderr => "stderr",
+            };
+            ensure!(
+                received <= available,
+                "command {name} exceeds {limit} bytes"
+            );
+            let required = output.len() + received;
+            if required > output.capacity() {
+                let reserved = output.capacity().saturating_mul(2).max(required).min(limit);
+                output
+                    .try_reserve_exact(reserved - output.len())
+                    .context("reserve command output")?;
+                ensure!(
+                    output.capacity() <= limit,
+                    "command {name} allocation exceeds {limit} bytes"
+                );
+            }
+            output.extend_from_slice(&chunk[..received]);
+        } else {
+            let retained = received.min(capacity);
+            let removed = (output.len() + retained).saturating_sub(capacity);
+            output.drain(..removed);
+            output.extend_from_slice(&chunk[received - retained..received]);
+        }
+        let visible = if diagnostic {
+            received.min(capacity.saturating_sub(published))
+        } else {
+            received
+        };
         if let Some(progress) = progress {
             if visible > 0 {
-                progress(CommandProgress {
-                    stream,
-                    sequence,
-                    bytes: chunk[..visible].to_vec(),
-                })?;
+                publish_progress(
+                    progress,
+                    CommandProgress {
+                        stream,
+                        sequence,
+                        bytes: chunk[..visible].to_vec(),
+                    },
+                )
+                .await?;
                 sequence += 1;
             }
-            if visible < received && !truncated && !notice.is_empty() {
-                progress(CommandProgress {
-                    stream,
-                    sequence,
-                    bytes: notice.to_vec(),
-                })?;
+            if diagnostic && visible < received && !truncated && !notice.is_empty() {
+                publish_progress(
+                    progress,
+                    CommandProgress {
+                        stream,
+                        sequence,
+                        bytes: notice.to_vec(),
+                    },
+                )
+                .await?;
                 sequence += 1;
             }
         }
         published += visible;
-        truncated |= visible < received;
+        truncated |= diagnostic && visible < received;
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn progress_is_bounded_and_preserves_stream_bytes_in_sequence() {
-        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
-        let captured = Arc::clone(&observed);
-        let progress: CommandProgressSink = Arc::new(move |chunk| {
-            captured.lock().unwrap().push(chunk);
-            Ok(())
-        });
-        let expected = vec![b'x'; 20_000];
-        let result = read_stream_progress(
-            &expected[..],
-            expected.len(),
-            CommandStream::Stderr,
-            Some(&progress),
-        )
-        .unwrap();
-        assert_eq!(result, expected);
-        let chunks = observed.lock().unwrap();
-        for (sequence, chunk) in chunks.iter().enumerate() {
-            assert_eq!(chunk.sequence, sequence as u64);
-            assert_eq!(chunk.stream, CommandStream::Stderr);
-            assert!(chunk.bytes.len() <= 8192);
-        }
-        assert_eq!(
-            chunks
-                .iter()
-                .flat_map(|chunk| chunk.bytes.iter().copied())
-                .collect::<Vec<_>>(),
-            expected
-        );
-    }
-
-    #[test]
-    fn stream_accepts_exact_limit_and_rejects_the_next_byte() {
-        assert_eq!(
-            read_stream_progress(&b"1234"[..], 4, CommandStream::Stdout, None).unwrap(),
-            b"1234"
-        );
-        assert!(
-            read_stream_progress(&b"12345"[..], 4, CommandStream::Stdout, None)
-                .unwrap_err()
-                .to_string()
-                .contains("stdout exceeds 4 bytes")
-        );
-        assert!(read_stream_progress(&b"x"[..], 0, CommandStream::Stderr, None).is_err());
-        assert!(
-            read_stream_progress(&b""[..], 0, CommandStream::Stderr, None)
-                .unwrap()
-                .is_empty()
-        );
-    }
+async fn publish_progress(progress: &CommandProgressSink, update: CommandProgress) -> Result<()> {
+    let progress = Arc::clone(progress);
+    tokio::task::spawn_blocking(move || progress(update))
+        .await
+        .context("command progress callback panicked")?
 }

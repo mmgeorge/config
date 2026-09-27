@@ -1,8 +1,6 @@
 use std::{
     fs::OpenOptions,
     io::{self, Read},
-    path::Path,
-    process::Command,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -14,12 +12,8 @@ use forge_diff::source::{
 
 use crate::{
     RepositoryIdentity, RepositoryPath, WorktreeId,
-    command::{CommandLimits, read_command},
     repository::{RepositoryRead, RepositoryState},
-    resolve_argument,
-    snapshot::{
-        ObjectState, WorktreeStamp, metadata_stamp, parse_object_state, read_worktree_stamp,
-    },
+    snapshot::{ObjectState, WorktreeStamp, metadata_stamp, read_worktree_stamp},
     store::RepositoryStore,
     validate_path,
 };
@@ -335,13 +329,12 @@ fn acquire_with_identity(
             check,
         ),
         ContentSource::IndexStage { path, stage } => {
-            let root = repository
+            repository
                 .identity
                 .worktree_root
                 .as_ref()
                 .context("index source requires a worktree")?;
-            let Some(state) = read_index_stage(root, &path, stage, local.object_hash(), check)?
-            else {
+            let Some(state) = read_index_stage(local, &path, stage, check)? else {
                 return Ok(ContentResult::Missing);
             };
             if state.mode == 0o160000 {
@@ -367,7 +360,7 @@ fn acquire_with_identity(
                 check,
             )?;
             ensure!(
-                Some(state) == read_index_stage(root, &path, stage, local.object_hash(), check)?,
+                Some(state) == read_index_stage(local, &path, stage, check)?,
                 "index stage changed during content acquisition"
             );
             Ok(result)
@@ -598,81 +591,28 @@ fn read_bounded(
 }
 
 fn read_index_stage(
-    root: &Path,
+    repository: &gix::Repository,
     path: &RepositoryPath,
     stage: IndexStage,
-    hash: gix::hash::Kind,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<ObjectState>> {
-    let output = read_command(
-        Command::new("git")
-            .args([
-                "--no-pager",
-                "--no-optional-locks",
-                "--literal-pathspecs",
-                "-C",
-            ])
-            .arg(root)
-            .args([
-                "-c",
-                "core.fsmonitor=false",
-                "ls-files",
-                "--stage",
-                "-z",
-                "--",
-            ])
-            .arg(resolve_argument(path)?),
-        CommandLimits {
-            stdout_bytes: 64 * 1024,
-            stderr_bytes: 64 * 1024,
-            timeout: Duration::from_secs(30),
-        },
-        &mut *check,
-    )?;
-    ensure!(
-        output.status.success(),
-        "Git index read failed: {}",
-        String::from_utf8_lossy(&output.stderr)
-    );
+    use gix::bstr::ByteSlice;
+    check()?;
+    let index = repository
+        .index_or_empty()
+        .context("read repository index")?;
     let stage = match stage {
-        IndexStage::Normal => b'0',
-        IndexStage::Base => b'1',
-        IndexStage::Ours => b'2',
-        IndexStage::Theirs => b'3',
+        IndexStage::Normal => gix::index::entry::Stage::Unconflicted,
+        IndexStage::Base => gix::index::entry::Stage::Base,
+        IndexStage::Ours => gix::index::entry::Stage::Ours,
+        IndexStage::Theirs => gix::index::entry::Stage::Theirs,
     };
-    let mut selected = None;
-    let mut seen = [false; 4];
-    if output.stdout.is_empty() {
-        return Ok(None);
-    }
-    ensure!(
-        output.stdout.last() == Some(&0),
-        "index stage output is not NUL terminated"
-    );
-    for entry in output.stdout[..output.stdout.len() - 1].split(|byte| *byte == 0) {
-        let separator = entry
-            .iter()
-            .position(|byte| *byte == b'\t')
-            .context("index stage has no path separator")?;
-        ensure!(
-            &entry[separator + 1..] == path.raw(),
-            "index stage returned another path"
-        );
-        let field = entry[..separator]
-            .split(|byte| *byte == b' ')
-            .collect::<Vec<_>>();
-        ensure!(
-            field.len() == 3 && field[2].len() == 1 && matches!(field[2][0], b'0'..=b'3'),
-            "invalid index stage record"
-        );
-        let position = (field[2][0] - b'0') as usize;
-        ensure!(!seen[position], "duplicate index stage");
-        seen[position] = true;
-        let state = parse_object_state(field[0], field[1], hash)?;
-        if field[2][0] == stage {
-            selected = Some(state);
-        }
-    }
+    let selected = index
+        .entry_by_path_and_stage(path.raw().as_bstr(), stage)
+        .map(|entry| ObjectState {
+            mode: entry.mode.bits(),
+            object: entry.id,
+        });
     check()?;
     Ok(selected)
 }

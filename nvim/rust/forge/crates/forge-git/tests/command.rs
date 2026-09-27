@@ -86,6 +86,103 @@ fn active_cancellation_terminates_a_spawned_child() {
 }
 
 #[test]
+fn cancellation_terminates_a_descendant_holding_inherited_pipes() {
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let marker = fixture_dir.path().join("descendant-marker");
+    let ready = marker.with_extension("ready");
+    let mut command = fixture("command_child_descendant");
+    command.env("FORGE_TEST_MARKER", &marker);
+    let error = read_command(&mut command, limits(), || {
+        anyhow::ensure!(!ready.exists(), "cancel descendant tree");
+        Ok(())
+    })
+    .unwrap_err();
+    assert!(error.to_string().contains("cancel descendant tree"));
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(!marker.exists(), "descendant survived command cancellation");
+}
+
+#[test]
+fn deadline_terminates_descendants_after_the_direct_child_exits() {
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let marker = fixture_dir.path().join("exited-parent-marker");
+    let mut command = fixture("command_child_descendant_exits");
+    command.env("FORGE_TEST_MARKER", &marker);
+    let error = read_command(
+        &mut command,
+        CommandLimits {
+            timeout: Duration::from_millis(300),
+            ..limits()
+        },
+        || Ok(()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("deadline"));
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(
+        !marker.exists(),
+        "descendant survived after its parent exited"
+    );
+}
+
+#[cfg(windows)]
+#[test]
+fn job_object_terminates_descendants_after_owner_abort() {
+    let fixture_dir = tempfile::tempdir().unwrap();
+    let marker = fixture_dir.path().join("owner-abort-marker");
+    let output = fixture("command_owner_abort")
+        .env("FORGE_TEST_MARKER", &marker)
+        .output()
+        .unwrap();
+    assert!(!output.status.success());
+    std::thread::sleep(Duration::from_millis(1100));
+    assert!(!marker.exists(), "descendant survived owner abort");
+}
+
+#[test]
+#[ignore = "subprocess fixture invoked by command ownership tests"]
+fn command_child_descendant() {
+    let marker = std::path::PathBuf::from(std::env::var_os("FORGE_TEST_MARKER").unwrap());
+    let mut descendant = fixture("command_descendant_marker");
+    descendant.env("FORGE_TEST_MARKER", &marker);
+    descendant.spawn().unwrap();
+    std::fs::write(marker.with_extension("ready"), b"ready").unwrap();
+    std::thread::sleep(Duration::from_secs(10));
+}
+
+#[test]
+#[ignore = "subprocess fixture invoked by command ownership tests"]
+fn command_child_descendant_exits() {
+    let marker = std::path::PathBuf::from(std::env::var_os("FORGE_TEST_MARKER").unwrap());
+    let mut descendant = fixture("command_descendant_marker");
+    descendant.env("FORGE_TEST_MARKER", &marker);
+    descendant.spawn().unwrap();
+}
+
+#[test]
+#[ignore = "subprocess fixture invoked by command ownership tests"]
+fn command_descendant_marker() {
+    std::thread::sleep(Duration::from_millis(750));
+    let marker = std::path::PathBuf::from(std::env::var_os("FORGE_TEST_MARKER").unwrap());
+    std::fs::write(marker, b"survived").unwrap();
+}
+
+#[cfg(windows)]
+#[test]
+#[ignore = "subprocess fixture invoked by command ownership tests"]
+fn command_owner_abort() {
+    let marker = std::path::PathBuf::from(std::env::var_os("FORGE_TEST_MARKER").unwrap());
+    let mut command = fixture("command_child_descendant");
+    command.env("FORGE_TEST_MARKER", &marker);
+    let _ = read_command(&mut command, limits(), || {
+        if marker.with_extension("ready").exists() {
+            std::process::abort();
+        }
+        Ok(())
+    });
+}
+
+#[test]
 fn callback_unwind_disposes_the_child_before_returning() {
     let started = Instant::now();
     let outcome = std::panic::catch_unwind(|| {

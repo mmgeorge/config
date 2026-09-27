@@ -72,33 +72,13 @@ pub async fn observe(
                 .worktree
                 .then(|| read_index_stamp(&worker.identity.index, &mut check))
                 .transpose()?;
-            let mut command = Command::new("git");
-            command
-                .args([
-                    "--no-pager",
-                    "--no-optional-locks",
-                    "--literal-pathspecs",
-                    "-C",
-                ])
-                .arg(root)
-                .args(["rev-parse", "--verify", "--end-of-options"])
-                .arg(format!("{}^{{commit}}", request.reference));
-            let output = read_command(
-                &mut command,
-                CommandLimits {
-                    stdout_bytes: 128,
-                    stderr_bytes: 4096,
-                    timeout: Duration::from_secs(30),
-                },
-                &mut check,
-            )?;
-            ensure!(
-                output.status.success(),
-                "comparison reference unavailable: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let commit = gix::ObjectId::from_hex(output.stdout.trim_ascii())
-                .context("invalid comparison commit")?;
+            check()?;
+            let spec = format!("{}^{{commit}}", request.reference);
+            let commit = local
+                .rev_parse_single(spec.as_str())
+                .context("comparison reference unavailable")?
+                .detach();
+            check()?;
             let mut command = Command::new("git");
             command
                 .args([

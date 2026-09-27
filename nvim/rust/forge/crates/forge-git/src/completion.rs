@@ -1,5 +1,5 @@
 use std::{
-    process::Command,
+    collections::HashMap,
     sync::Arc,
     time::{Duration, Instant},
 };
@@ -8,7 +8,6 @@ use anyhow::{Context, Result, ensure};
 
 use crate::{
     GitStorageId,
-    command::{CommandLimits, read_command},
     repository::{RepositoryGeneration, RepositoryRead, RepositoryState},
     store::RepositoryStore,
 };
@@ -22,10 +21,10 @@ pub struct RevisionId(pub u64);
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RevisionBackend {
-    GitForEachRef,
+    Gix,
 }
 
-/// Bounds candidate storage independently from bounded Git enumeration output.
+/// Bounds candidate storage independently from reference enumeration output.
 #[derive(Clone, Copy, Debug)]
 pub struct CandidateLimits {
     items: usize,
@@ -118,13 +117,13 @@ impl RepositoryState {
                     };
                     let candidates =
                         collect_candidates(local.object_hash(), limits, &mut check, |check| {
-                            enumerate(&worker, limits, check)
+                            enumerate(&local, limits, check)
                         })?;
                     Ok(RevisionCandidates {
                         revision: request.revision,
                         generation: request.generation,
                         storage: worker.identity.storage.clone(),
-                        backend: RevisionBackend::GitForEachRef,
+                        backend: RevisionBackend::Gix,
                         reference_digest: format!("{:064x}", request.revision.0),
                         values: candidates.values,
                         truncated: candidates.truncated,
@@ -209,41 +208,82 @@ fn collect_candidates(
 }
 
 fn enumerate(
-    repository: &RepositoryState,
+    repository: &gix::Repository,
     limits: CandidateLimits,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Vec<u8>> {
-    let output = read_command(
-        Command::new("git")
-            .args(["--no-pager", "--no-optional-locks", "-C"])
-            .arg(
-                repository
-                    .identity
-                    .worktree_root
-                    .as_ref()
-                    .unwrap_or(&repository.identity.git_directory),
-            )
-            .args([
-                "for-each-ref",
-                "--sort=refname",
-                "--format=%(refname)%00%(refname:short)%00%(objectname)%00",
-            ])
-            .arg(format!("--count={}", limits.items + 1))
-            .args(["refs/heads", "refs/remotes"]),
-        CommandLimits {
-            stdout_bytes: MAX_ENUMERATION_BYTES,
-            stderr_bytes: 64 * 1024,
-            timeout: Duration::from_secs(30),
-        },
-        check,
-    )?;
-    ensure!(
-        output.status.success(),
-        "Git revision enumeration failed with {}: {}",
-        output.status,
-        String::from_utf8_lossy(&output.stderr)
-    );
-    Ok(output.stdout)
+    use gix::bstr::ByteSlice;
+    check()?;
+    let platform = repository.references()?;
+    let references = platform.all()?;
+    let mut names = Vec::new();
+    let mut branches = Vec::new();
+    let mut name_bytes = 0usize;
+    for reference in references {
+        check()?;
+        let reference =
+            reference.map_err(|error| anyhow::anyhow!("enumerate revision reference: {error}"))?;
+        let name = reference.name().as_bstr().as_bytes().to_vec();
+        name_bytes = name_bytes.saturating_add(name.capacity());
+        ensure!(
+            name_bytes <= MAX_ENUMERATION_BYTES,
+            "reference enumeration exceeds byte limit"
+        );
+        if name.starts_with(b"refs/heads/") || name.starts_with(b"refs/remotes/") {
+            branches.push(name.clone());
+        }
+        names.push(name);
+        ensure!(
+            names.len() <= MAX_CANDIDATES * 16,
+            "reference enumeration exceeds count limit"
+        );
+    }
+    branches.sort_unstable();
+    branches.dedup();
+    let mut short_counts = HashMap::new();
+    for name in &names {
+        *short_counts.entry(abbreviated_name(name)).or_insert(0usize) += 1;
+    }
+    let mut output = Vec::new();
+    for name in branches.into_iter().take(limits.items + 1) {
+        check()?;
+        let abbreviated = abbreviated_name(&name);
+        let collisions = short_counts.get(&abbreviated).copied().unwrap_or(0);
+        let short = if collisions == 1 {
+            abbreviated
+        } else {
+            name.strip_prefix(b"refs/")
+                .context("invalid reference namespace")?
+                .to_vec()
+        };
+        let object = repository
+            .find_reference(gix::bstr::BStr::new(&name))?
+            .peel_to_id()?
+            .detach();
+        output.extend_from_slice(&name);
+        output.push(0);
+        output.extend_from_slice(&short);
+        output.push(0);
+        output.extend_from_slice(object.to_string().as_bytes());
+        output.extend_from_slice(b"\0\n");
+        ensure!(
+            output.len() <= MAX_ENUMERATION_BYTES,
+            "revision enumeration exceeds byte limit"
+        );
+    }
+    Ok(output)
+}
+
+fn abbreviated_name(name: &[u8]) -> Vec<u8> {
+    for prefix in [b"refs/heads/".as_slice(), b"refs/remotes/", b"refs/tags/"] {
+        if let Some(short) = name.strip_prefix(prefix) {
+            if prefix == b"refs/remotes/" && short.ends_with(b"/HEAD") {
+                return short[..short.len() - b"/HEAD".len()].to_vec();
+            }
+            return short.to_vec();
+        }
+    }
+    name.to_vec()
 }
 
 fn build_candidates(
@@ -533,7 +573,7 @@ mod tests {
                 revision: request.revision,
                 generation: request.generation,
                 storage: repository.identity.storage.clone(),
-                backend: RevisionBackend::GitForEachRef,
+                backend: RevisionBackend::Gix,
                 reference_digest: format!("{:064x}", request.revision.0),
                 values: Vec::new(),
                 truncated: false,

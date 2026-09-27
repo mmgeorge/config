@@ -1,10 +1,9 @@
-use std::{ffi::OsString, process::Command, sync::Arc, time::Duration};
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 
 use crate::{
     RepositoryPath,
-    command::{CommandLimits, read_command},
     repository::{RepositoryRead, RepositoryState},
     resolve_argument,
     store::RepositoryStore,
@@ -49,60 +48,41 @@ pub async fn resolve_file(
                     blob,
                 });
             }
-            let root = local.workdir().context("file revision requires worktree")?;
+            local.workdir().context("file revision requires worktree")?;
+            cancellation.check()?;
             let commit = if reference == ":0" {
                 None
             } else {
-                let mut command = Command::new("git");
-                command
-                    .args(["--no-pager", "--no-optional-locks", "-C"])
-                    .arg(root)
-                    .args(["rev-parse", "--verify", "--end-of-options"])
-                    .arg(format!("{reference}^{{commit}}"));
-                let output = read_command(
-                    &mut command,
-                    CommandLimits {
-                        stdout_bytes: 128,
-                        stderr_bytes: 4096,
-                        timeout: Duration::from_secs(30),
-                    },
-                    || cancellation.check(),
-                )?;
-                ensure!(
-                    output.status.success(),
-                    "revision is unavailable: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                );
+                let spec = format!("{reference}^{{commit}}");
                 Some(
-                    gix::ObjectId::from_hex(output.stdout.trim_ascii())
-                        .context("invalid resolved commit")?,
+                    local
+                        .rev_parse_single(spec.as_str())
+                        .context("revision is unavailable")?
+                        .detach(),
                 )
             };
-            let mut spec =
-                OsString::from(commit.map_or_else(|| ":0:".into(), |commit| format!("{commit}:")));
-            spec.push(&path_argument);
-            let mut command = Command::new("git");
-            command
-                .args(["--no-pager", "--no-optional-locks", "-C"])
-                .arg(root)
-                .args(["rev-parse", "--verify", "--end-of-options"])
-                .arg(spec);
-            let output = read_command(
-                &mut command,
-                CommandLimits {
-                    stdout_bytes: 128,
-                    stderr_bytes: 4096,
-                    timeout: Duration::from_secs(30),
-                },
-                || cancellation.check(),
-            )?;
-            ensure!(
-                output.status.success(),
-                "revision file is unavailable: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            let blob = gix::ObjectId::from_hex(output.stdout.trim_ascii())
-                .context("invalid resolved file object")?;
+            cancellation.check()?;
+            let blob = if let Some(commit) = commit {
+                let tree = local
+                    .find_object(commit)
+                    .context("read revision commit")?
+                    .peel_to_tree()
+                    .context("read revision tree")?;
+                tree.lookup_entry_by_path(&path_argument)
+                    .context("look up revision file")?
+                    .context("revision file is unavailable")?
+                    .object_id()
+            } else {
+                let index = local.index_or_empty().context("read revision index")?;
+                index
+                    .entry_by_path_and_stage(
+                        gix::bstr::BStr::new(path.raw()),
+                        gix::index::entry::Stage::Unconflicted,
+                    )
+                    .context("revision file is unavailable")?
+                    .id
+            };
+            cancellation.check()?;
             Ok(ResolvedFile {
                 origin: commit.map_or(RevisionOrigin::Index, RevisionOrigin::Commit),
                 blob,

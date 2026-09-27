@@ -109,7 +109,12 @@ async fn stage_unstage_and_discard_use_exact_targets_and_settlement() {
     )
     .await;
     assert_eq!(staged.target[0].completion, TargetCompletion::Completed);
-    assert!(staged.settled.as_ref().is_some_and(|settled| settled.path.len() == 1));
+    assert!(
+        staged
+            .settled
+            .as_ref()
+            .is_some_and(|settled| settled.path.len() == 1)
+    );
     assert_eq!(
         git(directory.path(), &["show", ":sample.txt"]),
         b"changed\n"
@@ -167,7 +172,9 @@ async fn whole_file_stage_uses_current_source_after_queue_handoff() {
             },
         )
         .unwrap();
-    intent.validate_observed_sources(&observed.head, &observed.path).unwrap();
+    intent
+        .validate_observed_sources(&observed.head, &observed.path)
+        .unwrap();
     let ticket = service.submit(intent).unwrap();
     std::fs::write(directory.path().join("sample.txt"), "new text\n").unwrap();
     guard.finish(OperationCompletion::Completed).unwrap();
@@ -184,20 +191,59 @@ async fn whole_file_stage_uses_current_source_after_queue_handoff() {
 #[tokio::test]
 async fn preparation_waits_for_earlier_staging_before_capturing_commit_index() {
     let (directory, store, repository, service) = fixture().await;
-    std::fs::write(directory.path().join("sample.txt"), "staged before commit capture\n").unwrap();
-    let staged = service.reserve(Arc::clone(&repository), GitWriteAction::Stage { path: vec![path("sample.txt")] }).unwrap();
-    let preparing = service.prepare(Arc::clone(&repository), GitWriteAction::Commit { message: "commit after optimistic stage".into() });
+    std::fs::write(
+        directory.path().join("sample.txt"),
+        "staged before commit capture\n",
+    )
+    .unwrap();
+    let staged = service
+        .reserve(
+            Arc::clone(&repository),
+            GitWriteAction::Stage {
+                path: vec![path("sample.txt")],
+            },
+        )
+        .unwrap();
+    let preparing = service.prepare(
+        Arc::clone(&repository),
+        GitWriteAction::Commit {
+            message: "commit after optimistic stage".into(),
+        },
+    );
     tokio::pin!(preparing);
-    let waiting = std::future::poll_fn(|context| std::task::Poll::Ready(std::future::Future::poll(preparing.as_mut(), context).is_pending())).await;
-    assert!(waiting, "commit captured the index before earlier staging completed");
+    let waiting = std::future::poll_fn(|context| {
+        std::task::Poll::Ready(std::future::Future::poll(preparing.as_mut(), context).is_pending())
+    })
+    .await;
+    assert!(
+        waiting,
+        "commit captured the index before earlier staging completed"
+    );
     let outcome = service.submit(staged).unwrap().finish().await.unwrap();
-    assert!(outcome.target.iter().all(|target| target.completion == TargetCompletion::Completed));
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed)
+    );
     service.acknowledge(outcome.operation).unwrap();
-    let intent = tokio::time::timeout(Duration::from_secs(10), preparing).await.unwrap().unwrap();
+    let intent = tokio::time::timeout(Duration::from_secs(10), preparing)
+        .await
+        .unwrap()
+        .unwrap();
     let committed = service.submit(intent).unwrap().finish().await.unwrap();
-    assert!(committed.target.iter().all(|target| target.completion == TargetCompletion::Completed), "{committed:?}");
+    assert!(
+        committed
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed),
+        "{committed:?}"
+    );
     service.acknowledge(committed.operation).unwrap();
-    assert_eq!(git(directory.path(), &["show", "HEAD:sample.txt"]), b"staged before commit capture\n");
+    assert_eq!(
+        git(directory.path(), &["show", "HEAD:sample.txt"]),
+        b"staged before commit capture\n"
+    );
     assert_eq!(store.writes.usage().operations, 0);
 }
 
@@ -206,15 +252,49 @@ async fn unverified_outcome_blocks_writes_until_read_only_reconciliation() {
     let (directory, store, repository, service) = fixture().await;
     let scope = MutationScope::Index(repository.identity.worktree.clone().unwrap());
     let operation = store.writes.admit(vec![scope.clone()], 1).unwrap();
-    store.writes.start(operation).unwrap().unwrap().finish_quarantined(OperationCompletion::Uncertain).unwrap();
+    store
+        .writes
+        .start(operation)
+        .unwrap()
+        .unwrap()
+        .finish_quarantined(OperationCompletion::Uncertain)
+        .unwrap();
     assert!(store.writes.take_receipt(operation).is_none());
-    assert!(service.reserve(Arc::clone(&repository), GitWriteAction::Stage { path: vec![path("sample.txt")] }).is_err());
+    assert!(
+        service
+            .reserve(
+                Arc::clone(&repository),
+                GitWriteAction::Stage {
+                    path: vec![path("sample.txt")]
+                }
+            )
+            .is_err()
+    );
     service.reconcile(&repository).await.unwrap();
     assert!(store.writes.quarantined(&[scope]).is_empty());
-    std::fs::write(directory.path().join("sample.txt"), "after reconciliation\n").unwrap();
-    let outcome = run(&service, &repository, GitWriteAction::Stage { path: vec![path("sample.txt")] }).await;
-    assert!(outcome.target.iter().all(|target| target.completion == TargetCompletion::Completed));
-    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"after reconciliation\n");
+    std::fs::write(
+        directory.path().join("sample.txt"),
+        "after reconciliation\n",
+    )
+    .unwrap();
+    let outcome = run(
+        &service,
+        &repository,
+        GitWriteAction::Stage {
+            path: vec![path("sample.txt")],
+        },
+    )
+    .await;
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed)
+    );
+    assert_eq!(
+        git(directory.path(), &["show", ":sample.txt"]),
+        b"after reconciliation\n"
+    );
 }
 
 #[tokio::test]
@@ -1148,24 +1228,54 @@ async fn whole_file_stage_accepts_large_sources_and_changes_after_preparation() 
     let (directory, _, repository, service) = fixture().await;
     let large = vec![b'x'; 9 * 1024 * 1024];
     std::fs::write(directory.path().join("large.bin"), &large).unwrap();
-    let intent = service.prepare(Arc::clone(&repository), GitWriteAction::Batch {
-        action: vec![
-            GitWriteAction::Stage { path: vec![path("large.bin")] },
-            GitWriteAction::Stage { path: vec![path("sample.txt")] },
-        ],
-    }).await.unwrap();
+    let intent = service
+        .prepare(
+            Arc::clone(&repository),
+            GitWriteAction::Batch {
+                action: vec![
+                    GitWriteAction::Stage {
+                        path: vec![path("large.bin")],
+                    },
+                    GitWriteAction::Stage {
+                        path: vec![path("sample.txt")],
+                    },
+                ],
+            },
+        )
+        .await
+        .unwrap();
     std::fs::write(directory.path().join("sample.txt"), b"new index\n").unwrap();
     git(directory.path(), &["add", "sample.txt"]);
     std::fs::write(directory.path().join("sample.txt"), b"execution contents\n").unwrap();
     let outcome = service.submit(intent).unwrap().finish().await.unwrap();
-    assert!(outcome.target.iter().all(|target| target.completion == TargetCompletion::Completed), "{outcome:?}");
-    let staged = crate::command::read_command(
-        git_command(&repository).unwrap().args(["show", ":large.bin"]),
-        CommandLimits { stdout_bytes: 10 * 1024 * 1024, stderr_bytes: 4096, timeout: Duration::from_secs(30) },
-        || Ok(()),
-    ).unwrap();
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed),
+        "{outcome:?}"
+    );
+    let mut command = git_command(&repository).unwrap();
+    command.args(["show", ":large.bin"]);
+    let staged = tokio::task::spawn_blocking(move || {
+        crate::command::read_command(
+            &mut command,
+            CommandLimits {
+                stdout_bytes: 10 * 1024 * 1024,
+                stderr_bytes: 4096,
+                timeout: Duration::from_secs(30),
+            },
+            || Ok(()),
+        )
+    })
+    .await
+    .unwrap()
+    .unwrap();
     assert!(staged.status.success());
     assert_eq!(staged.stdout, large);
-    assert_eq!(git(directory.path(), &["show", ":sample.txt"]), b"execution contents\n");
+    assert_eq!(
+        git(directory.path(), &["show", ":sample.txt"]),
+        b"execution contents\n"
+    );
     service.acknowledge(outcome.operation).unwrap();
 }

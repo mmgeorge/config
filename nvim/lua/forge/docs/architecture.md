@@ -3657,21 +3657,20 @@ gates remain incomplete.
 ## 61. Revision candidates and synchronous completion cache
 
 `RepositoryState::refresh_revisions` collects local and remote branch arguments through the shared
-blocking read pool. The implementation explicitly reports `GitForEachRef`. Git supplies short-name
-disambiguation and symbolic remote references, preserving the existing command's candidate meaning.
+blocking read pool. The `Gix` backend enumerates references, resolves symbolic remote references,
+and preserves Git-compatible short names, including ambiguous local branches.
 The result retains raw argument bytes, a sorted candidate list, request revision, repository
 generation, shared-storage identity, and a digest of the enumerated full refs and object IDs.
 
-Each enumeration requests at most 20,001 records and captures at most 16 MiB stdout and 64 KiB
-stderr. Accepted candidate storage permits 20,000 values and 2 MiB of actual vector capacities,
+Each enumeration retains at most 20,001 candidate records and 16 MiB of encoded reference data.
+Accepted candidate storage permits 20,000 values and 2 MiB of actual vector capacities,
 including the candidate index. Callers can lower both limits. The extra record proves truncation
 when the count ceiling is reached. Byte saturation keeps an admitted prefix and marks truncation.
 Malformed framing, unsorted full refs, duplicate short arguments, and wrong object hash formats
 reject the result. Invalid UTF-8 arguments retain their original bytes.
 
-Two equal enumeration digests fence detected ref changes. The first byte buffer is dropped before
-the second command starts. Collection checks cancellation and the 30-second cooperative deadline.
-This is sampled consistency, without an atomic ref transaction or process-tree termination claim.
+Two equal enumerations fence detected ref changes. Collection checks cancellation and the
+30-second cooperative deadline. This is sampled consistency without an atomic ref transaction.
 A newer request, duplicate adoption, foreign storage, or repository invalidation rejects publication.
 Failed refreshes preserve the accepted snapshot. Invalidation acquires observation then revision
 state locks, advances generation, and clears both current snapshots before releasing those locks.
@@ -4049,11 +4048,13 @@ fifty-label limits and excludes issue bodies.
 
 The client reuses forge-git's retained blocking read pool and bounded command runner. Four admitted
 native requests share a 64 KiB input budget. Each process accepts at most 8 MiB stdout and 64 KiB
-stderr, with a 120-second execution deadline. Cancellation signals the native owner, which kills and
-reaps its direct child before releasing ownership. Scoped pipe readers also retain admission until
-they exit. A descendant retaining inherited pipes can outlive the execution deadline, and shutdown
-reports unfinished work instead of claiming that those resources were released. Complete process-tree
-termination remains an acceptance boundary.
+stderr, with a 120-second execution deadline. A blocking worker drives Tokio process I/O through
+the existing runtime. `process-wrap` contains each command in a Windows Job Object or Unix process
+group. Cancellation and deadlines terminate that job or group, await its exit, and collect both
+bounded streams before releasing admission. Windows `KillOnDrop` also terminates the job if the
+Rust host exits unexpectedly. Unix process groups need a surviving owner to receive cancellation,
+so forced host death has no equivalent guarantee. Git can leave a repository lock after forced
+termination, which requires separate recovery.
 
 GraphQL decoding bounds issue, label, and error collections while consuming the response. An empty
 issue connection succeeds. Missing fields, malformed JSON, invalid pagination, GraphQL errors, and
