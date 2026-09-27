@@ -359,7 +359,7 @@ function M.refresh(state, callback)
   local run
   run = function()
     local epoch = state.refresh_epoch
-    local function finish(result, failure, snapshot)
+    local function complete(failure)
       if epoch ~= state.refresh_epoch then
         state.refresh_recover = true
         run()
@@ -372,15 +372,33 @@ function M.refresh(state, callback)
         state.refresh_recover = true
         notice(failure)
       else
-        if snapshot then
-          buffer.apply_snapshot(state.replica, result)
-          state.refresh_recover = false
-        elseif result and result ~= vim.NIL then buffer.apply_patch(state.replica, result) end
-        if snapshot or (result and result ~= vim.NIL) then state.done = {} end
         if state.context then state.context.refresh() end
         M.demand(state)
       end
       for _, complete in ipairs(callbacks) do complete(not failure, failure) end
+    end
+    local function finish(result, failure, snapshot)
+      if epoch ~= state.refresh_epoch then
+        state.refresh_recover = true
+        run()
+        return
+      end
+      if failure then complete(failure) return end
+      if snapshot then
+        buffer.apply_snapshot(state.replica, result, function(applied)
+          if applied.kind ~= "Applied" then complete("Status snapshot could not be applied") return end
+          state.refresh_recover = false
+          state.done = {}
+          complete()
+        end)
+        return
+      end
+      if result and result ~= vim.NIL then
+        local applied = buffer.apply_patch(state.replica, result)
+        if applied.kind ~= "Applied" then complete("Status refresh could not be applied") return end
+        state.done = {}
+      end
+      complete()
     end
     request(state, { operation = "refresh", document = state.document }, function(result, failure)
       if epoch == state.refresh_epoch and not failure and state.refresh_recover then

@@ -1482,6 +1482,45 @@ async fn commit_editor_options_and_progress_receipts_use_the_copied_host_fixture
         acknowledged["result"]["acknowledged"], true,
         "{acknowledged}"
     );
+    let original_tree = git(root, &["rev-parse", "HEAD^{tree}"]);
+    std::fs::write(
+        root.join("commit.txt"),
+        "staged after the original commit\n",
+    )
+    .unwrap();
+    git(root, &["add", "commit.txt"]);
+    let prepared_amend = host
+        .request(
+            5,
+            "repository.write",
+            json!({
+                "operation":"prepare",
+                "workspace":root,
+                "action":{
+                    "kind":"commit_editor",
+                    "command":editor,
+                    "nvim_server":nvim_server,
+                    "amend":true,
+                },
+            }),
+        )
+        .await;
+    let amend_intent = prepared_amend["result"]["intent"]
+        .as_str()
+        .expect("amend editor intent");
+    let amended = host
+        .request(
+            6,
+            "repository.write",
+            json!({"operation":"submit","intent":amend_intent}),
+        )
+        .await;
+    assert_eq!(amended["result"]["success"], true, "{amended}");
+    assert_eq!(git(root, &["rev-parse", "HEAD^{tree}"]), original_tree);
+    assert_eq!(
+        git(root, &["diff", "--cached", "--name-only"]),
+        b"commit.txt\n"
+    );
     host.stop().await;
 }
 

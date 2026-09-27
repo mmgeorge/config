@@ -16,6 +16,7 @@ M.specs = {
   { id = "ignore", label = "ignore", desc = "Ignore file in Forge only", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
   { id = "discard", label = "discard", desc = "Discard hunk/file/selection", modes = { "n", "x" }, visual = true, pinned = true, views = { status = true } },
   { id = "commit", label = "commit", desc = "Commit", modes = "n", pinned = true, views = { status = true } },
+  { id = "commit_amend", label = "amend", desc = "Edit latest commit message", modes = "n", pinned = false, views = { status = true } },
   { id = "push", label = "push", desc = "Push", modes = "n", pinned = true, views = { status = true } },
   { id = "pull", label = "pull", desc = "Pull", modes = "n", pinned = true, views = { status = true } },
   { id = "pr", label = "pr", desc = "Open pull request", modes = "n", pinned = true, views = { status = true } },

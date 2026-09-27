@@ -61,6 +61,8 @@ pub(crate) enum WriteAction {
     CommitEditor {
         command: String,
         nvim_server: String,
+        #[serde(default)]
+        amend: bool,
     },
     Push,
     PublishBranch {
@@ -231,9 +233,11 @@ impl WriteAction {
             Self::CommitEditor {
                 command,
                 nvim_server,
+                amend,
             } => GitWriteAction::CommitWithEditor {
                 command,
                 nvim_server,
+                amend,
             },
             Self::Push => GitWriteAction::Push,
             Self::PublishBranch { name, head } => GitWriteAction::PublishBranch {

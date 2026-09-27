@@ -223,6 +223,7 @@ M.defaults = {
       discard = "j",
       open = { "o", "<CR>", "." },
       commit = "cc",
+      commit_amend = "ca",
       push = "opp",
       pull = "opP",
       pr = "ogp",

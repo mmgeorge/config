@@ -51,7 +51,9 @@ local function run()
     assert_true(action.kind == "commit_editor", "commit host bypassed fake-editor admission")
     assert_true(type(action.command) == "string" and action.command ~= "", "commit host omitted GIT_EDITOR")
     assert_true(type(action.nvim_server) == "string" and action.nvim_server ~= "", "commit host omitted parent RPC address")
-    vim.system({ "git", "-C", workspace, "commit" }, {
+    local command = { "git", "-C", workspace, "commit" }
+    if action.amend then vim.list_extend(command, { "--amend", "--only" }) end
+    vim.system(command, {
       text = true,
       timeout = 30000,
       stderr = function(error, data)
@@ -94,6 +96,35 @@ local function run()
   local receipt = table.concat(vim.tbl_map(function(item) return item.text end, receipt_list), "\n")
   assert_true(receipt:find("forge%-pre%-commit%-stdout") and receipt:find("forge%-pre%-commit%-stderr"),
     "pre-commit stdout/stderr did not reach the commit receipt path: " .. receipt)
+
+  local original_tree = vim.trim(git({ "rev-parse", "HEAD^{tree}" }))
+  vim.fn.writefile({ "staged but not amended" }, repository .. "/tracked.txt")
+  git({ "add", "tracked.txt" })
+  commit.commit({ win = window, workspace = repository, amend = true })
+  assert_true(vim.wait(15000, function()
+    return commit._active and vim.b[vim.api.nvim_win_get_buf(window)].forge_commit_buffer
+  end, 10), "amend GIT_EDITOR did not open")
+  editor = vim.api.nvim_win_get_buf(window)
+  assert_true(vim.api.nvim_buf_get_lines(editor, 0, 1, false)[1] == "user authored commit",
+    "amend did not preload the latest commit message")
+  local regenerate = vim.fn.maparg("<C-a>", "n", false, true)
+  assert_true(type(regenerate.callback) == "function", "amend lost AI regeneration mapping")
+  regenerate.callback()
+  assert_true(request_list[2].params.comparison == "latest_commit",
+    "amend regeneration did not select the latest commit")
+  request_list[2].callback({ state = "ready", message = "AI amended message" })
+  assert_true(vim.api.nvim_buf_get_lines(editor, 0, 1, false)[1] == "AI amended message",
+    "amend regeneration did not replace the message")
+  vim.api.nvim_buf_set_lines(editor, 0, 1, false, { "updated commit message" })
+  vim.fn.maparg("<C-c><C-c>", "n", false, true).callback()
+  assert_true(vim.wait(30000, function() return commit._active == nil end, 10),
+    "real git amend did not settle")
+  assert_true(vim.trim(git({ "log", "-1", "--format=%s" })) == "updated commit message",
+    "amend did not replace the latest message")
+  assert_true(vim.trim(git({ "rev-parse", "HEAD^{tree}" })) == original_tree,
+    "amend changed the committed tree")
+  assert_true(git({ "diff", "--cached", "--name-only" }):find("tracked.txt", 1, true) ~= nil,
+    "amend consumed staged changes")
 end
 
 local ok, failure = xpcall(run, debug.traceback)

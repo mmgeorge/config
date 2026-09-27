@@ -4482,7 +4482,7 @@ Planning continuation: turn {} of {}.",
                 words.join(" ")
             };
             if !title.is_empty() {
-                self.session.name = title.chars().take(120).collect();
+                self.session.name = title.chars().take(30).collect();
                 self.save_session()?;
             }
         }
@@ -7140,10 +7140,22 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.session.name.clear();
-        broker.interaction_for_turn("/plan  design a thing", true, 100).await.unwrap();
-        assert_eq!(broker.session.name, "design a thing");
+        broker.interaction_for_turn("/plan convert to rust", true, 100).await.unwrap();
+        assert_eq!(broker.session.name, "convert to rust");
         assert_eq!(broker.store.load_session(&broker.session.id).unwrap().unwrap().name,
-            "design a thing");
+            "convert to rust");
+    }
+
+    #[tokio::test]
+    async fn first_slash_prompt_caps_persisted_session_name_at_thirty_characters() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.session.name.clear();
+        broker.interaction_for_turn("/plan convert a rather long repository from TypeScript to Rust", true, 100).await.unwrap();
+        assert_eq!(broker.session.name, "convert a rather long reposito");
+        assert_eq!(broker.store.load_session(&broker.session.id).unwrap().unwrap().name,
+            "convert a rather long reposito");
     }
 
     #[tokio::test]

@@ -255,11 +255,6 @@ local function status_text()
   local raw_mode = state.pending_mode or active_session.mode or active_session.execution_mode or "read"
   local mode = raw_mode:lower() == "yolo" and "YOLO" or (raw_mode:sub(1, 1):upper() .. raw_mode:sub(2))
   if state.pending_mode then mode = mode .. "*" end
-  local backend = active_session.backend or config.options.harness.backend
-  local provider = active_session.provider_label
-    or (backend == "codex" and "Codex CLI")
-    or (backend == "copilot" and "Copilot CLI")
-    or backend
   local configured_model = active_session.model or config.options.harness.model
   local model = active_session.resolved_model or (configured_model == "default" and "resolving model" or configured_model)
   local effort = selected_setting(state, "effort")
@@ -279,7 +274,7 @@ local function status_text()
       group = require("forge.infra.highlights").harness_mode(raw_mode),
     },
     {
-      text = (" • %s • %s %s%s"):format(provider, model, effort, fast),
+      text = (" • %s %s%s"):format(model, effort, fast),
       group = "ForgeStatusLabel",
     },
   }

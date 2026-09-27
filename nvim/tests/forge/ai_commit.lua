@@ -102,8 +102,11 @@ local function run()
   ai_commit.ensure(cwd, { ref = "HEAD", force = true })
   take("generate", "head")({ state = "ready", message = "new draft" })
   assert_equal(ai_commit.state(cwd, "HEAD").message, "new draft")
+  ai_commit.ensure("D:/another-workspace", { ref = "HEAD" })
+  take("generate", "head")({ state = "ready", message = "other draft" })
   ai_commit.clear(cwd)
   assert_equal(ai_commit.state(cwd, "HEAD"), nil)
+  assert_equal(ai_commit.state().message, "other draft", "clearing one workspace removed another draft")
   assert_equal(#requests, 0)
 end
 

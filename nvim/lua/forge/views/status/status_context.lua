@@ -121,16 +121,17 @@ function M.producer_handlers(options)
       if latest then context.set_remote_action({ action = action, status = vim.fn.strcharpart(latest, 0, 1024) }) end
     end)
   end
+  local function start_commit(amend)
+    if not options.is_alive() then return end
+    require("forge.integrations.commit").commit({ win = window(), workspace = options.workspace,
+      amend = amend, on_done = refresh, on_success = function()
+        local context = options.context and options.context()
+        if context then context.clear_about() end
+      end })
+  end
   return {
-    commit = function()
-      if options.is_alive() then
-        require("forge.integrations.commit").commit({ win = window(), workspace = options.workspace,
-          on_done = refresh, on_success = function()
-            local context = options.context and options.context()
-            if context then context.clear_about() end
-          end })
-      end
-    end,
+    commit = function() start_commit(false) end,
+    commit_amend = function() start_commit(true) end,
     push = function() remote("push") end,
     pull = function() remote("pull") end,
     pr = function() open_pull_request(false) end,

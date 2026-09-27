@@ -28,6 +28,7 @@ impl Drop for GenerationPermit {
 pub enum Comparison {
     Head,
     Staged,
+    LatestCommit,
 }
 
 #[derive(Clone, Deserialize, Serialize)]

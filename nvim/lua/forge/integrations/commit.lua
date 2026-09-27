@@ -72,7 +72,14 @@ function M.client()
     local connected, chan = pcall(vim.fn.sockconnect, "pipe", parent, { rpc = true })
     assert(connected and chan ~= 0, "cannot reach parent nvim at " .. tostring(parent))
     vim.rpcrequest(chan, "nvim_command", code)
-    pcall(vim.fn.chanclose, chan)
+    local parent_watch = vim.uv.new_timer()
+    assert(parent_watch, "cannot monitor parent nvim")
+    parent_watch:start(1000, 1000, vim.schedule_wrap(function()
+      if vim.api.nvim_get_chan_info(chan).id == chan then return end
+      parent_watch:stop()
+      parent_watch:close()
+      vim.cmd("cq")
+    end))
   end)
   if not ok then
     pcall(vim.api.nvim_err_writeln, "forge.commit (client): " .. tostring(err))
@@ -146,7 +153,7 @@ function M.editor(target, client_addr)
 
   local buf = vim.fn.bufadd(target)
   vim.b[buf].forge_commit_buffer = true
-  vim.b[buf].ai_commit_generated = true
+  vim.b[buf].ai_commit_generated = not st.amend
   vim.fn.bufload(buf)
   vim.bo[buf].buftype = ""
   vim.bo[buf].swapfile = false
@@ -155,9 +162,12 @@ function M.editor(target, client_addr)
   vim.bo[buf].modifiable = true
 
   vim.api.nvim_win_set_buf(st.win, buf)
-  winbar(st.win, " %#Comment#<C-c><C-c>%* commit   %#Comment#<C-q>%* abort   %#Comment#<C-a>%* regenerate staged ")
+  winbar(st.win, st.amend
+    and " %#Comment#<C-c><C-c>%* amend   %#Comment#<C-q>%* abort   %#Comment#<C-a>%* regenerate commit "
+    or " %#Comment#<C-c><C-c>%* commit   %#Comment#<C-q>%* abort   %#Comment#<C-a>%* regenerate staged ")
 
   local finished = false
+  local leave_autocmd
   local function finish(abort)
     if finished then return end
     finished = true
@@ -172,6 +182,7 @@ function M.editor(target, client_addr)
         return
       end
     end
+    if leave_autocmd then pcall(vim.api.nvim_del_autocmd, leave_autocmd) end
     vim.cmd("stopinsert")
     if not abort and st.console and vim.api.nvim_buf_is_valid(st.console) and vim.api.nvim_win_is_valid(st.win) then
       vim.api.nvim_win_set_buf(st.win, st.console)
@@ -182,6 +193,7 @@ function M.editor(target, client_addr)
     -- Git still owns the process lifetime; M._finish hands the window back to
     -- the preview when hooks/commit finalization finish.
   end
+  leave_autocmd = vim.api.nvim_create_autocmd("VimLeavePre", { once = true, callback = function() finish(true) end })
 
   local map = { buffer = buf, nowait = true, silent = true }
   vim.keymap.set({ "n", "i" }, "<C-c><C-c>", function() finish(false) end, map)
@@ -191,16 +203,18 @@ function M.editor(target, client_addr)
     if finished then return end
     require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(buf, st.root or vim.fn.getcwd(), function(message, level)
       vim.notify(message, level, { title = "Forge commit" })
-    end, true)
+    end, true, st.amend and "latest_commit" or nil)
   end, map)
   vim.api.nvim_create_autocmd("BufWipeout", { buffer = buf, once = true, callback = function() finish(true) end })
 
   vim.api.nvim_set_current_win(st.win)
   -- Enter in normal mode (no startinsert): keeps <C-q>/<C-c><C-c> reliable.
   pcall(vim.api.nvim_win_set_cursor, st.win, { 1, 0 })
-  require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(buf, st.root or vim.fn.getcwd(), function(message, level)
-    vim.notify(message, level, { title = "Forge commit" })
-  end)
+  if not st.amend then
+    require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(buf, st.root or vim.fn.getcwd(), function(message, level)
+      vim.notify(message, level, { title = "Forge commit" })
+    end)
+  end
 end
 
 -- ─── running git commit + result ────────────────────────────────────────────
@@ -233,7 +247,7 @@ function M._finish(code)
       local ai_commit = require("forge.integrations.ai_commit")
       if ai_commit.state(st.root, "HEAD") then ai_commit.clear(st.root) end
     end
-    vim.notify(code == 0 and "Commit complete" or "Commit aborted", vim.log.levels.INFO)
+    vim.notify(code == 0 and (st.amend and "Amend complete" or "Commit complete") or "Commit aborted", vim.log.levels.INFO)
     if st.console and vim.api.nvim_buf_is_valid(st.console) then
       pcall(vim.api.nvim_buf_delete, st.console, { force = true })
     end
@@ -264,10 +278,9 @@ function M._finish(code)
   end
 end
 
---- Run `git commit` with the fake editor, reusing `opts.win` (the diff-preview
---- window). `opts.list_win` is the Trouble window; `opts.on_done` refreshes the
---- list and restores the preview after the window is handed back.
----@param opts { win: number, workspace?: string, list_win?: number, on_done?: function, on_success?: function }
+--- Run Git's commit editor in `opts.win` and restore the preview when Git exits.
+--- `amend` edits the latest message while preserving staged changes.
+---@param opts { win: number, workspace?: string, list_win?: number, amend?: boolean, on_done?: function, on_success?: function }
 function M.commit(opts)
   opts = opts or {}
   local win = opts.win
@@ -321,6 +334,7 @@ function M.commit(opts)
           on_success = opts.on_success,
           aborted = false,
           root = root,
+          amend = opts.amend == true,
         }
         M._admission_pending = false
 
@@ -329,14 +343,14 @@ function M.commit(opts)
         vim.wo[win].number = false
         vim.wo[win].relativenumber = false
         vim.wo[win].wrap = true
-        winbar(win, " Committing... ")
+        winbar(win, opts.amend and " Amending... " or " Committing... ")
 
         local server = vim.v.servername
         if server == nil or server == "" then server = vim.fn.serverstart() end
 
         local editor = remote_editor_cmd()
         local commit_ok, commit_process_or_error = pcall(git_write.execute, root, {
-          kind = "commit_editor", command = editor, nvim_server = server,
+          kind = "commit_editor", command = editor, nvim_server = server, amend = opts.amend == true,
         }, function(commit_result)
           if not commit_result.ok and commit_result.output ~= "" then
             append_text(console, commit_result.output)

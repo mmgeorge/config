@@ -98,6 +98,7 @@ pub enum GitWriteAction {
     CommitWithEditor {
         command: String,
         nvim_server: String,
+        amend: bool,
     },
     UpdateRepositoryConfig {
         expected: Option<Vec<u8>>,
@@ -588,6 +589,7 @@ impl GitWriteAction {
         if let Self::CommitWithEditor {
             command,
             nvim_server,
+            ..
         } = self
         {
             ensure!(
@@ -669,6 +671,7 @@ impl GitWriteAction {
             Self::CommitWithEditor {
                 command,
                 nvim_server,
+                ..
             } => command.capacity() + nvim_server.capacity(),
             _ => 0,
         })
@@ -1137,9 +1140,13 @@ fn run_target(
         GitWriteAction::CommitWithEditor {
             command: editor,
             nvim_server,
+            amend,
         } => {
+            command.arg("commit");
+            if *amend {
+                command.args(["--amend", "--only"]);
+            }
             command
-                .arg("commit")
                 .env("GIT_EDITOR", editor)
                 .env("GIT_SEQUENCE_EDITOR", editor)
                 .env("NVIM", nvim_server);

@@ -71,8 +71,9 @@ generic `application`, `domain`, or `ports` layers.
 
 Only the Harness transcript window owns the winbar. Clear the composer winbar.
 Start the transcript winbar with `Read` or `Write`, omit the redundant Harness
-title and trust-profile suffix, then name the underlying CLI/provider and
-resolved runtime model rather than only the adapter kind or configured `default` sentinel.
+title, trust-profile suffix, and CLI/provider label, then show the resolved
+runtime model rather than the configured `default` sentinel. `/config` shows
+the underlying CLI/provider.
 Resolve the Codex default through `model/list`, persist `provider_label` and
 `resolved_model` on the Harness session, and show an explicit resolving state
 until provider metadata arrives. Stream provider events into the transcript

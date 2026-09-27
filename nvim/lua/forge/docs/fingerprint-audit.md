@@ -1,10 +1,12 @@
 # Forge fingerprint audit
 
 The AI comparison-token design documented below was retired on 2026-09-11.
-About now generates once per Status open without repository snapshots or identity
-comparisons. The commit editor reuses that draft unconditionally, and Ctrl-A
-explicitly regenerates from staged contents. The earlier measurements below are
-historical. Other subsystem hash boundaries remain as documented.
+About generates once when Status opens without a preliminary repository identity
+request. On refocus, Status compares the HEAD object and nonignored file generations
+in its refreshed snapshot with the draft's source and regenerates when they change.
+The commit editor reuses the current draft, and Ctrl-A explicitly regenerates from
+staged contents. The earlier measurements below are historical. Other subsystem
+hash boundaries remain as documented.
 
 Forge uses Git object IDs and filesystem metadata for ordinary observation and AI
 message reuse. Exact byte checks remain where a mismatch can authorize a destructive

@@ -9,10 +9,11 @@ local original_startup_log_path = startup_log.path
 startup_log.path = function() return startup_log_path end
 local original_context = package.loaded["forge.views.status.status_context"]
 local context_attachment = {}
+local refocus_checks = 0
 package.loaded["forge.views.status.status_context"] = {
   attach = function(options)
     context_attachment[#context_attachment + 1] = options
-    return { refresh = function() end, refocus = function() end, close = function() end }
+    return { refresh = function() end, refocus = function() refocus_checks = refocus_checks + 1 end, close = function() end }
   end,
   producer_handlers = function() return {} end,
 }
@@ -29,6 +30,8 @@ status._set_runner_for_test(function(_, params, callback)
     callback({ closed = true })
   elseif params.operation == "close_view" or params.operation == "refresh" then
     callback(nil)
+  elseif params.operation == "snapshot" then
+    callback(fixture.snapshot(params.document, { context = { workspace = workspace, branch = "main", recent = {}, issues = {}, branch_prefix = "" } }))
   else
     error("unexpected lifecycle request: " .. params.operation)
   end
@@ -71,6 +74,12 @@ local succeeded, failure = xpcall(function()
   vim.api.nvim_win_set_buf(source_window, hidden.replica.buffer)
   status.demand(hidden)
   await(function() return hidden.view[source_window] ~= nil end, "redisplayed document did not attach its view")
+  local about_source = context_attachment[#context_attachment].get_about_source()
+  assert(#about_source.file == 1 and about_source.file[1].generation == 1, "About source omitted visible file generation")
+  vim.api.nvim_set_current_win(source_window)
+  local before_refocus = refocus_checks
+  vim.api.nvim_exec_autocmds("FocusGained", {})
+  await(function() return refocus_checks > before_refocus end, "refocus did not check About after refresh")
   status.close(hidden)
   await(function() return closed_document[hidden.document] end, "hidden document close did not settle")
 

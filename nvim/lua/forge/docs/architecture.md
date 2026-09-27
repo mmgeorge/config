@@ -2298,8 +2298,8 @@ their existing generated permission outputs.
 
 Only the transcript window owns the Harness winbar. The composer clears its window-local
 winbar so the split presents session identity once. The transcript winbar begins directly
-with the active execution mode, omits the redundant Harness title, and then
-displays the underlying provider executable and resolved runtime model.
+with the active execution mode and resolved runtime model. `/config` displays
+the underlying CLI provider.
 Codex resolves the configured `default` sentinel through the `isDefault` entry from
 `model/list`, then caches and persists that model on the Harness session. Copilot maps the SDK
 model catalog into the same picker and applies supported reasoning effort when it creates,
@@ -2308,7 +2308,9 @@ instead of presenting `default` as though it were a real model ID.
 
 `/rename <name>` routes directly to the broker's durable `session.rename` request rather
 than entering the model transcript. The broker retains rename metadata without displaying a
-timeline message. The Harness tab displays up to 30 characters of the current session name. Bare `/rename` shows only
+timeline message. The first prompt names an unnamed session from its first 30 characters after
+removing a leading slash command such as `/plan`. The Harness tab displays up to 30 characters of
+the current session name. Bare `/rename` shows only
 `Generating session name…` until the name is persisted. It captures visible conversation history and generates a 2-6 word name
 in an isolated provider conversation using the selected model. Naming selects the lowest advertised
 reasoning effort for explicit models. Copilot Auto retains provider-managed reasoning. The request

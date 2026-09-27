@@ -43,7 +43,7 @@ client.request_for = function(session_id, method, params, callback)
 end
 local success, failure = xpcall(function()
   state.transcript_buf, state.transcript_win, state.composer_buf, state.composer_win, state.timeline_tab = require("forge.views.harness.layout").open("native-controller")
-  state.session = { id = "native-controller", backend = "mock", model = "mock", execution_mode = "read" }
+  state.session = { id = "native-controller", backend = "mock", provider_label = "Mock CLI", model = "mock", execution_mode = "read" }
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "native draft" })
   controller.attach()
   controller.render()
@@ -55,6 +55,8 @@ local success, failure = xpcall(function()
   controller.refresh_winbar()
   local title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
     { use_winbar = true, maxwidth = 200 }).str
+  assert(title:find("Read • mock", 1, true), "winbar lost execution mode or model")
+  assert(not title:find("Mock CLI", 1, true), "winbar still shows the CLI provider")
   assert(not title:find("Parser 100% coverage", 1, true), "session name remains in top bar")
   local tab_title = vim.api.nvim_eval_statusline(vim.o.tabline,
     { use_tabline = true, maxwidth = 200 }).str

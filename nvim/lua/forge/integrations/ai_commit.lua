@@ -32,7 +32,9 @@ local function native_request(cwd, ref, ignored, callback, is_current)
   local resolved, failure = require("ai").resolve(require("ai.adapters").get().commit)
   if not resolved then callback(nil, failure) return end
   local model = { provider = resolved.provider.name, model = resolved.model, thinking = resolved.thinking }
-  local params = { operation = "generate", workspace = cwd, comparison = ref == "staged" and "staged" or "head", ignored_paths = ignored or {}, model = model }
+  local params = { operation = "generate", workspace = cwd,
+    comparison = ref == "staged" and "staged" or ref == "latest_commit" and "latest_commit" or "head",
+    ignored_paths = ignored or {}, model = model }
   local lifetime = M._states
   local function receive(result, failure)
     if M._states ~= lifetime or (is_current and not is_current()) then return end
@@ -128,7 +130,7 @@ function M.ensure(cwd, opts, cb)
   local waiters = current and current.state == "generating" and current.waiters or {}
   if cb then waiters[#waiters + 1] = cb end
   local key = state_key(cwd, ref)
-  M._request_ids[key] = nil
+  M._request_ids[key] = (M._request_ids[key] or 0) + 1
   local request_id = M._request_ids[key]
   local state = { state = "generating", cwd = cwd, ref = ref, waiters = waiters }
   if not set_state(cwd, ref, state) then M._request_ids[key] = nil notify_waiters(state) return end
@@ -156,9 +158,9 @@ function M.clear(cwd, ref)
   ref = ref or "HEAD"
   local key = state_key(cwd, ref)
   local current = get_state(cwd, ref)
-  M._request_ids[key] = (M._request_ids[key] or 0) + 1
+  M._request_ids[key] = nil
   M._states[key] = nil
-  if ref == "HEAD" then M._state = nil end
+  if ref == "HEAD" and M._state == current then M._state = nil end
   if current and current.state == "generating" then
     current.state, current.message = "none", nil
     notify_waiters(current)
@@ -179,7 +181,8 @@ end
 ---@param cwd string
 ---@param notify? fun(message: string, level: integer)
 ---@param regenerate? boolean
-function M.populate_commit_buffer_when_ready(buf, cwd, notify, regenerate)
+---@param comparison? "latest_commit"
+function M.populate_commit_buffer_when_ready(buf, cwd, notify, regenerate, comparison)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
   if not regenerate and vim.b[buf].forge_ai_commit_populate_started then return end
   vim.b[buf].forge_ai_commit_populate_started = true
@@ -202,7 +205,7 @@ function M.populate_commit_buffer_when_ready(buf, cwd, notify, regenerate)
     if state.state ~= "ready" or not state.message then
       if notify then
         if state.state == "error" then notify(state.error or "Unable to generate commit message", vim.log.levels.WARN)
-        elseif regenerate and state.state == "none" then notify("No staged changes to describe", vim.log.levels.INFO) end
+        elseif regenerate and state.state == "none" then notify(comparison == "latest_commit" and "No latest commit to describe" or "No staged changes to describe", vim.log.levels.INFO) end
       end
       return
     end
@@ -216,11 +219,11 @@ function M.populate_commit_buffer_when_ready(buf, cwd, notify, regenerate)
     if window ~= -1 then vim.api.nvim_win_set_cursor(window, { 1, 0 }) end
     vim.b[buf].forge_ai_commit_populated = true
   end
-  local ref = regenerate and "staged" or "HEAD"
+  local ref = comparison or (regenerate and "staged" or "HEAD")
   if not regenerate and not get_state(cwd, ref) then return end
   M.ensure(cwd, { ref = ref, force = regenerate == true,
     on_start = function()
-      if notify then notify(regenerate and "Generating staged commit message..." or "Waiting for About draft...", vim.log.levels.INFO) end
+      if notify then notify(regenerate and (comparison == "latest_commit" and "Generating latest commit message..." or "Generating staged commit message...") or "Waiting for About draft...", vim.log.levels.INFO) end
     end,
   }, apply_message)
 end

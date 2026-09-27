@@ -1,10 +1,13 @@
 use std::path::PathBuf;
+use std::process::Command;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result, bail, ensure};
 use forge_diff::engine::{DiffEngine, DiffRequest};
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
 use forge_diff::workers::WorkPriority;
+use forge_git::command::{CommandLimits, read_command};
 use forge_git::content::{
     ContentLimits, ContentRequest, ContentResult, ContentSource, WorktreeConversion,
 };
@@ -42,6 +45,9 @@ pub async fn collect(
         .open(PathBuf::from(&request.workspace))
         .await?
         .context("generation requires a Git worktree")?;
+    if request.comparison == Comparison::LatestCommit {
+        return collect_latest_commit(store, repository).await;
+    }
     let observation = store
         .read(Arc::clone(&repository), 0, |local, cancellation| {
             forge_git::reader::StatusReader::status_comparison(&local, &mut || cancellation.check())
@@ -160,6 +166,7 @@ pub async fn collect(
             empty()?
         };
         let new = match request.comparison {
+            Comparison::LatestCommit => unreachable!("latest commit uses committed sources"),
             Comparison::Staged if index.is_none_or(|index| index.object.is_null()) => empty()?,
             Comparison::Staged => {
                 source(
@@ -285,6 +292,75 @@ pub async fn collect(
     Ok(CommitContext {
         prompt,
         source_requests,
+        diff_pairs,
+    })
+}
+
+async fn collect_latest_commit(
+    store: &RepositoryStore,
+    repository: Arc<RepositoryState>,
+) -> Result<CommitContext> {
+    let root = repository
+        .identity
+        .worktree_root
+        .clone()
+        .context("generation requires a worktree")?;
+    let output = store
+        .read(repository, 0, move |_local, cancellation| {
+            let mut command = Command::new("git");
+            command.arg("-C").arg(root).args([
+                "show",
+                "--format=",
+                "--no-color",
+                "--no-ext-diff",
+                "HEAD",
+            ]);
+            read_command(
+                &mut command,
+                CommandLimits {
+                    stdout_bytes: 256 * 1024,
+                    stderr_bytes: 4096,
+                    timeout: Duration::from_secs(30),
+                },
+                || cancellation.check(),
+            )
+        })
+        .await?
+        .value;
+    ensure!(
+        output.status.success(),
+        "cannot read latest commit: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let diff = String::from_utf8_lossy(&output.stdout);
+    if diff.trim().is_empty() {
+        return Ok(CommitContext {
+            prompt: None,
+            source_requests: 1,
+            diff_pairs: 0,
+        });
+    }
+    let diff_pairs = diff
+        .lines()
+        .filter(|line| line.starts_with("diff --git "))
+        .count();
+    let mut end = diff.len().min(180_000);
+    while !diff.is_char_boundary(end) {
+        end -= 1;
+    }
+    let truncated = end < diff.len();
+    let prompt = format!(
+        "Generate a conventional commit message for the latest commit.{}\n\nDiff:\n{}",
+        if truncated {
+            " Context is truncated."
+        } else {
+            ""
+        },
+        &diff[..end]
+    );
+    Ok(CommitContext {
+        prompt: Some(prompt),
+        source_requests: 1,
         diff_pairs,
     })
 }
@@ -483,6 +559,15 @@ mod tests {
                 && !staged.contains("new value")
                 && !staged.contains("removed")
         );
+        request.comparison = Comparison::LatestCommit;
+        let latest = collect(&store, &diff, &request)
+            .await
+            .unwrap()
+            .prompt
+            .unwrap();
+        assert!(latest.contains("+before") && latest.contains("+removed"));
+        assert!(!latest.contains("staged value") && !latest.contains("worktree value"));
+        request.comparison = Comparison::Staged;
         git(root, &["add", "excluded.txt"]);
         let staged = collect(&store, &diff, &request)
             .await
