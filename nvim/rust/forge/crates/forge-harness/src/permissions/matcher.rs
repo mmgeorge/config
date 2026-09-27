@@ -80,7 +80,10 @@ fn command_pattern_score(pattern: &str, invocation: &CommandInvocation) -> Optio
     let literal_count = pattern_token_list
         .len()
         .saturating_sub(usize::from(wildcard));
-    if literal_count == 0 || invocation.token_list.len() < literal_count {
+    if literal_count == 0 {
+        return (pattern_token_list.len() == 1 && wildcard).then_some(0);
+    }
+    if invocation.token_list.len() < literal_count {
         return None;
     }
     let matches = pattern_token_list[..literal_count]
@@ -310,6 +313,74 @@ mod test {
         };
         assert_eq!(
             permission.evaluate(ExecutionMode::Read, &denied).decision,
+            PermissionDecision::Deny
+        );
+    }
+
+    #[test]
+    fn catch_all_command_rule_supplies_the_default_decision() {
+        let request = PermissionRequest {
+            id: "1".into(),
+            provider: "test".into(),
+            reason: None,
+            target_list: vec![PermissionTarget::Command {
+                command: "cargo test".into(),
+            }],
+        };
+        for (rule, expected) in [
+            ("allow", PermissionDecision::Allow),
+            ("ask", PermissionDecision::Ask),
+            ("deny", PermissionDecision::Deny),
+        ] {
+            let permission = compiled(&format!(r#"{{"permission":{{"bash":{{"*":"{rule}"}}}}}}"#));
+            assert_eq!(
+                permission.evaluate(ExecutionMode::Read, &request).decision,
+                expected
+            );
+        }
+        assert_eq!(
+            compiled(r#"{"permission":{"bash":{"git":"allow"}}}"#)
+                .evaluate(ExecutionMode::Read, &request)
+                .decision,
+            PermissionDecision::Ask
+        );
+    }
+
+    #[test]
+    fn specific_command_rules_override_catch_all_and_compounds_keep_denials() {
+        let permission =
+            compiled(r#"{"permission":{"bash":{"*":"deny","git":"allow","git push":"ask"}}}"#);
+        let mut request = PermissionRequest {
+            id: "1".into(),
+            provider: "test".into(),
+            reason: None,
+            target_list: vec![PermissionTarget::Command {
+                command: String::new(),
+            }],
+        };
+        for (command, expected) in [
+            ("git status", PermissionDecision::Allow),
+            ("git push origin main", PermissionDecision::Ask),
+            ("git status && cargo test", PermissionDecision::Deny),
+            ("", PermissionDecision::Ask),
+            ("git $(echo status)", PermissionDecision::Ask),
+        ] {
+            request.target_list = vec![PermissionTarget::Command {
+                command: command.into(),
+            }];
+            assert_eq!(
+                permission.evaluate(ExecutionMode::Read, &request).decision,
+                expected,
+                "command: {command}"
+            );
+        }
+        request.target_list = vec![PermissionTarget::Command {
+            command: "git status".into(),
+        }];
+        assert_eq!(
+            compiled(r#"{"permission":{"bash":{"*":"allow","git status":"deny"}}}"#)
+                .evaluate(ExecutionMode::Read, &request)
+                .decision,
             PermissionDecision::Deny
         );
     }

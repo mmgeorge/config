@@ -2263,6 +2263,9 @@ gives every surfaced provider request to one `PermissionCoordinator`. `allow` pr
 `deny` rejects immediately, and `ask` blocks the provider response on the Harness approval float.
 Persistent approval choices atomically replace exact or broad JSON rules with allow or deny. The
 permission document remains outside provider write authority, including shell commands that name it.
+In `permission.bash`, `"*"` supplies the lowest-priority decision for a recognized command.
+More specific command rules override it. Without a matching rule, commands ask for approval.
+Empty or ambiguous command text also asks, even when `"*"` allows other commands.
 
 Approval requests bypass the timeline reducer and stream directly into the controller. Resolution
 and cancellation emit matching lifecycle events keyed by approval ID, so the controller removes the
