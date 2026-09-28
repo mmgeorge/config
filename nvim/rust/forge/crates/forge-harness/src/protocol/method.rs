@@ -15,6 +15,8 @@ pub enum HarnessMethod {
     TraceToggle,
     #[serde(rename = "trace.clear")]
     TraceClear,
+    #[serde(rename = "trace.session.clear")]
+    TraceSessionClear,
     #[serde(rename = "backend.models")]
     BackendModels,
     #[serde(rename = "agent.list")]

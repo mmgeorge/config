@@ -346,7 +346,6 @@ mod test {
             rustdoc: Some(Arc::new(
                 RustdocResolver::new(crate::rustdoc::RustdocResolverConfig {
                     crates_io_base: "http://127.0.0.1:9".into(),
-                    docs_rs_base: "http://127.0.0.1:9".into(),
                     cache_dir,
                     cargo_source: crate::rustdoc::CargoSourceResolverConfig {
                         cargo_executable: PathBuf::from("missing-cargo"),

@@ -624,7 +624,14 @@ async fn route_request(
     method: HarnessMethod,
     message_sink: &MessageSender,
 ) -> Result<()> {
-    if matches!(method, HarnessMethod::TraceStatus | HarnessMethod::TraceConfigure | HarnessMethod::TraceToggle | HarnessMethod::TraceClear) {
+    if matches!(
+        method,
+        HarnessMethod::TraceStatus
+            | HarnessMethod::TraceConfigure
+            | HarnessMethod::TraceToggle
+            | HarnessMethod::TraceClear
+            | HarnessMethod::TraceSessionClear
+    ) {
         let trace = registry.runtime.trace();
         match method {
             HarnessMethod::TraceConfigure => {
@@ -635,6 +642,7 @@ async fn route_request(
             }
             HarnessMethod::TraceToggle => { trace.toggle()?; }
             HarnessMethod::TraceClear => { trace.clear()?; }
+            HarnessMethod::TraceSessionClear => { trace.clear_session(&session_id)?; }
             _ => {}
         }
         message_sink.send_response(Response::success(request.id, serde_json::to_value(trace.session_status(&session_id))?)?).await?;
@@ -1317,14 +1325,15 @@ mod tests {
         for (id, method, params) in [
             (2, "trace.configure", json!({"enabled":true})),
             (3, "trace.status", json!({})),
-            (4, "trace.configure", json!({"enabled":false})),
+            (4, "trace.session.clear", json!({})),
+            (5, "trace.configure", json!({"enabled":false})),
         ] {
             tokio::time::timeout(Duration::from_secs(1),
                 service.dispatch(Some(session_id.clone()), Request { id, method:method.into(), params }, &sink)
             ).await.expect("trace control waited for the broker").unwrap();
             let frame = output.recv().await.unwrap().unwrap();
             let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
-            assert_eq!(value["result"]["enabled"], id != 4);
+            assert_eq!(value["result"]["enabled"], id != 5);
             assert!(value["result"]["path"].as_str().unwrap().contains(&session_id));
         }
         drop(owner);

@@ -12,6 +12,7 @@ local function notice(message) notifications.error(message, "ForgePlanReview") e
 ---@class ForgeNativePlanFold
 ---@field id string
 ---@field owner string
+---@field heading_start_line integer
 ---@field start_line integer
 ---@field end_line integer
 ---@field record table
@@ -29,7 +30,7 @@ local function task_folds(review, owner)
       result[#result + 1] = {
         id = id,
         owner = record.owner,
-        heading_line = block_row + record.fold.start.row,
+        heading_start_line = block_row + 1,
         start_line = block_row + record.fold.start.row + 1,
         end_line = finish_block_row + record.fold["end"].position.row + 1,
         record = record,
@@ -57,7 +58,7 @@ local function default_closed_folds(review, owner)
       result[#result + 1] = {
         id = id,
         owner = record.owner,
-        heading_line = block_row + record.fold.start.row,
+        heading_start_line = block_row + 1,
         start_line = block_row + record.fold.start.row + 1,
         end_line = finish_block_row + record.fold["end"].position.row + 1,
         record = record,
@@ -101,16 +102,16 @@ local function toggle_task_fold(review)
   local cursor_line = vim.api.nvim_win_get_cursor(view.window)[1]
   local selected
   for _, fold in ipairs(task_folds(review)) do
-    if (fold.heading_line == cursor_line or fold.start_line == cursor_line)
+    if (cursor_line >= fold.heading_start_line and cursor_line <= fold.start_line)
       and (not selected or fold.end_line < selected.end_line) then selected = fold end
   end
   if not selected then return end
   vim.api.nvim_win_call(view.window, function()
-    local return_to_heading = cursor_line == selected.heading_line
+    local return_to_heading = cursor_line < selected.start_line
     local folded = vim.fn.foldclosed(selected.start_line) >= 0
     vim.api.nvim_win_set_cursor(view.window, { selected.start_line, 0 })
     vim.cmd(folded and "silent! normal! zO" or "silent! normal! zc")
-    if return_to_heading then vim.api.nvim_win_set_cursor(view.window, { selected.heading_line, 0 }) end
+    if return_to_heading then vim.api.nvim_win_set_cursor(view.window, { cursor_line, 0 }) end
     if folded then
       for _, fold in ipairs(task_folds(review)) do
         if fold.start_line >= selected.start_line and fold.end_line <= selected.end_line then

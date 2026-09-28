@@ -8,6 +8,7 @@ license = "MIT"
 anyhow = "1.0"
 async-trait = "0.1"
 clap = { version = "4.5", features = ["derive"] }
+dunce = "1.0"
 futures-util = "0.3"
 forge-protocol = { path = "../forge-protocol" }
 forge-git = { path = "../forge-git" }
@@ -22,6 +23,9 @@ rusqlite = { version = "0.40.1", features = ["bundled"] }
 reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 schemars = "=1.2.2"
 semver = "1.0"
+syn = { version = "2.0", features = ["full", "visit-mut"] }
+quote = "1.0"
+proc-macro2 = { version = "1.0", features = ["span-locations"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_path_to_error = "0.1"
@@ -34,8 +38,6 @@ tokio-tungstenite = "0.28"
 tempfile = "3.23"
 toml = "0.9"
 uuid = { version = "1.18", features = ["serde", "v4"] }
-zstd = "0.13"
 
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.62.2", features = ["Win32_System_Threading"] }
-

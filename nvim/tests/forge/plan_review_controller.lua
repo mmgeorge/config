@@ -29,6 +29,14 @@ client.request_for = function(session_id, method, params, callback)
         { id = "task", range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = 21 } } },
       }, fold = {
         { id = "plan:task:1", start = { row = 0, column = 0 }, ["end"] = { block = "task", position = { row = 2, column = 0 } }, closed = false },
+      } } },
+      { id = "wrapped_task", text = {
+        "2. Own square velocity through a focused ECS component. The component keeps movement data with",
+        "   the entity that uses it and exposes narrow operations for input changes and boundary reflection.",
+        "   Its dedicated module prevents motion state from becoming application-wide state.",
+        "   file src/motion.rs",
+      }, metadata = { decoration = {}, editable_region = {}, target = {}, fold = {
+        { id = "plan:task:2", start = { row = 2, column = 0 }, ["end"] = { block = "wrapped_task", position = { row = 4, column = 0 } }, closed = false },
       } } } } } })
   elseif params.operation == "plan_action" and params.input.action == "jump_entity" then
     callback({ jump = { block = "overview", position = { row = 0, column = 5 } } })
@@ -59,6 +67,22 @@ local success, failure = xpcall(function()
     "native PlanReview did not retain the opened task fold")
   review.command_set.action_by_id.toggle.run({})
   assert(vim.fn.foldclosed(task_row + 1) == task_row + 1, "native PlanReview did not close the selected task fold")
+  local _, wrapped_row = review.owner.replica.sequence:position("wrapped_task")
+  for _, heading_row in ipairs({ wrapped_row + 1, wrapped_row + 2, wrapped_row + 3 }) do
+    assert(vim.fn.foldclosed(wrapped_row + 3) == wrapped_row + 3,
+      "wrapped task should start folded at its final description row")
+    vim.api.nvim_win_set_cursor(review.win, { heading_row, 0 })
+    review.command_set.action_by_id.toggle.run({})
+    assert(vim.fn.foldclosed(wrapped_row + 3) == -1,
+      "Tab should expand a task from any description row")
+    assert(vim.api.nvim_win_get_cursor(review.win)[1] == heading_row,
+      "expanding a wrapped task should preserve the selected description row")
+    review.command_set.action_by_id.toggle.run({})
+    assert(vim.fn.foldclosed(wrapped_row + 3) == wrapped_row + 3,
+      "Tab should collapse a task from any description row")
+    assert(vim.api.nvim_win_get_cursor(review.win)[1] == heading_row,
+      "collapsing a wrapped task should preserve the selected description row")
+  end
   vim.cmd("vsplit")
   vim.api.nvim_win_set_buf(0, review.buf)
   review.owner.refresh_views()

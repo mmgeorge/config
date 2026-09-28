@@ -74,10 +74,6 @@ pub async fn validate_plan_rust_api(
         }
     }
 
-    let package_list = package_version
-        .iter()
-        .map(|(package, version)| (package.clone(), version.clone()))
-        .collect::<Vec<_>>();
     let mut edge_list = Vec::new();
     for (flow_index, flow) in document.flows.iter().enumerate() {
         collect_flow_edge(
@@ -137,44 +133,30 @@ pub async fn validate_plan_rust_api(
             continue;
         };
         match resolver
-            .type_hover(dependency_name, version, receiver)
-            .await
-        {
-            Ok(_) => {}
-            Err(RustdocError::Unavailable(message)) => {
-                warning.push(PlanViolation {
-                    path: path.clone(),
-                    message: partial_validation_warning(&message, &format!("type `{receiver}`")),
-                });
-                continue;
-            }
-            Err(error) => {
-                violation.push(PlanViolation {
-                    path: path.clone(),
-                    message: error.to_string(),
-                });
-                continue;
-            }
-        }
-        match resolver
-            .callable_hover(
-                &package_list,
+            .declaration(
                 dependency_name,
                 version,
                 receiver,
-                &callable.name,
-                callable.kind,
+                Some((&callable.name, callable.kind)),
             )
             .await
         {
-            Ok(_) => {}
-            Err(RustdocError::Unavailable(message)) => warning.push(PlanViolation {
-                path,
-                message: partial_validation_warning(
-                    &message,
-                    &format!("callable `{}::{}`", receiver, callable.name),
-                ),
-            }),
+            Ok(declaration) => check_signature(
+                edge,
+                receiver,
+                &declaration,
+                &path,
+                &mut violation,
+                &mut warning,
+            ),
+            Err(RustdocError::Unavailable(message) | RustdocError::Ambiguous(message)) => warning
+                .push(PlanViolation {
+                    path,
+                    message: partial_validation_warning(
+                        &message,
+                        &format!("callable `{}::{}`", receiver, callable.name),
+                    ),
+                }),
             Err(error) => violation.push(PlanViolation {
                 path,
                 message: error.to_string(),
@@ -187,6 +169,107 @@ pub async fn validate_plan_rust_api(
     } else {
         Err(RustApiValidationError { violation })
     }
+}
+
+fn check_signature(
+    edge: &crate::plan::PlanFlowEdge,
+    receiver: &str,
+    declaration: &super::index::SourceItem,
+    path: &str,
+    violation: &mut Vec<PlanViolation>,
+    warning: &mut Vec<PlanViolation>,
+) {
+    let mut comparison = Vec::new();
+    if let (Some(payload), Some(input)) = (&edge.payload_type, &declaration.input) {
+        let actual = match input.as_slice() {
+            [input] => input.clone(),
+            input => format!("({})", input.join(", ")),
+        };
+        comparison.push(("payload_type", payload.clone(), actual));
+    }
+    if let (Some(output), Some(actual)) = (&edge.return_type, &declaration.output) {
+        let expected = match &output.error_type {
+            Some(error) => format!("Result<{}, {error}>", output.value_type),
+            None => output.value_type.clone(),
+        };
+        comparison.push(("return_type", expected, actual.clone()));
+    }
+    for (field, expected, actual) in comparison {
+        let field_path = format!(
+            "{}.{}",
+            path.strip_suffix(".callable").unwrap_or(path),
+            field
+        );
+        match compare_type(&expected, &actual, receiver, &declaration.generic) {
+            Ok(true) => {}
+            Ok(false) => violation.push(PlanViolation {
+                path: field_path,
+                message: format!(
+                    "declared `{expected}` but source signature `{}` declares `{actual}`",
+                    declaration.signature
+                ),
+            }),
+            Err(message) => warning.push(PlanViolation {
+                path: field_path,
+                message: format!("signature check skipped: {message}; source declares `{actual}`"),
+            }),
+        }
+    }
+}
+
+fn compare_type(
+    expected: &str,
+    actual: &str,
+    receiver: &str,
+    generic: &[String],
+) -> Result<bool, String> {
+    use quote::ToTokens;
+    use syn::visit_mut::VisitMut;
+    struct Normalize<'a> {
+        receiver: &'a syn::Type,
+        generic: &'a [String],
+        uncertain: bool,
+    }
+    impl VisitMut for Normalize<'_> {
+        fn visit_type_mut(&mut self, value: &mut syn::Type) {
+            if matches!(
+                value,
+                syn::Type::ImplTrait(_) | syn::Type::Infer(_) | syn::Type::Macro(_)
+            ) {
+                self.uncertain = true;
+            }
+            if let syn::Type::Path(path) = value {
+                if path.path.is_ident("Self") {
+                    *value = self.receiver.clone();
+                } else if path
+                    .path
+                    .segments
+                    .iter()
+                    .any(|segment| self.generic.iter().any(|name| segment.ident == name))
+                {
+                    self.uncertain = true;
+                }
+            }
+            syn::visit_mut::visit_type_mut(self, value);
+        }
+    }
+    let receiver = syn::parse_str::<syn::Type>(receiver).map_err(|error| error.to_string())?;
+    let mut expected = syn::parse_str::<syn::Type>(expected)
+        .map_err(|error| format!("invalid stated type: {error}"))?;
+    let mut actual = syn::parse_str::<syn::Type>(actual)
+        .map_err(|error| format!("unsupported source type: {error}"))?;
+    let mut normalizer = Normalize {
+        receiver: &receiver,
+        generic,
+        uncertain: false,
+    };
+    normalizer.visit_type_mut(&mut expected);
+    normalizer.visit_type_mut(&mut actual);
+    let equal = expected.to_token_stream().to_string() == actual.to_token_stream().to_string();
+    if !equal && normalizer.uncertain {
+        return Err("generic substitution requires inference beyond declaration checking".into());
+    }
+    Ok(equal)
 }
 
 fn collect_flow_edge<'a>(
@@ -283,5 +366,60 @@ mod test {
                 "flows.0.edges.0.branches.0.edges.0.callable",
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod signature_test {
+    use super::*;
+
+    #[test]
+    fn checks_concrete_inputs_outputs_and_preserves_declared_generics() {
+        assert_eq!(compare_type("f32", "f32", "Clock", &[]), Ok(true));
+        assert_eq!(compare_type("f64", "f32", "Clock", &[]), Ok(false));
+        assert_eq!(
+            compare_type("(Color, Vec2)", "(Color,Vec2)", "Sprite", &[]),
+            Ok(true)
+        );
+        assert_eq!(compare_type("&mut App", "&mut Self", "App", &[]), Ok(true));
+        assert_eq!(
+            compare_type("Result<(), Error>", "Result<(), Error>", "App", &[]),
+            Ok(true)
+        );
+        assert_eq!(compare_type("T", "T", "Clock", &["T".into()]), Ok(true));
+        assert!(compare_type("f32", "T", "Clock", &["T".into()]).is_err());
+    }
+
+    #[test]
+    fn reports_type_mismatches_on_the_plan_fields() {
+        let (_directory, mut index) = super::super::index::test::fixture();
+        let declaration = index
+            .callable(
+                "facade",
+                "1.0.0",
+                "Clock",
+                "reset",
+                crate::plan::PlanCallableKind::Method,
+            )
+            .unwrap();
+        let edge: crate::plan::PlanFlowEdge = serde_json::from_value(serde_json::json!({
+            "relation": "call", "target": {"kind": "external_entity", "entity_kind": "type", "name": "Clock", "dependency": "facade"},
+            "callable": {"kind": "method", "name": "reset"}, "payload_type": "f64",
+            "return_type": {"value_type": "bool", "error_type": "std::io::Error"}, "expansion": [], "branches": []
+        })).unwrap();
+        let mut violation = Vec::new();
+        let mut warning = Vec::new();
+        check_signature(
+            &edge,
+            "Clock",
+            &declaration,
+            "flows.0.edges.0.callable",
+            &mut violation,
+            &mut warning,
+        );
+        assert_eq!(violation.len(), 2);
+        assert_eq!(violation[0].path, "flows.0.edges.0.payload_type");
+        assert_eq!(violation[1].path, "flows.0.edges.0.return_type");
+        assert!(warning.is_empty());
     }
 }

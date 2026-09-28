@@ -295,6 +295,7 @@ pub struct PlanFlowEdge {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub callable: Option<PlanCallable>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Transferred payload, or callable parameters excluding self (a tuple for multiple inputs).
     pub payload_type: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub return_type: Option<PlanFlowReturnType>,

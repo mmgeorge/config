@@ -1,1058 +1,831 @@
+use super::RustdocError;
+use super::source::{RustdocSourceLocation, SourceGraph, SourcePackage};
 use crate::plan::PlanCallableKind;
-use anyhow::{Context, Result};
-use serde::Deserialize;
-use serde_json::Value;
+use quote::ToTokens;
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
-const MIN_SUPPORTED_RUSTDOC_FORMAT_VERSION: u32 = 33;
-const MAX_SUPPORTED_RUSTDOC_FORMAT_VERSION: u32 = 60;
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct RustdocJson {
-    pub format_version: u32,
-    pub index: HashMap<String, Item>,
-    pub paths: HashMap<String, PathEntry>,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct Item {
-    pub name: Option<String>,
-    pub span: Option<RustdocSourceSpan>,
-    pub docs: Option<String>,
-    pub inner: Value,
-}
-
-impl Item {
-    fn inner_for(&self, kind: &str) -> Option<&Value> {
-        self.inner.get(kind)
-    }
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct PathEntry {
-    pub path: Vec<String>,
-    pub kind: Value,
-}
-
-impl PathEntry {
-    fn full_path(&self) -> String {
-        self.path.join("::")
-    }
-
-    fn kind_name(&self) -> &str {
-        self.kind.as_str().unwrap_or("")
-    }
-}
-
-#[derive(Clone, Debug, Deserialize, Eq, PartialEq)]
-pub struct RustdocSourceSpan {
-    pub filename: PathBuf,
-    pub begin: (usize, usize),
-    pub end: (usize, usize),
-}
-
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct RustdocItem {
+#[derive(Clone)]
+/// Source declaration shared by signature checking, hover, and navigation.
+pub(crate) struct SourceItem {
+    pub package_id: String,
     pub path: String,
     pub signature: String,
     pub docs: String,
-    pub span: Option<RustdocSourceSpan>,
+    pub location: RustdocSourceLocation,
+    pub input: Option<Vec<String>>,
+    pub output: Option<String>,
+    pub generic: Vec<String>,
+    alias: Option<String>,
 }
 
-#[derive(Debug)]
-pub(crate) struct RustdocIndex {
-    item_by_name: HashMap<String, Vec<RustdocItem>>,
-    receiver_by_name: HashMap<String, Vec<RustType>>,
-    callable_list: Vec<RustdocCallable>,
+#[derive(Clone)]
+struct Import {
+    module: String,
+    name: Option<String>,
+    target: String,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) struct ResolvedReceiver {
-    authored: String,
-    canonical: RustType,
-}
-
-impl ResolvedReceiver {
-    pub(crate) fn authored(&self) -> &str {
-        &self.authored
-    }
-}
-
-#[derive(Clone, Debug)]
-struct RustdocCallable {
-    receiver: RustType,
+#[derive(Clone)]
+struct Callable {
+    module: String,
+    receiver: String,
+    kind: PlanCallableKind,
     name: String,
-    item: RustdocItem,
+    item: SourceItem,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RustType {
-    Path {
-        item_id: Option<String>,
-        path: String,
-        arguments: Vec<RustGenericArgument>,
-    },
-    Generic(String),
-    Primitive(String),
-    Borrowed {
-        mutable: bool,
-        target: Box<RustType>,
-    },
-    Tuple(Vec<RustType>),
-    Slice(Box<RustType>),
-    Array {
-        target: Box<RustType>,
-        length: String,
-    },
+#[derive(Default)]
+struct PackageIndex {
+    item: HashMap<String, Vec<SourceItem>>,
+    module: HashSet<String>,
+    import: Vec<Import>,
+    callable: Vec<Callable>,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-enum RustGenericArgument {
-    Type(RustType),
-    Lifetime(String),
-    Const(String),
-    Infer,
+/// Resolves declarations through source modules and re-exports without compiling dependencies.
+pub(crate) struct SourceIndex {
+    package: HashMap<String, SourcePackage>,
+    dependency: HashMap<String, HashMap<String, String>>,
+    parsed: HashMap<String, PackageIndex>,
 }
 
-#[derive(Clone, Debug)]
-struct AliasTemplate {
-    parameter_list: Vec<String>,
-    target: RustType,
-}
-
-impl RustdocIndex {
-    pub(crate) fn parse(source: &[u8]) -> Result<Self> {
-        let document: RustdocJson =
-            serde_json::from_slice(source).context("decode Rustdoc JSON")?;
-        anyhow::ensure!(
-            (MIN_SUPPORTED_RUSTDOC_FORMAT_VERSION..=MAX_SUPPORTED_RUSTDOC_FORMAT_VERSION)
-                .contains(&document.format_version),
-            "unsupported Rustdoc JSON format {}; supported versions are {} through {}",
-            document.format_version,
-            MIN_SUPPORTED_RUSTDOC_FORMAT_VERSION,
-            MAX_SUPPORTED_RUSTDOC_FORMAT_VERSION
-        );
-        Self::build(&document)
+impl SourceIndex {
+    pub(crate) fn new(graph: SourceGraph) -> Self {
+        Self {
+            package: graph
+                .packages
+                .into_iter()
+                .map(|package| (package.id.clone(), package))
+                .collect(),
+            dependency: graph
+                .resolve
+                .nodes
+                .into_iter()
+                .map(|node| {
+                    (
+                        node.id,
+                        node.deps
+                            .into_iter()
+                            .map(|dependency| (dependency.name, dependency.pkg))
+                            .collect(),
+                    )
+                })
+                .collect(),
+            parsed: HashMap::new(),
+        }
     }
 
-    fn build(document: &RustdocJson) -> Result<Self> {
-        let mut item_by_name = HashMap::<String, Vec<RustdocItem>>::new();
-        for (item_id, path) in &document.paths {
-            let Some(item) = document.index.get(item_id) else {
-                continue;
-            };
-            let Some(name) = item.name.as_deref() else {
-                continue;
-            };
-            item_by_name
-                .entry(name.to_owned())
-                .or_default()
-                .push(RustdocItem {
-                    path: path.full_path(),
-                    signature: item_signature(item, path.kind_name()),
-                    docs: item.docs.clone().unwrap_or_default(),
-                    span: item.span.clone(),
-                });
+    fn load(&mut self, package_id: &str) -> Result<(), RustdocError> {
+        if self.parsed.contains_key(package_id) {
+            return Ok(());
         }
-
-        let alias_by_id = document
-            .index
+        let package = self
+            .package
+            .get(package_id)
+            .ok_or_else(|| unavailable("package absent from Cargo graph"))?;
+        let target = package
+            .targets
             .iter()
-            .filter_map(|(item_id, item)| {
-                let alias = item.inner_for("type_alias")?;
-                let target = alias
-                    .get("type")
-                    .and_then(|value| rust_type(document, value))?;
-                Some((
-                    item_id.clone(),
-                    AliasTemplate {
-                        parameter_list: alias_parameter_list(alias),
-                        target,
-                    },
-                ))
+            .find(|target| {
+                target
+                    .kind
+                    .iter()
+                    .any(|kind| matches!(kind.as_str(), "lib" | "proc-macro" | "rlib"))
             })
-            .collect::<HashMap<_, _>>();
-        let mut receiver_by_name = HashMap::<String, Vec<RustType>>::new();
-        for (item_id, path) in &document.paths {
-            let Some(item) = document.index.get(item_id) else {
-                continue;
-            };
-            let Some(name) = item.name.as_deref() else {
-                continue;
-            };
-            let receiver = if alias_by_id.contains_key(item_id) {
-                expand_alias(
-                    RustType::Path {
-                        item_id: Some(item_id.clone()),
-                        path: path.full_path(),
-                        arguments: Vec::new(),
-                    },
-                    &alias_by_id,
-                    &mut HashSet::new(),
-                )?
-            } else {
-                RustType::Path {
-                    item_id: Some(item_id.clone()),
-                    path: path.full_path(),
-                    arguments: Vec::new(),
-                }
-            };
-            receiver_by_name
-                .entry(name.to_owned())
-                .or_default()
-                .push(receiver);
-        }
-
-        let mut callable_list = Vec::new();
-        for item in document.index.values() {
-            let Some(implementation) = item.inner_for("impl") else {
-                continue;
-            };
-            let Some(receiver) = implementation
-                .get("for")
-                .and_then(|value| rust_type(document, value))
-            else {
-                continue;
-            };
-            let receiver = expand_alias(receiver, &alias_by_id, &mut HashSet::new())?;
-            let trait_reference = implementation.get("trait").filter(|value| !value.is_null());
-            let trait_path = trait_reference.map(|value| type_name(document, value));
-            let mut method_id_list = implementation
-                .get("items")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            if let Some(trait_item) = trait_reference
-                .and_then(type_id)
-                .and_then(|trait_id| document.index.get(&trait_id))
-                .and_then(|trait_item| trait_item.inner_for("trait"))
-            {
-                method_id_list.extend(
-                    trait_item
-                        .get("items")
-                        .and_then(Value::as_array)
-                        .cloned()
-                        .unwrap_or_default(),
-                );
-            }
-            for method_id in method_id_list {
-                let Some(method_id) = id_string(&method_id) else {
-                    continue;
-                };
-                let Some(method) = document.index.get(&method_id) else {
-                    continue;
-                };
-                let Some(method_name) = method.name.as_deref() else {
-                    continue;
-                };
-                if method.inner_for("function").is_none() {
-                    continue;
-                }
-                let owner_path = trait_path
-                    .clone()
-                    .unwrap_or_else(|| rust_type_display(&receiver));
-                let resolved = RustdocItem {
-                    path: format!("{owner_path}::{method_name}"),
-                    signature: function_signature(method),
-                    docs: method.docs.clone().unwrap_or_default(),
-                    span: method.span.clone(),
-                };
-                if !callable_list.iter().any(|entry: &RustdocCallable| {
-                    entry.receiver == receiver
-                        && entry.name == method_name
-                        && entry.item.path == resolved.path
-                }) {
-                    callable_list.push(RustdocCallable {
-                        receiver: receiver.clone(),
-                        name: method_name.to_owned(),
-                        item: resolved,
-                    });
-                }
-            }
-        }
-
-        Ok(Self {
-            item_by_name,
-            receiver_by_name,
-            callable_list,
-        })
+            .ok_or_else(|| unavailable("dependency has no library source"))?;
+        let root = package
+            .manifest_path
+            .parent()
+            .ok_or_else(|| unavailable("package has no source directory"))?;
+        let mut index = PackageIndex::default();
+        parse_file(
+            package,
+            root,
+            &target.src_path,
+            "",
+            &mut index,
+            &mut HashSet::new(),
+        )?;
+        self.parsed.insert(package_id.into(), index);
+        Ok(())
     }
 
-    pub(crate) fn type_item(&self, name: &str) -> Result<RustdocItem, LookupError> {
-        unique(self.item_by_name.get(name), "type", name)
-    }
-
-    pub(crate) fn resolve_receiver(&self, authored: &str) -> Result<ResolvedReceiver, LookupError> {
-        let receiver_list = self
-            .receiver_by_name
-            .get(short_name(authored).as_str())
-            .cloned()
-            .unwrap_or_default();
-        match receiver_list.as_slice() {
-            [canonical] => Ok(ResolvedReceiver {
-                authored: authored.to_owned(),
-                canonical: canonical.clone(),
-            }),
-            [] => Err(LookupError::Missing(format!(
-                "type `{authored}` does not exist"
+    fn package_id(&self, package: &str, version: &str) -> Result<String, RustdocError> {
+        let candidate = self
+            .package
+            .values()
+            .filter(|candidate| candidate.name == package && candidate.version == version)
+            .collect::<Vec<_>>();
+        match candidate.as_slice() {
+            [package] => Ok(package.id.clone()),
+            [] => Err(unavailable(format!(
+                "Cargo graph does not contain `{package}` {version}"
             ))),
-            _ => Err(LookupError::Ambiguous(format!(
-                "type `{authored}` resolves to {} items",
-                receiver_list.len()
+            _ => Err(RustdocError::Ambiguous(format!(
+                "multiple source identities for `{package}` {version}"
             ))),
         }
+    }
+
+    pub(crate) fn type_item(
+        &mut self,
+        package: &str,
+        version: &str,
+        receiver: &str,
+    ) -> Result<SourceItem, RustdocError> {
+        let package_id = self.package_id(package, version)?;
+        let path = type_path(receiver)?;
+        let mut candidate = self.resolve(&package_id, "", &path, &mut HashSet::new())?;
+        if candidate.is_empty() && !path.contains("::") {
+            candidate = self.resolve(
+                &package_id,
+                "",
+                &format!("prelude::{path}"),
+                &mut HashSet::new(),
+            )?;
+        }
+        unique(candidate, receiver)
     }
 
     pub(crate) fn callable(
-        &self,
-        receiver: &ResolvedReceiver,
-        callable: &str,
+        &mut self,
+        package: &str,
+        version: &str,
+        receiver: &str,
+        name: &str,
         kind: PlanCallableKind,
-    ) -> Result<RustdocItem, LookupError> {
-        let mut item_list = self
-            .callable_list
+    ) -> Result<SourceItem, RustdocError> {
+        let mut owner = self.type_item(package, version, receiver)?;
+        let mut alias_seen = HashSet::new();
+        while let Some(alias) = owner.alias.clone() {
+            if !alias_seen.insert((owner.package_id.clone(), owner.path.clone())) {
+                return Err(unavailable(format!("cyclic source alias `{receiver}`")));
+            }
+            let module = parent(&owner.path);
+            owner = unique(
+                self.resolve(
+                    &owner.package_id,
+                    module,
+                    &type_path(&alias)?,
+                    &mut HashSet::new(),
+                )?,
+                &alias,
+            )?;
+        }
+        self.load(&owner.package_id)?;
+        let callable = self.parsed[&owner.package_id].callable.clone();
+        let mut candidate = Vec::new();
+        for callable in callable
+            .into_iter()
+            .filter(|callable| callable.name == name && callable.kind == kind)
+        {
+            let resolved = self.resolve(
+                &owner.package_id,
+                &callable.module,
+                &callable.receiver,
+                &mut HashSet::new(),
+            )?;
+            if resolved.iter().any(|resolved| {
+                resolved.package_id == owner.package_id && resolved.path == owner.path
+            }) {
+                candidate.push(callable.item);
+            }
+        }
+        unique(candidate, &format!("{receiver}::{name}"))
+    }
+
+    fn resolve(
+        &mut self,
+        package_id: &str,
+        module: &str,
+        path: &str,
+        visited: &mut HashSet<String>,
+    ) -> Result<Vec<SourceItem>, RustdocError> {
+        let key = format!("{package_id}|{module}|{path}");
+        if visited.len() >= 256 || !visited.insert(key.clone()) {
+            return Ok(Vec::new());
+        }
+        let result = self.resolve_inner(package_id, module, path, visited);
+        visited.remove(&key);
+        result
+    }
+
+    fn resolve_inner(
+        &mut self,
+        package_id: &str,
+        module: &str,
+        path: &str,
+        visited: &mut HashSet<String>,
+    ) -> Result<Vec<SourceItem>, RustdocError> {
+        self.load(package_id)?;
+        let (head, tail) = path.split_once("::").unwrap_or((path, ""));
+        if head == "crate" {
+            return self.resolve(package_id, "", tail, visited);
+        }
+        if head == "self" {
+            return self.resolve(package_id, module, tail, visited);
+        }
+        if head == "super" {
+            return self.resolve(package_id, parent(module), tail, visited);
+        }
+        let package = &self.package[package_id];
+        if package.targets.iter().any(|target| target.name == head) && !tail.is_empty() {
+            return self.resolve(package_id, "", tail, visited);
+        }
+        let full = join(module, path);
+        if let Some(item) = self.parsed[package_id].item.get(&full) {
+            return Ok(item.clone());
+        }
+        let nested = join(module, head);
+        if !tail.is_empty() && self.parsed[package_id].module.contains(&nested) {
+            return self.resolve(package_id, &nested, tail, visited);
+        }
+        let import = self.parsed[package_id]
+            .import
             .iter()
-            .filter(|entry| entry.name == callable)
-            .filter(|entry| callable_kind(&entry.item.signature) == kind)
-            .filter(|entry| receiver_matches(&receiver.canonical, &entry.receiver))
-            .map(|entry| entry.item.clone())
+            .filter(|import| import.module == module)
+            .cloned()
             .collect::<Vec<_>>();
-        item_list.sort_by(|left, right| left.path.cmp(&right.path));
-        item_list.dedup_by(|left, right| left.path == right.path);
-        unique(Some(&item_list), "callable", callable)
+        let named = import
+            .iter()
+            .filter(|import| import.name.as_deref() == Some(head))
+            .collect::<Vec<_>>();
+        if !named.is_empty() {
+            let mut candidate = Vec::new();
+            for import in named {
+                candidate.extend(self.resolve(
+                    package_id,
+                    module,
+                    &join(&import.target, tail),
+                    visited,
+                )?);
+            }
+            return Ok(candidate);
+        }
+        if let Some(dependency) = self
+            .dependency
+            .get(package_id)
+            .and_then(|map| map.get(head))
+            .cloned()
+        {
+            if !tail.is_empty() {
+                return self.resolve(&dependency, "", tail, visited);
+            }
+        }
+        let mut candidate = Vec::new();
+        for import in import.iter().filter(|import| import.name.is_none()) {
+            candidate.extend(self.resolve(
+                package_id,
+                module,
+                &join(&import.target, path),
+                visited,
+            )?);
+        }
+        Ok(candidate)
     }
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub(crate) enum LookupError {
-    Missing(String),
-    Ambiguous(String),
-}
-
-fn unique(
-    item_list: Option<&Vec<RustdocItem>>,
-    kind: &str,
-    name: &str,
-) -> Result<RustdocItem, LookupError> {
-    let item_list = item_list.cloned().unwrap_or_default();
-    match item_list.as_slice() {
-        [] => Err(LookupError::Missing(format!(
-            "{kind} `{name}` does not exist"
-        ))),
-        [item] => Ok(item.clone()),
-        _ => Err(LookupError::Ambiguous(format!(
-            "{kind} `{name}` resolves to {} items",
-            item_list.len()
-        ))),
+fn parse_file(
+    package: &SourcePackage,
+    root: &Path,
+    file: &Path,
+    module: &str,
+    index: &mut PackageIndex,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<(), RustdocError> {
+    let file = file
+        .canonicalize()
+        .map_err(|error| unavailable(format!("read source {}: {error}", file.display())))?;
+    let root = root
+        .canonicalize()
+        .map_err(|error| unavailable(error.to_string()))?;
+    if !file.starts_with(&root) {
+        return Err(unavailable("source module escapes its Cargo package"));
     }
-}
-
-fn callable_kind(signature: &str) -> PlanCallableKind {
-    if signature.split_once('(').is_some_and(|(_, parameters)| {
-        parameters.trim_start().starts_with("&self")
-            || parameters.trim_start().starts_with("&mut self")
-            || parameters.trim_start().starts_with("self")
-    }) {
-        PlanCallableKind::Method
-    } else {
-        PlanCallableKind::Function
+    if !visited.insert(file.clone()) {
+        return Ok(());
     }
-}
-
-fn short_name(value: &str) -> String {
-    value.rsplit("::").next().unwrap_or(value).to_owned()
-}
-
-fn id_string(value: &Value) -> Option<String> {
-    value
-        .as_str()
-        .map(str::to_owned)
-        .or_else(|| value.as_u64().map(|value| value.to_string()))
-}
-
-fn type_id(value: &Value) -> Option<String> {
-    let value = value.get("resolved_path").unwrap_or(value);
-    value.get("id").and_then(id_string)
-}
-
-fn type_name(document: &RustdocJson, value: &Value) -> String {
-    if let Some(path) = type_id(value).and_then(|item_id| document.paths.get(&item_id)) {
-        return path.full_path();
-    }
-    let value = value.get("resolved_path").unwrap_or(value);
-    value
-        .get("path")
-        .and_then(Value::as_str)
-        .or_else(|| value.get("name").and_then(Value::as_str))
-        .unwrap_or("")
-        .to_owned()
-}
-
-fn rust_type(document: &RustdocJson, value: &Value) -> Option<RustType> {
-    if let Some(generic) = value.get("generic").and_then(Value::as_str) {
-        return Some(RustType::Generic(generic.to_owned()));
-    }
-    if let Some(primitive) = value.get("primitive").and_then(Value::as_str) {
-        return Some(RustType::Primitive(primitive.to_owned()));
-    }
-    if let Some(reference) = value.get("borrowed_ref") {
-        return Some(RustType::Borrowed {
-            mutable: reference
-                .get("is_mutable")
-                .and_then(Value::as_bool)
-                .unwrap_or(false),
-            target: Box::new(rust_type(document, reference.get("type")?)?),
-        });
-    }
-    if let Some(tuple) = value.get("tuple").and_then(Value::as_array) {
-        return Some(RustType::Tuple(
-            tuple
-                .iter()
-                .map(|value| rust_type(document, value))
-                .collect::<Option<Vec<_>>>()?,
+    if visited.len() > 4096 {
+        return Err(unavailable(
+            "source index exceeded 4096 module files per package",
         ));
     }
-    if let Some(slice) = value.get("slice") {
-        return Some(RustType::Slice(Box::new(rust_type(document, slice)?)));
-    }
-    if let Some(array) = value.get("array") {
-        return Some(RustType::Array {
-            target: Box::new(rust_type(document, array.get("type")?)?),
-            length: array
-                .get("len")
-                .and_then(Value::as_str)
-                .unwrap_or_default()
-                .to_owned(),
-        });
-    }
-    let path = value.get("resolved_path").unwrap_or(value);
-    let path_name = type_id(path)
-        .and_then(|item_id| document.paths.get(&item_id))
-        .map(PathEntry::full_path)
-        .or_else(|| {
-            path.get("path")
-                .and_then(Value::as_str)
-                .or_else(|| path.get("name").and_then(Value::as_str))
-                .map(str::to_owned)
-        })?;
-    Some(RustType::Path {
-        item_id: type_id(path),
-        path: path_name,
-        arguments: generic_argument_list(document, path.get("args")),
-    })
-}
-
-fn generic_argument_list(
-    document: &RustdocJson,
-    value: Option<&Value>,
-) -> Vec<RustGenericArgument> {
-    let Some(value) = value else {
-        return Vec::new();
-    };
-    let argument_list = value
-        .get("angle_bracketed")
-        .and_then(|value| value.get("args"))
-        .and_then(Value::as_array)
-        .or_else(|| value.get("args").and_then(Value::as_array))
-        .cloned()
-        .unwrap_or_default();
-    argument_list
-        .into_iter()
-        .filter_map(|argument| {
-            if let Some(value) = argument.get("type") {
-                return rust_type(document, value).map(RustGenericArgument::Type);
-            }
-            if let Some(lifetime) = argument.get("lifetime").and_then(Value::as_str) {
-                return Some(RustGenericArgument::Lifetime(lifetime.to_owned()));
-            }
-            if let Some(constant) = argument.get("const") {
-                return Some(RustGenericArgument::Const(constant.to_string()));
-            }
-            argument
-                .get("infer")
-                .is_some()
-                .then_some(RustGenericArgument::Infer)
-        })
-        .collect()
-}
-
-fn alias_parameter_list(alias: &Value) -> Vec<String> {
-    alias
-        .get("generics")
-        .and_then(|value| value.get("params"))
-        .and_then(Value::as_array)
-        .into_iter()
-        .flatten()
-        .filter_map(|parameter| parameter.get("name").and_then(Value::as_str))
-        .map(str::to_owned)
-        .collect()
-}
-
-fn expand_alias(
-    receiver: RustType,
-    alias_by_id: &HashMap<String, AliasTemplate>,
-    visiting: &mut HashSet<String>,
-) -> Result<RustType> {
-    let RustType::Path {
-        item_id: Some(item_id),
-        arguments,
-        ..
-    } = &receiver
-    else {
-        return Ok(receiver);
-    };
-    let Some(alias) = alias_by_id.get(item_id) else {
-        return Ok(receiver);
-    };
-    anyhow::ensure!(
-        visiting.insert(item_id.clone()),
-        "cyclic Rust type alias involving item {item_id}"
-    );
-    let substitution = alias
-        .parameter_list
-        .iter()
-        .cloned()
-        .zip(arguments.iter().filter_map(|argument| match argument {
-            RustGenericArgument::Type(value) => Some(value.clone()),
-            _ => None,
-        }))
-        .collect::<HashMap<_, _>>();
-    let expanded = substitute_type(&alias.target, &substitution);
-    let expanded = expand_alias(expanded, alias_by_id, visiting);
-    visiting.remove(item_id);
-    expanded
-}
-
-fn substitute_type(value: &RustType, substitution: &HashMap<String, RustType>) -> RustType {
-    match value {
-        RustType::Generic(name) => substitution
-            .get(name)
-            .cloned()
-            .unwrap_or_else(|| value.clone()),
-        RustType::Path {
-            item_id,
-            path,
-            arguments,
-        } => RustType::Path {
-            item_id: item_id.clone(),
-            path: path.clone(),
-            arguments: arguments
-                .iter()
-                .map(|argument| match argument {
-                    RustGenericArgument::Type(value) => {
-                        RustGenericArgument::Type(substitute_type(value, substitution))
-                    }
-                    argument => argument.clone(),
-                })
-                .collect(),
-        },
-        RustType::Borrowed { mutable, target } => RustType::Borrowed {
-            mutable: *mutable,
-            target: Box::new(substitute_type(target, substitution)),
-        },
-        RustType::Tuple(value_list) => RustType::Tuple(
-            value_list
-                .iter()
-                .map(|value| substitute_type(value, substitution))
-                .collect(),
-        ),
-        RustType::Slice(target) => RustType::Slice(Box::new(substitute_type(target, substitution))),
-        RustType::Array { target, length } => RustType::Array {
-            target: Box::new(substitute_type(target, substitution)),
-            length: length.clone(),
-        },
-        RustType::Primitive(_) => value.clone(),
-    }
-}
-
-fn receiver_matches(query: &RustType, implementation: &RustType) -> bool {
-    match_receiver(query, implementation, &mut HashMap::new())
-}
-
-fn match_receiver(
-    query: &RustType,
-    implementation: &RustType,
-    binding: &mut HashMap<String, RustType>,
-) -> bool {
-    if let RustType::Generic(name) = implementation {
-        return match binding.get(name) {
-            Some(existing) => existing == query,
-            None => {
-                binding.insert(name.clone(), query.clone());
-                true
-            }
-        };
-    }
-    match (query, implementation) {
-        (
-            RustType::Path {
-                path: query_path,
-                arguments: query_arguments,
-                ..
-            },
-            RustType::Path {
-                path: implementation_path,
-                arguments: implementation_arguments,
-                ..
-            },
-        ) => {
-            query_path == implementation_path
-                && (query_arguments.is_empty()
-                    || query_arguments.len() == implementation_arguments.len()
-                        && query_arguments.iter().zip(implementation_arguments).all(
-                            |(query, implementation)| {
-                                match_generic_argument(query, implementation, binding)
-                            },
-                        ))
-        }
-        (
-            RustType::Borrowed {
-                mutable: query_mutable,
-                target: query_target,
-            },
-            RustType::Borrowed {
-                mutable: implementation_mutable,
-                target: implementation_target,
-            },
-        ) => {
-            query_mutable == implementation_mutable
-                && match_receiver(query_target, implementation_target, binding)
-        }
-        (RustType::Tuple(query), RustType::Tuple(implementation)) => {
-            query.len() == implementation.len()
-                && query
-                    .iter()
-                    .zip(implementation)
-                    .all(|(query, implementation)| match_receiver(query, implementation, binding))
-        }
-        (RustType::Slice(query), RustType::Slice(implementation)) => {
-            match_receiver(query, implementation, binding)
-        }
-        (
-            RustType::Array {
-                target: query_target,
-                length: query_length,
-            },
-            RustType::Array {
-                target: implementation_target,
-                length: implementation_length,
-            },
-        ) => {
-            query_length == implementation_length
-                && match_receiver(query_target, implementation_target, binding)
-        }
-        _ => query == implementation,
-    }
-}
-
-fn match_generic_argument(
-    query: &RustGenericArgument,
-    implementation: &RustGenericArgument,
-    binding: &mut HashMap<String, RustType>,
-) -> bool {
-    match (query, implementation) {
-        (RustGenericArgument::Type(query), RustGenericArgument::Type(implementation)) => {
-            match_receiver(query, implementation, binding)
-        }
-        _ => query == implementation,
-    }
-}
-
-fn rust_type_display(value: &RustType) -> String {
-    match value {
-        RustType::Path {
-            path, arguments, ..
-        } if arguments.is_empty() => path.clone(),
-        RustType::Path {
-            path, arguments, ..
-        } => format!(
-            "{path}<{}>",
-            arguments
-                .iter()
-                .map(rust_generic_argument_display)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        RustType::Generic(name) | RustType::Primitive(name) => name.clone(),
-        RustType::Borrowed { mutable, target } => {
-            format!(
-                "&{}{}",
-                if *mutable { "mut " } else { "" },
-                rust_type_display(target)
-            )
-        }
-        RustType::Tuple(value_list) => format!(
-            "({})",
-            value_list
-                .iter()
-                .map(rust_type_display)
-                .collect::<Vec<_>>()
-                .join(", ")
-        ),
-        RustType::Slice(target) => format!("[{}]", rust_type_display(target)),
-        RustType::Array { target, length } => {
-            format!("[{}; {length}]", rust_type_display(target))
-        }
-    }
-}
-
-fn rust_generic_argument_display(value: &RustGenericArgument) -> String {
-    match value {
-        RustGenericArgument::Type(value) => rust_type_display(value),
-        RustGenericArgument::Lifetime(value) | RustGenericArgument::Const(value) => value.clone(),
-        RustGenericArgument::Infer => "_".into(),
-    }
-}
-
-fn item_signature(item: &Item, kind: &str) -> String {
-    if kind == "function" {
-        function_signature(item)
+    let source = std::fs::read_to_string(&file).map_err(|error| unavailable(error.to_string()))?;
+    let parsed = syn::parse_file(&source)
+        .map_err(|error| unavailable(format!("parse source {}: {error}", file.display())))?;
+    let directory = if matches!(
+        file.file_name().and_then(|name| name.to_str()),
+        Some("lib.rs" | "mod.rs")
+    ) {
+        file.parent().unwrap().to_path_buf()
     } else {
-        format!("{kind} {}", item.name.as_deref().unwrap_or("_"))
-    }
+        file.with_extension("")
+    };
+    parse_items(
+        package,
+        &root,
+        &file,
+        &directory,
+        module,
+        parsed.items,
+        index,
+        visited,
+    )
 }
 
-fn function_signature(item: &Item) -> String {
-    let Some(function) = item.inner_for("function") else {
-        return String::new();
-    };
-    let name = item.name.as_deref().unwrap_or("_");
-    let Some(signature) = function.get("sig") else {
-        return format!("fn {name}()");
-    };
-    let parameters = signature
-        .get("inputs")
-        .and_then(Value::as_array)
-        .map(|input_list| {
-            input_list
-                .iter()
-                .filter_map(Value::as_array)
-                .map(|input| {
-                    let parameter = input.first().and_then(Value::as_str).unwrap_or("_");
-                    let type_name = input.get(1).map(type_to_string).unwrap_or_default();
-                    match (parameter, type_name.as_str()) {
-                        ("self", "Self") => "self".to_owned(),
-                        ("self", "&Self") => "&self".to_owned(),
-                        ("self", "&mut Self") => "&mut self".to_owned(),
-                        _ => format!("{parameter}: {type_name}"),
+fn parse_items(
+    package: &SourcePackage,
+    root: &Path,
+    file: &Path,
+    directory: &Path,
+    module: &str,
+    items: Vec<syn::Item>,
+    index: &mut PackageIndex,
+    visited: &mut HashSet<PathBuf>,
+) -> Result<(), RustdocError> {
+    index.module.insert(module.into());
+    for item in items {
+        match item {
+            syn::Item::Mod(declaration) => {
+                if declaration.attrs.iter().any(is_test_only) {
+                    continue;
+                }
+                let nested = join(module, &declaration.ident.to_string());
+                if let Some((_, items)) = declaration.content {
+                    parse_items(
+                        package,
+                        root,
+                        file,
+                        &directory.join(declaration.ident.to_string()),
+                        &nested,
+                        items,
+                        index,
+                        visited,
+                    )?;
+                } else {
+                    let explicit = declaration.attrs.iter().find_map(|attribute| {
+                        if !attribute.path().is_ident("path") {
+                            return None;
+                        }
+                        let syn::Meta::NameValue(value) = &attribute.meta else {
+                            return None;
+                        };
+                        let syn::Expr::Lit(value) = &value.value else {
+                            return None;
+                        };
+                        let syn::Lit::Str(value) = &value.lit else {
+                            return None;
+                        };
+                        Some(directory.join(value.value()))
+                    });
+                    let direct = directory.join(format!("{}.rs", declaration.ident));
+                    let nested_file = directory.join(declaration.ident.to_string()).join("mod.rs");
+                    let path = explicit.unwrap_or_else(|| {
+                        if direct.is_file() {
+                            direct
+                        } else {
+                            nested_file
+                        }
+                    });
+                    if path.is_file() {
+                        parse_file(package, root, &path, &nested, index, visited)?;
                     }
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
-        })
-        .unwrap_or_default();
-    let output = signature
-        .get("output")
-        .filter(|value| !value.is_null())
-        .map(type_to_string)
-        .filter(|value| value != "()");
-    match output {
-        Some(output) => format!("fn {name}({parameters}) -> {output}"),
-        None => format!("fn {name}({parameters})"),
+                }
+            }
+            syn::Item::Use(declaration) => {
+                flatten_use(module, "", declaration.tree, &mut index.import)
+            }
+            syn::Item::ExternCrate(declaration) => {
+                let target = declaration.ident.to_string();
+                let name = declaration
+                    .rename
+                    .map(|(_, name)| name.to_string())
+                    .unwrap_or_else(|| target.clone());
+                index.import.push(Import {
+                    module: module.into(),
+                    name: Some(name),
+                    target,
+                });
+            }
+            syn::Item::Struct(declaration) => {
+                let signature = format!(
+                    "{} struct {}{}",
+                    declaration.vis.to_token_stream(),
+                    declaration.ident,
+                    declaration.generics.to_token_stream()
+                );
+                insert_type(
+                    package,
+                    file,
+                    module,
+                    &declaration.ident,
+                    &declaration.attrs,
+                    signature,
+                    None,
+                    index,
+                );
+            }
+            syn::Item::Enum(declaration) => {
+                let signature = format!(
+                    "{} enum {}{}",
+                    declaration.vis.to_token_stream(),
+                    declaration.ident,
+                    declaration.generics.to_token_stream()
+                );
+                insert_type(
+                    package,
+                    file,
+                    module,
+                    &declaration.ident,
+                    &declaration.attrs,
+                    signature,
+                    None,
+                    index,
+                );
+            }
+            syn::Item::Trait(declaration) => {
+                let signature = format!(
+                    "{} trait {}{}",
+                    declaration.vis.to_token_stream(),
+                    declaration.ident,
+                    declaration.generics.to_token_stream()
+                );
+                insert_type(
+                    package,
+                    file,
+                    module,
+                    &declaration.ident,
+                    &declaration.attrs,
+                    signature,
+                    None,
+                    index,
+                );
+            }
+            syn::Item::Type(declaration) => {
+                let signature = declaration.to_token_stream().to_string();
+                insert_type(
+                    package,
+                    file,
+                    module,
+                    &declaration.ident,
+                    &declaration.attrs,
+                    signature,
+                    Some(declaration.ty.to_token_stream().to_string()),
+                    index,
+                );
+            }
+            syn::Item::Impl(declaration) => {
+                let receiver = match type_path(&declaration.self_ty.to_token_stream().to_string()) {
+                    Ok(path) => path,
+                    Err(_) => continue,
+                };
+                for item in declaration.items {
+                    let syn::ImplItem::Fn(function) = item else {
+                        continue;
+                    };
+                    if declaration.trait_.is_none()
+                        && !matches!(function.vis, syn::Visibility::Public(_))
+                    {
+                        continue;
+                    }
+                    let kind = if function.sig.receiver().is_some() {
+                        PlanCallableKind::Method
+                    } else {
+                        PlanCallableKind::Function
+                    };
+                    let name = function.sig.ident.to_string();
+                    let mut item = source_item(
+                        package,
+                        file,
+                        &join(module, &format!("{receiver}::{name}")),
+                        &function.sig.ident,
+                        &function.attrs,
+                        function.sig.to_token_stream().to_string(),
+                    );
+                    item.generic = declaration
+                        .generics
+                        .type_params()
+                        .chain(function.sig.generics.type_params())
+                        .map(|parameter| parameter.ident.to_string())
+                        .collect();
+                    item.input = Some(
+                        function
+                            .sig
+                            .inputs
+                            .iter()
+                            .filter_map(|argument| match argument {
+                                syn::FnArg::Typed(argument) => {
+                                    Some(argument.ty.to_token_stream().to_string())
+                                }
+                                _ => None,
+                            })
+                            .collect(),
+                    );
+                    item.output = Some(match function.sig.output {
+                        syn::ReturnType::Default => "()".into(),
+                        syn::ReturnType::Type(_, output) => output.to_token_stream().to_string(),
+                    });
+                    index.callable.push(Callable {
+                        module: module.into(),
+                        receiver: receiver.clone(),
+                        kind,
+                        name,
+                        item,
+                    });
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
+}
+
+fn insert_type(
+    package: &SourcePackage,
+    file: &Path,
+    module: &str,
+    name: &syn::Ident,
+    attributes: &[syn::Attribute],
+    signature: String,
+    alias: Option<String>,
+    index: &mut PackageIndex,
+) {
+    let path = join(module, &name.to_string());
+    let mut item = source_item(package, file, &path, name, attributes, signature);
+    item.alias = alias;
+    index.item.entry(path).or_default().push(item);
+}
+
+fn source_item(
+    package: &SourcePackage,
+    file: &Path,
+    path: &str,
+    name: &syn::Ident,
+    attributes: &[syn::Attribute],
+    signature: String,
+) -> SourceItem {
+    let start = name.span().start();
+    SourceItem {
+        package_id: package.id.clone(),
+        path: path.into(),
+        signature,
+        docs: attributes
+            .iter()
+            .filter_map(|attribute| {
+                if !attribute.path().is_ident("doc") {
+                    return None;
+                }
+                let syn::Meta::NameValue(value) = &attribute.meta else {
+                    return None;
+                };
+                let syn::Expr::Lit(value) = &value.value else {
+                    return None;
+                };
+                let syn::Lit::Str(value) = &value.lit else {
+                    return None;
+                };
+                Some(value.value().trim_start().to_string())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        location: RustdocSourceLocation {
+            package: package.name.clone(),
+            version: package.version.clone(),
+            path: dunce::simplified(file).into(),
+            line: start.line,
+            column: start.column + 1,
+        },
+        input: None,
+        output: None,
+        generic: Vec::new(),
+        alias: None,
     }
 }
 
-fn type_to_string(value: &Value) -> String {
-    if let Some(primitive) = value.get("primitive").and_then(Value::as_str) {
-        return primitive.to_owned();
+fn flatten_use(module: &str, prefix: &str, tree: syn::UseTree, imports: &mut Vec<Import>) {
+    match tree {
+        syn::UseTree::Path(path) => flatten_use(
+            module,
+            &join(prefix, &path.ident.to_string()),
+            *path.tree,
+            imports,
+        ),
+        syn::UseTree::Name(name) => {
+            let (target, name) = if name.ident == "self" {
+                (
+                    prefix.into(),
+                    prefix.rsplit("::").next().unwrap_or(prefix).into(),
+                )
+            } else {
+                (
+                    join(prefix, &name.ident.to_string()),
+                    name.ident.to_string(),
+                )
+            };
+            imports.push(Import {
+                module: module.into(),
+                name: Some(name),
+                target,
+            });
+        }
+        syn::UseTree::Rename(rename) => imports.push(Import {
+            module: module.into(),
+            name: Some(rename.rename.to_string()),
+            target: if rename.ident == "self" {
+                prefix.into()
+            } else {
+                join(prefix, &rename.ident.to_string())
+            },
+        }),
+        syn::UseTree::Glob(_) => imports.push(Import {
+            module: module.into(),
+            name: None,
+            target: prefix.into(),
+        }),
+        syn::UseTree::Group(group) => {
+            for tree in group.items {
+                flatten_use(module, prefix, tree, imports);
+            }
+        }
     }
-    if let Some(generic) = value.get("generic").and_then(Value::as_str) {
-        return generic.to_owned();
+}
+
+fn is_test_only(attribute: &syn::Attribute) -> bool {
+    attribute.path().is_ident("cfg")
+        && matches!(&attribute.meta, syn::Meta::List(list) if list.tokens.to_string() == "test")
+}
+
+fn type_path(source: &str) -> Result<String, RustdocError> {
+    let parsed = syn::parse_str::<syn::Type>(source)
+        .map_err(|error| unavailable(format!("cannot parse type `{source}`: {error}")))?;
+    let syn::Type::Path(path) = parsed else {
+        return Err(unavailable(format!("unsupported receiver `{source}`")));
+    };
+    Ok(path
+        .path
+        .segments
+        .iter()
+        .map(|segment| segment.ident.to_string())
+        .collect::<Vec<_>>()
+        .join("::"))
+}
+
+fn unique(mut candidate: Vec<SourceItem>, name: &str) -> Result<SourceItem, RustdocError> {
+    candidate.sort_by(|left, right| {
+        (
+            &left.location.path,
+            left.location.line,
+            left.location.column,
+        )
+            .cmp(&(
+                &right.location.path,
+                right.location.line,
+                right.location.column,
+            ))
+    });
+    candidate.dedup_by(|left, right| left.location == right.location);
+    match candidate.len() {
+        1 => Ok(candidate.remove(0)),
+        0 => Err(unavailable(format!(
+            "could not resolve `{name}` in Cargo source (macro-generated declarations and inactive optional dependencies may be unavailable)"
+        ))),
+        count => Err(RustdocError::Ambiguous(format!(
+            "`{name}` has {count} source declarations; use a qualified path"
+        ))),
     }
-    if let Some(reference) = value.get("borrowed_ref") {
-        let prefix = if reference
-            .get("is_mutable")
-            .and_then(Value::as_bool)
-            .unwrap_or(false)
-        {
-            "&mut "
-        } else {
-            "&"
-        };
-        return format!(
-            "{prefix}{}",
-            reference
-                .get("type")
-                .map(type_to_string)
-                .unwrap_or_else(|| "_".into())
-        );
+}
+
+fn join(prefix: &str, suffix: &str) -> String {
+    if prefix.is_empty() {
+        suffix.into()
+    } else if suffix.is_empty() {
+        prefix.into()
+    } else {
+        format!("{prefix}::{suffix}")
     }
-    let path = value.get("resolved_path").unwrap_or(value);
-    if let Some(name) = path
-        .get("path")
-        .and_then(Value::as_str)
-        .or_else(|| path.get("name").and_then(Value::as_str))
-    {
-        return name.to_owned();
-    }
-    if let Some(tuple) = value.get("tuple").and_then(Value::as_array) {
-        return format!(
-            "({})",
-            tuple
-                .iter()
-                .map(type_to_string)
-                .collect::<Vec<_>>()
-                .join(", ")
-        );
-    }
-    "_".to_owned()
+}
+fn parent(path: &str) -> &str {
+    path.rsplit_once("::").map_or("", |(parent, _)| parent)
+}
+fn unavailable(message: impl Into<String>) -> RustdocError {
+    RustdocError::Unavailable(message.into())
 }
 
 #[cfg(test)]
-mod test {
+pub(super) mod test {
     use super::*;
 
-    fn fixture() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "format_version": 57,
-            "paths": {
-                "1": { "path": ["parquet", "ParquetRecordBatchReaderBuilder"], "kind": "struct" },
-                "2": { "path": ["geoparquet", "GeoParquetMetadataExt"], "kind": "trait" }
-            },
-            "index": {
-                "1": {
-                    "name": "ParquetRecordBatchReaderBuilder",
-                    "span": {
-                        "filename": "src/reader.rs",
-                        "begin": [10, 1],
-                        "end": [20, 2]
-                    },
-                    "docs": "Builds readers for one Parquet input.",
-                    "inner": { "struct": { "impls": [3] } }
-                },
-                "2": {
-                    "name": "GeoParquetMetadataExt",
-                    "span": {
-                        "filename": "src/metadata.rs",
-                        "begin": [30, 1],
-                        "end": [40, 2]
-                    },
-                    "docs": "Reads GeoParquet metadata.",
-                    "inner": { "trait": { "items": [4] } }
-                },
-                "3": {
-                    "name": null,
-                    "span": null,
-                    "docs": null,
-                    "inner": {
-                        "impl": {
-                            "trait": { "id": 2, "path": "GeoParquetMetadataExt" },
-                            "for": { "id": 1, "path": "ParquetRecordBatchReaderBuilder" },
-                            "items": []
-                        }
-                    }
-                },
-                "4": {
-                    "name": "geoparquet_metadata",
-                    "span": {
-                        "filename": "src/metadata.rs",
-                        "begin": [35, 5],
-                        "end": [38, 6]
-                    },
-                    "docs": "Returns decoded GeoParquet file metadata.",
-                    "inner": {
-                        "function": {
-                            "sig": {
-                                "inputs": [["self", { "borrowed_ref": { "is_mutable": false, "type": { "generic": "Self" } } }]],
-                                "output": { "resolved_path": { "path": "GeoParquetMetadata", "id": 5 } }
-                            }
-                        }
-                    }
-                }
-            }
-        }))
-        .unwrap()
-    }
-
-    fn generic_alias_fixture() -> Vec<u8> {
-        serde_json::to_vec(&serde_json::json!({
-            "format_version": 57,
-            "paths": {
-                "1": { "path": ["parquet", "ArrowReaderBuilder"], "kind": "struct" },
-                "2": { "path": ["parquet", "SyncReader"], "kind": "struct" },
-                "3": {
-                    "path": ["parquet", "ParquetRecordBatchReaderBuilder"],
-                    "kind": "type_alias"
-                }
-            },
-            "index": {
-                "1": {
-                    "name": "ArrowReaderBuilder",
-                    "span": null,
-                    "docs": "Builds one Arrow reader.",
-                    "inner": { "struct": { "impls": [4] } }
-                },
-                "2": {
-                    "name": "SyncReader",
-                    "span": null,
-                    "docs": "Reads Parquet bytes synchronously.",
-                    "inner": { "struct": { "impls": [] } }
-                },
-                "3": {
-                    "name": "ParquetRecordBatchReaderBuilder",
-                    "span": null,
-                    "docs": "Names the synchronous Parquet reader builder.",
-                    "inner": {
-                        "type_alias": {
-                            "type": {
-                                "resolved_path": {
-                                    "name": "ArrowReaderBuilder",
-                                    "id": 1,
-                                    "args": {
-                                        "angle_bracketed": {
-                                            "args": [{
-                                                "type": {
-                                                    "resolved_path": {
-                                                        "name": "SyncReader",
-                                                        "id": 2,
-                                                        "args": {
-                                                            "angle_bracketed": {
-                                                                "args": [{
-                                                                    "type": { "generic": "T" }
-                                                                }]
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }]
-                                        }
-                                    }
-                                }
-                            },
-                            "generics": {
-                                "params": [{
-                                    "name": "T",
-                                    "kind": { "type": {} }
-                                }]
-                            }
-                        }
-                    }
-                },
-                "4": {
-                    "name": null,
-                    "span": null,
-                    "docs": null,
-                    "inner": {
-                        "impl": {
-                            "trait": null,
-                            "for": {
-                                "resolved_path": {
-                                    "name": "ArrowReaderBuilder",
-                                    "id": 1,
-                                    "args": {
-                                        "angle_bracketed": {
-                                            "args": [{
-                                                "type": {
-                                                    "resolved_path": {
-                                                        "name": "SyncReader",
-                                                        "id": 2,
-                                                        "args": {
-                                                            "angle_bracketed": {
-                                                                "args": [{
-                                                                    "type": { "generic": "T" }
-                                                                }]
-                                                            }
-                                                        }
-                                                    }
-                                                }
-                                            }]
-                                        }
-                                    }
-                                }
-                            },
-                            "items": [5]
-                        }
-                    }
-                },
-                "5": {
-                    "name": "try_new",
-                    "span": {
-                        "filename": "src/arrow_reader/mod.rs",
-                        "begin": [120, 5],
-                        "end": [123, 6]
-                    },
-                    "docs": "Builds a synchronous Parquet record batch reader.",
-                    "inner": {
-                        "function": {
-                            "sig": {
-                                "inputs": [[
-                                    "reader",
-                                    { "generic": "T" }
-                                ]],
-                                "output": {
-                                    "resolved_path": {
-                                        "path": "Result",
-                                        "id": 6
-                                    }
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }))
-        .unwrap()
+    pub(in crate::rustdoc) fn fixture() -> (tempfile::TempDir, SourceIndex) {
+        let directory = tempfile::tempdir().unwrap();
+        let facade = directory.path().join("facade");
+        let engine = directory.path().join("engine");
+        std::fs::create_dir_all(&facade).unwrap();
+        std::fs::create_dir_all(&engine).unwrap();
+        std::fs::write(facade.join("lib.rs"), "pub use dependency::prelude; pub use dependency::Clock as Timer; pub type Alias<T> = dependency::Clock<T>;").unwrap();
+        std::fs::write(
+            engine.join("lib.rs"),
+            r#"
+mod clock;
+pub use clock::Clock;
+pub mod prelude { pub use crate::Clock; }
+pub mod other { pub struct Clock; impl Clock { pub fn elapsed(&self) -> bool { false } } }
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            engine.join("clock.rs"),
+            r#"
+/// Measures elapsed time.
+pub struct Clock<T = ()> { marker: T }
+impl<T> Clock<T> {
+    /// Reads the elapsed seconds.
+    pub fn elapsed(&self) -> f32 { 0.0 }
+    pub fn reset(&mut self, elapsed: f32) -> Result<(), std::io::Error> { Ok(()) }
+    pub fn generic(&self, value: T) -> T { value }
+    pub fn new() -> Self { todo!() }
+}
+"#,
+        )
+        .unwrap();
+        let graph = serde_json::from_value(serde_json::json!({
+            "packages": [
+                { "id": "facade", "name": "facade", "version": "1.0.0", "manifest_path": facade.join("Cargo.toml"), "targets": [{"name": "facade", "kind": ["lib"], "src_path": facade.join("lib.rs")}] },
+                { "id": "engine", "name": "engine", "version": "1.2.3", "manifest_path": engine.join("Cargo.toml"), "targets": [{"name": "engine", "kind": ["lib"], "src_path": engine.join("lib.rs")}] }
+            ],
+            "resolve": { "nodes": [{"id": "facade", "deps": [{"name": "dependency", "pkg": "engine"}]}, {"id": "engine", "deps": []}] }
+        })).unwrap();
+        (directory, SourceIndex::new(graph))
     }
 
     #[test]
-    fn resolves_generic_alias_methods_without_rewriting_the_authored_receiver() {
-        let index = RustdocIndex::parse(&generic_alias_fixture()).unwrap();
-        let receiver = index
-            .resolve_receiver("ParquetRecordBatchReaderBuilder")
+    fn follows_dependency_reexports_to_the_exact_method_source() {
+        let (_directory, mut index) = fixture();
+        let declaration = index
+            .callable(
+                "facade",
+                "1.0.0",
+                "Clock",
+                "elapsed",
+                PlanCallableKind::Method,
+            )
             .unwrap();
-
-        assert_eq!(receiver.authored, "ParquetRecordBatchReaderBuilder");
-        assert_eq!(
-            rust_type_display(&receiver.canonical),
-            "parquet::ArrowReaderBuilder<parquet::SyncReader<T>>"
+        #[cfg(windows)]
+        assert!(!declaration.location.path.to_string_lossy().starts_with(r"\\?\"));
+        assert_eq!(declaration.location.package, "engine");
+        assert_eq!(declaration.location.version, "1.2.3");
+        assert_eq!(declaration.output.as_deref(), Some("f32"));
+        assert_eq!(declaration.docs, "Reads the elapsed seconds.");
+        let source = std::fs::read_to_string(&declaration.location.path).unwrap();
+        assert!(
+            source.lines().nth(declaration.location.line - 1).unwrap()
+                [declaration.location.column - 1..]
+                .starts_with("elapsed")
         );
-        let method = index
-            .callable(&receiver, "try_new", PlanCallableKind::Function)
+        let renamed = index
+            .callable(
+                "facade",
+                "1.0.0",
+                "Timer",
+                "elapsed",
+                PlanCallableKind::Method,
+            )
             .unwrap();
-        assert_eq!(
-            method.path,
-            "parquet::ArrowReaderBuilder<parquet::SyncReader<T>>::try_new"
+        assert_eq!(renamed.location, declaration.location);
+        let alias = index
+            .callable(
+                "facade",
+                "1.0.0",
+                "Alias<u32>",
+                "elapsed",
+                PlanCallableKind::Method,
+            )
+            .unwrap();
+        assert_eq!(alias.location, declaration.location);
+        assert!(
+            index
+                .callable(
+                    "facade",
+                    "1.0.0",
+                    "Clock",
+                    "elapsed",
+                    PlanCallableKind::Function
+                )
+                .is_err()
         );
     }
 
     #[test]
-    fn resolves_extension_trait_methods_for_external_receivers() {
-        let index = RustdocIndex::parse(&fixture()).unwrap();
-        let receiver = index
-            .resolve_receiver("ParquetRecordBatchReaderBuilder")
-            .unwrap();
-        let method = index
-            .callable(&receiver, "geoparquet_metadata", PlanCallableKind::Method)
-            .unwrap();
-        assert_eq!(
-            method.path,
-            "geoparquet::GeoParquetMetadataExt::geoparquet_metadata"
-        );
-        assert_eq!(
-            method.signature,
-            "fn geoparquet_metadata(&self) -> GeoParquetMetadata"
-        );
-        assert_eq!(method.docs, "Returns decoded GeoParquet file metadata.");
-        assert_eq!(
-            method.span,
-            Some(RustdocSourceSpan {
-                filename: PathBuf::from("src/metadata.rs"),
-                begin: (35, 5),
-                end: (38, 6),
-            })
-        );
-    }
-
-    #[test]
-    fn rejects_a_callable_kind_that_conflicts_with_its_receiver() {
-        let index = RustdocIndex::parse(&fixture()).unwrap();
-        let receiver = index
-            .resolve_receiver("ParquetRecordBatchReaderBuilder")
-            .unwrap();
+    fn reports_ambiguous_exports_instead_of_selecting_a_same_named_type() {
+        let (directory, mut index) = fixture();
+        std::fs::write(
+            directory.path().join("facade/lib.rs"),
+            "pub use dependency::*; pub use dependency::other::*;",
+        )
+        .unwrap();
         assert!(matches!(
-            index.callable(&receiver, "geoparquet_metadata", PlanCallableKind::Function,),
-            Err(LookupError::Missing(_))
+            index.type_item("facade", "1.0.0", "Clock"),
+            Err(RustdocError::Ambiguous(_))
         ));
     }
 }

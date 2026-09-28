@@ -177,7 +177,6 @@ struct RustdocTarget {
     receiver_package: String,
     receiver_version: String,
     callable: Option<PlanCallable>,
-    package_list: Vec<(String, String)>,
 }
 
 fn rustdoc_callable(callable: Option<&PlanCallable>) -> Result<&PlanCallable> {
@@ -1075,6 +1074,10 @@ impl HarnessBroker {
             HarnessMethod::TraceClear => {
                 Ok((serde_json::to_value(self.trace.clear()?)?, Vec::new()))
             }
+            HarnessMethod::TraceSessionClear => Ok((
+                serde_json::to_value(self.trace.clear_session(&self.session.id)?)?,
+                Vec::new(),
+            )),
             HarnessMethod::BackendModels => self.list_backend_model().await,
             HarnessMethod::AgentList => {
                 Ok((serde_json::to_value(self.snapshot()?.agent)?, Vec::new()))
@@ -1164,7 +1167,6 @@ impl HarnessBroker {
             let callable = rustdoc_callable(target.callable.as_ref())?;
             self.rustdoc
                 .callable_hover(
-                    &target.package_list,
                     &target.receiver_package,
                     &target.receiver_version,
                     &target.receiver,
@@ -1206,7 +1208,6 @@ impl HarnessBroker {
             let callable = rustdoc_callable(target.callable.as_ref())?;
             self.rustdoc
                 .callable_source(
-                    &target.package_list,
                     &target.receiver_package,
                     &target.receiver_version,
                     &target.receiver,
@@ -1283,38 +1284,19 @@ impl HarnessBroker {
             .iter()
             .position(|dependency| dependency.name == receiver_dependency)
             .context("Rust receiver dependency is not declared by this plan")?;
-        let dependency_index_list = if selection == "callable" {
-            (0..document.dependencies.len()).collect::<Vec<_>>()
-        } else {
-            vec![dependency_index]
-        };
-        for index in dependency_index_list {
-            if document.dependencies[index].resolved_version.is_some() {
-                continue;
-            }
-            let dependency_name = document.dependencies[index].name.clone();
-            let dependency_requirement = document.dependencies[index].version.clone();
+        if document.dependencies[dependency_index].resolved_version.is_none() {
+            let dependency = &document.dependencies[dependency_index];
             let version = self
                 .rustdoc
-                .resolve_version(&dependency_name, &dependency_requirement)
+                .resolve_version(&dependency.name, &dependency.version)
                 .await?;
-            document.dependencies[index].resolved_version = Some(version);
+            document.dependencies[dependency_index].resolved_version = Some(version);
         }
         let receiver_package = document.dependencies[dependency_index].name.clone();
         let receiver_version = document.dependencies[dependency_index]
             .resolved_version
             .clone()
             .context("Rust receiver dependency version was not resolved")?;
-        let package_list = document
-            .dependencies
-            .iter()
-            .filter_map(|dependency| {
-                dependency
-                    .resolved_version
-                    .as_ref()
-                    .map(|version| (dependency.name.clone(), version.clone()))
-            })
-            .collect();
         Ok(RustdocTarget {
             plan_id,
             expected_version,
@@ -1323,7 +1305,6 @@ impl HarnessBroker {
             receiver_package,
             receiver_version,
             callable,
-            package_list,
         })
     }
 

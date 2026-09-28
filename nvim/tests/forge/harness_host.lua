@@ -44,7 +44,19 @@ local success, failure = xpcall(function()
   end)
   assert(vim.wait(3000, function() return log_status ~= nil end, 10))
   assert(log_status.enabled and log_status.path:find(state.session.id, 1, true))
-  assert(table.concat(vim.fn.readfile(log_status.path), "\n"):find(prompt, 1, true), "session trace lost prompt body")
+  local prompt_record
+  for _, line in ipairs(vim.fn.readfile(log_status.path)) do
+    if line:find(prompt, 1, true) then prompt_record = line break end
+  end
+  assert(prompt_record, "session trace lost prompt body")
+  local cleared_status
+  client.request("trace.session.clear", {}, function(result, error)
+    assert(not error, error)
+    cleared_status = result
+  end)
+  assert(vim.wait(3000, function() return cleared_status ~= nil end, 10))
+  assert(cleared_status.enabled and cleared_status.path == log_status.path)
+  assert(not vim.tbl_contains(vim.fn.readfile(log_status.path), prompt_record), "prior session trace survived clear")
   assert(vim.bo[state.composer_buf].modifiable and not vim.bo[state.transcript_buf].modifiable)
   local previous = state.transcript_win
   vim.api.nvim_set_current_win(previous)

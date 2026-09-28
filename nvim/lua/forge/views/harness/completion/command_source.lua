@@ -19,6 +19,7 @@ local command_list = {
   { label = "/log open", detail = "Open the current session debug log" },
   { label = "/log on", detail = "Enable persistent Harness logging" },
   { label = "/log off", detail = "Disable Harness logging" },
+  { label = "/log clear", detail = "Clear the current session debug log" },
   { label = "/recap", detail = "Summarize the conversation without changing agent history" },
   { label = "/bg", detail = "List and terminate background terminals" },
   { label = "/agent", detail = "Switch between Main and child-agent timelines", capability = "agent_observe" },

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::fs::{self, File, OpenOptions};
-use std::io::{Seek, SeekFrom, Write};
+use std::io::{ErrorKind, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -210,6 +210,39 @@ impl TraceStore {
         drop(file);
         self.record("global", "trace.cleared", Value::Null);
         Ok(self.status())
+    }
+
+    /// Clear one session's detailed log and retained rotations without changing tracing enablement.
+    pub fn clear_session(&self, session_id: &str) -> Result<TraceStatus> {
+        let path = self.session_path(session_id);
+        fs::create_dir_all(path.parent().unwrap())?;
+        let lock = OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(path.with_extension("lock"))?;
+        lock.lock()?;
+        let result = (|| -> Result<()> {
+            for generation in 1..=3 {
+                let rotated = path.with_extension(format!("jsonl.{generation}"));
+                match fs::remove_file(&rotated) {
+                    Ok(()) => {}
+                    Err(error) if error.kind() == ErrorKind::NotFound => {}
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .open(&path)
+                .with_context(|| format!("clear Harness session trace {}", path.display()))?;
+            Ok(())
+        })();
+        let unlocked = lock.unlock();
+        result?;
+        unlocked?;
+        Ok(self.session_status(session_id))
     }
 
     /// Append at most 32 scalar metadata fields with a bounded session identity.

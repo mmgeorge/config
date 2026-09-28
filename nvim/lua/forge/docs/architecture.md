@@ -1589,8 +1589,12 @@ files retain request and response payloads with named credential fields redacted
 Codex protocol frames and Copilot session configuration, prompt, event, and isolated-generation
 records. Each file rotates at 15 MiB and retains three older segments. Oversized individual
 records contain an explicit omission with their encoded byte count. Session-independent events
-use the global log. `/log`, `/log open`, and `:ForgeHarnessLog` open the current session file in
-a reusable read-only tab. The Configuration picker displays the provider CLI as read-only context.
+use the global log. `/log`, `/log open`, and `:ForgeHarnessLog` render the current session file
+as timestamped events with indented JSON payloads in a reusable read-only tab. `R` refreshes
+the view, and editor focus, buffer entry, and idle events refresh it when the file changes.
+`/log clear` empties only the current session file and removes its three rotated segments.
+It leaves the global trace, other session logs, and logging preference unchanged.
+The Configuration picker displays the provider CLI as read-only context.
 
 The Codex `CodexTurnCoordinator` treats one user request as an exchange that may outlive
 its first parent app-server turn. A `turn/start` acknowledgement admits its returned turn before
@@ -1922,23 +1926,30 @@ classification.
 Submission recursively rejects any nonempty edge expansion whose complete subtree contains only
 `return` relationships and no branch. The parent edge already owns that result, so the rejected JSON
 violation tells the provider to add material nested work or remove the redundant expansion.
-Canonical submission performs Rust API validation inside the provider-visible
-`harness_plan_submit` call after structural validation. The broker-owned resolver downloads
-exact-version Rustdoc JSON from docs.rs, indexes public types plus inherent and extension-trait
-callables, and verifies each typed Rust flow receiver and callable against its declared Cargo
-package. The index parses Rustdoc type-alias targets as typed trees, substitutes alias generic
-parameters into their canonical targets, expands alias chains with cycle rejection, and matches
-callables through normalized receiver paths and generic arguments. The canonical plan and review
-continue to show the public alias authored in the external target, while validation uses the
-resolved receiver internally. No string-name fallback can convert an unrelated same-named type into
-a match. The parser accepts Rustdoc JSON format versions 33 through 60 and rejects newer formats
-until their type-tree representation receives explicit coverage. Confirmed missing or ambiguous APIs return exact JSON paths through the failed tool result,
-leaving that provider turn open for edits and another submission. Registry, network, or
-Rustdoc-build failures remain explicit warnings because unavailable evidence cannot prove a
-semantic error. The broker may refresh derived versions and warnings while freezing the accepted
-revision, but that refresh never introduces a post-tool rejection. Successfully parsed compressed
-Rustdoc documents enter a permanent exact-version cache, while failed downloads and invalid
-documents never enter that cache.
+Canonical submission checks declared Rust signatures inside the provider-visible
+`harness_plan_submit` call after structural validation. The broker-owned resolver uses Cargo
+metadata from an isolated cache manifest with the exact planned dependency version. Cargo
+populates its source cache and locks the dependency graph without building dependencies or
+creating files in the planned project. Subsequent loads preserve that lockfile. Acquisition has
+a 120-second timeout and kills the Cargo child when cancelled.
+
+The source index parses library module files on a blocking worker and follows module paths,
+dependency aliases, named re-exports, and glob re-exports. It retains declaration signatures,
+doc comments, and source positions for hover and navigation. Type aliases resolve to their target
+for method lookup, while authored names remain in the plan. Duplicate source declarations remain
+ambiguous. Each package is limited to 4096 module files and resolution paths to 256 active steps.
+Module files must remain inside their owning Cargo package.
+
+Callable checks compare an optional `payload_type` with non-receiver parameters, using a tuple
+for multiple parameters, and an optional `return_type` with the declared return type. An
+`error_type` represents `Result<value_type, error_type>`. Generic types remain declared parameters.
+The checker does not prove trait bounds, borrow validity, feature availability, or compilation.
+Macro-generated declarations, unavailable source, and unresolved generic substitutions produce
+explicit warnings. Concrete signature mismatches return exact JSON field paths through the failed
+tool result. Source browsing and navigation do not require successful signature validation.
+The broker may refresh derived versions and warnings while freezing the accepted revision, but
+that refresh never introduces a post-tool rejection. docs.rs JSON is not used by checking,
+hover, or navigation. The `plan.rustdoc.*` protocol names remain unchanged.
 Every rejected control call crosses provider boundaries as one compact JSON object with `ok: false`,
 a stable failure `code`, an exact `violation` array, the active plan version when available,
 and retry guidance. Argument violations also include compact expected shapes for missing fields,
@@ -1987,7 +1998,7 @@ PlanReview uses that canonical metadata to highlight free-function invocations t
 `@function.call`, method invocations through `@function.method.call`, and type receivers through
 `@type`. Branch keywords use conditional highlighting, while endpoint labels retain ordinary text
 styling. Planned references open their canonical entity information, workspace references jump to
-their recorded declaration, and external Rust references resolve exact-version Rustdoc data.
+their recorded declaration, and external Rust references resolve exact-version Cargo source declarations.
 Edges and branches remain in the left column while repository-relative paths for
 planned and workspace entities align in one calculated right column. External participants remain
 in the relationship text because their names identify runtime receivers rather than source locations.
@@ -2023,7 +2034,7 @@ resolved description through the shared cursor-relative popup primitive.
 It follows LSP hover behavior in a borderless 40-column float while keeping focus restoration and
 close events inside Forge.
 On a typed Rust flow receiver or callable, the same command asks the broker for the indexed
-exact-version Rustdoc signature and complete documentation instead. The plan ID, plan version,
+exact-version source signature and doc comments instead. The plan ID, plan version,
 edge JSON Pointer, and dependency selection guard the request against stale PlanReview buffers.
 Pressing the shared open action on
 an exact dependency token delegates its `https://crates.io/crates/<package>` URL to `vim.ui.open`,
@@ -2034,9 +2045,8 @@ The `jump_entity` command first resolves a planned entity, maps its canonical ob
 line through the comment projection's extmark index, and moves `.` to the visible UML declaration.
 An anchored workspace token opens its repository-relative file at the validated declaration line
 and remains editable. When the token instead names a typed external Rust receiver or callable, the
-broker resolves its exact dependency version through the same Rustdoc index used by hover, asks
-Cargo to populate its global registry source cache when necessary, and opens the indexed source
-span read-only. A normal `:edit` records the cross-buffer jumplist entry, so `<C-o>` and the existing
+broker resolves its exact dependency version through the same Cargo source index used by hover
+and opens the declaration position read-only. A normal `:edit` records the cross-buffer jumplist entry, so `<C-o>` and the existing
 `,` mapping return to the original PlanReview token. Responses stop navigating after the review
 cursor, buffer, plan version, or canonical dependency selection changes. `<CR>` retains plan-file
 navigation.
