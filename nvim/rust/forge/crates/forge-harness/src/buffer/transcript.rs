@@ -43,7 +43,7 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     pub fn response(&self, id: BlockId, source: &str) -> Result<RenderedMarkdown> {
         let source = markdown_math::normalize(source);
-        let mut rendered = MarkdownRenderer::source(id, &source, self.profile)?;
+        let mut rendered = MarkdownRenderer::file_link_labels(id, &source, self.profile)?;
         rendered.block.metadata.markdown = true;
         rendered.block.metadata.layout = Some(ContentLayout {
             indent: 2, marker: None, source_indent: 0,
@@ -53,7 +53,7 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     pub fn commentary(&self, id: BlockId, source: &str) -> Result<RenderedMarkdown> {
         let source = markdown_math::normalize(source);
-        let mut rendered = MarkdownRenderer::source(id, &source, self.profile)?;
+        let mut rendered = MarkdownRenderer::file_link_labels(id, &source, self.profile)?;
         let block = &mut rendered.block;
         block.metadata.markdown = true;
         block.metadata.decoration.clear();
@@ -688,6 +688,29 @@ mod test {
             "A [界 link](https://example.test).", "", "More text wraps."
         ]);
         rendered.block.validate()?;
+        Ok(())
+    }
+
+    #[test]
+    fn response_and_commentary_present_file_labels_with_original_destinations() -> Result<()> {
+        let source = "Added [PROJECT.md](/D:/code/test-plan/PROJECT.md) describing the repo layout and [CONTRIBUTING.md](/D:/code/test-plan/CONTRIBUTING.md) with the run command. [web](https://example.test)";
+        let expected = "Added PROJECT.md describing the repo layout and CONTRIBUTING.md with the run command. [web](https://example.test)";
+        for columns in [60, 113] {
+            let profile = WidthProfile { columns, ..WidthProfile::default() };
+            let renderer = TranscriptRenderer::new(&profile)?;
+            for rendered in [
+                renderer.response(BlockId("response".into()), source)?,
+                renderer.commentary(BlockId("commentary".into()), source)?,
+            ] {
+                assert_eq!(rendered.block.text.wire_rows(), vec![expected]);
+                assert_eq!(rendered.link.len(), 3);
+                assert_eq!(rendered.link[0].destination, "/D:/code/test-plan/PROJECT.md");
+                assert_eq!(rendered.link[1].destination, "/D:/code/test-plan/CONTRIBUTING.md");
+                let target = &rendered.block.metadata.target[1];
+                assert_eq!(&expected[target.range.start.column..target.range.end.column], "CONTRIBUTING.md");
+                rendered.block.validate()?;
+            }
+        }
         Ok(())
     }
 

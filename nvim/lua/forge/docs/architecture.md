@@ -1726,7 +1726,11 @@ projection keeps the interaction as the single visible owner and omits the redun
 ownership, highlights, and folds are assigned. Continuation rows therefore preserve the tree's
 two-column indent without depending on window-local soft-wrap behavior.
 Markdown responses retain each source line and rely on Neovim soft-wrap so window resizing can
-reflow prose without rebuilding the timeline. Their two-column structural indentation lives in
+reflow prose without rebuilding the timeline. Assistant responses and commentary project local
+file links as their labels, with the original destinations retained in navigation metadata.
+This removes hidden path bytes from Neovim's wrap calculation. Web links and code examples retain
+their Markdown source. The projection preserves physical rows and remaps byte-column targets,
+while durable responses retain the original Markdown. Their two-column structural indentation lives in
 the real buffer text because `breakindent` cannot measure inline virtual text. The first response
 row overlays `▸ ` onto those two spaces, preserving the timeline marker without changing layout.
 Keep structural whitespace real and reserve extmarks for overlay markers and highlighting, or

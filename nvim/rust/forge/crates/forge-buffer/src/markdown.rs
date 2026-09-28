@@ -91,6 +91,25 @@ impl MarkdownRenderer {
         source: &str,
         profile: &WidthProfile,
     ) -> Result<RenderedMarkdown, ContractError> {
+        Self::project_source(id, source, profile, false)
+    }
+
+    /// Presents file links as their original labels, retaining destinations and physical rows.
+    /// Web links, code examples, and other Markdown remain in source form.
+    pub fn file_link_labels(
+        id: BlockId,
+        source: &str,
+        profile: &WidthProfile,
+    ) -> Result<RenderedMarkdown, ContractError> {
+        Self::project_source(id, source, profile, true)
+    }
+
+    fn project_source(
+        id: BlockId,
+        source: &str,
+        profile: &WidthProfile,
+        file_labels: bool,
+    ) -> Result<RenderedMarkdown, ContractError> {
         id.validate()?;
         profile.validate()?;
         if source.len() > 8 * 1024 * 1024 || source.contains('\0') {
@@ -113,7 +132,22 @@ impl MarkdownRenderer {
             .collect();
         let mut metadata = BlockMetadata::default();
         let mut link = Vec::new();
+        let mut file_link: Option<(Range<usize>, Option<Range<usize>>)> = None;
+        let mut omission = Vec::new();
         for (event, range) in Parser::new_ext(source, Options::all()).into_offset_iter() {
+            if matches!(event, Event::End(TagEnd::Link)) {
+                if let Some((whole, Some(label))) = file_link.take() {
+                    omission.extend([whole.start..label.start, label.end..whole.end]);
+                }
+            } else if let Some((_, label)) = &mut file_link {
+                match label {
+                    Some(label) => {
+                        label.start = label.start.min(range.start);
+                        label.end = label.end.max(range.end);
+                    }
+                    None => *label = Some(range.clone()),
+                }
+            }
             let capture = match event {
                 Event::Start(Tag::Heading { .. }) => "@markup.heading",
                 Event::Start(Tag::Emphasis) => "@markup.italic",
@@ -122,6 +156,9 @@ impl MarkdownRenderer {
                 Event::Start(Tag::CodeBlock(_)) => "@markup.raw.block",
                 Event::Code(_) | Event::InlineMath(_) | Event::DisplayMath(_) => "@markup.raw",
                 Event::Start(Tag::Link { dest_url, .. }) => {
+                    if file_labels && file_destination(&dest_url) {
+                        file_link = Some((range.clone(), None));
+                    }
                     let target = TargetId(format!("markdown-source-link:{}:{}", id.0, range.start));
                     let first = start
                         .partition_point(|offset| *offset <= range.start)
@@ -186,6 +223,11 @@ impl MarkdownRenderer {
                 return Err(ContractError("Markdown decoration budget exceeded"));
             }
         }
+        let text = if omission.is_empty() {
+            BufferText::from_rows(&row)?
+        } else {
+            project_file_labels(source, &start, &omission, &mut metadata)?
+        };
         let source = (0..row.len())
             .map(|row| MarkdownSourceRange {
                 source: row..row + 1,
@@ -194,7 +236,7 @@ impl MarkdownRenderer {
             .collect();
         let block = BufferBlock {
             id,
-            text: BufferText::from_rows(row)?,
+            text,
             metadata,
         };
         block.validate()?;
@@ -429,6 +471,73 @@ impl MarkdownRenderer {
             code: state.code_block,
         })
     }
+}
+
+fn file_destination(destination: &str) -> bool {
+    if destination.is_empty() || destination.starts_with(['#', '?']) || destination.starts_with("//") {
+        return false;
+    }
+    if destination.get(..5).is_some_and(|scheme| scheme.eq_ignore_ascii_case("file:")) {
+        return true;
+    }
+    let bytes = destination.as_bytes();
+    if bytes.len() >= 3 && bytes[0].is_ascii_alphabetic() && bytes[1] == b':'
+        && matches!(bytes[2], b'/' | b'\\')
+    {
+        return true;
+    }
+    let prefix = destination.split(['/', '\\']).next().unwrap_or_default();
+    !prefix.contains(':')
+}
+
+fn project_file_labels(
+    source: &str,
+    row_start: &[usize],
+    omission: &[Range<usize>],
+    metadata: &mut BlockMetadata,
+) -> Result<BufferText, ContractError> {
+    let mut removed = Vec::new();
+    let mut removed_bytes = 0;
+    for range in omission {
+        let mut offset = range.start;
+        for part in source[range.clone()].split_inclusive('\n') {
+            let length = part.trim_end_matches('\n').len();
+            if length > 0 {
+                removed.push((offset..offset + length, removed_bytes));
+                removed_bytes += length;
+            }
+            offset += part.len();
+        }
+    }
+    let translate = |offset: usize| {
+        let index = removed.partition_point(|(range, _)| range.end <= offset);
+        let before = index.checked_sub(1)
+            .map_or(0, |index| removed[index].1 + removed[index].0.len());
+        let within = removed.get(index)
+            .map_or(0, |(range, _)| offset.saturating_sub(range.start).min(range.len()));
+        offset - before - within
+    };
+    let position = |position: &mut TextPosition| {
+        let start = row_start[position.row];
+        position.column = translate(start + position.column) - translate(start);
+    };
+    for target in &mut metadata.target {
+        position(&mut target.range.start);
+        position(&mut target.range.end);
+    }
+    for decoration in &mut metadata.decoration {
+        position(&mut decoration.range.start);
+        position(&mut decoration.range.end);
+    }
+    metadata.decoration.retain(|decoration| decoration.range.start != decoration.range.end);
+    let mut projected = String::with_capacity(source.len() - removed_bytes);
+    let mut offset = 0;
+    for (range, _) in &removed {
+        projected.push_str(&source[offset..range.start]);
+        offset = range.end;
+    }
+    projected.push_str(&source[offset..]);
+    BufferText::from_rows(projected.split('\n'))
 }
 
 impl RenderState<'_> {
@@ -686,6 +795,70 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn file_labels_preserve_web_links_code_and_navigation_columns() {
+        let source = "Added [**界.md**](/D:/code/test/界.md) and [`other.md`](file:///tmp/other.md). [web](https://example.test) [anchor](#here) `[literal](./raw.md)`";
+        let expected = "Added **界.md** and `other.md`. [web](https://example.test) [anchor](#here) `[literal](./raw.md)`";
+        let rendered = MarkdownRenderer::file_link_labels(
+            BlockId("files".into()), source, &WidthProfile::default(),
+        ).unwrap();
+        assert_eq!(rendered.block.text.wire_rows(), vec![expected]);
+        assert_eq!(rendered.link.len(), 4);
+        for (link, label) in rendered.link.iter().zip([
+            "**界.md**", "`other.md`", "[web](https://example.test)", "[anchor](#here)",
+        ]) {
+            let target = rendered.block.metadata.target.iter().find(|target| target.id == link.target).unwrap();
+            assert_eq!(&expected[target.range.start.column..target.range.end.column], label);
+        }
+        assert_eq!(rendered.link[0].destination, "/D:/code/test/界.md");
+        assert_eq!(rendered.link[1].destination, "file:///tmp/other.md");
+        rendered.block.validate().unwrap();
+        let editable = MarkdownRenderer::source(
+            BlockId("editable".into()), source, &WidthProfile::default(),
+        ).unwrap();
+        assert_eq!(editable.block.text.wire_rows(), vec![source]);
+    }
+
+    #[test]
+    fn file_labels_keep_physical_rows_references_and_code_examples() {
+        let source = "[first\nsecond](./file.md) [reference][local]\n\n[local]: ../other.md\n\n```md\n[example](./example.md)\n```\n";
+        let rendered = MarkdownRenderer::file_link_labels(
+            BlockId("rows".into()), source, &WidthProfile::default(),
+        ).unwrap();
+        assert_eq!(rendered.block.text.wire_rows(), vec![
+            "first", "second reference", "", "[local]: ../other.md", "", "```md",
+            "[example](./example.md)", "```", "",
+        ]);
+        assert_eq!(rendered.link.len(), 2);
+        assert_eq!(rendered.link[1].destination, "../other.md");
+        for (index, mapping) in rendered.source.iter().enumerate() {
+            assert_eq!(mapping.source, index..index + 1);
+            assert_eq!(mapping.output, index..index + 1);
+        }
+        assert_eq!(rendered.block.metadata.target[0].range.end, TextPosition { row: 1, column: 6 });
+        assert_eq!(rendered.block.metadata.target[1].range.start, TextPosition { row: 1, column: 7 });
+        rendered.block.validate().unwrap();
+    }
+
+    #[test]
+    fn file_labels_distinguish_local_paths_from_remote_schemes() {
+        for destination in ["/tmp/a.md", "/D:/code/a.md", "D:/code/a.md", "file:///tmp/a.md", "FILE:///tmp/a.md", "./src/main.rs", "../README.md", "Cargo.toml", "src/main.rs#L20"] {
+            let source = format!("[label]({destination})");
+            let rendered = MarkdownRenderer::file_link_labels(
+                BlockId("local".into()), &source, &WidthProfile::default(),
+            ).unwrap();
+            assert_eq!(rendered.block.text.row(0), Some("label"), "{destination}");
+            assert_eq!(rendered.link[0].destination, destination);
+        }
+        for destination in ["https://example.test/a.md", "http://example.test", "//example.test/a.md", "mailto:a@example.test", "ftp://example.test/a.md", "app://tool", "#heading", "?query"] {
+            let source = format!("[label]({destination})");
+            let rendered = MarkdownRenderer::file_link_labels(
+                BlockId("remote".into()), &source, &WidthProfile::default(),
+            ).unwrap();
+            assert_eq!(rendered.block.text.row(0), Some(source.as_str()), "{destination}");
+        }
+    }
 
     #[test]
     fn markdown_renders_native_rows_and_link_byte_targets() {

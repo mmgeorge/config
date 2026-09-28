@@ -1263,16 +1263,10 @@ fn append_entity_cells(
         entity_anchor.clone(),
     );
     for (member_index, member) in entity.members.iter().enumerate() {
-        let member_declaration = format!(
-            "{} {}",
-            visibility_marker(member.visibility),
-            member_signature(member)
-        );
-        append_diagram_text(
+        append_diagram_member(
             cell_list,
             &format!("{indent}  "),
-            &format!("{indent}  "),
-            &member_declaration,
+            member,
             width,
             DiagramAnchor {
                 target: PlanReviewTarget::EntityMember {
@@ -1340,6 +1334,41 @@ fn append_entity_cells(
             path_column,
         );
     }
+}
+
+fn append_diagram_member(
+    cell_list: &mut RenderRows<DiagramCell>,
+    indent: &str,
+    member: &ProgramEntityMemberChange,
+    width: usize,
+    anchor: DiagramAnchor,
+) {
+    if cell_list.exhausted {
+        return;
+    }
+    let declaration = format!("{} {}", visibility_marker(member.visibility), member_signature(member));
+    if !matches!(member.kind, MemberKind::Method | MemberKind::Function)
+        || member.parameters.is_empty()
+        || indent.chars().count() + declaration.chars().count() <= width
+    {
+        append_diagram_text(cell_list, indent, indent, &declaration, width, anchor);
+        return;
+    }
+    cell_list.push(DiagramCell {
+        text: format!("{indent}{} {}(", visibility_marker(member.visibility), member.name),
+        anchor: anchor.clone(),
+    });
+    cell_list.extend(member.parameters.iter().map(|parameter| DiagramCell {
+        text: format!("{indent}    {}: {},", parameter.name, parameter.type_name),
+        anchor: anchor.clone(),
+    }));
+    let return_type = member.return_type.as_deref()
+        .map(|value| format!(": {value}"))
+        .unwrap_or_default();
+    cell_list.push(DiagramCell {
+        text: format!("{indent}  ){return_type}"),
+        anchor,
+    });
 }
 
 fn append_aligned_diagram_declaration(
@@ -2097,6 +2126,58 @@ mod test {
         );
         assert!(!rendered.markdown.contains("### Contracts"));
         assert_eq!(rendered.markdown.matches("## Concrete").count(), 1);
+    }
+
+    #[test]
+    fn wraps_diagram_arguments_without_splitting_nested_types_or_losing_navigation() {
+        let mut document = test_fixture("plan", "Overview");
+        document.entity_changes[0].members = vec![ProgramEntityMemberChange {
+            action: ChangeAction::Add,
+            renamed_from: None,
+            kind: MemberKind::Method,
+            name: "move_player".into(),
+            description: None,
+            visibility: Some(Visibility::Public),
+            type_name: None,
+            parameters: vec![
+                FunctionParameter { name: "time".into(), type_name: "Res<Time>".into() },
+                FunctionParameter { name: "config".into(), type_name: "Res<ArenaConfig>".into() },
+                FunctionParameter { name: "progress".into(), type_name: "Res<ArenaProgress>".into() },
+                FunctionParameter { name: "players".into(), type_name: "Query<(&PlayerMotion, &mut Transform), With<Player>>".into() },
+            ],
+            return_type: Some("Result<(), Error>".into()),
+        }];
+        let graph = PlanGraph::new(&document);
+        let mut renderer = PlanRenderer::new(&document);
+        render_object_model(&mut renderer, &document, &graph);
+        let rendered = renderer.finish().unwrap();
+        let expected = [
+            "  + move_player(",
+            "      time: Res<Time>,",
+            "      config: Res<ArenaConfig>,",
+            "      progress: Res<ArenaProgress>,",
+            "      players: Query<(&PlayerMotion, &mut Transform), With<Player>>,",
+            "    ): Result<(), Error>",
+        ];
+        assert!(rendered.markdown.contains(&expected.join("\n")), "{}", rendered.markdown);
+        for (index, line) in rendered.markdown.lines().enumerate() {
+            if expected.contains(&line) {
+                let anchor = rendered.navigation.resolve_line(index as u32 + 1).unwrap();
+                assert_eq!(anchor.json_path, "/entity_changes/0/members/0");
+                assert!(matches!(anchor.target, PlanReviewTarget::EntityMember { .. }));
+            }
+        }
+        let member = &document.entity_changes[0].members[0];
+        let indent = "    ";
+        let exact_width = format!("{indent}+ {}", member_signature(member)).chars().count();
+        let mut cells = RenderRows::default();
+        append_diagram_member(&mut cells, indent, member, exact_width, object_model_anchor());
+        assert_eq!(cells.row.len(), 1);
+        let mut cells = RenderRows::default();
+        append_diagram_member(&mut cells, indent, member, exact_width - 1, object_model_anchor());
+        assert_eq!(cells.row[0].text, "    + move_player(");
+        assert_eq!(cells.row[1].text, "        time: Res<Time>,");
+        assert_eq!(cells.row.last().unwrap().text, "      ): Result<(), Error>");
     }
 
     #[test]
