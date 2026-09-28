@@ -56,7 +56,13 @@ local success, failure = xpcall(function()
   end
   assert(owner_count > 0, "plan fixture has no virtual owner labels")
   local task_fold, task_fold_count = nil, 0
+  local stage_count = 0
   for id, record in pairs(review.owner.replica.fold.record or {}) do
+    if id:match("^plan:stage:") then
+      local _, block_row = review.owner.replica.sequence:position(record.owner)
+      assert(vim.fn.foldclosed(block_row + record.fold.start.row + 1) == -1, "stage collapsed by default")
+      stage_count = stage_count + 1
+    end
     if id:match("^plan:task:") then
       local _, block_row = review.owner.replica.sequence:position(record.owner)
       local row = block_row + record.fold.start.row + 1
@@ -66,6 +72,9 @@ local success, failure = xpcall(function()
     end
   end
   assert(task_fold_count > 0, "native PlanReview projection has no task fold")
+  assert(stage_count > 0, "native PlanReview projection has no stage fold")
+  local rendered = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
+  assert(rendered:find("1a. ", 1, true), "task label missing from inspection")
   assert(task_fold, "native PlanReview has no outermost task fold")
   assert(vim.fn.foldclosed(task_fold.row) == task_fold.row, "native PlanReview did not close task folds by default")
   vim.api.nvim_win_set_cursor(review.win, { task_fold.row, 0 })
@@ -126,6 +135,10 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_text(review.buf, annotation_row + annotation.row, 0, annotation_row + annotation.row, 0, { literal, "second line" })
   vim.cmd("write")
   await(function() return not vim.bo[review.buf].modified end, "annotation save was not acknowledged")
+  local task_record = review.owner.replica.fold.record[task_fold.id]
+  local _, task_start = review.owner.replica.sequence:position(task_record.owner)
+  assert(vim.fn.foldclosed(task_start + task_record.fold.start.row + 1) == -1,
+    "annotation update reset the expanded task")
   assert(vim.api.nvim_buf_get_lines(review.buf, annotation_row, annotation_row + 1, false)[1]:find("Plan comment", 1, true))
   vim.api.nvim_win_set_cursor(review.win, { 1, 0 })
   review.owner.sync_focus()

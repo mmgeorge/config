@@ -258,6 +258,7 @@ impl ChangeTree {
             },
         };
         self.block[start].metadata.fold.push(FoldRange {
+            heading_start: None,
             collapse_children: start == 0,
             id: FoldId(id.into()),
             start: TextPosition { row: 0, column: 0 },

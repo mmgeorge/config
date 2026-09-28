@@ -85,6 +85,11 @@ pub enum PlanReviewTarget {
     FlowBranch {
         condition: String,
     },
+    Stage {
+        id: String,
+        title: String,
+    },
+    TaskDetail,
     Task {
         title: String,
     },
@@ -433,7 +438,7 @@ fn render_files(
     renderer.blank();
 
     let mut file_list = Vec::<RenderedFileEntry>::new();
-    for (task_index, task) in document.tasks.iter().enumerate() {
+    for (task_index, task) in document.tasks().enumerate() {
         for (file_index, file) in task.files.iter().enumerate() {
             let path = file.change.path().to_owned();
             if !file_list.iter().any(|entry| entry.path == path) {
@@ -455,7 +460,7 @@ fn render_files(
                 file_list.push(RenderedFileEntry {
                     label,
                     path: path.clone(),
-                    json_path: format!("/tasks/{task_index}/files/{file_index}"),
+                    json_path: format!("{}/files/{file_index}", document.task_path(task_index)),
                     symbol_list: Vec::new(),
                 });
             }
@@ -509,7 +514,7 @@ fn render_files(
             json_path: entity_json_path(document, &entity.name),
         });
     }
-    for (task_index, task) in document.tasks.iter().enumerate() {
+    for (task_index, task) in document.tasks().enumerate() {
         for (file_index, file) in task.files.iter().enumerate() {
             let path = file.change.path();
             let Some(entry) = file_list.iter_mut().find(|entry| entry.path == path) else {
@@ -528,7 +533,8 @@ fn render_files(
                         category: test.category,
                     },
                     json_path: format!(
-                        "/tasks/{task_index}/files/{file_index}/subtasks/{subtask_index}"
+                        "{}/files/{file_index}/subtasks/{subtask_index}",
+                        document.task_path(task_index)
                     ),
                 });
             }
@@ -1468,107 +1474,167 @@ fn render_dependencies(renderer: &mut PlanRenderer, document: &PlanDocument) {
 }
 
 fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &PlanGraph<'_>) {
-    renderer.section("# Tasks", PlanSection::Tasks, "/tasks");
+    renderer.section("# Tasks", PlanSection::Tasks, "/stages");
     renderer.blank();
-    for (task_index, task) in document.tasks.iter().enumerate() {
-        let task_path = format!("/tasks/{task_index}");
+    for (stage_index, stage) in document.stages.iter().enumerate() {
         renderer.push_wrapped(
-            [&format!("{}. ", task_index + 1), "   "],
-            &format!("**{}** {}", task.title, task.description),
-            PlanReviewTarget::Task {
-                title: task.title.clone(),
+            [&format!("{}. ", stage_index + 1), "   "],
+            &stage.title,
+            PlanReviewTarget::Stage {
+                id: stage.id.clone(),
+                title: stage.title.clone(),
             },
-            &task_path,
+            format!("/stages/{stage_index}"),
             None,
-            format!("Task: {}", task.title),
+            stage.title.clone(),
         );
-        renderer.blank();
-        for (file_index, file) in task.files.iter().enumerate() {
-            let file_path = format!("{task_path}/files/{file_index}");
-            let path = file.change.path();
-            renderer.push(
-                format!("   file {path}"),
-                PlanReviewTarget::File {
-                    path: path.to_owned(),
+        for (task_index, task) in stage.tasks.iter().enumerate() {
+            let task_path = format!("/stages/{stage_index}/tasks/{task_index}");
+            let branch = if task_index + 1 == stage.tasks.len() {
+                "└─"
+            } else {
+                "├─"
+            };
+            let continuation = if task_index + 1 == stage.tasks.len() {
+                "   "
+            } else {
+                "│  "
+            };
+            let heading = format!("   {branch} {}. ", document.task_label(&task.id).unwrap());
+            renderer.push_wrapped(
+                [&heading, &format!("   {continuation}   ")],
+                &task.title,
+                PlanReviewTarget::Task {
+                    title: task.title.clone(),
                 },
-                &file_path,
-                Some(path),
-                path,
+                &task_path,
+                None,
+                format!("Task: {}", task.title),
             );
-            for (subtask_index, subtask) in file.subtasks.iter().enumerate() {
-                let subtask_path = format!("{file_path}/subtasks/{subtask_index}");
-                let subtask_is_last = subtask_index + 1 == file.subtasks.len();
-                let subtask_prefix = if subtask_is_last {
-                    "   └─ "
-                } else {
-                    "   ├─ "
-                };
-                let subtask_continuation = if subtask_is_last {
-                    "      "
-                } else {
-                    "   │  "
-                };
-                match subtask {
-                    PlanSubtask::Work(subtask) => {
-                        renderer.push_wrapped(
-                            [subtask_prefix, subtask_continuation],
-                            &format!("{} {}", subtask.action.label(), subtask.description),
-                            PlanReviewTarget::Subtask {
-                                path: path.to_owned(),
-                            },
-                            &subtask_path,
-                            Some(path),
-                            format!("{path}: {}", subtask.description),
-                        );
-                        let entity_list = graph.entities_in_presentation_order(&subtask.entities);
-                        for (entity_index, entity) in entity_list.iter().enumerate() {
-                            let entity_is_last = entity_index + 1 == entity_list.len();
-                            let entity_prefix = format!(
-                                "{subtask_continuation}{}",
-                                if entity_is_last { "└─ " } else { "├─ " }
-                            );
-                            let entity_continuation = format!(
-                                "{subtask_continuation}{}",
-                                if entity_is_last { "   " } else { "│  " }
-                            );
+            renderer.push_wrapped(
+                [
+                    &format!("   {continuation}   "),
+                    &format!("   {continuation}   "),
+                ],
+                &task.description,
+                PlanReviewTarget::TaskDetail,
+                format!("{task_path}/description"),
+                None,
+                task.title.clone(),
+            );
+            if !task.requires.is_empty() {
+                let labels = task
+                    .requires
+                    .iter()
+                    .filter_map(|id| document.task_label(id))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                renderer.push(
+                    format!("   {continuation}   Requires: {labels}"),
+                    PlanReviewTarget::TaskDetail,
+                    format!("{task_path}/requires"),
+                    None,
+                    "Prerequisites",
+                );
+            }
+            for (file_index, file) in task.files.iter().enumerate() {
+                let file_path = format!("{task_path}/files/{file_index}");
+                let path = file.change.path();
+                renderer.push(
+                    format!(
+                        "   {continuation}{} file {path}",
+                        if file_index + 1 == task.files.len() {
+                            "└─"
+                        } else {
+                            "├─"
+                        }
+                    ),
+                    PlanReviewTarget::File {
+                        path: path.to_owned(),
+                    },
+                    &file_path,
+                    Some(path),
+                    path,
+                );
+                for (subtask_index, subtask) in file.subtasks.iter().enumerate() {
+                    let subtask_path = format!("{file_path}/subtasks/{subtask_index}");
+                    let subtask_is_last = subtask_index + 1 == file.subtasks.len();
+                    let file_continuation = if file_index + 1 == task.files.len() {
+                        "   "
+                    } else {
+                        "│  "
+                    };
+                    let subtask_prefix = format!(
+                        "   {continuation}{file_continuation}{} ",
+                        if subtask_is_last { "└─" } else { "├─" }
+                    );
+                    let subtask_continuation = format!(
+                        "   {continuation}{file_continuation}{}",
+                        if subtask_is_last { "   " } else { "│  " }
+                    );
+                    match subtask {
+                        PlanSubtask::Work(subtask) => {
                             renderer.push_wrapped(
-                                [&entity_prefix, &entity_continuation],
-                                &format!(
-                                    "{} — {}",
-                                    entity_change_label(entity),
-                                    entity.description
-                                ),
-                                PlanReviewTarget::Entity {
-                                    name: entity.name.clone(),
+                                [&subtask_prefix, &subtask_continuation],
+                                &format!("{} {}", subtask.action.label(), subtask.description),
+                                PlanReviewTarget::Subtask {
+                                    path: path.to_owned(),
                                 },
-                                entity_json_path(document, &entity.name),
-                                Some(&entity.path),
-                                entity_change_label(entity),
+                                &subtask_path,
+                                Some(path),
+                                format!("{path}: {}", subtask.description),
+                            );
+                            let entity_list =
+                                graph.entities_in_presentation_order(&subtask.entities);
+                            for (entity_index, entity) in entity_list.iter().enumerate() {
+                                let entity_is_last = entity_index + 1 == entity_list.len();
+                                let entity_prefix = format!(
+                                    "{subtask_continuation}{}",
+                                    if entity_is_last { "└─ " } else { "├─ " }
+                                );
+                                let entity_continuation = format!(
+                                    "{subtask_continuation}{}",
+                                    if entity_is_last { "   " } else { "│  " }
+                                );
+                                renderer.push_wrapped(
+                                    [&entity_prefix, &entity_continuation],
+                                    &format!(
+                                        "{} — {}",
+                                        entity_change_label(entity),
+                                        entity.description
+                                    ),
+                                    PlanReviewTarget::Entity {
+                                        name: entity.name.clone(),
+                                    },
+                                    entity_json_path(document, &entity.name),
+                                    Some(&entity.path),
+                                    entity_change_label(entity),
+                                );
+                            }
+                        }
+                        PlanSubtask::Test(test) => {
+                            renderer.push_wrapped(
+                                [&subtask_prefix, &subtask_continuation],
+                                &format!(
+                                    "{} {}Test `{}` — {}",
+                                    action_label(test.action),
+                                    test_category_label(test.category),
+                                    test.name,
+                                    test.behavior
+                                ),
+                                PlanReviewTarget::Test {
+                                    category: test.category,
+                                },
+                                &subtask_path,
+                                Some(path),
+                                test.name.clone(),
                             );
                         }
                     }
-                    PlanSubtask::Test(test) => {
-                        renderer.push_wrapped(
-                            [subtask_prefix, subtask_continuation],
-                            &format!(
-                                "{} {}Test `{}` — {}",
-                                action_label(test.action),
-                                test_category_label(test.category),
-                                test.name,
-                                test.behavior
-                            ),
-                            PlanReviewTarget::Test {
-                                category: test.category,
-                            },
-                            &subtask_path,
-                            Some(path),
-                            test.name.clone(),
-                        );
-                    }
                 }
-            }
-            if file_index + 1 < task.files.len() {
-                renderer.blank();
+                if file_index + 1 < task.files.len() {
+                    renderer.blank();
+                }
             }
         }
         renderer.blank();
@@ -1579,7 +1645,7 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
     renderer.section("# Tests", PlanSection::Tests, "/tasks");
     renderer.blank();
     let mut file_group_list = Vec::new();
-    for (task_index, task) in document.tasks.iter().enumerate() {
+    for (task_index, task) in document.tasks().enumerate() {
         for (file_index, file) in task.files.iter().enumerate() {
             let test_list = file
                 .subtasks
@@ -1609,7 +1675,7 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
             PlanReviewTarget::File {
                 path: path.to_owned(),
             },
-            format!("/tasks/{task_index}/files/{file_index}"),
+            format!("{}/files/{file_index}", document.task_path(task_index)),
             Some(path),
             path,
         );
@@ -1629,7 +1695,10 @@ fn render_tests(renderer: &mut PlanRenderer, document: &PlanDocument) {
                 PlanReviewTarget::Test {
                     category: test.category,
                 },
-                format!("/tasks/{task_index}/files/{file_index}/subtasks/{subtask_index}"),
+                format!(
+                    "{}/files/{file_index}/subtasks/{subtask_index}",
+                    document.task_path(task_index)
+                ),
                 Some(path),
                 test.name.clone(),
             );
@@ -1881,22 +1950,22 @@ mod test {
         inspector.path = "hello/src/inspection.rs".into();
         document.entity_changes.push(inspector);
         document.dependencies.clear();
-        document.tasks[0].files[0].change = PlanFileChange::Modify {
+        document.stages[0].tasks[0].files[0].change = PlanFileChange::Modify {
             path: "hello/src/main.rs".into(),
         };
-        document.tasks[0].files.push(PlanFile {
+        document.stages[0].tasks[0].files.push(PlanFile {
             change: PlanFileChange::Add {
                 path: "hello/src/inspection.rs".into(),
             },
             subtasks: Vec::new(),
         });
-        document.tasks[0].files.push(PlanFile {
+        document.stages[0].tasks[0].files.push(PlanFile {
             change: PlanFileChange::Remove {
                 path: "hello/src/obsolete.rs".into(),
             },
             subtasks: Vec::new(),
         });
-        document.tasks[0].files.push(PlanFile {
+        document.stages[0].tasks[0].files.push(PlanFile {
             change: PlanFileChange::Rename {
                 from: "hello/tests/old_cli.rs".into(),
                 to: "hello/tests/inspect_cli.rs".into(),
@@ -2242,7 +2311,7 @@ mod test {
         assert_eq!(anchored_row, nonblank_row);
         for anchor in &rendered.navigation.anchor {
             if matches!(anchor.target, PlanReviewTarget::Task { .. }) {
-                assert!(source_row[anchor.line as usize - 1].starts_with("1. "));
+                assert!(source_row[anchor.line as usize - 1].starts_with("   └─ 1a. "));
             }
         }
     }
@@ -2250,7 +2319,8 @@ mod test {
     #[test]
     fn separates_task_heading_and_aligns_wrapped_tree_rows() {
         let mut document = test_fixture("plan", "Overview");
-        let PlanSubtask::Work(subtask) = &mut document.tasks[0].files[0].subtasks[0] else {
+        let PlanSubtask::Work(subtask) = &mut document.stages[0].tasks[0].files[0].subtasks[0]
+        else {
             panic!("expected work subtask");
         };
         subtask.description = "the canonical plan owner with enough supporting detail to wrap onto a continuation row and preserve subtask-alignment-sentinel.".into();
@@ -2267,20 +2337,23 @@ mod test {
             .next()
             .expect("task body");
 
-        assert!(task_markdown.contains("Give planning one owner.\n\n   file src/plan.rs"));
+        assert!(task_markdown.contains("Give planning one owner.\n      ├─ file src/plan.rs"));
         assert!(
             task_markdown
                 .lines()
-                .any(|line| line.starts_with("      ")
+                .any(|line| line.starts_with("      │")
                     && line.contains("subtask-alignment-sentinel"))
         );
-        assert!(task_markdown.lines().any(
-            |line| line.starts_with("         ") && line.contains("entity-alignment-sentinel")
-        ));
+        assert!(
+            task_markdown
+                .lines()
+                .any(|line| line.starts_with("      │")
+                    && line.contains("entity-alignment-sentinel"))
+        );
         let task_line_list = task_markdown.lines().collect::<Vec<_>>();
         let second_file_index = task_line_list
             .iter()
-            .position(|line| *line == "   file tests/plan_submission.rs")
+            .position(|line| *line == "      └─ file tests/plan_submission.rs")
             .expect("second indented file group");
         assert_eq!(task_line_list[second_file_index - 1], "");
         assert!(
@@ -2308,7 +2381,8 @@ mod test {
             return_type: None,
         }];
         document.entity_changes.push(second_entity);
-        let PlanSubtask::Work(subtask) = &mut document.tasks[0].files[0].subtasks[0] else {
+        let PlanSubtask::Work(subtask) = &mut document.stages[0].tasks[0].files[0].subtasks[0]
+        else {
             panic!("expected work subtask");
         };
         subtask.entities.push("PlanRenderer".into());
@@ -2358,7 +2432,7 @@ mod test {
             return_type: Some("Result<InspectionReport, InspectionError>".into()),
         }];
         document.entity_changes = vec![report, error, inspector];
-        document.tasks[0].files[0].subtasks = vec![
+        document.stages[0].tasks[0].files[0].subtasks = vec![
             PlanSubtask::Work(PlanWorkSubtask {
                 action: SubtaskAction::Create,
                 description: "Create the inspector boundary.".into(),
@@ -2492,14 +2566,14 @@ mod test {
         assert!(
             rendered
                 .markdown
-                .contains("   └─ Add UnitTest `validates_plans` — Reject malformed plans.")
+                .contains("└─ Add UnitTest `validates_plans` — Reject malformed plans.")
         );
         assert!(
-            rendered.markdown.contains(
-                "   └─ Add IntegrationTest `submits_complete_plan` — Submit one complete"
-            )
+            rendered
+                .markdown
+                .contains("└─ Add IntegrationTest `submits_complete_plan` — Submit one complete")
         );
-        assert!(rendered.markdown.contains("      boundary."));
+        assert!(rendered.markdown.contains("boundary."));
         let test_plan_markdown = rendered
             .markdown
             .split_once("# Tests")
@@ -2517,7 +2591,7 @@ mod test {
                 .anchor
                 .iter()
                 .filter(|anchor| matches!(anchor.target, PlanReviewTarget::Test { .. }))
-                .all(|anchor| anchor.json_path.starts_with("/tasks/"))
+                .all(|anchor| anchor.json_path.starts_with("/stages/"))
         );
     }
 
@@ -2525,7 +2599,7 @@ mod test {
     fn groups_test_plan_entries_by_file_with_closed_unicode_branches() {
         let mut document = test_fixture("plan", "Overview");
         attach_test_fixture(&mut document);
-        let file = document.tasks[0]
+        let file = document.stages[0].tasks[0]
             .files
             .iter_mut()
             .find(|file| file.change.path() == "src/plan.rs")

@@ -49,7 +49,6 @@ pub struct PlanResourceSet {
     pub entity_changes: Option<Vec<ProgramEntityChange>>,
     pub dependencies: Option<Vec<PlanDependencyChange>>,
     pub flows: Option<Vec<PlanFlow>>,
-    pub tasks: Option<Vec<PlanTask>>,
 }
 
 impl PlanResourceSet {
@@ -57,7 +56,6 @@ impl PlanResourceSet {
         self.entity_changes.as_ref().is_none_or(Vec::is_empty)
             && self.dependencies.as_ref().is_none_or(Vec::is_empty)
             && self.flows.as_ref().is_none_or(Vec::is_empty)
-            && self.tasks.as_ref().is_none_or(Vec::is_empty)
     }
 }
 
@@ -76,7 +74,6 @@ pub struct PlanResourceRename {
     pub entity_changes: Option<Vec<PlanSemanticRename>>,
     pub dependencies: Option<Vec<PlanSemanticRename>>,
     pub flows: Option<Vec<PlanSemanticRename>>,
-    pub tasks: Option<Vec<PlanSemanticRename>>,
 }
 
 impl PlanResourceRename {
@@ -84,7 +81,6 @@ impl PlanResourceRename {
         self.entity_changes.as_ref().is_none_or(Vec::is_empty)
             && self.dependencies.as_ref().is_none_or(Vec::is_empty)
             && self.flows.as_ref().is_none_or(Vec::is_empty)
-            && self.tasks.as_ref().is_none_or(Vec::is_empty)
     }
 }
 
@@ -95,7 +91,6 @@ pub struct PlanResourceDelete {
     pub entity_changes: Option<Vec<String>>,
     pub dependencies: Option<Vec<String>>,
     pub flows: Option<Vec<String>>,
-    pub tasks: Option<Vec<String>>,
 }
 
 impl PlanResourceDelete {
@@ -103,7 +98,6 @@ impl PlanResourceDelete {
         self.entity_changes.as_ref().is_none_or(Vec::is_empty)
             && self.dependencies.as_ref().is_none_or(Vec::is_empty)
             && self.flows.as_ref().is_none_or(Vec::is_empty)
-            && self.tasks.as_ref().is_none_or(Vec::is_empty)
     }
 }
 
@@ -149,6 +143,7 @@ pub struct PlanMutation {
     pub rename: Option<PlanResourceRename>,
     pub set: Option<PlanResourceSet>,
     pub delete: Option<PlanResourceDelete>,
+    pub stages: Option<Vec<PlanStage>>,
     pub assumptions: Option<Vec<String>>,
 }
 
@@ -165,6 +160,7 @@ impl PlanMutation {
                 .delete
                 .as_ref()
                 .is_none_or(PlanResourceDelete::is_empty)
+            && self.stages.is_none()
             && self.assumptions.is_none()
     }
 }
@@ -188,6 +184,7 @@ struct PlanEditRequestWire {
     rename: Option<PlanResourceRename>,
     set: Option<PlanResourceSet>,
     delete: Option<PlanResourceDelete>,
+    stages: Option<Vec<PlanStage>>,
     assumptions: Option<Vec<String>>,
 }
 
@@ -201,6 +198,7 @@ pub(crate) fn plan_edit_request_schema() -> Value {
         { "required": ["rename"] },
         { "required": ["set"] },
         { "required": ["delete"] },
+        { "required": ["stages"] },
         { "required": ["assumptions"] }
     ]);
     schema
@@ -220,6 +218,7 @@ impl<'de> Deserialize<'de> for PlanEditRequest {
                 rename: wire.rename,
                 set: wire.set,
                 delete: wire.delete,
+                stages: wire.stages,
                 assumptions: wire.assumptions,
             },
         })
@@ -316,6 +315,7 @@ pub fn apply_plan_mutation(document: &mut PlanDocument, mutation: PlanMutation) 
         set,
         delete,
         assumptions,
+        stages,
     } = mutation;
     let rename = rename.unwrap_or_default();
     let set = set.unwrap_or_default();
@@ -381,21 +381,8 @@ pub fn apply_plan_mutation(document: &mut PlanDocument, mutation: PlanMutation) 
             },
         )?;
     }
-    if rename.tasks.is_some() || set.tasks.is_some() || delete.tasks.is_some() {
-        apply_resource_patch(
-            &mut document.tasks,
-            rename.tasks.unwrap_or_default(),
-            set.tasks.unwrap_or_default(),
-            delete.tasks.unwrap_or_default(),
-            ResourceSchema {
-                resource: "task",
-                collection: "tasks",
-                semantic_key_field: "title",
-                semantic_key: |task| task.title.as_str(),
-                rename_value: |task, title| task.title = title,
-                prepare_value: prepare_task,
-            },
-        )?;
+    if let Some(stages) = stages {
+        document.stages = stages;
     }
     if let Some(assumptions) = assumptions {
         document.assumptions = assumptions;
@@ -665,8 +652,6 @@ fn prepare_dependency(
 
 fn prepare_flow(_existing: Option<&PlanFlow>, _flow: &mut PlanFlow) {}
 
-fn prepare_task(_existing: Option<&PlanTask>, _task: &mut PlanTask) {}
-
 fn propagate_entity_rename(
     document: &mut PlanDocument,
     rename_by_previous_name: &HashMap<String, String>,
@@ -730,7 +715,11 @@ fn propagate_entity_rename(
         rename_planned_reference(&mut flow.source, rename_by_previous_name);
         propagate_flow_edge_rename(&mut flow.edges, rename_by_previous_name);
     }
-    for task in &mut document.tasks {
+    for task in document
+        .stages
+        .iter_mut()
+        .flat_map(|stage| &mut stage.tasks)
+    {
         replace_identifier_occurrences(&mut task.title, rename_by_previous_name);
         replace_identifier_occurrences(&mut task.description, rename_by_previous_name);
         for file in &mut task.files {
@@ -906,7 +895,7 @@ mod test {
             entity_changes: Vec::new(),
             dependencies: Vec::new(),
             flows: Vec::new(),
-            tasks: Vec::new(),
+            stages: Vec::new(),
             assumptions: Vec::new(),
         }
     }

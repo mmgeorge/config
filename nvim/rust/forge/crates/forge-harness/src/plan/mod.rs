@@ -956,8 +956,10 @@ impl PlanFileStore {
             .join(format!("submitted-{revision:04}.json"));
         let content = fs::read_to_string(&path)
             .with_context(|| format!("read submitted plan document {}", path.display()))?;
-        serde_json::from_str(&content)
-            .with_context(|| format!("decode submitted plan document {}", path.display()))
+        let document: PlanDocument = serde_json::from_str(&content)
+            .with_context(|| format!("decode submitted plan document {}", path.display()))?;
+        document.validate()?;
+        Ok(document)
     }
 
     /// Delete one physical plan artifact after its control state retracts.
@@ -1211,8 +1213,7 @@ mod test {
         });
         let mut repaired_task = incomplete
             .document
-            .tasks
-            .iter()
+            .tasks()
             .find(|task| task.title == "Create plan state")
             .unwrap()
             .clone();
@@ -1233,9 +1234,14 @@ mod test {
                     plan_id: "plan".into(),
                     expected_version: 2,
                     mutation: PlanMutation {
+                        stages: Some(vec![PlanStage {
+                            id: "foundation".into(),
+                            title: "Establish plan state".into(),
+                            tasks: vec![repaired_task],
+                        }]),
                         set: Some(PlanResourceSet {
                             entity_changes: Some(vec![repaired_entity]),
-                            tasks: Some(vec![repaired_task]),
+
                             ..Default::default()
                         }),
                         ..Default::default()

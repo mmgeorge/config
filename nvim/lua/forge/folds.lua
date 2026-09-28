@@ -112,6 +112,11 @@ function M.validate(sequence, changed, retired, state, read_row)
     assert(not previous or previous.owner == owner or changed[previous.owner] or retired[previous.owner],
       "duplicate fold identity")
     local start_row, start_column = position(owner, fold.start)
+    if fold.heading_start then
+      local heading_row, heading_column = position(fold.heading_start.block, fold.heading_start.position)
+      assert(heading_row < start_row or (heading_row == start_row and heading_column <= start_column),
+        "fold heading follows its start")
+    end
     local end_row, end_column = position(fold["end"].block, fold["end"].position)
     assert(start_row < end_row or (start_row == end_row and start_column < end_column), "empty or reversed fold")
   end
@@ -163,9 +168,17 @@ function M.update(session, prepared, replace_all)
     remove_boundary(session, record)
     if prepared.changed[record.owner] or prepared.retired[record.owner] then
       state.owner[record.owner][id] = nil
-      state.endpoint[record.fold["end"].block][id] = nil
+      if record.fold.heading_start then
+        local heading = record.fold.heading_start.block
+        state.endpoint[heading][id] = nil
+        if not next(state.endpoint[heading]) then state.endpoint[heading] = nil end
+      end
+      local endpoint = record.fold["end"].block
+      if state.endpoint[endpoint] then
+        state.endpoint[endpoint][id] = nil
+        if not next(state.endpoint[endpoint]) then state.endpoint[endpoint] = nil end
+      end
       if not next(state.owner[record.owner]) then state.owner[record.owner] = nil end
-      if not next(state.endpoint[record.fold["end"].block]) then state.endpoint[record.fold["end"].block] = nil end
       state.record[id] = nil
     end
   end
@@ -175,6 +188,11 @@ function M.update(session, prepared, replace_all)
       state.record[fold.id] = { owner = owner, fold = fold }
       state.owner[owner] = state.owner[owner] or {}
       state.owner[owner][fold.id] = true
+      if fold.heading_start then
+        local heading = fold.heading_start.block
+        state.endpoint[heading] = state.endpoint[heading] or {}
+        state.endpoint[heading][fold.id] = true
+      end
       state.endpoint[fold["end"].block] = state.endpoint[fold["end"].block] or {}
       state.endpoint[fold["end"].block][fold.id] = true
       affected[fold.id] = true

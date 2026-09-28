@@ -472,18 +472,26 @@ impl TimelineRenderer<'_> {
             PlanEventContent::Execution { event: lifecycle } => {
                 let label = match lifecycle {
                     PlanExecutionLifecycleEvent::TaskStarted {
+                        task_path,
                         ordinal,
                         total,
                         title,
                         ..
-                    } => format!("Task {ordinal}/{total}: {title}"),
+                    } => format!(
+                        "Task {} ({ordinal}/{total}): {title}",
+                        crate::plan::PlanDocument::label_for_path(task_path).unwrap_or_default()
+                    ),
                     PlanExecutionLifecycleEvent::TaskCompleted {
+                        task_path,
                         ordinal,
                         total,
                         title,
                         elapsed_ms,
                         ..
-                    } => format!("Completed {ordinal}/{total}: {title} · {elapsed_ms} ms"),
+                    } => format!(
+                        "Completed {} ({ordinal}/{total}): {title} · {elapsed_ms} ms",
+                        crate::plan::PlanDocument::label_for_path(task_path).unwrap_or_default()
+                    ),
                     PlanExecutionLifecycleEvent::DeviationRecorded { summary, .. } => {
                         format!("Deviation: {summary}")
                     }
@@ -1212,6 +1220,7 @@ impl TimelineRenderer<'_> {
             },
         };
         self.block[start].metadata.fold.push(FoldRange {
+            heading_start: None,
             collapse_children: false,
             id: FoldId(identity.into()),
             start: TextPosition { row: 0, column: 0 },

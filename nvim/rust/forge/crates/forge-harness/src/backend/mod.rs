@@ -26,11 +26,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
-pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = r#"You run inside Forge Harness. During planning, Harness owns the active canonical JSON PlanDocument, its plan ID, version, and every internal ID. Read the document with harness_plan_read before editing it. Mutate it only through harness_plan_edit.
+pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = r#"You run inside Forge Harness. During planning, Harness owns the active canonical JSON PlanDocument, its plan ID and version. The model authors stable stage and task IDs. Read the document with harness_plan_read before editing it. Mutate it only through harness_plan_edit.
 
 Use Markdown for user-facing responses unless the user requests another format. Use fenced code blocks with language tags for code and inline code for identifiers and commands. Do not wrap the entire response in a code fence. Keep structured tool arguments in their required schema.
 
-The harness_plan_edit request uses a PlanDocument edit schema. Send plan_id, expected_version, and only plan, rename, set, delete, or assumptions. Patch title, overview, and usage inside plan. Send assumptions as one complete replacement array. Under set, place complete entity_changes, dependencies, flows, and tasks directly into their ordered collection arrays without key/value wrappers. Harness derives each semantic key from the resource name or title. A matching key replaces in place, while a new key appends in request order. Under rename, group explicit {"from":"<current semantic key>","to":"<new semantic key>"} entries by resource collection. Use rename only when changing an identifying name or title, then use the destination key in set when the complete resource also changes. Under delete, group current semantic keys by resource collection. Delete retracts an entry from the plan document. To plan source or manifest removal, set a complete resource whose implementation action is remove. Every action inside a resource describes future implementation, never document editing.
+The harness_plan_edit request uses a PlanDocument edit schema. Send plan_id, expected_version, and only plan, rename, set, delete, stages, or assumptions. Patch title, overview, and usage inside plan. Send assumptions as one complete replacement array. Replace the complete ordered task tree through stages: each stage has id, title, and tasks, and each task has id, title, description, requires, and files containing subtasks. Preserve stable IDs across revisions. Task requires entries reference task IDs in earlier stages. Stages execute in order, and sibling tasks must be independently completable, including their verification, with no shared file edits or rename endpoints. Harness derives labels such as 2a from positions. Under set, place complete entity_changes, dependencies, and flows directly into their ordered collection arrays without key/value wrappers. Harness derives each semantic key from the resource name or title. A matching key replaces in place, while a new key appends in request order. Under rename, group explicit {"from":"<current semantic key>","to":"<new semantic key>"} entries by resource collection. Use rename only when changing an identifying name or title, then use the destination key in set when the complete resource also changes. Under delete, group current semantic keys by resource collection. Delete retracts an entry from the plan document. To plan source or manifest removal, set a complete resource whose implementation action is remove. Every action inside a resource describes future implementation, never document editing.
 
 Each set resource contains every retained nested member, variant, step, edge, file, and subtask. Never send Harness IDs, create/replace/delete operation envelopes, recursive mutation wrappers, JSON Patch op/path fields, or the whole PlanDocument. Never repeat a semantic key, rename and delete the same resource, or place the same key in both set and delete.
 
@@ -42,7 +42,7 @@ Trace every dependency's claimed role into concrete plan content. Show dependenc
 
 Every failed control call returns one JSON object with ok false, a stable code, exact violation paths, correction hints, and retry data. Parse that object, correct every violation in one edit, and use retry.expected_version when present. A planning turn must end with harness_question_ask or a successful harness_plan_submit after required edits.
 
-During execution, call harness_plan_task_report after each whole task with subtask, entity, path, and test evidence, and call harness_plan_deviation when implementation diverges from accepted intent. Call harness_question_ask whenever a material user decision remains. Use harness_question_answer only while a Harness question remains pending and the user explicitly answers it. Use harness_question_withdraw only while a Harness question remains pending and no material decision remains. Planning-feedback turns contain answers Harness already recorded and consumed, so never call either question-resolution tool from those turns. The question tools work in every mode. End the turn after a Harness question or terminal plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone."#;
+During execution, execute only the selected whole task, serially. Call harness_plan_task_report with execution_id, task_id, current plan_version, task_path, and subtask, entity, path, and test evidence. Canonical task paths use /stages/0/tasks/0 and descendant evidence paths use /stages/0/tasks/0/files/0/subtasks/0. Stage completion derives from persisted task completion. Call harness_plan_deviation before departing from accepted intent. Call harness_question_ask whenever a material user decision remains. Use harness_question_answer only while a Harness question remains pending and the user explicitly answers it. Use harness_question_withdraw only while a Harness question remains pending and no material decision remains. Planning-feedback turns contain answers Harness already recorded and consumed, so never call either question-resolution tool from those turns. The question tools work in every mode. End the turn after a Harness question or terminal plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone."#;
 
 /// Identifies one supported provider implementation without leaking launch strings across consumers.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -744,7 +744,7 @@ impl Backend for MockBackend {
                 }),
                 ..Default::default()
             };
-            if document.tasks.is_empty() {
+            if document.stages.is_empty() {
                 mutation.set = Some(crate::plan::PlanResourceSet {
                     entity_changes: Some(vec![crate::plan::ProgramEntityChange {
                             action: crate::plan::EntityChangeAction::Add,
@@ -778,7 +778,9 @@ impl Backend for MockBackend {
                                     branches: Vec::new(),
                             }],
                     }]),
-                    tasks: Some(vec![crate::plan::PlanTask {
+                    ..Default::default()
+                });
+                mutation.stages = Some(vec![crate::plan::PlanStage { id: "implementation".into(), title: "Implement the change".into(), tasks: vec![crate::plan::PlanTask { id: "requested-change".into(), requires: Vec::new(),
                             title: "Implement the requested change".into(),
                             description: "Connect the requested behavior to its source boundary."
                                 .into(),
@@ -810,9 +812,7 @@ impl Backend for MockBackend {
                                     ),
                                 ],
                             }],
-                    }]),
-                    ..Default::default()
-                });
+                    }] }]);
             }
             plan_edit.push(crate::plan::PlanEditRequest {
                 plan_id: document.plan_id.clone(),
@@ -841,15 +841,26 @@ impl Backend for MockBackend {
             .as_ref()
             .zip(execution_id)
             .and_then(|(document, execution_id)| {
-                document
-                    .tasks
-                    .first()
+                request
+                    .input
+                    .text()
+                    .split("Active task:\n```json\n")
+                    .nth(1)
+                    .and_then(|tail| tail.split("\n```").next())
+                    .and_then(|value| serde_json::from_str::<serde_json::Value>(value).ok())
+                    .and_then(|active| {
+                        active["task_id"]
+                            .as_str()
+                            .and_then(|id| document.task_by_id(id).map(|(_, task)| task))
+                    })
                     .map(|task| (document, task, execution_id))
             })
             .map(
                 |(document, task, execution_id)| crate::plan::PlanTaskReport {
+                    task_id: task.id.clone(),
+                    plan_version: document.version,
                     execution_id,
-                    task_path: "/tasks/0".into(),
+                    task_path: document.task_by_id(&task.id).unwrap().0,
                     state: crate::plan::PlanTaskState::Complete,
                     completed_subtask_paths: task
                         .files
@@ -860,7 +871,10 @@ impl Backend for MockBackend {
                                 .iter()
                                 .enumerate()
                                 .map(move |(subtask_index, _)| {
-                                    format!("/tasks/0/files/{file_index}/subtasks/{subtask_index}")
+                                    format!(
+                                        "{}/files/{file_index}/subtasks/{subtask_index}",
+                                        document.task_by_id(&task.id).unwrap().0
+                                    )
                                 })
                         })
                         .collect(),
@@ -886,7 +900,8 @@ impl Backend for MockBackend {
                                 move |(subtask_index, subtask)| {
                                     subtask.test().map(|_| crate::plan::PlanTestResult {
                                         test_subtask_path: Some(format!(
-                                            "/tasks/0/files/{file_index}/subtasks/{subtask_index}"
+                                            "{}/files/{file_index}/subtasks/{subtask_index}",
+                                            document.task_by_id(&task.id).unwrap().0
                                         )),
                                         status: crate::plan::PlanTestStatus::Passed,
                                         command: Some("mock test".into()),
@@ -911,7 +926,12 @@ impl Backend for MockBackend {
                     blocking_reason: None,
                 },
             );
-        let execution_complete = plan_task_report.is_some();
+        let execution_complete = plan_task_report.as_ref().is_some_and(|report| {
+            execution_document
+                .as_ref()
+                .and_then(|document| document.tasks().last())
+                .is_some_and(|task| task.id == report.task_id)
+        });
         if !self.emit_before_delay
             && let Some(event_sink) = event_sink
         {
@@ -1045,6 +1065,16 @@ fn mock_capability() -> BackendCapability {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn provider_instructions_describe_staged_edits_and_revision_scoped_reports() {
+        let prompt = super::HARNESS_SYSTEM_MESSAGE;
+        assert!(prompt.contains("plan, rename, set, delete, stages, or assumptions"));
+        assert!(prompt.contains("Task requires entries reference task IDs in earlier stages"));
+        assert!(prompt.contains("execution_id, task_id, current plan_version, task_path"));
+        assert!(prompt.contains("/stages/0/tasks/0/files/0/subtasks/0"));
+        assert!(!prompt.contains("flows, and tasks directly"));
+        assert!(!prompt.contains("version, and every internal ID"));
+    }
     use super::{Backend, BackendRequest, MockBackend, PromptMode};
     use crate::session::ExecutionMode;
     use std::sync::Arc;
@@ -1067,7 +1097,7 @@ mod test {
                         harness_session_id: "harness-session".into(),
                         workspace: ".".into(),
                         input: super::BackendInput::from_text(
-                            "Active canonical PlanDocument:\n```json\n{\"schema_version\":2,\"version\":1,\"plan_id\":\"plan\",\"title\":\"Refactor X\",\"overview\":\"Planning\",\"usage\":null,\"entity_changes\":[],\"dependencies\":[],\"flows\":[],\"tasks\":[],\"assumptions\":[]}\n```\n\nRefactor X",
+                            "Active canonical PlanDocument:\n```json\n{\"schema_version\":5,\"version\":1,\"plan_id\":\"plan\",\"title\":\"Refactor X\",\"overview\":\"Planning\",\"usage\":null,\"entity_changes\":[],\"dependencies\":[],\"flows\":[],\"stages\":[],\"assumptions\":[]}\n```\n\nRefactor X",
                         ),
                         mode: PromptMode::Plan,
                         model: "mock-model".into(),

@@ -2028,7 +2028,7 @@ impl HarnessBroker {
                 entity_changes: Vec::new(),
                 dependencies: Vec::new(),
                 flows: Vec::new(),
-                tasks: Vec::new(),
+                stages: Vec::new(),
                 assumptions: Vec::new(),
             };
             return self.start_plan(request.to_owned(), text.clone(), document).await;
@@ -4830,7 +4830,7 @@ Planning continuation: turn {} of {}.",
                 PlanExecutionLifecycleEvent::TaskStarted {
                     task_path,
                     ordinal: 1,
-                    total: accepted_document.tasks.len(),
+                    total: accepted_document.tasks().count(),
                     title: active_task.title.clone(),
                 },
             );
@@ -5392,8 +5392,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .enumerate()
             .find(|(_, task)| task.state == crate::plan::PlanTaskState::Active)
             .map(|(task_index, _)| task_index);
-        let active_task =
-            active_task_index.and_then(|task_index| effective.document.tasks.get(task_index));
+        let active_task = active_task_index.and_then(|task_index| {
+            effective
+                .document
+                .task_by_id(&execution.scheduler.task[task_index].task_id)
+                .map(|(_, task)| task)
+        });
         Ok(Some(execution_prompt(
             kind,
             &execution.id,
@@ -5491,6 +5495,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             accepted_revision,
         )?;
         let mut deviation_list = self.store.list_plan_deviation(&self.session.id)?;
+        deviation_list.retain(|deviation| deviation.execution_id == execution.id);
         let effective_before_deviation =
             crate::plan::build_effective_plan(&accepted, &deviation_list)?;
         let mut pause_for_review = false;
@@ -5542,8 +5547,22 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                     .then(|| self.clock.now_ms()),
             };
             deviation.validate()?;
-            self.store
-                .save_plan_deviation(&self.session.id, &deviation)?;
+            let mut candidate_deviations = deviation_list.clone();
+            let mut candidate = deviation.clone();
+            if candidate.disposition == PlanDeviationDisposition::Pending {
+                candidate.disposition = PlanDeviationDisposition::UserApproved;
+            }
+            candidate_deviations.push(candidate);
+            let proposed = crate::plan::build_effective_plan(&accepted, &candidate_deviations)?;
+            let mut candidate_scheduler = execution.scheduler.clone();
+            candidate_scheduler.reconcile(&proposed.document)?;
+            if disposition == PlanDeviationDisposition::AutoApproved {
+                execution.scheduler = candidate_scheduler;
+                self.store.save_plan_transition(&deviation, &execution)?;
+            } else {
+                self.store
+                    .save_plan_deviation(&self.session.id, &deviation)?;
+            }
             event.push(self.event(
                 if disposition == PlanDeviationDisposition::Pending {
                     "plan_deviation_review"
@@ -5563,6 +5582,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             deviation_list.push(deviation);
         }
         let effective = crate::plan::build_effective_plan(&accepted, &deviation_list)?;
+        execution.scheduler.reconcile(&effective.document)?;
         if pause_for_review {
             anyhow::ensure!(
                 output.plan_task_report.is_empty(),
@@ -5590,8 +5610,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 .context("scheduled task not found")?;
             let task = effective
                 .document
-                .tasks
-                .get(task_index)
+                .task_by_id(&report.task_id)
+                .map(|(_, task)| task)
                 .context("canonical task not found")?;
             let task_path = report.task_path.clone();
             let task_title = task.title.clone();
@@ -5685,8 +5705,36 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             PlanDeviationDisposition::Rejected
         };
         deviation.resolved_at_ms = Some(self.clock.now_ms());
-        self.store
-            .save_plan_deviation(&self.session.id, &deviation)?;
+        if approved {
+            let mut execution = self
+                .store
+                .load_plan_execution(&deviation.execution_id)?
+                .context("execution is unavailable")?;
+            let plan = self
+                .store
+                .load_plan(&deviation.plan_id)?
+                .context("plan is unavailable")?;
+            let accepted = self.plan_file.read_submitted_document(
+                &self.session.id,
+                &plan.id,
+                plan.accepted_revision
+                    .context("accepted revision is missing")?,
+            )?;
+            let mut deviations = self.store.list_plan_deviation(&self.session.id)?;
+            deviations.retain(|entry| entry.execution_id == execution.id);
+            for entry in &mut deviations {
+                if entry.id == deviation.id {
+                    *entry = deviation.clone();
+                }
+            }
+            let effective = crate::plan::build_effective_plan(&accepted, &deviations)?;
+            execution.scheduler.reconcile(&effective.document)?;
+            self.store.save_plan_transition(&deviation, &execution)?;
+        }
+        if !approved {
+            self.store
+                .save_plan_deviation(&self.session.id, &deviation)?;
+        }
         let mut event =
             vec![self.event("plan_deviation_resolved", serde_json::to_value(&deviation)?)?];
         if approved {
@@ -7579,7 +7627,7 @@ mod test {
             }),
             ..Default::default()
         };
-        if document.tasks.is_empty() {
+        if document.stages.is_empty() {
             mutation.set = Some(crate::plan::PlanResourceSet {
                 entity_changes: Some(vec![crate::plan::ProgramEntityChange {
                         action: crate::plan::EntityChangeAction::Modify,
@@ -7619,39 +7667,40 @@ mod test {
                                 branches: Vec::new(),
                         }],
                 }]),
-                tasks: Some(vec![crate::plan::PlanTask {
-                        title: "Implement the migration".into(),
-                        description: "Apply the selected strategy at its owner.".into(),
-                        files: vec![crate::plan::PlanFile {
-                            change: crate::plan::PlanFileChange::Modify {
-                                path: "src/migration.rs".into(),
-                            },
-                            subtasks: vec![
-                                crate::plan::PlanSubtask::Work(
-                                    crate::plan::PlanWorkSubtask {
-                                        action: crate::plan::SubtaskAction::Create,
-                                        description: "Change the persisted format.".into(),
-                                        entities: vec!["migrate".into()],
-                                    },
-                                ),
-                                crate::plan::PlanSubtask::Test(
-                                    crate::plan::PlanTestSubtask {
-                                        operation: crate::plan::TestSubtaskOperation::Test,
-                                        action: crate::plan::ChangeAction::Add,
-                                        renamed_from: None,
-                                        name: "verify_migration".into(),
-                                        category: crate::plan::TestCategory::Unit,
-                                        behavior:
-                                            "The selected strategy preserves valid state.".into(),
-                                        covers_entities: vec!["migrate".into()],
-                                    },
-                                ),
-                            ],
-                        }],
-                }]),
                 ..Default::default()
             });
         }
+        mutation.stages = Some(vec![crate::plan::PlanStage {
+            id: "implementation".into(),
+            title: "Implement the change".into(),
+            tasks: vec![crate::plan::PlanTask {
+                id: "requested-change".into(),
+                requires: Vec::new(),
+                title: "Implement the migration".into(),
+                description: "Apply the selected strategy at its owner.".into(),
+                files: vec![crate::plan::PlanFile {
+                    change: crate::plan::PlanFileChange::Modify {
+                        path: "src/migration.rs".into(),
+                    },
+                    subtasks: vec![
+                        crate::plan::PlanSubtask::Work(crate::plan::PlanWorkSubtask {
+                            action: crate::plan::SubtaskAction::Create,
+                            description: "Change the persisted format.".into(),
+                            entities: vec!["migrate".into()],
+                        }),
+                        crate::plan::PlanSubtask::Test(crate::plan::PlanTestSubtask {
+                            operation: crate::plan::TestSubtaskOperation::Test,
+                            action: crate::plan::ChangeAction::Add,
+                            renamed_from: None,
+                            name: "verify_migration".into(),
+                            category: crate::plan::TestCategory::Unit,
+                            behavior: "The selected strategy preserves valid state.".into(),
+                            covers_entities: vec!["migrate".into()],
+                        }),
+                    ],
+                }],
+            }],
+        }]);
         let edit_request = crate::plan::PlanEditRequest {
             plan_id: document.plan_id.clone(),
             expected_version: document.version,
@@ -10553,7 +10602,7 @@ mod test {
             .unwrap();
         assert_eq!(updated_document.entity_changes[0].name, "MigrationRunner");
         assert_eq!(
-            updated_document.tasks[0].files[0].subtasks[0].owned_entities(),
+            updated_document.stages[0].tasks[0].files[0].subtasks[0].owned_entities(),
             ["MigrationRunner"]
         );
         assert_eq!(

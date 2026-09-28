@@ -25,10 +25,13 @@ client.request_for = function(session_id, method, params, callback)
       { id = "file", text = { "file src/plan.rs", "child entity" }, metadata = { decoration = {}, editable_region = {}, target = {}, fold = {
         { id = "plan:file-tree:1", start = { row = 0, column = 0 }, ["end"] = { block = "file", position = { row = 2, column = 0 } }, closed = true },
       } } },
+      { id = "stage", text = { "1. Establish shared foundations" }, metadata = { decoration = {}, editable_region = {}, target = {}, fold = {
+        { id = "plan:stage:foundation", start = { row = 0, column = 0 }, ["end"] = { block = "wrapped_task", position = { row = 4, column = 0 } }, closed = false },
+      } } },
       { id = "task", text = { "Native projected plan", "task detail" }, metadata = { decoration = {}, editable_region = {}, target = {
         { id = "task", range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = 21 } } },
       }, fold = {
-        { id = "plan:task:1", start = { row = 0, column = 0 }, ["end"] = { block = "task", position = { row = 2, column = 0 } }, closed = false },
+        { id = "plan:task:1", start = { row = 0, column = 0 }, ["end"] = { block = "task", position = { row = 2, column = 0 } }, closed = true },
       } } },
       { id = "wrapped_task", text = {
         "2. Own square velocity through a focused ECS component. The component keeps movement data with",
@@ -36,7 +39,7 @@ client.request_for = function(session_id, method, params, callback)
         "   Its dedicated module prevents motion state from becoming application-wide state.",
         "   file src/motion.rs",
       }, metadata = { decoration = {}, editable_region = {}, target = {}, fold = {
-        { id = "plan:task:2", start = { row = 2, column = 0 }, ["end"] = { block = "wrapped_task", position = { row = 4, column = 0 } }, closed = false },
+        { id = "plan:task:2", start = { row = 2, column = 0 }, ["end"] = { block = "wrapped_task", position = { row = 4, column = 0 } }, closed = true },
       } } } } } })
   elseif params.operation == "plan_action" and params.input.action == "jump_entity" then
     callback({ jump = { block = "overview", position = { row = 0, column = 5 } } })
@@ -59,6 +62,8 @@ local success, failure = xpcall(function()
   assert(vim.fn.foldclosed(file_row + 1) == file_row + 1,
     "native PlanReview did not preserve Rust default-closed file-tree folds")
   local _, task_row = review.owner.replica.sequence:position("task")
+  local _, stage_row = review.owner.replica.sequence:position("stage")
+  assert(vim.fn.foldclosed(stage_row + 1) == -1, "stages should initially expose their task headings")
   assert(vim.fn.foldclosed(task_row + 1) == task_row + 1, "native PlanReview did not close task folds by default")
   vim.api.nvim_win_set_cursor(review.win, { task_row + 1, 0 })
   review.command_set.action_by_id.toggle.run({})
@@ -83,6 +88,12 @@ local success, failure = xpcall(function()
     assert(vim.api.nvim_win_get_cursor(review.win)[1] == heading_row,
       "collapsing a wrapped task should preserve the selected description row")
   end
+  vim.api.nvim_win_set_cursor(review.win, { stage_row + 1, 0 })
+  review.command_set.action_by_id.toggle.run({})
+  assert(vim.fn.foldclosed(stage_row + 1) == stage_row + 1, "Tab should collapse the stage")
+  review.command_set.action_by_id.toggle.run({})
+  assert(vim.fn.foldclosed(stage_row + 1) == -1, "Tab should reopen the stage")
+  assert(vim.fn.foldclosed(task_row + 1) == task_row + 1, "reopening a stage should preserve child folds")
   vim.cmd("vsplit")
   vim.api.nvim_win_set_buf(0, review.buf)
   review.owner.refresh_views()

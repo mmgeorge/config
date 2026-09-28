@@ -72,7 +72,10 @@ Flows:
 - Reuse entity names from the object model. Keep independent flows separate.
 - Use compact type and entity names so the vertical projection keeps its aligned owner column within 100 characters.
 
-Tasks:
+Stages and tasks:
+- Author stages containing full task objects, each with a stable id and explicit requires array. Stages execute in order. Sibling tasks must finish independently, including their required verification. Never infer prerequisites solely from runtime calls.
+- Prerequisite IDs must refer to tasks in earlier stages. Sibling tasks cannot edit the same file, including rename endpoints. Review hidden dependencies and shared mutable resources before submitting. Put assembled verification after its implementation prerequisites.
+- Harness generates stage numbers and task letters from position. Never put numbering in titles. Harness currently executes one lettered task at a time.
 - Organize tasks by domain object and ownership responsibility, not by implementation phase, file bucket, or one forced code-flow sequence.
 - When the plan adds, modifies, or removes any dependency, make the task that configures those dependency changes the first task in the plan.
 - Make every task title an active architectural review claim. Prefer `<Active verb> <domain object> <with|through|in|across> <architectural role>.` Vary that shape only when another concise active construction states the ownership change more precisely.
@@ -111,12 +114,12 @@ Validation:
 - Revise any plan that violates the modularity rules, produces flow lines over 100 characters, or collapses failures and user-visible behavior into vague `handle`, `support`, `make`, or `update` wording."#;
 const EDIT_CONTRACT: &str = r#"Use `harness_plan_edit` to apply one atomic patch through the PlanDocument edit schema. The tool request schema and the canonical PlanDocument schema serve different jobs:
 
-- The canonical document uses PlanDocument schema version 4. Harness generates the edit and deviation input schemas from the same typed Rust declarations that Serde decodes, so follow the advertised tool schema instead of inferring fields from rendered Markdown.
-- Send `plan_id`, `expected_version`, and only the patch fields `plan`, `rename`, `set`, `delete`, or `assumptions`.
+- The canonical document uses PlanDocument schema version 5. Harness generates the edit and deviation input schemas from the same typed Rust declarations that Serde decodes, so follow the advertised tool schema instead of inferring fields from rendered Markdown.
+- Send `plan_id`, `expected_version`, and only the patch fields `plan`, `rename`, `set`, `delete`, `stages`, or `assumptions`.
 - Patch `plan.title`, `plan.overview`, and `plan.usage` directly. Set usage to JSON null to clear it.
 - Replace `assumptions` with one complete string array.
-- Under `set`, group ordered complete Plan Schema resources directly by `entity_changes`, `dependencies`, `flows`, or `tasks`. Do not wrap a resource in `key` and `value`.
-- Harness derives each set resource's semantic key from its entity or dependency `name` or its flow or task `title`. A matching key replaces in place. A new key appends in request order.
+- Under `set`, group ordered complete Plan Schema resources directly by `entity_changes`, `dependencies`, or `flows`. Do not wrap a resource in `key` and `value`.
+- Harness derives each set resource's semantic key from its entity or dependency `name` or its flow `title`. A matching key replaces in place. A new key appends in request order.
 - Under `rename`, group explicit `{"from":<current semantic key>,"to":<new semantic key>}` entries by resource collection. Use rename only when changing the identifying name or title, then address the destination key from `set` when also replacing the complete resource.
 - Under `delete`, group current semantic keys by resource collection. `delete` retracts resources from this plan document.
 - To plan removal from source code or a manifest, use `set` with a complete value whose implementation `action` is `"remove"`. The `action` field never edits the PlanDocument.
@@ -124,7 +127,7 @@ const EDIT_CONTRACT: &str = r#"Use `harness_plan_edit` to apply one atomic patch
 - Include the required implementation `action` on every entity, dependency, member, variant field, task file, and concrete test that defines one.
 - Descriptions on members, enum variants, and enum payload fields are optional and preserved for the PlanReview info popup, not rendered in Markdown. Enum payload fields also accept optional `visibility` metadata without applying visibility semantics, and the redundant `kind: "field"` discriminator remains optional.
 - For a nested declaration rename, set `action` to `"rename"`, put the previous identifier in `renamed_from`, and put the destination identifier in `name`; omit `renamed_from` for every other action.
-- Never invent node ID fields. The schema identifies semantic resources by name or title and addresses concrete nodes by position only after a plan version exists.
+- Author stable IDs on stages and tasks. Replace the complete ordered stages tree through the top-level stages patch field. Preserve IDs when changing titles or regrouping pending work. Other resources retain their existing semantic keys.
 - Never send `operation: "create"`, `"replace"`, or `"delete"` envelopes, recursive mutation wrappers, or JSON Patch `op` and `path` fields.
 - Never rename and delete the same resource, set and delete the same semantic key, or repeat a semantic key within one collection.
 
@@ -255,28 +258,6 @@ Every rejected control call returns exactly one JSON object. Read its `phase`, `
           }
         ]
       }
-    ],
-    "tasks": [
-      {
-        "title": "Own pending drafts through durable state.",
-        "description": "Give unsaved edits a lifetime independent from editor buffers.",
-        "files": [
-          {
-            "action": "add",
-            "path": "src/draft_sync.rs",
-            "subtasks": [
-              {
-                "operation": "create",
-                "description": "the durable draft owner.",
-                "entities": [
-                  "DraftCache",
-                  "DraftState"
-                ]
-              }
-            ]
-          }
-        ]
-      }
     ]
   },
   "delete": {
@@ -286,6 +267,36 @@ Every rejected control call returns exactly one JSON object. Read its `phase`, `
   },
   "assumptions": [
     "Draft persistence uses the existing workspace storage boundary."
+  ],
+  "stages": [
+    {
+      "id": "draft-storage",
+      "title": "Establish durable drafts",
+      "tasks": [
+        {
+          "title": "Own pending drafts through durable state.",
+          "description": "Give unsaved edits a lifetime independent from editor buffers.",
+          "files": [
+            {
+              "action": "add",
+              "path": "src/draft_sync.rs",
+              "subtasks": [
+                {
+                  "operation": "create",
+                  "description": "the durable draft owner.",
+                  "entities": [
+                    "DraftCache",
+                    "DraftState"
+                  ]
+                }
+              ]
+            }
+          ],
+          "id": "draft-state",
+          "requires": []
+        }
+      ]
+    }
   ]
 }
 ```"#;
@@ -325,6 +336,11 @@ pub fn execution_prompt(
         .filter(|entity| active_entity_name.contains(&entity.name))
         .collect::<Vec<_>>();
     let active_work = serde_json::json!({
+        "task_id": active_task.map(|task| &task.id),
+        "plan_version": document.version,
+        "label": active_task.and_then(|task| document.task_label(&task.id)),
+        "task_path": active_task.and_then(|task| document.task_by_id(&task.id).map(|(path, _)| path)),
+        "stage": active_task.and_then(|task| document.stages.iter().find(|stage| stage.tasks.iter().any(|child| child.id == task.id))).map(|stage| serde_json::json!({"id": stage.id, "title": stage.title})),
         "task": active_task,
         "entity_changes": active_entity_change,
     });
@@ -334,7 +350,7 @@ pub fn execution_prompt(
         ""
     };
     Ok(format!(
-        "{boundary} Execution ID: {execution_id}.{recovery} Complete the active whole task before calling harness_plan_task_report with detailed subtask, entity, path, and test evidence. Address tasks, subtasks, entities, and tests by their JSON pointer paths in this exact plan version. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective canonical PlanDocument:\n```json\n{}\n```",
+        "{boundary} Execution ID: {execution_id}.{recovery} Complete the active whole task before calling harness_plan_task_report with the active task_id, current plan_version, and detailed subtask, entity, path, and test evidence. A stage completes only when all its lettered tasks have persisted completion. Execute only the selected task even when its siblings are independent. Address tasks, subtasks, entities, and tests by their JSON pointer paths in this exact plan version. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective canonical PlanDocument:\n```json\n{}\n```",
         serde_json::to_string_pretty(&active_work)?,
         serde_json::to_string_pretty(document)?,
     ))
@@ -348,7 +364,7 @@ impl PlanPrompt {
 
 Explore the repository before asking questions. Resolve discoverable facts from the code. You may write supporting planning material when the retained authorization permits it. Ask only when a product decision materially changes the implementation. When feedback is required, call harness_question_ask with one to three concise questions, two or three mutually exclusive choices per structured question, and a recommended choice first. End that turn after requesting feedback.
 
-Harness already created the canonical PlanDocument and owns its plan ID, version, and original prompt. The prompt is Harness-owned render context and is not a model-editable field. Build the semantic plan only through harness_plan_edit. Model each changed program construct once as a ProgramEntityChange with its add, modify, remove, or rename action. For a rename, put the existing identifier in `renamed_from` and the destination identifier in `name`; never encode one rename as separate remove and add entities. Model every package decision once as a top-level dependency change with its version, manifest, license, and justification. Nest ordinary member changes under their owning entity and enum cases under the enum's dedicated variants collection. Express inheritance and conformance directly on that entity. Use tagged planned_entity, workspace_entity, or external_entity references in flows. Reserve workspace_entity for unchanged repository constructs and record their entity kind, name, repository-relative path, and one-indexed declaration line. Attach every entity to exactly one subtask. Harness derives dependency ownership by matching each manifest to exactly one task file. Keep dependencies, entities, independent flows, architectural tasks, file boundaries, optional high-value tests, and assumptions aligned. Plan nodes have no generated IDs. Validation reports concise dot-and-index paths such as `flows[0].edges[1]`, while accepted-plan execution uses version-scoped JSON pointers such as `/tasks/0/files/1/subtasks/2`. {USAGE_CONTRACT} Do not use provider task updates as the plan. When the document passes submission validation, call harness_plan_submit with the exact plan_id and expected_version. Ordinary prose and provider checklists do not submit a plan.
+Harness already created the canonical PlanDocument and owns its plan ID, version, and original prompt. The prompt is Harness-owned render context and is not a model-editable field. Build the semantic plan only through harness_plan_edit. Model each changed program construct once as a ProgramEntityChange with its add, modify, remove, or rename action. For a rename, put the existing identifier in `renamed_from` and the destination identifier in `name`; never encode one rename as separate remove and add entities. Model every package decision once as a top-level dependency change with its version, manifest, license, and justification. Nest ordinary member changes under their owning entity and enum cases under the enum's dedicated variants collection. Express inheritance and conformance directly on that entity. Use tagged planned_entity, workspace_entity, or external_entity references in flows. Reserve workspace_entity for unchanged repository constructs and record their entity kind, name, repository-relative path, and one-indexed declaration line. Attach every entity to exactly one subtask. Harness derives dependency ownership by matching each manifest to exactly one task file. Keep dependencies, entities, independent flows, architectural tasks, file boundaries, optional high-value tests, and assumptions aligned. Stages and tasks carry stable model-authored IDs. Harness derives display numbering from their positions. Validation reports concise dot-and-index paths such as `flows[0].edges[1]`, while accepted-plan execution uses version-scoped JSON pointers such as `/stages/0/tasks/0/files/1/subtasks/2`. {USAGE_CONTRACT} Do not use provider task updates as the plan. When the document passes submission validation, call harness_plan_submit with the exact plan_id and expected_version. Ordinary prose and provider checklists do not submit a plan.
 
 {WALKTHROUGH_CONTRACT}
 
@@ -567,7 +583,7 @@ mod test {
         assert!(prompt.contains("nested member, variant, field, edge, branch"));
         assert!(prompt.contains("edge's `expansion`"));
         assert!(prompt.contains("ordered complete Plan Schema resources"));
-        assert!(prompt.contains("PlanDocument schema version 4"));
+        assert!(prompt.contains("PlanDocument schema version 5"));
         assert!(prompt.contains("same typed Rust declarations that Serde decodes"));
         assert!(prompt.contains("`members`, `variants`, `conforms_to`"));
         assert!(prompt.contains("redundant `kind: \"field\"` discriminator"));
@@ -685,7 +701,7 @@ mod test {
     #[test]
     fn execution_prompt_reanchors_start_and_resume_to_the_active_task() {
         let document = super::super::document::test_fixture("plan", "Overview");
-        let task = &document.tasks[0];
+        let task = &document.stages[0].tasks[0];
         let start = execution_prompt(
             PlanExecutionPromptKind::Start,
             "execution",

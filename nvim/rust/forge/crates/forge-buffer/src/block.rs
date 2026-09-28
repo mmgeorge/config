@@ -66,6 +66,9 @@ pub struct BlockAnchor {
 /// Declares a half-open native fold from its owning block to an exact endpoint block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoldRange {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// First heading row that can toggle this fold while leaving the heading visible.
+    pub heading_start: Option<BlockAnchor>,
     pub id: FoldId,
     pub start: TextPosition,
     pub end: BlockAnchor,

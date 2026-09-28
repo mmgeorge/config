@@ -199,6 +199,7 @@ impl SqliteStore {
             .with_context(|| format!("load Harness session lease {session_id}"))?;
         let mut session = decode_current_session(&payload)?
             .with_context(|| format!("Harness session {session_id} uses an outdated format"))?;
+        discard_incompatible_plan_state(&transaction, &mut session)?;
         session.acquire_lease(client_id, now_ms)?;
         transaction.execute(
             "UPDATE session_record SET payload=?2 WHERE id=?1",
@@ -404,20 +405,55 @@ impl SqliteStore {
         )
     }
 
+    /// Commit an approved scope change and its reconciled scheduler together.
+    pub fn save_plan_transition(
+        &mut self,
+        deviation: &crate::plan::PlanDeviation,
+        execution: &PlanExecutionRecord,
+    ) -> Result<()> {
+        let mut deviation_payload = serde_json::to_value(deviation)?;
+        let mut execution_payload = serde_json::to_value(execution)?;
+        for payload in [&mut deviation_payload, &mut execution_payload] {
+            payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+        }
+        let transaction = self.connection.transaction()?;
+        for (table, id, payload) in [
+            ("plan_deviation_record", &deviation.id, deviation_payload),
+            ("plan_execution_record", &execution.id, execution_payload),
+        ] {
+            transaction.execute(&format!("INSERT INTO {table}(id, session_id, payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload"),
+                params![id, execution.session_id, encode(&payload)?])?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn save_plan_payload<T: Serialize>(
+        &mut self,
+        table: &str,
+        id: &str,
+        session_id: &str,
+        value: &T,
+    ) -> Result<()> {
+        let mut payload = serde_json::to_value(value)?;
+        payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+        self.save_scoped_payload(table, id, session_id, &payload)
+    }
+
     /// Write a plan lifecycle record.
     pub fn save_plan(&mut self, plan: &PlanRecord) -> Result<()> {
-        self.save_scoped_payload("plan_record", &plan.id, &plan.session_id, plan)
+        self.save_plan_payload("plan_record", &plan.id, &plan.session_id, plan)
     }
 
     /// Load a plan by stable Harness identifier.
     pub fn load_plan(&self, plan_id: &str) -> Result<Option<PlanRecord>> {
-        self.load_payload("SELECT payload FROM plan_record WHERE id=?1", [plan_id])
+        self.load_payload("SELECT payload FROM plan_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=5", [plan_id])
     }
 
     /// Load every plan artifact for one session in creation order.
     pub fn list_plan(&self, session_id: &str) -> Result<Vec<PlanRecord>> {
         self.list_payload(
-            "SELECT payload FROM plan_record WHERE session_id=?1 ORDER BY rowid",
+            "SELECT payload FROM plan_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=5 ORDER BY rowid",
             [session_id],
         )
     }
@@ -431,7 +467,7 @@ impl SqliteStore {
 
     /// Write one immutable plan lifecycle event.
     pub fn save_plan_lifecycle(&mut self, lifecycle: &PlanLifecycleRecord) -> Result<()> {
-        self.save_scoped_payload(
+        self.save_plan_payload(
             "plan_lifecycle_record",
             &lifecycle.id,
             &lifecycle.session_id,
@@ -442,7 +478,7 @@ impl SqliteStore {
     /// Load plan lifecycle events in their insertion order.
     pub fn list_plan_lifecycle(&self, session_id: &str) -> Result<Vec<PlanLifecycleRecord>> {
         self.list_payload(
-            "SELECT payload FROM plan_lifecycle_record WHERE session_id=?1 ORDER BY rowid",
+            "SELECT payload FROM plan_lifecycle_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=5 ORDER BY rowid",
             [session_id],
         )
     }
@@ -471,7 +507,7 @@ impl SqliteStore {
 
     /// Write one accepted-plan execution record.
     pub fn save_plan_execution(&mut self, execution: &PlanExecutionRecord) -> Result<()> {
-        self.save_scoped_payload(
+        self.save_plan_payload(
             "plan_execution_record",
             &execution.id,
             &execution.session_id,
@@ -482,7 +518,7 @@ impl SqliteStore {
     /// Load one accepted-plan execution by stable identifier.
     pub fn load_plan_execution(&self, execution_id: &str) -> Result<Option<PlanExecutionRecord>> {
         self.load_payload(
-            "SELECT payload FROM plan_execution_record WHERE id=?1",
+            "SELECT payload FROM plan_execution_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=5",
             [execution_id],
         )
     }
@@ -490,7 +526,7 @@ impl SqliteStore {
     /// Load every accepted-plan execution for one session.
     pub fn list_plan_execution(&self, session_id: &str) -> Result<Vec<PlanExecutionRecord>> {
         self.list_payload(
-            "SELECT payload FROM plan_execution_record WHERE session_id=?1 ORDER BY rowid",
+            "SELECT payload FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=5 ORDER BY rowid",
             [session_id],
         )
     }
@@ -501,7 +537,7 @@ impl SqliteStore {
         session_id: &str,
         deviation: &crate::plan::PlanDeviation,
     ) -> Result<()> {
-        self.save_scoped_payload(
+        self.save_plan_payload(
             "plan_deviation_record",
             &deviation.id,
             session_id,
@@ -512,7 +548,7 @@ impl SqliteStore {
     /// Load every plan deviation for one session in chronological order.
     pub fn list_plan_deviation(&self, session_id: &str) -> Result<Vec<crate::plan::PlanDeviation>> {
         self.list_payload(
-            "SELECT payload FROM plan_deviation_record WHERE session_id=?1 ORDER BY rowid",
+            "SELECT payload FROM plan_deviation_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=5 ORDER BY rowid",
             [session_id],
         )
     }
@@ -523,13 +559,13 @@ impl SqliteStore {
         session_id: &str,
         audit: &crate::plan::PlanAudit,
     ) -> Result<()> {
-        self.save_scoped_payload("plan_audit_record", &audit.id, session_id, audit)
+        self.save_plan_payload("plan_audit_record", &audit.id, session_id, audit)
     }
 
     /// Load every plan audit for one session in chronological order.
     pub fn list_plan_audit(&self, session_id: &str) -> Result<Vec<crate::plan::PlanAudit>> {
         self.list_payload(
-            "SELECT payload FROM plan_audit_record WHERE session_id=?1 ORDER BY rowid",
+            "SELECT payload FROM plan_audit_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=5 ORDER BY rowid",
             [session_id],
         )
     }
@@ -539,7 +575,7 @@ impl SqliteStore {
         &mut self,
         resolution: &crate::plan::PlanResolutionRecord,
     ) -> Result<()> {
-        self.save_scoped_payload(
+        self.save_plan_payload(
             "plan_resolution_record",
             &resolution.id,
             &resolution.session_id,
@@ -553,7 +589,7 @@ impl SqliteStore {
         session_id: &str,
     ) -> Result<Vec<crate::plan::PlanResolutionRecord>> {
         self.list_payload(
-            "SELECT payload FROM plan_resolution_record WHERE session_id=?1 ORDER BY rowid",
+            "SELECT payload FROM plan_resolution_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=5 ORDER BY rowid",
             [session_id],
         )
     }
@@ -729,7 +765,8 @@ impl SqliteStore {
         let rows = statement.query_map(params, |row| row.get::<_, String>(0))?;
         let mut session_list = Vec::new();
         for row in rows {
-            if let Some(session) = decode_current_session(&row?)? {
+            if let Some(mut session) = decode_current_session(&row?)? {
+                discard_incompatible_plan_state(&self.connection, &mut session)?;
                 session_list.push(session);
             }
         }
@@ -773,7 +810,13 @@ impl SessionStore for SqliteStore {
             )
             .optional()?;
         match payload {
-            Some(value) => decode_current_session(&value),
+            Some(value) => {
+                let mut session = decode_current_session(&value)?;
+                if let Some(session) = session.as_mut() {
+                    discard_incompatible_plan_state(&self.connection, session)?;
+                }
+                Ok(session)
+            }
             None => Ok(None),
         }
     }
@@ -806,6 +849,30 @@ fn decode<T: DeserializeOwned>(value: &str) -> Result<T> {
     serde_json::from_str(value).context("decode Harness storage payload")
 }
 
+fn discard_incompatible_plan_state(
+    connection: &Connection,
+    session: &mut HarnessSession,
+) -> Result<()> {
+    if let Some(plan_id) = session.active_plan_id.as_ref() {
+        let supported: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plan_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=5)",
+            [plan_id], |row| row.get(0))?;
+        if !supported {
+            session.active_plan_id = None;
+        }
+    }
+
+    if let Some(goal_id) = session.goal_id.as_ref() {
+        let incompatible: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload, '$.goal_id')=?2 AND coalesce(json_extract(payload, '$.schema_version'),0)<>5)",
+            params![session.id, goal_id], |row| row.get(0))?;
+        if incompatible {
+            session.goal_id = None;
+        }
+    }
+    Ok(())
+}
+
 fn encode_session(session: &HarnessSession) -> Result<String> {
     encode(&SessionEnvelope {
         format_version: SESSION_FORMAT_VERSION,
@@ -829,6 +896,34 @@ fn decode_current_session(value: &str) -> Result<Option<HarnessSession>> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn outdated_plans_do_not_restore_execution_or_block_the_session() {
+        let temporary = tempfile::tempdir().unwrap();
+        let mut store = SqliteStore::open(temporary.path()).unwrap();
+        let mut stored = session("current", "D:/work");
+        stored.active_plan_id = Some("old-plan".into());
+        stored.goal_id = Some("old-goal".into());
+        store.save_session(&stored).unwrap();
+        store
+            .connection
+            .execute(
+                "INSERT INTO plan_record(id,session_id,payload) VALUES('old-plan','current',?1)",
+                [r#"{"id":"old-plan","schema_version":4}"#],
+            )
+            .unwrap();
+        store.connection.execute("INSERT INTO plan_execution_record(id,session_id,payload) VALUES('old-execution','current',?1)",
+            [r#"{"id":"old-execution","goal_id":"old-goal","schema_version":4}"#]).unwrap();
+        assert!(store.list_plan("current").unwrap().is_empty());
+        assert!(store.list_plan_execution("current").unwrap().is_empty());
+        let reopened = store.load_session("current").unwrap().unwrap();
+        assert!(reopened.active_plan_id.is_none() && reopened.goal_id.is_none());
+        assert_eq!(reopened.name, "current");
+        let leased = store
+            .acquire_session_lease("current", "client", 10)
+            .unwrap();
+        assert!(leased.active_plan_id.is_none() && leased.goal_id.is_none());
+    }
 
     fn session(id: &str, workspace: &str) -> HarnessSession {
         HarnessSession {

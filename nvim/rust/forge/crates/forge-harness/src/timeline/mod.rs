@@ -639,7 +639,7 @@ mod test {
                 after_exchange_id: Some("second".into()),
                 occurred_at_ms: 120,
                 event: PlanExecutionLifecycleEvent::TaskCompleted {
-                    task_path: "/tasks/0".into(),
+                    task_path: "/stages/0/tasks/0".into(),
                     ordinal: 1,
                     total: 1,
                     title: "Task".into(),
@@ -671,11 +671,11 @@ mod test {
             exchanges.push(exchange);
         }
         assert_eq!(
-            execution.task_duration_ms("/tasks/0", exchanges.iter(), 120),
+            execution.task_duration_ms("/stages/0/tasks/0", exchanges.iter(), 120),
             30
         );
         assert_eq!(
-            execution.task_duration_ms("/tasks/0", exchanges.iter(), 5),
+            execution.task_duration_ms("/stages/0/tasks/0", exchanges.iter(), 5),
             0
         );
         super::planning::attach(&mut exchanges, &[], Vec::new(), vec![execution], Vec::new(), &[], &[]);

@@ -222,7 +222,13 @@ fn schema_violation(error: &ValidationError<'_>, schema: &Value) -> ControlToolV
 
 fn plan_edit_schema_hint(path: &str, code: &str, kind: &ValidationErrorKind) -> Option<String> {
     let edit_path = path.strip_prefix("proposed_changes.").unwrap_or(path);
-    let collection = ["entity_changes", "dependencies", "flows", "tasks"]
+    if ["tasks", "set.tasks", "rename.tasks", "delete.tasks"]
+        .iter()
+        .any(|prefix| edit_path == *prefix || edit_path.starts_with(&format!("{prefix}.")))
+    {
+        return Some("Replace the complete task tree under `stages`, with stable stage and task IDs, task `requires`, and each task's files and subtasks.".into());
+    }
+    let collection = ["entity_changes", "dependencies", "flows"]
         .into_iter()
         .find(|collection| {
             edit_path == *collection

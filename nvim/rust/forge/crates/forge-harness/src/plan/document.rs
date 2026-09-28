@@ -579,16 +579,28 @@ impl JsonSchema for PlanFile {
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct PlanTask {
+    pub id: String,
+    pub requires: Vec<String>,
     pub title: String,
     pub description: String,
     pub files: Vec<PlanFile>,
 }
 
 pub const PROVISIONAL_PLAN_TITLE: &str = "Planning in progress";
-pub const PLAN_SCHEMA_VERSION: u32 = 4;
+pub const PLAN_SCHEMA_VERSION: u32 = 5;
+
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Owns independent tasks behind an ordered execution barrier.
+pub struct PlanStage {
+    pub id: String,
+    pub title: String,
+    pub tasks: Vec<PlanTask>,
+}
 
 /// Owns the complete canonical plan consumed by review and execution.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
 pub struct PlanDocument {
     pub schema_version: u32,
     pub version: u64,
@@ -605,12 +617,78 @@ pub struct PlanDocument {
     #[serde(default)]
     pub flows: Vec<PlanFlow>,
     #[serde(default)]
-    pub tasks: Vec<PlanTask>,
+    pub stages: Vec<PlanStage>,
     #[serde(default)]
     pub assumptions: Vec<String>,
 }
 
 impl PlanDocument {
+    /// Visit executable tasks in stage order.
+    pub fn tasks(&self) -> impl Iterator<Item = &PlanTask> {
+        self.stages.iter().flat_map(|stage| &stage.tasks)
+    }
+
+    /// Resolve an execution ordinal into its canonical address.
+    pub fn task_path(&self, ordinal: usize) -> String {
+        let mut remaining = ordinal;
+        for (stage_index, stage) in self.stages.iter().enumerate() {
+            if remaining < stage.tasks.len() {
+                return format!("/stages/{stage_index}/tasks/{remaining}");
+            }
+            remaining -= stage.tasks.len();
+        }
+        panic!("canonical task ordinal is out of bounds");
+    }
+
+    /// Resolve a stable task identity into its current address and value.
+    pub fn task_by_id(&self, id: &str) -> Option<(String, &PlanTask)> {
+        self.tasks()
+            .enumerate()
+            .find(|(_, task)| task.id == id)
+            .map(|(ordinal, task)| (self.task_path(ordinal), task))
+    }
+
+    /// Resolve a canonical task pointer without accepting descendant paths.
+    pub fn task_at(&self, pointer: &str) -> Option<&PlanTask> {
+        let parts = pointer.split('/').collect::<Vec<_>>();
+        if parts.len() != 5 || !parts[0].is_empty() || parts[1] != "stages" || parts[3] != "tasks" {
+            return None;
+        }
+        let stage: usize = parts[2].parse().ok()?;
+        let task: usize = parts[4].parse().ok()?;
+        if pointer != format!("/stages/{stage}/tasks/{task}") {
+            return None;
+        }
+        self.stages.get(stage)?.tasks.get(task)
+    }
+
+    /// Produce a positional reviewer label independent of stable identity.
+    pub fn task_label(&self, id: &str) -> Option<String> {
+        self.task_by_id(id)
+            .and_then(|(path, _)| Self::label_for_path(&path))
+    }
+
+    /// Format a revision-scoped task address for execution history.
+    pub fn label_for_path(path: &str) -> Option<String> {
+        let parts = path.split('/').collect::<Vec<_>>();
+        if parts.len() == 5 && parts[0].is_empty() && parts[1] == "stages" && parts[3] == "tasks" {
+            let stage_index: usize = parts[2].parse().ok()?;
+            let task_index: usize = parts[4].parse().ok()?;
+            let mut number = task_index.checked_add(1)?;
+            let mut suffix = Vec::new();
+            while number > 0 {
+                number -= 1;
+                suffix.push((b'a' + (number % 26) as u8) as char);
+                number /= 26;
+            }
+            return Some(format!(
+                "{}{}",
+                stage_index.checked_add(1)?,
+                suffix.into_iter().rev().collect::<String>()
+            ));
+        }
+        None
+    }
     /// Validate references and structural invariants after every semantic edit.
     pub fn validate(&self) -> Result<()> {
         validate_plan_edit(self)
@@ -693,7 +771,8 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
                 branches: Vec::new(),
             }],
         }],
-        tasks: vec![PlanTask {
+        stages: vec![PlanStage { id: "foundation".into(), title: "Establish plan state".into(), tasks: vec![PlanTask {
+            id: "plan-state".into(), requires: Vec::new(),
             title: "Create plan state".into(),
             description: "Give planning one owner.".into(),
             files: vec![PlanFile {
@@ -706,7 +785,7 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
                     entities: vec!["PlanDocument".into()],
                 })],
             }],
-        }],
+        }] }],
         assumptions: Vec::new(),
     }
 }
@@ -739,14 +818,14 @@ pub(crate) fn integration_test_subtask_fixture() -> PlanSubtask {
 
 #[cfg(test)]
 pub(crate) fn attach_test_fixture(document: &mut PlanDocument) {
-    document.tasks[0].files[0]
+    document.stages[0].tasks[0].files[0]
         .subtasks
         .push(test_subtask_fixture());
 }
 
 #[cfg(test)]
 pub(crate) fn attach_integration_test_fixture(document: &mut PlanDocument) {
-    document.tasks[0].files.push(PlanFile {
+    document.stages[0].tasks[0].files.push(PlanFile {
         change: PlanFileChange::Add {
             path: "tests/plan_submission.rs".into(),
         },
@@ -1013,6 +1092,6 @@ mod test {
         let mut document = test_fixture("plan", "Version plans.");
         document.schema_version = PLAN_SCHEMA_VERSION + 1;
         let unsupported = document.validate().unwrap_err().to_string();
-        assert!(unsupported.contains("supported PlanDocument schema version 4"));
+        assert!(unsupported.contains("supported PlanDocument schema version 5"));
     }
 }

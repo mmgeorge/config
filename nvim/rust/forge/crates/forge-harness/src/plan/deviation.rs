@@ -158,7 +158,7 @@ mod test {
             disposition: PlanDeviationDisposition::AutoApproved,
             summary: "Change overview".into(),
             reason: "Repository evidence changed.".into(),
-            task_path: Some("/tasks/0".into()),
+            task_path: Some("/stages/0/tasks/0".into()),
             subtask_path: None,
             affected_paths: Vec::new(),
             proposed_changes: PlanMutation {

@@ -484,7 +484,9 @@ mod test {
                             "extends": null,
                             "conforms_to": []
                         }],
-                        "tasks": [{
+                    },
+                    "stages": [{"id": "foundation", "title": "Establish plan state", "tasks": [{
+                            "id": "plan-state", "requires": [],
                             "title": "Create plan state",
                             "description": "Give planning one owner.",
                             "files": [{
@@ -505,7 +507,7 @@ mod test {
                                 }]
                             }]
                         }]
-                    }
+                    }]
                 }),
             })
             .await
@@ -534,18 +536,20 @@ mod test {
                     .into(),
             },
         );
-        context.plan_document.as_mut().unwrap().tasks[0].files.push(
-            serde_json::from_value(json!({
-                "action": "modify",
-                    "path": "Cargo.toml",
-                    "subtasks": [{
-                        "operation": "configure",
-                    "description": "the invalid dependency requirement.",
-                    "entities": []
-                }]
-            }))
-            .unwrap(),
-        );
+        context.plan_document.as_mut().unwrap().stages[0].tasks[0]
+            .files
+            .push(
+                serde_json::from_value(json!({
+                    "action": "modify",
+                        "path": "Cargo.toml",
+                        "subtasks": [{
+                            "operation": "configure",
+                        "description": "the invalid dependency requirement.",
+                        "entities": []
+                    }]
+                }))
+                .unwrap(),
+            );
         let mut runtime = ControlToolRuntime::new(context);
 
         let error = runtime
@@ -588,18 +592,20 @@ mod test {
                     .into(),
             },
         );
-        context.plan_document.as_mut().unwrap().tasks[0].files.push(
-            serde_json::from_value(json!({
-                "action": "modify",
-                "path": "Cargo.toml",
-                "subtasks": [{
-                    "operation": "configure",
-                    "description": "the DataFusion dependency.",
-                    "entities": []
-                }]
-            }))
-            .unwrap(),
-        );
+        context.plan_document.as_mut().unwrap().stages[0].tasks[0]
+            .files
+            .push(
+                serde_json::from_value(json!({
+                    "action": "modify",
+                    "path": "Cargo.toml",
+                    "subtasks": [{
+                        "operation": "configure",
+                        "description": "the DataFusion dependency.",
+                        "entities": []
+                    }]
+                }))
+                .unwrap(),
+            );
         let mut runtime = ControlToolRuntime::new(context);
 
         let result = runtime

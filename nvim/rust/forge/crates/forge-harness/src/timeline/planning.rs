@@ -479,9 +479,9 @@ mod tests {
             "id":"execution", "session_id":"session", "plan_id":"plan", "goal_id":"goal",
             "state":"active", "created_at_ms":1, "lifecycle":[
                 {"anchor":anchor, "sequence":1,"after_exchange_id":"exchange","occurred_at_ms":10,
-                 "kind":"task_completed","task_path":"/tasks/0","ordinal":1,"total":2,"title":"First","elapsed_ms":0},
+                 "kind":"task_completed","task_path":"/stages/0/tasks/0","ordinal":1,"total":2,"title":"First","elapsed_ms":0},
                 {"anchor":anchor, "sequence":2,"after_exchange_id":"exchange","occurred_at_ms":10,
-                 "kind":"task_started","task_path":"/tasks/1","ordinal":2,"total":2,"title":"Second"},
+                 "kind":"task_started","task_path":"/stages/0/tasks/1","ordinal":2,"total":2,"title":"Second"},
                 {"anchor":anchor, "sequence":3,"after_exchange_id":"exchange","occurred_at_ms":10,
                  "kind":"deviation_recorded","deviation_id":"deviation","summary":"Scope decision"}
             ]

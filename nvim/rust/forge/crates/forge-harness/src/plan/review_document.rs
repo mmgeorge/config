@@ -785,7 +785,7 @@ mod tests {
         summary.name = "DiagnosticSummary".into();
         canonical.entity_changes.push(summary);
         if let crate::plan::document::PlanSubtask::Work(subtask) =
-            &mut canonical.tasks[0].files[0].subtasks[0]
+            &mut canonical.stages[0].tasks[0].files[0].subtasks[0]
         {
             subtask.entities.push("DiagnosticSummary".into());
         }

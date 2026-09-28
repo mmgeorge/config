@@ -225,6 +225,7 @@ pub(crate) fn project(
         }
         let text = BufferText::from_rows(body.text.slice(range.clone())?)?;
         header.metadata.fold = vec![FoldRange {
+            heading_start: None,
             collapse_children: false,
             id: FoldId(header.id.0.clone()),
             start: TextPosition { row: 0, column: 0 },

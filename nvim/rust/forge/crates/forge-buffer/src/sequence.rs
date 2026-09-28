@@ -304,6 +304,22 @@ impl BlockSequence {
             let block = resolve(owner).ok_or(ContractError("fold owner is absent"))?;
             let start_index = position(owner).ok_or(ContractError("fold owner has no position"))?;
             for fold in &block.metadata.fold {
+                if let Some(heading) = &fold.heading_start {
+                    let heading_block =
+                        resolve(&heading.block).ok_or(ContractError("fold heading was removed"))?;
+                    let heading_index = position(&heading.block)
+                        .ok_or(ContractError("fold heading has no position"))?;
+                    crate::block::TextRange {
+                        start: heading.position,
+                        end: heading.position,
+                    }
+                    .validate(&heading_block.text)?;
+                    if heading_index > start_index
+                        || (heading_index == start_index && heading.position > fold.start)
+                    {
+                        return Err(ContractError("fold heading follows its start"));
+                    }
+                }
                 let endpoint =
                     resolve(&fold.end.block).ok_or(ContractError("fold endpoint was removed"))?;
                 let end_index = position(&fold.end.block)
@@ -488,6 +504,12 @@ impl BlockSequence {
         }
         for fold in &block.metadata.fold {
             self.fold_owner.insert(fold.id.clone(), block.id.clone());
+            if let Some(heading) = &fold.heading_start {
+                self.fold_endpoint
+                    .entry(heading.block.clone())
+                    .or_default()
+                    .insert(block.id.clone());
+            }
             self.fold_endpoint
                 .entry(fold.end.block.clone())
                 .or_default()
@@ -519,6 +541,14 @@ impl BlockSequence {
             }
             for fold in node.block.metadata.fold {
                 self.fold_owner.remove(&fold.id);
+                if let Some(heading) = &fold.heading_start {
+                    if let Some(owners) = self.fold_endpoint.get_mut(&heading.block) {
+                        owners.remove(&node.block.id);
+                        if owners.is_empty() {
+                            self.fold_endpoint.remove(&heading.block);
+                        }
+                    }
+                }
                 if let Some(owners) = self.fold_endpoint.get_mut(&fold.end.block) {
                     owners.remove(&node.block.id);
                     if owners.is_empty() {
@@ -755,10 +785,30 @@ mod tests {
     }
 
     #[test]
+    fn wrapped_fold_headings_remain_valid_across_splices() {
+        use crate::block::{BlockAnchor, FoldRange};
+        let mut owner = block(2, 1);
+        owner.metadata.fold.push(FoldRange {
+            heading_start: Some(BlockAnchor { block: BlockId("block-1".into()), position: TextPosition { row: 0, column: 0 } }),
+            collapse_children: false,
+            id: FoldId("task".into()),
+            start: TextPosition { row: 0, column: 0 },
+            end: BlockAnchor { block: BlockId("block-3".into()), position: TextPosition { row: 1, column: 0 } },
+            closed: true,
+        });
+        let mut sequence = BlockSequence::new(vec![block(1, 1), owner, block(3, 1)]).unwrap();
+        assert!(sequence.splice(0..1, vec![]).is_err());
+        sequence.splice(0..1, vec![block(1, 2)]).unwrap();
+        sequence.splice(0..3, vec![]).unwrap();
+        assert!(sequence.fold_endpoint.is_empty());
+    }
+
+    #[test]
     fn fold_endpoint_edits_are_validated_before_publication() {
         use crate::block::{BlockAnchor, FoldRange};
         let mut first = block(1, 1);
         first.metadata.fold.push(FoldRange {
+            heading_start: None,
             collapse_children: false,
             id: FoldId("section".into()),
             start: TextPosition { row: 0, column: 0 },

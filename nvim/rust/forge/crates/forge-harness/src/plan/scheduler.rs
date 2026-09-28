@@ -1,4 +1,4 @@
-use super::document::{PlanDocument, PlanSubtask, PlanTask};
+use super::document::{PlanDocument, PlanSubtask, PlanTask, ProgramEntityChange};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
@@ -35,6 +35,11 @@ pub struct PlanTestResult {
 /// Tracks granular evidence while one complete task remains the scheduling unit.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanTaskExecution {
+    pub task_id: String,
+    pub stage_id: String,
+    pub plan_version: u64,
+    pub definition: PlanTask,
+    pub entity_changes: Vec<ProgramEntityChange>,
     pub task_path: String,
     pub state: PlanTaskState,
     #[serde(default)]
@@ -57,6 +62,8 @@ pub struct PlanTaskExecution {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanTaskReport {
     pub execution_id: String,
+    pub task_id: String,
+    pub plan_version: u64,
     pub task_path: String,
     pub state: PlanTaskState,
     #[serde(default)]
@@ -86,11 +93,32 @@ impl PlanScheduler {
             plan_id: document.plan_id.clone(),
             plan_version: document.version,
             task: document
-                .tasks
-                .iter()
+                .tasks()
                 .enumerate()
-                .map(|(task_index, _)| PlanTaskExecution {
-                    task_path: task_pointer(task_index),
+                .map(|(task_index, task)| PlanTaskExecution {
+                    task_id: task.id.clone(),
+                    stage_id: document
+                        .stages
+                        .iter()
+                        .find(|stage| stage.tasks.iter().any(|candidate| candidate.id == task.id))
+                        .expect("task belongs to stage")
+                        .id
+                        .clone(),
+                    plan_version: document.version,
+                    definition: task.clone(),
+                    entity_changes: document
+                        .entity_changes
+                        .iter()
+                        .filter(|entity| {
+                            task.files
+                                .iter()
+                                .flat_map(|file| &file.subtasks)
+                                .flat_map(PlanSubtask::owned_entities)
+                                .any(|name| name == &entity.name)
+                        })
+                        .cloned()
+                        .collect(),
+                    task_path: document.task_path(task_index),
                     state: PlanTaskState::Pending,
                     started_at_ms: None,
                     completed_at_ms: None,
@@ -111,6 +139,13 @@ impl PlanScheduler {
         document: &'a PlanDocument,
         now_ms: i64,
     ) -> Option<&'a PlanTask> {
+        if self
+            .task
+            .iter()
+            .any(|task| matches!(task.state, PlanTaskState::Active | PlanTaskState::Blocked))
+        {
+            return None;
+        }
         let (task_index, execution) = self
             .task
             .iter_mut()
@@ -118,7 +153,83 @@ impl PlanScheduler {
             .find(|(_, task)| task.state == PlanTaskState::Pending)?;
         execution.state = PlanTaskState::Active;
         execution.started_at_ms = Some(now_ms);
-        document.tasks.get(task_index)
+        document.tasks().nth(task_index)
+    }
+
+    /// Adopt validated remaining work without reassigning persisted completion.
+    pub fn reconcile(&mut self, document: &PlanDocument) -> anyhow::Result<()> {
+        document.validate_for_submission()?;
+        anyhow::ensure!(
+            self.plan_id == document.plan_id,
+            "cannot reconcile a different plan"
+        );
+        let mut updated = Self::activate(document);
+        for stage in &document.stages {
+            let previous = self
+                .task
+                .iter()
+                .filter(|task| task.stage_id == stage.id)
+                .collect::<Vec<_>>();
+            if !previous.is_empty()
+                && previous
+                    .iter()
+                    .all(|task| task.state == PlanTaskState::Complete)
+            {
+                anyhow::ensure!(
+                    stage.tasks.len() == previous.len(),
+                    "cannot add work to a completed stage"
+                );
+            }
+        }
+        for (ordinal, prior) in self.task.iter().enumerate() {
+            let next = updated
+                .task
+                .iter_mut()
+                .find(|task| task.task_id == prior.task_id);
+            if prior.state == PlanTaskState::Complete {
+                let next = next.ok_or_else(|| {
+                    anyhow::anyhow!("cannot remove completed task {}", prior.task_id)
+                })?;
+                anyhow::ensure!(
+                    next.definition == prior.definition
+                        && next.entity_changes == prior.entity_changes
+                        && next.task_path == prior.task_path
+                        && next.stage_id == prior.stage_id,
+                    "cannot redefine or move completed task {}",
+                    prior.task_id
+                );
+                anyhow::ensure!(
+                    document
+                        .tasks()
+                        .nth(ordinal)
+                        .is_some_and(|task| task.id == prior.task_id),
+                    "cannot insert unfinished work before completed tasks"
+                );
+                *next = prior.clone();
+            } else if let Some(next) = next {
+                let path = next.task_path.clone();
+                if matches!(prior.state, PlanTaskState::Active | PlanTaskState::Blocked) {
+                    anyhow::ensure!(path == prior.task_path, "cannot move the active task");
+                }
+                if next.definition == prior.definition
+                    && next.entity_changes == prior.entity_changes
+                    && path == prior.task_path
+                {
+                    *next = prior.clone();
+                    next.plan_version = document.version;
+                } else if matches!(prior.state, PlanTaskState::Active | PlanTaskState::Blocked) {
+                    next.state = prior.state;
+                    next.started_at_ms = prior.started_at_ms;
+                }
+            } else {
+                anyhow::ensure!(
+                    prior.state == PlanTaskState::Pending,
+                    "cannot remove the active task"
+                );
+            }
+        }
+        *self = updated;
+        Ok(())
     }
 
     /// Reactivate the blocked task while retaining its accumulated execution evidence.
@@ -169,12 +280,22 @@ impl PlanScheduler {
             self.plan_id == document.plan_id && self.plan_version == document.version,
             "scheduler does not target this plan revision"
         );
-        let task_index = task_index_from_pointer(&report.task_path)
-            .ok_or_else(|| anyhow::anyhow!("canonical task path is invalid"))?;
+        anyhow::ensure!(
+            report.plan_version == document.version,
+            "task report plan version is stale"
+        );
+        let task_index = self
+            .task
+            .iter()
+            .position(|task| task.task_id == report.task_id)
+            .ok_or_else(|| anyhow::anyhow!("canonical task id is invalid"))?;
         let planned_task = document
-            .tasks
-            .get(task_index)
+            .task_at(&report.task_path)
             .ok_or_else(|| anyhow::anyhow!("canonical task not found"))?;
+        anyhow::ensure!(
+            planned_task.id == report.task_id,
+            "task id and path disagree"
+        );
         validate_task_evidence(document, task_index, planned_task, &report)?;
         let task = self
             .task
@@ -215,7 +336,10 @@ fn validate_task_evidence(
                 .iter()
                 .enumerate()
                 .map(move |(subtask_index, _)| {
-                    subtask_pointer(task_index, file_index, subtask_index)
+                    format!(
+                        "{}/files/{file_index}/subtasks/{subtask_index}",
+                        document.task_path(task_index)
+                    )
                 })
         })
         .collect::<HashSet<_>>();
@@ -253,7 +377,10 @@ fn validate_task_evidence(
                 .enumerate()
                 .filter(|(_, subtask)| subtask.test().is_some())
                 .map(move |(subtask_index, _)| {
-                    subtask_pointer(task_index, file_index, subtask_index)
+                    format!(
+                        "{}/files/{file_index}/subtasks/{subtask_index}",
+                        document.task_path(task_index)
+                    )
                 })
         })
         .collect::<HashSet<_>>();
@@ -319,18 +446,6 @@ fn validate_task_evidence(
     Ok(())
 }
 
-fn task_pointer(task_index: usize) -> String {
-    format!("/tasks/{task_index}")
-}
-
-fn task_index_from_pointer(pointer: &str) -> Option<usize> {
-    pointer.strip_prefix("/tasks/")?.parse().ok()
-}
-
-fn subtask_pointer(task_index: usize, file_index: usize, subtask_index: usize) -> String {
-    format!("/tasks/{task_index}/files/{file_index}/subtasks/{subtask_index}")
-}
-
 fn entity_pointer(entity_index: usize) -> String {
     format!("/entity_changes/{entity_index}")
 }
@@ -340,16 +455,96 @@ mod test {
     use super::*;
 
     #[test]
+    fn staged_execution_preserves_identity_and_rejects_stale_evidence() {
+        use super::super::document::*;
+        let mut document = test_fixture("plan", "Overview");
+        let mut stage = PlanStage {
+            id: "implementation".into(),
+            title: "Implement consumers".into(),
+            tasks: Vec::new(),
+        };
+        for id in ["Reader", "Writer"] {
+            let mut entity = document.entity_changes[0].clone();
+            entity.name = id.into();
+            entity.path = format!("src/{id}.rs");
+            let mut task = document.stages[0].tasks[0].clone();
+            task.id = id.into();
+            task.title = format!("Implement {id}");
+            task.requires = vec!["plan-state".into()];
+            task.files[0].change = PlanFileChange::Add {
+                path: entity.path.clone(),
+            };
+            *task.files[0].subtasks[0].owned_entities_mut().unwrap() = vec![id.into()];
+            stage.tasks.push(task);
+            document.entity_changes.push(entity);
+        }
+        document.stages.push(stage);
+        document.validate_for_submission().unwrap();
+        let mut scheduler = PlanScheduler::activate(&document);
+        scheduler.next_task(&document, 1).unwrap();
+        assert!(scheduler.next_task(&document, 2).is_none());
+        for ordinal in 0..3 {
+            let task = document.tasks().nth(ordinal).unwrap();
+            let report = PlanTaskReport {
+                execution_id: "execution".into(),
+                task_id: task.id.clone(),
+                plan_version: document.version,
+                task_path: document.task_path(ordinal),
+                state: PlanTaskState::Complete,
+                completed_subtask_paths: vec![format!(
+                    "{}/files/0/subtasks/0",
+                    document.task_path(ordinal)
+                )],
+                completed_entity_paths: vec![format!("/entity_changes/{ordinal}")],
+                test_results: Vec::new(),
+                changed_paths: vec![task.files[0].change.path().into()],
+                summary: Some("Complete".into()),
+                blocking_reason: None,
+            };
+            let mut stale = report.clone();
+            stale.plan_version = 0;
+            assert!(scheduler.apply_report(&document, stale, 3).is_err());
+            if ordinal == 1 {
+                assert_eq!(document.task_label(&task.id).as_deref(), Some("2a"));
+                let mut changed = document.clone();
+                changed.version += 1;
+                changed.stages[1].tasks[0].description =
+                    "Implement the revised reader contract.".into();
+                scheduler.reconcile(&changed).unwrap();
+                assert!(
+                    scheduler
+                        .apply_report(&document, report.clone(), 3)
+                        .is_err()
+                );
+                scheduler.reconcile(&document).unwrap();
+            }
+            scheduler
+                .apply_report(&document, report, ordinal as i64 + 3)
+                .unwrap();
+            scheduler = serde_json::from_value(serde_json::to_value(&scheduler).unwrap()).unwrap();
+        }
+        assert!(scheduler.is_complete());
+        let mut altered = document.clone();
+        altered.stages[0].tasks[0].description = "Different completed work".into();
+        assert!(scheduler.reconcile(&altered).is_err());
+        assert_eq!(scheduler.task[0].definition, document.stages[0].tasks[0]);
+    }
+
+    #[test]
     fn resumption_reactivates_the_blocked_task_without_skipping_or_erasing_evidence() {
         let mut document = super::super::document::test_fixture("plan", "Overview");
-        document.tasks.push(document.tasks[0].clone());
+        let mut second = document.stages[0].tasks[0].clone();
+        second.id = "second".into();
+        document.stages[0].tasks.push(second);
         let mut scheduler = PlanScheduler::activate(&document);
         scheduler.next_task(&document, 10).unwrap();
         let mut report = PlanTaskReport {
+            task_id: "plan-state".into(),
+            plan_version: 1,
             execution_id: "execution".into(),
-            task_path: "/tasks/0".into(),
+            task_path: "/stages/0/tasks/0".into(),
             state: PlanTaskState::Blocked,
-            completed_subtask_paths: vec!["/tasks/0/files/0/subtasks/0".into()],
+            completed_subtask_paths: vec!["/stages/0/tasks/0/files/0/subtasks/0".into()],
             completed_entity_paths: vec!["/entity_changes/0".into()],
             test_results: Vec::new(),
             changed_paths: vec!["src/plan.rs".into()],
@@ -393,10 +588,12 @@ mod test {
             .apply_report(
                 &document,
                 PlanTaskReport {
+                    task_id: "plan-state".into(),
+                    plan_version: 1,
                     execution_id: "execution".into(),
-                    task_path: "/tasks/0".into(),
+                    task_path: "/stages/0/tasks/0".into(),
                     state: PlanTaskState::Complete,
-                    completed_subtask_paths: vec!["/tasks/0/files/0/subtasks/0".into()],
+                    completed_subtask_paths: vec!["/stages/0/tasks/0/files/0/subtasks/0".into()],
                     completed_entity_paths: vec!["/entity_changes/0".into()],
                     test_results: Vec::new(),
                     changed_paths: vec!["src/plan.rs".into()],
@@ -409,7 +606,7 @@ mod test {
         assert!(scheduler.is_complete());
         assert_eq!(
             scheduler.task[0].completed_subtask_paths,
-            ["/tasks/0/files/0/subtasks/0"]
+            ["/stages/0/tasks/0/files/0/subtasks/0"]
         );
         assert_eq!(scheduler.task[0].started_at_ms, Some(10));
         assert_eq!(scheduler.task[0].completed_at_ms, Some(20));
@@ -426,16 +623,18 @@ mod test {
             .apply_report(
                 &document,
                 PlanTaskReport {
+                    task_id: "plan-state".into(),
+                    plan_version: 1,
                     execution_id: "execution".into(),
-                    task_path: "/tasks/0".into(),
+                    task_path: "/stages/0/tasks/0".into(),
                     state: PlanTaskState::Complete,
                     completed_subtask_paths: vec![
-                        "/tasks/0/files/0/subtasks/0".into(),
-                        "/tasks/0/files/0/subtasks/1".into(),
+                        "/stages/0/tasks/0/files/0/subtasks/0".into(),
+                        "/stages/0/tasks/0/files/0/subtasks/1".into(),
                     ],
                     completed_entity_paths: vec!["/entity_changes/0".into()],
                     test_results: vec![PlanTestResult {
-                        test_subtask_path: Some("/tasks/0/files/0/subtasks/1".into()),
+                        test_subtask_path: Some("/stages/0/tasks/0/files/0/subtasks/1".into()),
                         status: PlanTestStatus::Passed,
                         command: Some("cargo test validates_plans".into()),
                         detail: None,
@@ -452,26 +651,29 @@ mod test {
             scheduler.task[0].test_results[0]
                 .test_subtask_path
                 .as_deref(),
-            Some("/tasks/0/files/0/subtasks/1")
+            Some("/stages/0/tasks/0/files/0/subtasks/1")
         );
     }
 
     #[test]
     fn timestamps_each_whole_task_once_across_scheduler_transitions() {
         let mut document = super::super::document::test_fixture("plan", "Overview");
-        let mut second_task = document.tasks[0].clone();
+        let mut second_task = document.stages[0].tasks[0].clone();
         second_task.title = "Second task".into();
-        document.tasks.push(second_task);
+        second_task.id = "second".into();
+        document.stages[0].tasks.push(second_task);
         let mut scheduler = PlanScheduler::activate(&document);
         scheduler.next_task(&document, 10).unwrap();
         let next_task = scheduler
             .apply_report(
                 &document,
                 PlanTaskReport {
+                    task_id: "plan-state".into(),
+                    plan_version: 1,
                     execution_id: "execution".into(),
-                    task_path: "/tasks/0".into(),
+                    task_path: "/stages/0/tasks/0".into(),
                     state: PlanTaskState::Complete,
-                    completed_subtask_paths: vec!["/tasks/0/files/0/subtasks/0".into()],
+                    completed_subtask_paths: vec!["/stages/0/tasks/0/files/0/subtasks/0".into()],
                     completed_entity_paths: vec!["/entity_changes/0".into()],
                     test_results: Vec::new(),
                     changed_paths: Vec::new(),

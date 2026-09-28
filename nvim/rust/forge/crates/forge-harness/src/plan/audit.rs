@@ -14,6 +14,9 @@ pub struct PlanAuditPathDifference {
 /// Reports the final execution state and evidence of one planned task.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanAuditTask {
+    pub task_id: String,
+    pub label: String,
+    pub plan_version: u64,
     pub task_path: String,
     pub state: PlanTaskState,
     pub completed_subtask_paths: Vec<String>,
@@ -48,8 +51,7 @@ pub fn build_plan_audit(
     created_at_ms: i64,
 ) -> PlanAudit {
     let planned_paths = document
-        .tasks
-        .iter()
+        .tasks()
         .flat_map(|task| {
             task.files.iter().flat_map(|file| {
                 file.change
@@ -99,6 +101,9 @@ pub fn build_plan_audit(
             .task
             .iter()
             .map(|task| PlanAuditTask {
+                task_id: task.task_id.clone(),
+                label: PlanDocument::label_for_path(&task.task_path).unwrap_or_default(),
+                plan_version: task.plan_version,
                 task_path: task.task_path.clone(),
                 state: task.state,
                 completed_subtask_paths: task.completed_subtask_paths.clone(),

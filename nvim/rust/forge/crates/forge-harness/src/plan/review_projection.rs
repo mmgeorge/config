@@ -184,6 +184,7 @@ pub(crate) fn project(
             },
         };
         block[start_block].metadata.fold.push(FoldRange {
+            heading_start: None,
             collapse_children: false,
             id: FoldId(format!("plan:heading:{source_row}")),
             start: TextPosition { row: 0, column: 0 },
@@ -212,25 +213,52 @@ pub(crate) fn project(
                 column: 0,
             },
         };
-        let fold_start_row = source
+        let anchor = source
             .rendered
             .navigation
             .anchor
             .iter()
             .find(|anchor| anchor.line as usize == source_start)
-            .is_some_and(|anchor| matches!(anchor.target, PlanReviewTarget::Subtask { .. }))
-            .then_some(0)
-            .unwrap_or(1);
-        block[row_block[start]].metadata.fold.push(FoldRange {
-            collapse_children: false,
-            id: FoldId(format!("plan:task:{source_start}")),
-            start: TextPosition {
-                row: fold_start_row,
-                column: 0,
-            },
-            end: endpoint,
-            closed: false,
+            .expect("fold owner");
+        let heading_end = source
+            .rendered
+            .navigation
+            .anchor
+            .iter()
+            .filter(|next| next.json_path == anchor.json_path)
+            .map(|next| source_output[&(next.line as usize)].end)
+            .max()
+            .unwrap_or(start + 1);
+        let (fold_id, closed) = match &anchor.target {
+            PlanReviewTarget::Stage { id, .. } => (format!("plan:stage:{id}"), false),
+            PlanReviewTarget::Task { .. } => (
+                format!(
+                    "plan:task:{}",
+                    source
+                        .document
+                        .task_at(&anchor.json_path)
+                        .expect("canonical task")
+                        .id
+                ),
+                true,
+            ),
+            _ => (format!("plan:change:{}", anchor.json_path), false),
+        };
+        let heading_start = Some(BlockAnchor {
+            block: block[row_block[start]].id.clone(),
+            position: TextPosition { row: 0, column: 0 },
         });
+        block[row_block[heading_end - 1]]
+            .metadata
+            .fold
+            .push(FoldRange {
+                heading_start,
+                collapse_children: false,
+                id: FoldId(fold_id),
+                start: TextPosition { row: 0, column: 0 },
+                end: endpoint,
+                closed,
+            });
     }
     for (source_start, source_end) in file_tree_ranges(
         &source.rendered.navigation.anchor,
@@ -251,6 +279,7 @@ pub(crate) fn project(
             position: TextPosition { row: 0, column: 0 },
         };
         block[row_block[start]].metadata.fold.push(FoldRange {
+            heading_start: None,
             id: FoldId(format!("plan:file-tree:{source_start}")),
             collapse_children: false,
             start: TextPosition { row: 0, column: 0 },
@@ -582,17 +611,18 @@ fn task_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(usize, usize
     for anchor in anchor {
         let depth = match &anchor.target {
             PlanReviewTarget::Section { .. } => 0,
-            PlanReviewTarget::Task { .. } => 1,
-            PlanReviewTarget::File { .. } if anchor.json_path.starts_with("/tasks/") => 2,
-            PlanReviewTarget::Subtask { .. } => 3,
-            PlanReviewTarget::Test { .. } if anchor.json_path.starts_with("/tasks/") => 3,
+            PlanReviewTarget::Stage { .. } => 1,
+            PlanReviewTarget::Task { .. } => 2,
+            PlanReviewTarget::File { .. } if anchor.json_path.starts_with("/stages/") => 3,
+            PlanReviewTarget::Subtask { .. } => 4,
+            PlanReviewTarget::Test { .. } if anchor.json_path.starts_with("/stages/") => 4,
             _ => continue,
         };
         if let Some((_, _, start, _)) = active
             .last_mut()
             .filter(|(_, path, _, _)| *path == anchor.json_path)
         {
-            *start = anchor.line as usize;
+            let _ = start;
             continue;
         }
         while active
@@ -607,7 +637,9 @@ fn task_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(usize, usize
         if depth > 0 {
             let fold = matches!(
                 anchor.target,
-                PlanReviewTarget::Task { .. } | PlanReviewTarget::Subtask { .. }
+                PlanReviewTarget::Stage { .. }
+                    | PlanReviewTarget::Task { .. }
+                    | PlanReviewTarget::Subtask { .. }
             );
             active.push((depth, &anchor.json_path, anchor.line as usize, fold));
         }
@@ -1090,24 +1122,24 @@ mod tests {
             &[
                 anchor(
                     1,
-                    "/tasks/0",
+                    "/stages/0/tasks/0",
                     super::PlanReviewTarget::Task {
                         title: "first".into(),
                     },
                 ),
                 anchor(
                     2,
-                    "/tasks/0/files/0",
+                    "/stages/0/tasks/0/files/0",
                     super::PlanReviewTarget::File { path: "a".into() },
                 ),
                 anchor(
                     3,
-                    "/tasks/0/files/0/subtasks/0",
+                    "/stages/0/tasks/0/files/0/subtasks/0",
                     super::PlanReviewTarget::Subtask { path: "a".into() },
                 ),
                 anchor(
                     4,
-                    "/tasks/0/files/0/subtasks/0",
+                    "/stages/0/tasks/0/files/0/subtasks/0",
                     super::PlanReviewTarget::Subtask { path: "a".into() },
                 ),
                 anchor(
@@ -1119,7 +1151,7 @@ mod tests {
                 ),
                 anchor(
                     7,
-                    "/tasks/1",
+                    "/stages/0/tasks/1",
                     super::PlanReviewTarget::Task {
                         title: "second".into(),
                     },
@@ -1127,7 +1159,7 @@ mod tests {
             ],
             10,
         );
-        assert_eq!(ranges, [(4, 7), (1, 7), (7, 10)]);
+        assert_eq!(ranges, [(3, 7), (1, 7), (7, 10)]);
     }
     use super::*;
     use crate::plan::{PlanAnnotationInput, PlanFileStore};
@@ -1138,10 +1170,11 @@ mod tests {
     fn projected_annotations_keep_literal_text_and_exact_canonical_source_rows() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path(), temporary.path());
-        let canonical = crate::plan::document::test_fixture(
+        let mut canonical = crate::plan::document::test_fixture(
             "plan",
             "A **bold** overview with several wrapping words",
         );
+        canonical.stages[0].tasks[0].title = "Implement the canonical plan state and preserve every source anchor across repeated inspection and execution transitions without losing evidence".into();
         store
             .write_working_document("session", "plan", &canonical)
             .unwrap();
@@ -1210,6 +1243,31 @@ mod tests {
             }
         }
         assert!(owner_count > 0);
+        let stage = block
+            .iter()
+            .flat_map(|block| &block.metadata.fold)
+            .find(|fold| fold.id.0.starts_with("plan:stage:"))
+            .unwrap();
+        assert!(!stage.closed);
+        let task_owner = block
+            .iter()
+            .find(|block| {
+                block
+                    .metadata
+                    .fold
+                    .iter()
+                    .any(|fold| fold.id.0.starts_with("plan:task:"))
+            })
+            .unwrap();
+        let task = task_owner
+            .metadata
+            .fold
+            .iter()
+            .find(|fold| fold.id.0.starts_with("plan:task:"))
+            .unwrap();
+        assert!(task.closed);
+        assert_eq!(task.start.row, 0);
+        assert_ne!(task.heading_start.as_ref().unwrap().block, task_owner.id);
         for fold in block.iter().flat_map(|block| &block.metadata.fold) {
             if fold.id.0.starts_with("plan:task:") {
                 let endpoint = block

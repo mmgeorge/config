@@ -24,13 +24,17 @@ local function task_folds(review, owner)
   local state = replica and replica.fold
   local result = {}
   for id, record in pairs(state and state.record or {}) do
-    if id:match("^plan:task:") then
+    if id:match("^plan:task:") or id:match("^plan:stage:") or id:match("^plan:change:") then
       local _, block_row = replica.sequence:position(record.owner)
+      local heading_row = block_row
+      if record.fold.heading_start then
+        heading_row = select(2, replica.sequence:position(record.fold.heading_start.block)) + record.fold.heading_start.position.row
+      end
       local finish_block_row = select(2, replica.sequence:position(record.fold["end"].block))
       result[#result + 1] = {
         id = id,
         owner = record.owner,
-        heading_start_line = block_row + 1,
+        heading_start_line = heading_row + 1,
         start_line = block_row + record.fold.start.row + 1,
         end_line = finish_block_row + record.fold["end"].position.row + 1,
         record = record,
@@ -52,7 +56,7 @@ local function default_closed_folds(review, owner)
   local state = replica and replica.fold
   local result = {}
   for id, record in pairs(state and state.record or {}) do
-    if record.fold.closed then
+    if record.fold.closed and not id:match("^plan:task:") then
       local _, block_row = replica.sequence:position(record.owner)
       local finish_block_row = select(2, replica.sequence:position(record.fold["end"].block))
       result[#result + 1] = {
@@ -86,7 +90,9 @@ local function apply_task_folds(review, window, owner)
     vim.list_extend(folds, default_closed_folds(review, owner))
     table.sort(folds, function(left, right) return left.start_line > right.start_line end)
     for _, fold in ipairs(folds) do
-      if fold.record.fold.closed or review.task_folded_by_id[fold.id] ~= false then
+      local closed = review.task_folded_by_id[fold.id]
+      if closed == nil then closed = fold.record.fold.closed end
+      if closed then
         vim.api.nvim_win_set_cursor(window, { fold.start_line, 0 })
         vim.cmd("silent! normal! zc")
       end
@@ -110,17 +116,9 @@ local function toggle_task_fold(review)
     local return_to_heading = cursor_line < selected.start_line
     local folded = vim.fn.foldclosed(selected.start_line) >= 0
     vim.api.nvim_win_set_cursor(view.window, { selected.start_line, 0 })
-    vim.cmd(folded and "silent! normal! zO" or "silent! normal! zc")
+    vim.cmd(folded and "silent! normal! zo" or "silent! normal! zc")
     if return_to_heading then vim.api.nvim_win_set_cursor(view.window, { cursor_line, 0 }) end
-    if folded then
-      for _, fold in ipairs(task_folds(review)) do
-        if fold.start_line >= selected.start_line and fold.end_line <= selected.end_line then
-          set_task_folded(review, fold.id, false)
-        end
-      end
-    else
-      set_task_folded(review, selected.id, true)
-    end
+    set_task_folded(review, selected.id, not folded)
   end)
 end
 
@@ -345,6 +343,7 @@ function M.open(plan)
     keymaps.setup_view_keymaps(native_buffer, "plan_review", set)
     keymaps.apply_view_winbar(window, "PlanReview", "plan_review", set, plan.historical_revision
       and ("Revision " .. plan.historical_revision .. " • historical • read-only")
+      or plan.state == "accepted" and "Accepted plan • read-only projection • C adds comments"
       or "Awaiting review • read-only projection • C adds comments")
     for _, warning in ipairs(plan.validation_warning or {}) do
       notifications.warn(("%s: %s"):format(warning.path or "Rust API", warning.message or "validation unavailable"), "PlanReview validation")

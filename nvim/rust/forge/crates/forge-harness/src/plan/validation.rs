@@ -528,12 +528,88 @@ impl<'a> PlanValidator<'a> {
 
     fn validate_tasks(&mut self) {
         self.unique_name(
-            "tasks",
-            self.document.tasks.iter().map(|task| task.title.as_str()),
+            "stages",
+            self.document.stages.iter().map(|stage| stage.id.as_str()),
         );
+        self.unique_name(
+            "stages.tasks",
+            self.document.tasks().map(|task| task.id.as_str()),
+        );
+        let owner_stage = self
+            .document
+            .stages
+            .iter()
+            .enumerate()
+            .flat_map(|(index, stage)| {
+                stage
+                    .tasks
+                    .iter()
+                    .map(move |task| (task.id.as_str(), index))
+            })
+            .collect::<HashMap<_, _>>();
+        for (stage_index, stage) in self.document.stages.iter().enumerate() {
+            let stage_path = format!("/stages/{stage_index}");
+            if stage.id.len() > 128 || stage.id.chars().any(char::is_control) {
+                self.push(
+                    &format!("{stage_path}/id"),
+                    "must contain at most 128 bytes without control characters",
+                );
+            }
+            self.required(&format!("{stage_path}/title"), &stage.title);
+            let mut file_owner = HashMap::new();
+            for (task_index, task) in stage.tasks.iter().enumerate() {
+                let task_path = format!("{stage_path}/tasks/{task_index}");
+                if task.id.len() > 128 || task.id.chars().any(char::is_control) {
+                    self.push(
+                        &format!("{task_path}/id"),
+                        "must contain at most 128 bytes without control characters",
+                    );
+                }
+                let mut prerequisite = HashSet::new();
+                for id in &task.requires {
+                    if !prerequisite.insert(id) {
+                        self.push(
+                            &format!("{task_path}/requires"),
+                            "duplicates a prerequisite",
+                        );
+                    }
+                    match owner_stage.get(id.as_str()) {
+                        Some(owner) if *owner < stage_index => {}
+                        Some(_) => self.push(
+                            &format!("{task_path}/requires"),
+                            &format!("prerequisite {id} must belong to an earlier stage"),
+                        ),
+                        None => self.push(
+                            &format!("{task_path}/requires"),
+                            &format!("references missing task {id}"),
+                        ),
+                    }
+                }
+                for file in &task.files {
+                    for path in file
+                        .change
+                        .source_path()
+                        .into_iter()
+                        .chain(std::iter::once(file.change.path()))
+                    {
+                        let normalized = path.replace('\\', "/").split('/').filter(|part| !part.is_empty() && *part != ".").collect::<Vec<_>>().join("/").to_lowercase();
+                        if let Some(previous) = file_owner.insert(normalized, task.id.as_str()) {
+                            if previous != task.id {
+                                self.push(
+                                    &format!("{task_path}/files"),
+                                    &format!(
+                                        "file {path} is also owned by sibling task {previous}"
+                                    ),
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
         let mut attached_entity = HashMap::<&str, String>::new();
-        for (task_index, task) in self.document.tasks.iter().enumerate() {
-            let path = format!("tasks[{task_index}]");
+        for (task_index, task) in self.document.tasks().enumerate() {
+            let path = self.document.task_path(task_index);
             self.required(&format!("{path}.title"), &task.title);
             self.prose(&format!("{path}.description"), &task.description);
             let mut file_path_set = HashSet::new();
@@ -675,8 +751,16 @@ impl<'a> PlanValidator<'a> {
                 "must replace the provisional title before submission",
             );
         }
-        if self.document.tasks.is_empty() {
-            self.push("tasks", "requires at least one task");
+        if self.document.stages.is_empty() {
+            self.push("stages", "requires at least one stage");
+        }
+        for (index, stage) in self.document.stages.iter().enumerate() {
+            if stage.tasks.is_empty() {
+                self.push(
+                    &format!("/stages/{index}/tasks"),
+                    "requires at least one task",
+                );
+            }
         }
         for (flow_index, flow) in self.document.flows.iter().enumerate() {
             if flow.edges.is_empty() {
@@ -694,8 +778,7 @@ impl<'a> PlanValidator<'a> {
         }
         let attached_entity_name = self
             .document
-            .tasks
-            .iter()
+            .tasks()
             .flat_map(|task| &task.files)
             .flat_map(|file| &file.subtasks)
             .flat_map(PlanSubtask::owned_entities)
@@ -705,8 +788,7 @@ impl<'a> PlanValidator<'a> {
         for (dependency_index, dependency) in self.document.dependencies.iter().enumerate() {
             let owner_count = self
                 .document
-                .tasks
-                .iter()
+                .tasks()
                 .flat_map(|task| &task.files)
                 .filter(|file| file.change.path() == dependency.manifest)
                 .count();
@@ -725,25 +807,22 @@ impl<'a> PlanValidator<'a> {
                 );
             }
         }
-        for (task_index, task) in self.document.tasks.iter().enumerate() {
+        for (task_index, task) in self.document.tasks().enumerate() {
+            let task_path = self.document.task_path(task_index);
             if task.files.is_empty() {
-                self.push(
-                    &format!("tasks[{task_index}].files"),
-                    "requires at least one file",
-                );
+                self.push(&format!("{task_path}/files"), "requires at least one file");
             }
             for (file_index, file) in task.files.iter().enumerate() {
                 let file_path = file.change.path();
                 if file.subtasks.is_empty() {
                     self.push(
-                        &format!("tasks[{task_index}].files[{file_index}].subtasks"),
+                        &format!("{task_path}/files/{file_index}/subtasks"),
                         "requires at least one subtask",
                     );
                 }
                 for (subtask_index, subtask) in file.subtasks.iter().enumerate() {
-                    let subtask_path = format!(
-                        "tasks[{task_index}].files[{file_index}].subtasks[{subtask_index}]"
-                    );
+                    let subtask_path =
+                        format!("{task_path}/files/{file_index}/subtasks/{subtask_index}");
                     if let PlanSubtask::Work(work) = subtask
                         && description_starts_with_action(work.action.label(), &work.description)
                     {
@@ -1058,6 +1137,63 @@ fn entity_kind_is_type(kind: EntityKind) -> bool {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn stages_reject_sibling_dependencies_and_file_conflicts() {
+        use super::super::document::*;
+        let mut document = test_fixture("plan", "Overview");
+        document.entity_changes.clear();
+        document.flows.clear();
+        document.stages[0].tasks[0].files.clear();
+        let mut sibling = document.stages[0].tasks[0].clone();
+        sibling.id = "second".into();
+        sibling.title = "Second task".into();
+        sibling.requires = vec!["plan-state".into()];
+        document.stages[0].tasks.push(sibling);
+        assert!(
+            document
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("earlier stage")
+        );
+        document.stages[0].tasks[1].requires.clear();
+        for task in &mut document.stages[0].tasks {
+            task.files.push(PlanFile {
+                change: PlanFileChange::Modify {
+                    path: "src/shared.rs".into(),
+                },
+                subtasks: vec![],
+            });
+        }
+        assert!(
+            document
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("sibling task")
+        );
+        document.stages[0].tasks[1].files[0].change = PlanFileChange::Rename {
+            from: "src/shared.rs".into(),
+            to: "src/renamed.rs".into(),
+        };
+        assert!(document.validate().is_err());
+        let mut later = document.stages[0].tasks.pop().unwrap();
+        later.requires = vec!["plan-state".into()];
+        document.stages.push(PlanStage {
+            id: "later".into(),
+            title: "Later work".into(),
+            tasks: vec![later],
+        });
+        document.validate().unwrap();
+        document.stages[1].tasks[0].requires = vec!["missing".into()];
+        assert!(
+            document
+                .validate()
+                .unwrap_err()
+                .to_string()
+                .contains("missing task")
+        );
+    }
     use super::super::{
         ChangeAction, EntityChangeAction, MemberKind, PlanCallable, PlanCallableKind,
         PlanFileChange, PlanFlowRelation, ProgramEntityMemberChange, Visibility,
@@ -1068,7 +1204,7 @@ mod test {
     #[test]
     fn rejects_a_file_rename_without_distinct_paths() {
         let mut document = test_fixture("plan", "Overview");
-        document.tasks[0].files[0].change = PlanFileChange::Rename {
+        document.stages[0].tasks[0].files[0].change = PlanFileChange::Rename {
             from: "src/plan.rs".into(),
             to: "src/plan.rs".into(),
         };
@@ -1142,7 +1278,7 @@ mod test {
         let mut document = test_fixture("plan", "Overview");
         document.entity_changes[0].action = EntityChangeAction::Rename;
         document.entity_changes[0].renamed_from = Some("LegacyPlanDocument".into());
-        document.tasks[0].files[0].change = PlanFileChange::Modify {
+        document.stages[0].tasks[0].files[0].change = PlanFileChange::Modify {
             path: document.entity_changes[0].path.clone(),
         };
         assert!(document.validate().is_ok());
@@ -1200,7 +1336,7 @@ mod test {
     #[test]
     fn submission_rejects_unattached_entities() {
         let mut document = test_fixture("plan", "Validate.");
-        document.tasks[0].files[0].subtasks[0]
+        document.stages[0].tasks[0].files[0].subtasks[0]
             .owned_entities_mut()
             .unwrap()
             .clear();
@@ -1274,7 +1410,7 @@ mod test {
     fn submission_rejects_a_description_that_repeats_its_operation() {
         let mut document = test_fixture("plan", "Keep structured operations singular.");
         let super::super::document::PlanSubtask::Work(subtask) =
-            &mut document.tasks[0].files[0].subtasks[0]
+            &mut document.stages[0].tasks[0].files[0].subtasks[0]
         else {
             panic!("fixture must contain a work subtask");
         };
@@ -1282,7 +1418,7 @@ mod test {
 
         let error = document.validate_for_submission().unwrap_err().to_string();
 
-        assert!(error.contains("tasks[0].files[0].subtasks[0].description"));
+        assert!(error.contains("/stages/0/tasks/0/files/0/subtasks/0.description"));
         assert!(error.contains(
             "must complement operation `create` without repeating `Create` as its first word"
         ));
@@ -1292,7 +1428,7 @@ mod test {
     fn submission_accepts_a_description_that_complements_its_operation() {
         let mut document = test_fixture("plan", "Keep structured operations singular.");
         let super::super::document::PlanSubtask::Work(subtask) =
-            &mut document.tasks[0].files[0].subtasks[0]
+            &mut document.stages[0].tasks[0].files[0].subtasks[0]
         else {
             panic!("fixture must contain a work subtask");
         };
@@ -1306,7 +1442,7 @@ mod test {
         let mut document = test_fixture("plan", "Validate optional test traceability.");
         attach_test_fixture(&mut document);
         let super::super::document::PlanSubtask::Test(test) =
-            &mut document.tasks[0].files[0].subtasks[1]
+            &mut document.stages[0].tasks[0].files[0].subtasks[1]
         else {
             panic!("fixture must append a test subtask");
         };
@@ -1371,7 +1507,7 @@ mod test {
                 license: Some("MIT".into()),
                 justification: "Run asynchronous work.".into(),
             });
-        document.tasks[0]
+        document.stages[0].tasks[0]
             .files
             .push(super::super::document::PlanFile {
                 change: super::super::document::PlanFileChange::Modify {

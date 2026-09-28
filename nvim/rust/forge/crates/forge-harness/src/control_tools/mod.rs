@@ -360,11 +360,13 @@ fn plan_task_report_input_schema() -> Value {
     strict_object_input_schema(
         vec![
             ("execution_id", string_schema()),
+            ("task_id", string_schema()),
+            ("plan_version", json!({"type": "integer", "minimum": 1})),
             (
                 "task_path",
                 json_pointer_schema(
-                    "^/tasks/[0-9]+$",
-                    "JSON Pointer for the active task in the accepted plan revision, for example /tasks/0.",
+                    "^/stages/[0-9]+/tasks/[0-9]+$",
+                    "JSON Pointer for the active task in the accepted plan revision, for example /stages/0/tasks/0.",
                 ),
             ),
             (
@@ -374,7 +376,7 @@ fn plan_task_report_input_schema() -> Value {
             (
                 "completed_subtask_paths",
                 json_pointer_array_schema(
-                    "^/tasks/[0-9]+/files/[0-9]+/subtasks/[0-9]+$",
+                    "^/stages/[0-9]+/tasks/[0-9]+/files/[0-9]+/subtasks/[0-9]+$",
                     "JSON Pointer for one completed subtask in the accepted plan revision.",
                 ),
             ),
@@ -394,7 +396,7 @@ fn plan_task_report_input_schema() -> Value {
                             (
                                 "test_subtask_path",
                                 nullable_json_pointer_schema(
-                                    "^/tasks/[0-9]+/files/[0-9]+/subtasks/[0-9]+$",
+                                    "^/stages/[0-9]+/tasks/[0-9]+/files/[0-9]+/subtasks/[0-9]+$",
                                     "JSON Pointer for the concrete test subtask in the accepted plan revision.",
                                 ),
                             ),
@@ -416,7 +418,13 @@ fn plan_task_report_input_schema() -> Value {
             ("summary", nullable_string_schema()),
             ("blocking_reason", nullable_string_schema()),
         ],
-        &["execution_id", "task_path", "state"],
+        &[
+            "execution_id",
+            "task_id",
+            "plan_version",
+            "task_path",
+            "state",
+        ],
     )
 }
 
@@ -1420,7 +1428,7 @@ mod test {
         let schema = plan_task_report_input_schema();
         assert_eq!(
             schema.pointer("/properties/task_path/pattern"),
-            Some(&json!("^/tasks/[0-9]+$"))
+            Some(&json!("^/stages/[0-9]+/tasks/[0-9]+$"))
         );
         assert_eq!(
             schema.pointer("/properties/completed_entity_paths/items/pattern"),
@@ -1431,6 +1439,7 @@ mod test {
             name: "harness_plan_task_report".into(),
             arguments: json!({
                 "execution_id": "execution",
+                "task_id": "plan-state", "plan_version": 1,
                 "task_path": "tasks[0]",
                 "state": "complete"
             }),
@@ -1444,7 +1453,8 @@ mod test {
             name: "harness_plan_task_report".into(),
             arguments: json!({
                 "execution_id": "execution",
-                "task_path": "/tasks/0",
+                "task_id": "plan-state", "plan_version": 1,
+                "task_path": "/stages/0/tasks/0",
                 "state": "complete"
             }),
         };

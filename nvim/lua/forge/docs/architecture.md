@@ -2240,18 +2240,36 @@ without item timestamps cannot recover every historical intra-turn position exac
 reuses that task, the effective canonical plan, and an interruption-specific prompt that preserves
 completed workspace work.
 
-The scheduler addresses the active task and submitted evidence with version-scoped JSON Pointers
-such as `/tasks/0`, `/tasks/0/files/1/subtasks/2`, and `/entity_changes/3`. It validates every
-pointer against the accepted plan revision before recording completion, which preserves exact
-evidence without manufacturing durable IDs for nodes that already have canonical document paths.
+PlanDocument schema 5 stores `stages[] -> tasks[] -> files[] -> subtasks[]`. Each stage and task
+has a stable model-authored ID. Task `requires` entries name tasks in earlier stages. Validation
+rejects missing references, sibling dependencies, forward dependencies, and sibling file overlap,
+including rename sources and destinations. The model remains responsible for semantic independence
+and verification boundaries that file ownership cannot prove. Stages form sequential barriers.
+The scheduler currently executes sibling tasks serially in document order.
+
+PlanReview displays numbered stages and lettered task titles by default, with file and subtask
+details collapsed. Labels such as `2a` derive from positions, while IDs preserve identity across
+edits. Tab works from every wrapped heading row and preserves child fold preferences.
+
+The scheduler addresses active work by task ID and plan version. Reports also supply exact
+version-scoped JSON Pointers such as `/stages/1/tasks/0`,
+`/stages/1/tasks/0/files/1/subtasks/2`, and `/entity_changes/3`. Completion requires all planned
+subtask and entity evidence. Stale reports cannot complete revised work. Approved deviations
+reconcile by ID and persist the deviation and scheduler together. Completed tasks retain their
+original evidence and definition. Reconciliation rejects changes to completed work or insertion
+of unfinished work before it. Stage completion derives from its tasks.
+
+Persisted plan records carry the current schema version. Incompatible plans and executions are
+unavailable without migration. Session loading clears stale plan references while retaining
+unrelated session state.
 
 The Harness winbar uses the goal-linked execution projected by Rust rather than parsing goal text.
 Explicit goals render `Goal active (N s)` or `Goal complete (N s)`. Accepted plans render
 `Plan active (Task X/Y, N s)` or `Plan complete (N s)`. Paused, blocked, stalled, cancelled, and
 cleared states do not occupy winbar space because they contain no active work.
 
-Canonical scheduler rows render only `Task X/Y started: <PlanTask.title>` and
-`Task X/Y completed in Ns`. A successfully persisted deviation renders immediately after its
+Canonical scheduler rows render `Task 2a (X/Y): <PlanTask.title>` and
+`Task 2a (X/Y) completed in Ns`. A successfully persisted deviation renders immediately after its
 causal source position inside the exchange, while the terminal plan resolution retains the full deviation audit. Pending
 tasks, subtasks, rationale text, and file lists do not become lifecycle rows.
 
