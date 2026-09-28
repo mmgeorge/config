@@ -26,7 +26,7 @@ use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
 use crate::permissions::store::PermissionStore;
 use crate::plan::state_machine::{PlanEvent, PlanStateMachine};
 use crate::plan::{
-    ArtifactSummary, ContextChoice, PlanAcceptance, PlanCallable, PlanDeviation,
+    ArtifactSummary, PlanAcceptance, PlanCallable, PlanDeviation,
     PlanDeviationDisposition, PlanDeviationKind, PlanDocument, PlanElicitation,
     PlanExecutionLifecycleEvent, PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState,
     PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer,
@@ -36,7 +36,7 @@ use crate::plan::{
 use crate::protocol::HarnessMethod;
 use crate::rustdoc::{RustdocResolver, RustdocResolverConfig, validate_plan_rust_api};
 use crate::session::{
-    ContextUsage, ExecutionMode, HarnessMode, HarnessPreference, HarnessSession, ModelSetting,
+    ContextUsage, ExecutionMode, HarnessMode, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
     ProviderForkState, SessionStore,
 };
 use crate::storage::SqliteStore;
@@ -574,6 +574,8 @@ impl HarnessBroker {
                             effort: preference
                                 .as_ref()
                                 .map_or(request.effort, |value| value.effort.clone()),
+                            plan_executor: preference.as_ref().map_or_else(Default::default, |value| value.plan_executor.clone()),
+                            plan_compact: preference.as_ref().is_some_and(|value| value.plan_compact),
                             context_window: None,
                             fast_mode: preference.as_ref().is_some_and(|value| value.fast_mode),
                             execution_mode: ExecutionMode::Read,
@@ -616,11 +618,13 @@ impl HarnessBroker {
             store.save_agent_run(&Agent::primary(&session.id, now_ms))?;
         }
         let previous_preference = store.load_preference(&session.workspace, &session.backend)?;
-        store.save_preference(
-            &session.workspace,
-            &session.backend,
-            &preference_for_session(&session, previous_preference),
-        )?;
+        if previous_preference.is_none() {
+            store.save_preference(
+                &session.workspace,
+                &session.backend,
+                &preference_for_session(&session, None),
+            )?;
+        }
         let mut capability = backend_descriptor.capability;
         capability.native_fork = session.native_fork || capability.native_fork;
         capability.native_compact = session.native_compact || capability.native_compact;
@@ -4677,13 +4681,11 @@ Planning continuation: turn {} of {}.",
             .acceptance
             .as_ref()
             .context("active plan has no acceptance state")?;
-        let context_choice = acceptance.context_choice()?;
         let execution_mode = acceptance.execution_mode()?;
         self.accept_plan(json!({
             "plan_id": plan.id,
             "digest": acceptance.review_digest,
             "saved_source_digest": acceptance.saved_source_digest,
-            "fresh_context": context_choice == ContextChoice::Fresh,
             "execution_mode": execution_mode,
         }))
         .await
@@ -4749,6 +4751,19 @@ Planning continuation: turn {} of {}.",
                 "saved plan source changed during acceptance"
             );
         }
+        if self.session.plan_executor.enabled {
+            let executor = self.session.plan_executor.clone();
+            self.validate_plan_executor(&executor).await?;
+        }
+        if self.session.plan_compact {
+            anyhow::ensure!(self.capability.native_compact, "current backend does not support context compaction");
+            anyhow::ensure!(self.session.backend_session_id.is_some(), "current session has no provider conversation to compact");
+        }
+        let compact_event = if self.session.plan_compact {
+            self.compact_session().await?.1
+        } else {
+            Vec::new()
+        };
         plan.user_revision += 1;
         plan.accepted_digest = Some(digest);
         plan.accepted_revision = Some(plan.model_revision);
@@ -4774,15 +4789,13 @@ Planning continuation: turn {} of {}.",
             created_at_ms: self.clock.now_ms(),
         };
         self.store.save_plan_lifecycle(&lifecycle)?;
-        let fresh_context = params
-            .get("fresh_context")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
         let planning_backend_session_id = self.session.backend_session_id.clone();
-        if fresh_context {
-            self.session.backend_session_id = None;
-            self.session.provider_checkpoint_id = None;
-            self.session.context_usage = None;
+        if self.session.plan_executor.enabled {
+            let executor = &self.session.plan_executor;
+            self.session.model = executor.model.clone().context("plan executor model is not configured")?;
+            self.session.resolved_model = Some(self.session.model.clone());
+            self.session.effort = executor.effort.clone().context("plan executor thinking is not configured")?;
+            self.session.context_window = None;
         }
         self.session.execution_mode = execution_mode;
         self.session.mode = HarnessMode::from(self.session.execution_mode);
@@ -4823,7 +4836,7 @@ Planning continuation: turn {} of {}.",
             );
         }
         self.store.save_plan_execution(&execution_record)?;
-        let mut pre_execution_event = Vec::new();
+        let mut pre_execution_event = compact_event;
         self.emit_live(
             BackendEvent {
                 address: None,
@@ -4918,7 +4931,7 @@ Planning continuation: turn {} of {}.",
                     "execution": execution_record,
                     "content": accepted_render.markdown,
                     "document": accepted_document,
-                    "fresh_context": fresh_context
+                    "plan_compact": self.session.plan_compact
                 }),
             )?,
         );
@@ -6172,6 +6185,44 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let requested_effort = params.get("effort").and_then(Value::as_str);
         let requested_context_window = params.get("context_window").and_then(Value::as_str);
         let validate_selection = params.get("validate").and_then(Value::as_bool) == Some(true);
+        let mut plan_executor = self.session.plan_executor.clone();
+        let mut plan_compact = self.session.plan_compact;
+        if let Some(enabled) = params.get("plan_compact").and_then(Value::as_bool) {
+            if enabled {
+                anyhow::ensure!(self.capability.native_compact, "current backend does not support context compaction");
+            }
+            plan_compact = enabled;
+        }
+        if let Some(enabled) = params.get("plan_executor_enabled").and_then(Value::as_bool) {
+            if enabled {
+                anyhow::ensure!(self.capability.model_selection, "current backend does not support model selection");
+                if plan_executor.model.is_none() {
+                    let active_model = self.session.resolved_model.clone().unwrap_or_else(|| self.session.model.clone());
+                    let selected_model = if active_model == "default" {
+                        self.backend.model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
+                            .await?.into_iter().find(|candidate| candidate.is_default)
+                            .context("the backend has no default model")?.id
+                    } else {
+                        active_model
+                    };
+                    plan_executor.model = Some(selected_model);
+                    plan_executor.effort = Some(self.session.effort.clone());
+                }
+            }
+            plan_executor.enabled = enabled;
+        }
+        if let Some(model) = params.get("plan_executor_model").and_then(Value::as_str) {
+            anyhow::ensure!(!model.trim().is_empty(), "plan executor model cannot be empty");
+            plan_executor.model = Some(model.to_owned());
+        }
+        if let Some(effort) = params.get("plan_executor_effort").and_then(Value::as_str) {
+            anyhow::ensure!(!effort.trim().is_empty(), "plan executor thinking cannot be empty");
+            plan_executor.effort = Some(effort.to_owned());
+        }
+        if params.get("plan_executor_model").is_some() || params.get("plan_executor_effort").is_some()
+            || params.get("plan_executor_enabled").and_then(Value::as_bool) == Some(true) {
+            self.validate_plan_executor(&plan_executor).await?;
+        }
         if validate_selection
             && (requested_model.is_some()
                 || requested_effort.is_some()
@@ -6244,12 +6295,29 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         if let Some(fast_mode) = params.get("fast_mode").and_then(Value::as_bool) {
             self.session.fast_mode = fast_mode;
         }
+        self.session.plan_executor = plan_executor;
+        self.session.plan_compact = plan_compact;
         self.save_session()?;
-        self.save_preference()?;
+        let update_model_preference = requested_model.is_some()
+            || requested_effort.is_some()
+            || params.get("context_window").is_some();
+        self.save_preference(update_model_preference)?;
         Ok((
             serde_json::to_value(&self.session)?,
             vec![self.event("session_configured", serde_json::to_value(&self.session)?)?],
         ))
+    }
+
+    async fn validate_plan_executor(&mut self, executor: &PlanExecutor) -> Result<()> {
+        anyhow::ensure!(self.capability.model_selection, "current backend does not support model selection");
+        let model = executor.model.as_deref().context("plan executor model is not configured")?;
+        let effort = executor.effort.as_deref().context("plan executor thinking is not configured")?;
+        let model_list = self.backend.model_list(self.backend_request(BackendInput::from_text(""), PromptMode::Chat)).await?;
+        let selected = model_list.iter().find(|candidate| candidate.id == model)
+            .with_context(|| format!("plan executor model {model} is unavailable for this backend"))?;
+        anyhow::ensure!(selected.reasoning.is_empty() || selected.reasoning.iter().any(|candidate| candidate == effort),
+            "plan executor thinking {effort} is unavailable for model {model}");
+        Ok(())
     }
 
     fn delete_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -6353,14 +6421,22 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .save_owned_session(&self.session, &self.client_id)
     }
 
-    fn save_preference(&mut self) -> Result<()> {
+    fn save_preference(&mut self, update_model_preference: bool) -> Result<()> {
         let previous = self
             .store
             .load_preference(&self.session.workspace, &self.session.backend)?;
+        let mut preference = preference_for_session(&self.session, previous.clone());
+        if !update_model_preference {
+            if let Some(previous) = previous {
+                preference.model = previous.model;
+                preference.effort = previous.effort;
+                preference.model_setting = previous.model_setting;
+            }
+        }
         self.store.save_preference(
             &self.session.workspace,
             &self.session.backend,
-            &preference_for_session(&self.session, previous),
+            &preference,
         )
     }
 
@@ -6527,6 +6603,8 @@ fn preference_for_session(
         effort: session.effort.clone(),
         model_setting,
         fast_mode: session.fast_mode,
+        plan_executor: session.plan_executor.clone(),
+        plan_compact: session.plan_compact,
     }
 }
 
@@ -8118,6 +8196,68 @@ mod test {
         }
     }
 
+    #[tokio::test]
+    async fn plan_settings_preserve_the_planning_model_and_reject_invalid_executor_choices() {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: workspace.path().to_string_lossy().into_owned(),
+                client_id: "test-client".into(),
+                backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+                model: "mock-model".into(),
+                effort: "low".into(),
+                session_id: None,
+                new_session_name: None,
+                goal_max_turns: 20,
+                lease_conflict_action: None,
+            },
+            Box::new(FixedClock(100)),
+        ).unwrap();
+        let rejected = broker.configure_session(json!({
+            "plan_executor_model": "unknown-model", "plan_executor_effort": "high"
+        })).await;
+        assert!(rejected.is_err());
+        assert!(broker.session.plan_executor.model.is_none());
+        broker.configure_session(json!({
+            "plan_executor_model": "mock-model", "plan_executor_effort": "high",
+            "plan_executor_enabled": true, "plan_compact": true
+        })).await.unwrap();
+        assert_eq!(broker.session.model, "mock-model");
+        assert_eq!(broker.session.effort, "low");
+        broker.session.backend_session_id = Some("mock-session".into());
+        let (_, events) = broker.compact_session().await.unwrap();
+        assert_eq!(events[0].event, "context_compacted");
+        assert_eq!(broker.session.effort, "low");
+        let preference = broker.store.load_preference(&broker.session.workspace, "mock").unwrap().unwrap();
+        assert_eq!(preference.effort, "low");
+        assert!(preference.plan_compact);
+        assert!(preference.plan_executor.enabled);
+        broker.session.effort = "high".into();
+        broker.save_session().unwrap();
+        drop(broker);
+        let next = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: workspace.path().to_string_lossy().into_owned(),
+                client_id: "next-client".into(),
+                backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+                model: "mock-model".into(),
+                effort: "medium".into(),
+                session_id: None,
+                new_session_name: Some("next".into()),
+                goal_max_turns: 20,
+                lease_conflict_action: None,
+            },
+            Box::new(FixedClock(200)),
+        ).unwrap();
+        assert_eq!(next.session.effort, "low");
+        assert!(next.session.plan_executor.enabled);
+    }
+
     #[test]
     fn rejects_a_second_live_session_controller() {
         let mut session = HarnessSession {
@@ -8133,6 +8273,8 @@ mod test {
             provider_label: "Mock backend".into(),
             resolved_model: Some("model".into()),
             effort: "low".into(),
+            plan_executor: Default::default(),
+            plan_compact: false,
             context_window: None,
             fast_mode: false,
             execution_mode: ExecutionMode::Read,
@@ -8166,6 +8308,8 @@ mod test {
                 effort: "high".into(),
                 model_setting,
                 fast_mode: false,
+                plan_executor: Default::default(),
+                plan_compact: false,
             }),
         );
         assert_eq!(preference.model_setting.len(), 2);
@@ -10642,7 +10786,6 @@ mod test {
             "plan_acceptance"
         );
         for (id, question_id, option) in [
-            (4, "acceptance-context", "Continue context"),
             (
                 5,
                 "acceptance-execution-mode",
@@ -10665,6 +10808,16 @@ mod test {
                 answer.response.error()
             );
         }
+        broker.session.plan_executor = PlanExecutor {
+            enabled: true,
+            model: Some("mock-model".into()),
+            effort: Some("high".into()),
+        };
+        broker.session.plan_compact = true;
+        let provider_session = broker.session.backend_session_id.take();
+        assert!(broker.accept_plan(json!({ "execution_mode": "write" })).await.is_err());
+        assert_eq!(broker.active_plan_acceptance().unwrap().state, PlanState::AwaitingReview);
+        broker.session.backend_session_id = provider_session;
         let accepted = broker
             .dispatch(Request {
                 id: 6,
@@ -10678,6 +10831,10 @@ mod test {
             accepted.response.error()
         );
         assert_eq!(broker.session.execution_mode, ExecutionMode::Write);
+        assert_eq!(broker.session.effort, "high");
+        assert!(accepted.event.iter().any(|event| event.event == "context_compacted"));
+        let compacted = accepted.event.iter().find(|event| event.event == "context_compacted").unwrap();
+        assert_eq!(compacted.payload["session"]["effort"], "low");
         let goal = broker.active_goal().unwrap();
         assert_eq!(
             goal.objective,

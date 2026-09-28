@@ -175,6 +175,10 @@ pub struct HarnessSession {
     pub resolved_model: Option<String>,
     pub effort: String,
     #[serde(default)]
+    pub plan_executor: PlanExecutor,
+    #[serde(default)]
+    pub plan_compact: bool,
+    #[serde(default)]
     pub context_window: Option<String>,
     #[serde(default)]
     pub fast_mode: bool,
@@ -205,6 +209,18 @@ pub struct HarnessPreference {
     pub model_setting: BTreeMap<String, ModelSetting>,
     #[serde(default)]
     pub fast_mode: bool,
+    #[serde(default)]
+    pub plan_executor: PlanExecutor,
+    #[serde(default)]
+    pub plan_compact: bool,
+}
+
+/// Selects the model used after a plan is accepted.
+#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+pub struct PlanExecutor {
+    pub enabled: bool,
+    pub model: Option<String>,
+    pub effort: Option<String>,
 }
 
 /// Stores durable controls selected for one provider model.

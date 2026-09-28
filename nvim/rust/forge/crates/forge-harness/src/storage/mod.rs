@@ -17,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 28;
+const SESSION_FORMAT_VERSION: u32 = 29;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -844,6 +844,8 @@ mod test {
             provider_label: "Copilot CLI".into(),
             resolved_model: None,
             effort: "medium".into(),
+            plan_executor: Default::default(),
+            plan_compact: false,
             context_window: None,
             fast_mode: false,
             execution_mode: crate::session::ExecutionMode::Read,
@@ -1136,6 +1138,8 @@ mod test {
             effort: "low".into(),
             model_setting: Default::default(),
             fast_mode: true,
+            plan_executor: Default::default(),
+            plan_compact: false,
         };
         store
             .save_preference("D:/work", "codex", &preference)

@@ -23,6 +23,7 @@ pub fn prepare_new_session(
         source.backend == configured_backend,
         "source session uses a different configured backend"
     );
+    let preference = store.load_preference(&source.workspace, &source.backend)?;
     let session_id = Uuid::new_v4().to_string();
     let child = HarnessSession {
         primary_agent_id: HarnessSession::primary_agent_id(&session_id),
@@ -39,11 +40,14 @@ pub fn prepare_new_session(
         backend_session_id: None,
         provider_checkpoint_id: None,
         provider_fork_state: ProviderForkState::Ready,
-        model: source.model,
+        model: preference.as_ref().map_or_else(|| source.model.clone(), |value| value.model.clone()),
         provider_label: source.provider_label,
-        resolved_model: source.resolved_model,
-        effort: source.effort,
-        context_window: source.context_window,
+        resolved_model: None,
+        effort: preference.as_ref().map_or_else(|| source.effort.clone(), |value| value.effort.clone()),
+        plan_executor: preference.as_ref().map_or(source.plan_executor, |value| value.plan_executor.clone()),
+        plan_compact: preference.as_ref().map_or(source.plan_compact, |value| value.plan_compact),
+        context_window: preference.as_ref().and_then(|value| value.model_setting.get(&value.model))
+            .and_then(|setting| setting.context_window.clone()).or(source.context_window),
         fast_mode: source.fast_mode,
         execution_mode: ExecutionMode::Read,
         mode: HarnessMode::Read,

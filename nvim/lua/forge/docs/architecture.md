@@ -2313,6 +2313,15 @@ Only the transcript window owns the Harness winbar. The composer clears its wind
 winbar so the split presents session identity once. The transcript winbar begins directly
 with the active execution mode and resolved runtime model. `/config` displays
 the underlying CLI provider.
+The model picker and `/config` share `views/picker/field.lua` for field rendering.
+The active field uses arrows, while inactive fields retain equal-width padding.
+`/config` also stores Plan Executor enablement, executor model and thinking, and
+Plan Compact enablement with the workspace/backend model preferences. Plan acceptance
+validates these settings before changing the plan state. When enabled, native compaction
+finishes in the planning conversation before the broker selects the executor model and
+starts the first implementation turn. A failed compaction leaves the plan awaiting review.
+The executor remains the active session model after execution, while the ordinary model
+preference remains the default for a new session.
 Codex resolves the configured `default` sentinel through the `isDefault` entry from
 `model/list`, then caches and persists that model on the Harness session. Copilot maps the SDK
 model catalog into the same picker and applies supported reasoning effort when it creates,

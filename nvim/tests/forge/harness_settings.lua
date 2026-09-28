@@ -6,25 +6,95 @@ local picker = require("forge.views.picker")
 local path = vim.fn.tempname() .. ".jsonl"
 vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","session_id":"settings-session","payload":{"method":"turn/start","items":["a,b","c"]}}' }, path)
 local enabled = false
+local configured_session = {
+  id = "settings-session", backend = "codex", model = "mock-model", effort = "medium",
+  plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
+}
 local original_request = client.request_for
 client.request_for = function(session_id, method, params, callback)
   assert(session_id == "settings-session")
-  assert(method == "trace.status" or method == "trace.configure" or method == "trace.session.clear")
+  assert(method == "trace.status" or method == "trace.configure" or method == "trace.session.clear"
+    or method == "session.configure" or method == "backend.models")
+  if method == "backend.models" then
+    callback({
+      { id = "mock-model", reasoning = { "low", "medium", "high" }, default_reasoning = "medium" },
+      { id = "other-model", reasoning = { "low", "high" }, default_reasoning = "low" },
+    })
+    return
+  end
+  if method == "session.configure" then
+    if params.plan_executor_enabled ~= nil then configured_session.plan_executor.enabled = params.plan_executor_enabled end
+    if params.plan_compact ~= nil then configured_session.plan_compact = params.plan_compact end
+    if params.plan_executor_model then configured_session.plan_executor.model = params.plan_executor_model end
+    if params.plan_executor_effort then configured_session.plan_executor.effort = params.plan_executor_effort end
+    callback(vim.deepcopy(configured_session))
+    return
+  end
   if method == "trace.configure" then enabled = params.enabled end
   if method == "trace.session.clear" then vim.fn.writefile({}, path) end
   callback({ enabled = enabled, path = path })
 end
 local success, failure = xpcall(function()
-  local state = { session = { id = "settings-session", backend = "codex" }, busy = true }
+  local state = { session = configured_session, capability = { model_selection = true, native_compact = true }, busy = true }
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
   local instance = picker._state_for_test()
   local text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
   assert(text:find("CLI: Codex CLI", 1, true), text)
   assert(text:find("Logging", 1, true) and text:find("Off", 1, true), text)
+  assert(text:find("Plan Executor", 1, true) and text:find("Plan Compact", 1, true), text)
+  assert(text:find("Description", 1, true), text)
+  assert(text:match("Plan Executor[^\n]*mock%-model"), text)
+  assert(not text:find("[←", 1, true), text)
   vim.fn.maparg("<Right>", "n", false, true).callback()
   assert(enabled and require("forge.infra.perf").enabled("harness"))
   vim.fn.maparg("<Left>", "n", false, true).callback()
   assert(not enabled and not require("forge.infra.perf").enabled("harness"))
+  instance.state.selected_index_by_page.config = 2
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  assert(state.session.plan_executor.enabled)
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert(not state.session.plan_executor.enabled)
+  vim.fn.maparg("<CR>", "n", false, true).callback()
+  assert(state.session.plan_executor.enabled)
+  local config_text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
+  assert(config_text:find("Plan Executor", 1, true) and config_text:find("On", 1, true))
+  vim.fn.maparg("<Left>", "n", false, true).callback()
+  assert(not state.session.plan_executor.enabled)
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  assert(state.session.plan_executor.enabled)
+  instance.state.selected_index_by_page.config = 3
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  assert(state.session.plan_compact)
+  vim.fn.maparg("<Left>", "n", false, true).callback()
+  assert(not state.session.plan_compact)
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  assert(state.session.plan_compact)
+  instance.state.selected_index_by_page.config = 2
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  local field_text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
+  assert(not field_text:find("[←", 1, true), field_text)
+  local executor_value = instance.spec.page_list[1].option_list[2].columns[2]
+  assert(executor_value:find("← mock-model →", 1, true), executor_value)
+  assert(not executor_value:find("← On →", 1, true), executor_value)
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  assert(state.session.plan_executor.model == "other-model")
+  assert(state.session.plan_executor.effort == "low")
+  assert(picker._state_for_test() == instance, "model cycling replaced the config picker")
+  vim.fn.maparg("<Left>", "n", false, true).callback()
+  assert(state.session.plan_executor.model == "mock-model")
+  vim.fn.maparg("<Left>", "n", false, true).callback()
+  assert(state.session.plan_executor.model == "other-model", "model cycling did not wrap")
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  assert(state.session.plan_executor.effort == "high")
+  vim.fn.maparg("<Right>", "n", false, true).callback()
+  assert(state.session.plan_executor.effort == "low", "thinking cycling did not wrap")
+  vim.fn.maparg("<Left>", "n", false, true).callback()
+  assert(state.session.plan_executor.effort == "high")
+  assert(picker._state_for_test() == instance, "thinking cycling replaced the config picker")
+  assert(picker.is_open("harness-config"))
   picker.close()
   settings.log("settings-session", "on")
   assert(enabled)

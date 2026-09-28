@@ -586,6 +586,21 @@ or `M._status_conventional_commit_type_end(...)` instead of hand-building a
 plain string, so the conventional commit `<type>` prefix is colorized
 consistently across Head/Merge/Push, PR, About, and commit-list rows.
 
+## Shared UI Components
+
+Before adding or changing a Forge control, inspect the existing equivalent and
+reuse its rendering, focus, navigation, and activation behavior. Reusing a picker
+container alone does not satisfy this requirement. Do not add view-specific
+selection markers, field formatting, or interaction conventions when a shared
+control already owns that behavior.
+
+If an existing control needs another capability, extend its shared component or
+extract its existing implementation into one shared component and update every
+affected consumer. Keep views responsible for values and actions. For picker
+fields, reuse `views/picker/field.lua` and the established model-picker behavior.
+Left/Right must cycle inline values without opening another picker. Verify the
+changed view and existing consumers against the same interaction contract.
+
 ## Shared Status UX Pattern
 
 ForgeStatus' Unstaged/Staged model is the canonical UX pattern for all

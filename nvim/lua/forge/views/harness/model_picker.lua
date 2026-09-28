@@ -1,6 +1,7 @@
 local ModelPicker = {}
 
 local picker = require("forge.views.picker")
+local picker_field = require("forge.views.picker.field")
 
 local function format_token_count(token_count)
   if not token_count then return nil end
@@ -83,15 +84,6 @@ local function context_label(model)
   return nil
 end
 
-local function padded_field(value, active, column)
-  if column.width == 0 then return nil end
-  local text = value or ""
-  if column.selectable then
-    text = active and ("← %s →"):format(text) or ("  %s  "):format(text)
-  end
-  return text .. string.rep(" ", math.max(0, column.width - vim.fn.strdisplaywidth(text)))
-end
-
 local function column_layout(model_list)
   local layout = {
     reasoning = { width = 0, selectable = false },
@@ -123,9 +115,9 @@ local function model_detail(model, active_field, layout)
   local function append(value)
     if value and value ~= "" then segment_list[#segment_list + 1] = value end
   end
-  append(padded_field(model.picker_reasoning, active_field == "reasoning", layout.reasoning))
-  append(padded_field(context_label(model), active_field == "context_window", layout.context_window))
-  append(padded_field(model.vision and "Vision" or nil, false, layout.vision))
+  append(picker_field.render(model.picker_reasoning, active_field == "reasoning", layout.reasoning))
+  append(picker_field.render(context_label(model), active_field == "context_window", layout.context_window))
+  append(picker_field.render(model.vision and "Vision" or nil, false, layout.vision))
   append(model.description)
   return table.concat(segment_list, "  ")
 end
@@ -165,10 +157,10 @@ function ModelPicker.open(options)
       local active = model.id == selected_model_id and active_field(model) or nil
       local columns = { model.id }
       if layout.reasoning.width > 0 then
-        columns[#columns + 1] = padded_field(model.picker_reasoning, active == "reasoning", layout.reasoning)
+        columns[#columns + 1] = picker_field.render(model.picker_reasoning, active == "reasoning", layout.reasoning)
       end
       if layout.context_window.width > 0 then
-        columns[#columns + 1] = padded_field(context_label(model), active == "context_window", layout.context_window)
+        columns[#columns + 1] = picker_field.render(context_label(model), active == "context_window", layout.context_window)
       end
       if layout.vision.width > 0 then columns[#columns + 1] = model.vision and "Vision" or "" end
       columns[#columns + 1] = model.description or ""

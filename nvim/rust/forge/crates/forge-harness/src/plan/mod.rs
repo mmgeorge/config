@@ -304,14 +304,6 @@ pub struct PlanElicitation {
     pub clarification_active: bool,
 }
 
-/// Defines whether accepted-plan execution reuses or replaces planning context.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ContextChoice {
-    Continue,
-    Fresh,
-}
-
 /// Owns the durable reviewer decisions required before a plan can execute.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct PlanAcceptance {
@@ -325,28 +317,12 @@ pub struct PlanAcceptance {
 impl PlanAcceptance {
     /// Build acceptance questions from the execution modes exposed by the active backend.
     pub fn new(review_digest: String, execution_mode_list: &[ExecutionMode]) -> Result<Self> {
-        let context_question = PlanQuestion {
-            id: "acceptance-context".into(),
-            header: "Context".into(),
-            question: "Which provider context should execute the accepted plan?".into(),
-            options: vec![
-                PlanQuestionOption {
-                    label: "Continue context".into(),
-                    description: "Continue from the planning conversation.".into(),
-                },
-                PlanQuestionOption {
-                    label: "Fresh context".into(),
-                    description: "Execute the plan without the planning conversation.".into(),
-                },
-            ],
-            allow_freeform: false,
-        };
         anyhow::ensure!(
             !execution_mode_list.is_empty(),
             "the active backend exposes no execution mode"
         );
-        let mut question_list = vec![context_question];
-        if execution_mode_list.len() > 1 {
+        let mut question_list = Vec::new();
+        if !execution_mode_list.is_empty() {
             question_list.push(PlanQuestion {
                 id: "acceptance-execution-mode".into(),
                 header: "Execution access".into(),
@@ -373,15 +349,6 @@ impl PlanAcceptance {
             execution_mode_list: execution_mode_list.to_vec(),
             elicitation: PlanElicitation::new(question_set),
         })
-    }
-
-    /// Resolve the selected context only after every acceptance question has an answer.
-    pub fn context_choice(&self) -> Result<ContextChoice> {
-        match selected_option(&self.elicitation, "acceptance-context")? {
-            "Continue context" => Ok(ContextChoice::Continue),
-            "Fresh context" => Ok(ContextChoice::Fresh),
-            option => anyhow::bail!("unsupported plan context choice {option:?}"),
-        }
     }
 
     /// Resolve the selected execution boundary only after every acceptance question has an answer.
@@ -1555,24 +1522,14 @@ mod test {
     }
 
     #[test]
-    fn acceptance_requires_context_and_execution_access_before_execution() {
+    fn acceptance_requires_execution_access_before_execution() {
         let mut acceptance = PlanAcceptance::new(
             "digest".into(),
             &[ExecutionMode::Write, ExecutionMode::Read],
         )
         .unwrap();
-        assert_eq!(acceptance.elicitation.question_set.questions.len(), 2);
-        assert!(acceptance.context_choice().is_err());
-        acceptance
-            .elicitation
-            .answer(
-                "acceptance-context",
-                PlanQuestionResponse::Selected {
-                    option: "Fresh context".into(),
-                    feedback: None,
-                },
-            )
-            .unwrap();
+        assert_eq!(acceptance.elicitation.question_set.questions.len(), 1);
+        assert!(acceptance.execution_mode().is_err());
         acceptance
             .elicitation
             .answer(
@@ -1583,7 +1540,6 @@ mod test {
                 },
             )
             .unwrap();
-        assert_eq!(acceptance.context_choice().unwrap(), ContextChoice::Fresh);
         assert_eq!(acceptance.execution_mode().unwrap(), ExecutionMode::Write);
     }
 }
