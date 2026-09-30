@@ -1,8 +1,8 @@
 use forge_buffer::ContractError;
 use forge_buffer::block::{
-    BlockMetadata, BufferBlock, Decoration, Gutter, TextChunk, TextPosition, TextRange,
+    BlockAnchor, BlockMetadata, BufferBlock, Decoration, FoldRange, Gutter, TextChunk, TextPosition, TextRange,
 };
-use forge_buffer::identity::BlockId;
+use forge_buffer::identity::{BlockId, FoldId};
 use forge_buffer::text::BufferText;
 
 use crate::display::{DisplayHunk, DisplayRow, RowKind};
@@ -53,6 +53,26 @@ pub fn header(
         text: BufferText::from_rows([text])?,
         metadata,
     })
+}
+
+/// Attach a file or hunk fold whose collapsed row is its header.
+///
+/// The endpoint is exclusive. Callers retain default expansion and child-collapse policy.
+pub fn fold_header(
+    header: &mut BufferBlock,
+    id: FoldId,
+    end: BlockAnchor,
+    closed: bool,
+    collapse_children: bool,
+) {
+    header.metadata.fold = vec![FoldRange {
+        id,
+        heading_start: None,
+        start: TextPosition { row: 0, column: 0 },
+        end,
+        closed,
+        collapse_children,
+    }];
 }
 
 /// Project a saved patch row through the standard diff gutters and side backgrounds.

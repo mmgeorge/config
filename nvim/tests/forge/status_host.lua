@@ -80,6 +80,27 @@ local ok, failure = xpcall(function()
   assert(#notices == 0, table.concat(notices, "\n"))
   assert(vim.b[state.replica.buffer].forge_native_document and not client._client.harness_ready)
   assert(vim.wo.foldmethod == "expr", "public facade replaced native folds")
+  local file = assert(state.replica.inventory.file[1], "status file is missing")
+  local _, file_row = state.replica.sequence:position("file:" .. file.id)
+  vim.api.nvim_win_set_cursor(0, { file_row + 1, 0 })
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<Tab>", true, false, true), "xt", false)
+  await_phase("file and hunk expansion", 15000, function()
+    return settled() and next(state.done) ~= nil
+      and table.concat(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false), "\n"):find("@@", 1, true)
+  end)
+  local hunk_row
+  for row, line in ipairs(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false)) do
+    if line:find("@@", 1, true) then hunk_row = row break end
+  end
+  assert(hunk_row, "status hunk is missing")
+  vim.api.nvim_win_set_cursor(0, { hunk_row, 0 })
+  vim.cmd("normal! zc")
+  assert(vim.fn.foldclosed(hunk_row) == hunk_row, "status hunk does not collapse on its header")
+  vim.cmd("normal! zo")
+  _, file_row = state.replica.sequence:position("file:" .. file.id)
+  vim.api.nvim_win_set_cursor(0, { file_row + 1, 0 })
+  vim.cmd("normal! zc")
+  assert(vim.fn.foldclosed(hunk_row) == file_row + 1, "status file left its first hunk visible")
   local closed = false
   record_phase("close native status")
   status.close(state, function() closed = true end)

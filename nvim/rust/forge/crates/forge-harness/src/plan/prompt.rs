@@ -55,7 +55,7 @@ pub fn execution_prompt(
         ""
     };
     Ok(format!(
-        "{boundary} Execution ID: {execution_id}.{recovery} Complete the active whole task before calling harness_plan_task_report with the active task_id, current plan_version, and detailed subtask, entity, path, and test evidence. A stage completes only when all its lettered tasks have persisted completion. Execute only the selected task even when its siblings are independent. Address tasks, subtasks, entities, and tests by their JSON pointer paths in this exact plan version. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective canonical PlanDocument:\n```json\n{}\n```",
+        "{boundary} Execution ID: {execution_id}.{recovery} Complete the active whole task before calling harness_plan_task_report with the active task_id, current plan_version, and detailed subtask, entity, path, and test evidence. A stage completes only when all its lettered tasks have persisted completion. Execute only the selected task even when its siblings are independent. Address tasks, subtasks, entities, and tests by their JSON pointer paths in this exact plan version. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective declaration design:\n```json\n{}\n```",
         serde_json::to_string_pretty(&active_work)?,
         serde_json::to_string_pretty(document)?,
     ))
@@ -65,7 +65,7 @@ impl PlanPrompt {
     /// Build a decision-complete planning request for one user objective.
     pub fn draft(request: &str) -> String {
         format!(
-            r#"You are planning a software change in Harness Plan mode. The retained execution authorization governs every command and file operation. Planning does not imply read-only access.
+            r#"You are planning a software change in Harness Plan mode. The retained execution authorization governs every command and file operation. Planning may inspect source but must not modify project files.
 
 {PLANNING_CONTRACT}
 
@@ -77,7 +77,7 @@ User request:
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing Harness Plan mode conversation. The Harness already recorded and consumed the user's answers below. Do not call harness_question_answer or harness_question_withdraw for them. Incorporate the answers through semantic harness_plan_edit operations. If another material product decision remains, call harness_question_ask and end the turn. Otherwise call harness_plan_submit with the exact canonical plan ID and version.
+            r#"Continue the existing Harness Plan mode conversation. The Harness already recorded and consumed the user's answers below. Do not call harness_question_answer or harness_question_withdraw for them. Incorporate the answers through harness_design_apply_patch edits. If another material product decision remains, call harness_question_ask and end the turn. Otherwise call harness_plan_submit with the exact canonical plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -108,14 +108,14 @@ Original request:
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("None");
         format!(
-            r#"Revise the saved canonical plan in Harness Plan mode. Resolve every annotation and overall comment with semantic harness_plan_edit operations, then call harness_plan_submit with the exact resulting plan ID and version.
+            r#"Revise the saved canonical plan in Harness Plan mode. Resolve every annotation and overall comment with harness_design_apply_patch edits, then call harness_plan_submit with the exact resulting plan ID and version.
 
 {PLANNING_CONTRACT}
 
 Overall review comment:
 {comment}
 
-Current canonical PlanDocument:
+Current declaration design:
 ```json
 {document_json}
 ```
@@ -127,7 +127,7 @@ Semantic annotations:
 
     /// Prepend the complete canonical plan so every provider can discover and edit it.
     pub fn with_active_document(prompt: String, document_json: &str) -> String {
-        format!("Active canonical PlanDocument:\n```json\n{document_json}\n```\n\n{prompt}")
+        format!("Active declaration design:\n```json\n{document_json}\n```\n\n{prompt}")
     }
 
     /// Keep review discussion read-only until the user requests a canonical plan revision.
@@ -135,7 +135,7 @@ Semantic annotations:
         format!(
             "Continue discussing the active canonical plan in Harness Plan mode. \
 Answer questions without editing or resubmitting the plan. When the user requests changes, \
-revise the existing plan through harness_plan_edit, then submit the resulting plan ID and version \
+revise the existing plan through harness_design_apply_patch, then submit the resulting plan ID and version \
 through harness_plan_submit. A successful edit starts a revision of the same plan. \
 Ask for clarification when the requested change is unclear. Resolve pending questions before editing. \
 Do not implement the plan or modify project files.\n\n{prompt}"
@@ -217,53 +217,14 @@ mod test {
     }
 
     #[test]
-    fn planning_example_applies_and_submits_with_independent_consumers() {
-        use crate::plan::{PLAN_SCHEMA_VERSION, PlanDocument, PlanEditRequest, apply_plan_edit};
-        let contract = PLANNING_CONTRACT.replace("\r\n", "\n");
-        let example = contract
-            .split_once("```json\n")
-            .and_then(|(_, remainder)| remainder.split_once("\n```"))
-            .map(|(example, _)| example)
-            .expect("planning contract must contain a complete edit example");
-        let request: PlanEditRequest = serde_json::from_str(example)
-            .expect("example must match the advertised edit schema");
-        let document = PlanDocument {
-            schema_version: PLAN_SCHEMA_VERSION,
-            version: request.expected_version,
-            plan_id: request.plan_id.clone(),
-            title: "Planning in progress".into(),
-            prompt: "Preserve editor drafts".into(),
-            overview: String::new(),
-            usage: None,
-            entity_changes: Vec::new(),
-            dependencies: Vec::new(),
-            flows: Vec::new(),
-            stages: Vec::new(),
-            assumptions: Vec::new(),
-        };
-        let edited = apply_plan_edit(&document, request).expect("example must apply atomically");
-        let planned = edited.document;
-        planned
-            .validate_for_submission()
-            .expect("example must pass submission validation");
-        assert_eq!(planned.prompt, document.prompt);
-        assert_eq!(planned.version, document.version + 1);
-        assert_eq!(
-            planned.stages.iter().map(|stage| stage.tasks.len()).collect::<Vec<_>>(),
-            [1, 3, 1]
-        );
-        for task in &planned.stages[1].tasks {
-            assert_eq!(task.requires, [planned.stages[0].tasks[0].id.clone()]);
-        }
-        assert_eq!(
-            planned.stages[2].tasks[0].requires,
-            planned.stages[1]
-                .tasks
-                .iter()
-                .map(|task| task.id.clone())
-                .collect::<Vec<_>>()
-        );
-        crate::plan::render_plan(&planned).expect("example must remain renderable");
+    fn planning_patch_example_applies_to_virtual_declarations() {
+        let example = PLANNING_CONTRACT.split_once("```text\n").unwrap().1.split_once("\n```").unwrap().0;
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.proposed.insert("src/textures.rs".into(), "impl Texture {\n  pub fn request(texture: TextureId) -> TextureHandle;\n\n  pub fn status(request: RequestId) -> RequestStatus;\n}\n".into());
+        let changed = design.patch(example).unwrap();
+        assert!(changed.proposed["src/textures.rs"].contains("-> TextureRequest;"));
+        assert!(changed.proposed["src/textures.rs"].contains("pub fn cancel(request: RequestId) -> bool;"));
+        assert_eq!(design.baseline,changed.baseline);
     }
 
     #[test]
@@ -284,8 +245,8 @@ mod test {
         assert!(prompt.contains(r#""plan_id":"plan""#));
         assert!(prompt.contains("Semantic annotations"));
         assert!(prompt.contains("PlanDocument"));
-        assert!(prompt.contains("reviewer-readable implementation walkthrough"));
-        assert!(prompt.contains("Validate the PlanDocument as one ownership model"));
+        assert!(prompt.contains("baseline/proposed side"));
+        assert!(prompt.contains("harness_design_apply_patch"));
         assert!(!prompt.contains("Current rendered plan"));
     }
 

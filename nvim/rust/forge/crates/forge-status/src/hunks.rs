@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, ensure};
 use forge_buffer::{
     block::{
-        BlockAnchor, BlockMetadata, BufferBlock, Decoration, FoldRange, TargetRange, TextChunk,
+        BlockAnchor, BlockMetadata, BufferBlock, Decoration, TargetRange, TextChunk,
         TextPosition, TextRange,
     },
     identity::{BlockId, FoldId, TargetId},
@@ -224,20 +224,20 @@ pub(crate) fn project(
             metadata.gutter.push(item);
         }
         let text = BufferText::from_rows(body.text.slice(range.clone())?)?;
-        header.metadata.fold = vec![FoldRange {
-            heading_start: None,
-            collapse_children: false,
-            id: FoldId(header.id.0.clone()),
-            start: TextPosition { row: 0, column: 0 },
-            end: BlockAnchor {
+        let fold_id = FoldId(header.id.0.clone());
+        forge_diff::projection::fold_header(
+            &mut header,
+            fold_id,
+            BlockAnchor {
                 block: body_id.clone(),
                 position: TextPosition {
                     row: text.row_count(),
                     column: 0,
                 },
             },
-            closed: document.local_path.is_some() && file.section == StatusSection::Staged,
-        }];
+            document.local_path.is_some() && file.section == StatusSection::Staged,
+            false,
+        );
         if let Some(position) = file
             .body
             .as_ref()

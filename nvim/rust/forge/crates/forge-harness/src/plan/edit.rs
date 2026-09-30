@@ -1,7 +1,9 @@
 use std::collections::{HashMap, HashSet};
 
 use anyhow::{Context, Result};
-use schemars::{JsonSchema, generate::SchemaSettings};
+use schemars::JsonSchema;
+#[cfg(test)]
+use schemars::generate::SchemaSettings;
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::{Value, json};
 
@@ -189,6 +191,7 @@ struct PlanEditRequestWire {
 }
 
 /// Generate the model-facing PlanEdit schema from the same types Serde decodes.
+#[cfg(test)]
 pub(crate) fn plan_edit_request_schema() -> Value {
     let generator = SchemaSettings::draft07().for_deserialize().into_generator();
     let mut schema = serde_json::to_value(generator.into_root_schema_for::<PlanEditRequestWire>())
@@ -891,6 +894,7 @@ mod test {
             title: "Plan".into(),
             prompt: "Plan the change.".into(),
             overview: "Initial".into(),
+            design: None,
             usage: None,
             entity_changes: Vec::new(),
             dependencies: Vec::new(),

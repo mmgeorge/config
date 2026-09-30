@@ -12,7 +12,7 @@ use crate::control_tools::{
     ControlToolInvocation, ControlToolRuntime, ControlTurnContext, apply_invocation,
     control_tool_failure_json,
 };
-use crate::plan::{PlanDocument, apply_plan_edit, render_plan};
+use crate::plan::{PlanDocument, render_plan};
 use crate::session::{ContextUsage, ExecutionMode};
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
@@ -568,7 +568,7 @@ impl CodexJsonRpc {
                 Ok(json!({
                     "contentItems": [{
                         "type": "inputText",
-                        "text": "Harness already recorded and consumed this planning feedback. Continue with harness_plan_edit, harness_question_ask, or harness_plan_submit."
+                        "text": "Harness already recorded and consumed this planning feedback. Continue with harness_design_apply_patch, harness_question_ask, or harness_plan_submit."
                     }],
                     "success": false
                 }))
@@ -714,15 +714,12 @@ impl CodexJsonRpc {
         }
         match invocation.name.as_str() {
             "harness_plan_edit" => {
-                let request = output
-                    .plan_edit
-                    .pop()
-                    .context("plan edit did not produce an edit request")?;
-                let document = self
-                    .plan_document
-                    .as_ref()
-                    .context("plan edit has no active canonical document")?;
-                self.plan_document = Some(apply_plan_edit(document, request)?.document);
+                anyhow::bail!("obsolete plan edit tool. Use harness_design_apply_patch");
+            }
+            "harness_design_apply_patch" => {
+                let request = output.design_patch.pop().context("design patch has no request")?;
+                self.plan_document = Some(self.plan_document.as_ref().context("design patch has no active design")?.patch_design(request)?);
+                return Ok(Some(format!("Declaration patch accepted. Active version: {}",self.plan_document.as_ref().unwrap().version)));
             }
             "harness_plan_read" => {
                 let requested_plan_id = output
@@ -737,6 +734,10 @@ impl CodexJsonRpc {
                     requested_plan_id == document.plan_id,
                     "requested plan id does not match the active plan"
                 );
+                if let Some(design) = &document.design {
+                    let value = design.read(invocation.arguments.get("path").and_then(Value::as_str), invocation.arguments.get("baseline").and_then(Value::as_bool).unwrap_or(false))?;
+                    return Ok(Some(serde_json::json!({"plan_id":document.plan_id,"version":document.version,"declarations":value}).to_string()));
+                }
             }
             "harness_plan_submit" => {
                 let submission = output
@@ -1427,6 +1428,8 @@ fn control_tool_name<'value>(method: &str, value: &'value Value) -> Option<&'val
         .filter(|name| {
             matches!(
                 *name,
+                "harness_design_apply_patch"
+                    |
                 "harness_plan_edit"
                     | "harness_plan_read"
                     | "harness_plan_submit"
@@ -2119,11 +2122,11 @@ mod test {
                     "item": {
                         "id": overview,
                         "type": "dynamicToolCall",
-                        "tool": "harness_plan_edit",
+                        "tool": "harness_design_apply_patch",
                         "arguments": {
                             "plan_id": "plan-1",
                             "expected_version": 1,
-                            "plan": { "overview": overview }
+                            "patch": overview
                         }
                     }
                 }
@@ -2153,7 +2156,7 @@ mod test {
             false,
         )
         .await;
-        assert!(output.plan_edit.is_empty());
+        assert!(output.design_patch.is_empty());
 
         normalize_event_in_workspace(
             &invocation("item/started", "corrected"),
@@ -2164,7 +2167,7 @@ mod test {
         )
         .await;
         apply_control_request_result(&request("rejected"), &mut output, false).unwrap();
-        assert!(output.plan_edit.is_empty());
+        assert!(output.design_patch.is_empty());
         apply_control_request_result(&request("corrected"), &mut output, true).unwrap();
         normalize_event_in_workspace(
             &invocation("item/completed", "corrected"),
@@ -2175,15 +2178,8 @@ mod test {
         )
         .await;
 
-        assert_eq!(output.plan_edit.len(), 1);
-        assert_eq!(
-            output.plan_edit[0]
-                .mutation
-                .plan
-                .as_ref()
-                .and_then(|plan| plan.overview.as_deref()),
-            Some("corrected")
-        );
+        assert_eq!(output.design_patch.len(), 1);
+        assert_eq!(output.design_patch[0].patch,"corrected");
     }
 
     #[tokio::test]

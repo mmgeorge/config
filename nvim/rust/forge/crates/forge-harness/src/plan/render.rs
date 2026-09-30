@@ -96,6 +96,13 @@ pub enum PlanReviewTarget {
     File {
         path: String,
     },
+    Declaration {
+        path: String,
+        side: String,
+        line: u32,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        column: Option<u32>,
+    },
     FileDirectory {
         path: String,
     },
@@ -144,7 +151,7 @@ pub struct PlanNavigationIndex {
 impl PlanNavigationIndex {
     /// Resolve the semantic anchor attached to one reviewer-visible line.
     pub fn resolve_line(&self, line: u32) -> Option<&PlanNavigationAnchor> {
-        self.anchor.iter().find(|anchor| anchor.line == line)
+        self.anchor.iter().rev().find(|anchor| anchor.line == line)
     }
 }
 
@@ -386,6 +393,7 @@ pub fn render_plan(document: &PlanDocument) -> Result<RenderedPlan> {
 
 /// Render one plan against its repository root so file status reflects the worktree.
 pub fn render_plan_at(document: &PlanDocument, workspace: &Path) -> Result<RenderedPlan> {
+    if document.design.is_some() { document.validate()?; return super::design_review::render(document); }
     serialized_size(document, 8 * 1024 * 1024)?;
     validate_plan_render(document)?;
     let graph = PlanGraph::new(document);

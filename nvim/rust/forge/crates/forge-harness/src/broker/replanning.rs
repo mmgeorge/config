@@ -82,9 +82,15 @@ impl HarnessBroker {
         &mut self,
         request: String,
         prompt: String,
-        document: PlanDocument,
+        mut document: PlanDocument,
     ) -> Result<(Value, Vec<SessionEvent>)> {
         let mut leading_event = Vec::new();
+        if document.design.is_none() {
+            let workspace = PathBuf::from(&self.session.workspace);
+            document.design = Some(tokio::task::spawn_blocking(move || crate::plan::DeclarationDesign::capture(&workspace)).await??);
+            document.title = request.lines().next().unwrap_or("Declaration design").chars().take(100).collect();
+            document.overview = request.clone();
+        }
         if let Some(active) = self
             .session
             .active_plan_id

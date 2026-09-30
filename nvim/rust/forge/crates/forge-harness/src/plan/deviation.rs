@@ -1,9 +1,8 @@
 use super::document::PlanDocument;
 use super::edit::{PlanEditRequest, PlanMutation, apply_plan_edit};
 use anyhow::Result;
-use schemars::{JsonSchema, generate::SchemaSettings};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
 
 /// Defines whether one divergence changes accepted scope.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -66,13 +65,6 @@ pub struct PlanDeviationRequest {
     #[serde(default)]
     pub affected_paths: Vec<String>,
     pub proposed_changes: PlanMutation,
-}
-
-/// Generate the deviation schema from its Serde request contract.
-pub(crate) fn plan_deviation_request_schema() -> Value {
-    let generator = SchemaSettings::draft07().for_deserialize().into_generator();
-    serde_json::to_value(generator.into_root_schema_for::<PlanDeviationRequest>())
-        .expect("PlanDeviationRequest schema serializes")
 }
 
 impl PlanDeviation {

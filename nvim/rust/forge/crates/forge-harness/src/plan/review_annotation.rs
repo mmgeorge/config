@@ -10,6 +10,15 @@ const MAX_ANNOTATION_BYTES: usize = 1024 * 1024;
 pub(crate) struct ReviewAnnotation {
     pub id: String,
     pub source: PlanAnnotationInput,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub anchor: Option<ReviewAnnotationAnchor>,
+}
+
+/// Binds a review selection to immutable saved declaration positions.
+#[derive(Clone, Serialize, Deserialize)]
+pub(crate) struct ReviewAnnotationAnchor {
+    pub start: super::PlanReviewTarget,
+    pub end: super::PlanReviewTarget,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -61,6 +70,38 @@ impl ReviewAnnotationStore {
         &self.annotation
     }
 
+    /// Rebuild display ranges from saved targets, including older comments with row-only anchors.
+    pub(crate) fn reanchor(
+        &mut self,
+        saved: &super::PlanNavigationIndex,
+        current: &super::PlanNavigationIndex,
+    ) -> Result<()> {
+        for annotation in &mut self.annotation {
+            if annotation.anchor.is_none() {
+                annotation.anchor = Some(ReviewAnnotationAnchor {
+                    start: saved
+                        .resolve_line(annotation.source.start_line)
+                        .context("saved comment start has no declaration target")?
+                        .target
+                        .clone(),
+                    end: saved
+                        .resolve_line(annotation.source.end_line)
+                        .context("saved comment end has no declaration target")?
+                        .target
+                        .clone(),
+                });
+            }
+            let anchor = annotation.anchor.as_ref().expect("resolved comment anchor");
+            let start = find_target(current, &anchor.start)
+                .context("comment start is absent from the formatted design")?;
+            let end = find_target(current, &anchor.end)
+                .context("comment end is absent from the formatted design")?;
+            annotation.source.start_line = start.min(end);
+            annotation.source.end_line = start.max(end);
+        }
+        Ok(())
+    }
+
     pub(crate) fn replace(&mut self, annotation: Vec<ReviewAnnotation>) -> Result<()> {
         validate(&annotation)?;
         let source = super::review_source::read_source(&self.source_path)?;
@@ -85,6 +126,38 @@ impl ReviewAnnotationStore {
         self.annotation = annotation;
         Ok(())
     }
+}
+
+fn find_target(
+    index: &super::PlanNavigationIndex,
+    target: &super::PlanReviewTarget,
+) -> Option<u32> {
+    index
+        .anchor
+        .iter()
+        .find(|anchor| {
+            if &anchor.target == target {
+                return true;
+            }
+            match (target, &anchor.target) {
+                (
+                    super::PlanReviewTarget::Declaration {
+                        path,
+                        side,
+                        line,
+                        column: None,
+                    },
+                    super::PlanReviewTarget::Declaration {
+                        path: current_path,
+                        side: current_side,
+                        line: current_line,
+                        ..
+                    },
+                ) => path == current_path && side == current_side && line == current_line,
+                _ => false,
+            }
+        })
+        .map(|anchor| anchor.line)
 }
 
 fn read_optional(path: &std::path::Path) -> Result<Option<Vec<u8>>> {
@@ -141,6 +214,100 @@ mod tests {
     use super::*;
 
     #[test]
+    fn persisted_declaration_targets_follow_display_spacing_changes() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("working.json");
+        std::fs::write(&source_path, b"saved design").unwrap();
+        let checksum = digest(b"saved design");
+        let target = super::super::PlanReviewTarget::Declaration {
+            path: "registry.rs".into(),
+            side: "proposed".into(),
+            line: 3,
+            column: Some(20),
+        };
+        let mut index = super::super::PlanNavigationIndex {
+            plan_id: "plan".into(),
+            plan_version: 1,
+            anchor: vec![super::super::PlanNavigationAnchor {
+                line: 8,
+                target: target.clone(),
+                json_path: "saved position".into(),
+                path: Some("registry.rs".into()),
+                label: "second".into(),
+            }],
+        };
+        let mut store = ReviewAnnotationStore::open(source_path.clone(), checksum.clone()).unwrap();
+        store
+            .replace(vec![ReviewAnnotation {
+                id: "comment".into(),
+                source: PlanAnnotationInput {
+                    start_line: 8,
+                    end_line: 8,
+                    body: "Review second".into(),
+                },
+                anchor: Some(ReviewAnnotationAnchor {
+                    start: target.clone(),
+                    end: target.clone(),
+                }),
+            }])
+            .unwrap();
+        let mut reopened = ReviewAnnotationStore::open(source_path.clone(), checksum).unwrap();
+        index.anchor[0].line = 12;
+        reopened.reanchor(&index, &index).unwrap();
+        assert_eq!(reopened.annotation()[0].source.end_line, 12);
+        assert_eq!(reopened.annotation()[0].source.body, "Review second");
+        reopened.replace(reopened.annotation().to_vec()).unwrap();
+        assert_eq!(std::fs::read(source_path).unwrap(), b"saved design");
+    }
+
+    #[test]
+    fn older_row_only_comments_resolve_through_the_saved_navigation_index() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source_path = temporary.path().join("working.json");
+        std::fs::write(&source_path, b"saved design").unwrap();
+        let mut store = ReviewAnnotationStore::open(source_path, digest(b"saved design")).unwrap();
+        store
+            .replace(vec![ReviewAnnotation {
+                id: "legacy".into(),
+                source: PlanAnnotationInput {
+                    start_line: 4,
+                    end_line: 4,
+                    body: "Review this member".into(),
+                },
+                anchor: None,
+            }])
+            .unwrap();
+        let target = super::super::PlanReviewTarget::Declaration {
+            path: "registry.rs".into(),
+            side: "proposed".into(),
+            line: 3,
+            column: None,
+        };
+        let saved = super::super::PlanNavigationIndex {
+            plan_id: "plan".into(),
+            plan_version: 1,
+            anchor: vec![super::super::PlanNavigationAnchor {
+                line: 4,
+                target,
+                json_path: "old line".into(),
+                path: Some("registry.rs".into()),
+                label: "member".into(),
+            }],
+        };
+        let mut current = saved.clone();
+        current.anchor[0].line = 9;
+        if let super::super::PlanReviewTarget::Declaration { column, .. } =
+            &mut current.anchor[0].target
+        {
+            *column = Some(4);
+        }
+        store.reanchor(&saved, &current).unwrap();
+        assert_eq!(store.annotation()[0].source.end_line, 9);
+        assert_eq!(store.annotation()[0].source.body, "Review this member");
+        assert!(store.annotation()[0].anchor.is_some());
+    }
+
+    #[test]
     fn annotation_restart_preserves_text_and_rejects_concurrent_or_source_changes() {
         let temporary = tempfile::tempdir().unwrap();
         let source = temporary.path().join("working.json");
@@ -149,6 +316,7 @@ mod tests {
         let mut first = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
         let mut stale = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
         let annotation = vec![ReviewAnnotation {
+            anchor: None,
             id: "comment".into(),
             source: PlanAnnotationInput {
                 start_line: 1,

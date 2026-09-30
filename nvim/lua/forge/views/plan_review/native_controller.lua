@@ -24,7 +24,7 @@ local function task_folds(review, owner)
   local state = replica and replica.fold
   local result = {}
   for id, record in pairs(state and state.record or {}) do
-    if id:match("^plan:task:") or id:match("^plan:stage:") or id:match("^plan:change:") then
+    if id:match("^plan:design:") then
       local _, block_row = replica.sequence:position(record.owner)
       local heading_row = block_row
       if record.fold.heading_start then
@@ -112,14 +112,12 @@ local function toggle_task_fold(review)
       and (not selected or fold.end_line < selected.end_line) then selected = fold end
   end
   if not selected then return end
-  vim.api.nvim_win_call(view.window, function()
-    local return_to_heading = cursor_line < selected.start_line
-    local folded = vim.fn.foldclosed(selected.start_line) >= 0
-    vim.api.nvim_win_set_cursor(view.window, { selected.start_line, 0 })
-    vim.cmd(folded and "silent! normal! zo" or "silent! normal! zc")
-    if return_to_heading then vim.api.nvim_win_set_cursor(view.window, { cursor_line, 0 }) end
-    set_task_folded(review, selected.id, not folded)
-  end)
+  if require("forge.folds").toggle_heading(review.owner.replica, view.window) then
+    local folded = vim.api.nvim_win_call(view.window, function()
+      return vim.fn.foldclosed(selected.start_line) == selected.start_line
+    end)
+    set_task_folded(review, selected.id, folded)
+  end
 end
 
 local function close_review(review)
@@ -213,6 +211,7 @@ local function action(review, name)
       end
     elseif name == "delete" then
       return
+    elseif name == "open" and type(result.declarations) == "table" then show_document(review, result.declarations, "Declarations", result.filetype)
     elseif name == "schema" then show_document(review, result.schema, "Canonical plan", "json")
     elseif name == "entity_info" then
       if type(result.info) == "table" then show_document(review, result.info, "Plan entity") else rustdoc(review, result, captured, false) end
@@ -252,23 +251,7 @@ end
 local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review) end)
-  for _, name in ipairs({ "open", "jump_entity", "entity_info", "schema", "comment", "delete" }) do command_set.register(set, name, function() action(review, name) end) end
-  command_set.register(set, "rename_entity", function()
-    if review.plan.historical_revision then return end
-    review.owner.action("rename_entity", function(result, failure, captured)
-      if failure then notice(failure) return end
-      if not result.rename_allowed then notifications.info("Only added plan entities can be renamed", "ForgePlanReview") return end
-      local tick = vim.api.nvim_buf_get_changedtick(review.buf)
-      popup.input({ prompt = "Rename plan entity: ", default = result.entity_name }, function(name)
-        if not name or not review.owner.is_current(captured) or tick ~= vim.api.nvim_buf_get_changedtick(review.buf) then return end
-        client.request_for(review.session_id, "plan.entity.rename", { plan_id = review.plan.id, expected_version = result.version,
-          entity_name = result.entity_name, name = name }, function(renamed, rename_error)
-          if rename_error then notice(rename_error) return end
-          if renamed and renamed.plan and close_review(review) then M.open(renamed.plan) end
-        end)
-      end)
-    end)
-  end)
+  for _, name in ipairs({ "open", "comment", "delete" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
   command_set.register(set, "abort_plan", function()
     if not review.plan.historical_revision and session.harness.active_plan

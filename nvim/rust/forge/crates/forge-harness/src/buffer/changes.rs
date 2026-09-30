@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use anyhow::{Result, ensure};
 use forge_buffer::block::{
-    BlockAnchor, BlockMetadata, BufferBlock, Decoration, FoldRange, TargetRange, TextChunk,
+    BlockAnchor, BlockMetadata, BufferBlock, Decoration, TargetRange, TextChunk,
     TextPosition, TextRange,
 };
 use forge_buffer::identity::{BlockId, FoldId, TargetId};
@@ -257,14 +257,13 @@ impl ChangeTree {
                 column: 0,
             },
         };
-        self.block[start].metadata.fold.push(FoldRange {
-            heading_start: None,
-            collapse_children: start == 0,
-            id: FoldId(id.into()),
-            start: TextPosition { row: 0, column: 0 },
+        forge_diff::projection::fold_header(
+            &mut self.block[start],
+            FoldId(id.into()),
             end,
-            closed: true,
-        });
+            true,
+            start == 0,
+        );
         Ok(())
     }
 }

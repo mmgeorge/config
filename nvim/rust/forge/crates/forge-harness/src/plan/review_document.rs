@@ -221,6 +221,21 @@ impl PlanReviewDocument {
         column: usize,
     ) -> Result<serde_json::Value> {
         use super::PlanReviewTarget;
+        if let Some(design) = &self.source.document.design {
+            ensure!(action == "open", "this design action is unavailable");
+            let (path,side) = match &anchor.target {
+                PlanReviewTarget::Declaration { path,side,.. } => (path,side.as_str()),
+                PlanReviewTarget::File { path } => (path,"proposed"),
+                _ => anyhow::bail!("select a declaration file or line"),
+            };
+            let text = if side == "baseline" { design.baseline.get(path).map(|file| &file.text) } else { design.proposed.get(path).or_else(|| design.baseline.get(path).map(|file| &file.text)) }.context("declaration file is unavailable")?;
+            let presentation = forge_diff::syntax::DeclarationOverview::present(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let snapshot = BufferDocument::new(DocumentId(format!("plan:declarations:{}",uuid::Uuid::new_v4())),vec![forge_buffer::block::BufferBlock {
+                id:forge_buffer::identity::BlockId("declarations".into()),text:forge_buffer::text::BufferText::from_rows(presentation.text.lines())?,metadata:Default::default(),
+            }])?.snapshot();
+            let filetype = forge_diff::syntax::DeclarationOverview::language(path).map(|language| language.name()).unwrap_or("text");
+            return Ok(serde_json::json!({"declarations":snapshot,"filetype":filetype}));
+        }
         let callable = match &anchor.target {
             PlanReviewTarget::FlowEdge {
                 callable_name: Some(name),
@@ -359,15 +374,20 @@ impl PlanReviewDocument {
             );
         }
         let anchor = self.action(input)?;
-        let end_line = match end {
-            Some(end) => self.action(end)?.line,
-            None => anchor.line,
+        let end_anchor = match end {
+            Some(end) => self.action(end)?,
+            None => anchor.clone(),
         };
+        let end_line = end_anchor.line;
         let mut annotation = self.annotation.annotation().to_vec();
         annotation.retain(|annotation| !annotation.source.body.trim().is_empty());
         let id = uuid::Uuid::new_v4().to_string();
         annotation.push(ReviewAnnotation {
             id: id.clone(),
+            anchor: self.source.document.design.as_ref().map(|_| super::review_annotation::ReviewAnnotationAnchor {
+                start: anchor.target.clone(),
+                end: end_anchor.target.clone(),
+            }),
             source: super::PlanAnnotationInput {
                 start_line: anchor.line.min(end_line),
                 end_line: anchor.line.max(end_line),
@@ -533,7 +553,10 @@ impl PlanReviewDocument {
         } else {
             source.path.with_extension("json")
         };
-        let annotation = ReviewAnnotationStore::open(annotation_path, source.saved_digest.clone())?;
+        let mut annotation = ReviewAnnotationStore::open(annotation_path, source.saved_digest.clone())?;
+        if let Some(saved) = &source.saved_navigation {
+            annotation.reanchor(saved, &source.rendered.navigation)?;
+        }
         let (block, target) = super::review_projection::project(
             &source,
             &width,
@@ -690,6 +713,7 @@ mod tests {
                 .unwrap();
         annotation
             .replace(vec![ReviewAnnotation {
+                anchor: None,
                 id: "original-comment".into(),
                 source: crate::plan::PlanAnnotationInput {
                     start_line: 1,

@@ -108,6 +108,15 @@ impl ControlToolRuntime {
             "this provider turn already reached a terminal control action"
         );
         match invocation.name.as_str() {
+            "harness_design_apply_patch" => {
+                self.require_readable_plan()?;
+                anyhow::ensure!(!self.context.has_active_elicitation, "resolve pending Harness questions before editing the design");
+                let request = output.design_patch.pop().context("design patch has no request")?;
+                let document = self.plan_document.as_ref().context("design patch has no active design")?;
+                self.plan_document = Some(document.patch_design(request)?);
+                if self.context.plan_state == Some(PlanState::AwaitingReview) { self.context.plan_state = Some(PlanState::Revising); }
+                Ok(ControlToolResult { invocation:Some(invocation), message:self.plan_version_message("Declaration patch accepted") })
+            }
             "harness_repository_status"
             | "harness_repository_changed_paths"
             | "harness_repository_diff"
@@ -155,10 +164,10 @@ impl ControlToolRuntime {
                     output.plan_read.as_deref() == Some(&document.plan_id),
                     "requested plan id does not match the active plan"
                 );
-                Ok(ControlToolResult {
-                    invocation: Some(invocation),
-                    message: document.model_json()?,
-                })
+                let message = if let Some(design) = &document.design {
+                        serde_json::to_string(&serde_json::json!({"plan_id":document.plan_id,"version":document.version,"file":design.read(invocation.arguments.get("path").and_then(serde_json::Value::as_str),invocation.arguments.get("baseline").and_then(serde_json::Value::as_bool).unwrap_or(false))?}))?
+                    } else { document.model_json()? };
+                Ok(ControlToolResult { invocation: Some(invocation), message })
             }
             "harness_plan_submit" => {
                 self.require_editable_plan()?;
@@ -179,6 +188,11 @@ impl ControlToolRuntime {
                     "submitted version does not match active version"
                 );
                 document.validate_for_submission()?;
+                if let Some(design) = &document.design {
+                    design.check_workspace(self.context.workspace_root.as_deref().context("design submission has no workspace root")?)?;
+                    self.terminal = true;
+                    return Ok(ControlToolResult { invocation:Some(invocation), message:self.plan_version_message("Declaration design submitted for review") });
+                }
                 let workspace_root = self
                     .context
                     .workspace_root
@@ -358,168 +372,28 @@ mod test {
     }
 
     #[tokio::test]
-    async fn discussion_reads_reviewed_plan_and_only_successful_edits_enable_submission() {
+    async fn declaration_tools_stage_versions_and_recover_atomic_failures() {
         let mut context = planning_context();
         context.mode = PromptMode::PlanDiscussion;
         context.plan_state = Some(PlanState::AwaitingReview);
+        context.plan_document.as_mut().unwrap().design = Some(crate::plan::DeclarationDesign::default());
         let mut runtime = ControlToolRuntime::new(context);
-        runtime.invoke(ControlToolInvocation {
-            name: "harness_plan_read".into(), arguments: json!({"plan_id":"plan"}),
-        }).await.unwrap();
-        let submit = ControlToolInvocation {
-            name: "harness_plan_submit".into(), arguments: json!({"plan_id":"plan", "expected_version":1}),
-        };
-        assert!(runtime.invoke(submit.clone()).await.is_err());
-        assert!(runtime.invoke(ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({"plan_id":"plan", "expected_version":99, "plan":{"overview":"Changed"}}),
-        }).await.is_err());
-        assert!(runtime.invoke(submit).await.is_err());
-        runtime.context.has_active_elicitation = true;
-        let edit = ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({"plan_id":"plan", "expected_version":1, "plan":{"overview":"Changed"}}),
-        };
-        assert!(runtime.invoke(edit.clone()).await.is_err());
-        runtime.context.has_active_elicitation = false;
-        runtime.invoke(edit).await.unwrap();
-        runtime.invoke(ControlToolInvocation {
-            name: "harness_plan_submit".into(), arguments: json!({"plan_id":"plan", "expected_version":2}),
-        }).await.unwrap();
+        let patch = "*** Begin Patch\n*** Add File: src/lib.rs\n+pub struct Owner;\n*** End Patch";
+        assert!(runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(),arguments:json!({"plan_id":"plan","expected_version":1}) }).await.is_err());
+        let change = |version,patch:&str| ControlToolInvocation { name:"harness_design_apply_patch".into(),arguments:json!({"plan_id":"plan","expected_version":version,"patch":patch}) };
+        assert!(runtime.invoke(change(99,patch)).await.is_err());
+        assert!(runtime.invoke(change(1,"*** Begin Patch\n*** Add File: src/lib.rs\n+fn bad() {}\n*** End Patch")).await.is_err());
+        assert_eq!(runtime.plan_document().unwrap().version,1);
+        runtime.invoke(change(1,patch)).await.unwrap();
+        runtime.invoke(change(2,"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub struct Owner;\n+pub struct Owner { private: u64 }\n*** End Patch")).await.unwrap();
+        let read = runtime.invoke(ControlToolInvocation { name:"harness_plan_read".into(),arguments:json!({"plan_id":"plan","path":"src/lib.rs"}) }).await.unwrap();
+        assert!(read.message.contains("private: u64"));
+        runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(),arguments:json!({"plan_id":"plan","expected_version":3}) }).await.unwrap();
+        assert!(runtime.invoke(change(3,patch)).await.is_err());
     }
 
-    #[tokio::test]
-    async fn stages_edits_and_closes_the_turn_after_submission() {
-        let mut runtime = ControlToolRuntime::new(planning_context());
-        runtime
-            .invoke(ControlToolInvocation {
-                name: "harness_plan_edit".into(),
-                arguments: json!({
-                    "plan_id": "plan", "expected_version": 1,
-                    "plan": { "overview": "Changed" }
-                }),
-            })
-            .await
-            .unwrap();
-        runtime
-            .invoke(ControlToolInvocation {
-                name: "harness_plan_submit".into(),
-                arguments: json!({ "plan_id": "plan", "expected_version": 2 }),
-            })
-            .await
-            .unwrap();
-        assert!(
-            runtime
-                .invoke(ControlToolInvocation {
-                    name: "harness_plan_read".into(),
-                    arguments: json!({ "plan_id": "plan" }),
-                })
-                .await
-                .is_err()
-        );
-    }
 
-    #[tokio::test]
-    async fn keeps_the_draft_editable_after_submission_validation_fails() {
-        let mut runtime = ControlToolRuntime::new(planning_context());
-        runtime
-            .invoke(ControlToolInvocation {
-                name: "harness_plan_edit".into(),
-                arguments: json!({
-                    "plan_id": "plan",
-                    "expected_version": 1,
-                    "set": {
-                        "entity_changes": [{
-                            "action": "add",
-                            "kind": "struct",
-                            "name": "InspectionService",
-                            "description": "Own inspection.",
-                            "path": "src/inspection.rs",
-                            "members": [],
-                            "variants": [],
-                            "extends": null,
-                            "conforms_to": []
-                        }]
-                    }
-                }),
-            })
-            .await
-            .unwrap();
-        let submission_error = match runtime
-            .invoke(ControlToolInvocation {
-                name: "harness_plan_submit".into(),
-                arguments: json!({ "plan_id": "plan", "expected_version": 2 }),
-            })
-            .await
-        {
-            Ok(_) => panic!("incomplete plan submission should fail"),
-            Err(error) => error.to_string(),
-        };
-        assert!(submission_error.contains("must belong to exactly one subtask"));
 
-        runtime
-            .invoke(ControlToolInvocation {
-                name: "harness_plan_edit".into(),
-                arguments: json!({
-                    "plan_id": "plan",
-                    "expected_version": 2,
-                    "set": {
-                        "entity_changes": [{
-                            "action": "add",
-                            "kind": "struct",
-                            "name": "InspectionService",
-                            "description": "Own inspection.",
-                            "path": "src/inspection.rs",
-                            "members": [{
-                                "action": "add",
-                                "kind": "method",
-                                "name": "inspect",
-                                "description": "Inspect input.",
-                                "visibility": "public",
-                                "type": null,
-                                "parameters": [],
-                                "return_type": "InspectionReport"
-                            }],
-                            "variants": [],
-                            "extends": null,
-                            "conforms_to": []
-                        }],
-                    },
-                    "stages": [{"id": "foundation", "title": "Establish plan state", "tasks": [{
-                            "id": "plan-state", "requires": [],
-                            "title": "Create plan state",
-                            "description": "Give planning one owner.",
-                            "files": [{
-                                "path": "src/plan.rs",
-                                "action": "add",
-                                "subtasks": [{
-                                    "operation": "create",
-                                    "description": "Keep state durable.",
-                                    "entities": ["PlanDocument"]
-                                }]
-                            }, {
-                                "path": "src/inspection.rs",
-                                "action": "add",
-                                "subtasks": [{
-                                    "operation": "create",
-                                    "description": "the inspection owner.",
-                                    "entities": ["InspectionService"]
-                                }]
-                            }]
-                        }]
-                    }]
-                }),
-            })
-            .await
-            .unwrap();
-        runtime
-            .invoke(ControlToolInvocation {
-                name: "harness_plan_submit".into(),
-                arguments: json!({ "plan_id": "plan", "expected_version": 3 }),
-            })
-            .await
-            .unwrap();
-    }
 
     #[tokio::test]
     async fn returns_rust_api_violations_to_the_submit_tool_and_keeps_editing_open() {

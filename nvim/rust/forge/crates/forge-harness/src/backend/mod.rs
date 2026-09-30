@@ -26,23 +26,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::time::Duration;
 
-pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = r#"You run inside Forge Harness. During planning, Harness owns the active canonical JSON PlanDocument, its plan ID and version. The model authors stable stage and task IDs. Read the document with harness_plan_read before editing it. Mutate it only through harness_plan_edit.
-
-Use Markdown for user-facing responses unless the user requests another format. Use fenced code blocks with language tags for code and inline code for identifiers and commands. Do not wrap the entire response in a code fence. Keep structured tool arguments in their required schema.
-
-The harness_plan_edit request uses a PlanDocument edit schema. Send plan_id, expected_version, and only plan, rename, set, delete, stages, or assumptions. Patch title, overview, and usage inside plan. Send assumptions as one complete replacement array. Replace the complete ordered task tree through stages: each stage has id, title, and tasks, and each task has id, title, description, requires, and files containing subtasks. Preserve stable IDs across revisions. Task requires entries reference task IDs in earlier stages. Stages execute in order, and sibling tasks must be independently completable, including their verification, with no shared file edits or rename endpoints. Harness derives labels such as 2a from positions. Under set, place complete entity_changes, dependencies, and flows directly into their ordered collection arrays without key/value wrappers. Harness derives each semantic key from the resource name or title. A matching key replaces in place, while a new key appends in request order. Under rename, group explicit {"from":"<current semantic key>","to":"<new semantic key>"} entries by resource collection. Use rename only when changing an identifying name or title, then use the destination key in set when the complete resource also changes. Under delete, group current semantic keys by resource collection. Delete retracts an entry from the plan document. To plan source or manifest removal, set a complete resource whose implementation action is remove. Every action inside a resource describes future implementation, never document editing.
-
-Each set resource contains every retained nested member, variant, step, edge, file, and subtask. Never send Harness IDs, create/replace/delete operation envelopes, recursive mutation wrappers, JSON Patch op/path fields, or the whole PlanDocument. Never repeat a semantic key, rename and delete the same resource, or place the same key in both set and delete.
-
-Model each changed program construct once as an entity_change with its lifecycle action, source path, members, variants, and ownership references. Represent each concrete test as one flat task-file subtask with operation test and its action, name, category, behavior, and optional covers_entities fields directly on that subtask. Never model a concrete test as an entity_change or create a top-level tests resource.
-
-Flow targets use tagged planned_entity, workspace_entity, or typed external_entity references. Use workspace_entity only for an unchanged repository construct and provide its entity kind, name, repository-relative path, and one-indexed declaration line. Call, read, and write relations use a structured function or method callable with a bare identifier, and construct, call, read, and write always target one type entity.
-
-Trace every dependency's claimed role into concrete plan content. Show dependencies whose APIs perform domain work through typed external flow edges, and name the owning entity plus integration mechanism for runtime, derive, build, or test support that does not belong in a runtime flow. Before naming an external Rust callable, verify it against current documentation or source for the exact dependency version. If verification cannot establish the API, keep the boundary behind a planned entity, describe its concrete work through nested edges, and name the dependency responsibility in the owning entity or task instead of replacing the work with vague prose.
-
-Every failed control call returns one JSON object with ok false, a stable code, exact violation paths, correction hints, and retry data. Parse that object, correct every violation in one edit, and use retry.expected_version when present. A planning turn must end with harness_question_ask or a successful harness_plan_submit after required edits.
-
-During execution, execute only the selected whole task, serially. Call harness_plan_task_report with execution_id, task_id, current plan_version, task_path, and subtask, entity, path, and test evidence. Canonical task paths use /stages/0/tasks/0 and descendant evidence paths use /stages/0/tasks/0/files/0/subtasks/0. Stage completion derives from persisted task completion. Call harness_plan_deviation before departing from accepted intent. Call harness_question_ask whenever a material user decision remains. Use harness_question_answer only while a Harness question remains pending and the user explicitly answers it. Use harness_question_withdraw only while a Harness question remains pending and no material decision remains. Planning-feedback turns contain answers Harness already recorded and consumed, so never call either question-resolution tool from those turns. The question tools work in every mode. End the turn after a Harness question or terminal plan control call. For a terminal goal state, call harness_goal_complete or harness_goal_blocked. Never claim a control action through ordinary prose alone."#;
+pub(crate) const HARNESS_SYSTEM_MESSAGE: &str = include_str!("../plan/prompts/system.md");
 
 /// Identifies one supported provider implementation without leaking launch strings across consumers.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -310,6 +294,8 @@ pub struct BackendOutput {
     pub event: Vec<BackendEvent>,
     #[serde(default)]
     pub plan_edit: Vec<crate::plan::PlanEditRequest>,
+    #[serde(default)]
+    pub design_patch: Vec<crate::plan::DesignPatchRequest>,
     pub plan_submit: Option<PlanSubmitRequest>,
     pub plan_read: Option<String>,
     #[serde(default)]
@@ -674,6 +660,22 @@ impl Backend for MockBackend {
         let steering = self.steering_lane(&request.harness_session_id);
         let mut active_steering = steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
+        if request.mode == PromptMode::Plan {
+            if let Some(document) = request.control_context.as_ref().and_then(|context| context.plan_document.as_ref()).filter(|document| document.design.is_some()) {
+                let path = "src/change.rs";
+                let design = document.design.as_ref().unwrap();
+                let patch = if let Some(text) = design.proposed.get(path) {
+                    format!("*** Begin Patch\n*** Update File: {path}\n@@\n-{}\n+pub fn reviewed_change();\n*** End Patch",text.trim())
+                } else { format!("*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n*** End Patch") };
+                let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Design the requested change".into()) };
+                let proposed = document.patch_design(change.clone())?;
+                return Ok(BackendOutput {
+                    backend_session_id:request.backend_session_id.or(Some("mock-session".into())),
+                    design_patch:vec![change],plan_submit:Some(PlanSubmitRequest { plan_id:document.plan_id.clone(),expected_version:proposed.version }),
+                    structured_plan:true,capability:mock_capability(),..Default::default()
+                });
+            }
+        }
         let event = BackendEvent {
             address: None,
             turn_boundary: None,
@@ -944,6 +946,7 @@ impl Backend for MockBackend {
             provider_checkpoint_id: Some("mock-checkpoint".into()),
             event: vec![event],
             plan_edit,
+            design_patch: Vec::new(),
             plan_submit,
             plan_read: None,
             plan_deviation: Vec::new(),
@@ -1068,12 +1071,9 @@ mod test {
     #[test]
     fn provider_instructions_describe_staged_edits_and_revision_scoped_reports() {
         let prompt = super::HARNESS_SYSTEM_MESSAGE;
-        assert!(prompt.contains("plan, rename, set, delete, stages, or assumptions"));
-        assert!(prompt.contains("Task requires entries reference task IDs in earlier stages"));
-        assert!(prompt.contains("execution_id, task_id, current plan_version, task_path"));
-        assert!(prompt.contains("/stages/0/tasks/0/files/0/subtasks/0"));
-        assert!(!prompt.contains("flows, and tasks directly"));
-        assert!(!prompt.contains("version, and every internal ID"));
+        assert!(prompt.contains("harness_design_apply_patch"));
+        assert!(!prompt.contains("harness_plan_task_report"));
+        assert!(!prompt.contains("harness_plan_edit"));
     }
     use super::{Backend, BackendRequest, MockBackend, PromptMode};
     use crate::session::ExecutionMode;

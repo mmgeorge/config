@@ -19,6 +19,9 @@ pub(crate) fn project(
     revision: &HashMap<String, (RegionRevision, EditSequence)>,
     focused: Option<&str>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
+    if source.document.design.is_some() {
+        return super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax);
+    }
     let rendered = MarkdownRenderer::source(
         BlockId("plan:markdown".into()),
         source
@@ -652,7 +655,7 @@ fn task_ranges(anchor: &[PlanNavigationAnchor], end: usize) -> Vec<(usize, usize
     ranges
 }
 
-fn annotation_block(
+pub(super) fn annotation_block(
     annotation: &ReviewAnnotation,
     width: &WidthProfile,
     focused: bool,
@@ -1192,6 +1195,7 @@ mod tests {
             .find(|anchor| anchor.json_path == "/overview")
             .unwrap();
         let annotation = ReviewAnnotation {
+            anchor: None,
             id: "note".into(),
             source: PlanAnnotationInput {
                 start_line: anchor.line,

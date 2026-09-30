@@ -168,22 +168,10 @@ function M.open(state, host)
   local session_id = state.session.id
   request(session_id, "trace.status", {}, function(status)
     local pending = false
-    local executor_field = "enabled"
     local active = state.session
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
     local build_spec
-    local function configure(params)
-      if pending then return end
-      pending = true
-      client.request_for(session_id, "session.configure", params, function(result, failure)
-        pending = false
-        if failure then notifications.error(failure, "Harness configuration") return end
-        active = result
-        state.session = result
-        if picker.is_open("harness-config") then picker.update(build_spec()) end
-      end)
-    end
-    local function toggle(context, direction)
+    local function toggle(context)
       if pending or not context.option then return end
       local id = context.option.id
       if id == "logging" then
@@ -195,64 +183,9 @@ function M.open(state, host)
           M.adopt(status)
           if picker.is_open("harness-config") then picker.update(build_spec()) end
         end)
-      elseif id == "plan_executor" and executor_field == "enabled" then
-        if state.capability and state.capability.model_selection == false then return end
-        configure({ plan_executor_enabled = not (active.plan_executor and active.plan_executor.enabled) })
-      elseif id == "plan_compact" then
-        if state.capability and state.capability.native_compact == false then return end
-        configure({ plan_compact = not active.plan_compact })
-      elseif id == "plan_executor" then
-        if state.capability and state.capability.model_selection == false then return end
-        local field = executor_field
-        pending = true
-        client.request_for(session_id, "backend.models", {}, function(model_list, failure)
-          pending = false
-          if not picker.is_open("harness-config") then return end
-          if failure then notifications.error(failure, "Plan Executor") return end
-          if type(model_list) ~= "table" or #model_list == 0 then
-            notifications.error("No executor models are available", "Plan Executor")
-            return
-          end
-          local selected = active.plan_executor or {}
-          local model_id = selected.model or active.resolved_model or active.model
-          local model_index = 1
-          for index, model in ipairs(model_list) do
-            if model.id == model_id then model_index = index break end
-          end
-          if field == "model" then
-            model_index = ((model_index - 1 + direction) % #model_list) + 1
-          end
-          local model = model_list[model_index]
-          local reasoning = model.reasoning or {}
-          local effort = selected.effort or active.effort
-          if #reasoning > 0 then
-            if not vim.tbl_contains(reasoning, effort) then
-              effort = vim.tbl_contains(reasoning, model.default_reasoning) and model.default_reasoning or reasoning[1]
-            end
-            if field == "thinking" then
-              effort = reasoning[((vim.fn.index(reasoning, effort) + direction) % #reasoning) + 1]
-            end
-          elseif field == "thinking" then
-            return
-          end
-          configure({ plan_executor_model = model.id, plan_executor_effort = effort })
-        end)
       end
     end
-    local function next_executor_field(context)
-      if not context.option or context.option.id ~= "plan_executor" then return end
-      executor_field = ({ enabled = "model", model = "thinking", thinking = "enabled" })[executor_field]
-      picker.update(build_spec())
-    end
     build_spec = function()
-      local executor = active.plan_executor or {}
-      local model_enabled = not state.capability or state.capability.model_selection ~= false
-      local compact_enabled = not state.capability or state.capability.native_compact ~= false
-      local executor_value = model_enabled and table.concat({
-        picker_field.render(executor.enabled and "On" or "Off", executor_field == "enabled"),
-        picker_field.render(executor.model or active.resolved_model or active.model or "Default", executor_field == "model"),
-        picker_field.render(executor.effort or active.effort or "Default", executor_field == "thinking"),
-      }, "  ") or "Unavailable"
       return {
         owner = "harness-config", host = host,
         page_list = { {
@@ -260,18 +193,15 @@ function M.open(state, host)
           column_headers = { "Setting", "Value", "Description" },
           option_list = {
             { id = "logging", label = "Logging", columns = { "Logging", picker_field.render(status.enabled and "On" or "Off", true), "Save session log" } },
-            { id = "plan_executor", label = "Plan Executor", columns = { "Plan Executor", executor_value, "Switch model when a plan is accepted" } },
-            { id = "plan_compact", label = "Plan Compact", columns = { "Plan Compact", compact_enabled and picker_field.render(active.plan_compact and "On" or "Off", true) or "Unavailable", "Compact context before executing a plan" } },
           },
-          footer = "Tab executor field  ←→/Enter change  q close",
+          footer = "←→/Enter change  q close",
         } },
         action_list = {
-          { id = "previous-value", key = "<Left>", callback = function(context) toggle(context, -1) end },
-          { id = "next-value", key = "<Right>", callback = function(context) toggle(context, 1) end },
-          { id = "next-executor-field", key = "<Tab>", callback = next_executor_field },
+          { id = "previous-value", key = "<Left>", callback = toggle },
+          { id = "next-value", key = "<Right>", callback = toggle },
         },
         on_confirm = function(result)
-          toggle({ option = result.option }, 1)
+          toggle({ option = result.option })
           return false
         end,
       }

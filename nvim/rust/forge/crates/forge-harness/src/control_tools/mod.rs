@@ -66,15 +66,15 @@ impl ControlToolRegistry {
                 input_schema: repository_input_schema(true, true),
             },
             ControlToolDefinition {
-                name: "harness_plan_edit",
-                description: "Atomically edit the broker-created canonical PlanDocument with optimistic version checking. Patch title, overview, usage, and assumptions directly. Set complete top-level Plan Schema resources directly, rename identifying names or titles explicitly, and retract plan entries through delete lists. Action fields inside resources describe future implementation changes, not document editing. Plan nodes have no generated IDs. Model each changed program construct once as an entity_change and each concrete test once as a flat task-file subtask whose operation is test.",
-                input_schema: plan_edit_input_schema(),
+                name: "harness_design_apply_patch",
+                description: "Atomically edit proposed declaration overview files, not implementation files. Use the familiar *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax. Paths are project-relative virtual overview paths. Read files with harness_plan_read first. Functions contain signatures only, never bodies. Return the new design version. Optional title names the design.",
+                input_schema: strict_object_input_schema(vec![("plan_id",string_schema()),("expected_version",json!({"type":"integer","minimum":1})),("patch",string_schema()),("title",string_schema())], &["plan_id","expected_version","patch"]),
             },
             ControlToolDefinition {
                 name: "harness_plan_read",
-                description: "Request the current canonical JSON plan by stable plan ID. The next Harness planning context includes the complete document.",
+                description: "List declaration overview paths or read one baseline/proposed overview file. Omit path for the inventory. Set baseline true to inspect immutable current-code declarations. Returns the active design version. Does not return implementation bodies.",
                 input_schema: strict_object_input_schema(
-                    vec![("plan_id", string_schema())],
+                    vec![("plan_id", string_schema()),("path",string_schema()),("baseline",json!({"type":"boolean"}))],
                     &["plan_id"],
                 ),
             },
@@ -91,16 +91,6 @@ impl ControlToolRegistry {
                     ],
                     &["plan_id", "expected_version"],
                 ),
-            },
-            ControlToolDefinition {
-                name: "harness_plan_deviation",
-                description: "Record an execution-time informational or scope deviation. Scope deviations carry the same ordered set/delete proposed_changes shape as harness_plan_edit.",
-                input_schema: plan_deviation_input_schema(),
-            },
-            ControlToolDefinition {
-                name: "harness_plan_task_report",
-                description: "Complete or block the active whole-plan task with version-scoped JSON pointer evidence for the task, subtasks, entities, and tests. Harness validates the evidence and selects the next task.",
-                input_schema: plan_task_report_input_schema(),
             },
             ControlToolDefinition {
                 name: "harness_question_ask",
@@ -175,6 +165,10 @@ pub fn apply_invocation(
 ) -> Result<()> {
     validate_arguments(invocation)?;
     match invocation.name.as_str() {
+        "harness_design_apply_patch" => {
+            output.design_patch.push(decode_arguments::<crate::plan::DesignPatchRequest>(invocation)?);
+            output.structured_plan = true;
+        }
         "harness_plan_edit" => {
             output
                 .plan_edit
@@ -317,116 +311,17 @@ fn string_schema() -> Value {
     json!({ "type": "string" })
 }
 
-fn nullable_string_schema() -> Value {
-    json!({ "type": ["string", "null"] })
-}
 
-fn string_array_schema() -> Value {
-    json!({ "type": "array", "items": { "type": "string" } })
-}
 
-fn json_pointer_schema(pattern: &str, description: &str) -> Value {
-    json!({
-        "type": "string",
-        "pattern": pattern,
-        "description": description,
-    })
-}
 
-fn nullable_json_pointer_schema(pattern: &str, description: &str) -> Value {
-    json!({
-        "type": ["string", "null"],
-        "pattern": pattern,
-        "description": description,
-    })
-}
 
-fn json_pointer_array_schema(pattern: &str, description: &str) -> Value {
-    json!({
-        "type": "array",
-        "items": json_pointer_schema(pattern, description),
-    })
-}
 
+#[cfg(test)]
 fn plan_edit_input_schema() -> Value {
     crate::plan::plan_edit_request_schema()
 }
 
-fn plan_deviation_input_schema() -> Value {
-    crate::plan::plan_deviation_request_schema()
-}
 
-fn plan_task_report_input_schema() -> Value {
-    strict_object_input_schema(
-        vec![
-            ("execution_id", string_schema()),
-            ("task_id", string_schema()),
-            ("plan_version", json!({"type": "integer", "minimum": 1})),
-            (
-                "task_path",
-                json_pointer_schema(
-                    "^/stages/[0-9]+/tasks/[0-9]+$",
-                    "JSON Pointer for the active task in the accepted plan revision, for example /stages/0/tasks/0.",
-                ),
-            ),
-            (
-                "state",
-                json!({ "type": "string", "enum": ["complete", "blocked"] }),
-            ),
-            (
-                "completed_subtask_paths",
-                json_pointer_array_schema(
-                    "^/stages/[0-9]+/tasks/[0-9]+/files/[0-9]+/subtasks/[0-9]+$",
-                    "JSON Pointer for one completed subtask in the accepted plan revision.",
-                ),
-            ),
-            (
-                "completed_entity_paths",
-                json_pointer_array_schema(
-                    "^/entity_changes/[0-9]+$",
-                    "JSON Pointer for one completed entity in the accepted plan revision.",
-                ),
-            ),
-            (
-                "test_results",
-                json!({
-                    "type": "array",
-                    "items": strict_object_input_schema(
-                        vec![
-                            (
-                                "test_subtask_path",
-                                nullable_json_pointer_schema(
-                                    "^/stages/[0-9]+/tasks/[0-9]+/files/[0-9]+/subtasks/[0-9]+$",
-                                    "JSON Pointer for the concrete test subtask in the accepted plan revision.",
-                                ),
-                            ),
-                            (
-                                "status",
-                                json!({
-                                    "type": "string",
-                                    "enum": ["passed", "failed", "skipped", "not_run"]
-                                }),
-                            ),
-                            ("command", nullable_string_schema()),
-                            ("detail", nullable_string_schema()),
-                        ],
-                        &["status"],
-                    )
-                }),
-            ),
-            ("changed_paths", string_array_schema()),
-            ("summary", nullable_string_schema()),
-            ("blocking_reason", nullable_string_schema()),
-        ],
-        &[
-            "execution_id",
-            "task_id",
-            "plan_version",
-            "task_path",
-            "state",
-        ],
-    )
-}
 
 fn strict_object_input_schema(
     property_list: Vec<(&'static str, Value)>,
@@ -637,7 +532,19 @@ mod test {
         );
     }
     use super::*;
-    use crate::plan::{PatchField, PlanUsage};
+    #[test]
+    fn design_patch_contract_replaces_legacy_authoring_tools() {
+        let definition = ControlToolRegistry.definition_list();
+        assert!(definition.iter().any(|tool| tool.name == "harness_design_apply_patch"));
+        assert!(!definition.iter().any(|tool| matches!(tool.name,"harness_plan_edit" | "harness_plan_deviation" | "harness_plan_task_report")));
+        let invocation = ControlToolInvocation { name:"harness_design_apply_patch".into(),arguments:json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Add File: lib.rs\n+pub struct Owner;\n*** End Patch"}) };
+        let mut output = BackendOutput::default();
+        apply_invocation(&invocation,&mut output).unwrap();
+        assert_eq!(output.design_patch.len(),1);
+        let mut invalid = invocation;
+        invalid.arguments["baseline"] = json!({});
+        assert!(apply_invocation(&invalid,&mut BackendOutput::default()).is_err());
+    }
 
     #[test]
     #[cfg(any())]
@@ -1259,513 +1166,12 @@ mod test {
         assert!(!relation_violation_list(json!("dispatch")).is_empty());
     }
 
-    #[test]
-    fn exposes_direct_set_explicit_rename_and_delete_schema() {
-        let definition = ControlToolRegistry
-            .definition_list()
-            .into_iter()
-            .find(|definition| definition.name == "harness_plan_edit")
-            .unwrap();
-        let schema = definition.input_schema;
 
-        assert_eq!(
-            schema.pointer("/properties/set/anyOf/0/$ref"),
-            Some(&json!("#/definitions/PlanResourceSet"))
-        );
-        assert!(
-            schema
-                .pointer("/definitions/PlanResourceSet/properties/flows/items/properties/key")
-                .is_none()
-        );
-        assert_eq!(
-            schema.pointer("/definitions/PlanSemanticRename/required"),
-            Some(&json!(["from", "to"]))
-        );
-        assert_eq!(
-            schema.pointer("/definitions/PlanResourceSet/properties/flows/items/$ref"),
-            Some(&json!("#/definitions/PlanFlow"))
-        );
-        assert_eq!(
-            schema.pointer("/definitions/PlanResourceDelete/properties/flows/items/type"),
-            Some(&json!("string"))
-        );
-        assert_eq!(
-            schema.pointer("/definitions/PlanFlow/properties/source/$ref"),
-            Some(&json!("#/definitions/EntityReference"))
-        );
-        assert!(schema.pointer("/properties/entity_changes").is_none());
-        assert!(
-            schema
-                .pointer("/definitions/PlanFlowEdge/properties/edge_id")
-                .is_none()
-        );
-        assert!(schema.pointer("/properties/tests").is_none());
 
-        let deviation_schema = ControlToolRegistry
-            .definition_list()
-            .into_iter()
-            .find(|definition| definition.name == "harness_plan_deviation")
-            .unwrap()
-            .input_schema;
-        assert_eq!(
-            deviation_schema.pointer("/properties/proposed_changes/$ref"),
-            Some(&json!("#/definitions/PlanMutation"))
-        );
-        assert_eq!(
-            deviation_schema.pointer("/definitions/PlanResourceDelete/properties/flows/items/type"),
-            Some(&json!("string"))
-        );
-    }
 
-    #[test]
-    fn generated_plan_schema_keeps_nested_metadata_symmetric_and_complete() {
-        let schema = plan_edit_input_schema();
 
-        assert_eq!(
-            schema.pointer("/definitions/ProgramEntityMemberChange/required"),
-            Some(&json!(["action", "kind", "name"]))
-        );
-        assert_eq!(
-            schema.pointer("/definitions/EnumVariantChange/required"),
-            Some(&json!(["action", "name", "fields"]))
-        );
-        assert_eq!(
-            schema.pointer("/definitions/EnumVariantFieldChange/required"),
-            Some(&json!(["action", "name", "type"]))
-        );
-        for property in ["renamed_from", "description"] {
-            assert!(
-                schema
-                    .pointer(&format!(
-                        "/definitions/ProgramEntityMemberChange/properties/{property}"
-                    ))
-                    .is_some()
-            );
-            assert!(
-                schema
-                    .pointer(&format!(
-                        "/definitions/EnumVariantChange/properties/{property}"
-                    ))
-                    .is_some()
-            );
-            assert!(
-                schema
-                    .pointer(&format!(
-                        "/definitions/EnumVariantFieldChange/properties/{property}"
-                    ))
-                    .is_some()
-            );
-        }
-        assert!(
-            schema
-                .pointer("/definitions/EnumVariantFieldChange/properties/kind")
-                .is_some()
-        );
-        assert!(
-            schema
-                .pointer("/definitions/EnumVariantFieldChange/properties/visibility")
-                .is_some()
-        );
-        assert_eq!(
-            schema.pointer("/definitions/ProgramEntityChange/required"),
-            Some(&json!([
-                "action",
-                "kind",
-                "name",
-                "description",
-                "path",
-                "members",
-                "variants",
-                "conforms_to"
-            ]))
-        );
-        assert_eq!(
-            schema.pointer("/definitions/DependencyChangeAction/enum"),
-            Some(&json!(["add", "modify", "remove"]))
-        );
 
-        let invocation = ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({
-                "plan_id": "plan",
-                "expected_version": 1,
-                "set": {
-                    "entity_changes": [{
-                        "action": "add",
-                        "kind": "enum",
-                        "name": "InspectionState",
-                        "description": "Represents inspection progress.",
-                        "path": "src/state.rs",
-                        "members": [],
-                        "variants": [{
-                            "action": "add",
-                            "name": "Ready",
-                            "description": "Carries one ready report.",
-                            "fields": [{
-                                "action": "add",
-                                "kind": "field",
-                                "name": "report",
-                                "type": "InspectionReport",
-                                "visibility": "public",
-                                "description": "Carries the completed inspection."
-                            }, {
-                                "action": "remove",
-                                "name": "legacy_report",
-                                "type": "InspectionReport",
-                                "visibility": "private"
-                            }]
-                        }],
-                        "conforms_to": []
-                    }]
-                }
-            }),
-        };
-        apply_invocation(&invocation, &mut BackendOutput::default()).unwrap();
-    }
 
-    #[test]
-    fn task_report_schema_requires_canonical_json_pointers() {
-        let schema = plan_task_report_input_schema();
-        assert_eq!(
-            schema.pointer("/properties/task_path/pattern"),
-            Some(&json!("^/stages/[0-9]+/tasks/[0-9]+$"))
-        );
-        assert_eq!(
-            schema.pointer("/properties/completed_entity_paths/items/pattern"),
-            Some(&json!("^/entity_changes/[0-9]+$"))
-        );
 
-        let invalid_invocation = ControlToolInvocation {
-            name: "harness_plan_task_report".into(),
-            arguments: json!({
-                "execution_id": "execution",
-                "task_id": "plan-state", "plan_version": 1,
-                "task_path": "tasks[0]",
-                "state": "complete"
-            }),
-        };
-        assert!(
-            apply_invocation(&invalid_invocation, &mut BackendOutput::default()).is_err(),
-            "dot-and-index diagnostics must not masquerade as canonical JSON Pointers"
-        );
 
-        let valid_invocation = ControlToolInvocation {
-            name: "harness_plan_task_report".into(),
-            arguments: json!({
-                "execution_id": "execution",
-                "task_id": "plan-state", "plan_version": 1,
-                "task_path": "/stages/0/tasks/0",
-                "state": "complete"
-            }),
-        };
-        apply_invocation(&valid_invocation, &mut BackendOutput::default()).unwrap();
-    }
-
-    #[test]
-    fn decodes_ordered_complete_set_resources_without_generated_node_ids() {
-        let invocation = ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({
-                "plan_id": "plan",
-                "expected_version": 1,
-                "plan": {
-                    "overview": "Persist drafts.",
-                    "usage": {
-                        "command": "draft-sync status",
-                        "expected_result": "Print one pending draft."
-                    }
-                },
-                "set": {
-                    "entity_changes": [{
-                        "action": "add",
-                        "kind": "resource",
-                        "name": "DraftCache",
-                        "description": "Own pending drafts.",
-                        "path": "src/draft_sync.rs",
-                        "members": [{
-                            "action": "add",
-                            "kind": "method",
-                            "name": "store",
-                            "description": "Store one draft."
-                        }],
-                        "variants": [],
-                        "conforms_to": []
-                    }],
-                    "flows": [{
-                        "title": "Draft persistence",
-                        "description": "Persist draft observations.",
-                        "source": {
-                            "kind": "planned_entity",
-                            "entity": "DraftCache"
-                        },
-                        "edges": [{
-                            "relation": "read",
-                            "callable": {
-                                "kind": "method",
-                                "name": "pending"
-                            },
-                            "target": {
-                                "kind": "planned_entity",
-                                "entity": "DraftCache"
-                            },
-                            "return_type": {
-                                "value_type": "DraftChange[]"
-                            },
-                            "expansion": [],
-                            "branches": []
-                        }]
-                    }]
-                },
-                "assumptions": []
-            }),
-        };
-        let mut output = BackendOutput::default();
-
-        apply_invocation(&invocation, &mut output).unwrap();
-
-        let request = &output.plan_edit[0];
-        let set = request.mutation.set.as_ref().unwrap();
-        let entity = &set.entity_changes.as_ref().unwrap()[0];
-        assert_eq!(entity.name, "DraftCache");
-        assert_eq!(entity.members[0].name, "store");
-        let flow = &set.flows.as_ref().unwrap()[0];
-        assert_eq!(flow.edges.len(), 1);
-        assert_eq!(
-            request.mutation.plan.as_ref().unwrap().usage,
-            PatchField::Value(PlanUsage {
-                command: "draft-sync status".into(),
-                expected_result: "Print one pending draft.".into(),
-            })
-        );
-        assert_eq!(request.mutation.assumptions, Some(Vec::new()));
-    }
-
-    #[test]
-    fn rejects_legacy_operation_envelopes_with_the_new_patch_shape() {
-        let invocation = ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({
-                "plan_id": "plan",
-                "expected_version": 1,
-                "flows": [{
-                    "operation": "create",
-                    "value": {
-                        "title": "Legacy flow",
-                        "description": "Uses the removed operation envelope.",
-                        "source": { "kind": "planned_entity", "entity": "Reader" },
-                        "edges": []
-                    }
-                }]
-            }),
-        };
-
-        let error = apply_invocation(&invocation, &mut BackendOutput::default()).unwrap_err();
-        let error = error
-            .downcast_ref::<ControlToolArgumentError>()
-            .expect("legacy operation envelope must fail argument validation");
-        let violation = error
-            .violation
-            .iter()
-            .find(|violation| violation.path == "flows")
-            .expect("legacy top-level collection must report its exact path");
-
-        assert_eq!(violation.code, "unknown_field");
-        assert!(
-            violation
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("set.flows") && hint.contains("delete.flows"))
-        );
-    }
-
-    #[test]
-    fn rejects_key_value_wrappers_with_direct_set_guidance() {
-        let invocation = ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({
-                "plan_id": "plan",
-                "expected_version": 1,
-                "set": {
-                    "flows": [{
-                        "key": "Draft persistence",
-                        "value": {
-                            "title": "Draft persistence",
-                            "description": "Persist draft observations.",
-                            "source": { "kind": "planned_entity", "entity": "DraftCache" },
-                            "edges": []
-                        }
-                    }]
-                }
-            }),
-        };
-
-        let error = apply_invocation(&invocation, &mut BackendOutput::default()).unwrap_err();
-        let error = error
-            .downcast_ref::<ControlToolArgumentError>()
-            .expect("key/value wrapper must fail argument validation");
-
-        assert!(
-            error.violation.iter().any(|violation| {
-                violation.path == "set.flows[0]"
-                    && violation.code == "unknown_field"
-                    && violation
-                        .hint
-                        .as_deref()
-                        .is_some_and(|hint| hint.contains("without a key/value wrapper"))
-            }),
-            "unexpected violations: {:#?}",
-            error.violation
-        );
-    }
-
-    #[test]
-    fn reports_missing_implementation_actions_at_the_complete_resource_paths() {
-        let invocation = ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({
-                "plan_id": "plan",
-                "expected_version": 1,
-                "set": {
-                    "dependencies": [{
-                        "name": "durable-cache",
-                        "version": "1",
-                        "manifest": "Cargo.toml",
-                        "license": "MIT",
-                        "justification": "Provides durable storage."
-                    }],
-                    "entity_changes": [{
-                        "action": "add",
-                        "kind": "enum",
-                        "name": "InspectionError",
-                        "description": "Classifies inspection failures.",
-                        "path": "src/inspection.rs",
-                        "members": [],
-                        "variants": [{
-                            "action": "add",
-                            "name": "Read",
-                            "description": "Carries one read failure.",
-                            "fields": [{
-                                "name": "source",
-                                "type": "String"
-                            }]
-                        }],
-                        "extends": null,
-                        "conforms_to": []
-                    }]
-                }
-            }),
-        };
-
-        let error = apply_invocation(&invocation, &mut BackendOutput::default()).unwrap_err();
-        let error = error
-            .downcast_ref::<ControlToolArgumentError>()
-            .expect("missing implementation actions must fail argument validation");
-        let path_list = error
-            .violation
-            .iter()
-            .filter(|violation| violation.code == "missing_field")
-            .map(|violation| violation.path.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(path_list.contains(&"set.dependencies[0]"));
-        assert!(path_list.contains(&"set.entity_changes[0].variants[0].fields[0]"));
-        assert!(error.violation.iter().all(|violation| {
-            violation
-                .hint
-                .as_deref()
-                .is_some_and(|hint| hint.contains("implementation `action`"))
-        }));
-    }
-
-    #[test]
-    fn rejects_recursive_mutations_and_generated_node_id_fields() {
-        let recursive = ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({
-                "plan_id": "plan",
-                "expected_version": 1,
-                "set": {
-                    "flows": {
-                        "modify": []
-                    }
-                }
-            }),
-        };
-        let recursive_error =
-            apply_invocation(&recursive, &mut BackendOutput::default()).unwrap_err();
-        let recursive_error = recursive_error
-            .downcast_ref::<ControlToolArgumentError>()
-            .expect("recursive shape must fail argument validation");
-        assert!(recursive_error.violation.iter().any(|violation| {
-            violation.path == "set.flows" && violation.code == "type_mismatch"
-        }));
-
-        let generated_node_id = ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({
-                "plan_id": "plan",
-                "expected_version": 1,
-                "set": {
-                    "entity_changes": [{
-                        "entity_id": "draft_cache",
-                        "action": "add",
-                        "kind": "resource",
-                        "name": "DraftCache",
-                        "description": "Own pending drafts.",
-                        "path": "src/draft_sync.rs"
-                    }]
-                }
-            }),
-        };
-        let node_id_error =
-            apply_invocation(&generated_node_id, &mut BackendOutput::default()).unwrap_err();
-        let node_id_error = node_id_error
-            .downcast_ref::<ControlToolArgumentError>()
-            .expect("generated node IDs must fail argument validation");
-        assert!(
-            node_id_error.violation.iter().any(|violation| {
-                violation.path == "set.entity_changes[0].entity_id"
-                    && violation.code == "unknown_field"
-                    && violation.message.contains("entity_id")
-            }),
-            "unexpected violations: {:#?}",
-            node_id_error.violation
-        );
-    }
-
-    #[test]
-    fn reports_exact_set_paths_and_all_independent_violations() {
-        let invocation = ControlToolInvocation {
-            name: "harness_plan_edit".into(),
-            arguments: json!({
-                "expected_version": 0,
-                "unexpected": true,
-                "set": {
-                    "flows": [{
-                        "title": "Reader",
-                        "description": "Read input.",
-                        "source": { "entity": "reader" },
-                        "edges": []
-                    }]
-                }
-            }),
-        };
-        let error = apply_invocation(&invocation, &mut BackendOutput::default()).unwrap_err();
-        let error = error
-            .downcast_ref::<ControlToolArgumentError>()
-            .expect("invalid request must fail argument validation");
-        let path_list = error
-            .violation
-            .iter()
-            .map(|violation| violation.path.as_str())
-            .collect::<Vec<_>>();
-
-        assert!(path_list.contains(&"<arguments>"));
-        assert!(path_list.contains(&"expected_version"));
-        assert!(
-            path_list
-                .iter()
-                .any(|path| path.starts_with("set.flows[0]"))
-        );
-    }
 }

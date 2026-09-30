@@ -3,6 +3,8 @@
 mod assets;
 mod context;
 mod query;
+mod declaration;
+pub use declaration::{DeclarationOverview, DeclarationPosition, DeclarationPresentation};
 mod service;
 mod tree;
 

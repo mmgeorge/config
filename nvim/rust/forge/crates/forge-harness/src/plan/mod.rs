@@ -9,6 +9,9 @@ use crate::session::{ExecutionMode, continuation::ContinuationBudget};
 mod audit;
 mod deviation;
 mod document;
+mod design;
+mod design_review;
+pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest};
 mod edit;
 pub(crate) mod event;
 pub use event::{ExchangeAnchor, ExchangePlanEvent, PlanEventContent};
@@ -28,12 +31,12 @@ mod validation;
 pub use audit::{
     PlanAudit, PlanAuditPathDifference, PlanAuditTask, build_plan_audit, render_plan_audit,
 };
-pub(crate) use deviation::plan_deviation_request_schema;
 pub use deviation::{
     EffectivePlan, PlanDeviation, PlanDeviationDisposition, PlanDeviationKind,
     PlanDeviationRequest, ScopeDeviationReview, build_effective_plan,
 };
 pub use document::*;
+#[cfg(test)]
 pub(crate) use edit::plan_edit_request_schema;
 pub use edit::{
     PatchField, PlanEditRequest, PlanEditResult, PlanFieldPatch, PlanMutation, PlanMutationError,

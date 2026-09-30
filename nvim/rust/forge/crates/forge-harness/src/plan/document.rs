@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Deserializer, Serialize};
 use std::borrow::Cow;
@@ -587,7 +587,7 @@ pub struct PlanTask {
 }
 
 pub const PROVISIONAL_PLAN_TITLE: &str = "Planning in progress";
-pub const PLAN_SCHEMA_VERSION: u32 = 5;
+pub const PLAN_SCHEMA_VERSION: u32 = 6;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -609,6 +609,8 @@ pub struct PlanDocument {
     #[serde(default)]
     pub prompt: String,
     pub overview: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub design: Option<super::DeclarationDesign>,
     pub usage: Option<PlanUsage>,
     #[serde(default)]
     pub entity_changes: Vec<ProgramEntityChange>,
@@ -623,6 +625,21 @@ pub struct PlanDocument {
 }
 
 impl PlanDocument {
+    /// Apply one optimistic declaration patch without exposing the immutable baseline to edits.
+    pub fn patch_design(&self, request: super::DesignPatchRequest) -> Result<Self> {
+        anyhow::ensure!(request.plan_id == self.plan_id, "design plan id does not match the active plan");
+        anyhow::ensure!(request.expected_version == self.version, "design version conflict: expected_version must be {}", self.version);
+        let mut candidate = self.clone();
+        candidate.design = Some(self.design.as_ref().context("obsolete plan format. Create a new declaration design.")?.patch(&request.patch)?);
+        if let Some(title) = request.title {
+            anyhow::ensure!(!title.trim().is_empty() && title.len() <= 1024, "design title must contain 1 to 1024 bytes");
+            candidate.title = title.trim().into();
+        }
+        if candidate.design == self.design && candidate.title == self.title { return Ok(self.clone()); }
+        candidate.version = self.version.checked_add(1).context("design version overflow")?;
+        candidate.validate()?;
+        Ok(candidate)
+    }
     /// Visit executable tasks in stage order.
     pub fn tasks(&self) -> impl Iterator<Item = &PlanTask> {
         self.stages.iter().flat_map(|stage| &stage.tasks)
@@ -691,16 +708,26 @@ impl PlanDocument {
     }
     /// Validate references and structural invariants after every semantic edit.
     pub fn validate(&self) -> Result<()> {
+        if let Some(design) = &self.design {
+            anyhow::ensure!(self.schema_version == PLAN_SCHEMA_VERSION, "obsolete plan format. Create a new declaration design.");
+            anyhow::ensure!(self.version > 0 && !self.plan_id.is_empty() && !self.title.trim().is_empty(),"design identity, title, and version are required");
+            anyhow::ensure!(serde_json::to_vec(self)?.len() <= 8 * 1024 * 1024,"declaration design exceeds 8 MiB");
+            return design.validate();
+        }
         validate_plan_edit(self)
     }
 
     /// Validate that one working document can enter mandatory review.
     pub fn validate_for_submission(&self) -> Result<()> {
+        if self.design.is_some() { return self.validate(); }
         validate_plan_submission(self)
     }
 
     /// Serialize the semantic planning surface without Harness-derived state.
     pub fn model_json(&self) -> Result<String> {
+        if let Some(design) = &self.design {
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"declaration_files":design.read(None,false)?}))?);
+        }
         let mut value = serde_json::to_value(self)?;
         value
             .as_object_mut()
@@ -737,6 +764,7 @@ pub(crate) fn test_fixture(plan_id: &str, overview: &str) -> PlanDocument {
         title: "Structured plan".into(),
         prompt: "Create a structured plan.".into(),
         overview: overview.into(),
+        design: None,
         usage: None,
         entity_changes: vec![ProgramEntityChange {
             action: EntityChangeAction::Add,
@@ -1092,6 +1120,6 @@ mod test {
         let mut document = test_fixture("plan", "Version plans.");
         document.schema_version = PLAN_SCHEMA_VERSION + 1;
         let unsupported = document.validate().unwrap_err().to_string();
-        assert!(unsupported.contains("supported PlanDocument schema version 5"));
+        assert!(unsupported.contains("supported PlanDocument schema version 6"));
     }
 }
