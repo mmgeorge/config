@@ -2088,7 +2088,12 @@ The backend subscribes before every send, forwards deltas immediately, and lets
 `CopilotEventDecoder` normalize messages, reasoning, tool lifecycle, usage, tasks, and subagent
 events into the same broker model as Codex. `/plan` does not select a provider-native plan mode.
 Harness sends the same structured planning contract through both backends without changing the
-session's retained Read, Write, Full, or YOLO authorization. The
+session's retained Read, Write, Full, or YOLO authorization. `plan/prompts/planning.md` owns the
+JSON authoring procedure, field contracts, independence checks, and complete edit example.
+`PlanPrompt` embeds that file with `include_str!` for draft, feedback, and revision requests.
+The example passes the real edit, submission-validation, and rendering paths in tests. Harness
+validates declared prerequisites and file ownership, while the planner must assess semantic
+independence and avoid unnecessary stage barriers. The
 `harness_question_ask` pauses either backend on one to three structured decisions while
 `harness_plan_submit` alone creates a review artifact. `ControlToolRegistry` owns every Harness
 tool schema once, then Codex projects it into app-server dynamic tools while Copilot projects it
@@ -2254,6 +2259,9 @@ The scheduler currently executes sibling tasks serially in document order.
 PlanReview displays numbered stages and lettered task titles by default, with file and subtask
 details collapsed. Labels such as `2a` derive from positions, while IDs preserve identity across
 edits. Tab works from every wrapped heading row and preserves child fold preferences.
+Task descriptions and file branches align with the title text after the task
+label. Wrapped titles use the same column, retaining the outer connector for sibling tasks.
+Task prerequisites remain in the plan data for validation and execution but are not rendered.
 
 The scheduler addresses active work by task ID and plan version. Reports also supply exact
 version-scoped JSON Pointers such as `/stages/1/tasks/0`,

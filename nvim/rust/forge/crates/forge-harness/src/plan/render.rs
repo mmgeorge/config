@@ -1529,9 +1529,11 @@ fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &Pl
             } else {
                 "│  "
             };
-            let heading = format!("   {branch} {}. ", document.task_label(&task.id).unwrap());
+            let label = document.task_label(&task.id).unwrap();
+            let heading = format!("   {branch} {label}. ");
+            let content_prefix = format!("   {continuation}{}", " ".repeat(label.chars().count() + 2));
             renderer.push_wrapped(
-                [&heading, &format!("   {continuation}   ")],
+                [&heading, &content_prefix],
                 &task.title,
                 PlanReviewTarget::Task {
                     title: task.title.clone(),
@@ -1541,37 +1543,19 @@ fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &Pl
                 format!("Task: {}", task.title),
             );
             renderer.push_wrapped(
-                [
-                    &format!("   {continuation}   "),
-                    &format!("   {continuation}   "),
-                ],
+                [&content_prefix, &content_prefix],
                 &task.description,
                 PlanReviewTarget::TaskDetail,
                 format!("{task_path}/description"),
                 None,
                 task.title.clone(),
             );
-            if !task.requires.is_empty() {
-                let labels = task
-                    .requires
-                    .iter()
-                    .filter_map(|id| document.task_label(id))
-                    .collect::<Vec<_>>()
-                    .join(", ");
-                renderer.push(
-                    format!("   {continuation}   Requires: {labels}"),
-                    PlanReviewTarget::TaskDetail,
-                    format!("{task_path}/requires"),
-                    None,
-                    "Prerequisites",
-                );
-            }
             for (file_index, file) in task.files.iter().enumerate() {
                 let file_path = format!("{task_path}/files/{file_index}");
                 let path = file.change.path();
                 renderer.push(
                     format!(
-                        "   {continuation}{} file {path}",
+                        "{content_prefix}{} file {path}",
                         if file_index + 1 == task.files.len() {
                             "└─"
                         } else {
@@ -1594,11 +1578,11 @@ fn render_tasks(renderer: &mut PlanRenderer, document: &PlanDocument, graph: &Pl
                         "│  "
                     };
                     let subtask_prefix = format!(
-                        "   {continuation}{file_continuation}{} ",
+                        "{content_prefix}{file_continuation}{} ",
                         if subtask_is_last { "└─" } else { "├─" }
                     );
                     let subtask_continuation = format!(
-                        "   {continuation}{file_continuation}{}",
+                        "{content_prefix}{file_continuation}{}",
                         if subtask_is_last { "   " } else { "│  " }
                     );
                     match subtask {
@@ -2418,23 +2402,23 @@ mod test {
             .next()
             .expect("task body");
 
-        assert!(task_markdown.contains("Give planning one owner.\n      ├─ file src/plan.rs"));
+        assert!(task_markdown.contains("          Give planning one owner.\n          ├─ file src/plan.rs"));
         assert!(
             task_markdown
                 .lines()
-                .any(|line| line.starts_with("      │")
+                .any(|line| line.starts_with("          │")
                     && line.contains("subtask-alignment-sentinel"))
         );
         assert!(
             task_markdown
                 .lines()
-                .any(|line| line.starts_with("      │")
+                .any(|line| line.starts_with("          │")
                     && line.contains("entity-alignment-sentinel"))
         );
         let task_line_list = task_markdown.lines().collect::<Vec<_>>();
         let second_file_index = task_line_list
             .iter()
-            .position(|line| *line == "      └─ file tests/plan_submission.rs")
+            .position(|line| *line == "          └─ file tests/plan_submission.rs")
             .expect("second indented file group");
         assert_eq!(task_line_list[second_file_index - 1], "");
         assert!(
