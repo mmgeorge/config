@@ -43,12 +43,14 @@ pub(super) fn project(
     let (source, navigation, hidden) = rows(document, syntax, public_only, true)?;
     let mut target = HashMap::new();
     let mut block = Vec::new();
-    let mut annotation_end = HashMap::new();
+    let mut source_end = HashMap::new();
     for (index, mut row) in source.into_iter().enumerate() {
         if row.id.0.starts_with("plan:description:") {
             row = forge_buffer::markdown::MarkdownRenderer::source(
                 row.id.clone(),
-                &width.wrap_plain(&row.text.wire_rows().join("\n"), 0)?.join("\n"),
+                &width
+                    .wrap_plain(&row.text.wire_rows().join("\n"), 0)?
+                    .join("\n"),
                 width,
             )?
             .block;
@@ -68,6 +70,16 @@ pub(super) fn project(
             target.insert(id, anchor.clone());
         }
         let row_id = row.id.clone();
+        source_end.insert(
+            row_id.clone(),
+            BlockAnchor {
+                block: row_id.clone(),
+                position: TextPosition {
+                    row: row.text.row_count(),
+                    column: 0,
+                },
+            },
+        );
         block.push(row);
         for annotation in annotation
             .iter()
@@ -79,7 +91,7 @@ pub(super) fn project(
                 focused == Some(annotation.id.as_str()),
                 revision.get(&annotation.id).copied().unwrap_or_default(),
             )?;
-            annotation_end.insert(
+            source_end.insert(
                 row_id.clone(),
                 BlockAnchor {
                     block: comment.id.clone(),
@@ -95,7 +107,7 @@ pub(super) fn project(
     for item in &mut block {
         for fold in &mut item.metadata.fold {
             if fold.end.position.row > 0
-                && let Some(end) = annotation_end.get(&fold.end.block)
+                && let Some(end) = source_end.get(&fold.end.block)
             {
                 fold.end = end.clone();
             }
@@ -387,46 +399,77 @@ fn rows(
         navigation.anchor.push(PlanNavigationAnchor {
             line: 1,
             target: PlanReviewTarget::Section {
-                section: super::PlanSection::Overview,
+                section: super::PlanSection::Files,
             },
-            json_path: "/overview".into(),
+            json_path: "/design".into(),
             path: None,
             label: "No declaration changes".into(),
         });
     }
-    if !design.document.description.trim().is_empty() {
-        let mut description = Vec::new();
-        for (index, line) in design.document.description.lines().enumerate() {
-            description.push(BufferBlock {
-                id: BlockId(format!("plan:description:{index}")),
-                text: BufferText::from_rows([line])?,
-                metadata: BlockMetadata::default(),
-            });
-        }
+    let mut description = vec![forge_diff::projection::header(
+        BlockId("plan:section:description".into()),
+        vec![TextChunk {
+            text: "Description:".into(),
+            capture: "ForgeStatusHeader".into(),
+        }],
+        0,
+    )?];
+    let text = if design.document.description.trim().is_empty() {
+        "No description."
+    } else {
+        &design.document.description
+    };
+    for (index, line) in text.lines().enumerate() {
         description.push(BufferBlock {
-            id: BlockId("plan:description:separator".into()),
-            text: BufferText::from_rows([""])?,
+            id: BlockId(format!("plan:description:{index}")),
+            text: BufferText::from_rows([line])?,
             metadata: BlockMetadata::default(),
         });
-        let count = description.len() as u32;
-        for anchor in &mut navigation.anchor {
-            anchor.line += count;
-        }
-        for line in 1..count {
-            navigation.anchor.push(PlanNavigationAnchor {
-                line,
-                target: PlanReviewTarget::Section {
-                    section: super::PlanSection::Overview,
-                },
-                json_path: "/design/document/description".into(),
-                path: None,
-                label: "Change description".into(),
-            });
-        }
-        description.extend(block);
-        block = description;
-        navigation.anchor.sort_by_key(|anchor| anchor.line);
     }
+    fold(&mut description, 0, "plan:section:description")?;
+    let description_count = description.len() as u32;
+    description.push(BufferBlock {
+        id: BlockId("plan:section:separator".into()),
+        text: BufferText::from_rows([""])?,
+        metadata: BlockMetadata::default(),
+    });
+    let changes_start = description.len();
+    description.push(forge_diff::projection::header(
+        BlockId("plan:section:changes".into()),
+        vec![TextChunk {
+            text: "Changes:".into(),
+            capture: "ForgeStatusHeader".into(),
+        }],
+        0,
+    )?);
+    let count = description.len() as u32;
+    for anchor in &mut navigation.anchor {
+        anchor.line += count;
+    }
+    for line in 1..=description_count {
+        navigation.anchor.push(PlanNavigationAnchor {
+            line,
+            target: PlanReviewTarget::Section {
+                section: super::PlanSection::Overview,
+            },
+            json_path: "/design/document/description".into(),
+            path: None,
+            label: "Change description".into(),
+        });
+    }
+    navigation.anchor.push(PlanNavigationAnchor {
+        line: count,
+        target: PlanReviewTarget::Section {
+            section: super::PlanSection::Files,
+        },
+        json_path: "/design".into(),
+        path: None,
+        label: "Declaration changes".into(),
+    });
+    description.extend(block);
+    fold(&mut description, changes_start, "plan:section:changes")?;
+    block = description;
+    navigation.anchor.sort_by_key(|anchor| anchor.line);
     ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
     Ok((block, navigation, hidden))
 }
@@ -457,6 +500,9 @@ fn public_blocks(
         public_count.push(public_count.last().unwrap() + usize::from(declaration));
     }
     for (start, header) in block.iter().enumerate() {
+        if header.id.0.starts_with("plan:section:") {
+            continue;
+        }
         for fold in &header.metadata.fold {
             let end = *index
                 .get(&fold.end.block)
@@ -542,7 +588,14 @@ fn public_blocks(
         .zip(retained)
         .filter_map(|(block, keep)| keep.then_some(block))
         .collect();
-    if output.is_empty() {
+    let changes = output
+        .iter()
+        .position(|block| block.id.0 == "plan:section:changes")
+        .context("changes section is missing")?;
+    if output[changes + 1..]
+        .iter()
+        .all(|block| block.id.0.starts_with("plan:annotation:"))
+    {
         output.push(forge_diff::projection::header(
             BlockId("plan:design:public:empty".into()),
             vec![TextChunk {
@@ -552,6 +605,8 @@ fn public_blocks(
             0,
         )?);
     }
+    output[changes].metadata.fold.clear();
+    fold(&mut output, changes, "plan:section:changes")?;
     Ok(output)
 }
 
@@ -616,15 +671,19 @@ mod tests {
         document.design = Some(design);
         let saved = serde_json::to_vec(&document).unwrap();
         let rendered = render(&document).unwrap();
-        assert!(rendered.markdown.starts_with("Requests retain"));
+        assert!(
+            rendered
+                .markdown
+                .starts_with("Description:\nRequests retain")
+        );
         let anchor = rendered.navigation.resolve_line(1).unwrap();
         assert_eq!(anchor.json_path, "/design/document/description");
         let annotation = ReviewAnnotation {
             id: "description".into(),
             anchor: None,
             source: super::super::PlanAnnotationInput {
-                start_line: 1,
-                end_line: 1,
+                start_line: 2,
+                end_line: 2,
                 body: "Confirm the cancellation lifecycle".into(),
             },
         };
@@ -644,6 +703,24 @@ mod tests {
                 .find(|block| block.id.0 == "plan:description:0")
                 .unwrap();
             assert!(description.text.row_count() > 1);
+            let header = block
+                .iter()
+                .find(|block| block.id.0 == "plan:section:description")
+                .unwrap();
+            let endpoint = &header.metadata.fold[0].end;
+            assert_eq!(endpoint.block.0, "plan:annotation:description");
+            assert!(
+                block
+                    .iter()
+                    .any(|block| block.text.row(0) == Some("Changes:"))
+            );
+            assert!(
+                block
+                    .iter()
+                    .filter(|block| block.id.0.starts_with("plan:section:"))
+                    .flat_map(|block| &block.metadata.fold)
+                    .all(|fold| !fold.closed)
+            );
             assert!(
                 target
                     .values()
@@ -738,9 +815,31 @@ mod tests {
             true,
         )
         .unwrap();
-        assert_eq!(block.len(), 1);
-        assert_eq!(block[0].text.row(0), Some("No public declaration changes."));
-        assert!(target.is_empty());
+        assert!(
+            block
+                .iter()
+                .any(|block| block.text.row(0) == Some("No public declaration changes."))
+        );
+        assert!(
+            block
+                .iter()
+                .any(|block| block.text.row(0) == Some("Description:"))
+        );
+        assert!(
+            block
+                .iter()
+                .any(|block| block.text.row(0) == Some("Changes:"))
+        );
+        assert!(
+            target
+                .values()
+                .all(|anchor| matches!(anchor.target, PlanReviewTarget::Section { .. }))
+        );
+        forge_buffer::document::BufferDocument::new(
+            forge_buffer::identity::DocumentId("public-empty".into()),
+            block,
+        )
+        .unwrap();
     }
 
     #[test]
@@ -781,7 +880,7 @@ mod tests {
             render(&document)
                 .unwrap()
                 .markdown
-                .starts_with("No declaration changes.")
+                .contains("Changes:\nNo declaration changes.")
         );
     }
 
@@ -829,15 +928,17 @@ mod tests {
             .iter()
             .filter(|block| !block.metadata.fold.is_empty())
             .collect();
-        assert_eq!(folded_header.len(), 2);
+        assert_eq!(folded_header.len(), 4);
+        assert_eq!(folded_header[0].text.row(0), Some("Description:"));
+        assert_eq!(folded_header[1].text.row(0), Some("Changes:"));
         assert!(
-            folded_header[0]
+            folded_header[2]
                 .text
                 .row(0)
                 .unwrap()
                 .starts_with("Modified src/lib.rs")
         );
-        assert!(folded_header[1].text.row(0).unwrap().starts_with("@@"));
+        assert!(folded_header[3].text.row(0).unwrap().starts_with("@@"));
         for header in folded_header {
             let fold = &header.metadata.fold[0];
             assert!(fold.heading_start.is_none());

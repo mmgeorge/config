@@ -24,7 +24,7 @@ local function task_folds(review, owner)
   local state = replica and replica.fold
   local result = {}
   for id, record in pairs(state and state.record or {}) do
-    if id:match("^plan:design:") then
+    if id:match("^plan:design:") or id:match("^plan:section:") then
       local _, block_row = replica.sequence:position(record.owner)
       local heading_row = block_row
       if record.fold.heading_start then

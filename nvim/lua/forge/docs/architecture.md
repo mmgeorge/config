@@ -1841,7 +1841,11 @@ The declaration design also owns a virtual `plan.json` with only a model-authore
 The read tool lists it alongside declaration paths. The patch tool edits the description and
 declaration files atomically at one optimistic version, while source baselines and workspace checks
 exclude plan metadata. Submission requires a nonempty description of at most 16 KiB. Review renders
-the description above the shared declaration diff, retains it in either visibility mode, and maps
+the description and declaration diff under separate `Description:` and `Changes:` headings. Both
+sections start expanded and use the shared fold-header constructor and native Tab behavior, with
+independent file and hunk folds below Changes. Section endpoints include wrapped text and comments.
+The public filter retains both headings and an explicit empty state when no public changes remain.
+Review retains the description in either visibility mode and maps
 comments to `/design/document/description`. Behavior-only proposals still carry this description.
 
 Trait implementation bodies render as empty braces in both inspection modes. Inherent implementation

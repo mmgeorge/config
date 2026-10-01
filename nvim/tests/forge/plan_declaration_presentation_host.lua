@@ -56,12 +56,14 @@ local success, failure = xpcall(function()
   assert(not text(review.buf):find("fn default", 1, true), "full view exposed trait implementation members")
   assert(text(review.buf):find("pub fn new", 1, true), "full view hid inherent methods")
   assert(bytes(artifact_path) == artifact and bytes(plan.working_path) == projection, "opening rewrote the plan")
-  local file_row, hunk_row
+  local file_row, hunk_row, description_row, changes_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if line == "Description:" then description_row = row end
+    if line == "Changes:" then changes_row = row end
     if line:find("Modified src/change.rs", 1, true) then file_row = row end
     if line:find("@@", 1, true) then hunk_row = row end
   end
-  assert(file_row and hunk_row, "diff headers are missing")
+  assert(file_row and hunk_row and description_row and changes_row, "section or diff headers are missing")
   local function closed(row)
     return vim.api.nvim_win_call(review.win, function() return vim.fn.foldclosed(row) end)
   end
@@ -69,6 +71,16 @@ local success, failure = xpcall(function()
     vim.api.nvim_win_set_cursor(review.win, { row, 0 })
     review.command_set.action_by_id.toggle.run({})
   end
+  assert(closed(description_row) == -1 and closed(changes_row) == -1, "plan sections did not start expanded")
+  toggle(description_row)
+  assert(closed(description_row + 1) == description_row and closed(file_row) == -1,
+    "description fold hid changes or left its body visible")
+  toggle(description_row)
+  toggle(changes_row)
+  assert(closed(file_row) == changes_row and closed(hunk_row) == changes_row and closed(description_row) == -1,
+    "changes fold left descendants visible or hid the description")
+  toggle(changes_row)
+  assert(closed(file_row) == -1 and closed(hunk_row) == -1, "section reopening changed child folds")
   toggle(file_row)
   assert(closed(file_row) == file_row and closed(hunk_row) == file_row,
     "closing a file left its first hunk visible")
@@ -183,7 +195,7 @@ local success, failure = xpcall(function()
     "public filtering discarded private declarations or comments")
   assert(bytes(annotation_path) == comments and bytes(artifact_path) == artifact
     and bytes(plan.working_path) == projection, "visibility toggle changed persisted review data")
-  vim.api.nvim_win_set_cursor(review.win, { 1, 0 })
+  vim.api.nvim_win_set_cursor(review.win, { description_row + 1, 0 })
   local description_comment
   review.owner.action("comment", function(value, error_message)
     assert(not error_message, error_message)
@@ -203,11 +215,16 @@ local success, failure = xpcall(function()
   end
   assert(description_anchor and description_anchor.start.target_type == "section" and description_anchor.start.section == "overview",
     "description comment did not retain its metadata target")
+  toggle(description_row)
+  assert(closed(description_comment_row + 1) == description_row, "description fold left its comment visible")
   public_key()
   await(function() return review.public_only == true end, "description visibility test did not toggle")
+  assert(closed(description_row) == description_row, "visibility toggle reopened the description")
   assert(text(review.buf):find("Clarify the behavior in the description", 1, true), "public filter hid description comment")
   public_key()
   await(function() return review.public_only == false end, "description visibility test did not restore")
+  toggle(description_row)
+  assert(closed(description_row) == -1, "description section did not reopen")
   review.command_set.action_by_id.close.run({})
   await(function() return state.plan_review == nil end, "review did not close")
   require("forge.views.plan_review").open(plan)
