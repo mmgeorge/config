@@ -3394,9 +3394,16 @@ Planning continuation: turn {} of {}.",
                     validated_document.version == submission.expected_version,
                     "plan version changed before Rust API validation"
                 );
-                let validation_warning = if let Some(design) = &validated_document.design {
-                    design.check_workspace(Path::new(&self.session.workspace))?;
-                    Vec::new()
+                let validation_warning = if let Some(design) = &mut validated_document.design {
+                    let formatted = design.formatted()?;
+                    formatted.check_workspace(Path::new(&self.session.workspace))?;
+                    *design = formatted;
+                    let mut resolver = crate::declaration::DeclarationResolver::prepare(Path::new(&self.session.workspace), design, false).await?;
+                    let report = resolver.validate(design);
+                    report.ensure_valid()?;
+                    let warning = report.warnings();
+                    design.validation = Some(report);
+                    warning
                 } else { match validate_plan_rust_api(&self.rustdoc, &mut validated_document).await {
                         Ok(report) => report.warning,
                         Err(error) => error.violation,

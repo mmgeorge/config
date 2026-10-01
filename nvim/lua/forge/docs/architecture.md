@@ -1815,6 +1815,44 @@ members remain visible when changed. Lua function headers omit the closing `end`
 bindings stop at `=>`. These overview files describe interfaces and do not claim compilation validity.
 Configuration retains complete values. Unsupported extensions remain outside this design representation.
 
+`declaration` owns Rust and TypeScript name resolution for submission validation and `.` navigation.
+The shared Tree-sitter `DeclarationIndex` extracts scopes, symbols, imports, exports, generics, and
+signature references without examining implementation bodies. Proposed declarations replace their
+baseline files. Deleted lines use a separate baseline graph, and deleted files cannot reappear from
+disk. Lexical bindings take precedence over implicit library names. Primitive types use language
+rules. Library types resolve through real declarations rather than a name allowlist.
+
+Cargo metadata runs against isolated manifests and target stubs under Cargo's cache. It acquires
+dependency sources through Cargo's normal registry and Git caches, preserving the reviewed checkout.
+The plan retains captured Cargo lockfiles as generated, immutable metadata. Manifest and captured
+lockfile identities select reusable package graphs, while source-content hashes select
+parsed declarations. Workspace dependency aliases, library roots, modules, and re-exports retain
+their package identities. External module sources load when reference resolution reaches them,
+so opening a plan does not parse every dependency or standard-library module.
+The selected workspace toolchain supplies `rust-src` and edition-specific
+`std` or `core` preludes. Missing `rust-src` produces a warning with installation instructions and
+disables standard-library and prelude checks. It does not disable project or dependency checks.
+
+TypeScript resolution reads configured libraries from the installed TypeScript package, follows
+library references, and indexes included project globals and ambient type packages. It respects
+explicit `types`, version-dependent defaults, type roots, path aliases, relative modules, and package
+declaration entry points. Exports do not become globals. Type and value namespaces remain distinct.
+Unsupported package selection, incomplete syntax, generated declarations, conditional compilation,
+and unavailable sources produce unverified evidence rather than invented missing-import errors.
+
+The submit tool runs reference validation before becoming terminal, so the provider can repair a
+rejected design in the same turn. The broker repeats validation on the formatted snapshot before
+freezing it. `DeclarationDesign.validation` stores generated location-bearing diagnostics and its
+snapshot fingerprint. Patches invalidate that evidence. Review displays a collapsible Validation
+section. Proven invalid or ambiguous references reject submission. Unverified references warn.
+
+`.` resolves the selected token through saved Tree-sitter token coordinates. It jumps to a visible
+plan declaration and opens containing folds, opens a declaration snapshot when the target is hidden
+or outside the diff, or opens the exact existing project/dependency/standard-library source location.
+Re-export navigation follows the defining declaration. Filtering remains unchanged. Native input
+revision, view, and cursor guards discard stale responses. Lua owns key binding and presentation,
+while Rust owns resolution and source coordinates.
+
 `DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves
 inside Harness-owned `plans/<session>/<plan>/working.json`. The provider receives the plan identity,
 version, request, and path inventory. `harness_plan_read` reads one virtual file or its baseline.
@@ -1866,7 +1904,18 @@ from their JSON, while saved projections remain available to resolve older row-o
 execution authorization even when ordinary session requests permit workspace changes.
 
 PlanReview reuses `forge-diff` hunk generation, unified patch parsing, file headers, intraline emphasis,
-diff gutters, and tree-sitter syntax decorations. Modified declaration files retain complete context
+diff gutters, and tree-sitter syntax decorations. Opening adopts a generated loading buffer with a
+PlanReview winbar before requesting the snapshot, without displaying or parsing the saved Markdown
+projection. Declaration jumps first resolve against captured project declarations. Only unresolved
+jumps acquire dependency and standard-library sources, once per review, independently of opening
+and highlighting. Local bindings and explicit imports take precedence over wildcard imports.
+Automatic comment-focus requests wait for navigation responses so they cannot supersede a jump.
+Cursor movement still invalidates a pending navigation result. Failed attachment closes the review
+tab and reports the error.
+Review submission waits for queued document requests and saved edits before capturing its input.
+The replica stays attached and disables editing until the submission acknowledgement arrives,
+preventing an early close request from invalidating approval.
+Modified declaration files retain complete context
 so spacing changes cannot remove comment targets from a hunk. Unchanged context rows retain both
 baseline and proposed positions, with proposed positions owning ordinary row actions. File and hunk
 folds start open. PlanReview, ForgeStatus hunks, and Harness changes use the shared

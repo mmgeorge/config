@@ -338,6 +338,14 @@ pub(crate) fn control_tool_failure_json(
                     .map(plan_violation)
                     .collect(),
             )
+        } else if let Some(validation_error) = error.downcast_ref::<crate::declaration::DeclarationValidationError>() {
+            (failure_phase(invocation), "declaration_validation_failed".to_owned(), validation_error.diagnostic.iter().map(|diagnostic| ControlToolViolation {
+                path:format!("{}:{}:{}", diagnostic.path, diagnostic.line, diagnostic.column + 1),
+                code:"invalid_declaration_reference".into(),
+                message:format!("{}: {}", diagnostic.reference, diagnostic.reason),
+                expected_shape:None,
+                hint:Some("Patch the declaration or its import, then submit the current version again.".into()),
+            }).collect())
         } else if let Some(validation_error) = error.downcast_ref::<RustApiValidationError>() {
             (
                 failure_phase(invocation),

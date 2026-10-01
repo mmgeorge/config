@@ -118,6 +118,41 @@ impl PlanReviewStore {
         Ok(opened)
     }
 
+    /// Resolve snapshot declarations before acquiring external evidence for an unresolved jump.
+    pub(crate) async fn prepare_declaration_jump(&self, input: &DocumentInput) -> Result<()> {
+        let captured = {
+            let store = self.document.lock()
+                .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+            let (document, admission) = store.get(&input.document)
+                .context("plan review document is closed")?;
+            admission.check()?;
+            let target = document.check_input(input)?.context("plan review input has no source target")?;
+            let Some(design) = &document.source.document.design else { return Ok(()); };
+            if document.source.resolver.get().is_none() {
+                let proposed = crate::declaration::DeclarationResolver::local(&document.source.workspace, design, false)?;
+                let baseline = crate::declaration::DeclarationResolver::local(&document.source.workspace, design, true)?;
+                ensure!(document.source.resolver.set(Mutex::new((proposed, baseline))).is_ok(), "declaration resolver was already initialized");
+            }
+            let anchor = document.target.get(&target).context("plan review source target is missing")?;
+            let row = document.document.block(&input.block).and_then(|block| block.text.row(input.position.row))
+                .context("plan review input row is missing")?;
+            if matches!(document.resolve_declaration(anchor, row, input.position.column)?,
+                crate::declaration::DeclarationResolution::Resolved { .. } | crate::declaration::DeclarationResolution::Intrinsic) {
+                return Ok(());
+            }
+            if document.source.resolver_sources.get().is_some() { return Ok(()); }
+            (Arc::clone(&document.source.resolver), Arc::clone(&document.source.resolver_sources), document.source.workspace.clone(), design.clone())
+        };
+        captured.1.get_or_try_init(|| async {
+            let proposed = crate::declaration::DeclarationResolver::prepare(&captured.2, &captured.3, false).await?;
+            let baseline = crate::declaration::DeclarationResolver::prepare(&captured.2, &captured.3, true).await?;
+            *captured.0.get().context("declaration resolver is unavailable")?.lock()
+                .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))? = (proposed, baseline);
+            Ok::<_, anyhow::Error>(())
+        }).await?;
+        Ok(())
+    }
+
     pub(crate) fn action(&self, input: DocumentInput) -> Result<serde_json::Value> {
         let mut store = self
             .document
@@ -226,6 +261,7 @@ impl PlanReviewDocument {
     ) -> Result<serde_json::Value> {
         use super::PlanReviewTarget;
         if let Some(design) = &self.source.document.design {
+            if action == "jump_entity" { return self.jump_declaration(&anchor, row, column); }
             ensure!(action == "open", "this design action is unavailable");
             let (path,side) = match &anchor.target {
                 PlanReviewTarget::Declaration { path,side,.. } => (path,side.as_str()),
@@ -358,6 +394,53 @@ impl PlanReviewDocument {
             "entity_name":entity.map(|entity| &entity.name), "rename_allowed":entity.is_some_and(|entity| entity.action == super::EntityChangeAction::Add),
             "version":self.source.document.version, "rustdoc_selection":if callable.is_some() { "callable" } else { "receiver" } }),
         )
+    }
+
+    fn resolve_declaration(&self, anchor: &PlanNavigationAnchor, row: &str, column: usize) -> Result<crate::declaration::DeclarationResolution> {
+        let super::PlanReviewTarget::Declaration { path, side, line, column: saved_column } = &anchor.target else { anyhow::bail!("select a declaration type or import"); };
+        let design = self.source.document.design.as_ref().context("declaration design is unavailable")?;
+        let text = if side == "baseline" { design.baseline.get(path).map(|file| &file.text) } else { design.proposed.get(path) }.context("declaration snapshot is unavailable")?;
+        let position = forge_diff::syntax::DeclarationOverview::token_position(path, text, forge_diff::syntax::DeclarationPosition { line: *line, column: saved_column.unwrap_or(0) }, row, column).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let resolver = self.source.resolver.get().context("declaration resolver is unavailable")?;
+        let mut resolver = resolver.lock().map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
+        Ok(if side == "baseline" { resolver.1.at(path, position.line, position.column) } else { resolver.0.at(path, position.line, position.column) })
+    }
+
+    fn jump_declaration(&self, anchor: &PlanNavigationAnchor, row: &str, column: usize) -> Result<serde_json::Value> {
+        use crate::declaration::DeclarationResolution;
+        let result = self.resolve_declaration(anchor, row, column)?;
+        let super::PlanReviewTarget::Declaration { side, .. } = &anchor.target else { anyhow::bail!("select a declaration type or import"); };
+        let design = self.source.document.design.as_ref().context("declaration design is unavailable")?;
+        let destination = match result {
+            DeclarationResolution::Resolved { destination } => destination,
+            DeclarationResolution::Intrinsic => return Ok(serde_json::json!({"message":"This is a language intrinsic with no source declaration."})),
+            DeclarationResolution::Invalid { reason } | DeclarationResolution::Ambiguous { reason } | DeclarationResolution::Unverified { reason } => return Ok(serde_json::json!({"message":reason})),
+        };
+        if !destination.proposed && side != "baseline" {
+            return Ok(serde_json::json!({"source": {"path":destination.path, "line":destination.line, "column":destination.column}}));
+        }
+        let relative = std::path::Path::new(&destination.path).strip_prefix(&self.source.workspace).ok().map(|path| path.to_string_lossy().replace('\\', "/"));
+        if let Some(relative) = relative {
+            let text = if side == "baseline" { design.baseline.get(&relative).map(|file| &file.text) } else { design.proposed.get(&relative) }.context("resolved declaration snapshot is unavailable")?;
+            let presentation = forge_diff::syntax::DeclarationOverview::present(&relative, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let display_position = forge_diff::syntax::DeclarationOverview::display_position(&relative, text, forge_diff::syntax::DeclarationPosition { line:destination.line,column:destination.column }).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let row_anchor = presentation.source[(display_position.line - 1) as usize];
+            for block in self.document.blocks(self.document.revision(), 0..self.document.block_count())? {
+                for target in &block.metadata.target {
+                    let Some(anchor) = self.target.get(&target.id) else { continue; };
+                    if matches!(&anchor.target, super::PlanReviewTarget::Declaration { path, side: target_side, line, column } if path == &relative && target_side == side && row_anchor.is_some_and(|position| position.line == *line && Some(position.column) == *column)) {
+                        if let Some(column) = block.text.row(0).filter(|row| row.get(display_position.column as usize..).is_some_and(|rest| rest.starts_with(&destination.name))).map(|_| display_position.column) {
+                            return Ok(serde_json::json!({"jump":{"block":block.id,"position":{"row":0,"column":column}}}));
+                        }
+                    }
+                }
+            }
+            let selected = display_position.line - 1;
+            let column = display_position.column;
+            let snapshot = BufferDocument::new(DocumentId(format!("plan:declaration:{}",uuid::Uuid::new_v4())), vec![forge_buffer::block::BufferBlock { id: forge_buffer::identity::BlockId("declarations".into()), text:forge_buffer::text::BufferText::from_rows(presentation.text.lines())?, metadata:Default::default() }])?.snapshot();
+            return Ok(serde_json::json!({"declarations":snapshot,"filetype":forge_diff::syntax::DeclarationOverview::filetype(&relative),"selection":{"row":selected,"column":column}}));
+        }
+        Ok(serde_json::json!({"source":{"path":destination.path,"line":destination.line,"column":destination.column}}))
     }
 
     fn add_annotation(
@@ -604,7 +687,7 @@ impl PlanReviewDocument {
             .clone())
     }
 
-    fn validate_input(&mut self, input: DocumentInput) -> Result<Option<TargetId>> {
+    fn check_input(&self, input: &DocumentInput) -> Result<Option<TargetId>> {
         input.validate()?;
         ensure!(
             input.document == self.id && input.revision == self.document.revision(),
@@ -612,7 +695,7 @@ impl PlanReviewDocument {
         );
         let sequence = self
             .view
-            .get_mut(&input.view)
+            .get(&input.view)
             .context("plan review view is closed")?;
         ensure!(
             input.sequence.0 > sequence.0,
@@ -639,7 +722,12 @@ impl PlanReviewDocument {
             })
             .map(|target| target.id.clone());
         ensure!(input.target == target, "plan review input target changed");
-        *sequence = input.sequence;
+        Ok(target)
+    }
+
+    fn validate_input(&mut self, input: DocumentInput) -> Result<Option<TargetId>> {
+        let target = self.check_input(&input)?;
+        *self.view.get_mut(&input.view).context("plan review view is closed")? = input.sequence;
         Ok(target)
     }
 
@@ -824,6 +912,65 @@ mod tests {
         assert!(latest.annotation.annotation().is_empty());
     }
 
+    #[tokio::test]
+    async fn declaration_jumps_use_token_positions_and_filtered_snapshots() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Declarations");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Define the API.".into();
+        design.document.description = "Expose users through the API.".into();
+        design.proposed.insert("tsconfig.json".into(), "{\"compilerOptions\":{\"noLib\":true}}".into());
+        design.proposed.insert("model.ts".into(), "export interface User<T> { value: T; }\n".into());
+        design.proposed.insert("api.ts".into(), "import type { User } from './model';\ninterface Hidden {}\nexport interface Api { user: User<string>; hidden: Hidden; }\n".into());
+        canonical.design = Some(design);
+        store.write_working_document("session", "plan", &canonical).unwrap();
+        let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let source = store.capture_review_source("session", "plan", 1, &digest).unwrap();
+        let document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
+        let resolver = Arc::clone(&document.source.resolver);
+        assert!(resolver.get().is_none(), "opening acquired dependency sources");
+        let snapshot = document.snapshot();
+        let block = snapshot.block.iter().find(|block| block.text.row(0).is_some_and(|row| row.contains("user: User"))).unwrap();
+        let input = DocumentInput {
+            document: document.id.clone(), revision: snapshot.revision, view: ViewId("view".into()),
+            sequence: InputSequence(1), action: "jump_entity".into(), block: block.id.clone(),
+            position: forge_buffer::block::TextPosition { row: 0, column: block.text.row(0).unwrap().find("User").unwrap() },
+            target: block.metadata.target.first().map(|target| target.id.clone()),
+        };
+        let review = PlanReviewStore::default();
+        review.insert(document, review.admit(input.document.clone()).unwrap()).unwrap();
+        let mut stale = input.clone();
+        stale.sequence = InputSequence(0);
+        assert!(review.prepare_declaration_jump(&stale).await.is_err());
+        assert!(resolver.get().is_none(), "invalid input acquired sources");
+        review.prepare_declaration_jump(&input).await.unwrap();
+        assert!(resolver.get().is_some(), "first jump did not acquire sources");
+        assert!(review.document.lock().unwrap().get(&input.document).unwrap().0.source.resolver_sources.get().is_none(),
+            "a local declaration jump acquired external sources");
+        let resolved = review.action(input.clone()).unwrap();
+        assert!(resolved["jump"].is_object(), "{resolved}");
+        assert!(review.prepare_declaration_jump(&input).await.is_err(), "superseded input was accepted");
+        let (mut document, _admission) = review.document.lock().unwrap().remove(&input.document).unwrap();
+        let select = |document:&PlanReviewDocument, needle:&str| {
+            let snapshot = document.snapshot();
+            let block = snapshot.block.iter().find(|block| block.text.row(0).is_some_and(|row| row.contains(needle))).unwrap();
+            let row = block.text.row(0).unwrap().to_owned();
+            let anchor = block.metadata.target.iter().find_map(|target| document.target.get(&target.id)).unwrap().clone();
+            (anchor,row)
+        };
+        let (anchor, row) = select(&document,"user: User");
+        let result = document.describe(anchor,"jump_entity",&row,row.find("User").unwrap()).unwrap();
+        let jump:forge_buffer::block::BlockAnchor = serde_json::from_value(result["jump"].clone()).unwrap();
+        assert!(document.document.block(&jump.block).unwrap().text.row(0).unwrap()[jump.position.column..].starts_with("User"));
+        document.toggle_public().unwrap();
+        let (anchor,row) = select(&document,"hidden: Hidden");
+        let result = document.describe(anchor,"jump_entity",&row,row.find("Hidden").unwrap()).unwrap();
+        assert!(result["declarations"].is_object(), "{result}");
+        assert!(result["selection"]["row"].is_number());
+        assert!(document.source.public_only);
+    }
+
     #[test]
     fn signature_type_jump_resolves_cursor_entity_and_preserves_flow_navigation() {
         let temporary = tempfile::tempdir().unwrap();
@@ -918,6 +1065,47 @@ mod tests {
                 .unwrap()["jump"]
                 .is_null()
         );
+    }
+
+    #[tokio::test]
+    async fn proposed_rust_nested_and_imported_types_jump_without_dependency_acquisition() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Movement declarations");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Define movement interfaces.".into();
+        design.document.description = "Separate movement intent from entity transforms.".into();
+        design.proposed.insert("Cargo.toml".into(), "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nbevy = \"=0.19.1\"\n".into());
+        design.proposed.insert("src/lib.rs".into(), "/// Owns movement input.\nmod controls;\n/// Consumes movement input.\nmod arena;\n".into());
+        design.proposed.insert("src/controls.rs".into(), "use bevy::prelude::*;\n\n/// Holds normalized movement intent.\n#[derive(Resource, Default)]\npub(crate) struct MovementInput {\n  /// Direction limited to unit length.\n  pub(crate) direction: Vec2,\n}\n\n/// Samples keyboard movement.\npub(crate) fn movement_input(\n  keys: Res<ButtonInput<KeyCode>>,\n  mut movement: ResMut<MovementInput>,\n);\n".into());
+        design.proposed.insert("src/arena.rs".into(), "use bevy::prelude::*;\nuse crate::controls::MovementInput;\n\n/// Advances the player from sampled input.\npub(crate) fn move_player(\n  movement: Res<MovementInput>,\n);\n".into());
+        canonical.design = Some(design);
+        file.write_working_document("session", "plan", &canonical).unwrap();
+        let (_, _, digest) = file.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let source = file.capture_review_source("session", "plan", 1, &digest).unwrap();
+        let dependency_sources = Arc::clone(&source.resolver_sources);
+        let document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
+        let review = PlanReviewStore::default();
+        let id = document.id.clone();
+        review.insert(document, review.admit(id.clone()).unwrap()).unwrap();
+        for (index, needle) in ["ResMut<MovementInput>", "Res<MovementInput>", "use crate::controls::MovementInput", "pub(crate) struct MovementInput"].into_iter().enumerate() {
+            let input = {
+                let store = review.document.lock().unwrap();
+                let document = &store.get(&id).unwrap().0;
+                let snapshot = document.snapshot();
+                let block = snapshot.block.iter().find(|block| block.text.row(0).is_some_and(|row| row.contains(needle))).unwrap();
+                DocumentInput { document:id.clone(), revision:snapshot.revision, view:ViewId("view".into()), sequence:InputSequence(index as u64 + 1), action:"jump_entity".into(),
+                    block:block.id.clone(), position:forge_buffer::block::TextPosition { row:0,column:block.text.row(0).unwrap().find("MovementInput").unwrap()+4 },
+                    target:block.metadata.target.first().map(|target| target.id.clone()) }
+            };
+            review.prepare_declaration_jump(&input).await.unwrap();
+            let result = review.action(input).unwrap();
+            let jump: forge_buffer::block::BlockAnchor = serde_json::from_value(result["jump"].clone()).unwrap();
+            let store = review.document.lock().unwrap();
+            let destination = store.get(&id).unwrap().0.document.block(&jump.block).unwrap().text.row(0).unwrap();
+            assert!(destination.contains("pub(crate) struct MovementInput") && destination[jump.position.column..].starts_with("MovementInput"), "{needle}: {result}");
+            assert!(dependency_sources.get().is_none(), "{needle} acquired unavailable Bevy sources");
+        }
     }
 
     #[test]

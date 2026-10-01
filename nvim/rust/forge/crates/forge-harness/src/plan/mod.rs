@@ -902,6 +902,12 @@ impl PlanFileStore {
             document.design = Some(formatted);
         }
         document.validate_for_submission()?;
+        if let Some(design) = &mut document.design {
+            if design.validation.as_ref().is_none_or(|report| report.fingerprint != crate::declaration::fingerprint(design)) {
+                design.validation = Some(crate::declaration::DeclarationResolver::local(&self.workspace, design, false)?.validate(design));
+            }
+            design.validation.as_ref().unwrap().ensure_valid()?;
+        }
         let rendered = render_plan_at(&document, &self.workspace)?;
         self.write_working_document(session_id, plan_id, &document)?;
         let plan_directory = self.plan_dir(session_id, plan_id);

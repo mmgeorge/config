@@ -189,10 +189,19 @@ impl ControlToolRuntime {
                 );
                 document.validate_for_submission()?;
                 if let Some(design) = &document.design {
-                    let design = design.formatted()?;
-                    design.check_workspace(self.context.workspace_root.as_deref().context("design submission has no workspace root")?)?;
+                    let mut design = design.formatted()?;
+                    let workspace = self.context.workspace_root.as_deref().context("design submission has no workspace root")?;
+                    design.check_workspace(workspace)?;
+                    let mut resolver = crate::declaration::DeclarationResolver::prepare(workspace, &design, false).await?;
+                    let report = resolver.validate(&design);
+                    report.ensure_valid()?;
+                    let warning = report.warnings();
+                    design.validation = Some(report);
+                    let mut submitted = document.clone();
+                    submitted.design = Some(design);
+                    self.plan_document = Some(submitted);
                     self.terminal = true;
-                    return Ok(ControlToolResult { invocation:Some(invocation), message:self.plan_version_message("Declaration design submitted for review") });
+                    return Ok(ControlToolResult { invocation:Some(invocation), message:format!("{}\n{}", self.plan_version_message("Declaration design submitted for review"), serde_json::to_string(&warning)?) });
                 }
                 let workspace_root = self
                     .context
@@ -378,6 +387,7 @@ mod test {
         context.mode = PromptMode::PlanDiscussion;
         context.plan_state = Some(PlanState::AwaitingReview);
         context.plan_document.as_mut().unwrap().design = Some(crate::plan::DeclarationDesign::default());
+        context.plan_document.as_mut().unwrap().design.as_mut().unwrap().document.task = "Own private state.".into();
         let mut runtime = ControlToolRuntime::new(context);
         let patch = "*** Begin Patch\n*** Add File: src/lib.rs\n+pub struct Owner;\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Introduce an owner for private state.\"\n*** End Patch";
         assert!(runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(),arguments:json!({"plan_id":"plan","expected_version":1}) }).await.is_err());
@@ -401,6 +411,26 @@ mod test {
 
 
 
+
+    #[tokio::test]
+    async fn declaration_submit_returns_reference_errors_and_allows_repair() {
+        let mut context = planning_context();
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Define the public API.".into();
+        design.document.description = "Expose a typed API.".into();
+        design.proposed.insert("tsconfig.json".into(), "{\"compilerOptions\":{\"noLib\":true}}".into());
+        design.proposed.insert("api.ts".into(), "export interface Api { item: Missing; }\n".into());
+        context.plan_document.as_mut().unwrap().design = Some(design);
+        let mut runtime = ControlToolRuntime::new(context);
+        let submit = |version| ControlToolInvocation { name:"harness_plan_submit".into(),arguments:serde_json::json!({"plan_id":"plan","expected_version":version}) };
+        let error = runtime.invoke(submit(1)).await.unwrap_err();
+        let failure:serde_json::Value = serde_json::from_str(&crate::control_tools::control_tool_failure_json(&submit(1), &error, runtime.plan_document())).unwrap();
+        assert_eq!(failure["code"], "declaration_validation_failed");
+        assert!(failure["violation"][0]["path"].as_str().unwrap().starts_with("api.ts:1:"));
+        runtime.invoke(ControlToolInvocation { name:"harness_design_apply_patch".into(),arguments:serde_json::json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: api.ts\n@@\n-export interface Api { item: Missing; }\n+export interface Api { item: string; }\n*** End Patch"}) }).await.unwrap();
+        runtime.invoke(submit(2)).await.unwrap();
+        assert!(runtime.plan_document().unwrap().design.as_ref().unwrap().validation.is_some());
+    }
 
     #[tokio::test]
     async fn returns_rust_api_violations_to_the_submit_tool_and_keeps_editing_open() {

@@ -29,6 +29,12 @@ pub struct DesignDocument {
 /// Owns baseline declarations and the agent's proposed file contents.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DeclarationDesign {
+    /// Retains dependency selection independently of subsequent checkout edits.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub cargo_lock: BTreeMap<String, String>,
+    /// Generated reference evidence for the exact submitted declaration snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub validation: Option<crate::declaration::DeclarationValidation>,
     #[serde(default)]
     pub document: DesignDocument,
     #[serde(default = "default_line_width")]
@@ -45,6 +51,8 @@ fn default_line_width() -> usize {
 impl Default for DeclarationDesign {
     fn default() -> Self {
         Self {
+            cargo_lock: BTreeMap::new(),
+            validation: None,
             document: DesignDocument::default(),
             line_width: default_line_width(),
             baseline: BTreeMap::new(),
@@ -98,10 +106,15 @@ impl DeclarationDesign {
             .filter(|path| !path.is_empty())
         {
             let path = std::str::from_utf8(bytes)?.replace('\\', "/");
-            if path == PLAN_DOCUMENT_PATH || !DeclarationOverview::supports(&path) {
+            let cargo_lock = Path::new(&path).file_name().is_some_and(|name| name == "Cargo.lock");
+            if path == PLAN_DOCUMENT_PATH || (!cargo_lock && !DeclarationOverview::supports(&path)) {
                 continue;
             }
-            validate_path(&path)?;
+            if cargo_lock {
+                validate_relative_path(&path)?;
+            } else {
+                validate_path(&path)?;
+            }
             let target = workspace.join(&path);
             let metadata = match std::fs::symlink_metadata(&target) {
                 Ok(metadata) => metadata,
@@ -117,6 +130,13 @@ impl DeclarationDesign {
             );
             let source =
                 std::fs::read_to_string(&target).with_context(|| format!("read {path}"))?;
+            if cargo_lock {
+                toml::from_str::<toml::Value>(&source).with_context(|| format!("parse {path}"))?;
+                retained_bytes += source.len();
+                ensure!(retained_bytes <= 8 * 1024 * 1024, "declaration snapshot exceeds 8 MiB");
+                design.cargo_lock.insert(path, source);
+                continue;
+            }
             let text = DeclarationOverview::extract(&path, &source)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("extract {path}"))?;
@@ -152,6 +172,12 @@ impl DeclarationDesign {
             ensure!(!text.contains('\0'), "plan {name} contains a NUL byte");
         }
         let mut bytes = 0usize;
+        for (path, text) in &self.cargo_lock {
+            validate_relative_path(path)?;
+            ensure!(Path::new(path).file_name().is_some_and(|name| name == "Cargo.lock"), "invalid Cargo lockfile path: {path}");
+            toml::from_str::<toml::Value>(text).with_context(|| format!("parse {path}"))?;
+            bytes += text.len();
+        }
         for (path, file) in &self.baseline {
             validate_path(path)?;
             DeclarationOverview::parse(path, &file.text)
@@ -170,6 +196,7 @@ impl DeclarationDesign {
                 "baseline and proposed declaration snapshot exceeds 8 MiB"
             );
         }
+        ensure!(bytes <= 8 * 1024 * 1024, "declaration snapshot exceeds 8 MiB");
         for (from, to) in &self.moved {
             ensure!(
                 self.baseline.contains_key(from)
@@ -196,6 +223,9 @@ impl DeclarationDesign {
                 .with_context(|| format!("format proposed {path}"))?;
         }
         candidate.validate()?;
+        if candidate.validation.as_ref().is_some_and(|report| report.fingerprint != crate::declaration::fingerprint(&candidate)) {
+            candidate.validation = None;
+        }
         Ok(candidate)
     }
 
@@ -274,6 +304,7 @@ impl DeclarationDesign {
             "patch must start with *** Begin Patch and end with *** End Patch"
         );
         let mut candidate = self.clone();
+        candidate.validation = None;
         let mut position = 1;
         let mut edited = BTreeSet::new();
         while position < lines.len() - 1 {
@@ -400,6 +431,9 @@ impl DeclarationDesign {
         }
         ensure!(!edited.is_empty(), "patch has no file operations");
         candidate.validate()?;
+        if candidate.proposed == self.proposed && candidate.document == self.document && candidate.moved == self.moved {
+            candidate.validation = self.validation.clone();
+        }
         Ok(candidate)
     }
 }
@@ -415,6 +449,15 @@ pub struct DesignPatchRequest {
 }
 
 fn validate_path(path: &str) -> Result<()> {
+    validate_relative_path(path)?;
+    ensure!(
+        DeclarationOverview::supports(path),
+        "unsupported declaration path: {path}. Supported files are .rs, .ts, .tsx, .lua, JSON/JSONC, TOML, YAML, and XML configuration."
+    );
+    Ok(())
+}
+
+fn validate_relative_path(path: &str) -> Result<()> {
     ensure!(
         !path.is_empty()
             && !path.contains(['\\', ':', '\n', '\r', '\0'])
@@ -428,10 +471,6 @@ fn validate_path(path: &str) -> Result<()> {
             .components()
             .all(|part| matches!(part, Component::Normal(_))),
         "path escapes declaration proposal: {path}"
-    );
-    ensure!(
-        DeclarationOverview::supports(path),
-        "unsupported declaration path: {path}. Supported files are .rs, .ts, .tsx, .lua, JSON/JSONC, TOML, YAML, and XML configuration."
     );
     Ok(())
 }
@@ -520,8 +559,11 @@ mod tests {
             r#"{"branch_prefix":"feature/","declaration_line_width":50}"#,
         )
         .unwrap();
+        std::fs::write(workspace.path().join("Cargo.lock"), "version = 4\n").unwrap();
         let design = DeclarationDesign::capture(workspace.path()).unwrap();
         assert_eq!(design.line_width, 50);
+        assert_eq!(design.cargo_lock["Cargo.lock"], "version = 4\n");
+        assert!(!design.proposed.contains_key("Cargo.lock"));
         assert!(
             design.baseline["lib.rs"]
                 .text

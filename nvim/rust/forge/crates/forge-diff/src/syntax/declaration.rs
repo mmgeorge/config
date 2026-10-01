@@ -25,6 +25,32 @@ pub struct DeclarationPresentation {
 }
 
 impl DeclarationOverview {
+    /// Locate a saved declaration token in the current inspection presentation.
+    pub fn display_position(path: &str, saved: &str, source: DeclarationPosition) -> Result<DeclarationPosition, SyntaxError> {
+        let presentation = Self::present(path, saved)?;
+        let language = Self::language(path).ok_or_else(|| SyntaxError::Language(path.into()))?;
+        let saved_tokens = layout_tokens(language, saved)?;
+        let displayed_tokens = layout_tokens(language, &presentation.text)?;
+        let identity = saved_tokens.iter().find(|(_, (position, _))| *position == source).map(|(identity, _)| identity).ok_or_else(|| SyntaxError::Query("saved declaration token is unavailable".into()))?;
+        displayed_tokens.get(identity).map(|(position, _)| *position).ok_or_else(|| SyntaxError::Query("declaration token is hidden in the presentation".into()))
+    }
+    /// Map a selected rendered token to its saved declaration position.
+    pub fn token_position(path: &str, saved: &str, anchor: DeclarationPosition, row: &str, column: usize) -> Result<DeclarationPosition, SyntaxError> {
+        let presentation = Self::present(path, saved)?;
+        let language = Self::language(path).ok_or_else(|| SyntaxError::Language(path.into()))?;
+        let saved_tokens = layout_tokens(language, saved)?;
+        let displayed_tokens = layout_tokens(language, &presentation.text)?;
+        let display_row = presentation.source.iter().enumerate().find(|(index, position)| **position == Some(anchor) && presentation.text.lines().nth(*index) == Some(row))
+            .or_else(|| presentation.source.iter().enumerate().find(|(_, position)| **position == Some(anchor))).map(|(index, _)| index as u32 + 1);
+        if let Some(display_row) = display_row {
+            for (identity, (position, token)) in displayed_tokens {
+                if position.line == display_row && position.column as usize <= column && column < position.column as usize + token.len() {
+                    if let Some((source, _)) = saved_tokens.get(&identity) { return Ok(*source); }
+                }
+            }
+        }
+        Err(SyntaxError::Query("cursor is not on a mapped declaration token".into()))
+    }
     /// Admit source declarations and complete configuration documents independently of highlighting.
     pub fn supports(path: &str) -> bool {
         Self::language(path).is_some() || ConfigurationFormat::for_path(path).is_some()
@@ -42,7 +68,7 @@ impl DeclarationOverview {
     pub fn language(path: &str) -> Option<SyntaxLanguage> {
         match path.rsplit('.').next()? {
             "rs" => Some(SyntaxLanguage::Rust),
-            "ts" => Some(SyntaxLanguage::Typescript),
+            "ts" | "mts" | "cts" => Some(SyntaxLanguage::Typescript),
             "tsx" => Some(SyntaxLanguage::Tsx),
             "lua" => Some(SyntaxLanguage::Lua),
             "toml" => Some(SyntaxLanguage::Toml),

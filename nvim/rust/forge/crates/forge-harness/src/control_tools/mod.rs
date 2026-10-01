@@ -80,7 +80,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "harness_plan_submit",
-                description: "Submit the exact validated canonical plan version for mandatory user review. Invalid plans return actionable validation errors and remain editable.",
+                description: "Format and submit the exact canonical declaration design for user review. Automatically validate Rust and TypeScript imports and signature references against the proposed declarations and available sources. Proven invalid references return actionable errors and remain editable. Unavailable or unsupported evidence returns warnings and permits submission. No implementation build or second model review runs.",
                 input_schema: strict_object_input_schema(
                     vec![
                         ("plan_id", string_schema()),

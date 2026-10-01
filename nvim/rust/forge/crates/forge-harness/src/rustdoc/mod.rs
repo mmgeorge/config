@@ -5,4 +5,5 @@ mod validation;
 
 pub use resolver::{RustdocError, RustdocHover, RustdocResolver, RustdocResolverConfig};
 pub use source::{CargoSourceResolver, CargoSourceResolverConfig, RustdocSourceLocation};
+pub(crate) use source::SourceGraph;
 pub use validation::{RustApiValidationError, RustApiValidationReport, validate_plan_rust_api};

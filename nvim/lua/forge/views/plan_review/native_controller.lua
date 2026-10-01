@@ -121,7 +121,7 @@ local function toggle_task_fold(review)
 end
 
 local function close_review(review)
-  if not review.owner.close() then notice("Plan annotations are awaiting their saved acknowledgement") return false end
+  if not review.owner.close() then notice("Plan review is awaiting a saved acknowledgement") return false end
   if vim.api.nvim_tabpage_is_valid(review.tab) and review.tab ~= review.return_tab and vim.fn.tabpagenr("$") > 1 then
     vim.api.nvim_set_current_tabpage(review.tab)
     vim.cmd("tabclose")
@@ -146,7 +146,7 @@ local function discard_failed_attachment(review)
   end
 end
 
-local function show_document(review, snapshot, title, filetype)
+local function show_document(review, snapshot, title, filetype, selection)
   if type(snapshot) ~= "table" then return end
   local view = review.owner.current_view()
   if not view then return end
@@ -157,6 +157,10 @@ local function show_document(review, snapshot, title, filetype)
   local replica = buffer.open(snapshot.document, { buffer = native_buffer, generated = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(native_buffer), filetype = filetype or "markdown", notice = notice })
   if buffer.apply_snapshot(replica, snapshot).kind ~= "Applied" then buffer.close(replica) return end
+  if selection then
+    vim.api.nvim_win_set_cursor(window, { selection.row + 1, selection.column })
+    vim.api.nvim_win_call(window, function() vim.cmd("normal! zv") end)
+  end
   local closed = false
   local function close()
     if closed then return end
@@ -207,7 +211,12 @@ end
 
 local function action(review, name)
   if review.plan.historical_revision and (name == "comment" or name == "delete") then return end
+  local opening_cursor = vim.api.nvim_win_get_cursor(review.win)
   review.owner.action(name, function(result, failure, captured)
+    if name == "jump_entity" and (not review.owner.is_current(captured)
+        or not vim.api.nvim_win_is_valid(review.win)
+        or vim.api.nvim_win_get_buf(review.win) ~= review.buf
+        or not vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), opening_cursor)) then return end
     if failure then notice(failure) return end
     if name == "toggle_public" then
       review.public_only = result.public_only
@@ -223,7 +232,8 @@ local function action(review, name)
       end
     elseif name == "delete" then
       return
-    elseif name == "open" and type(result.declarations) == "table" then show_document(review, result.declarations, "Declarations", result.filetype)
+    elseif type(result.message) == "string" then notifications.info(result.message, "ForgePlanReview")
+    elseif type(result.declarations) == "table" then show_document(review, result.declarations, "Declarations", result.filetype, result.selection)
     elseif name == "schema" then show_document(review, result.schema, "Canonical plan", "json")
     elseif name == "entity_info" then
       if type(result.info) == "table" then show_document(review, result.info, "Plan entity") else rustdoc(review, result, captured, false) end
@@ -233,7 +243,7 @@ local function action(review, name)
       and result.anchor.target.target_type == "dependency" then
       require("forge.views.plan_review.dependency_browser").open(result.anchor.target.name)
     elseif type(result.source) == "table" then
-      effect(review, captured, { kind = "open_file", path = result.source.path, row = result.source.line - 1, column = 0 })
+      effect(review, captured, { kind = "open_file", path = result.source.path, row = result.source.line - 1, column = result.source.column or 0 })
     else rustdoc(review, result, captured, true) end
   end)
 end
@@ -257,13 +267,13 @@ local function submit(review, method, params)
     if result then controller.activate_snapshot(result) end
     controller.render()
     if method == "plan.acceptance.begin" then vim.schedule(function() controller.present_plan_question(true) end) end
-  end, function() close_review(review) end)
+  end)
 end
 
 local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review) end)
-  for _, name in ipairs({ "open", "comment", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({ "open", "jump_entity", "comment", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
   command_set.register(set, "abort_plan", function()
     if not review.plan.historical_revision and session.harness.active_plan
@@ -313,8 +323,16 @@ function M.open(plan)
   if native_buffer >= 0 and vim.api.nvim_buf_is_loaded(native_buffer) and vim.bo[native_buffer].modified and not recovery then
     notice("The physical plan buffer has unsaved changes") return
   end
-  if native_buffer < 0 then native_buffer = vim.fn.bufadd(plan.working_path) end
-  vim.fn.bufload(native_buffer)
+  if native_buffer < 0 then
+    native_buffer = vim.api.nvim_create_buf(false, true)
+    vim.api.nvim_buf_set_name(native_buffer, plan.working_path)
+  end
+  vim.bo[native_buffer].buftype = "nofile"
+  vim.bo[native_buffer].filetype = "forge"
+  vim.bo[native_buffer].modifiable = true
+  vim.api.nvim_buf_set_lines(native_buffer, 0, -1, false, { "Loading plan review…" })
+  vim.bo[native_buffer].modified = false
+  vim.bo[native_buffer].modifiable = false
   vim.cmd("tabnew")
   vim.api.nvim_win_set_buf(0, native_buffer)
   local window = vim.api.nvim_get_current_win()
@@ -323,6 +341,10 @@ function M.open(plan)
   local review = { plan = plan, buf = native_buffer, win = window, tab = vim.api.nvim_get_current_tabpage(),
     return_win = origin, return_tab = origin_tab, session_id = session.harness.session.id, task_folded_by_id = {} }
   session.harness.plan_review = review
+  local loading_commands = command_set.new()
+  command_set.register(loading_commands, "close", function() close_review(review) end)
+  keymaps.setup_view_keymaps(native_buffer, "plan_review", loading_commands)
+  keymaps.apply_view_winbar(window, "PlanReview", "plan_review", loading_commands, "Loading review")
   review.owner = require("forge.views.plan_review.document").attach({ plan = plan, session_id = review.session_id,
     buffer = native_buffer, window = window, recovery = recovery, notice = notice,
     configure_view = function(view, owner) apply_task_folds(review, view.window, owner) end }, function(owner, failure)

@@ -18,6 +18,11 @@ pub enum ConfigurationFormat {
 }
 
 impl ConfigurationFormat {
+    /// Decode TypeScript configuration without discarding comments manually.
+    pub fn json_value(text: &str) -> Result<serde_json::Value, SyntaxError> {
+        jsonc_parser::parse_to_serde_value::<serde_json::Value>(text, &jsonc_parser::ParseOptions::default())
+            .map_err(|error| SyntaxError::Query(error.to_string()))
+    }
     /// Select a configuration format by extension and established JSONC filenames.
     pub fn for_path(path: &str) -> Option<Self> {
         let normalized = path.replace('\\', "/").to_ascii_lowercase();

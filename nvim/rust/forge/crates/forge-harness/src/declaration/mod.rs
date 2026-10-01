@@ -1,0 +1,1099 @@
+//! Resolves declaration references once for validation and source navigation.
+
+mod sources;
+#[cfg(test)]
+mod tests;
+mod typescript;
+
+use crate::plan::DeclarationDesign;
+use anyhow::{Context, Result};
+use forge_diff::syntax::{
+    DeclarationIndex, DeclarationPosition, DeclarationReference, DeclarationSymbol,
+    SymbolVisibility,
+};
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// A resolved declaration in the proposal or an exact source file.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
+pub struct DeclarationDestination {
+    pub path: String,
+    pub line: u32,
+    pub column: u32,
+    pub proposed: bool,
+    pub name: String,
+}
+
+/// Evidence distinguishing invalid references from unavailable analysis.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum DeclarationResolution {
+    Resolved { destination: DeclarationDestination },
+    Intrinsic,
+    Invalid { reason: String },
+    Ambiguous { reason: String },
+    Unverified { reason: String },
+}
+
+/// One location-bearing diagnostic returned to the model and reviewer.
+#[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
+pub struct DeclarationDiagnostic {
+    pub path: String,
+    pub line: u32,
+    pub column: u32,
+    pub reference: String,
+    pub error: bool,
+    pub reason: String,
+}
+
+/// Generated submission evidence, never authored by the planning model.
+#[derive(Clone, Debug, Default, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
+pub struct DeclarationValidation {
+    pub fingerprint: String,
+    pub checked: usize,
+    pub diagnostic: Vec<DeclarationDiagnostic>,
+}
+
+/// Keeps invalid reference locations intact across provider tool transports.
+#[derive(Debug)]
+pub(crate) struct DeclarationValidationError {
+    pub diagnostic: Vec<DeclarationDiagnostic>,
+}
+
+impl std::fmt::Display for DeclarationValidationError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(formatter, "Declaration validation failed:")?;
+        for diagnostic in &self.diagnostic {
+            writeln!(
+                formatter,
+                "{}:{}:{}: {}: {}",
+                diagnostic.path,
+                diagnostic.line,
+                diagnostic.column + 1,
+                diagnostic.reference,
+                diagnostic.reason
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl std::error::Error for DeclarationValidationError {}
+
+impl DeclarationValidation {
+    pub fn ensure_valid(&self) -> Result<()> {
+        let errors = self
+            .diagnostic
+            .iter()
+            .filter(|diagnostic| diagnostic.error)
+            .cloned()
+            .collect::<Vec<_>>();
+        if !errors.is_empty() {
+            return Err(DeclarationValidationError { diagnostic: errors }.into());
+        }
+        Ok(())
+    }
+    pub fn warnings(&self) -> Vec<crate::plan::PlanViolation> {
+        self.diagnostic
+            .iter()
+            .filter(|diagnostic| !diagnostic.error)
+            .map(|diagnostic| crate::plan::PlanViolation {
+                path: format!(
+                    "{}:{}:{}",
+                    diagnostic.path,
+                    diagnostic.line,
+                    diagnostic.column + 1
+                ),
+                message: diagnostic.reason.clone(),
+            })
+            .collect()
+    }
+}
+
+#[derive(Clone)]
+struct IndexedFile {
+    path: PathBuf,
+    index: Arc<DeclarationIndex>,
+    original: Option<Arc<DeclarationIndex>>,
+    package: String,
+    module: Vec<String>,
+    proposed: bool,
+}
+
+#[derive(Clone, Default)]
+struct RustPackage {
+    edition: String,
+    dependency: HashMap<String, String>,
+    incomplete: bool,
+    no_std: bool,
+    no_implicit_prelude: bool,
+}
+
+#[derive(Clone, Copy)]
+struct RustAccess<'scope> {
+    package: &'scope str,
+    scope: &'scope [String],
+}
+
+fn accessible(
+    visibility: SymbolVisibility,
+    package: &str,
+    scope: &[String],
+    origin: RustAccess<'_>,
+) -> bool {
+    match visibility {
+        SymbolVisibility::Public => true,
+        SymbolVisibility::Crate => origin.package == package,
+        SymbolVisibility::Private => origin.package == package && origin.scope.starts_with(scope),
+        SymbolVisibility::Parent => {
+            origin.package == package
+                && origin
+                    .scope
+                    .starts_with(&scope[..scope.len().saturating_sub(1)])
+        }
+    }
+}
+
+/// Owns a snapshot's module graph and the same resolution evidence used by jumps.
+pub(crate) struct DeclarationResolver {
+    workspace: PathBuf,
+    snapshot: BTreeMap<String, String>,
+    cargo_lock: BTreeMap<String, String>,
+    workspace_files: HashSet<String>,
+    changed: HashSet<String>,
+    baseline: bool,
+    file: BTreeMap<PathBuf, IndexedFile>,
+    package: HashMap<String, RustPackage>,
+    module: HashMap<(String, Vec<String>), PathBuf>,
+    pending_module: HashMap<(String, Vec<String>), (PathBuf, bool)>,
+    warning: Vec<String>,
+    typescript: typescript::TypescriptEnvironment,
+    rust_library: bool,
+    bytes: usize,
+}
+
+type ParseCache = Mutex<BTreeMap<String, Arc<DeclarationIndex>>>;
+static PARSE_CACHE: OnceLock<ParseCache> = OnceLock::new();
+
+impl DeclarationResolver {
+    /// Validate direct store callers using locally available project evidence.
+    pub(crate) fn local(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
+        let mut resolver = Self::snapshot(workspace, design, baseline)?;
+        sources::project(&mut resolver)?;
+        resolver.typescript_environment()?;
+        Ok(resolver)
+    }
+    /// Capture configured sources without modifying the reviewed workspace.
+    pub(crate) async fn prepare(
+        workspace: &Path,
+        design: &DeclarationDesign,
+        baseline: bool,
+    ) -> Result<Self> {
+        let mut resolver = Self::snapshot(workspace, design, baseline)?;
+        sources::prepare(&mut resolver).await?;
+        resolver.typescript_environment()?;
+        Ok(resolver)
+    }
+
+    /// Create an isolated lexical snapshot before acquiring external evidence.
+    fn snapshot(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
+        let workspace = dunce::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+        let snapshot = if baseline {
+            design
+                .baseline
+                .iter()
+                .map(|(path, file)| (path.clone(), file.text.clone()))
+                .collect()
+        } else {
+            design.proposed.clone()
+        };
+        let workspace_files = design
+            .baseline
+            .keys()
+            .chain(design.proposed.keys())
+            .cloned()
+            .collect();
+        let changed = design.changed_paths().into_iter().collect();
+        let mut resolver = Self {
+            workspace,
+            snapshot,
+            cargo_lock: design.cargo_lock.clone(),
+            workspace_files,
+            changed,
+            baseline,
+            file: BTreeMap::new(),
+            package: HashMap::new(),
+            module: HashMap::new(),
+            pending_module: HashMap::new(),
+            warning: Vec::new(),
+            typescript: Default::default(),
+            rust_library: false,
+            bytes: 0,
+        };
+        let paths = resolver
+            .snapshot
+            .keys()
+            .filter(|path| {
+                matches!(
+                    Path::new(path)
+                        .extension()
+                        .and_then(|extension| extension.to_str()),
+                    Some("ts" | "tsx" | "mts" | "cts")
+                )
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        for path in paths {
+            resolver.load_file(&resolver.workspace.join(path), "", &[])?;
+        }
+        Ok(resolver)
+    }
+
+    fn read(&self, path: &Path) -> Option<String> {
+        let path = normalize(path);
+        if let Ok(relative) = path.strip_prefix(&self.workspace) {
+            let key = relative.to_string_lossy().replace('\\', "/");
+            // Every eligible workspace declaration comes from the immutable snapshot.
+            if matches!(
+                path.extension().and_then(|extension| extension.to_str()),
+                Some("rs" | "ts" | "tsx" | "mts" | "cts" | "toml" | "json" | "jsonc")
+            ) {
+                if let Some(text) = self.snapshot.get(&key) {
+                    return Some(text.clone());
+                }
+                if self.workspace_files.contains(&key) {
+                    return None;
+                }
+            }
+        }
+        std::fs::read_to_string(path).ok()
+    }
+
+    fn load_file(&mut self, path: &Path, package: &str, module: &[String]) -> Result<bool> {
+        let path = normalize(path);
+        if self.file.contains_key(&path) {
+            return Ok(true);
+        }
+        let Some(text) = self.read(&path) else {
+            return Ok(false);
+        };
+        self.bytes += text.len();
+        anyhow::ensure!(
+            self.bytes <= 128 * 1024 * 1024 && self.file.len() < 16384,
+            "declaration index exceeded 128 MiB or 16384 files"
+        );
+        let key = format!(
+            "{}:{}",
+            path.extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or(""),
+            crate::plan::digest(text.as_bytes())
+        );
+        let cache = PARSE_CACHE.get_or_init(Default::default);
+        let cached = cache
+            .lock()
+            .map_err(|_| anyhow::anyhow!("declaration cache lock poisoned"))?
+            .get(&key)
+            .cloned();
+        let index = match cached {
+            Some(index) => index,
+            None => {
+                let index = Arc::new(
+                    DeclarationIndex::extract(&path.to_string_lossy(), &text)
+                        .map_err(|error| anyhow::anyhow!("{}: {error:?}", path.display()))?,
+                );
+                let mut cache = cache
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("declaration cache lock poisoned"))?;
+                if cache.len() >= 512 {
+                    cache.clear();
+                }
+                cache.insert(key, index.clone());
+                index
+            }
+        };
+        let proposed = !self.baseline
+            && path.strip_prefix(&self.workspace).ok().is_some_and(|path| {
+                self.changed
+                    .contains(&path.to_string_lossy().replace('\\', "/"))
+            });
+        let original = if !self.baseline && !proposed && path.starts_with(&self.workspace) {
+            std::fs::read_to_string(&path)
+                .ok()
+                .and_then(|source| DeclarationIndex::extract(&path.to_string_lossy(), &source).ok())
+                .map(Arc::new)
+        } else {
+            None
+        };
+        self.file.insert(
+            path.clone(),
+            IndexedFile {
+                path: path.clone(),
+                index,
+                original,
+                package: package.into(),
+                module: module.to_vec(),
+                proposed,
+            },
+        );
+        if !package.is_empty() {
+            self.module.insert((package.into(), module.to_vec()), path);
+        }
+        Ok(true)
+    }
+
+    fn load_rust(
+        &mut self,
+        path: &Path,
+        package: &str,
+        module: &[String],
+        depth: usize,
+    ) -> Result<()> {
+        if depth > 64 {
+            self.package.entry(package.into()).or_default().incomplete = true;
+            return Ok(());
+        }
+        let path = normalize(path);
+        if self.file.contains_key(&path) {
+            return Ok(());
+        }
+        if !self.load_file(&path, package, module)? {
+            self.package.entry(package.into()).or_default().incomplete = true;
+            return Ok(());
+        }
+        let index = self.file[&path].index.clone();
+        let state = self.package.entry(package.into()).or_default();
+        state.incomplete |= index.incomplete;
+        if module.is_empty() {
+            state.no_std = index.no_std;
+            state.no_implicit_prelude = index.no_implicit_prelude;
+        }
+        let directory = path.parent().unwrap_or(Path::new("."));
+        let base = if module.is_empty() || path.file_name().is_some_and(|name| name == "mod.rs") {
+            directory.to_path_buf()
+        } else {
+            directory.join(path.file_stem().unwrap_or_default())
+        };
+        for declaration in &index.module {
+            let mut nested = module.to_vec();
+            nested.extend(declaration.scope.clone());
+            nested.push(declaration.name.clone());
+            if declaration.inline {
+                self.module.insert((package.into(), nested), path.clone());
+                continue;
+            }
+            let container = declaration
+                .scope
+                .iter()
+                .fold(base.clone(), |directory, name| directory.join(name));
+            let explicit = declaration
+                .path
+                .as_ref()
+                .map(|relative| container.join(relative));
+            let direct = container.join(format!("{}.rs", declaration.name));
+            let target = explicit.unwrap_or_else(|| {
+                if self.read(&direct).is_some() {
+                    direct
+                } else {
+                    container.join(&declaration.name).join("mod.rs")
+                }
+            });
+            if !path.starts_with(&self.workspace) {
+                self.pending_module
+                    .insert((package.into(), nested), (target, declaration.conditional));
+                continue;
+            }
+            self.load_rust(&target, package, &nested, depth + 1)?;
+            if declaration.conditional {
+                for file in self
+                    .file
+                    .values_mut()
+                    .filter(|file| file.package == package && file.module.starts_with(&nested))
+                {
+                    let index = Arc::make_mut(&mut file.index);
+                    for symbol in &mut index.symbol {
+                        symbol.conditional = true;
+                    }
+                    for reference in &mut index.reference {
+                        reference.conditional = true;
+                    }
+                    for import in &mut index.import {
+                        import.conditional = true;
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Validate imports and signature references only in proposed changed files.
+    pub(crate) fn validate(&mut self, design: &DeclarationDesign) -> DeclarationValidation {
+        let changed = design.changed_paths().into_iter().collect::<HashSet<_>>();
+        let files = self
+            .file
+            .values()
+            .filter(|file| {
+                file.path
+                    .strip_prefix(&self.workspace)
+                    .ok()
+                    .is_some_and(|relative| {
+                        changed.contains(&relative.to_string_lossy().replace('\\', "/"))
+                    })
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut report = DeclarationValidation {
+            fingerprint: fingerprint(design),
+            ..Default::default()
+        };
+        for warning in &self.warning {
+            report.diagnostic.push(DeclarationDiagnostic {
+                path: "plan".into(),
+                line: 1,
+                column: 0,
+                reference: String::new(),
+                error: false,
+                reason: warning.clone(),
+            });
+        }
+        if !self.rust_library
+            && !self.package.is_empty()
+            && !report
+                .diagnostic
+                .iter()
+                .any(|diagnostic| diagnostic.reason.contains("rust-src"))
+        {
+            report.diagnostic.push(DeclarationDiagnostic { path:"plan".into(),line:1,column:0,reference:String::new(),error:false,reason:"rust-src is unavailable. Run `rustup component add rust-src` in the workspace. Standard-library and prelude checks are disabled.".into() });
+        }
+        for file in files {
+            for reference in &file.index.reference {
+                let result = self.resolve_reference(&file, reference);
+                record(
+                    &mut report,
+                    &self.workspace,
+                    &file.path,
+                    reference.position,
+                    &reference.path.join("::"),
+                    result,
+                );
+            }
+            for import in &file.index.import {
+                if import.conditional {
+                    continue;
+                }
+                let mut path = import.path.clone();
+                if import.glob || import.namespace {
+                    // Namespace imports require a module, not a same-named declaration.
+                    path.push("*".into());
+                }
+                let result = if file.package.is_empty() {
+                    let result =
+                        self.resolve_ts_import(&file, import, &path, false, &mut HashSet::new());
+                    if matches!(result, DeclarationResolution::Invalid { .. }) {
+                        self.resolve_ts_import(&file, import, &path, true, &mut HashSet::new())
+                    } else {
+                        result
+                    }
+                } else {
+                    let result = self.resolve_rust_path(
+                        &file.package,
+                        &joined(&file.module, &import.scope),
+                        &path,
+                        false,
+                        RustAccess {
+                            package: &file.package,
+                            scope: &file.module,
+                        },
+                        &mut HashSet::new(),
+                    );
+                    if matches!(result, DeclarationResolution::Invalid { .. }) {
+                        self.resolve_rust_path(
+                            &file.package,
+                            &joined(&file.module, &import.scope),
+                            &path,
+                            true,
+                            RustAccess {
+                                package: &file.package,
+                                scope: &file.module,
+                            },
+                            &mut HashSet::new(),
+                        )
+                    } else {
+                        result
+                    }
+                };
+                let result = if import.export && !file.package.is_empty() {
+                    self.exported_resolution(result, import.visibility)
+                } else {
+                    result
+                };
+                record(
+                    &mut report,
+                    &self.workspace,
+                    &file.path,
+                    import.position,
+                    &import.source.clone().unwrap_or_else(|| path.join("::")),
+                    result,
+                );
+            }
+        }
+        let mut seen = HashSet::new();
+        report.diagnostic.retain(|diagnostic| {
+            seen.insert((
+                diagnostic.path.clone(),
+                diagnostic.line,
+                diagnostic.column,
+                diagnostic.reason.clone(),
+            ))
+        });
+        report
+    }
+
+    /// Resolve the exact signature token selected in saved declaration coordinates.
+    pub(crate) fn at(&mut self, path: &str, line: u32, column: u32) -> DeclarationResolution {
+        let absolute = normalize(&self.workspace.join(path));
+        let Some(file) = self.file.get(&absolute).cloned() else {
+            return unverified("this file has no Rust or TypeScript declaration index");
+        };
+        if let Some(reference) = file.index.reference.iter().find(|reference| {
+            reference.position.line == line
+                && reference.position.column <= column
+                && (column as usize) < reference.position.column as usize + reference.length
+        }) {
+            return self.resolve_reference(&file, reference);
+        }
+        if let Some(symbol) = file.index.symbol.iter().find(|symbol| {
+            symbol.position.line == line
+                && symbol.position.column <= column
+                && column < symbol.position.column + symbol.name.len() as u32
+        }) {
+            return resolved(&file, symbol);
+        }
+        if let Some(import) = file
+            .index
+            .import
+            .iter()
+            .filter(|import| import.position.line == line && import.position.column <= column)
+            .max_by_key(|import| import.position.column)
+        {
+            return if file.package.is_empty() {
+                self.resolve_ts_import(&file, import, &import.path, false, &mut HashSet::new())
+            } else {
+                self.resolve_rust_path(
+                    &file.package,
+                    &joined(&file.module, &import.scope),
+                    &import.path,
+                    false,
+                    RustAccess {
+                        package: &file.package,
+                        scope: &file.module,
+                    },
+                    &mut HashSet::new(),
+                )
+            };
+        }
+        unverified("cursor is not on a declaration type or import")
+    }
+
+    fn resolve_reference(
+        &mut self,
+        file: &IndexedFile,
+        reference: &DeclarationReference,
+    ) -> DeclarationResolution {
+        if reference.conditional {
+            return unverified("reference is conditionally compiled");
+        }
+        if reference.path.iter().any(|part| part.contains(['<', '>'])) {
+            return unverified("qualified or dependent types require semantic evidence");
+        }
+        if file.package.is_empty() {
+            return self.resolve_ts(file, reference, &mut HashSet::new());
+        }
+        let scope = joined(&file.module, &reference.scope);
+        for depth in (0..=scope.len()).rev() {
+            let result = self.rust_member(
+                &file.package,
+                &scope[..depth],
+                &reference.path,
+                reference.value_namespace,
+                RustAccess {
+                    package: &file.package,
+                    scope: &scope,
+                },
+                &mut HashSet::new(),
+            );
+            let bound = self
+                .file
+                .values()
+                .filter(|candidate| candidate.package == file.package)
+                .any(|candidate| {
+                    scope[..depth]
+                        .strip_prefix(candidate.module.as_slice())
+                        .is_some_and(|relative| {
+                            candidate.index.symbol.iter().any(|symbol| {
+                                symbol.scope == relative
+                                    && reference.path.first() == Some(&symbol.name)
+                                    && if reference.value_namespace {
+                                        symbol.value_namespace
+                                    } else {
+                                        symbol.type_namespace
+                                    }
+                            }) || candidate.index.import.iter().any(|import| {
+                                import.scope == relative
+                                    && import.alias.as_ref() == reference.path.first()
+                            })
+                        })
+                });
+            if bound
+                || matches!(
+                    result,
+                    DeclarationResolution::Resolved { .. }
+                        | DeclarationResolution::Intrinsic
+                        | DeclarationResolution::Ambiguous { .. }
+                )
+            {
+                return result;
+            }
+        }
+        let first = reference.path.first().map(String::as_str).unwrap_or("");
+        let package = self.package.get(&file.package).cloned().unwrap_or_default();
+        if first == "crate"
+            || first == "self"
+            || first == "super"
+            || package.dependency.contains_key(first)
+            || matches!(first, "std" | "core" | "alloc")
+        {
+            return self.resolve_rust_path(
+                &file.package,
+                &file.module,
+                &reference.path,
+                reference.value_namespace,
+                RustAccess {
+                    package: &file.package,
+                    scope: &scope,
+                },
+                &mut HashSet::new(),
+            );
+        }
+        if !reference.value_namespace && reference.path.len() == 1 && rust_primitive(first) {
+            return DeclarationResolution::Intrinsic;
+        }
+        if !package.no_implicit_prelude && !file.index.no_implicit_prelude {
+            if !self.rust_library {
+                return unverified("rust-src is unavailable, so prelude resolution is disabled");
+            }
+            let library = if package.no_std { "core" } else { "std" };
+            let path = [
+                vec![
+                    "prelude".into(),
+                    format!(
+                        "rust_{}",
+                        if package.edition.is_empty() {
+                            "2015"
+                        } else {
+                            &package.edition
+                        }
+                    ),
+                ],
+                reference.path.clone(),
+            ]
+            .concat();
+            let result = self.rust_member(
+                library,
+                &[],
+                &path,
+                reference.value_namespace,
+                RustAccess {
+                    package: library,
+                    scope: &[],
+                },
+                &mut HashSet::new(),
+            );
+            if !matches!(result, DeclarationResolution::Invalid { .. }) {
+                return result;
+            }
+        }
+        self.missing_rust(&file.package, &reference.path.join("::"))
+    }
+
+    fn exported_resolution(
+        &self,
+        result: DeclarationResolution,
+        visibility: SymbolVisibility,
+    ) -> DeclarationResolution {
+        if visibility == SymbolVisibility::Public {
+            if let DeclarationResolution::Resolved { destination } = &result {
+                if let Some(file) = self.file.get(Path::new(&destination.path)) {
+                    let index = file.original.as_deref().unwrap_or(&file.index);
+                    if index.symbol.iter().any(|symbol| {
+                        symbol.position.line == destination.line
+                            && symbol.position.column == destination.column
+                            && symbol.visibility != SymbolVisibility::Public
+                    }) {
+                        return invalid(
+                            "public re-export refers to a declaration with restricted visibility",
+                        );
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    fn resolve_rust_path(
+        &mut self,
+        package: &str,
+        scope: &[String],
+        path: &[String],
+        value: bool,
+        origin: RustAccess<'_>,
+        visited: &mut HashSet<String>,
+    ) -> DeclarationResolution {
+        let Some(first) = path.first().map(String::as_str) else {
+            return invalid("empty Rust import path");
+        };
+        match first {
+            "crate" => self.rust_member(package, &[], &path[1..], value, origin, visited),
+            "self" => self.rust_member(package, scope, &path[1..], value, origin, visited),
+            "super" => {
+                if scope.is_empty() {
+                    invalid("super refers outside the crate root")
+                } else {
+                    self.resolve_rust_path(
+                        package,
+                        &scope[..scope.len() - 1],
+                        &path[1..],
+                        value,
+                        origin,
+                        visited,
+                    )
+                }
+            }
+            "std" | "core" | "alloc" => {
+                if self.rust_library {
+                    self.rust_member(first, &[], &path[1..], value, origin, visited)
+                } else {
+                    unverified(
+                        "rust-src is unavailable, so standard-library resolution is disabled",
+                    )
+                }
+            }
+            _ => {
+                if let Some(dependency) = self
+                    .package
+                    .get(package)
+                    .and_then(|package| package.dependency.get(first))
+                    .cloned()
+                {
+                    return self.rust_member(&dependency, &[], &path[1..], value, origin, visited);
+                }
+                self.rust_member(package, &[], path, value, origin, visited)
+            }
+        }
+    }
+
+    fn rust_member(
+        &mut self,
+        package: &str,
+        scope: &[String],
+        path: &[String],
+        value: bool,
+        origin: RustAccess<'_>,
+        visited: &mut HashSet<String>,
+    ) -> DeclarationResolution {
+        let key = format!("{package}:{}:{}:{value}", scope.join("::"), path.join("::"));
+        if visited.len() > 256 || !visited.insert(key.clone()) {
+            return unverified("cyclic or excessively deep re-export chain");
+        }
+        let result = self.rust_member_inner(package, scope, path, value, origin, visited);
+        visited.remove(&key);
+        result
+    }
+
+    fn rust_member_inner(
+        &mut self,
+        package: &str,
+        scope: &[String],
+        path: &[String],
+        value: bool,
+        origin: RustAccess<'_>,
+        visited: &mut HashSet<String>,
+    ) -> DeclarationResolution {
+        for depth in 0..=scope.len() {
+            let module = &scope[..depth];
+            if let Some((target, conditional)) = self
+                .pending_module
+                .remove(&(package.into(), module.to_vec()))
+            {
+                if let Err(error) = self.load_rust(&target, package, module, depth) {
+                    self.package.entry(package.into()).or_default().incomplete = true;
+                    return unverified(&format!("module source cannot be indexed: {error:#}"));
+                }
+                if conditional {
+                    return unverified("module is conditionally compiled");
+                }
+            }
+        }
+        if path.is_empty() || path == ["*"] {
+            return if self.module.contains_key(&(package.into(), scope.to_vec())) {
+                DeclarationResolution::Intrinsic
+            } else {
+                self.missing_rust(package, &scope.join("::"))
+            };
+        }
+        let first = &path[0];
+        let mut results = Vec::new();
+        let files = self
+            .file
+            .values()
+            .filter(|file| file.package == package)
+            .cloned()
+            .collect::<Vec<_>>();
+        for file in &files {
+            let relative = scope.strip_prefix(file.module.as_slice());
+            let Some(relative) = relative else {
+                continue;
+            };
+            for symbol in file.index.symbol.iter().filter(|symbol| {
+                symbol.scope == relative
+                    && &symbol.name == first
+                    && if value {
+                        symbol.value_namespace
+                    } else {
+                        symbol.type_namespace
+                    }
+            }) {
+                if !accessible(symbol.visibility, package, scope, origin) {
+                    return invalid("declaration is not public outside its crate");
+                }
+                if symbol.conditional {
+                    results.push(unverified("declaration is conditionally compiled"));
+                } else if path.len() == 1 {
+                    results.push(resolved(file, symbol));
+                } else if symbol.parameter {
+                    results.push(unverified(
+                        "associated types on generic parameters require semantic evidence",
+                    ));
+                } else {
+                    let mut nested = scope.to_vec();
+                    nested.push(first.clone());
+                    results.push(self.rust_member(
+                        package,
+                        &nested,
+                        &path[1..],
+                        value,
+                        origin,
+                        visited,
+                    ));
+                }
+            }
+            for import in file.index.import.iter().filter(|import| {
+                import.scope == relative && !import.glob && import.alias.as_ref() == Some(first)
+            }) {
+                if !accessible(import.visibility, package, scope, origin) {
+                    continue;
+                }
+                if import.conditional {
+                    results.push(unverified("re-export is conditionally compiled"));
+                    continue;
+                }
+                let mut target = import.path.clone();
+                target.extend(if import.glob { path } else { &path[1..] }.iter().cloned());
+                let result = self.resolve_rust_path(
+                    package,
+                    scope,
+                    &target,
+                    value,
+                    RustAccess { package, scope },
+                    visited,
+                );
+                results.push(self.exported_resolution(result, import.visibility));
+            }
+        }
+        // Lexical declarations and explicit imports take precedence over wildcard imports.
+        if !results.is_empty() {
+            return combine(results, || self.missing_rust(package, &joined(scope, path).join("::")));
+        }
+        for file in &files {
+            let Some(relative) = scope.strip_prefix(file.module.as_slice()) else { continue; };
+            for import in file.index.import.iter().filter(|import| import.scope == relative && import.glob) {
+                if !accessible(import.visibility, package, scope, origin) { continue; }
+                if import.conditional {
+                    results.push(unverified("re-export is conditionally compiled"));
+                    continue;
+                }
+                let target = joined(&import.path, path);
+                let result = self.resolve_rust_path(package, scope, &target, value,
+                    RustAccess { package, scope }, visited);
+                results.push(self.exported_resolution(result, import.visibility));
+            }
+        }
+        combine(results, || {
+            self.missing_rust(package, &joined(scope, path).join("::"))
+        })
+    }
+
+    fn missing_rust(&self, package: &str, name: &str) -> DeclarationResolution {
+        match self.package.get(package) {
+            None => unverified("dependency source or standard-library source is unavailable"),
+            Some(package) if package.incomplete => unverified(
+                "source graph contains macros, generated modules, unsupported syntax, or unavailable modules",
+            ),
+            _ => invalid(&format!("no accessible declaration resolves `{name}`")),
+        }
+    }
+}
+
+pub(crate) fn fingerprint(design: &DeclarationDesign) -> String {
+    crate::plan::digest(
+        &serde_json::to_vec(&(&design.proposed, &design.cargo_lock))
+            .expect("string maps serialize"),
+    )
+}
+
+fn normalize(path: &Path) -> PathBuf {
+    let mut result = PathBuf::new();
+    for component in path.components() {
+        match component {
+            std::path::Component::CurDir => {}
+            std::path::Component::ParentDir => {
+                result.pop();
+            }
+            _ => result.push(component.as_os_str()),
+        }
+    }
+    result
+}
+
+fn joined(prefix: &[String], suffix: &[String]) -> Vec<String> {
+    prefix.iter().chain(suffix).cloned().collect()
+}
+fn invalid(reason: &str) -> DeclarationResolution {
+    DeclarationResolution::Invalid {
+        reason: reason.into(),
+    }
+}
+fn unverified(reason: &str) -> DeclarationResolution {
+    DeclarationResolution::Unverified {
+        reason: reason.into(),
+    }
+}
+
+fn resolved(file: &IndexedFile, symbol: &DeclarationSymbol) -> DeclarationResolution {
+    let position = file
+        .original
+        .as_ref()
+        .and_then(|index| {
+            index
+                .symbol
+                .iter()
+                .find(|original| original.name == symbol.name && original.scope == symbol.scope)
+        })
+        .map(|original| original.position)
+        .unwrap_or(symbol.position);
+    DeclarationResolution::Resolved {
+        destination: DeclarationDestination {
+            path: file.path.to_string_lossy().into_owned(),
+            line: position.line,
+            column: position.column,
+            proposed: file.proposed,
+            name: symbol.name.clone(),
+        },
+    }
+}
+
+fn combine(
+    results: Vec<DeclarationResolution>,
+    missing: impl FnOnce() -> DeclarationResolution,
+) -> DeclarationResolution {
+    let mut destinations = Vec::new();
+    let mut uncertain = None;
+    for result in results {
+        match result {
+            DeclarationResolution::Resolved { destination } => {
+                if !destinations.contains(&destination) {
+                    destinations.push(destination);
+                }
+            }
+            DeclarationResolution::Intrinsic => return DeclarationResolution::Intrinsic,
+            DeclarationResolution::Unverified { .. } | DeclarationResolution::Ambiguous { .. } => {
+                uncertain = Some(result)
+            }
+            DeclarationResolution::Invalid { .. } => {}
+        }
+    }
+    if destinations.len() > 1 {
+        return DeclarationResolution::Ambiguous {
+            reason: "multiple accessible declarations resolve this name".into(),
+        };
+    }
+    if let Some(result) = uncertain {
+        return result;
+    }
+    match destinations.pop() {
+        Some(destination) => DeclarationResolution::Resolved { destination },
+        None => missing(),
+    }
+}
+
+fn rust_primitive(name: &str) -> bool {
+    matches!(
+        name,
+        "bool"
+            | "char"
+            | "str"
+            | "u8"
+            | "u16"
+            | "u32"
+            | "u64"
+            | "u128"
+            | "usize"
+            | "i8"
+            | "i16"
+            | "i32"
+            | "i64"
+            | "i128"
+            | "isize"
+            | "f16"
+            | "f32"
+            | "f64"
+            | "f128"
+    )
+}
+
+fn record(
+    report: &mut DeclarationValidation,
+    workspace: &Path,
+    path: &Path,
+    position: DeclarationPosition,
+    reference: &str,
+    result: DeclarationResolution,
+) {
+    report.checked += 1;
+    if matches!(&result, DeclarationResolution::Unverified { reason } if reason.starts_with("rust-src is unavailable"))
+    {
+        return;
+    }
+    let (error, reason) = match result {
+        DeclarationResolution::Resolved { .. } | DeclarationResolution::Intrinsic => return,
+        DeclarationResolution::Invalid { reason } | DeclarationResolution::Ambiguous { reason } => {
+            (true, reason)
+        }
+        DeclarationResolution::Unverified { reason } => (false, reason),
+    };
+    report.diagnostic.push(DeclarationDiagnostic {
+        path: path
+            .strip_prefix(workspace)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .replace('\\', "/"),
+        line: position.line,
+        column: position.column,
+        reference: reference.into(),
+        error,
+        reason,
+    });
+}

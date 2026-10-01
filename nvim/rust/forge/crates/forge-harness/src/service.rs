@@ -178,6 +178,9 @@ impl HarnessService {
                 return controller.plan_review.insert(document, admission);
             }
             crate::buffer::session::PresentationRequest::PlanAction { input } => {
+                if input.action == "jump_entity" {
+                    controller.plan_review.prepare_declaration_jump(input).await?;
+                }
                 return Ok(serde_json::to_value(
                     controller.plan_review.action(input.clone())?,
                 )?);
