@@ -134,6 +134,7 @@ impl DeclarationDesign {
             );
             design.proposed.insert(path, text);
         }
+        design.validate()?;
         Ok(design)
     }
 
@@ -157,6 +158,9 @@ impl DeclarationDesign {
             DeclarationOverview::parse(path, &file.text)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("validate baseline {path}"))?;
+            if DeclarationOverview::language(path) == Some(forge_diff::syntax::SyntaxLanguage::Toml) {
+                toml::from_str::<toml::Value>(&file.text).with_context(|| format!("validate TOML baseline {path}"))?;
+            }
             bytes += file.text.len();
         }
         for (path, text) in &self.proposed {
@@ -164,6 +168,9 @@ impl DeclarationDesign {
             DeclarationOverview::parse(path, text)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("validate {path}"))?;
+            if DeclarationOverview::language(path) == Some(forge_diff::syntax::SyntaxLanguage::Toml) {
+                toml::from_str::<toml::Value>(text).with_context(|| format!("validate TOML {path}"))?;
+            }
             bytes += text.len();
             ensure!(
                 bytes <= 8 * 1024 * 1024,
@@ -431,7 +438,7 @@ fn validate_path(path: &str) -> Result<()> {
     );
     ensure!(
         DeclarationOverview::language(path).is_some(),
-        "unsupported declaration path: {path}. Only .rs, .ts, .tsx, and .lua are supported."
+        "unsupported declaration path: {path}. Only .rs, .ts, .tsx, .lua, and .toml are supported."
     );
     Ok(())
 }

@@ -1074,6 +1074,35 @@ mod test {
     use super::*;
 
     #[test]
+    fn manifest_changes_capture_patch_submit_and_remain_visible_without_source_writes() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(temporary.path()).status().unwrap().success());
+        let manifest = "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nengine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n";
+        fs::write(temporary.path().join("Cargo.toml"), manifest).unwrap();
+        let design = DeclarationDesign::capture(temporary.path()).unwrap();
+        assert_eq!(design.baseline["Cargo.toml"].text, manifest);
+        let invalid = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n name = \"arena\"\n+name = \"duplicate\"\n*** End Patch";
+        assert!(design.patch(invalid).is_err());
+        let patch = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n-engine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n+engine = { version = \"1.3\", default-features = false, features = [\"render\", \"input\"] }\n*** Add File: config/arena.toml\n+[arena]\n+speed = 200\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Enable engine input and configure arena speed.\"\n*** End Patch";
+        let mut document = document::test_fixture("plan", "Arena dependencies");
+        document.design = Some(design.patch(patch).unwrap());
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        store.write_working_document("session", "plan", &document).unwrap();
+        let (submitted, rendered, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        assert!(rendered.markdown.contains("Modified Cargo.toml"));
+        assert!(rendered.markdown.contains("engine = { version = \"1.3\""));
+        assert!(rendered.markdown.contains("config/arena.toml"));
+        let (rows, targets) = design_review::project(&submitted, &Default::default(), &[], &Default::default(), None, &Default::default(), true).unwrap();
+        let text = rows.iter().flat_map(|row| row.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Modified Cargo.toml"));
+        assert!(text.contains("speed = 200"));
+        assert!(targets.values().any(|anchor| matches!(&anchor.target, PlanReviewTarget::Declaration { path, side, .. } if path == "Cargo.toml" && side == "proposed")));
+        assert_eq!(store.capture_review_source("session", "plan", 1, &checksum).unwrap().document.design, submitted.design);
+        assert_eq!(fs::read_to_string(temporary.path().join("Cargo.toml")).unwrap(), manifest);
+        assert!(!temporary.path().join("config/arena.toml").exists());
+    }
+
+    #[test]
     fn submission_formats_saved_snapshots_before_diffing_without_touching_source() {
         let temporary = tempfile::tempdir().unwrap();
         let source = "pub struct Registry { pub first: u64, pub second: u64 }\n";

@@ -2,7 +2,7 @@
 
 Design the final interfaces and ownership structures required by the user's request.
 Harness owns an immutable declaration baseline and an editable proposed copy. Edit virtual
-overview files and the virtual plan.json description, then submit them for mandatory review. Do not implement the design or
+overview files, complete TOML configuration files, and the virtual plan.json description, then submit them for mandatory review. Do not implement the design or
 modify project files.
 
 ## Procedure
@@ -13,7 +13,7 @@ modify project files.
    Supply `path` to read a proposed file. Set `baseline: true` to read original declarations.
 3. Resolve discoverable facts from source. Ask only about material decisions source cannot answer.
    Respect requests not to ask questions. Use `harness_question_ask` when needed and end the turn.
-4. Design complete declaration files. Preserve unchanged declarations, private members, complete
+4. Design complete declaration files and required TOML configuration changes. Preserve unchanged declarations, private members, complete
    types, generics, visibility, documentation, and associations. Add only useful requested work.
    Write the change summary in the separate virtual `plan.json` document described below.
    Do not author JSON entities, flows, tasks, stages, prerequisites, or execution reports.
@@ -57,8 +57,8 @@ atomic patch:
 
 ## Overview syntax
 
-Paths match project-relative source paths. Supported extensions are `.rs`, `.ts`, `.tsx`, and
-`.lua`. Overviews retain native layouts but are not compilable implementation files. Never write
+Paths match project-relative source paths. Supported extensions are `.rs`, `.ts`, `.tsx`, `.lua`, and
+`.toml`. Source overviews retain native layouts but are not compilable implementation files. Never write
 function bodies, empty or placeholder bodies, pseudocode, or executable initializers. Preserve
 reference qualifiers, generic arguments, and complete return types. Do not infer missing types.
 
@@ -121,6 +121,28 @@ function M.get(id)
 return M
 ```
 
+## TOML manifests and configuration
+
+TOML files retain their complete contents, including tables, keys, values, comments, arrays, and
+inline tables. They are editable configuration proposals rather than abbreviated declarations.
+Include required `Cargo.toml` changes when the design adds or changes dependencies, features,
+package settings, workspace members, library targets, or binary targets. Keep unaffected settings
+and include affected nested crate manifests. Do not omit a required manifest change because the
+design focuses on source declarations.
+
+Read the existing virtual file and patch it with the same Add File, Update File, Delete File, and
+Move to operations. Use valid TOML and preserve exact string values. Source declaration restrictions
+on initializers do not apply to TOML values. Harness validates TOML and preserves its text without
+applying declaration indentation or prose wrapping. Configuration remains visible in public-only
+inspection. Do not write the actual manifest during planning.
+
+For example, a proposed dependency section retains its complete settings:
+
+```toml
+[dependencies]
+engine = { version = "1.2", default-features = false, features = ["render"] }
+```
+
 ## Context-based file patches
 
 Patch paths are virtual proposed files, not paths beneath a real `design/` directory. Add File
@@ -150,8 +172,8 @@ Resolve feedback against its revision, file, baseline/proposed side, saved text 
 Comment labels quote the formatted declaration, while target coordinates refer to saved text.
 Read current proposed files before revising them. Preserve useful decisions and submit the new version.
 
-Manifests, configuration, project documentation, implementation bodies, dependency graphs, and task
-execution are outside this MVP. If only function behavior changes, explain that no declaration
+Non-TOML configuration, project documentation, lockfiles, implementation bodies, dependency graphs,
+and task execution are outside this MVP. If only function behavior changes, explain that no declaration
 changes are represented in `plan.json` and submit the unchanged declaration proposal. Never manufacture interface changes
 to make a diff appear. Validation checks declaration syntax, not unwritten implementation behavior.
 

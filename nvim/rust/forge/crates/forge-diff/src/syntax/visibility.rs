@@ -40,7 +40,7 @@ impl DeclarationVisibility {
         let mut visibility = Visibility {
             language,
             text: &surrogate,
-            rows: vec![!public_only; text.lines().count()],
+            rows: vec![!public_only || language == SyntaxLanguage::Toml; text.lines().count()],
             types: HashMap::new(),
             replacement: HashMap::new(),
             lines: text.lines().collect(),
@@ -48,7 +48,7 @@ impl DeclarationVisibility {
                 .lines()
                 .find_map(|line| line.trim().strip_prefix("return ").map(str::to_owned)),
         };
-        if public_only {
+        if public_only && language != SyntaxLanguage::Toml {
             visibility.collect_types(tree.root_node());
             visibility.group(tree.root_node(), Scope::Top);
         }
@@ -370,6 +370,12 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn configuration_remains_visible_in_public_only_inspection() {
+        let source = "# Package settings\n[package]\nname = \"arena\"\nversion = \"0.1.0\"\n\n[dependencies]\nbevy = \"0.17\"\n";
+        assert_eq!(visible("Cargo.toml", source), source.trim_end());
     }
 
     #[test]

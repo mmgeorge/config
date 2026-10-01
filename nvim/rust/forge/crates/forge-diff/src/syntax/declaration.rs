@@ -32,6 +32,7 @@ impl DeclarationOverview {
             "ts" => Some(SyntaxLanguage::Typescript),
             "tsx" => Some(SyntaxLanguage::Tsx),
             "lua" => Some(SyntaxLanguage::Lua),
+            "toml" => Some(SyntaxLanguage::Toml),
             _ => None,
         }
     }
@@ -57,6 +58,9 @@ impl DeclarationOverview {
             return Err(SyntaxError::Query(format!(
                 "invalid source syntax in {path}"
             )));
+        }
+        if language == SyntaxLanguage::Toml {
+            return Ok(source.to_owned());
         }
         let query_text = match language {
             SyntaxLanguage::Rust => include_str!("../../query/forge/rust/design.scm"),
@@ -108,6 +112,10 @@ impl DeclarationOverview {
         let language = Self::language(path).ok_or_else(|| {
             SyntaxError::Query(format!("unsupported declaration language: {path}"))
         })?;
+        if language == SyntaxLanguage::Toml {
+            Self::project(path, overview, false)?;
+            return Ok(overview.to_owned());
+        }
         let canonical = normalize(overview);
         let surrogate = declaration_surrogate(language, &canonical);
         let projected = Self::project(path, &surrogate, false)?;
@@ -176,6 +184,9 @@ impl DeclarationOverview {
         }
         Self::parse(path, overview)?;
         let language = Self::language(path).unwrap();
+        if language == SyntaxLanguage::Toml {
+            return Ok(overview.to_owned());
+        }
         let text = Self::format(path, overview)?;
         let text = wrap_parameters(language, &text, line_width)?;
         let text = format_indentation(language, &text)?;
@@ -186,6 +197,9 @@ impl DeclarationOverview {
 
     fn format(path: &str, overview: &str) -> Result<String, SyntaxError> {
         let language = Self::language(path).unwrap();
+        if language == SyntaxLanguage::Toml {
+            return Self::parse(path, overview);
+        }
         let text = Self::project(path, &declaration_surrogate(language, overview), true)?;
         format_indentation(language, &text)
     }
@@ -978,6 +992,19 @@ fn normalize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn toml_configuration_retains_values_comments_and_multiline_string_contents() {
+        let manifest = "# Engine package\r\n[package]\r\nname = \"arena\"\r\nversion = \"0.1.0\"\r\n\r\n[dependencies]\r\nbevy = { version = \"0.17\", default-features = false, features = [\"std\", \"bevy_sprite\"] }\r\n\r\n[package.metadata]\r\nnotes = \"\"\"first\r\n  preserve indentation\r\nlast\"\"\"\r\n";
+        assert_eq!(DeclarationOverview::extract("Cargo.toml", manifest).unwrap(), manifest);
+        assert_eq!(DeclarationOverview::parse("Cargo.toml", manifest).unwrap(), manifest);
+        assert_eq!(DeclarationOverview::format_with_width("Cargo.toml", manifest, 40).unwrap(), manifest);
+        let display = DeclarationOverview::present("Cargo.toml", manifest).unwrap();
+        assert_eq!(display.text, manifest);
+        let dependency_row = manifest.lines().position(|line| line.starts_with("bevy =")).unwrap();
+        assert_eq!(display.source[dependency_row].unwrap().line, dependency_row as u32 + 1);
+        assert!(DeclarationOverview::parse("Cargo.toml", "[dependencies\nbevy =").is_err());
+    }
 
     #[test]
     fn configured_width_wraps_contracts_and_keeps_literals_and_fences_opaque() {

@@ -9,6 +9,8 @@ local compact = table.concat({ "pub struct Registry { pub first: u64, pub second
 compact = "/// Registry keeps the published handles and exposes the shared declarations used by callers throughout the application.\n" .. compact
 vim.fn.writefile({ '{"declaration_line_width":60}' }, workspace .. "/.forge.json")
 vim.fn.writefile(vim.split(compact, "\n", { plain = true }), workspace .. "/src/change.rs")
+local manifest = '[package]\nname = "arena"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\nengine = { version = "1.2", default-features = false, features = ["render"] }\n'
+vim.fn.writefile(vim.split(manifest:gsub("\n$", ""), "\n", { plain = true }), workspace .. "/Cargo.toml")
 local initialized = vim.system({ "git", "init", workspace }, { text = true }):wait(10000)
 assert(initialized.code == 0, initialized.stderr)
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
@@ -47,6 +49,9 @@ local success, failure = xpcall(function()
   local document = vim.json.decode(artifact)
   assert(document.design.baseline["src/change.rs"].text:find("  pub second: u64,", 1, true), "submission did not store formatted declarations")
   assert(bytes(workspace .. "/src/change.rs") == compact .. "\n", "submission changed project source")
+  assert(document.design.baseline["Cargo.toml"].text == manifest, "manifest baseline lost values")
+  assert(document.design.proposed["Cargo.toml"]:find('version = "0.2.0"', 1, true), "manifest proposal did not change")
+  assert(bytes(workspace .. "/Cargo.toml") == manifest, "planning modified the project manifest")
   assert(document.design.line_width == 60, "repository formatting width was not retained")
   for _, line in ipairs(vim.split(document.design.baseline["src/change.rs"].text, "\n", { plain = true })) do
     if line:match("^/// ") then assert(#line <= 60, "submitted prose did not wrap") end
@@ -161,6 +166,8 @@ local success, failure = xpcall(function()
   end
   public_key()
   await(function() return review.public_only == true end, "Shift+Tab did not enable public visibility")
+  assert(text(review.buf):find("Modified Cargo.toml", 1, true), "public filter hid manifest changes")
+  assert(text(review.buf):find('version = "0.2.0"', 1, true), "public filter hid TOML values")
   assert(text(review.buf):find("fn main();", 1, true), "public filter hid the binary entry point")
   assert(not text(review.buf):find("fn hidden_helper();", 1, true), "public filter exposed a private helper")
   assert(not text(review.buf):find("secret:", 1, true), "public filter exposed a private field")

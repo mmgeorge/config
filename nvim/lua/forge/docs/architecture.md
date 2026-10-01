@@ -1800,12 +1800,12 @@ Declaration design records use schema 6. Older plan records are excluded from st
 and older document schemas fail validation. Planning no longer authors entities, flows, stages,
 or implementation tasks.
 
-Harness captures nonignored Git working-tree Rust, TypeScript, TSX, and Lua files. Tree-sitter
+Harness captures nonignored Git working-tree Rust, TypeScript, TSX, Lua, and TOML files. Tree-sitter
 language adapters extract immutable declaration baselines, complete signatures, fields, visibility,
 generics, imports, and documentation. They omit executable bodies and value initializers. Private
 members remain visible when changed. Lua function headers omit the closing `end`. TypeScript arrow
 bindings stop at `=>`. These overview files describe interfaces and do not claim compilation validity.
-Unsupported extensions, manifests, and configuration files stay outside this design representation.
+TOML retains complete configuration values. Unsupported extensions remain outside this design representation.
 
 `DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves
 inside Harness-owned `plans/<session>/<plan>/working.json`. The provider receives the plan identity,
@@ -1822,6 +1822,14 @@ proposal before computing the review diff and freezing canonical JSON. Formattin
 source digests nor project files, and it does not create an extra model edit version. Working JSON
 and submitted JSON retain the same formatted declaration text, so revision patches and comment
 coordinates address the reviewed declarations. Both submission entry points share this boundary.
+
+TOML manifests and configuration files share the virtual patch, submission, diff, navigation, and
+comment boundaries. Capture retains the complete file rather than stripping values. Syntax admission
+uses the bundled TOML grammar, and design validation uses the native TOML parser to reject duplicate
+keys and invalid configuration. Submission preserves exact TOML text, including multiline strings,
+without declaration reformatting. Public-only inspection retains every configuration row. Planning
+instructions require affected `Cargo.toml` edits for dependency, feature, package, workspace, and target
+changes. No configuration proposal writes project files before implementation.
 
 The repository's optional `.forge.json` key `declaration_line_width` selects an integer from 40
 through 240, defaulting to 80. Capture records the selected width in the design artifact, so a
