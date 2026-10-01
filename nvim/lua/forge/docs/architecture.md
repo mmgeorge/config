@@ -1837,6 +1837,17 @@ baseline and proposed positions, with proposed positions owning ordinary row act
 folds start open. PlanReview, ForgeStatus hunks, and Harness changes use the shared
 header-fold constructor. A closed file shows only its file header, and a closed hunk
 shows only its hunk header. PlanReview toggles headers through the shared Lua fold engine.
+The declaration design also owns a virtual `plan.json` with only a model-authored `description`.
+The read tool lists it alongside declaration paths. The patch tool edits the description and
+declaration files atomically at one optimistic version, while source baselines and workspace checks
+exclude plan metadata. Submission requires a nonempty description of at most 16 KiB. Review renders
+the description above the shared declaration diff, retains it in either visibility mode, and maps
+comments to `/design/document/description`. Behavior-only proposals still carry this description.
+
+Trait implementation bodies render as empty braces in both inspection modes. Inherent implementation
+methods remain visible according to the selected visibility mode. Saved declaration text and canonical
+comment coordinates retain all trait implementation members for execution.
+
 Shift+Tab toggles public declaration visibility through a revision-validated layout action.
 Tree-sitter classifies visibility on both diff sides, including inherited trait and enum
 visibility. Filtering removes private rows and their comments from the projection, prunes

@@ -45,13 +45,24 @@ pub(super) fn project(
     let mut block = Vec::new();
     let mut annotation_end = HashMap::new();
     for (index, mut row) in source.into_iter().enumerate() {
+        if row.id.0.starts_with("plan:description:") {
+            row = forge_buffer::markdown::MarkdownRenderer::source(
+                row.id.clone(),
+                &width.wrap_plain(&row.text.wire_rows().join("\n"), 0)?.join("\n"),
+                width,
+            )?
+            .block;
+        }
         if let Some(anchor) = navigation.resolve_line(index as u32 + 1) {
             let id = TargetId(format!("plan:declaration:row:{index}"));
             row.metadata.target.push(TargetRange {
                 id: id.clone(),
                 range: TextRange {
                     start: TextPosition { row: 0, column: 0 },
-                    end: TextPosition { row: 1, column: 0 },
+                    end: TextPosition {
+                        row: row.text.row_count(),
+                        column: 0,
+                    },
                 },
             });
             target.insert(id, anchor.clone());
@@ -383,6 +394,39 @@ fn rows(
             label: "No declaration changes".into(),
         });
     }
+    if !design.document.description.trim().is_empty() {
+        let mut description = Vec::new();
+        for (index, line) in design.document.description.lines().enumerate() {
+            description.push(BufferBlock {
+                id: BlockId(format!("plan:description:{index}")),
+                text: BufferText::from_rows([line])?,
+                metadata: BlockMetadata::default(),
+            });
+        }
+        description.push(BufferBlock {
+            id: BlockId("plan:description:separator".into()),
+            text: BufferText::from_rows([""])?,
+            metadata: BlockMetadata::default(),
+        });
+        let count = description.len() as u32;
+        for anchor in &mut navigation.anchor {
+            anchor.line += count;
+        }
+        for line in 1..count {
+            navigation.anchor.push(PlanNavigationAnchor {
+                line,
+                target: PlanReviewTarget::Section {
+                    section: super::PlanSection::Overview,
+                },
+                json_path: "/design/document/description".into(),
+                path: None,
+                label: "Change description".into(),
+            });
+        }
+        description.extend(block);
+        block = description;
+        navigation.anchor.sort_by_key(|anchor| anchor.line);
+    }
     ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
     Ok((block, navigation, hidden))
 }
@@ -563,6 +607,62 @@ fn pointer(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn behavior_only_description_retains_comment_targets_in_both_views() {
+        let mut document = crate::plan::document::test_fixture("summary", "Summary");
+        let mut design = super::super::DeclarationDesign::default();
+        design.document.description = "Requests retain their cancellation state until all pending work finishes. Publication occurs only after upload completion and the previous allocation remains alive until submitted frames finish.".into();
+        document.design = Some(design);
+        let saved = serde_json::to_vec(&document).unwrap();
+        let rendered = render(&document).unwrap();
+        assert!(rendered.markdown.starts_with("Requests retain"));
+        let anchor = rendered.navigation.resolve_line(1).unwrap();
+        assert_eq!(anchor.json_path, "/design/document/description");
+        let annotation = ReviewAnnotation {
+            id: "description".into(),
+            anchor: None,
+            source: super::super::PlanAnnotationInput {
+                start_line: 1,
+                end_line: 1,
+                body: "Confirm the cancellation lifecycle".into(),
+            },
+        };
+        for public_only in [false, true] {
+            let (block, target) = project(
+                &document,
+                &WidthProfile::default(),
+                &[annotation.clone()],
+                &HashMap::new(),
+                None,
+                &HashMap::new(),
+                public_only,
+            )
+            .unwrap();
+            let description = block
+                .iter()
+                .find(|block| block.id.0 == "plan:description:0")
+                .unwrap();
+            assert!(description.text.row_count() > 1);
+            assert!(
+                target
+                    .values()
+                    .any(|anchor| anchor.json_path == "/design/document/description")
+            );
+            assert!(
+                block
+                    .iter()
+                    .flat_map(|block| block.text.wire_rows())
+                    .any(|line| line.contains("Confirm the cancellation"))
+            );
+            forge_buffer::document::BufferDocument::new(
+                forge_buffer::identity::DocumentId("summary".into()),
+                block,
+            )
+            .unwrap();
+        }
+        assert_eq!(serde_json::to_vec(&document).unwrap(), saved);
+    }
 
     #[test]
     fn public_filter_preserves_targets_folds_and_hidden_comment_storage() {

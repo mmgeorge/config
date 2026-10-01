@@ -111,7 +111,11 @@ impl Visibility<'_> {
                 }
                 self.replacement.insert(
                     opening,
-                    format!("{}{}", self.lines[opening].trim_end(), self.lines[closing].trim_start()),
+                    format!(
+                        "{}{}",
+                        self.lines[opening].trim_end(),
+                        self.lines[closing].trim_start()
+                    ),
                 );
                 self.replacement.insert(closing, String::new());
             }
@@ -369,14 +373,28 @@ mod tests {
         let source = "pub struct ArenaPlugin {}
 impl ArenaPlugin { pub fn new() -> Self; fn internal(); }
 impl Default for ArenaPlugin { fn default() -> Self; }";
-        let text = DeclarationOverview::present("src/plugin.rs", source).unwrap().text;
+        let text = DeclarationOverview::present("src/plugin.rs", source)
+            .unwrap()
+            .text;
         for public_only in [false, true] {
-            let visibility = DeclarationVisibility::analyze("src/plugin.rs", &text, public_only).unwrap();
-            let rendered = text.lines().enumerate()
+            let visibility =
+                DeclarationVisibility::analyze("src/plugin.rs", &text, public_only).unwrap();
+            let rendered = text
+                .lines()
+                .enumerate()
                 .filter(|(row, _)| visibility.rows[*row])
-                .map(|(row, line)| visibility.replacement.get(&row).map(String::as_str).unwrap_or(line))
-                .collect::<Vec<_>>().join("
-");
+                .map(|(row, line)| {
+                    visibility
+                        .replacement
+                        .get(&row)
+                        .map(String::as_str)
+                        .unwrap_or(line)
+                })
+                .collect::<Vec<_>>()
+                .join(
+                    "
+",
+                );
             assert!(rendered.contains("impl Default for ArenaPlugin {}"));
             assert!(!rendered.contains("fn default"));
             assert!(rendered.contains("pub fn new"));

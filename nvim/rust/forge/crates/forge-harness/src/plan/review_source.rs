@@ -167,6 +167,7 @@ mod tests {
             "registry.rs".into(),
             "pub struct Registry {\n    first: u64,\n    second: u64,\n}\n".into(),
         );
+        design.document.description = "Revise registry declarations.".into();
         document.design = Some(design);
         store
             .write_working_document("session", "plan", &document)

@@ -45,10 +45,12 @@ local success, failure = xpcall(function()
   local document = vim.json.decode(artifact)
   assert(document.design.baseline["src/change.rs"].text == compact .. "\n", "baseline stored display formatting")
   assert(document.design.proposed["src/change.rs"] == "pub fn reviewed_change();\n")
+  assert(document.design.document.description == "Revise the registry interface while preserving its ownership boundary.")
   local projection = bytes(plan.working_path)
   require("forge.views.plan_review").open(plan)
   await(function() return state.plan_review and state.plan_review.owner.ready end, "declaration review did not open")
   local review = state.plan_review
+  assert(text(review.buf):find(document.design.document.description, 1, true), "change description is missing")
   assert(text(review.buf):find("  pub second: u64,", 1, true), "compact member did not receive display indentation")
   assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "full view did not abbreviate trait implementation")
   assert(not text(review.buf):find("fn default", 1, true), "full view exposed trait implementation members")
@@ -136,6 +138,7 @@ local success, failure = xpcall(function()
   public_key()
   await(function() return review.public_only == true end, "Shift+Tab did not enable public visibility")
   assert(not text(review.buf):find("secret:", 1, true), "public filter exposed a private field")
+  assert(text(review.buf):find(document.design.document.description, 1, true), "public filter hid change description")
   assert(text(review.buf):find("#[derive(Debug, Clone)]\npub struct ArenaPlugin {}", 1, true),
     "empty public struct did not compact with its attributes")
   assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "public view did not abbreviate trait implementation")
@@ -180,6 +183,31 @@ local success, failure = xpcall(function()
     "public filtering discarded private declarations or comments")
   assert(bytes(annotation_path) == comments and bytes(artifact_path) == artifact
     and bytes(plan.working_path) == projection, "visibility toggle changed persisted review data")
+  vim.api.nvim_win_set_cursor(review.win, { 1, 0 })
+  local description_comment
+  review.owner.action("comment", function(value, error_message)
+    assert(not error_message, error_message)
+    description_comment = value
+  end)
+  await(function() return description_comment end, "description comment did not attach")
+  local _, description_comment_row = review.owner.replica.sequence:position(description_comment.block)
+  vim.api.nvim_win_set_cursor(review.win, { description_comment_row + description_comment.row + 1, 0 })
+  review.owner.sync_editability()
+  vim.api.nvim_buf_set_text(review.buf, description_comment_row + description_comment.row, 0,
+    description_comment_row + description_comment.row, 0, { "Clarify the behavior in the description" })
+  vim.cmd("write")
+  await(function() return not vim.bo[review.buf].modified end, "description comment did not save")
+  local description_anchor
+  for _, saved in ipairs(vim.json.decode(bytes(annotation_path)).annotation) do
+    if saved.source.body == "Clarify the behavior in the description" then description_anchor = saved.anchor end
+  end
+  assert(description_anchor and description_anchor.start.target_type == "section" and description_anchor.start.section == "overview",
+    "description comment did not retain its metadata target")
+  public_key()
+  await(function() return review.public_only == true end, "description visibility test did not toggle")
+  assert(text(review.buf):find("Clarify the behavior in the description", 1, true), "public filter hid description comment")
+  public_key()
+  await(function() return review.public_only == false end, "description visibility test did not restore")
   review.command_set.action_by_id.close.run({})
   await(function() return state.plan_review == nil end, "review did not close")
   require("forge.views.plan_review").open(plan)

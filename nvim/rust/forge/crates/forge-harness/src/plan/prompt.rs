@@ -218,10 +218,13 @@ mod test {
 
     #[test]
     fn planning_patch_example_applies_to_virtual_declarations() {
-        let example = PLANNING_CONTRACT.split_once("```text\n").unwrap().1.split_once("\n```").unwrap().0;
+        let examples = PLANNING_CONTRACT.split("```text\n").skip(1).map(|part| part.split_once("\n```").unwrap().0).collect::<Vec<_>>();
+        let example = examples.last().unwrap();
         let mut design = crate::plan::DeclarationDesign::default();
         design.proposed.insert("src/textures.rs".into(), "impl Texture {\n  pub fn request(texture: TextureId) -> TextureHandle;\n\n  pub fn status(request: RequestId) -> RequestStatus;\n}\n".into());
-        let changed = design.patch(example).unwrap();
+        let described = design.patch(examples[0]).unwrap();
+        assert!(!described.document.description.is_empty());
+        let changed = described.patch(example).unwrap();
         assert!(changed.proposed["src/textures.rs"].contains("-> TextureRequest;"));
         assert!(changed.proposed["src/textures.rs"].contains("pub fn cancel(request: RequestId) -> bool;"));
         assert_eq!(design.baseline,changed.baseline);

@@ -13,9 +13,21 @@ pub struct DeclarationFile {
     pub source_digest: String,
 }
 
+const PLAN_DOCUMENT_PATH: &str = "plan.json";
+
+/// Records the model-authored description independently of declaration files.
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct DesignDocument {
+    /// Describes the intended behavioral change and its design.
+    pub description: String,
+}
+
 /// Owns baseline declarations and the agent's proposed file contents.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DeclarationDesign {
+    #[serde(default)]
+    pub document: DesignDocument,
     pub baseline: BTreeMap<String, DeclarationFile>,
     pub proposed: BTreeMap<String, String>,
     pub moved: BTreeMap<String, String>,
@@ -88,6 +100,14 @@ impl DeclarationDesign {
 
     /// Validate every proposed overview before exposing a persisted revision.
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            self.document.description.len() <= 16 * 1024,
+            "plan description exceeds 16 KiB"
+        );
+        ensure!(
+            !self.document.description.contains('\0'),
+            "plan description contains a NUL byte"
+        );
         let mut bytes = 0usize;
         for (path, file) in &self.baseline {
             validate_path(path)?;
@@ -161,6 +181,12 @@ impl DeclarationDesign {
     /// Read one virtual overview or list paths without sending the complete snapshot.
     pub fn read(&self, path: Option<&str>, baseline: bool) -> Result<serde_json::Value> {
         if let Some(path) = path {
+            if path == PLAN_DOCUMENT_PATH {
+                ensure!(!baseline, "plan.json has no source baseline");
+                return Ok(
+                    serde_json::json!({"path":path,"side":"proposed","text":format!("{}\n",serde_json::to_string_pretty(&self.document)?)}),
+                );
+            }
             validate_path(path)?;
             let text = if baseline {
                 self.baseline.get(path).map(|file| &file.text)
@@ -173,7 +199,7 @@ impl DeclarationDesign {
             )
         } else {
             Ok(
-                serde_json::json!({"paths":self.baseline.keys().chain(self.proposed.keys()).collect::<BTreeSet<_>>(),"changed_paths":self.changed_paths()}),
+                serde_json::json!({"paths":self.baseline.keys().chain(self.proposed.keys()).map(String::as_str).chain([PLAN_DOCUMENT_PATH]).collect::<BTreeSet<_>>(),"changed_paths":self.changed_paths()}),
             )
         }
     }
@@ -206,7 +232,14 @@ impl DeclarationDesign {
                         .map(|path| ("delete", path))
                 })
                 .context("expected Add File, Update File, or Delete File header")?;
-            validate_path(path)?;
+            if path == PLAN_DOCUMENT_PATH {
+                ensure!(
+                    kind == "update",
+                    "plan.json already exists and can only be updated"
+                );
+            } else {
+                validate_path(path)?;
+            }
             ensure!(
                 edited.insert(path.to_owned()),
                 "file appears more than once in patch: {path}"
@@ -216,6 +249,10 @@ impl DeclarationDesign {
                 && let Some(to) = lines[position].strip_prefix("*** Move to: ")
             {
                 ensure!(kind == "update", "Move to requires Update File");
+                ensure!(
+                    path != PLAN_DOCUMENT_PATH && to != PLAN_DOCUMENT_PATH,
+                    "plan.json cannot be moved"
+                );
                 validate_path(to)?;
                 ensure!(
                     to != path
@@ -238,6 +275,13 @@ impl DeclarationDesign {
                 position += 1;
             }
             let body = &lines[start..position];
+            if path == PLAN_DOCUMENT_PATH {
+                let original = format!("{}\n", serde_json::to_string_pretty(&candidate.document)?);
+                let text = patch_file(&original, body)?;
+                candidate.document = serde_json::from_str(&text)
+                    .context("plan.json must contain only a string description")?;
+                continue;
+            }
             match kind {
                 "delete" => {
                     ensure!(body.is_empty(), "Delete File must have no patch body");
@@ -399,6 +443,52 @@ fn patch_file(original: &str, patch: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn description_and_declaration_edits_commit_atomically() {
+        let design = DeclarationDesign::default();
+        let patch = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Add cancellable requests.\"\n*** Add File: src/request.rs\n+pub struct Request;\n*** End Patch";
+        let changed = design.patch(patch).unwrap();
+        assert_eq!(changed.document.description, "Add cancellable requests.");
+        assert_eq!(changed.changed_paths(), vec!["src/request.rs"]);
+        assert!(!changed.proposed.contains_key("plan.json"));
+        let read = changed.read(Some("plan.json"), false).unwrap();
+        assert!(
+            read["text"]
+                .as_str()
+                .unwrap()
+                .contains("Add cancellable requests.")
+        );
+        assert!(changed.read(Some("plan.json"), true).is_err());
+        assert!(
+            changed.read(None, false).unwrap()["paths"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|path| path == "plan.json")
+        );
+        assert!(
+            design
+                .patch(&patch.replace("pub struct Request;", "fn invalid() {}"))
+                .is_err()
+        );
+        assert!(design.document.description.is_empty() && design.proposed.is_empty());
+        let invalid = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Change\",\n+  \"tasks\": []\n*** End Patch";
+        assert!(design.patch(invalid).is_err());
+        assert!(
+            design
+                .patch("*** Begin Patch\n*** Delete File: plan.json\n*** End Patch")
+                .is_err()
+        );
+        assert!(design.patch("*** Begin Patch\n*** Update File: plan.json\n*** Move to: other.rs\n@@\n {}\n*** End Patch").is_err());
+        let mut document = crate::plan::document::test_fixture("description", "Description");
+        document.design = Some(design);
+        assert!(document.validate_for_submission().is_err());
+        document.design = Some(changed.clone());
+        document.validate_for_submission().unwrap();
+        let oversized = changed.patch(&format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"Add cancellable requests.\"\n+  \"description\": \"{}\"\n*** End Patch", "x".repeat(16 * 1024 + 1)));
+        assert!(oversized.is_err());
+    }
 
     #[test]
     fn saved_layout_survives_validation_round_trip_and_agent_patches() {

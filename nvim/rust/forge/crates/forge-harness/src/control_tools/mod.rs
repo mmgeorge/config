@@ -67,12 +67,12 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "harness_design_apply_patch",
-                description: "Atomically edit proposed declaration overview files, not implementation files. Use the familiar *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax. Paths are project-relative virtual overview paths. Read files with harness_plan_read first. Functions contain signatures only, never bodies. Return the new design version. Optional title names the design.",
+                description: "Atomically edit proposed declaration overview files and the virtual plan.json containing only description. Use the familiar *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax. Paths are project-relative virtual overview paths. Read files with harness_plan_read first. Functions contain signatures only, never bodies. Return the new design version. A nonempty plan.json description is required before submission. plan.json already exists and accepts Update File only. Optional title names the design.",
                 input_schema: strict_object_input_schema(vec![("plan_id",string_schema()),("expected_version",json!({"type":"integer","minimum":1})),("patch",string_schema()),("title",string_schema())], &["plan_id","expected_version","patch"]),
             },
             ControlToolDefinition {
                 name: "harness_plan_read",
-                description: "List declaration overview paths or read one baseline/proposed overview file. Omit path for the inventory. Set baseline true to inspect immutable current-code declarations. Returns the active design version. Does not return implementation bodies.",
+                description: "List virtual declaration paths and plan.json or read one file. plan.json contains only the model-authored description and has no baseline. Omit path for the inventory. Set baseline true to inspect immutable current-code declarations. Returns the active design version. Does not return implementation bodies.",
                 input_schema: strict_object_input_schema(
                     vec![("plan_id", string_schema()),("path",string_schema()),("baseline",json!({"type":"boolean"}))],
                     &["plan_id"],

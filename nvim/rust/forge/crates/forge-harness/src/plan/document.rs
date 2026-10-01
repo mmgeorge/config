@@ -719,14 +719,18 @@ impl PlanDocument {
 
     /// Validate that one working document can enter mandatory review.
     pub fn validate_for_submission(&self) -> Result<()> {
-        if self.design.is_some() { return self.validate(); }
+        if let Some(design) = &self.design {
+            self.validate()?;
+            anyhow::ensure!(!design.document.description.trim().is_empty(), "plan.json description is required before submission");
+            return Ok(());
+        }
         validate_plan_submission(self)
     }
 
     /// Serialize the semantic planning surface without Harness-derived state.
     pub fn model_json(&self) -> Result<String> {
         if let Some(design) = &self.design {
-            return Ok(serde_json::to_string_pretty(&serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"declaration_files":design.read(None,false)?}))?);
+            return Ok(serde_json::to_string_pretty(&serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"document":design.document,"declaration_files":design.read(None,false)?}))?);
         }
         let mut value = serde_json::to_value(self)?;
         value
