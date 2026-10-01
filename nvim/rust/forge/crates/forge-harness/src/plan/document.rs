@@ -721,6 +721,7 @@ impl PlanDocument {
     pub fn validate_for_submission(&self) -> Result<()> {
         if let Some(design) = &self.design {
             self.validate()?;
+            anyhow::ensure!(!design.document.task.trim().is_empty(), "plan.json task is required before submission");
             anyhow::ensure!(!design.document.description.trim().is_empty(), "plan.json description is required before submission");
             return Ok(());
         }

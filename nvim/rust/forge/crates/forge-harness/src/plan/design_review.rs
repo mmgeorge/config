@@ -45,7 +45,7 @@ pub(super) fn project(
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
     for (index, mut row) in source.into_iter().enumerate() {
-        if row.id.0.starts_with("plan:description:") {
+        if row.id.0.starts_with("plan:description:") || row.id.0.starts_with("plan:task:") {
             row = forge_buffer::markdown::MarkdownRenderer::source(
                 row.id.clone(),
                 &width
@@ -414,35 +414,39 @@ fn rows(
             label: "No declaration changes".into(),
         });
     }
-    let mut description = vec![forge_diff::projection::header(
-        BlockId("plan:section:description".into()),
-        vec![TextChunk {
-            text: "Description:".into(),
-            capture: "ForgeStatusHeader".into(),
-        }],
-        0,
-    )?];
-    let text = if design.document.description.trim().is_empty() {
-        "No description."
-    } else {
-        &design.document.description
-    };
-    for (index, line) in text.lines().enumerate() {
-        description.push(BufferBlock {
-            id: BlockId(format!("plan:description:{index}")),
-            text: BufferText::from_rows([line])?,
-            metadata: BlockMetadata::default(),
+    let mut overview = Vec::new();
+    let mut section_anchor = Vec::new();
+    for (name, title, text, section, label) in [
+        ("task", "Task", design.document.task.as_str(), super::PlanSection::Task, "Requested task"),
+        ("description", "Description", design.document.description.as_str(), super::PlanSection::Overview, "Change description"),
+    ] {
+        let start = overview.len();
+        let fold_id = format!("plan:section:{name}");
+        overview.push(forge_diff::projection::header(
+            BlockId(fold_id.clone()),
+            vec![TextChunk { text: format!("{title}:"), capture: "ForgeStatusHeader".into() }], 0,
+        )?);
+        let text = if text.trim().is_empty() { if name == "task" { "No task overview." } else { "No description." } } else { text };
+        for (index, line) in text.lines().enumerate() {
+            overview.push(BufferBlock {
+                id: BlockId(format!("plan:{name}:{index}")),
+                text: BufferText::from_rows([line])?, metadata: BlockMetadata::default(),
+            });
+        }
+        fold(&mut overview, start, &fold_id)?;
+        for line in start as u32 + 1..=overview.len() as u32 {
+            section_anchor.push(PlanNavigationAnchor {
+                line, target: PlanReviewTarget::Section { section },
+                json_path: format!("/design/document/{name}"), path: None, label: label.into(),
+            });
+        }
+        overview.push(BufferBlock {
+            id: BlockId(format!("plan:section:{name}:separator")),
+            text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
         });
     }
-    fold(&mut description, 0, "plan:section:description")?;
-    let description_count = description.len() as u32;
-    description.push(BufferBlock {
-        id: BlockId("plan:section:separator".into()),
-        text: BufferText::from_rows([""])?,
-        metadata: BlockMetadata::default(),
-    });
-    let changes_start = description.len();
-    description.push(forge_diff::projection::header(
+    let changes_start = overview.len();
+    overview.push(forge_diff::projection::header(
         BlockId("plan:section:changes".into()),
         vec![TextChunk {
             text: "Changes:".into(),
@@ -450,21 +454,11 @@ fn rows(
         }],
         0,
     )?);
-    let count = description.len() as u32;
+    let count = overview.len() as u32;
     for anchor in &mut navigation.anchor {
         anchor.line += count;
     }
-    for line in 1..=description_count {
-        navigation.anchor.push(PlanNavigationAnchor {
-            line,
-            target: PlanReviewTarget::Section {
-                section: super::PlanSection::Overview,
-            },
-            json_path: "/design/document/description".into(),
-            path: None,
-            label: "Change description".into(),
-        });
-    }
+    navigation.anchor.extend(section_anchor);
     navigation.anchor.push(PlanNavigationAnchor {
         line: count,
         target: PlanReviewTarget::Section {
@@ -474,9 +468,9 @@ fn rows(
         path: None,
         label: "Declaration changes".into(),
     });
-    description.extend(block);
-    fold(&mut description, changes_start, "plan:section:changes")?;
-    block = description;
+    overview.extend(block);
+    fold(&mut overview, changes_start, "plan:section:changes")?;
+    block = overview;
     navigation.anchor.sort_by_key(|anchor| anchor.line);
     ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
     Ok((block, navigation, hidden))
@@ -743,6 +737,7 @@ mod tests {
     fn behavior_only_description_retains_comment_targets_in_both_views() {
         let mut document = crate::plan::document::test_fixture("summary", "Summary");
         let mut design = super::super::DeclarationDesign::default();
+        design.document.task = "Support observable cancellation and safe texture replacement.".into();
         design.document.description = "Requests retain their cancellation state until all pending work finishes. Publication occurs only after upload completion and the previous allocation remains alive until submitted frames finish.".into();
         document.design = Some(design);
         let saved = serde_json::to_vec(&document).unwrap();
@@ -750,16 +745,19 @@ mod tests {
         assert!(
             rendered
                 .markdown
-                .starts_with("Description:\nRequests retain")
+                .starts_with("Task:\nSupport observable cancellation and safe texture replacement.\n\nDescription:\nRequests retain")
         );
-        let anchor = rendered.navigation.resolve_line(1).unwrap();
+        let task_anchor = rendered.navigation.resolve_line(1).unwrap();
+        assert_eq!(task_anchor.json_path, "/design/document/task");
+        assert_eq!(task_anchor.target, PlanReviewTarget::Section { section: super::super::PlanSection::Task });
+        let anchor = rendered.navigation.resolve_line(4).unwrap();
         assert_eq!(anchor.json_path, "/design/document/description");
         let annotation = ReviewAnnotation {
             id: "description".into(),
             anchor: None,
             source: super::super::PlanAnnotationInput {
-                start_line: 2,
-                end_line: 2,
+                start_line: 5,
+                end_line: 5,
                 body: "Confirm the cancellation lifecycle".into(),
             },
         };
@@ -1004,17 +1002,18 @@ mod tests {
             .iter()
             .filter(|block| !block.metadata.fold.is_empty())
             .collect();
-        assert_eq!(folded_header.len(), 4);
-        assert_eq!(folded_header[0].text.row(0), Some("Description:"));
-        assert_eq!(folded_header[1].text.row(0), Some("Changes:"));
+        assert_eq!(folded_header.len(), 5);
+        assert_eq!(folded_header[0].text.row(0), Some("Task:"));
+        assert_eq!(folded_header[1].text.row(0), Some("Description:"));
+        assert_eq!(folded_header[2].text.row(0), Some("Changes:"));
         assert!(
-            folded_header[2]
+            folded_header[3]
                 .text
                 .row(0)
                 .unwrap()
                 .starts_with("Modified src/lib.rs")
         );
-        assert!(folded_header[3].text.row(0).unwrap().starts_with("@@"));
+        assert!(folded_header[4].text.row(0).unwrap().starts_with("@@"));
         for header in folded_header {
             let fold = &header.metadata.fold[0];
             assert!(fold.heading_start.is_none());

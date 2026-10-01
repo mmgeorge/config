@@ -72,11 +72,13 @@ local success, failure = xpcall(function()
   end
   assert(document.design.proposed["src/change.rs"] == "pub fn reviewed_change();\n")
   assert(document.design.document.description == "Revise the registry interface while preserving its ownership boundary.")
+  assert(document.design.document.task == "Revise the registry interface.")
   local projection = bytes(plan.working_path)
   require("forge.views.plan_review").open(plan)
   await(function() return state.plan_review and state.plan_review.owner.ready end, "declaration review did not open")
   local review = state.plan_review
   assert(text(review.buf):find(document.design.document.description, 1, true), "change description is missing")
+  assert(text(review.buf):find("Task:\n" .. document.design.document.task, 1, true), "task overview is missing or misplaced")
   assert(text(review.buf):find("  pub second: u64,", 1, true), "compact member did not receive display indentation")
   assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "full view did not abbreviate trait implementation")
   assert(not text(review.buf):find("fn default", 1, true), "full view exposed trait implementation members")
@@ -85,14 +87,15 @@ local success, failure = xpcall(function()
     assert(text(review.buf):find("Modified " .. path, 1, true), "configuration diff is missing: " .. path)
   end
   assert(bytes(artifact_path) == artifact and bytes(plan.working_path) == projection, "opening rewrote the plan")
-  local file_row, hunk_row, description_row, changes_row
+  local file_row, hunk_row, task_row, description_row, changes_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
     if line == "Description:" then description_row = row end
+    if line == "Task:" then task_row = row end
     if line == "Changes:" then changes_row = row end
     if line:find("Modified src/change.rs", 1, true) then file_row = row end
     if file_row and not hunk_row and line:find("@@", 1, true) then hunk_row = row end
   end
-  assert(file_row and hunk_row and description_row and changes_row, "section or diff headers are missing")
+  assert(file_row and hunk_row and task_row and description_row and changes_row, "section or diff headers are missing")
   local function closed(row)
     return vim.api.nvim_win_call(review.win, function() return vim.fn.foldclosed(row) end)
   end
@@ -101,6 +104,9 @@ local success, failure = xpcall(function()
     review.command_set.action_by_id.toggle.run({})
   end
   assert(closed(description_row) == -1 and closed(changes_row) == -1, "plan sections did not start expanded")
+  toggle(task_row)
+  assert(closed(task_row + 1) == task_row and closed(description_row) == -1, "task fold hid the description")
+  toggle(task_row)
   toggle(description_row)
   assert(closed(description_row + 1) == description_row and closed(file_row) == -1,
     "description fold hid changes or left its body visible")
@@ -248,6 +254,7 @@ local success, failure = xpcall(function()
   assert(not text(review.buf):find("fn hidden_helper();", 1, true), "public filter exposed a private helper")
   assert(not text(review.buf):find("secret:", 1, true), "public filter exposed a private field")
   assert(text(review.buf):find(document.design.document.description, 1, true), "public filter hid change description")
+  assert(text(review.buf):find(document.design.document.task, 1, true), "public filter hid task overview")
   assert(text(review.buf):find("#[derive(Debug, Clone)]\npub struct ArenaPlugin {}", 1, true),
     "empty public struct did not compact with its attributes")
   assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "public view did not abbreviate trait implementation")
@@ -322,6 +329,28 @@ local success, failure = xpcall(function()
   await(function() return review.public_only == false end, "description visibility test did not restore")
   toggle(description_row)
   assert(closed(description_row) == -1, "description section did not reopen")
+  vim.api.nvim_win_set_cursor(review.win, { task_row + 1, 0 })
+  local task_comment
+  review.owner.action("comment", function(value, error_message)
+    assert(not error_message, error_message)
+    task_comment = value
+  end)
+  await(function() return task_comment end, "task comment did not attach")
+  local _, task_comment_row = review.owner.replica.sequence:position(task_comment.block)
+  vim.api.nvim_win_set_cursor(review.win, { task_comment_row + task_comment.row + 1, 0 })
+  review.owner.sync_editability()
+  vim.api.nvim_buf_set_text(review.buf, task_comment_row + task_comment.row, 0,
+    task_comment_row + task_comment.row, 0, { "Clarify the requested outcome" })
+  vim.cmd("write")
+  await(function() return not vim.bo[review.buf].modified end, "task comment did not save")
+  local task_anchor
+  for _, saved in ipairs(vim.json.decode(bytes(annotation_path)).annotation) do
+    if saved.source.body == "Clarify the requested outcome" then task_anchor = saved.anchor end
+  end
+  assert(task_anchor and task_anchor.start.target_type == "section" and task_anchor.start.section == "task",
+    "task comment did not retain its separate metadata target")
+  toggle(task_row)
+  assert(closed(task_comment_row + 1) == task_row, "task fold left its comment visible")
   review.command_set.action_by_id.close.run({})
   await(function() return state.plan_review == nil end, "review did not close")
   require("forge.views.plan_review").open(plan)

@@ -391,16 +391,24 @@ function M.text()
   end
   local decoration = vim.list_extend({}, node.entry.metadata.decoration or {})
   vim.list_extend(decoration, node.entry.metadata.visible_decoration or {})
-  for _, span in ipairs(decoration) do
+  local background, background_priority = nil, -1
+  for order, span in ipairs(decoration) do
     if span.range.start.row <= relative and (span.range["end"].row > relative
       or span.range["end"].row == relative and span.range["end"].column > 0) then
       local first = span.range.start.row == relative and span.range.start.column or 0
       local last = span.range["end"].row == relative and span.range["end"].column or #text
       first, last = math.min(first, #text), math.min(last, #text)
       boundary[first], boundary[last] = true, true
-      spans[#spans + 1] = { first = first, last = last, capture = span.capture, priority = span.priority }
+      spans[#spans + 1] = { first = first, last = last, capture = span.capture, priority = span.priority, order = order }
+      if require("forge.decorations").full_width(span.capture) and span.priority >= background_priority then
+        background, background_priority = span.capture, span.priority
+      end
     end
   end
+  table.sort(spans, function(left, right)
+    if left.priority == right.priority then return left.order < right.order end
+    return left.priority < right.priority
+  end)
   local conceal = {}
   if vim.wo.conceallevel > 0 then
     for _, span in ipairs(node.entry.metadata.conceal or {}) do
@@ -420,12 +428,13 @@ function M.text()
   for index = 1, #column - 1 do
     local first, last = column[index], column[index + 1]
     vim.list_extend(chunks, gutter[first] or {})
-    local capture, priority = "Normal", -1
+    local capture = {}
     for _, span in ipairs(spans) do
-      if span.first <= first and span.last >= last and span.priority >= priority then
-        capture, priority = span.capture, span.priority
+      if span.first <= first and span.last >= last then
+        capture[#capture + 1] = span.capture
       end
     end
+    if #capture == 0 then capture[1] = background or "Normal" end
     local hidden
     for _, span in ipairs(conceal) do
       if span.first <= first and span.last >= last and (not hidden or span.priority >= hidden.priority) then hidden = span end
@@ -444,6 +453,21 @@ function M.text()
       chunks[#chunks + 1] = { record.fold.collapsed_suffix, "Comment" }
       break
     end
+  end
+  if background then
+    local width = 0
+    for _, chunk in ipairs(chunks) do
+      local capture = type(chunk[2]) == "table" and chunk[2] or { chunk[2] }
+      local layered = { background }
+      for _, group in ipairs(capture) do
+        if group ~= "Normal" and group ~= background then layered[#layered + 1] = group end
+      end
+      chunk[2] = layered
+      width = width + vim.fn.strdisplaywidth(chunk[1], width)
+    end
+    local window = vim.api.nvim_get_current_win()
+    local available = vim.api.nvim_win_get_width(window) - vim.fn.getwininfo(window)[1].textoff
+    if width < available then chunks[#chunks + 1] = { string.rep(" ", available - width), background } end
   end
   return chunks
 end

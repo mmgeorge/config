@@ -1872,16 +1872,23 @@ baseline and proposed positions, with proposed positions owning ordinary row act
 folds start open. PlanReview, ForgeStatus hunks, and Harness changes use the shared
 header-fold constructor. A closed file shows only its file header, and a closed hunk
 shows only its hunk header. PlanReview toggles headers through the shared Lua fold engine.
-The declaration design also owns a virtual `plan.json` with only a model-authored `description`.
-The read tool lists it alongside declaration paths. The patch tool edits the description and
+The declaration design also owns a virtual `plan.json` with model-authored `task` and `description`.
+Task states the requested outcome and scope. Description explains the proposed design for a reviewer,
+including responsibility boundaries and important lifecycle behavior, rather than inventorying changes.
+Planning prompts require an attached explanatory comment on every declaration in authored or revised
+source overviews, including private declarations and members. Agents must read the repository's
+code-comment guidance and the available technical-writing profiles. These comments record roles,
+ownership, domain meaning, and behavioral contracts without implementation bodies. Imports,
+attributes, parameters, and configuration entries do not require individual declaration comments.
+The read tool lists it alongside declaration paths. The patch tool edits these fields and
 declaration files atomically at one optimistic version, while source baselines and workspace checks
-exclude plan metadata. Submission requires a nonempty description of at most 16 KiB. Review renders
-the description and declaration diff under separate `Description:` and `Changes:` headings. Both
+exclude plan metadata. Submission requires both fields to be nonempty, with at most 16 KiB per field.
+Review renders the task, description, and declaration diff under `Task:`, `Description:`, and `Changes:`. All
 sections start expanded and use the shared fold-header constructor and native Tab behavior, with
 independent file and hunk folds below Changes. Section endpoints include wrapped text and comments.
-The public filter retains both headings and an explicit empty state when no public changes remain.
-Review retains the description in either visibility mode and maps
-comments to `/design/document/description`. Behavior-only proposals still carry this description.
+The public filter retains all headings and an explicit empty state when no public changes remain.
+Review retains both overviews in either visibility mode and maps comments separately to
+`/design/document/task` and `/design/document/description`. Behavior-only proposals carry both fields.
 
 Trait implementation bodies render as empty braces in both inspection modes. Inherent implementation
 methods remain visible according to the selected visibility mode. Public-only inspection retains Rust
@@ -1902,6 +1909,10 @@ interfaces, enums, and namespaces can fold when their bodies span multiple rows.
 include attached documentation and attributes for Tab activation, while folding starts at the
 opening brace so those attachments remain visible. The shared fold component appends a validated
 `collapsed_suffix` to the highlighted opening row, producing `{...}` without changing source text.
+Fold summaries stack row backgrounds, syntax, and inline captures in decoration priority order.
+The shared full-width background policy applies to gutters and the collapsed body marker as well.
+Display-only trailing fold chunks fill the current window's text width with that background.
+Source rows remain unpadded, and summaries recompute their width for each window and redraw.
 Visibility filtering removes hidden owners and repairs retained endpoints. Empty containers stay
 `{}` without a redundant fold. Rust enums start collapsed. Other containers start expanded.
 Native fold identities and explicit plan fold preferences preserve

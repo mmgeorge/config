@@ -1086,6 +1086,7 @@ mod test {
         let patch = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n-engine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n+engine = { version = \"1.3\", default-features = false, features = [\"render\", \"input\"] }\n*** Add File: config/arena.toml\n+[arena]\n+speed = 200\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Enable engine input and configure arena speed.\"\n*** End Patch";
         let mut document = document::test_fixture("plan", "Arena dependencies");
         document.design = Some(design.patch(patch).unwrap());
+        document.design.as_mut().unwrap().document.task = "Enable keyboard input with configurable arena movement.".into();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         store.write_working_document("session", "plan", &document).unwrap();
         let (submitted, rendered, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
@@ -1131,6 +1132,7 @@ mod test {
         design = design.patch("*** Begin Patch\n*** Add File: settings.jsonc\n+{\"enabled\":true,}\n*** End Patch").unwrap();
         design = design.patch("*** Begin Patch\n*** Delete File: settings.jsonc\n*** End Patch").unwrap();
         assert!(!design.proposed.contains_key("settings.jsonc"));
+        design.document.task = "Update project configuration across supported formats.".into();
         design.document.description = "Update package metadata, type checks, CI, and the XML project.".into();
         let mut document = document::test_fixture("plan", "Configuration");
         document.design = Some(design);
@@ -1159,6 +1161,7 @@ mod test {
         fs::write(temporary.path().join("registry.rs"), source).unwrap();
         let mut document = document::test_fixture("plan", "Registry");
         let mut design = DeclarationDesign::default();
+        design.document.task = "Format registry declarations without changing their interface.".into();
         design.document.description = "Preserve the registry interface.".into();
         design.line_width = 60;
         design.baseline.insert("registry.rs".into(), DeclarationFile {

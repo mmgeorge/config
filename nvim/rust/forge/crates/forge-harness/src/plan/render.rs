@@ -11,6 +11,7 @@ use std::path::Path;
 #[serde(rename_all = "snake_case")]
 pub enum PlanSection {
     Title,
+    Task,
     Overview,
     Usage,
     Diagrams,
@@ -1759,6 +1760,7 @@ fn render_assumptions(renderer: &mut PlanRenderer, document: &PlanDocument) {
 fn section_label(section: PlanSection) -> &'static str {
     match section {
         PlanSection::Title => "Plan title",
+        PlanSection::Task => "Task",
         PlanSection::Overview => "Overview",
         PlanSection::Usage => "Usage",
         PlanSection::Diagrams => "Diagrams",

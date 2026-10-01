@@ -15,10 +15,13 @@ pub struct DeclarationFile {
 
 const PLAN_DOCUMENT_PATH: &str = "plan.json";
 
-/// Records the model-authored description independently of declaration files.
+/// Records the requested outcome and proposed design independently of declaration files.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct DesignDocument {
+    /// States the requested outcome and scope without prescribing implementation steps.
+    #[serde(default)]
+    pub task: String,
     /// Describes the intended behavioral change and its design.
     pub description: String,
 }
@@ -144,14 +147,10 @@ impl DeclarationDesign {
             (40..=240).contains(&self.line_width),
             "declaration line width must be between 40 and 240"
         );
-        ensure!(
-            self.document.description.len() <= 16 * 1024,
-            "plan description exceeds 16 KiB"
-        );
-        ensure!(
-            !self.document.description.contains('\0'),
-            "plan description contains a NUL byte"
-        );
+        for (name, text) in [("task", &self.document.task), ("description", &self.document.description)] {
+            ensure!(text.len() <= 16 * 1024, "plan {name} exceeds 16 KiB");
+            ensure!(!text.contains('\0'), "plan {name} contains a NUL byte");
+        }
         let mut bytes = 0usize;
         for (path, file) in &self.baseline {
             validate_path(path)?;
@@ -341,7 +340,7 @@ impl DeclarationDesign {
                 let original = format!("{}\n", serde_json::to_string_pretty(&candidate.document)?);
                 let text = patch_file(&original, body)?;
                 candidate.document = serde_json::from_str(&text)
-                    .context("plan.json must contain only a string description")?;
+                    .context("plan.json must contain only string task and description fields")?;
                 continue;
             }
             match kind {
@@ -547,8 +546,9 @@ mod tests {
     #[test]
     fn description_and_declaration_edits_commit_atomically() {
         let design = DeclarationDesign::default();
-        let patch = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Add cancellable requests.\"\n*** Add File: src/request.rs\n+pub struct Request;\n*** End Patch";
+        let patch = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"task\": \"\",\n+  \"task\": \"Support cancellable texture loading.\",\n@@\n-  \"description\": \"\"\n+  \"description\": \"Add cancellable requests.\"\n*** Add File: src/request.rs\n+pub struct Request;\n*** End Patch";
         let changed = design.patch(patch).unwrap();
+        assert_eq!(changed.document.task, "Support cancellable texture loading.");
         assert_eq!(changed.document.description, "Add cancellable requests.");
         assert_eq!(changed.changed_paths(), vec!["src/request.rs"]);
         assert!(!changed.proposed.contains_key("plan.json"));
@@ -586,6 +586,8 @@ mod tests {
         assert!(document.validate_for_submission().is_err());
         document.design = Some(changed.clone());
         document.validate_for_submission().unwrap();
+        document.design.as_mut().unwrap().document.task.clear();
+        assert!(document.validate_for_submission().is_err());
         let oversized = changed.patch(&format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"Add cancellable requests.\"\n+  \"description\": \"{}\"\n*** End Patch", "x".repeat(16 * 1024 + 1)));
         assert!(oversized.is_err());
     }

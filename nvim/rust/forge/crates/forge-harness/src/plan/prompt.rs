@@ -224,6 +224,7 @@ mod test {
         design.proposed.insert("src/textures.rs".into(), "impl Texture {\n  pub fn request(texture: TextureId) -> TextureHandle;\n\n  pub fn status(request: RequestId) -> RequestStatus;\n}\n".into());
         let described = design.patch(examples[0]).unwrap();
         assert!(!described.document.description.is_empty());
+        assert!(!described.document.task.is_empty());
         let changed = described.patch(example).unwrap();
         assert!(changed.proposed["src/textures.rs"].contains("-> TextureRequest;"));
         assert!(changed.proposed["src/textures.rs"].contains("pub fn cancel(request: RequestId) -> bool;"));
