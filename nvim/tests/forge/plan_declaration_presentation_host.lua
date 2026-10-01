@@ -5,7 +5,9 @@ assert(vim.fn.mkdir(data, "p") == 1)
 local compact = table.concat({ "pub struct Registry { pub first: u64, pub second: u64, secret: u64 }",
   "#[derive(Debug, Clone)]", "pub struct ArenaPlugin { config: u64 }",
   "impl ArenaPlugin { pub fn new() -> Self; }",
-  "impl Default for ArenaPlugin { fn default() -> Self; }" }, "\n")
+  "impl Default for ArenaPlugin { fn default() -> Self; }", "fn main();", "fn hidden_helper();" }, "\n")
+compact = "/// Registry keeps the published handles and exposes the shared declarations used by callers throughout the application.\n" .. compact
+vim.fn.writefile({ '{"declaration_line_width":60}' }, workspace .. "/.forge.json")
 vim.fn.writefile(vim.split(compact, "\n", { plain = true }), workspace .. "/src/change.rs")
 local initialized = vim.system({ "git", "init", workspace }, { text = true }):wait(10000)
 assert(initialized.code == 0, initialized.stderr)
@@ -43,7 +45,12 @@ local success, failure = xpcall(function()
   local artifact_path = plan.working_path:gsub("%.md$", ".json")
   local artifact = bytes(artifact_path)
   local document = vim.json.decode(artifact)
-  assert(document.design.baseline["src/change.rs"].text == compact .. "\n", "baseline stored display formatting")
+  assert(document.design.baseline["src/change.rs"].text:find("  pub second: u64,", 1, true), "submission did not store formatted declarations")
+  assert(bytes(workspace .. "/src/change.rs") == compact .. "\n", "submission changed project source")
+  assert(document.design.line_width == 60, "repository formatting width was not retained")
+  for _, line in ipairs(vim.split(document.design.baseline["src/change.rs"].text, "\n", { plain = true })) do
+    if line:match("^/// ") then assert(#line <= 60, "submitted prose did not wrap") end
+  end
   assert(document.design.proposed["src/change.rs"] == "pub fn reviewed_change();\n")
   assert(document.design.document.description == "Revise the registry interface while preserving its ownership boundary.")
   local projection = bytes(plan.working_path)
@@ -122,8 +129,13 @@ local success, failure = xpcall(function()
   local annotation_path = vim.fn.glob(vim.fs.dirname(artifact_path) .. "/review-annotations-*.json", false, true)[1]
   assert(annotation_path, "comment storage is missing")
   local annotation = vim.json.decode(bytes(annotation_path)).annotation[1]
-  assert(annotation.anchor.start.side == "baseline" and annotation.anchor.start.line == 1, "comment retained a display line")
-  assert(annotation.anchor.start.column > 20, "compact fields lost their distinct saved positions")
+  local saved_second_row
+  for row, line in ipairs(vim.split(document.design.baseline["src/change.rs"].text, "\n", { plain = true })) do
+    if line:find("pub second:", 1, true) then saved_second_row = row break end
+  end
+  assert(annotation.anchor.start.side == "baseline" and annotation.anchor.start.line == saved_second_row,
+    "comment did not address the formatted saved declaration")
+  assert(annotation.anchor.start.column == 2, "formatted member lost its saved byte column")
   local private_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
     if line:find("secret:", 1, true) then private_row = row - 1 break end
@@ -149,6 +161,8 @@ local success, failure = xpcall(function()
   end
   public_key()
   await(function() return review.public_only == true end, "Shift+Tab did not enable public visibility")
+  assert(text(review.buf):find("fn main();", 1, true), "public filter hid the binary entry point")
+  assert(not text(review.buf):find("fn hidden_helper();", 1, true), "public filter exposed a private helper")
   assert(not text(review.buf):find("secret:", 1, true), "public filter exposed a private field")
   assert(text(review.buf):find(document.design.document.description, 1, true), "public filter hid change description")
   assert(text(review.buf):find("#[derive(Debug, Clone)]\npub struct ArenaPlugin {}", 1, true),

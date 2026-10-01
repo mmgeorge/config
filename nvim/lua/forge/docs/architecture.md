@@ -1816,13 +1816,26 @@ nothing. Every patch that changes the proposal increments the version. The basel
 `plan/prompts/planning.md` owns the complete declaration planning instructions, and
 `plan/prompts/system.md` owns the general provider control contract.
 
-Saved declaration text retains the agent's layout. Syntax admission excludes executable bodies without
-requiring display formatting. Inspection derives tree-sitter token positions from baseline and proposed
-text, formats both sides with current rules, and computes their diff. Two-space indentation, declaration
-spacing, and documentation placement belong to this derived presentation. Trees, token mappings, and
-formatted text remain in memory. Existing schema-6 artifacts receive current formatting when reopened
-without changing saved text, review digests, or plan versions. Formatting-only differences produce no
-visible declaration diff.
+Draft declaration patches retain the agent's layout. Capture formats the extracted baseline before
+the provider reads it. Submission applies the shared declaration formatter to both baseline and
+proposal before computing the review diff and freezing canonical JSON. Formatting changes neither
+source digests nor project files, and it does not create an extra model edit version. Working JSON
+and submitted JSON retain the same formatted declaration text, so revision patches and comment
+coordinates address the reviewed declarations. Both submission entry points share this boundary.
+
+The repository's optional `.forge.json` key `declaration_line_width` selects an integer from 40
+through 240, defaulting to 80. Capture records the selected width in the design artifact, so a
+historical revision retains its formatting policy. Invalid configuration rejects capture with an
+error. The formatter uses two-space indentation and declaration spacing, reflows prose line
+comments, and splits long callable parameter lists at their Tree-sitter comma boundaries. It
+preserves nested types, literal contents, fenced examples, and structured documentation. Indivisible
+identifiers, types, URLs, and inline code can exceed the requested width. This is a declaration
+formatter, not a compiler or a general source formatter.
+
+Inspection still derives disposable Tree-sitter token mappings and current structural presentation
+from saved declarations. Opening a working or historical design does not rewrite JSON, change its
+review digest, or increment its version. Formatting-only proposal changes disappear after both sides
+are canonicalized.
 
 Submission validates every proposed declaration and checks changed source digests and vacant new
 paths. It freezes canonical JSON and saves a diff projection and navigation index for the reviewed
@@ -1849,7 +1862,9 @@ Review retains the description in either visibility mode and maps
 comments to `/design/document/description`. Behavior-only proposals still carry this description.
 
 Trait implementation bodies render as empty braces in both inspection modes. Inherent implementation
-methods remain visible according to the selected visibility mode. Saved declaration text and canonical
+methods remain visible according to the selected visibility mode. Public-only inspection retains Rust
+free functions named `main` and their documentation and attributes as binary entry points. Private
+associated methods named `main` still follow the normal visibility filter. Saved declaration text and canonical
 comment coordinates retain all trait implementation members for execution.
 
 Shift+Tab toggles public declaration visibility through a revision-validated layout action.

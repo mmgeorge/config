@@ -64,9 +64,11 @@ reference qualifiers, generic arguments, and complete return types. Do not infer
 
 Use two spaces per indentation level and one blank line between declarations and methods.
 Keep consecutive imports, fields, and enum variants together. Attach documentation immediately
-above attributes and their declaration. Harness applies these rules when displaying the design. Saved files and accepted patches
-retain their declaration text and layout. Read virtual files before patching and match their
-actual text, including indentation. Display spacing can differ from the editable text.
+above attributes and their declaration. Harness supplies a formatted baseline and canonicalizes both declaration snapshots on submission.
+Prose comments wrap to the repository line width, defaulting to 80 columns, and long parameter lists
+use one parameter per line. Literals, code examples, and indivisible types remain intact. Read virtual
+files before patching and match their actual text, including indentation. Draft patches retain their
+layout until submission. After submission, read the formatted files before another revision.
 
 Rust retains structs, fields, enums, traits, aliases, imports, attributes, and `impl` blocks.
 Terminate callable signatures with a semicolon, including methods:

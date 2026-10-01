@@ -189,6 +189,7 @@ impl ControlToolRuntime {
                 );
                 document.validate_for_submission()?;
                 if let Some(design) = &document.design {
+                    let design = design.formatted()?;
                     design.check_workspace(self.context.workspace_root.as_deref().context("design submission has no workspace root")?)?;
                     self.terminal = true;
                     return Ok(ControlToolResult { invocation:Some(invocation), message:self.plan_version_message("Declaration design submitted for review") });

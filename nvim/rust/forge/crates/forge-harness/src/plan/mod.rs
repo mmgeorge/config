@@ -875,32 +875,7 @@ impl PlanFileStore {
         expected_version: u64,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let document = self.read_working_document(session_id, plan_id)?;
-        anyhow::ensure!(
-            document.version == expected_version,
-            "plan version changed before submission"
-        );
-        document.validate_for_submission()?;
-        let rendered = render_plan_at(&document, &self.workspace)?;
-        let plan_directory = self.plan_dir(session_id, plan_id);
-        let revision_directory = plan_directory.join("revisions");
-        fs::create_dir_all(&revision_directory)?;
-        write_text_atomically(&plan_directory.join("working.md"), &rendered.markdown)?;
-        write_json_atomically(
-            &plan_directory.join("working.index.json"),
-            &rendered.navigation,
-        )?;
-        let stem = format!("submitted-{revision:04}");
-        write_json_atomically(&revision_directory.join(format!("{stem}.json")), &document)?;
-        write_text_atomically(
-            &revision_directory.join(format!("{stem}.md")),
-            &rendered.markdown,
-        )?;
-        write_json_atomically(
-            &revision_directory.join(format!("{stem}.index.json")),
-            &rendered.navigation,
-        )?;
-        let checksum = digest(serde_json::to_vec(&document)?.as_slice());
-        Ok((document, rendered, checksum))
+        self.submit_validated_document_revision(session_id, plan_id, revision, expected_version, document)
     }
 
     /// Freeze one externally validated document without re-reading stale derived state.
@@ -910,7 +885,7 @@ impl PlanFileStore {
         plan_id: &str,
         revision: u32,
         expected_version: u64,
-        document: PlanDocument,
+        mut document: PlanDocument,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let current = self.read_working_document(session_id, plan_id)?;
         anyhow::ensure!(
@@ -921,9 +896,14 @@ impl PlanFileStore {
             document.plan_id == plan_id && document.version == expected_version,
             "validated document identity changed before submission"
         );
+        if let Some(design) = &document.design {
+            let formatted = design.formatted()?;
+            formatted.check_workspace(&self.workspace)?;
+            document.design = Some(formatted);
+        }
         document.validate_for_submission()?;
-        self.write_working_document(session_id, plan_id, &document)?;
         let rendered = render_plan_at(&document, &self.workspace)?;
+        self.write_working_document(session_id, plan_id, &document)?;
         let plan_directory = self.plan_dir(session_id, plan_id);
         let revision_directory = plan_directory.join("revisions");
         fs::create_dir_all(&revision_directory)?;
@@ -1092,6 +1072,41 @@ pub fn digest(content: &[u8]) -> String {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn submission_formats_saved_snapshots_before_diffing_without_touching_source() {
+        let temporary = tempfile::tempdir().unwrap();
+        let source = "pub struct Registry { pub first: u64, pub second: u64 }\n";
+        fs::write(temporary.path().join("registry.rs"), source).unwrap();
+        let mut document = document::test_fixture("plan", "Registry");
+        let mut design = DeclarationDesign::default();
+        design.document.description = "Preserve the registry interface.".into();
+        design.line_width = 60;
+        design.baseline.insert("registry.rs".into(), DeclarationFile {
+            text: forge_diff::syntax::DeclarationOverview::extract("registry.rs", source).unwrap(),
+            source_digest: digest(source.as_bytes()),
+        });
+        design.proposed.insert("registry.rs".into(), "pub struct Registry {\n pub first: u64,\n pub second: u64\n}\n".into());
+        document.design = Some(design);
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        store.write_working_document("session", "plan", &document).unwrap();
+        let (submitted, rendered, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let design = submitted.design.as_ref().unwrap();
+        assert!(design.changed_paths().is_empty(), "formatting created a false design change");
+        assert!(rendered.markdown.contains("No declaration changes"));
+        assert_eq!(design.proposed["registry.rs"], "pub struct Registry {\n  pub first: u64,\n  pub second: u64,\n}\n");
+        assert_eq!(store.read_working_document("session", "plan").unwrap().design, submitted.design);
+        assert_eq!(store.capture_review_source("session", "plan", 1, &checksum).unwrap().document.design, submitted.design);
+        assert_eq!(fs::read_to_string(temporary.path().join("registry.rs")).unwrap(), source);
+        let request = DesignPatchRequest { plan_id: "plan".into(), expected_version: 1, title: None,
+            patch: "*** Begin Patch\n*** Update File: registry.rs\n@@\n-  pub second: u64,\n+  pub second: String,\n*** End Patch".into() };
+        let revised = submitted.patch_design(request).unwrap();
+        store.write_working_document("session", "plan", &revised).unwrap();
+        let (submitted, _, _) = store.submit_validated_document_revision("session", "plan", 2, 2, revised).unwrap();
+        assert_eq!(submitted.design.as_ref().unwrap().changed_paths(), vec!["registry.rs"]);
+        assert_eq!(submitted.design.as_ref().unwrap().line_width, 60);
+        assert_eq!(fs::read_to_string(temporary.path().join("registry.rs")).unwrap(), source);
+    }
 
     #[test]
     fn preserves_submitted_json_revisions_while_the_working_document_changes() {

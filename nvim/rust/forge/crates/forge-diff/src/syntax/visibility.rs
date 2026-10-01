@@ -276,7 +276,11 @@ impl Visibility<'_> {
                 };
                 return self.container(node, body, member_scope, false);
             }
-            if !matches!(scope, Scope::Inherited) && !self.public(node) {
+            let entry_point = matches!(scope, Scope::Top)
+                && matches!(node.kind(), "function_item" | "function_signature_item")
+                && node.child_by_field_name("name")
+                    .is_some_and(|name| &self.text[name.byte_range()] == "main");
+            if !matches!(scope, Scope::Inherited) && !self.public(node) && !entry_point {
                 return false;
             }
             if let Some(body) = node.child_by_field_name("body") {
@@ -366,6 +370,18 @@ mod tests {
             })
             .collect::<Vec<_>>()
             .join("\n")
+    }
+
+    #[test]
+    fn public_filter_keeps_main_entry_point_and_attachments_but_hides_private_methods() {
+        let source = "/// Starts the binary.\n#[tokio::main]\nasync fn main() -> Result<(), Error>;\n\nfn main_helper();\n\npub struct Handler;\n\nimpl Handler {\n  fn main();\n}\n";
+        let output = visible("src/main.rs", source);
+        assert!(output.contains("/// Starts the binary."));
+        assert!(output.contains("#[tokio::main]"));
+        assert!(output.contains("async fn main() -> Result<(), Error>;"));
+        assert!(!output.contains("main_helper"));
+        assert!(!output.contains("impl Handler"));
+        assert!(!output.contains("  fn main();"));
     }
 
     #[test]

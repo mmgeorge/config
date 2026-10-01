@@ -24,13 +24,31 @@ pub struct DesignDocument {
 }
 
 /// Owns baseline declarations and the agent's proposed file contents.
-#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct DeclarationDesign {
     #[serde(default)]
     pub document: DesignDocument,
+    #[serde(default = "default_line_width")]
+    pub line_width: usize,
     pub baseline: BTreeMap<String, DeclarationFile>,
     pub proposed: BTreeMap<String, String>,
     pub moved: BTreeMap<String, String>,
+}
+
+fn default_line_width() -> usize {
+    80
+}
+
+impl Default for DeclarationDesign {
+    fn default() -> Self {
+        Self {
+            document: DesignDocument::default(),
+            line_width: default_line_width(),
+            baseline: BTreeMap::new(),
+            proposed: BTreeMap::new(),
+            moved: BTreeMap::new(),
+        }
+    }
 }
 
 impl DeclarationDesign {
@@ -52,6 +70,24 @@ impl DeclarationDesign {
             String::from_utf8_lossy(&result.stderr)
         );
         let mut design = Self::default();
+        match std::fs::read_to_string(workspace.join(".forge.json")) {
+            Ok(config) => {
+                let config: serde_json::Value =
+                    serde_json::from_str(&config).context("decode .forge.json")?;
+                if let Some(width) = config.get("declaration_line_width") {
+                    design.line_width = width
+                        .as_u64()
+                        .and_then(|width| usize::try_from(width).ok())
+                        .context(".forge.json declaration_line_width must be an integer")?;
+                }
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error).context("read .forge.json"),
+        }
+        ensure!(
+            (40..=240).contains(&design.line_width),
+            "declaration line width must be between 40 and 240"
+        );
         let mut retained_bytes = 0usize;
         for bytes in result
             .stdout
@@ -81,6 +117,9 @@ impl DeclarationDesign {
             let text = DeclarationOverview::extract(&path, &source)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("extract {path}"))?;
+            let text = DeclarationOverview::format_with_width(&path, &text, design.line_width)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .with_context(|| format!("format baseline {path}"))?;
             retained_bytes += text.len();
             ensure!(
                 retained_bytes <= 8 * 1024 * 1024,
@@ -100,6 +139,10 @@ impl DeclarationDesign {
 
     /// Validate every proposed overview before exposing a persisted revision.
     pub fn validate(&self) -> Result<()> {
+        ensure!(
+            (40..=240).contains(&self.line_width),
+            "declaration line width must be between 40 and 240"
+        );
         ensure!(
             self.document.description.len() <= 16 * 1024,
             "plan description exceeds 16 KiB"
@@ -136,6 +179,24 @@ impl DeclarationDesign {
             );
         }
         Ok(())
+    }
+
+    /// Format both declaration snapshots atomically before freezing their review identity.
+    pub fn formatted(&self) -> Result<Self> {
+        self.validate()?;
+        let mut candidate = self.clone();
+        for (path, file) in &mut candidate.baseline {
+            file.text = DeclarationOverview::format_with_width(path, &file.text, self.line_width)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .with_context(|| format!("format baseline {path}"))?;
+        }
+        for (path, text) in &mut candidate.proposed {
+            *text = DeclarationOverview::format_with_width(path, text, self.line_width)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .with_context(|| format!("format proposed {path}"))?;
+        }
+        candidate.validate()?;
+        Ok(candidate)
     }
 
     /// Return original paths whose declaration content or location changed.
@@ -443,6 +504,44 @@ fn patch_file(original: &str, patch: &[&str]) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_uses_repository_width_and_rejects_invalid_configuration() {
+        let workspace = tempfile::tempdir().unwrap();
+        let initialized = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(workspace.path())
+            .status()
+            .unwrap();
+        assert!(initialized.success());
+        std::fs::write(workspace.path().join("lib.rs"), "/// This long paragraph describes the registry contract and should wrap to the repository configured width.\npub struct Registry;\n").unwrap();
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            r#"{"branch_prefix":"feature/","declaration_line_width":50}"#,
+        )
+        .unwrap();
+        let design = DeclarationDesign::capture(workspace.path()).unwrap();
+        assert_eq!(design.line_width, 50);
+        assert!(
+            design.baseline["lib.rs"]
+                .text
+                .lines()
+                .all(|line| line.chars().count() <= 50)
+        );
+        assert!(design.changed_paths().is_empty());
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            r#"{"declaration_line_width":12}"#,
+        )
+        .unwrap();
+        assert!(DeclarationDesign::capture(workspace.path()).is_err());
+        std::fs::write(
+            workspace.path().join(".forge.json"),
+            r#"{"declaration_line_width":"80"}"#,
+        )
+        .unwrap();
+        assert!(DeclarationDesign::capture(workspace.path()).is_err());
+    }
 
     #[test]
     fn description_and_declaration_edits_commit_atomically() {

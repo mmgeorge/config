@@ -759,7 +759,11 @@ impl CodexJsonRpc {
                     document.version
                 );
                 document.validate_for_submission()?;
-                render_plan(document)?;
+                let mut document = document.clone();
+                if let Some(design) = &document.design {
+                    document.design = Some(design.formatted()?);
+                }
+                render_plan(&document)?;
             }
             _ => {}
         }

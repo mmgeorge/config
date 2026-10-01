@@ -163,11 +163,257 @@ impl DeclarationOverview {
         Ok(DeclarationPresentation { text, source })
     }
 
+    /// Canonicalize declarations with a bounded line width without modifying source files.
+    pub fn format_with_width(
+        path: &str,
+        overview: &str,
+        line_width: usize,
+    ) -> Result<String, SyntaxError> {
+        if !(40..=240).contains(&line_width) {
+            return Err(SyntaxError::Query(
+                "declaration line width must be between 40 and 240".into(),
+            ));
+        }
+        Self::parse(path, overview)?;
+        let language = Self::language(path).unwrap();
+        let text = Self::format(path, overview)?;
+        let text = wrap_parameters(language, &text, line_width)?;
+        let text = format_indentation(language, &text)?;
+        let text = wrap_comments(language, &text, line_width)?;
+        Self::parse(path, &text)?;
+        Ok(text)
+    }
+
     fn format(path: &str, overview: &str) -> Result<String, SyntaxError> {
         let language = Self::language(path).unwrap();
         let text = Self::project(path, &declaration_surrogate(language, overview), true)?;
         format_indentation(language, &text)
     }
+}
+
+fn formatting_tree(language: SyntaxLanguage, text: &str) -> Result<tree_sitter::Tree, SyntaxError> {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&language.grammar())
+        .map_err(|error| SyntaxError::Query(error.to_string()))?;
+    let tree = parser
+        .parse(declaration_surrogate(language, text), None)
+        .ok_or_else(|| SyntaxError::Query("declaration formatting was cancelled".into()))?;
+    if tree.root_node().has_error() {
+        return Err(SyntaxError::Query(
+            "invalid declaration formatting input".into(),
+        ));
+    }
+    Ok(tree)
+}
+
+fn wrap_parameters(
+    language: SyntaxLanguage,
+    text: &str,
+    line_width: usize,
+) -> Result<String, SyntaxError> {
+    let tree = formatting_tree(language, text)?;
+    let lines = text.lines().collect::<Vec<_>>();
+    let mut offsets = Vec::new();
+    let mut offset = 0;
+    for line in &lines {
+        offsets.push(offset);
+        offset += line.len() + 1;
+    }
+    let mut replacement = Vec::new();
+    collect_parameters(
+        tree.root_node(),
+        text,
+        &lines,
+        &offsets,
+        line_width,
+        &mut replacement,
+    );
+    replacement.sort_by_key(|(start, _, _)| std::cmp::Reverse(*start));
+    let mut output = text.to_owned();
+    for (start, end, contents) in replacement {
+        output.replace_range(start..end, &contents);
+    }
+    Ok(output)
+}
+
+fn collect_parameters(
+    node: Node<'_>,
+    text: &str,
+    lines: &[&str],
+    offsets: &[usize],
+    line_width: usize,
+    replacement: &mut Vec<(usize, usize, String)>,
+) {
+    if matches!(node.kind(), "parameters" | "formal_parameters") {
+        let first = node.start_position();
+        let last = node.end_position();
+        if first.row == last.row
+            && lines
+                .get(first.row)
+                .is_some_and(|line| line.chars().count() > line_width)
+        {
+            let start = offsets[first.row] + first.column;
+            let end = offsets[last.row] + last.column;
+            if end <= text.len()
+                && text.get(start..start + 1) == Some("(")
+                && text.get(end - 1..end) == Some(")")
+            {
+                let mut walk = node.walk();
+                let children = node.children(&mut walk).collect::<Vec<_>>();
+                if !children
+                    .iter()
+                    .any(|child| child.kind().contains("comment"))
+                {
+                    let mut parts = Vec::new();
+                    let mut cursor = start + 1;
+                    for child in children.iter().filter(|child| child.kind() == ",") {
+                        let comma = offsets[first.row] + child.start_position().column;
+                        parts.push(text[cursor..comma + 1].trim());
+                        cursor = comma + 1;
+                    }
+                    let final_part = text[cursor..end - 1].trim();
+                    if !final_part.is_empty() {
+                        parts.push(final_part);
+                    }
+                    if !parts.is_empty() {
+                        replacement.push((start, end, format!("(\n{}\n)", parts.join("\n"))));
+                    }
+                }
+            }
+        }
+        return;
+    }
+    if node.kind().contains("string")
+        || node.kind().contains("template")
+        || node.kind().contains("comment")
+    {
+        return;
+    }
+    let mut walk = node.walk();
+    for child in node.children(&mut walk) {
+        collect_parameters(child, text, lines, offsets, line_width, replacement);
+    }
+}
+
+fn collect_comment_rows(node: Node<'_>, rows: &mut std::collections::HashSet<usize>) {
+    if matches!(node.kind(), "line_comment" | "comment") {
+        let first = node.start_position();
+        let last = node.end_position();
+        if first.row == last.row || last.row == first.row + 1 && last.column == 0 {
+            rows.insert(first.row);
+        }
+        return;
+    }
+    if node.kind().contains("string")
+        || node.kind().contains("template")
+        || node.kind() == "block_comment"
+    {
+        return;
+    }
+    let mut walk = node.walk();
+    for child in node.children(&mut walk) {
+        collect_comment_rows(child, rows);
+    }
+}
+
+fn wrap_comments(
+    language: SyntaxLanguage,
+    text: &str,
+    line_width: usize,
+) -> Result<String, SyntaxError> {
+    let tree = formatting_tree(language, text)?;
+    let mut rows = std::collections::HashSet::new();
+    collect_comment_rows(tree.root_node(), &mut rows);
+    let mut output = Vec::new();
+    let mut paragraph = String::new();
+    let mut prefix = String::new();
+    let mut fenced = false;
+    for (row, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        let marker = ["///", "//!", "//", "--"]
+            .into_iter()
+            .find(|marker| trimmed.starts_with(marker));
+        let Some(marker) = marker.filter(|_| rows.contains(&row)) else {
+            flush_comment(&mut output, &mut paragraph, &prefix, line_width);
+            output.push(line.to_owned());
+            fenced = false;
+            continue;
+        };
+        let contents = &trimmed[marker.len()..];
+        let content = contents.trim();
+        let next_prefix = format!("{}{} ", &line[..line.len() - trimmed.len()], marker);
+        let fence = content.starts_with("```") || content.starts_with("~~~");
+        let structured = content.is_empty()
+            || fenced
+            || fence
+            || contents.starts_with("    ")
+            || content.starts_with(['@', '#', '|', '-', '*', '>', '[', '<'])
+            || content
+                .chars()
+                .next()
+                .is_some_and(|character| character.is_ascii_digit());
+        if prefix != next_prefix || structured {
+            flush_comment(&mut output, &mut paragraph, &prefix, line_width);
+        }
+        prefix = next_prefix;
+        if structured {
+            output.push(line.to_owned());
+            if fence {
+                fenced = !fenced;
+            }
+        } else {
+            if !paragraph.is_empty() {
+                paragraph.push(' ');
+            }
+            paragraph.push_str(content);
+        }
+    }
+    flush_comment(&mut output, &mut paragraph, &prefix, line_width);
+    Ok(normalize(&output.join("\n")))
+}
+
+fn flush_comment(
+    output: &mut Vec<String>,
+    paragraph: &mut String,
+    prefix: &str,
+    line_width: usize,
+) {
+    if paragraph.is_empty() {
+        return;
+    }
+    let mut line = prefix.to_owned();
+    let mut inline_code = false;
+    let mut word = String::new();
+    let mut words = Vec::new();
+    for part in paragraph.split_whitespace() {
+        if !word.is_empty() {
+            word.push(' ');
+        }
+        word.push_str(part);
+        if part.chars().filter(|character| *character == '`').count() % 2 == 1 {
+            inline_code = !inline_code;
+        }
+        if !inline_code {
+            words.push(std::mem::take(&mut word));
+        }
+    }
+    if !word.is_empty() {
+        words.push(word);
+    }
+    for word in words {
+        if line.len() > prefix.len() && line.chars().count() + 1 + word.chars().count() > line_width
+        {
+            output.push(line);
+            line = prefix.to_owned();
+        }
+        if line.len() > prefix.len() {
+            line.push(' ');
+        }
+        line.push_str(&word);
+    }
+    output.push(line);
+    paragraph.clear();
 }
 
 fn layout_tokens(
@@ -244,6 +490,7 @@ fn collect_tokens(
 }
 
 pub(super) fn declaration_surrogate(language: SyntaxLanguage, overview: &str) -> String {
+    let mut lua_header = false;
     overview
         .lines()
         .map(|line| {
@@ -251,7 +498,19 @@ pub(super) fn declaration_surrogate(language: SyntaxLanguage, overview: &str) ->
             if language == SyntaxLanguage::Lua
                 && (text.starts_with("function ") || text.starts_with("local function "))
             {
-                format!("{line} end\n")
+                lua_header = !text.ends_with(')');
+                if lua_header {
+                    format!("{line}\n")
+                } else {
+                    format!("{line} end\n")
+                }
+            } else if lua_header {
+                if text.ends_with(')') {
+                    lua_header = false;
+                    format!("{line} end\n")
+                } else {
+                    format!("{line}\n")
+                }
             } else if language == SyntaxLanguage::Lua
                 && !text.is_empty()
                 && text
@@ -572,7 +831,14 @@ fn project_node(
         if language == SyntaxLanguage::Lua {
             return node
                 .child_by_field_name("parameters")
-                .map(|parameters| flatten(&source[node.start_byte()..parameters.end_byte()]))
+                .map(|parameters| {
+                    let header = &source[node.start_byte()..parameters.end_byte()];
+                    if formatted {
+                        header.to_owned()
+                    } else {
+                        flatten(header)
+                    }
+                })
                 .unwrap_or_default();
         }
         if let Some(body) = node.child_by_field_name("body") {
@@ -712,6 +978,62 @@ fn normalize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn configured_width_wraps_contracts_and_keeps_literals_and_fences_opaque() {
+        let source = "/// This documentation describes the complete request contract and explains the lifetime of the returned handle across repeated calls.\n///\n/// ```rust\n/// let very_long_example = \"this example must remain exactly as written despite its length\";\n/// ```\npub fn request(texture: TextureId, registry: &mut TextureRegistry, decoder: &TextureDecoder) -> TextureRequest;\n";
+        let formatted = DeclarationOverview::format_with_width("texture.rs", source, 60).unwrap();
+        assert!(formatted.contains("pub fn request(\n  texture: TextureId,\n"));
+        assert!(formatted.contains("/// let very_long_example = \"this example must remain exactly as written despite its length\";"));
+        assert!(
+            formatted
+                .lines()
+                .filter(|line| line.starts_with("/// ") && !line.starts_with("/// let"))
+                .all(|line| line.chars().count() <= 60)
+        );
+        assert_eq!(
+            DeclarationOverview::format_with_width("texture.rs", &formatted, 60).unwrap(),
+            formatted
+        );
+        let wide = DeclarationOverview::format_with_width("texture.rs", source, 240).unwrap();
+        assert!(wide.contains("pub fn request(texture:"));
+        let literal = "export type Message = `first\n    /// this is literal content that must never be reformatted or interpreted as documentation\nlast`;\n";
+        let formatted = DeclarationOverview::format_with_width("message.ts", literal, 40).unwrap();
+        assert!(formatted.contains("    /// this is literal content that must never be reformatted or interpreted as documentation"));
+    }
+
+    #[test]
+    fn parameter_wrapping_preserves_nested_types_and_native_callables() {
+        for (path, source) in [
+            (
+                "registry.rs",
+                "pub fn request(registry: &mut Registry, values: Result<(First, Second), Error>, decoder: Decoder) -> Handle;\n",
+            ),
+            (
+                "registry.ts",
+                "export interface Registry { request(registry: Registry, values: Map<string, [First, Second]>, decoder: Decoder): Handle; }\n",
+            ),
+            (
+                "registry.tsx",
+                "export const request = (registry: Registry, values: Map<string, [First, Second]>, decoder: Decoder): Handle =>;\n",
+            ),
+            (
+                "registry.lua",
+                "local M\nfunction M.request(registry_identifier, first_parameter_identifier, second_parameter_identifier)\nreturn M\n",
+            ),
+        ] {
+            let formatted = DeclarationOverview::format_with_width(path, source, 60).unwrap();
+            assert!(formatted.contains("(\n"), "{path}: {formatted}");
+            DeclarationOverview::parse(path, &formatted).unwrap();
+            assert_eq!(
+                DeclarationOverview::format_with_width(path, &formatted, 60).unwrap(),
+                formatted,
+                "{path}"
+            );
+            let display = DeclarationOverview::present(path, &formatted).unwrap();
+            assert!(display.text.contains("(\n"), "{path}: {}", display.text);
+        }
+    }
 
     #[test]
     fn arena_declarations_have_two_space_indentation_and_attached_documentation() {
