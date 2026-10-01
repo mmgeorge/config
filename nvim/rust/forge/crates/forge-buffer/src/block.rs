@@ -67,6 +67,9 @@ pub struct BlockAnchor {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoldRange {
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Appends a compact body marker to the native fold summary without replacing source text.
+    pub collapsed_suffix: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     /// First heading row that can toggle this fold while leaving the heading visible.
     pub heading_start: Option<BlockAnchor>,
     pub id: FoldId,
@@ -190,7 +193,8 @@ impl BlockMetadata {
             + self
                 .fold
                 .iter()
-                .map(|fold| fold.id.0.capacity() + fold.end.block.0.capacity())
+                .map(|fold| fold.id.0.capacity() + fold.end.block.0.capacity()
+                    + fold.collapsed_suffix.as_ref().map_or(0, String::capacity))
                 .sum::<usize>()
             + self
                 .gutter
@@ -306,6 +310,9 @@ impl BufferBlock {
         }
         for fold in &self.metadata.fold {
             fold.id.validate()?;
+            if fold.collapsed_suffix.as_ref().is_some_and(|suffix| suffix.len() > 1024 || suffix.chars().any(char::is_control)) {
+                return Err(ContractError("fold summary suffix requires at most 1024 printable bytes"));
+            }
             fold.end.block.validate()?;
             TextRange {
                 start: fold.start,

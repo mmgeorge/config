@@ -66,6 +66,7 @@ pub fn fold_header(
     collapse_children: bool,
 ) {
     header.metadata.fold = vec![FoldRange {
+        collapsed_suffix: None,
         id,
         heading_start: None,
         start: TextPosition { row: 0, column: 0 },

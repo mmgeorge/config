@@ -2,7 +2,7 @@ use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
-    BlockAnchor, BlockMetadata, BufferBlock, TargetRange, TextChunk, TextPosition, TextRange,
+    BlockAnchor, BlockMetadata, BufferBlock, FoldRange, TargetRange, TextChunk, TextPosition, TextRange,
 };
 use forge_buffer::identity::{BlockId, EditSequence, FoldId, RegionRevision, TargetId};
 use forge_buffer::text::BufferText;
@@ -11,7 +11,7 @@ use forge_diff::display::RowKind;
 use forge_diff::file_header::FileChange;
 use forge_diff::patch::UnifiedPatch;
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
-use forge_diff::syntax::{DeclarationOverview, DeclarationPresentation, DeclarationVisibility};
+use forge_diff::syntax::{DeclarationFolding, DeclarationOverview, DeclarationPresentation, DeclarationVisibility};
 
 use super::review_annotation::ReviewAnnotation;
 use super::{
@@ -234,6 +234,7 @@ fn rows(
     let patch = String::from_utf8(patch)?;
     let parsed = UnifiedPatch::parse(&patch)?;
     let mut block = Vec::new();
+    let mut display_row = HashMap::<(String, String, usize), usize>::new();
     let mut navigation = PlanNavigationIndex {
         plan_id: document.plan_id.clone(),
         plan_version: document.version,
@@ -342,6 +343,10 @@ fn rows(
                 {
                     hidden.insert(BlockId(format!("{hunk_id}:row:{row_index}")));
                 }
+                if row.kind == RowKind::Context {
+                    display_row.insert((file.old_path.as_ref().unwrap().clone(), "baseline".into(), row.old_line.unwrap()), block.len());
+                }
+                display_row.insert((source_path.clone(), side.into(), line), block.len());
                 block.push(BufferBlock {
                     id: BlockId(format!("{hunk_id}:row:{row_index}")),
                     text: BufferText::from_rows([row_text])?,
@@ -383,6 +388,9 @@ fn rows(
                 }
             }
             fold(&mut block, hunk_start, &hunk_id)?;
+        }
+        if inspection {
+            declaration_folds(&mut block, [file.old_path.as_ref(), file.new_path.as_ref()], &presentation, &display_row)?;
         }
         fold(&mut block, start, &id)?;
     }
@@ -474,6 +482,40 @@ fn rows(
     Ok((block, navigation, hidden))
 }
 
+fn declaration_folds(
+    block: &mut [BufferBlock],
+    paths: [Option<&String>; 2],
+    presentation: &HashMap<(String, String), DeclarationPresentation>,
+    display_row: &HashMap<(String, String, usize), usize>,
+) -> Result<()> {
+    let mut candidates = Vec::new();
+    for (source_path, side) in [(paths[0], "baseline"), (paths[1], "proposed")] {
+        let Some(source_path) = source_path else { continue };
+        let Some(source) = presentation.get(&(source_path.clone(), side.into())) else { continue };
+        for declaration in DeclarationFolding::analyze(source_path, &source.text).map_err(|error| anyhow::anyhow!("{error:?}"))? {
+            let mapped = |line| display_row.get(&(source_path.clone(), side.into(), line)).copied();
+            let (Some(opening), Some(closing)) = (mapped(declaration.start), mapped(declaration.end)) else { continue };
+            if opening >= closing || !block[opening].text.wire_rows()[0].trim_end().ends_with('{') { continue; }
+            candidates.push((opening, closing, mapped(declaration.heading).unwrap_or(opening), declaration.collapsed_suffix, declaration.closed));
+        }
+    }
+    candidates.sort_by_key(|(opening, closing, _, _, _)| (std::cmp::Reverse(*opening), *closing));
+    let mut installed = Vec::new();
+    for (opening, closing, heading, suffix, closed) in candidates {
+        if installed.iter().any(|&(start, end)| end == closing
+            || (opening < start && start <= closing && closing < end)
+            || (start < opening && opening <= end && end < closing)) { continue; }
+        let endpoint = BlockAnchor { block: block[closing].id.clone(), position: TextPosition { row: 1, column: 0 } };
+        let heading_start = Some(BlockAnchor { block: block[heading].id.clone(), position: TextPosition { row: 0, column: 0 } });
+        let fold_id = FoldId(format!("{}:declaration", block[opening].id.0));
+        block[opening].metadata.fold.push(FoldRange { collapsed_suffix: Some(suffix), heading_start,
+            id: fold_id, start: TextPosition { row: 0, column: 0 }, end: endpoint,
+            closed, collapse_children: false });
+        installed.push((opening, closing));
+    }
+    Ok(())
+}
+
 fn public_blocks(
     mut block: Vec<BufferBlock>,
     hidden: &HashSet<BlockId>,
@@ -490,7 +532,7 @@ fn public_blocks(
     let mut public_count = vec![0usize];
     for (index, block) in block.iter().enumerate() {
         let declaration = retained[index]
-            && block.metadata.fold.is_empty()
+            && (block.metadata.fold.is_empty() || block.metadata.fold.iter().any(|fold| fold.collapsed_suffix.is_some()))
             && !block.id.0.starts_with("plan:annotation:")
             && block
                 .text
@@ -574,6 +616,9 @@ fn public_blocks(
             continue;
         }
         for fold in &mut header.metadata.fold {
+            if fold.heading_start.as_ref().is_some_and(|heading| !retained[index[&heading.block]]) {
+                fold.heading_start = None;
+            }
             let end = index[&fold.end.block];
             let boundary = end + usize::from(fold.end.position.row > 0);
             let last = boundary
@@ -662,6 +707,37 @@ fn pointer(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declaration_folds_keep_attributes_and_valid_filtered_endpoints() {
+        let mut document = crate::plan::document::test_fixture("containers", "Containers");
+        let mut design = super::super::DeclarationDesign::default();
+        design.document.description = "Expose configuration failures and state.".into();
+        design.proposed.insert("config.rs".into(), "#[derive(Debug)]\npub enum ConfigError {\n  /// Invalid arena size.\n  ArenaSize,\n  Radius,\n}\n\npub struct State {\n  pub count: u64,\n  private: u64,\n}\n\nimpl State {\n  pub fn count(&self) -> u64;\n  fn hidden();\n}\n\npub struct Empty {\n  private: u64,\n}\n".into());
+        document.design = Some(design);
+        for public_only in [false, true] {
+            let (block, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only).unwrap();
+            let index: HashMap<_, _> = block.iter().enumerate().map(|(row, block)| (block.id.clone(), row)).collect();
+            let mut declarations = 0;
+            for (row, owner) in block.iter().enumerate() {
+                for fold in &owner.metadata.fold {
+                    let Some(suffix) = &fold.collapsed_suffix else { continue };
+                    declarations += 1;
+                    assert_eq!(suffix, "...}");
+                    assert!(index[&fold.end.block] > row);
+                    assert!(fold.heading_start.as_ref().is_some_and(|heading| index[&heading.block] <= row));
+                    assert_eq!(fold.closed, owner.text.row(0).unwrap().contains("enum ConfigError"));
+                    if owner.text.row(0).unwrap().contains("enum ConfigError") {
+                        assert_eq!(block[index[&fold.heading_start.as_ref().unwrap().block]].text.row(0), Some("#[derive(Debug)]"));
+                    }
+                }
+            }
+            assert_eq!(declarations, if public_only { 3 } else { 4 });
+            if public_only {
+                assert!(block.iter().any(|block| block.text.row(0) == Some("pub struct Empty {}")));
+            }
+        }
+    }
 
     #[test]
     fn behavior_only_description_retains_comment_targets_in_both_views() {

@@ -698,6 +698,7 @@ fn reproject(document: &mut NotificationDocument) -> Result<Option<BufferPatch>>
                     .metadata
                     .fold
                     .push(forge_buffer::block::FoldRange {
+                        collapsed_suffix: None,
                         heading_start: None,
                         collapse_children: false,
                         id: forge_buffer::identity::FoldId(format!(

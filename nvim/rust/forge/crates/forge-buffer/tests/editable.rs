@@ -95,6 +95,7 @@ fn edit(sequence: u64, base: u64, rows: &[&str]) -> LocalEdit {
 fn local_edit_rebases_external_and_same_block_folds_in_one_atomic_patch() {
     let mut body = block();
     body.metadata.fold.push(FoldRange {
+        collapsed_suffix: None,
         heading_start: None,
         collapse_children: false,
         id: FoldId("trailing".into()),
@@ -110,6 +111,7 @@ fn local_edit_rebases_external_and_same_block_folds_in_one_atomic_patch() {
         text: BufferText::from_rows(["Comment"]).unwrap(),
         metadata: BlockMetadata {
             fold: vec![FoldRange {
+                collapsed_suffix: None,
                 heading_start: None,
                 collapse_children: false,
                 id: FoldId("comment".into()),

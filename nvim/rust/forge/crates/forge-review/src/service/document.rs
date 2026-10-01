@@ -748,6 +748,7 @@ impl ReviewService {
 
 fn attach_fold(owner: &mut BufferBlock, identity: String, endpoint: &BufferBlock, closed: bool) {
     owner.metadata.fold.push(FoldRange {
+        collapsed_suffix: None,
         heading_start: None,
         collapse_children: false,
         id: FoldId(identity),

@@ -56,7 +56,7 @@ local function default_closed_folds(review, owner)
   local state = replica and replica.fold
   local result = {}
   for id, record in pairs(state and state.record or {}) do
-    if record.fold.closed and not id:match("^plan:task:") then
+    if record.fold.closed and not (id:match("^plan:design:") or id:match("^plan:section:")) then
       local _, block_row = replica.sequence:position(record.owner)
       local finish_block_row = select(2, replica.sequence:position(record.fold["end"].block))
       result[#result + 1] = {

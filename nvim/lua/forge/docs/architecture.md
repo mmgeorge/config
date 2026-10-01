@@ -1896,7 +1896,19 @@ empty file and hunk groups, and rebases fold endpoints to retained blocks. Struc
 visible fields compact to an empty body while retaining attributes and declaration spacing.
 File and hunk fold endpoints include comments attached to their final row. Diff ranges and
 counts continue to describe the full design. Saved declarations, navigation positions, and
-annotation storage remain unchanged. Rust public-only inspection includes explicit `pub` modifiers with crate, parent, and path scopes,
+annotation storage remain unchanged. Declaration inspection projects Tree-sitter container bodies as nested native folds beneath file and
+hunk folds. Rust structs, enums, traits, impls, and inline modules, plus TypeScript classes,
+interfaces, enums, and namespaces can fold when their bodies span multiple rows. Fold headings
+include attached documentation and attributes for Tab activation, while folding starts at the
+opening brace so those attachments remain visible. The shared fold component appends a validated
+`collapsed_suffix` to the highlighted opening row, producing `{...}` without changing source text.
+Visibility filtering removes hidden owners and repairs retained endpoints. Empty containers stay
+`{}` without a redundant fold. Rust enums start collapsed. Other containers start expanded.
+Native fold identities and explicit plan fold preferences preserve
+collapse choices across visibility changes, refreshes, and comment insertion. Diff projection avoids
+crossing body folds and duplicate folds on shared context rows.
+
+Rust public-only inspection includes explicit `pub` modifiers with crate, parent, and path scopes,
 including `pub(crate)` and `pub(super)`. Members remain subject to their owner's visibility.
 The filter resets when the review document closes.
 Plan review opts into shared buffer view retention for patches and replacement snapshots.

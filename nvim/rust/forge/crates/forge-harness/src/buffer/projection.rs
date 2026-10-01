@@ -1220,6 +1220,7 @@ impl TimelineRenderer<'_> {
             },
         };
         self.block[start].metadata.fold.push(FoldRange {
+            collapsed_suffix: None,
             heading_start: None,
             collapse_children: false,
             id: FoldId(identity.into()),

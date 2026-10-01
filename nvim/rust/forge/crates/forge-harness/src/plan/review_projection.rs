@@ -187,6 +187,7 @@ pub(crate) fn project(
             },
         };
         block[start_block].metadata.fold.push(FoldRange {
+            collapsed_suffix: None,
             heading_start: None,
             collapse_children: false,
             id: FoldId(format!("plan:heading:{source_row}")),
@@ -255,6 +256,7 @@ pub(crate) fn project(
             .metadata
             .fold
             .push(FoldRange {
+                collapsed_suffix: None,
                 heading_start,
                 collapse_children: false,
                 id: FoldId(fold_id),
@@ -282,6 +284,7 @@ pub(crate) fn project(
             position: TextPosition { row: 0, column: 0 },
         };
         block[row_block[start]].metadata.fold.push(FoldRange {
+            collapsed_suffix: None,
             heading_start: None,
             id: FoldId(format!("plan:file-tree:{source_start}")),
             collapse_children: false,

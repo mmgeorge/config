@@ -107,6 +107,8 @@ function M.validate(sequence, changed, retired, state, read_row)
     assert(not seen[fold.id], "duplicate fold identity")
     seen[fold.id] = true
     assert(type(fold.closed) == "boolean", "invalid fold closed state")
+    assert(fold.collapsed_suffix == nil or (type(fold.collapsed_suffix) == "string"
+      and #fold.collapsed_suffix <= 1024 and not fold.collapsed_suffix:find("%c")), "invalid fold summary suffix")
     assert(fold.collapse_children == nil or type(fold.collapse_children) == "boolean", "invalid fold child policy")
     local previous = state and state.record[fold.id]
     assert(not previous or previous.owner == owner or changed[previous.owner] or retired[previous.owner],
@@ -274,15 +276,18 @@ function M.toggle_heading(session, window)
     or vim.api.nvim_win_get_buf(window) ~= session.buffer then return false end
   local row = vim.api.nvim_win_get_cursor(window)[1]
   for _, record in pairs(session.fold and session.fold.record or {}) do
-    if fold_start(session, record) == row then
+    local start = fold_start(session, record)
+    local heading = record.fold.heading_start
+    local first = heading and (select(2, session.sequence:position(heading.block)) + heading.position.row + 1) or start
+    if row >= first and row <= start then
       vim.api.nvim_win_call(window, function()
-        local opening = vim.fn.foldclosed(row) == row
-        vim.cmd("normal! za")
+        local opening = vim.fn.foldclosed(start) == start
+        vim.cmd(tostring(start) .. (opening and "foldopen" or "foldclose"))
         if opening and record.fold.collapse_children then
           local finish, children = fold_end(session, record), {}
           for _, child in pairs(session.fold.record) do
             local start = fold_start(session, child)
-            if start > row and fold_end(session, child) <= finish then children[#children + 1] = start end
+            if start > fold_start(session, record) and fold_end(session, child) <= finish then children[#children + 1] = start end
           end
           table.sort(children, function(left, right) return left > right end)
           for _, start in ipairs(children) do close_open_fold(start) end
@@ -433,6 +438,13 @@ function M.text()
     end
   end
   vim.list_extend(chunks, gutter[#text] or {})
+  for _, record in pairs(session.fold and session.fold.record or {}) do
+    if record.fold.collapsed_suffix and fold_start(session, record) == vim.v.foldstart
+      and fold_end(session, record) == vim.v.foldend then
+      chunks[#chunks + 1] = { record.fold.collapsed_suffix, "Comment" }
+      break
+    end
+  end
   return chunks
 end
 

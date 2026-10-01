@@ -5,6 +5,8 @@ mod context;
 mod query;
 mod configuration;
 mod declaration;
+mod declaration_fold;
+pub use declaration_fold::{DeclarationFold, DeclarationFolding};
 mod visibility;
 pub use configuration::ConfigurationFormat;
 pub use visibility::DeclarationVisibility;

@@ -848,6 +848,7 @@ fn fold(block: &mut [BufferBlock], header: usize, id: &str, closed: bool) {
     };
     let header = &mut block[header];
     header.metadata.fold.push(FoldRange {
+        collapsed_suffix: None,
         heading_start: None,
         collapse_children: false,
         id: FoldId(format!("walkthrough:{id}")),

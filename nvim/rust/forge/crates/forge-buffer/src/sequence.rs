@@ -789,6 +789,7 @@ mod tests {
         use crate::block::{BlockAnchor, FoldRange};
         let mut owner = block(2, 1);
         owner.metadata.fold.push(FoldRange {
+            collapsed_suffix: None,
             heading_start: Some(BlockAnchor { block: BlockId("block-1".into()), position: TextPosition { row: 0, column: 0 } }),
             collapse_children: false,
             id: FoldId("task".into()),
@@ -808,6 +809,7 @@ mod tests {
         use crate::block::{BlockAnchor, FoldRange};
         let mut first = block(1, 1);
         first.metadata.fold.push(FoldRange {
+            collapsed_suffix: None,
             heading_start: None,
             collapse_children: false,
             id: FoldId("section".into()),
