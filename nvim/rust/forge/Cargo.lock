@@ -718,11 +718,15 @@ dependencies = [
  "cc",
  "forge-buffer",
  "gix-imara-diff",
+ "jsonc-parser",
  "memchr",
  "regex",
+ "roxmltree",
+ "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "toml",
  "tree-sitter",
  "tree-sitter-language",
 ]
@@ -2272,6 +2276,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "jsonc-parser"
+version = "0.34.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ecded084f9b9a718d39668a42657c32253663d1f6afb3fbb9134f0305f73f48"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "jsonschema"
 version = "0.49.9"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3040,6 +3053,15 @@ dependencies = [
  "libc",
  "untrusted",
  "windows-sys 0.52.0",
+]
+
+[[package]]
+name = "roxmltree"
+version = "0.21.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f1964b10c76125c36f8afe190065a4bf9a87bf324842c05701330bba9f1cacbb"
+dependencies = [
+ "memchr",
 ]
 
 [[package]]

@@ -4,6 +4,7 @@ local snapshot_transfer = require("forge.snapshot")
 local BlockSequence = require("forge.block_sequence")
 local folds = require("forge.folds")
 local decorations = require("forge.decorations")
+local buffer_view = require("forge.buffer_view")
 local MAX_COUNTER = 9007199254740991
 
 local function counter(value)
@@ -151,6 +152,7 @@ function M.open(document, options)
   end
   local session = {
     physical = physical, generated = generated, previous_native = previous_native,
+    preserve_view = options.preserve_view == true,
     expected_changedtick = generated and options.expected_changedtick or nil,
     generated_filetype = options.filetype or "forge",
     document = document, buffer = buffer, namespace = vim.api.nvim_create_namespace(""),
@@ -447,6 +449,10 @@ local function commit_patch(session, patch, adoption, projection)
     local reconciled, failure = editable.reconciled(session.editable, revision)
     if not reconciled then return M.fail_apply(session, failure) end
   end
+  local retained_view = buffer_view.capture(session, function(id)
+    local entry = not prepared.retired[id] and (prepared.block[id] or session.block[id])
+    return entry ~= nil and entry ~= false and entry.row_count > 0
+  end)
   local readonly = vim.bo[session.buffer].readonly
   folds.capture(session)
   ok, prepared.failure = pcall(function()
@@ -486,6 +492,7 @@ local function commit_patch(session, patch, adoption, projection)
   session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
   decorations.attach(session)
   folds.refresh(session)
+  buffer_view.restore(session, retained_view)
   return { kind = "Applied", revision = session.revision }
 end
 
@@ -569,6 +576,9 @@ function M.apply_snapshot(session, snapshot)
       position = position, region_owner = region_owner, retired = {} }
   end)
   if not ok then return M.fail_apply(session, prepared) end
+  local retained_view = buffer_view.capture(session, function(id)
+    return prepared.block[id] ~= nil and prepared.block[id].row_count > 0
+  end)
   local readonly = vim.bo[session.buffer].readonly
   folds.capture(session)
   ok, prepared.failure = pcall(function()
@@ -606,6 +616,7 @@ function M.apply_snapshot(session, snapshot)
   session.local_patch = nil
   decorations.attach(session)
   folds.refresh(session)
+  buffer_view.restore(session, retained_view)
   return { kind = "Applied", revision = session.revision }
 end
 

@@ -185,7 +185,7 @@ function M.attach(options, callback)
     end
     return { draft = draft, saved_source_digest = owner.saved_source_digest }
   end
-  owner.replica = buffer.open(owner.document, { buffer = options.buffer, generated = true,
+  owner.replica = buffer.open(owner.document, { buffer = options.buffer, generated = true, preserve_view = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice,
     editable = { notice = options.notice, send = function(edit)
       if not alive() then return false end

@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use tree_sitter::{Node, Parser, Query, QueryCursor, StreamingIterator};
 
-use super::{SyntaxError, SyntaxLanguage};
+use super::{ConfigurationFormat, SyntaxError, SyntaxLanguage};
 
 /// Extracts and validates body-free declarations using the bundled source grammars.
 pub struct DeclarationOverview;
@@ -25,7 +25,20 @@ pub struct DeclarationPresentation {
 }
 
 impl DeclarationOverview {
-    /// Return the supported declaration language for a project source path.
+    /// Admit source declarations and complete configuration documents independently of highlighting.
+    pub fn supports(path: &str) -> bool {
+        Self::language(path).is_some() || ConfigurationFormat::for_path(path).is_some()
+    }
+
+    /// Return the inspection filetype, including configuration without a bundled grammar.
+    pub fn filetype(path: &str) -> &'static str {
+        ConfigurationFormat::for_path(path)
+            .map(ConfigurationFormat::name)
+            .or_else(|| Self::language(path).map(SyntaxLanguage::name))
+            .unwrap_or("text")
+    }
+
+    /// Return the bundled highlighting language when one exists for an admitted path.
     pub fn language(path: &str) -> Option<SyntaxLanguage> {
         match path.rsplit('.').next()? {
             "rs" => Some(SyntaxLanguage::Rust),
@@ -33,6 +46,8 @@ impl DeclarationOverview {
             "tsx" => Some(SyntaxLanguage::Tsx),
             "lua" => Some(SyntaxLanguage::Lua),
             "toml" => Some(SyntaxLanguage::Toml),
+            "json" | "jsonc" => Some(SyntaxLanguage::Json),
+            "yaml" | "yml" => Some(SyntaxLanguage::Yaml),
             _ => None,
         }
     }
@@ -43,6 +58,10 @@ impl DeclarationOverview {
     }
 
     fn project(path: &str, source: &str, formatted: bool) -> Result<String, SyntaxError> {
+        if let Some(config) = ConfigurationFormat::for_path(path) {
+            config.validate(path, source)?;
+            return Ok(source.to_owned());
+        }
         let language = Self::language(path).ok_or_else(|| {
             SyntaxError::Query(format!("unsupported declaration language: {path}"))
         })?;
@@ -58,9 +77,6 @@ impl DeclarationOverview {
             return Err(SyntaxError::Query(format!(
                 "invalid source syntax in {path}"
             )));
-        }
-        if language == SyntaxLanguage::Toml {
-            return Ok(source.to_owned());
         }
         let query_text = match language {
             SyntaxLanguage::Rust => include_str!("../../query/forge/rust/design.scm"),
@@ -109,13 +125,13 @@ impl DeclarationOverview {
                 "declaration overview exceeds 1 MiB or contains NUL".into(),
             ));
         }
+        if let Some(config) = ConfigurationFormat::for_path(path) {
+            config.validate(path, overview)?;
+            return Ok(overview.to_owned());
+        }
         let language = Self::language(path).ok_or_else(|| {
             SyntaxError::Query(format!("unsupported declaration language: {path}"))
         })?;
-        if language == SyntaxLanguage::Toml {
-            Self::project(path, overview, false)?;
-            return Ok(overview.to_owned());
-        }
         let canonical = normalize(overview);
         let surrogate = declaration_surrogate(language, &canonical);
         let projected = Self::project(path, &surrogate, false)?;
@@ -138,6 +154,14 @@ impl DeclarationOverview {
     /// Format an admitted document and derive navigation positions without changing it.
     pub fn present(path: &str, overview: &str) -> Result<DeclarationPresentation, SyntaxError> {
         Self::parse(path, overview)?;
+        if ConfigurationFormat::for_path(path).is_some() {
+            return Ok(DeclarationPresentation {
+                text: overview.to_owned(),
+                source: overview.lines().enumerate().map(|(row, _)| {
+                    Some(DeclarationPosition { line: row as u32 + 1, column: 0 })
+                }).collect(),
+            });
+        }
         let language = Self::language(path).ok_or_else(|| {
             SyntaxError::Query(format!("unsupported declaration language: {path}"))
         })?;
@@ -183,10 +207,10 @@ impl DeclarationOverview {
             ));
         }
         Self::parse(path, overview)?;
-        let language = Self::language(path).unwrap();
-        if language == SyntaxLanguage::Toml {
+        if ConfigurationFormat::for_path(path).is_some() {
             return Ok(overview.to_owned());
         }
+        let language = Self::language(path).unwrap();
         let text = Self::format(path, overview)?;
         let text = wrap_parameters(language, &text, line_width)?;
         let text = format_indentation(language, &text)?;
@@ -197,9 +221,6 @@ impl DeclarationOverview {
 
     fn format(path: &str, overview: &str) -> Result<String, SyntaxError> {
         let language = Self::language(path).unwrap();
-        if language == SyntaxLanguage::Toml {
-            return Self::parse(path, overview);
-        }
         let text = Self::project(path, &declaration_surrogate(language, overview), true)?;
         format_indentation(language, &text)
     }

@@ -139,9 +139,10 @@ impl HarnessService {
                             let Some(text) = text else { continue };
                             let presentation = forge_diff::syntax::DeclarationOverview::present(&path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
                             admission.check()?;
+                            let Some(language) = forge_diff::syntax::DeclarationOverview::language(&path) else { continue };
                             let handle = self.syntax.analyze(SyntaxRequest {
                                 source:forge_diff::source::SourceVersion::new(presentation.text.as_bytes().to_vec(),forge_diff::source::Representation::DisplayOnly)?,
-                                language:forge_diff::syntax::DeclarationOverview::language(&path).context("unsupported design syntax")?,
+                                language,
                                 priority:forge_diff::workers::WorkPriority::Visible,
                                 deadline:Some(Instant::now()+Duration::from_secs(10)),
                             }).await.map_err(|error| anyhow::anyhow!("Declaration syntax analysis failed: {error:?}"))?;

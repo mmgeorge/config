@@ -100,7 +100,11 @@ function M.open(options, callback)
       if not alive() then return end
       if failure then notice(failure) return end
       local result = replica.apply_snapshot(document, snapshot)
-      if result.kind ~= "Applied" then notice("Harness snapshot could not be adopted: " .. tostring(result.kind)) end
+      if result.kind ~= "Applied" then
+        notice("Harness snapshot could not be adopted: " .. tostring(result.kind))
+      elseif vim.api.nvim_get_current_buf() ~= options.transcript_buffer then
+        owner.follow_tail()
+      end
     end)
   end
   local transcript_tick = vim.api.nvim_buf_get_changedtick(options.transcript_buffer)
@@ -114,7 +118,7 @@ function M.open(options, callback)
     request({ operation = "close", document = identity }, function() end)
     callback(nil, message)
   end
-  owner.transcript = replica.open(identity, { buffer = options.transcript_buffer, generated = true,
+  owner.transcript = replica.open(identity, { buffer = options.transcript_buffer, generated = true, preserve_view = true,
     expected_changedtick = transcript_tick, filetype = "ForgeHarness", notice = notice,
     recover = function() recovery(owner.transcript) end })
   owner.composer = replica.open(owner.composer_id, { buffer = options.composer_buffer, generated = true,
@@ -171,6 +175,7 @@ function M.open(options, callback)
     })
     vim.bo[options.composer_buffer].modifiable = true
     callback(owner)
+    if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
     if opened.syntax_pending then vim.schedule(function() owner.highlight() end) end
   end)
 
@@ -194,23 +199,11 @@ function M.open(options, callback)
         return
       end
       owner.sync_failure = nil
-      local follow = {}
-      local previous_rows = vim.api.nvim_buf_line_count(options.transcript_buffer)
-      for window in pairs(owner.views) do
-        if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer
-          and vim.api.nvim_win_get_cursor(window)[1] >= previous_rows then follow[#follow + 1] = window end
-      end
       if type(result.snapshot) == "table" then replica.apply_snapshot(owner.transcript, result.snapshot)
       else
         for _, patch in ipairs(result.patch or {}) do
           local applied = replica.apply_patch(owner.transcript, patch)
           if applied.kind ~= "Applied" then break end
-        end
-      end
-      for _, window in ipairs(follow) do
-        if vim.api.nvim_buf_line_count(options.transcript_buffer) > previous_rows
-          and vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
-          vim.api.nvim_win_set_cursor(window, { vim.api.nvim_buf_line_count(options.transcript_buffer), 0 })
         end
       end
       local switched_timeline = owner.restore_timeline ~= nil
@@ -224,6 +217,7 @@ function M.open(options, callback)
       end
       render_markdown(switched_timeline)
       if options.on_update then options.on_update() end
+      if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
       if result.syntax_pending then owner.highlight() end
       if owner.pending then owner.sync() end
     end)
@@ -384,10 +378,12 @@ function M.open(options, callback)
   ---Resume transcript tail following for an explicit user action without changing focus.
   function owner.follow_tail()
     if not alive() or not owner.ready then return end
-    local window = owner.views[options.transcript_window] and options.transcript_window or next(owner.views)
-    if window and vim.api.nvim_win_is_valid(window)
-      and vim.api.nvim_win_get_buf(window) == owner.transcript.buffer then
-      vim.api.nvim_win_set_cursor(window, { vim.api.nvim_buf_line_count(owner.transcript.buffer), 0 })
+    local last_row = vim.api.nvim_buf_line_count(owner.transcript.buffer)
+    for window in pairs(owner.views) do
+      if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == owner.transcript.buffer then
+        vim.api.nvim_win_set_cursor(window, { last_row, 0 })
+        vim.api.nvim_win_call(window, function() vim.cmd("normal! $zb") end)
+      end
     end
   end
 
@@ -442,6 +438,15 @@ function M.open(options, callback)
   vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, { group = owner.group, callback = owner.resize })
   vim.api.nvim_create_autocmd({ "BufWinEnter", "BufWinLeave", "WinClosed" }, {
     group = owner.group, callback = function() vim.schedule(owner.refresh_views) end,
+  })
+  vim.api.nvim_create_autocmd({ "WinEnter", "BufEnter" }, {
+    group = owner.group, callback = function()
+      vim.schedule(function()
+        if alive() and owner.ready and vim.api.nvim_get_current_buf() ~= options.transcript_buffer then
+          owner.follow_tail()
+        end
+      end)
+    end,
   })
   for _, buffer in ipairs({ options.transcript_buffer, options.composer_buffer }) do
     vim.api.nvim_create_autocmd("BufWipeout", { group = owner.group, buffer = buffer, once = true,

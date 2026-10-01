@@ -237,7 +237,7 @@ impl PlanReviewDocument {
             let snapshot = BufferDocument::new(DocumentId(format!("plan:declarations:{}",uuid::Uuid::new_v4())),vec![forge_buffer::block::BufferBlock {
                 id:forge_buffer::identity::BlockId("declarations".into()),text:forge_buffer::text::BufferText::from_rows(presentation.text.lines())?,metadata:Default::default(),
             }])?.snapshot();
-            let filetype = forge_diff::syntax::DeclarationOverview::language(path).map(|language| language.name()).unwrap_or("text");
+            let filetype = forge_diff::syntax::DeclarationOverview::filetype(path);
             return Ok(serde_json::json!({"declarations":snapshot,"filetype":filetype}));
         }
         let callable = match &anchor.target {

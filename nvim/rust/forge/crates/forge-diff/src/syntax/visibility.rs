@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
 
 use super::declaration::{DeclarationOverview, declaration_surrogate};
-use crate::syntax::{SyntaxError, SyntaxLanguage};
+use crate::syntax::{ConfigurationFormat, SyntaxError, SyntaxLanguage};
 
 /// Classifies formatted declaration rows without changing saved declaration coordinates.
 pub struct DeclarationVisibility {
@@ -18,10 +18,15 @@ impl DeclarationVisibility {
     ///
     /// Public-only inspection includes public declarations and their attached documentation.
     ///
-    /// Rust restricted visibility is excluded. Trait members and enum variants inherit
+    /// Rust includes explicit public visibility, including crate and parent scopes.
+    /// Trait members and enum variants inherit
     /// their owner's visibility. TypeScript exports expose members except private and
     /// protected members. Lua exposes nonlocal bindings and the returned table.
     pub fn analyze(path: &str, text: &str, public_only: bool) -> Result<Self, SyntaxError> {
+        if ConfigurationFormat::for_path(path).is_some() {
+            DeclarationOverview::parse(path, text)?;
+            return Ok(Self { rows: vec![true; text.lines().count()], replacement: HashMap::new() });
+        }
         let language = DeclarationOverview::language(path)
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
         let surrogate = declaration_surrogate(language, text);
@@ -40,7 +45,7 @@ impl DeclarationVisibility {
         let mut visibility = Visibility {
             language,
             text: &surrogate,
-            rows: vec![!public_only || language == SyntaxLanguage::Toml; text.lines().count()],
+            rows: vec![!public_only; text.lines().count()],
             types: HashMap::new(),
             replacement: HashMap::new(),
             lines: text.lines().collect(),
@@ -48,7 +53,7 @@ impl DeclarationVisibility {
                 .lines()
                 .find_map(|line| line.trim().strip_prefix("return ").map(str::to_owned)),
         };
-        if public_only && language != SyntaxLanguage::Toml {
+        if public_only {
             visibility.collect_types(tree.root_node());
             visibility.group(tree.root_node(), Scope::Top);
         }
@@ -130,7 +135,7 @@ impl Visibility<'_> {
     fn public(&self, node: Node<'_>) -> bool {
         let mut cursor = node.walk();
         node.named_children(&mut cursor).any(|child| {
-            child.kind() == "visibility_modifier" && self.text[child.byte_range()].trim() == "pub"
+            child.kind() == "visibility_modifier"
         })
     }
 
@@ -437,12 +442,12 @@ impl Default for ArenaPlugin { fn default() -> Self; }";
             "derive",
             "Hidden",
             "secret",
-            "Restricted",
             "leaked",
         ] {
             assert!(!text.contains(private), "{text}");
         }
         for public in [
+            "pub(crate) struct Restricted",
             "pub struct Api",
             "pub value",
             "pub fn new",
@@ -453,6 +458,21 @@ impl Default for ArenaPlugin { fn default() -> Self; }";
             "impl Contract for Api",
         ] {
             assert!(text.contains(public), "{text}");
+        }
+    }
+
+    #[test]
+    fn scoped_public_owners_members_and_attachments_remain_visible() {
+        let source = "#[derive(Clone)]\n/// Crate state.\npub(crate) struct State { pub(super) value: u64, private: u64 }\nimpl State { pub(crate) fn new() -> Self; pub(super) fn update(&mut self); fn hidden(); }\npub(super) enum Phase { Ready, Done }\npub(crate) trait Contract { fn apply(&self); }\npub(super) fn configure();\nstruct Hidden;\nimpl Hidden { pub(crate) fn concealed(); }\n";
+        let text = visible("state.rs", source);
+        for retained in ["#[derive(Clone)]", "/// Crate state.", "pub(crate) struct State",
+            "pub(super) value", "impl State", "pub(crate) fn new", "pub(super) fn update",
+            "pub(super) enum Phase", "Ready", "Done", "pub(crate) trait Contract", "fn apply",
+            "pub(super) fn configure"] {
+            assert!(text.contains(retained), "missing {retained}: {text}");
+        }
+        for hidden in ["private:", "fn hidden", "struct Hidden", "fn concealed"] {
+            assert!(!text.contains(hidden), "exposed {hidden}: {text}");
         }
     }
 

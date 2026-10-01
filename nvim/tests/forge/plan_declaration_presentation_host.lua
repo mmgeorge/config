@@ -5,12 +5,21 @@ assert(vim.fn.mkdir(data, "p") == 1)
 local compact = table.concat({ "pub struct Registry { pub first: u64, pub second: u64, secret: u64 }",
   "#[derive(Debug, Clone)]", "pub struct ArenaPlugin { config: u64 }",
   "impl ArenaPlugin { pub fn new() -> Self; }",
-  "impl Default for ArenaPlugin { fn default() -> Self; }", "fn main();", "fn hidden_helper();" }, "\n")
+  "impl Default for ArenaPlugin { fn default() -> Self; }", "pub(crate) struct CrateState;", "pub(super) fn configure_parent();", "fn main();", "fn hidden_helper();" }, "\n")
 compact = "/// Registry keeps the published handles and exposes the shared declarations used by callers throughout the application.\n" .. compact
 vim.fn.writefile({ '{"declaration_line_width":60}' }, workspace .. "/.forge.json")
 vim.fn.writefile(vim.split(compact, "\n", { plain = true }), workspace .. "/src/change.rs")
 local manifest = '[package]\nname = "arena"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\nengine = { version = "1.2", default-features = false, features = ["render"] }\n'
 vim.fn.writefile(vim.split(manifest:gsub("\n$", ""), "\n", { plain = true }), workspace .. "/Cargo.toml")
+local configuration = {
+  ["package.json"] = '{"name":"arena","version":"0.1.0"}\n',
+  ["tsconfig.json"] = '{// Type checks\n"version":"0.1.0","compilerOptions":{"strict":true,},}\n',
+  ["ci.yaml"] = 'version: "0.1.0"\nscript: |\n  echo build\n',
+  ["App.csproj"] = '<Project Version="0.1.0"><PropertyGroup><TargetFramework>net9.0</TargetFramework></PropertyGroup></Project>\n',
+}
+for path, contents in pairs(configuration) do
+  vim.fn.writefile(vim.split(contents:gsub("\n$", ""), "\n", { plain = true }), workspace .. "/" .. path)
+end
 local initialized = vim.system({ "git", "init", workspace }, { text = true }):wait(10000)
 assert(initialized.code == 0, initialized.stderr)
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
@@ -52,6 +61,11 @@ local success, failure = xpcall(function()
   assert(document.design.baseline["Cargo.toml"].text == manifest, "manifest baseline lost values")
   assert(document.design.proposed["Cargo.toml"]:find('version = "0.2.0"', 1, true), "manifest proposal did not change")
   assert(bytes(workspace .. "/Cargo.toml") == manifest, "planning modified the project manifest")
+  for path, contents in pairs(configuration) do
+    assert(document.design.baseline[path].text == contents, "configuration baseline lost values: " .. path)
+    assert(document.design.proposed[path]:find('0.2.0', 1, true), "configuration proposal did not change: " .. path)
+    assert(bytes(workspace .. "/" .. path) == contents, "planning modified configuration: " .. path)
+  end
   assert(document.design.line_width == 60, "repository formatting width was not retained")
   for _, line in ipairs(vim.split(document.design.baseline["src/change.rs"].text, "\n", { plain = true })) do
     if line:match("^/// ") then assert(#line <= 60, "submitted prose did not wrap") end
@@ -67,13 +81,16 @@ local success, failure = xpcall(function()
   assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "full view did not abbreviate trait implementation")
   assert(not text(review.buf):find("fn default", 1, true), "full view exposed trait implementation members")
   assert(text(review.buf):find("pub fn new", 1, true), "full view hid inherent methods")
+  for path in pairs(configuration) do
+    assert(text(review.buf):find("Modified " .. path, 1, true), "configuration diff is missing: " .. path)
+  end
   assert(bytes(artifact_path) == artifact and bytes(plan.working_path) == projection, "opening rewrote the plan")
   local file_row, hunk_row, description_row, changes_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
     if line == "Description:" then description_row = row end
     if line == "Changes:" then changes_row = row end
     if line:find("Modified src/change.rs", 1, true) then file_row = row end
-    if line:find("@@", 1, true) then hunk_row = row end
+    if file_row and not hunk_row and line:find("@@", 1, true) then hunk_row = row end
   end
   assert(file_row and hunk_row and description_row and changes_row, "section or diff headers are missing")
   local function closed(row)
@@ -105,6 +122,35 @@ local success, failure = xpcall(function()
   vim.api.nvim_win_call(review.win, function() vim.cmd("normal! zc") end)
   assert(closed(hunk_row) == file_row, "native file folding left its first hunk visible")
   vim.api.nvim_win_call(review.win, function() vim.cmd("normal! zo") end)
+  local function public_key()
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<S-Tab>", true, false, true), "xt", false)
+  end
+  local function declaration_row(label)
+    for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+      if line:find(label, 1, true) then return row end
+    end
+    error("missing declaration: " .. label)
+  end
+  local function cursor_label()
+    local cursor = vim.api.nvim_win_get_cursor(review.win)
+    return vim.api.nvim_buf_get_lines(review.buf, cursor[1] - 1, cursor[1], false)[1], cursor[2]
+  end
+  vim.api.nvim_win_set_cursor(review.win, { declaration_row("pub fn new"), 18 })
+  public_key()
+  await(function() return review.public_only == true end, "cursor test did not hide private declarations")
+  local label, column = cursor_label()
+  assert(label:find("pub fn new", 1, true) and column == 18, "hiding private rows displaced a public declaration cursor")
+  public_key()
+  await(function() return review.public_only == false end, "cursor test did not expand private declarations")
+  label, column = cursor_label()
+  assert(label:find("pub fn new", 1, true) and column == 18, "expanding private rows displaced a public declaration cursor")
+  vim.api.nvim_win_set_cursor(review.win, { declaration_row("fn hidden_helper"), 18 })
+  public_key()
+  await(function() return review.public_only == true end, "cursor test did not hide private function")
+  label = cursor_label()
+  assert(label:find("pub fn reviewed_change", 1, true), "hidden private function did not select the nearest retained line")
+  public_key()
+  await(function() return review.public_only == false end, "cursor test did not restore complete view")
   local selected
   for row = 0, vim.api.nvim_buf_line_count(review.buf) - 1 do
     if vim.api.nvim_buf_get_lines(review.buf, row, row + 1, false)[1]:find("pub second:", 1, true) then selected = row break end
@@ -161,14 +207,18 @@ local success, failure = xpcall(function()
   vim.cmd("write")
   await(function() return not vim.bo[review.buf].modified end, "private comment did not save")
   local comments = bytes(annotation_path)
-  local function public_key()
-    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<S-Tab>", true, false, true), "xt", false)
-  end
   public_key()
   await(function() return review.public_only == true end, "Shift+Tab did not enable public visibility")
   assert(text(review.buf):find("Modified Cargo.toml", 1, true), "public filter hid manifest changes")
   assert(text(review.buf):find('version = "0.2.0"', 1, true), "public filter hid TOML values")
+  for path in pairs(configuration) do
+    assert(text(review.buf):find("Modified " .. path, 1, true), "public filter hid configuration: " .. path)
+  end
+  assert(text(review.buf):find('<Project Version="0.2.0">', 1, true), "public filter hid XML values")
+  assert(text(review.buf):find('"version":"0.2.0"', 1, true), "public filter hid JSON values")
   assert(text(review.buf):find("fn main();", 1, true), "public filter hid the binary entry point")
+  assert(text(review.buf):find("pub(crate) struct CrateState;", 1, true), "public filter hid crate visibility")
+  assert(text(review.buf):find("pub(super) fn configure_parent();", 1, true), "public filter hid parent visibility")
   assert(not text(review.buf):find("fn hidden_helper();", 1, true), "public filter exposed a private helper")
   assert(not text(review.buf):find("secret:", 1, true), "public filter exposed a private field")
   assert(text(review.buf):find(document.design.document.description, 1, true), "public filter hid change description")

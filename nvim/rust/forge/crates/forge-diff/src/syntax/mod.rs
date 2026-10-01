@@ -3,8 +3,10 @@
 mod assets;
 mod context;
 mod query;
+mod configuration;
 mod declaration;
 mod visibility;
+pub use configuration::ConfigurationFormat;
 pub use visibility::DeclarationVisibility;
 pub use declaration::{DeclarationOverview, DeclarationPosition, DeclarationPresentation};
 mod service;

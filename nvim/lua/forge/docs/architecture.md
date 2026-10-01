@@ -445,6 +445,14 @@ this document focused on architecture.
 
 ### Harness timeline ownership
 
+Transcript presentation follows the final row after updates whenever the current buffer is not
+the transcript. Focus, rather than the previous cursor row or row-count growth, controls automatic
+following. Leaving the transcript resumes following immediately. Focused transcript readers retain
+their cursor and viewport through the shared buffer view preservation, including snapshot recovery.
+Tail positioning reveals the end of wrapped final lines in every attached transcript window without
+changing focus. Explicit prompt submission and agent actions can request tail positioning directly.
+
+
 `client.lua` owns one persistent Forge JSONL process. Repository requests do not require Harness
 initialization. Harness requests and streamed events carry a durable session id, so the process routes
 independent turns without treating one session as globally active.
@@ -1800,12 +1808,12 @@ Declaration design records use schema 6. Older plan records are excluded from st
 and older document schemas fail validation. Planning no longer authors entities, flows, stages,
 or implementation tasks.
 
-Harness captures nonignored Git working-tree Rust, TypeScript, TSX, Lua, and TOML files. Tree-sitter
+Harness captures nonignored Git working-tree Rust, TypeScript, TSX, Lua, JSON/JSONC, TOML, YAML, and XML files. Tree-sitter
 language adapters extract immutable declaration baselines, complete signatures, fields, visibility,
 generics, imports, and documentation. They omit executable bodies and value initializers. Private
 members remain visible when changed. Lua function headers omit the closing `end`. TypeScript arrow
 bindings stop at `=>`. These overview files describe interfaces and do not claim compilation validity.
-TOML retains complete configuration values. Unsupported extensions remain outside this design representation.
+Configuration retains complete values. Unsupported extensions remain outside this design representation.
 
 `DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves
 inside Harness-owned `plans/<session>/<plan>/working.json`. The provider receives the plan identity,
@@ -1823,13 +1831,19 @@ source digests nor project files, and it does not create an extra model edit ver
 and submitted JSON retain the same formatted declaration text, so revision patches and comment
 coordinates address the reviewed declarations. Both submission entry points share this boundary.
 
-TOML manifests and configuration files share the virtual patch, submission, diff, navigation, and
-comment boundaries. Capture retains the complete file rather than stripping values. Syntax admission
-uses the bundled TOML grammar, and design validation uses the native TOML parser to reject duplicate
-keys and invalid configuration. Submission preserves exact TOML text, including multiline strings,
-without declaration reformatting. Public-only inspection retains every configuration row. Planning
-instructions require affected `Cargo.toml` edits for dependency, feature, package, workspace, and target
-changes. No configuration proposal writes project files before implementation.
+Configuration files share the virtual patch, submission, diff, navigation, and comment boundaries.
+`ConfigurationFormat` selects JSON/JSONC, TOML, YAML, and XML by extension, including XML project
+extensions. Capture and submission preserve exact complete text, including multiline strings,
+block scalars, comments, and CDATA. Public-only inspection retains every configuration row.
+Navigation maps display rows directly to saved rows. Native JSON, JSONC, TOML, and XML parsers
+validate admission, while the bundled YAML grammar checks YAML syntax. JSONC allows comments and
+trailing commas only for `.jsonc`, `tsconfig*.json`, `jsconfig*.json`, and `.vscode/` JSON paths.
+XML admission checks well-formedness without fetching external DTDs or validating application
+schemas. XML renders through the shared diff without syntax captures because Forge has no bundled
+XML highlighting grammar. Supported design paths are independent of highlighting availability.
+Planning instructions require affected manifest and configuration edits. No proposal writes project
+files before implementation. Root `plan.json` is reserved for virtual plan metadata and excluded
+from project capture. Nested `plan.json` remains ordinary JSON configuration.
 
 The repository's optional `.forge.json` key `declaration_line_width` selects an integer from 40
 through 240, defaulting to 80. Capture records the selected width in the design artifact, so a
@@ -1882,7 +1896,17 @@ empty file and hunk groups, and rebases fold endpoints to retained blocks. Struc
 visible fields compact to an empty body while retaining attributes and declaration spacing.
 File and hunk fold endpoints include comments attached to their final row. Diff ranges and
 counts continue to describe the full design. Saved declarations, navigation positions, and
-annotation storage remain unchanged. The filter resets when the review document closes.
+annotation storage remain unchanged. Rust public-only inspection includes explicit `pub` modifiers with crate, parent, and path scopes,
+including `pub(crate)` and `pub(super)`. Members remain subject to their owner's visibility.
+The filter resets when the review document closes.
+Plan review opts into shared buffer view retention for patches and replacement snapshots.
+Immediately before publication, `buffer_view` records each displaying window's block identity,
+row offset, byte column, and viewport. Retained declarations keep the cursor at that identity
+after filtering. Removed rows select the nearest retained row in the previous layout, with ties
+preferring the preceding row. Restoration clamps columns at UTF-8 boundaries, preserves the cursor's
+vertical viewport offset, and respects closed folds. Capturing at publication uses the latest
+cursor position rather than an earlier asynchronous action request.
+
 Opening a diff line
 displays the complete proposed or baseline overview rather than applying overview coordinates to
 implementation source. Inline annotations retain revision, file, baseline/proposed side, line, and

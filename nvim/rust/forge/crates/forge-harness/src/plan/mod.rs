@@ -1103,6 +1103,56 @@ mod test {
     }
 
     #[test]
+    fn configuration_changes_capture_validate_submit_and_render_with_saved_targets() {
+        let temporary = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(temporary.path()).status().unwrap().success());
+        let configurations = [
+            ("package.json", "{\"name\":\"before\"}\n", "{\"name\":\"after\"}\n", "{\"name\":}"),
+            ("tsconfig.json", "{\"strict\":false,}\n", "{// Checking\n\"strict\":true,}\n", "{\"strict\":true \"other\":false}"),
+            ("ci.yaml", "script: |\n  echo before\n", "script: |\n  echo after\n", "script: [unclosed"),
+            ("App.csproj", "<Project><Name>before</Name></Project>\n", "<Project><Name>after</Name></Project>\n", "<Project><Name></Project>"),
+        ];
+        for (path, baseline, _, _) in configurations {
+            fs::write(temporary.path().join(path), baseline).unwrap();
+        }
+        fs::write(temporary.path().join("plan.json"), "{\"project_setting\":true}").unwrap();
+        let mut design = DeclarationDesign::capture(temporary.path()).unwrap();
+        assert!(!design.baseline.contains_key("plan.json"));
+        for (path, baseline, proposed, invalid) in configurations {
+            assert_eq!(design.baseline[path].text, baseline);
+            let before = design.clone();
+            let invalid_patch = format!("*** Begin Patch\n*** Update File: {path}\n@@\n-{}\n+{invalid}\n*** End Patch", baseline.trim_end());
+            assert!(design.patch(&invalid_patch).is_err(), "{path}");
+            assert_eq!(design, before);
+            let removed = baseline.lines().map(|line| format!("-{line}")).collect::<Vec<_>>().join("\n");
+            let added = proposed.lines().map(|line| format!("+{line}")).collect::<Vec<_>>().join("\n");
+            design = design.patch(&format!("*** Begin Patch\n*** Update File: {path}\n@@\n{removed}\n{added}\n*** End Patch")).unwrap();
+        }
+        design = design.patch("*** Begin Patch\n*** Add File: settings.jsonc\n+{\"enabled\":true,}\n*** End Patch").unwrap();
+        design = design.patch("*** Begin Patch\n*** Delete File: settings.jsonc\n*** End Patch").unwrap();
+        assert!(!design.proposed.contains_key("settings.jsonc"));
+        design.document.description = "Update package metadata, type checks, CI, and the XML project.".into();
+        let mut document = document::test_fixture("plan", "Configuration");
+        document.design = Some(design);
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        store.write_working_document("session", "plan", &document).unwrap();
+        let (submitted, rendered, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        assert!(rendered.markdown.contains("Modified package.json"));
+        for public_only in [false, true] {
+            let (rows, targets) = design_review::project(&submitted, &Default::default(), &[], &Default::default(), None, &Default::default(), public_only).unwrap();
+            let text = rows.iter().flat_map(|row| row.text.wire_rows()).collect::<Vec<_>>().join("\n");
+            for (path, baseline, proposed, _) in configurations {
+                assert!(text.contains(path));
+                assert!(text.contains(proposed.lines().last().unwrap()));
+                assert!(targets.values().any(|anchor| matches!(&anchor.target, PlanReviewTarget::Declaration { path: target_path, side, .. } if target_path == path && side == "proposed")));
+                assert_eq!(fs::read_to_string(temporary.path().join(path)).unwrap(), baseline);
+                assert_eq!(submitted.design.as_ref().unwrap().proposed[path], proposed);
+            }
+        }
+        assert_eq!(store.capture_review_source("session", "plan", 1, &checksum).unwrap().document.design, submitted.design);
+    }
+
+    #[test]
     fn submission_formats_saved_snapshots_before_diffing_without_touching_source() {
         let temporary = tempfile::tempdir().unwrap();
         let source = "pub struct Registry { pub first: u64, pub second: u64 }\n";

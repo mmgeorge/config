@@ -95,7 +95,7 @@ impl DeclarationDesign {
             .filter(|path| !path.is_empty())
         {
             let path = std::str::from_utf8(bytes)?.replace('\\', "/");
-            if DeclarationOverview::language(&path).is_none() {
+            if path == PLAN_DOCUMENT_PATH || !DeclarationOverview::supports(&path) {
                 continue;
             }
             validate_path(&path)?;
@@ -158,9 +158,6 @@ impl DeclarationDesign {
             DeclarationOverview::parse(path, &file.text)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("validate baseline {path}"))?;
-            if DeclarationOverview::language(path) == Some(forge_diff::syntax::SyntaxLanguage::Toml) {
-                toml::from_str::<toml::Value>(&file.text).with_context(|| format!("validate TOML baseline {path}"))?;
-            }
             bytes += file.text.len();
         }
         for (path, text) in &self.proposed {
@@ -168,9 +165,6 @@ impl DeclarationDesign {
             DeclarationOverview::parse(path, text)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))
                 .with_context(|| format!("validate {path}"))?;
-            if DeclarationOverview::language(path) == Some(forge_diff::syntax::SyntaxLanguage::Toml) {
-                toml::from_str::<toml::Value>(text).with_context(|| format!("validate TOML {path}"))?;
-            }
             bytes += text.len();
             ensure!(
                 bytes <= 8 * 1024 * 1024,
@@ -437,8 +431,8 @@ fn validate_path(path: &str) -> Result<()> {
         "path escapes declaration proposal: {path}"
     );
     ensure!(
-        DeclarationOverview::language(path).is_some(),
-        "unsupported declaration path: {path}. Only .rs, .ts, .tsx, .lua, and .toml are supported."
+        DeclarationOverview::supports(path),
+        "unsupported declaration path: {path}. Supported files are .rs, .ts, .tsx, .lua, JSON/JSONC, TOML, YAML, and XML configuration."
     );
     Ok(())
 }
