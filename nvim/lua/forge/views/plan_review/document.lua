@@ -332,7 +332,7 @@ function M.attach(options, callback)
     if owner.add_pending or owner.focus_pending then return end
     local view = owner.current_view()
     if not view then return end
-    local layout_action = action == "comment" or action == "delete"
+    local layout_action = action == "comment" or action == "delete" or action == "toggle_public"
     if action == "delete" then
       local cursor = vim.api.nvim_win_get_cursor(view.window)
       local location = buffer.locate(owner.replica, cursor[1] - 1, cursor[2])
@@ -385,7 +385,7 @@ function M.attach(options, callback)
           vim.api.nvim_win_set_cursor(view.window, { math.max(1, line), 0 })
         end
       end
-      if current or action_error then receive(anchor, action_error, captured)
+      if current or action_error or action == "toggle_public" then receive(anchor, action_error, captured)
       else vim.schedule(owner.sync_focus) end
       owner.sync_editability()
     end)

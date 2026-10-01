@@ -145,6 +145,10 @@ impl PlanReviewStore {
             .snapshot();
             return Ok(serde_json::json!({"schema":snapshot}));
         }
+        if action == "toggle_public" {
+            document.validate_input(input)?;
+            return document.toggle_public();
+        }
         let column = input.position.column;
         let row = document
             .document
@@ -637,6 +641,26 @@ impl PlanReviewDocument {
         ensure!(input.target == target, "plan review input target changed");
         *sequence = input.sequence;
         Ok(target)
+    }
+
+    fn toggle_public(&mut self) -> Result<serde_json::Value> {
+        ensure!(self.source.document.design.is_some(), "public visibility requires a declaration design");
+        self.retain_annotation_revision();
+        let public_only = !self.source.public_only;
+        let (block, target) = super::design_review::project(
+            &self.source.document,
+            &self.width,
+            self.annotation.annotation(),
+            &self.annotation_revision,
+            None,
+            &self.source.declaration_syntax,
+            public_only,
+        )?;
+        let patch = self.document.edit(0..self.document.block_count(), block)?;
+        self.source.public_only = public_only;
+        self.focused_annotation = None;
+        self.target = target;
+        Ok(serde_json::json!({"patch":patch, "public_only":public_only}))
     }
 
     fn update_view(

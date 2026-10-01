@@ -665,7 +665,8 @@ impl Backend for MockBackend {
                 let path = "src/change.rs";
                 let design = document.design.as_ref().unwrap();
                 let patch = if let Some(text) = design.proposed.get(path) {
-                    format!("*** Begin Patch\n*** Update File: {path}\n@@\n-{}\n+pub fn reviewed_change();\n*** End Patch",text.trim())
+                    let removed = text.lines().map(|line| format!("-{line}\n")).collect::<String>();
+                    format!("*** Begin Patch\n*** Update File: {path}\n@@\n{removed}+pub fn reviewed_change();\n*** End Patch")
                 } else { format!("*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n*** End Patch") };
                 let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Design the requested change".into()) };
                 let proposed = document.patch_design(change.clone())?;

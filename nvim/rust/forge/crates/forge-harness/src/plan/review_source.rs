@@ -8,6 +8,7 @@ const SOURCE_CAPACITY: u64 = 8 * 1024 * 1024;
 
 pub(crate) struct PlanReviewSource {
     pub historical: bool,
+    pub public_only: bool,
     pub path: std::path::PathBuf,
     pub workspace: std::path::PathBuf,
     pub document: PlanDocument,
@@ -52,6 +53,7 @@ impl PlanFileStore {
             (saved, None)
         };
         Ok(PlanReviewSource {
+            public_only: false,
             historical: true,
             path: path.with_extension("md"),
             workspace: self.workspace.clone(),
@@ -115,6 +117,7 @@ impl PlanFileStore {
             None
         };
         Ok(PlanReviewSource {
+            public_only: false,
             historical: false,
             path: directory.join("working.md"),
             workspace: self.workspace.clone(),

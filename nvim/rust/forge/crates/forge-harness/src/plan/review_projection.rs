@@ -20,7 +20,7 @@ pub(crate) fn project(
     focused: Option<&str>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     if source.document.design.is_some() {
-        return super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax);
+        return super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax,source.public_only);
     }
     let rendered = MarkdownRenderer::source(
         BlockId("plan:markdown".into()),

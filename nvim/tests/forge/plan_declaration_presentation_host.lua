@@ -2,8 +2,11 @@ vim.loader.enable(false)
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace .. "/src", "p") == 1)
 assert(vim.fn.mkdir(data, "p") == 1)
-local compact = "pub struct Registry { pub first: u64, pub second: u64 }"
-vim.fn.writefile({ compact }, workspace .. "/src/change.rs")
+local compact = table.concat({ "pub struct Registry { pub first: u64, pub second: u64, secret: u64 }",
+  "#[derive(Debug, Clone)]", "pub struct ArenaPlugin { config: u64 }",
+  "impl ArenaPlugin { pub fn new() -> Self; }",
+  "impl Default for ArenaPlugin { fn default() -> Self; }" }, "\n")
+vim.fn.writefile(vim.split(compact, "\n", { plain = true }), workspace .. "/src/change.rs")
 local initialized = vim.system({ "git", "init", workspace }, { text = true }):wait(10000)
 assert(initialized.code == 0, initialized.stderr)
 local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
@@ -47,6 +50,9 @@ local success, failure = xpcall(function()
   await(function() return state.plan_review and state.plan_review.owner.ready end, "declaration review did not open")
   local review = state.plan_review
   assert(text(review.buf):find("  pub second: u64,", 1, true), "compact member did not receive display indentation")
+  assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "full view did not abbreviate trait implementation")
+  assert(not text(review.buf):find("fn default", 1, true), "full view exposed trait implementation members")
+  assert(text(review.buf):find("pub fn new", 1, true), "full view hid inherent methods")
   assert(bytes(artifact_path) == artifact and bytes(plan.working_path) == projection, "opening rewrote the plan")
   local file_row, hunk_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
@@ -104,6 +110,76 @@ local success, failure = xpcall(function()
   local annotation = vim.json.decode(bytes(annotation_path)).annotation[1]
   assert(annotation.anchor.start.side == "baseline" and annotation.anchor.start.line == 1, "comment retained a display line")
   assert(annotation.anchor.start.column > 20, "compact fields lost their distinct saved positions")
+  local private_row
+  for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if line:find("secret:", 1, true) then private_row = row - 1 break end
+  end
+  assert(private_row, "private field is missing from the complete view")
+  vim.api.nvim_win_set_cursor(review.win, { private_row + 1, 0 })
+  local private_comment
+  review.owner.action("comment", function(value, error_message)
+    assert(not error_message, error_message)
+    private_comment = value
+  end)
+  await(function() return private_comment end, "private comment did not attach")
+  local _, private_comment_row = review.owner.replica.sequence:position(private_comment.block)
+  vim.api.nvim_win_set_cursor(review.win, { private_comment_row + private_comment.row + 1, 0 })
+  review.owner.sync_editability()
+  vim.api.nvim_buf_set_text(review.buf, private_comment_row + private_comment.row, 0,
+    private_comment_row + private_comment.row, 0, { "Review the private field" })
+  vim.cmd("write")
+  await(function() return not vim.bo[review.buf].modified end, "private comment did not save")
+  local comments = bytes(annotation_path)
+  local function public_key()
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<S-Tab>", true, false, true), "xt", false)
+  end
+  public_key()
+  await(function() return review.public_only == true end, "Shift+Tab did not enable public visibility")
+  assert(not text(review.buf):find("secret:", 1, true), "public filter exposed a private field")
+  assert(text(review.buf):find("#[derive(Debug, Clone)]\npub struct ArenaPlugin {}", 1, true),
+    "empty public struct did not compact with its attributes")
+  assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "public view did not abbreviate trait implementation")
+  assert(not text(review.buf):find("fn default", 1, true), "public view exposed trait implementation members")
+  assert(text(review.buf):find("pub fn new", 1, true), "public view hid inherent methods")
+  assert(not text(review.buf):find("config:", 1, true), "empty public struct exposed private state")
+
+  assert(not text(review.buf):find("Review the private field", 1, true), "public filter exposed a private comment")
+  assert(text(review.buf):find("pub second:", 1, true) and text(review.buf):find("Review the second member", 1, true),
+    "public filter lost a public declaration or its comment")
+  local final_row
+  for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if line:find("pub fn reviewed_change", 1, true) then final_row = row - 1 break end
+  end
+  assert(final_row, "public callable is missing")
+  vim.api.nvim_win_set_cursor(review.win, { final_row + 1, 0 })
+  local final_comment
+  review.owner.action("comment", function(value, error_message)
+    assert(not error_message, error_message)
+    final_comment = value
+  end)
+  await(function() return final_comment end, "public-only comment did not attach")
+  local _, final_comment_row = review.owner.replica.sequence:position(final_comment.block)
+  vim.api.nvim_win_set_cursor(review.win, { final_comment_row + final_comment.row + 1, 0 })
+  review.owner.sync_editability()
+  vim.api.nvim_buf_set_text(review.buf, final_comment_row + final_comment.row, 0,
+    final_comment_row + final_comment.row, 0, { "Review the final callable" })
+  vim.cmd("write")
+  await(function() return not vim.bo[review.buf].modified end, "public-only comment did not save")
+  comments = bytes(annotation_path)
+  toggle(file_row)
+  assert(closed(hunk_row) == file_row, "public filtering broke file folding")
+  assert(closed(final_comment_row + 1) == file_row, "file fold exposed its final comment")
+  local label = vim.api.nvim_win_call(review.win, function() return vim.inspect(vim.fn.foldtextresult(file_row)) end)
+  assert(label:find("Modified src/change.rs", 1, true) and not label:find("@@", 1, true),
+    "public file fold label contains hunk contents")
+
+  toggle(file_row)
+  public_key()
+  await(function() return review.public_only == false end, "Shift+Tab did not restore complete visibility")
+  assert(text(review.buf):find("secret:", 1, true) and text(review.buf):find("Review the private field", 1, true),
+    "public filtering discarded private declarations or comments")
+  assert(bytes(annotation_path) == comments and bytes(artifact_path) == artifact
+    and bytes(plan.working_path) == projection, "visibility toggle changed persisted review data")
   review.command_set.action_by_id.close.run({})
   await(function() return state.plan_review == nil end, "review did not close")
   require("forge.views.plan_review").open(plan)

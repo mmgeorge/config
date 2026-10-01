@@ -1,9 +1,8 @@
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeSet, HashMap, HashSet};
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
-    BlockAnchor, BlockMetadata, BufferBlock, TargetRange, TextChunk, TextPosition,
-    TextRange,
+    BlockAnchor, BlockMetadata, BufferBlock, TargetRange, TextChunk, TextPosition, TextRange,
 };
 use forge_buffer::identity::{BlockId, EditSequence, FoldId, RegionRevision, TargetId};
 use forge_buffer::text::BufferText;
@@ -12,7 +11,7 @@ use forge_diff::display::RowKind;
 use forge_diff::file_header::FileChange;
 use forge_diff::patch::UnifiedPatch;
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
-use forge_diff::syntax::{DeclarationOverview, DeclarationPresentation};
+use forge_diff::syntax::{DeclarationOverview, DeclarationPresentation, DeclarationVisibility};
 
 use super::review_annotation::ReviewAnnotation;
 use super::{
@@ -20,7 +19,7 @@ use super::{
 };
 
 pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
-    let (block, navigation) = rows(document, &HashMap::new())?;
+    let (block, navigation, _) = rows(document, &HashMap::new(), false, false)?;
     let markdown = block
         .iter()
         .flat_map(|block| block.text.wire_rows())
@@ -39,10 +38,12 @@ pub(super) fn project(
     revision: &HashMap<String, (RegionRevision, EditSequence)>,
     focused: Option<&str>,
     syntax: &HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
+    public_only: bool,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
-    let (source, navigation) = rows(document, syntax)?;
+    let (source, navigation, hidden) = rows(document, syntax, public_only, true)?;
     let mut target = HashMap::new();
     let mut block = Vec::new();
+    let mut annotation_end = HashMap::new();
     for (index, mut row) in source.into_iter().enumerate() {
         if let Some(anchor) = navigation.resolve_line(index as u32 + 1) {
             let id = TargetId(format!("plan:declaration:row:{index}"));
@@ -55,18 +56,48 @@ pub(super) fn project(
             });
             target.insert(id, anchor.clone());
         }
+        let row_id = row.id.clone();
         block.push(row);
         for annotation in annotation
             .iter()
             .filter(|annotation| annotation.source.end_line == index as u32 + 1)
         {
-            block.push(super::review_projection::annotation_block(
+            let comment = super::review_projection::annotation_block(
                 annotation,
                 width,
                 focused == Some(annotation.id.as_str()),
                 revision.get(&annotation.id).copied().unwrap_or_default(),
-            )?);
+            )?;
+            annotation_end.insert(
+                row_id.clone(),
+                BlockAnchor {
+                    block: comment.id.clone(),
+                    position: TextPosition {
+                        row: comment.text.row_count(),
+                        column: 0,
+                    },
+                },
+            );
+            block.push(comment);
         }
+    }
+    for item in &mut block {
+        for fold in &mut item.metadata.fold {
+            if fold.end.position.row > 0
+                && let Some(end) = annotation_end.get(&fold.end.block)
+            {
+                fold.end = end.clone();
+            }
+        }
+    }
+    if public_only || !hidden.is_empty() {
+        block = public_blocks(block, &hidden)?;
+        let visible_target = block
+            .iter()
+            .flat_map(|block| &block.metadata.target)
+            .map(|range| range.id.clone())
+            .collect::<HashSet<_>>();
+        target.retain(|id, _| visible_target.contains(id));
     }
     Ok((block, target))
 }
@@ -74,12 +105,16 @@ pub(super) fn project(
 fn rows(
     document: &PlanDocument,
     syntax: &HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
-) -> Result<(Vec<BufferBlock>, PlanNavigationIndex)> {
+    public_only: bool,
+    inspection: bool,
+) -> Result<(Vec<BufferBlock>, PlanNavigationIndex, HashSet<BlockId>)> {
     let design = document
         .design
         .as_ref()
         .context("declaration review has no design")?;
     let mut patch = Vec::new();
+    let mut hidden = HashSet::new();
+    let mut visibility = HashMap::<(String, String), DeclarationVisibility>::new();
     let mut presentation = HashMap::<(String, String), DeclarationPresentation>::new();
     let destinations = design.moved.values().collect::<BTreeSet<_>>();
     for path in design.changed_paths() {
@@ -153,9 +188,23 @@ fn rows(
             )?;
         }
         if let Some(before) = before {
+            if inspection {
+                visibility.insert(
+                    (path.clone(), "baseline".into()),
+                    DeclarationVisibility::analyze(&path, &before.text, public_only)
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+                );
+            }
             presentation.insert((path.clone(), "baseline".into()), before);
         }
         if let Some(after) = after {
+            if inspection {
+                visibility.insert(
+                    (destination.clone(), "proposed".into()),
+                    DeclarationVisibility::analyze(destination, &after.text, public_only)
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+                );
+            }
             presentation.insert((destination.clone(), "proposed".into()), after);
         }
     }
@@ -247,18 +296,32 @@ fn rows(
                 } else {
                     ("proposed", path, row.new_line.unwrap())
                 };
+                let row_text = visibility
+                    .get(&(source_path.clone(), side.into()))
+                    .and_then(|visibility| visibility.replacement.get(&line))
+                    .map(String::as_str)
+                    .unwrap_or(row.text);
                 if let Some(handle) = syntax.get(&(source_path.clone(), side.into())) {
                     forge_diff::projection::append_syntax_row(
                         &mut metadata,
                         handle,
                         line,
                         0,
-                        row.text,
+                        row_text,
                     )?;
+                }
+                if inspection
+                    && !visibility
+                        .get(&(source_path.clone(), side.into()))
+                        .and_then(|visibility| visibility.rows.get(line))
+                        .copied()
+                        .unwrap_or(false)
+                {
+                    hidden.insert(BlockId(format!("{hunk_id}:row:{row_index}")));
                 }
                 block.push(BufferBlock {
                     id: BlockId(format!("{hunk_id}:row:{row_index}")),
-                    text: BufferText::from_rows([row.text])?,
+                    text: BufferText::from_rows([row_text])?,
                     metadata,
                 });
                 if row.kind == RowKind::Context {
@@ -277,7 +340,7 @@ fn rows(
                             baseline_path,
                             "baseline",
                             position,
-                            row.text,
+                            row_text,
                         ));
                     }
                 }
@@ -292,7 +355,7 @@ fn rows(
                         source_path,
                         side,
                         position,
-                        row.text,
+                        row_text,
                     ));
                 }
             }
@@ -321,7 +384,131 @@ fn rows(
         });
     }
     ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
-    Ok((block, navigation))
+    Ok((block, navigation, hidden))
+}
+
+fn public_blocks(
+    mut block: Vec<BufferBlock>,
+    hidden: &HashSet<BlockId>,
+) -> Result<Vec<BufferBlock>> {
+    let index: HashMap<_, _> = block
+        .iter()
+        .enumerate()
+        .map(|(index, block)| (block.id.clone(), index))
+        .collect();
+    let mut retained: Vec<_> = block
+        .iter()
+        .map(|block| !hidden.contains(&block.id))
+        .collect();
+    let mut public_count = vec![0usize];
+    for (index, block) in block.iter().enumerate() {
+        let declaration = retained[index]
+            && block.metadata.fold.is_empty()
+            && !block.id.0.starts_with("plan:annotation:")
+            && block
+                .text
+                .wire_rows()
+                .into_iter()
+                .any(|row| !row.trim().is_empty());
+        public_count.push(public_count.last().unwrap() + usize::from(declaration));
+    }
+    for (start, header) in block.iter().enumerate() {
+        for fold in &header.metadata.fold {
+            let end = *index
+                .get(&fold.end.block)
+                .context("public fold endpoint is missing")?;
+            let boundary = end + usize::from(fold.end.position.row > 0);
+            if public_count[boundary] == public_count[start + 1] {
+                retained[start] = false;
+            }
+        }
+    }
+    let mut owner = None;
+    for (position, item) in block.iter().enumerate() {
+        if item.id.0.starts_with("plan:annotation:") {
+            retained[position] &= owner.is_some_and(|owner: usize| retained[owner]);
+        } else {
+            owner = Some(position);
+        }
+    }
+    let mut blank = false;
+    for (position, item) in block.iter().enumerate() {
+        if !retained[position] {
+            continue;
+        }
+        let empty = item
+            .text
+            .wire_rows()
+            .iter()
+            .all(|row| row.trim().is_empty());
+        if empty && blank {
+            retained[position] = false;
+        }
+        blank = empty;
+    }
+    for (position, item) in block.iter().enumerate().rev() {
+        if !retained[position] {
+            continue;
+        }
+        if item
+            .text
+            .wire_rows()
+            .iter()
+            .all(|row| row.trim().is_empty())
+        {
+            retained[position] = false;
+        } else {
+            break;
+        }
+    }
+    let mut previous = Vec::with_capacity(block.len());
+    let mut last = None;
+    for (index, keep) in retained.iter().enumerate() {
+        if *keep {
+            last = Some(index);
+        }
+        previous.push(last);
+    }
+    let endpoint: Vec<_> = block
+        .iter()
+        .map(|block| BlockAnchor {
+            block: block.id.clone(),
+            position: TextPosition {
+                row: block.text.row_count(),
+                column: 0,
+            },
+        })
+        .collect();
+    for (start, header) in block.iter_mut().enumerate() {
+        if !retained[start] {
+            continue;
+        }
+        for fold in &mut header.metadata.fold {
+            let end = index[&fold.end.block];
+            let boundary = end + usize::from(fold.end.position.row > 0);
+            let last = boundary
+                .checked_sub(1)
+                .and_then(|end| previous[end])
+                .context("public fold has no retained endpoint")?;
+            fold.end = endpoint[last].clone();
+        }
+    }
+    let mut output: Vec<_> = block
+        .into_iter()
+        .zip(retained)
+        .filter_map(|(block, keep)| keep.then_some(block))
+        .collect();
+    if output.is_empty() {
+        output.push(forge_diff::projection::header(
+            BlockId("plan:design:public:empty".into()),
+            vec![TextChunk {
+                text: "No public declaration changes.".into(),
+                capture: "Comment".into(),
+            }],
+            0,
+        )?);
+    }
+    Ok(output)
 }
 
 fn declaration_anchor(
@@ -365,13 +552,7 @@ fn fold(block: &mut [BufferBlock], start: usize, id: &str) -> Result<()> {
             column: 0,
         },
     };
-    forge_diff::projection::fold_header(
-        &mut block[start],
-        FoldId(id.into()),
-        end,
-        false,
-        false,
-    );
+    forge_diff::projection::fold_header(&mut block[start], FoldId(id.into()), end, false, false);
     Ok(())
 }
 
@@ -382,6 +563,85 @@ fn pointer(path: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn public_filter_preserves_targets_folds_and_hidden_comment_storage() {
+        let mut document = crate::plan::document::test_fixture("public", "Visibility");
+        let mut design = super::super::DeclarationDesign::default();
+        design.proposed.insert(
+            "lib.rs".into(),
+            "pub struct Api { pub value: u64, secret: u64 }\nstruct Hidden;\n".into(),
+        );
+        document.design = Some(design);
+        let saved = serde_json::to_vec(&document).unwrap();
+        let rendered = render(&document).unwrap();
+        let private = rendered
+            .navigation
+            .anchor
+            .iter()
+            .find(|anchor| anchor.label.contains("secret:"))
+            .unwrap();
+        let annotation = ReviewAnnotation {
+            id: "private".into(),
+            anchor: None,
+            source: super::super::PlanAnnotationInput {
+                start_line: private.line,
+                end_line: private.line,
+                body: "Private field review".into(),
+            },
+        };
+        let (block, target) = project(
+            &document,
+            &WidthProfile::default(),
+            &[annotation],
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            true,
+        )
+        .unwrap();
+        let text = block
+            .iter()
+            .flat_map(|block| block.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("pub struct Api") && text.contains("pub value"));
+        assert!(
+            !text.contains("secret")
+                && !text.contains("Hidden")
+                && !text.contains("Private field review")
+        );
+        assert!(
+            target
+                .values()
+                .all(|anchor| !anchor.label.contains("secret") && !anchor.label.contains("Hidden"))
+        );
+        forge_buffer::document::BufferDocument::new(
+            forge_buffer::identity::DocumentId("public".into()),
+            block,
+        )
+        .unwrap();
+        assert_eq!(serde_json::to_vec(&document).unwrap(), saved);
+        document
+            .design
+            .as_mut()
+            .unwrap()
+            .proposed
+            .insert("lib.rs".into(), "struct Hidden;\n".into());
+        let (block, target) = project(
+            &document,
+            &WidthProfile::default(),
+            &[],
+            &HashMap::new(),
+            None,
+            &HashMap::new(),
+            true,
+        )
+        .unwrap();
+        assert_eq!(block.len(), 1);
+        assert_eq!(block[0].text.row(0), Some("No public declaration changes."));
+        assert!(target.is_empty());
+    }
 
     #[test]
     fn inspection_formats_both_sides_without_modifying_the_design() {
@@ -461,12 +721,22 @@ mod tests {
             &HashMap::new(),
             Some("review"),
             &HashMap::new(),
+            false,
         )
         .unwrap();
         assert!(block.iter().any(|block| !block.metadata.gutter.is_empty()));
-        let folded_header: Vec<_> = block.iter().filter(|block| !block.metadata.fold.is_empty()).collect();
+        let folded_header: Vec<_> = block
+            .iter()
+            .filter(|block| !block.metadata.fold.is_empty())
+            .collect();
         assert_eq!(folded_header.len(), 2);
-        assert!(folded_header[0].text.row(0).unwrap().starts_with("Modified src/lib.rs"));
+        assert!(
+            folded_header[0]
+                .text
+                .row(0)
+                .unwrap()
+                .starts_with("Modified src/lib.rs")
+        );
         assert!(folded_header[1].text.row(0).unwrap().starts_with("@@"));
         for header in folded_header {
             let fold = &header.metadata.fold[0];

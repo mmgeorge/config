@@ -4,6 +4,8 @@ mod assets;
 mod context;
 mod query;
 mod declaration;
+mod visibility;
+pub use visibility::DeclarationVisibility;
 pub use declaration::{DeclarationOverview, DeclarationPosition, DeclarationPresentation};
 mod service;
 mod tree;

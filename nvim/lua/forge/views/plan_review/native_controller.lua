@@ -196,11 +196,23 @@ local function rustdoc(review, result, captured, source)
   end
 end
 
+local function refresh_winbar(review)
+  local plan = review.plan
+  local detail = plan.historical_revision and ("Revision " .. plan.historical_revision .. " • historical • read-only")
+    or plan.state == "accepted" and "Accepted plan • read-only projection • C adds comments"
+    or "Awaiting review • read-only projection • C adds comments"
+  if review.public_only then detail = detail .. " • public only" end
+  keymaps.apply_view_winbar(review.win, "PlanReview", "plan_review", review.command_set, detail)
+end
+
 local function action(review, name)
   if review.plan.historical_revision and (name == "comment" or name == "delete") then return end
   review.owner.action(name, function(result, failure, captured)
     if failure then notice(failure) return end
-    if name == "comment" then
+    if name == "toggle_public" then
+      review.public_only = result.public_only
+      refresh_winbar(review)
+    elseif name == "comment" then
       local _, row = review.owner.replica.sequence:position(result.block)
       local view = review.owner.current_view()
       if row and view then
@@ -251,7 +263,7 @@ end
 local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review) end)
-  for _, name in ipairs({ "open", "comment", "delete" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({ "open", "comment", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
   command_set.register(set, "abort_plan", function()
     if not review.plan.historical_revision and session.harness.active_plan
@@ -324,10 +336,7 @@ function M.open(plan)
     local set = commands(review)
     review.command_set = set
     keymaps.setup_view_keymaps(native_buffer, "plan_review", set)
-    keymaps.apply_view_winbar(window, "PlanReview", "plan_review", set, plan.historical_revision
-      and ("Revision " .. plan.historical_revision .. " • historical • read-only")
-      or plan.state == "accepted" and "Accepted plan • read-only projection • C adds comments"
-      or "Awaiting review • read-only projection • C adds comments")
+    refresh_winbar(review)
     for _, warning in ipairs(plan.validation_warning or {}) do
       notifications.warn(("%s: %s"):format(warning.path or "Rust API", warning.message or "validation unavailable"), "PlanReview validation")
     end

@@ -269,6 +269,7 @@ M.defaults = {
     },
     plan_review = {
       toggle = "<Tab>",
+      toggle_public = "<S-Tab>",
       open = "<CR>",
       jump_entity = ".",
       entity_info = "ol",

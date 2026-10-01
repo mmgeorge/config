@@ -1837,6 +1837,14 @@ baseline and proposed positions, with proposed positions owning ordinary row act
 folds start open. PlanReview, ForgeStatus hunks, and Harness changes use the shared
 header-fold constructor. A closed file shows only its file header, and a closed hunk
 shows only its hunk header. PlanReview toggles headers through the shared Lua fold engine.
+Shift+Tab toggles public declaration visibility through a revision-validated layout action.
+Tree-sitter classifies visibility on both diff sides, including inherited trait and enum
+visibility. Filtering removes private rows and their comments from the projection, prunes
+empty file and hunk groups, and rebases fold endpoints to retained blocks. Structs with no
+visible fields compact to an empty body while retaining attributes and declaration spacing.
+File and hunk fold endpoints include comments attached to their final row. Diff ranges and
+counts continue to describe the full design. Saved declarations, navigation positions, and
+annotation storage remain unchanged. The filter resets when the review document closes.
 Opening a diff line
 displays the complete proposed or baseline overview rather than applying overview coordinates to
 implementation source. Inline annotations retain revision, file, baseline/proposed side, line, and

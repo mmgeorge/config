@@ -243,7 +243,7 @@ fn collect_tokens(
     }
 }
 
-fn declaration_surrogate(language: SyntaxLanguage, overview: &str) -> String {
+pub(super) fn declaration_surrogate(language: SyntaxLanguage, overview: &str) -> String {
     overview
         .lines()
         .map(|line| {
@@ -608,6 +608,19 @@ fn project_node(
                 }
             );
         }
+    }
+    if formatted && node.kind() == "ordered_field_declaration_list" {
+        let mut cursor = node.walk();
+        let mut position = node.start_byte() + 1;
+        let mut fields = Vec::new();
+        for child in node.children(&mut cursor) {
+            if child.kind() == "," || child.kind() == ")" {
+                let field = source[position..child.start_byte()].trim();
+                if !field.is_empty() { fields.push(flatten(field)); }
+                position = child.end_byte();
+            }
+        }
+        return format!("(\n{}\n)", fields.iter().map(|field| format!("{field},")).collect::<Vec<_>>().join("\n"));
     }
     if formatted
         && matches!(
