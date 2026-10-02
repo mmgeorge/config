@@ -178,12 +178,19 @@ impl HarnessService {
                 return controller.plan_review.insert(document, admission);
             }
             crate::buffer::session::PresentationRequest::PlanAction { input } => {
+                let trace = if input.action == "jump_entity" {
+                    crate::declaration::trace::DeclarationTrace::new(registry.runtime.trace(), &session_id, input)
+                } else { None };
+                let total = trace.as_ref().map(|trace| trace.stage("total", None));
                 if input.action == "jump_entity" {
-                    controller.plan_review.prepare_declaration_jump(input).await?;
+                    controller.plan_review.prepare_declaration_jump(input, trace.as_ref()).await?;
                 }
-                return Ok(serde_json::to_value(
-                    controller.plan_review.action(input.clone())?,
-                )?);
+                let stage = trace.as_ref().map(|trace| trace.stage("action", None));
+                let result = controller.plan_review.action(input.clone())?;
+                if let Some(stage) = stage { stage.complete(json!({})); }
+                let result = serde_json::to_value(result)?;
+                if let Some(stage) = total { stage.complete(json!({})); }
+                return Ok(result);
             }
             crate::buffer::session::PresentationRequest::PlanAddAnnotation { input, end } => {
                 return controller

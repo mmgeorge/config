@@ -3398,7 +3398,7 @@ Planning continuation: turn {} of {}.",
                     let formatted = design.formatted()?;
                     formatted.check_workspace(Path::new(&self.session.workspace))?;
                     *design = formatted;
-                    let mut resolver = crate::declaration::DeclarationResolver::prepare(Path::new(&self.session.workspace), design, false).await?;
+                    let mut resolver = crate::declaration::DeclarationResolver::prepare(Path::new(&self.session.workspace), design, false, None).await?;
                     let report = resolver.validate(design);
                     report.ensure_valid()?;
                     let warning = report.warnings();

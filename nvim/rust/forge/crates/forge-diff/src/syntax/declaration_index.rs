@@ -1,6 +1,7 @@
 //! Scope and reference extraction shared by declaration validation and navigation.
 
 use super::{DeclarationOverview, DeclarationPosition, SyntaxError, SyntaxLanguage};
+use std::time::{Duration, Instant};
 use tree_sitter::{Node, Parser};
 
 /// Accessibility attached to a declaration or re-export.
@@ -78,9 +79,24 @@ pub struct DeclarationIndex {
     pub type_reference: Vec<String>,
 }
 
+/// Separates parser work from the declaration walk without retaining source contents.
+#[derive(Default)]
+pub struct DeclarationIndexTiming {
+    pub parse: Duration,
+    pub extract: Duration,
+}
+
 impl DeclarationIndex {
     /// Parse exact source positions without formatting or discarding private declarations.
     pub fn extract(path: &str, source: &str) -> Result<Self, SyntaxError> {
+        Self::extract_timed(path, source).map(|(index, _)| index)
+    }
+
+    /// Return parser and declaration-walk durations for opt-in navigation profiling.
+    pub fn extract_timed(
+        path: &str,
+        source: &str,
+    ) -> Result<(Self, DeclarationIndexTiming), SyntaxError> {
         if source.len() > 8 * 1024 * 1024 {
             return Err(SyntaxError::MemoryLimit);
         }
@@ -92,11 +108,14 @@ impl DeclarationIndex {
         ) {
             return Err(SyntaxError::Language(path.into()));
         }
+        let started = Instant::now();
         let mut parser = Parser::new();
         parser
             .set_language(&language.grammar())
             .map_err(|error| SyntaxError::Query(error.to_string()))?;
         let tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
+        let parse = started.elapsed();
+        let started = Instant::now();
         let mut index = Self {
             incomplete: tree.root_node().has_error(),
             ..Self::default()
@@ -129,13 +148,14 @@ impl DeclarationIndex {
             source,
             language,
             &[],
+            "",
             false,
             false,
             false,
             &mut index,
             0,
         )?;
-        Ok(index)
+        Ok((index, DeclarationIndexTiming { parse, extract: started.elapsed() }))
     }
 }
 
@@ -197,6 +217,7 @@ fn walk(
     source: &str,
     language: SyntaxLanguage,
     scope: &[String],
+    attributes: &str,
     exported: bool,
     conditional: bool,
     global: bool,
@@ -208,7 +229,7 @@ fn walk(
     }
     let rust = language == SyntaxLanguage::Rust;
     let kind = node.kind();
-    let conditional = conditional || rust && preceding_attributes(node, source).contains("cfg");
+    let conditional = conditional || rust && attributes.contains("cfg");
     if matches!(
         kind,
         "block"
@@ -242,6 +263,7 @@ fn walk(
                 source,
                 language,
                 &[],
+                "",
                 false,
                 conditional,
                 true,
@@ -284,6 +306,7 @@ fn walk(
                 source,
                 language,
                 scope,
+                "",
                 kind == "export_statement",
                 conditional,
                 global,
@@ -302,6 +325,7 @@ fn walk(
                 source,
                 language,
                 scope,
+                "",
                 kind == "export_statement",
                 conditional,
                 global,
@@ -485,13 +509,12 @@ fn walk(
     }
     if kind == "mod_item" {
         if let Some(name) = name_node {
-            let preceding = preceding_attributes(node, source);
             index.module.push(DeclarationModule {
                 scope: scope.to_vec(),
                 name: contents(name, source).into(),
-                path: quoted_attribute(&preceding, "path"),
+                path: quoted_attribute(attributes, "path"),
                 inline: node.child_by_field_name("body").is_some(),
-                conditional: conditional || preceding.contains("cfg"),
+                conditional,
             });
         }
     }
@@ -559,10 +582,18 @@ fn walk(
         });
         return Ok(());
     }
-    let attributes = preceding_attributes(node, source);
-    let uncertain = conditional || rust && attributes.contains("cfg");
+    let mut preceding = String::new();
     let mut child_cursor = node.walk();
     for child in node.named_children(&mut child_cursor) {
+        match child.kind() {
+            "attribute_item" if rust => {
+                preceding.push_str(contents(child, source));
+                continue;
+            }
+            "line_comment" | "block_comment" | "comment" => continue,
+            _ => {}
+        }
+        let attributes = std::mem::take(&mut preceding);
         if name_node.is_some_and(|name| name.id() == child.id()) {
             continue;
         }
@@ -608,8 +639,9 @@ fn walk(
             source,
             language,
             child_scope,
+            &attributes,
             child_exported,
-            uncertain,
+            conditional,
             child_global,
             index,
             depth + 1,
@@ -618,34 +650,8 @@ fn walk(
     Ok(())
 }
 
-fn preceding_attributes(node: Node<'_>, source: &str) -> String {
-    let mut previous = node.prev_named_sibling();
-    let mut attributes = String::new();
-    while let Some(sibling) = previous {
-        if !matches!(
-            sibling.kind(),
-            "attribute_item" | "line_comment" | "block_comment"
-        ) {
-            break;
-        }
-        if sibling.kind() == "attribute_item" {
-            attributes.push_str(contents(sibling, source));
-        }
-        previous = sibling.prev_named_sibling();
-    }
-    attributes
-}
-
 fn synthetic_scope(node: Node<'_>, role: &str) -> String {
-    let mut ordinal = 0;
-    let mut previous = node.prev_named_sibling();
-    while let Some(sibling) = previous {
-        if sibling.kind() == node.kind() {
-            ordinal += 1;
-        }
-        previous = sibling.prev_named_sibling();
-    }
-    format!("@{role}:{ordinal}")
+    format!("@{role}:{}", node.start_byte())
 }
 
 fn rust_import(
@@ -835,6 +841,26 @@ fn typescript_import(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn documentation_runs_preserve_attributes_and_distinct_impl_scopes() {
+        let mut source = "//! Extensive library documentation.\n".repeat(1000);
+        source.push_str("#[cfg(feature = \"optional\")]\n/// Conditional model.\n#[path = \"other.rs\"]\npub mod optional;\n");
+        source.push_str("pub struct Store;\nimpl<T> Store { pub fn first(value: T); }\n");
+        source.push_str("impl<U> Store { pub fn second(value: U); }\n");
+        let index = DeclarationIndex::extract("lib.rs", &source).unwrap();
+        let module = index.module.iter().find(|module| module.name == "optional").unwrap();
+        assert_eq!(module.path.as_deref(), Some("other.rs"));
+        assert!(module.conditional);
+        assert!(!index.symbol.iter().find(|symbol| symbol.name == "Store").unwrap().conditional);
+        let first = index.symbol.iter().find(|symbol| symbol.name == "first").unwrap();
+        let second = index.symbol.iter().find(|symbol| symbol.name == "second").unwrap();
+        assert_ne!(first.scope, second.scope);
+        for (method, parameter) in [(first, "T"), (second, "U")] {
+            assert!(index.symbol.iter().any(|symbol| symbol.parameter && symbol.name == parameter
+                && symbol.scope == method.scope));
+        }
+    }
 
     #[test]
     fn rust_retains_scope_aliases_and_signature_references() {

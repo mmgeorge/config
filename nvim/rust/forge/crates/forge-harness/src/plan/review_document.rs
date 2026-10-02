@@ -119,37 +119,66 @@ impl PlanReviewStore {
     }
 
     /// Resolve snapshot declarations before acquiring external evidence for an unresolved jump.
-    pub(crate) async fn prepare_declaration_jump(&self, input: &DocumentInput) -> Result<()> {
+    pub(crate) async fn prepare_declaration_jump(&self, input: &DocumentInput, trace: Option<&crate::declaration::trace::DeclarationTrace>) -> Result<()> {
         let captured = {
+            let lock_stage = trace.map(|trace| trace.stage("review_lock", None));
             let store = self.document.lock()
                 .map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+            if let Some(stage) = lock_stage { stage.complete(serde_json::json!({})); }
             let (document, admission) = store.get(&input.document)
                 .context("plan review document is closed")?;
             admission.check()?;
             let target = document.check_input(input)?.context("plan review input has no source target")?;
             let Some(design) = &document.source.document.design else { return Ok(()); };
             if document.source.resolver.get().is_none() {
+                let stage = trace.map(|trace| trace.stage("prepare_local", None));
                 let proposed = crate::declaration::DeclarationResolver::local(&document.source.workspace, design, false)?;
                 let baseline = crate::declaration::DeclarationResolver::local(&document.source.workspace, design, true)?;
                 ensure!(document.source.resolver.set(Mutex::new((proposed, baseline))).is_ok(), "declaration resolver was already initialized");
+                if let Some(stage) = stage { stage.complete(serde_json::json!({})); }
+            }
+            {
+                let mut resolver = document.source.resolver.get().unwrap().lock()
+                    .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
+                resolver.0.trace = trace.cloned();
+                resolver.1.trace = trace.cloned();
+                resolver.0.enable_navigation_sources()?;
+                resolver.1.enable_navigation_sources()?;
             }
             let anchor = document.target.get(&target).context("plan review source target is missing")?;
             let row = document.document.block(&input.block).and_then(|block| block.text.row(input.position.row))
                 .context("plan review input row is missing")?;
-            if matches!(document.resolve_declaration(anchor, row, input.position.column)?,
+            let stage = trace.map(|trace| trace.stage("preflight", None));
+            let result = document.resolve_declaration(anchor, row, input.position.column)?;
+            if let Some(stage) = stage { stage.complete(serde_json::json!({"cached":document.source.resolver_sources.get().is_some(),"resolution":result})); }
+            if matches!(result,
                 crate::declaration::DeclarationResolution::Resolved { .. } | crate::declaration::DeclarationResolution::Intrinsic) {
                 return Ok(());
             }
             if document.source.resolver_sources.get().is_some() { return Ok(()); }
-            (Arc::clone(&document.source.resolver), Arc::clone(&document.source.resolver_sources), document.source.workspace.clone(), design.clone())
+            let resolver = document.source.resolver.get().unwrap().lock()
+                .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
+            let requires_fetch = resolver.0.requires_source_fetch() || resolver.1.requires_source_fetch();
+            if resolver.0.library_sources_checked() && resolver.1.library_sources_checked() && !requires_fetch { return Ok(()); }
+            (Arc::clone(&document.source.resolver), Arc::clone(&document.source.resolver_sources), document.source.workspace.clone(), design.clone(), requires_fetch)
         };
+        let stage = trace.map(|trace| trace.stage("prepare_external", None));
+        if !captured.4 {
+            let proposed = crate::declaration::DeclarationResolver::navigation(&captured.2, &captured.3, false, trace.cloned()).await?;
+            let baseline = crate::declaration::DeclarationResolver::navigation(&captured.2, &captured.3, true, trace.cloned()).await?;
+            *captured.0.get().context("declaration resolver is unavailable")?.lock()
+                .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))? = (proposed, baseline);
+            if let Some(stage) = stage { stage.complete(serde_json::json!({"cargo":false})); }
+            return Ok(());
+        }
         captured.1.get_or_try_init(|| async {
-            let proposed = crate::declaration::DeclarationResolver::prepare(&captured.2, &captured.3, false).await?;
-            let baseline = crate::declaration::DeclarationResolver::prepare(&captured.2, &captured.3, true).await?;
+            let proposed = crate::declaration::DeclarationResolver::prepare(&captured.2, &captured.3, false, trace.cloned()).await?;
+            let baseline = crate::declaration::DeclarationResolver::prepare(&captured.2, &captured.3, true, trace.cloned()).await?;
             *captured.0.get().context("declaration resolver is unavailable")?.lock()
                 .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))? = (proposed, baseline);
             Ok::<_, anyhow::Error>(())
         }).await?;
+        if let Some(stage) = stage { stage.complete(serde_json::json!({})); }
         Ok(())
     }
 
@@ -942,15 +971,15 @@ mod tests {
         review.insert(document, review.admit(input.document.clone()).unwrap()).unwrap();
         let mut stale = input.clone();
         stale.sequence = InputSequence(0);
-        assert!(review.prepare_declaration_jump(&stale).await.is_err());
+        assert!(review.prepare_declaration_jump(&stale, None).await.is_err());
         assert!(resolver.get().is_none(), "invalid input acquired sources");
-        review.prepare_declaration_jump(&input).await.unwrap();
+        review.prepare_declaration_jump(&input, None).await.unwrap();
         assert!(resolver.get().is_some(), "first jump did not acquire sources");
         assert!(review.document.lock().unwrap().get(&input.document).unwrap().0.source.resolver_sources.get().is_none(),
             "a local declaration jump acquired external sources");
         let resolved = review.action(input.clone()).unwrap();
         assert!(resolved["jump"].is_object(), "{resolved}");
-        assert!(review.prepare_declaration_jump(&input).await.is_err(), "superseded input was accepted");
+        assert!(review.prepare_declaration_jump(&input, None).await.is_err(), "superseded input was accepted");
         let (mut document, _admission) = review.document.lock().unwrap().remove(&input.document).unwrap();
         let select = |document:&PlanReviewDocument, needle:&str| {
             let snapshot = document.snapshot();
@@ -1098,7 +1127,7 @@ mod tests {
                     block:block.id.clone(), position:forge_buffer::block::TextPosition { row:0,column:block.text.row(0).unwrap().find("MovementInput").unwrap()+4 },
                     target:block.metadata.target.first().map(|target| target.id.clone()) }
             };
-            review.prepare_declaration_jump(&input).await.unwrap();
+            review.prepare_declaration_jump(&input, None).await.unwrap();
             let result = review.action(input).unwrap();
             let jump: forge_buffer::block::BlockAnchor = serde_json::from_value(result["jump"].clone()).unwrap();
             let store = review.document.lock().unwrap();

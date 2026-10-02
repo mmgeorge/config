@@ -85,15 +85,23 @@ pub(super) async fn prepare(resolver: &mut DeclarationResolver) -> Result<()> {
         }
     } else {
         match cargo_graph(resolver, &manifests).await {
-            Ok((graph, mirror)) => install_graph(resolver, graph, &mirror)?,
+            Ok((graph, mirror)) => {
+                let stage = resolver.trace.as_ref().map(|trace| trace.stage("index_dependencies", Some(resolver.baseline)));
+                install_graph(resolver, graph, &mirror)?;
+                if let Some(stage) = stage { stage.complete(resolver.statistics()); }
+            },
             Err(error) => {
                 resolver.warning.push(format!("Cargo dependency resolution is unavailable: {error:#}. External references remain unverified."));
                 install_project_fallback(resolver, &manifests)?;
             }
         }
     }
+    let stage = resolver.trace.as_ref().map(|trace| trace.stage("index_workspace", Some(resolver.baseline)));
     loose_project_files(resolver)?;
+    if let Some(stage) = stage { stage.complete(resolver.statistics()); }
+    let stage = resolver.trace.as_ref().map(|trace| trace.stage("standard_library", Some(resolver.baseline)));
     standard_library(resolver).await?;
+    if let Some(stage) = stage { stage.complete(resolver.statistics()); }
     Ok(())
 }
 
@@ -111,17 +119,24 @@ fn loose_project_files(resolver: &mut DeclarationResolver) -> Result<()> {
         .collect::<Vec<_>>();
     for path in paths {
         let identity = format!("unregistered:{path}");
-        let mut state = resolver
-            .package
-            .iter()
-            .filter(|(identity, _)| {
-                identity.as_str() != "std"
-                    && identity.as_str() != "core"
-                    && identity.as_str() != "alloc"
-            })
-            .map(|(_, package)| package.clone())
-            .next()
-            .unwrap_or_default();
+        let absolute = resolver.workspace.join(&path);
+        let owner = resolver.package.iter().filter(|(_, package)| {
+            package.source_manifest.as_ref().and_then(|path| path.parent())
+                .is_some_and(|directory| absolute.starts_with(directory))
+        }).max_by_key(|(_, package)| package.source_manifest.as_ref().unwrap().components().count());
+        let mut state = owner.map(|(_, package)| package.clone()).unwrap_or_default();
+        if let Some((package, state_owner)) = owner {
+            let manifest = state_owner.source_manifest.as_ref().unwrap();
+            if resolver.read(manifest.parent().unwrap().join("src/lib.rs").as_path()).is_some() {
+                if let Some(name) = resolver.read(manifest)
+                    .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
+                    .and_then(|manifest| manifest.get("lib").and_then(|library| library.get("name"))
+                        .or_else(|| manifest.get("package").and_then(|package| package.get("name")))
+                        .and_then(toml::Value::as_str).map(|name| name.replace('-', "_"))) {
+                    state.dependency.insert(name, package.clone());
+                }
+            }
+        }
         state.incomplete = true;
         resolver.package.insert(identity.clone(), state);
         resolver.load_rust(&resolver.workspace.join(path), &identity, &[], 0)?;
@@ -133,6 +148,7 @@ async fn cargo_graph(
     resolver: &DeclarationResolver,
     manifests: &[(String, String)],
 ) -> Result<(crate::rustdoc::SourceGraph, PathBuf)> {
+    let stage = resolver.trace.as_ref().map(|trace| trace.stage("cargo_graph", Some(resolver.baseline)));
     let identity = crate::plan::digest(
         serde_json::to_vec(&(
             resolver.workspace.to_string_lossy(),
@@ -148,6 +164,7 @@ async fn cargo_graph(
     let cached_graph = mirror.join("graph.json");
     if let Ok(bytes) = tokio::fs::read(&cached_graph).await {
         if let Ok(graph) = serde_json::from_slice(&bytes) {
+            if let Some(stage) = stage { stage.complete(serde_json::json!({"cached":true})); }
             return Ok((graph, mirror));
         }
     }
@@ -235,6 +252,7 @@ async fn cargo_graph(
         .args(["--color", "never"])
         .kill_on_drop(true);
     // Cargo owns its global registry/git cache. Only this isolated lockfile changes.
+    let metadata_stage = resolver.trace.as_ref().map(|trace| trace.stage("cargo_metadata", Some(resolver.baseline)));
     let output = tokio::time::timeout(Duration::from_secs(120), command.output())
         .await
         .context("Cargo declaration metadata exceeded 120 seconds")??;
@@ -243,8 +261,11 @@ async fn cargo_graph(
         "{}",
         String::from_utf8_lossy(&output.stderr).trim()
     );
+    if let Some(stage) = metadata_stage { stage.complete(serde_json::json!({"bytes":output.stdout.len()})); }
     tokio::fs::write(cached_graph, &output.stdout).await?;
-    Ok((serde_json::from_slice(&output.stdout)?, mirror))
+    let graph = serde_json::from_slice(&output.stdout)?;
+    if let Some(stage) = stage { stage.complete(serde_json::json!({"cached":false})); }
+    Ok((graph, mirror))
 }
 
 fn relocate_paths(value: &mut toml::Value, directory: &Path, workspace: &Path, mirror: &Path) {
@@ -317,7 +338,7 @@ fn install_graph(
         );
     }
     for package in &graph.packages {
-        // Install libraries first so a binary can import its package's library.
+        // Register libraries first so a binary can import its package's library.
         for target in package.targets.iter().filter(|target| {
             target
                 .kind
@@ -329,7 +350,14 @@ fn install_graph(
                 .strip_prefix(mirror)
                 .map(|relative| resolver.workspace.join(relative))
                 .unwrap_or(root);
-            resolver.load_rust(&root, &package.id, &[], 0)?;
+            if root.starts_with(&resolver.workspace) {
+                resolver.load_rust(&root, &package.id, &[], 0)?;
+            } else {
+                resolver.pending_module.insert(
+                    (package.id.clone(), Vec::new()),
+                    (root, false),
+                );
+            }
         }
     }
     for package in &graph.packages {
@@ -381,19 +409,11 @@ fn install_project_fallback(
         let identity = path.clone();
         let mut state = RustPackage {
             edition,
+            source_manifest: Some(normalize(&resolver.workspace.join(path))),
             ..Default::default()
         };
-        for section in ["dependencies", "dev-dependencies", "build-dependencies"] {
-            for alias in manifest
-                .get(section)
-                .and_then(toml::Value::as_table)
-                .into_iter()
-                .flat_map(|table| table.keys())
-            {
-                state
-                    .dependency
-                    .insert(alias.replace('-', "_"), format!("unavailable:{alias}"));
-            }
+        for alias in cache::dependency_aliases(&manifest) {
+            state.dependency.insert(alias.clone(), format!("unavailable:{alias}"));
         }
         resolver.package.insert(identity.clone(), state);
         let root = manifest
@@ -413,12 +433,14 @@ fn install_project_fallback(
     Ok(())
 }
 
-async fn standard_library(resolver: &mut DeclarationResolver) -> Result<()> {
+pub(super) async fn standard_library(resolver: &mut DeclarationResolver) -> Result<()> {
+    resolver.library_checked = true;
     let mut command = Command::new("rustc");
     command
         .current_dir(&resolver.workspace)
         .args(["--print", "sysroot"])
         .kill_on_drop(true);
+    let stage = resolver.trace.as_ref().map(|trace| trace.stage("rustc_sysroot", Some(resolver.baseline)));
     let result = tokio::time::timeout(Duration::from_secs(10), command.output()).await;
     let sysroot = match result {
         Ok(Ok(output)) if output.status.success() => {
@@ -426,6 +448,7 @@ async fn standard_library(resolver: &mut DeclarationResolver) -> Result<()> {
         }
         _ => PathBuf::new(),
     };
+    if let Some(stage) = stage { stage.complete(serde_json::json!({"available":!sysroot.as_os_str().is_empty()})); }
     let library = sysroot.join("lib/rustlib/src/rust/library");
     if !library.join("core/src/lib.rs").is_file() {
         resolver.warning.push("rust-src is unavailable for this workspace toolchain. Run `rustup component add rust-src` in the workspace. Standard-library and prelude checks are disabled.".into());
@@ -442,7 +465,10 @@ async fn standard_library(resolver: &mut DeclarationResolver) -> Result<()> {
                 ..Default::default()
             },
         );
-        resolver.load_rust(&library.join(name).join("src/lib.rs"), name, &[], 0)?;
+        resolver.pending_module.insert(
+            (name.into(), Vec::new()),
+            (library.join(name).join("src/lib.rs"), false),
+        );
     }
     resolver.rust_library = true;
     Ok(())

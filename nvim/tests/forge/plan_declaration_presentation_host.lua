@@ -283,6 +283,13 @@ local success, failure = xpcall(function()
   jump_to_snapshot("pub fn inspect_hidden", "HiddenState")
   public_key()
   await(function() return review.public_only == false end, "hidden-type test did not restore")
+  local trace_status
+  client.request_for(review.session_id, "trace.configure", { enabled = true }, function(result, failure)
+    assert(not failure, tostring(failure))
+    trace_status = result
+  end)
+  await(function() return trace_status ~= nil end, "jump logging did not enable")
+  assert(trace_status.enabled and type(trace_status.path) == "string", "trace status omitted its session log")
   local engine_row = declaration_row("pub fn engine_handle")
   local engine_text = vim.api.nvim_buf_get_lines(review.buf, engine_row - 1, engine_row, false)[1]
   vim.api.nvim_win_set_cursor(review.win, { engine_row, engine_text:find("::Engine", 1, true) + 4 })
@@ -324,6 +331,32 @@ local success, failure = xpcall(function()
     public_key()
     await(function() return review.public_only == false end, "Bevy test did not restore visibility")
   end
+  local phases, resolve_count, total_count = {}, 0, 0
+  for _, line in ipairs(vim.fn.readfile(trace_status.path)) do
+    local record = vim.json.decode(line)
+    if record.event == "declaration.jump" and record.payload.status == "completed" then
+      local payload = record.payload
+      assert(type(payload.duration_ms) == "number" and payload.duration_ms >= 0, "jump phase omitted elapsed time")
+      assert(payload.document and payload.sequence and payload.view, "jump phase lost its input identity")
+      phases[payload.phase] = true
+      if payload.phase == "resolve" then
+        resolve_count = resolve_count + 1
+        assert(type(payload.member_calls) == "number" and type(payload.glob_branches) == "number"
+          and type(payload.files) == "number" and type(payload.loaded_files) == "number", "jump omitted resolution work counts")
+        assert(type(payload.resolution) == "table", "jump omitted its resolution outcome")
+      elseif payload.phase == "index_file" and payload.available then
+        assert(type(payload.path) == "string" and type(payload.bytes) == "number"
+          and type(payload.cached) == "boolean", "file indexing omitted its source identity")
+        for _, field in ipairs({ "read_ms", "parse_ms", "extract_ms", "load_ms" }) do
+          assert(type(payload[field]) == "number" and payload[field] >= 0, "file indexing omitted " .. field)
+        end
+      elseif payload.phase == "total" then total_count = total_count + 1 end
+    end
+  end
+  assert(phases.preflight and phases.cached_dependency and phases.index_file and phases.action
+    and total_count > 0 and resolve_count >= 2, "dependency jump omitted cached-source and resolution timings")
+  assert(not phases.cargo_metadata, "cached dependency navigation invoked Cargo metadata")
+  print("declaration.jump trace verified: " .. trace_status.path)
   local attribute_row = declaration_row("#[derive(Facet,")
   assert(closed(enum_row) == enum_row, "Rust enum did not start collapsed")
   toggle(attribute_row)

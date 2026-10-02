@@ -192,7 +192,7 @@ impl ControlToolRuntime {
                     let mut design = design.formatted()?;
                     let workspace = self.context.workspace_root.as_deref().context("design submission has no workspace root")?;
                     design.check_workspace(workspace)?;
-                    let mut resolver = crate::declaration::DeclarationResolver::prepare(workspace, &design, false).await?;
+                    let mut resolver = crate::declaration::DeclarationResolver::prepare(workspace, &design, false, None).await?;
                     let report = resolver.validate(&design);
                     report.ensure_valid()?;
                     let warning = report.warnings();

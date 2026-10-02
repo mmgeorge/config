@@ -7,7 +7,7 @@ mod configuration;
 mod declaration;
 mod declaration_fold;
 mod declaration_index;
-pub use declaration_index::{DeclarationIndex, DeclarationImport, DeclarationModule, DeclarationReference, DeclarationSymbol, SymbolVisibility};
+pub use declaration_index::{DeclarationIndex, DeclarationIndexTiming, DeclarationImport, DeclarationModule, DeclarationReference, DeclarationSymbol, SymbolVisibility};
 pub use declaration_fold::{DeclarationFold, DeclarationFolding};
 mod visibility;
 pub use configuration::ConfigurationFormat;

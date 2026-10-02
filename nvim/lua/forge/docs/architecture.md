@@ -1907,13 +1907,36 @@ PlanReview reuses `forge-diff` hunk generation, unified patch parsing, file head
 diff gutters, and tree-sitter syntax decorations. Opening adopts a generated loading buffer with a
 PlanReview winbar before requesting the snapshot, without displaying or parsing the saved Markdown
 projection. Declaration jumps first resolve against captured project declarations. Only unresolved
-jumps acquire dependency and standard-library sources, once per review, independently of opening
-and highlighting. Local bindings and explicit imports take precedence over wildcard imports.
+jumps discover dependency and standard-library sources independently of opening and highlighting.
+Navigation reads manifest aliases and selects the highest compatible cached registry version,
+without consulting Cargo.lock or invoking Cargo metadata. It follows renamed, path, inherited
+workspace, and target-specific dependency declarations as each alias is reached. Missing reached
+sources and unsupported source kinds request Cargo acquisition through the isolated metadata
+mirror. Unreached dependencies do not trigger acquisition. Exact submission validation continues
+to use Cargo's resolved graph. Captured project roots remain indexed immediately. Dependency and
+standard-library roots use the same pending-module lookup as their children, so only modules
+reached by navigation or validation are parsed. Loaded indexes remain available for subsequent
+lookups within the review. Each Rust scope selects its owning file through the module map rather
+than scanning every indexed file in the crate. Wildcard lookup retains ambiguity checks across
+all applicable branches. Local bindings and explicit imports take precedence over wildcard imports.
 Rust re-export paths resolve names in their containing module before dependency or crate-root
 lookup. Navigation follows facade crates and nested wildcard re-exports to the defining source.
 One concrete destination remains navigable when other branches lack evidence. Multiple concrete
 destinations remain ambiguous. Submission validation retains uncertainty from incomplete branches,
 and conditional compilation remains unverified without evaluating feature gates.
+With Harness `/log on`, declaration jumps append correlated `declaration.jump` start and completion
+records to the existing session log. Phases separate review-lock acquisition, local preparation,
+preflight resolution, external preparation, Cargo graph cache or metadata, dependency indexing,
+standard-library acquisition, and the final action. Resolver records retain source file and byte
+counts, parse-cache hits and misses, wildcard branches, member calls, traversal depth, cycle stops,
+and the destination or unresolved outcome. Per-file records identify the source path, module,
+byte count, cache outcome, read duration, parser duration, and declaration-extraction duration.
+Resolver aggregates also measure child-module path probes separately from indexed file reads.
+Cached-dependency records identify the alias, cache outcome, and need for source acquisition.
+Declaration extraction carries outer attributes forward while walking siblings, and uses source
+positions to distinguish anonymous scopes. Neither operation rescans preceding documentation
+or sibling declarations.
+Interrupted phases retain their elapsed time on errors or cancellation. Logging changes no lookup rules and emits no notifications or review sections.
 Validation evidence remains internal to submission and is omitted from review sections and
 warning notifications.
 Automatic comment-focus requests wait for navigation responses so they cannot supersede a jump.

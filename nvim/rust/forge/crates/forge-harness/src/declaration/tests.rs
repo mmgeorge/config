@@ -511,9 +511,14 @@ async fn cargo_acquires_reusable_graph_without_touching_workspace() {
     let fixture = tempfile::tempdir().unwrap();
     let workspace = fixture.path().join("app");
     let dependency = fixture.path().join("engine");
+    let unused = fixture.path().join("unused");
     std::fs::create_dir_all(workspace.join("src")).unwrap();
     std::fs::create_dir_all(dependency.join("src")).unwrap();
-    let manifest = "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nengine={package='engine-core',path='../engine'}\n";
+    std::fs::create_dir_all(unused.join("src")).unwrap();
+    std::fs::write(unused.join("Cargo.toml"),
+        "[package]\nname='unused'\nversion='0.1.0'\nedition='2024'\n").unwrap();
+    std::fs::write(unused.join("src/lib.rs"), "pub struct Unrelated;\n").unwrap();
+    let manifest = "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nengine={package='engine-core',path='../engine'}\nunused={path='../unused'}\n";
     std::fs::write(workspace.join("Cargo.toml"), manifest).unwrap();
     std::fs::write(
         dependency.join("Cargo.toml"),
@@ -533,19 +538,31 @@ async fn cargo_acquires_reusable_graph_without_touching_workspace() {
             "use engine::Position;\npub struct Api { pub position: Position }\n",
         ),
     ]);
-    let mut resolver = DeclarationResolver::prepare(&workspace, &design, false)
+    let mut resolver = DeclarationResolver::prepare(&workspace, &design, false, None)
         .await
         .unwrap();
-    let report = resolver.validate(&design);
-    assert!(
-        report.diagnostic.iter().all(|diagnostic| !diagnostic.error),
-        "{report:?}"
-    );
+    for root in [&dependency, &unused] {
+        assert!(!resolver.file.contains_key(&normalize(&root.join("src/lib.rs"))),
+            "preparation eagerly indexed external source: {}", root.display());
+    }
     let result = resolver.at("src/lib.rs", 2, 32);
     assert!(
         matches!(result, DeclarationResolution::Resolved { ref destination } if destination.path.ends_with("model.rs") && !destination.proposed),
         "{result:?}"
     );
+    assert!(resolver.file.contains_key(&normalize(&dependency.join("src/lib.rs"))),
+        "navigation did not index the referenced dependency root");
+    assert!(resolver.file.contains_key(&normalize(&dependency.join("src/model.rs"))),
+        "navigation did not follow the re-export to its defining module");
+    assert!(!resolver.file.contains_key(&normalize(&unused.join("src/lib.rs"))),
+        "navigation indexed an unrelated dependency");
+    let loaded = resolver.file.len();
+    assert_eq!(resolver.at("src/lib.rs", 2, 32), result);
+    assert_eq!(resolver.file.len(), loaded, "a repeated jump reloaded dependency sources");
+    let report = resolver.validate(&design);
+    assert!(report.diagnostic.iter().all(|diagnostic| !diagnostic.error), "{report:?}");
+    assert!(!resolver.file.contains_key(&normalize(&unused.join("src/lib.rs"))),
+        "validation indexed an unrelated dependency");
     assert_eq!(
         std::fs::read_to_string(workspace.join("Cargo.toml")).unwrap(),
         manifest
@@ -553,7 +570,7 @@ async fn cargo_acquires_reusable_graph_without_touching_workspace() {
     assert!(!workspace.join("Cargo.lock").exists());
     // Subsequent checkout edits must not change the captured dependency graph.
     std::fs::write(workspace.join("Cargo.lock"), "invalid checkout lockfile").unwrap();
-    let mut reused = DeclarationResolver::prepare(&workspace, &design, false)
+    let mut reused = DeclarationResolver::prepare(&workspace, &design, false, None)
         .await
         .unwrap();
     assert_eq!(reused.at("src/lib.rs", 2, 32), result);
@@ -612,7 +629,7 @@ async fn bevy_prelude_navigation_reaches_resource_definitions() {
             "use bevy::prelude::*;\npub struct MovementInput;\npub fn update(shared: Res<MovementInput>, unique: ResMut<MovementInput>);\n",
         ),
     ]);
-    let mut resolver = DeclarationResolver::prepare(workspace.path(), &design, false)
+    let mut resolver = DeclarationResolver::prepare(workspace.path(), &design, false, None)
         .await
         .unwrap();
     for (name, column) in [("Res", 22), ("ResMut", 50)] {
@@ -626,4 +643,81 @@ async fn bevy_prelude_navigation_reaches_resource_definitions() {
     }
     assert!(!workspace.path().join("Cargo.toml").exists());
     assert!(!workspace.path().join("Cargo.lock").exists());
+}
+
+#[test]
+fn cached_navigation_prefers_latest_compatible_patch_and_follows_manifest_aliases() {
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("app");
+    let cargo = fixture.path().join("cargo");
+    let registry = cargo.join("registry/src/test-registry");
+    std::fs::create_dir_all(&workspace).unwrap();
+    for (name, version, manifest, source) in [
+        ("engine-core", "0.19.1", "", "pub struct Outdated;\n"),
+        ("engine-core", "0.19.8", "[dependencies]\nmodel={package='model-types',version='0.19'}\n", "pub use model::Position;\n"),
+        ("engine-core", "0.20.0", "", "pub struct Incompatible;\n"),
+        ("model-types", "0.19.4", "", "pub struct Position;\n"),
+        ("unused", "0.1.0", "", "pub struct Unrelated;\n"),
+    ] {
+        let directory = registry.join(format!("{name}-{version}"));
+        std::fs::create_dir_all(directory.join("src")).unwrap();
+        std::fs::write(directory.join("Cargo.toml"), format!("[package]\nname='{name}'\nversion='{version}'\nedition='2024'\n{manifest}")).unwrap();
+        std::fs::write(directory.join("src/lib.rs"), source).unwrap();
+    }
+    let manifest = "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nengine={package='engine-core',version='0.19'}\nunused='9.9'\n";
+    let design = design(&[("Cargo.toml", manifest), ("src/lib.rs", "use engine::Position;\npub fn update(position: Position);\n")]);
+    std::fs::write(workspace.join("Cargo.lock"), "invalid lockfile must not block cached navigation").unwrap();
+    let mut resolver = DeclarationResolver::local(&workspace, &design, false).unwrap();
+    resolver.source_cache = Some(cache::RustSourceCache::new(cargo.clone()));
+    let result = resolver.at("src/lib.rs", 2, 24);
+    assert!(matches!(result, DeclarationResolution::Resolved { ref destination }
+        if destination.name == "Position" && destination.path.contains("model-types-0.19.4")), "{result:?}");
+    assert!(resolver.file.keys().any(|path| path.to_string_lossy().contains("engine-core-0.19.8")));
+    assert!(!resolver.file.keys().any(|path| path.to_string_lossy().contains("engine-core-0.19.1")
+        || path.to_string_lossy().contains("engine-core-0.20.0") || path.to_string_lossy().contains("unused-")));
+    assert!(!resolver.requires_source_fetch(), "unreached dependencies requested Cargo acquisition");
+    assert!(!cargo.join("forge-declarations").exists(), "cached navigation prepared a Cargo metadata mirror");
+    let loaded = resolver.file.len();
+    assert_eq!(resolver.at("src/lib.rs", 2, 24), result);
+    assert_eq!(resolver.file.len(), loaded);
+    assert_eq!(std::fs::read_to_string(workspace.join("Cargo.lock")).unwrap(), "invalid lockfile must not block cached navigation");
+}
+
+#[test]
+fn cached_navigation_respects_exact_versions_workspace_paths_and_missing_sources() {
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("app");
+    let model = fixture.path().join("model");
+    std::fs::create_dir_all(workspace.join("src")).unwrap();
+    std::fs::create_dir_all(model.join("src")).unwrap();
+    std::fs::write(model.join("Cargo.toml"), "[package]\nname='model-types'\nversion='0.1.0'\nedition='2024'\n").unwrap();
+    std::fs::write(model.join("src/lib.rs"), "pub struct Position;\n").unwrap();
+    let incompatible = fixture.path().join("cargo/registry/src/test-registry/missing-0.19.8");
+    std::fs::create_dir_all(incompatible.join("src")).unwrap();
+    std::fs::write(incompatible.join("Cargo.toml"), "[package]\nname='missing'\nversion='0.19.8'\nedition='2024'\n").unwrap();
+    std::fs::write(incompatible.join("src/lib.rs"), "pub struct Unknown;\n").unwrap();
+    let design = design(&[("Cargo.toml", "[workspace]\n[workspace.dependencies]\nmodel={package='model-types',path='../model'}\n[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nmodel={workspace=true}\nmissing='=0.19.1'\n"),
+        ("src/lib.rs", "pub fn update(position: model::Position);\npub fn other(value: missing::Unknown);\n")]);
+    let mut resolver = DeclarationResolver::local(&workspace, &design, false).unwrap();
+    resolver.source_cache = Some(cache::RustSourceCache::new(fixture.path().join("cargo")));
+    let result = resolver.at("src/lib.rs", 1, 27);
+    assert!(matches!(result, DeclarationResolution::Resolved { ref destination } if destination.name == "Position"), "{result:?}");
+    assert!(!resolver.requires_source_fetch());
+    let missing = resolver.at("src/lib.rs", 2, 29);
+    assert!(matches!(missing, DeclarationResolution::Unverified { .. }), "{missing:?}");
+    assert!(resolver.requires_source_fetch());
+}
+
+#[test]
+fn cached_navigation_binary_can_use_its_package_library() {
+    let root = tempfile::tempdir().unwrap();
+    let design = design(&[("Cargo.toml", "[package]\nname='arena'\nversion='0.1.0'\nedition='2024'\n"),
+        ("src/lib.rs", "pub struct Game;\n"),
+        ("src/main.rs", "use arena::Game;\nfn main(game: Game);\n")]);
+    let mut resolver = DeclarationResolver::local(root.path(), &design, false).unwrap();
+    resolver.source_cache = Some(cache::RustSourceCache::new(root.path().join("cargo")));
+    let result = resolver.at("src/main.rs", 2, 15);
+    assert!(matches!(result, DeclarationResolution::Resolved { ref destination }
+        if destination.path.ends_with("lib.rs") && destination.name == "Game"), "{result:?}");
+    assert!(!resolver.requires_source_fetch());
 }

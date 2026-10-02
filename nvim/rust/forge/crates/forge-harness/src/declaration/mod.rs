@@ -1,6 +1,8 @@
 //! Resolves declaration references once for validation and source navigation.
 
 mod sources;
+mod cache;
+pub(crate) mod trace;
 #[cfg(test)]
 mod tests;
 mod typescript;
@@ -8,7 +10,7 @@ mod typescript;
 use crate::plan::DeclarationDesign;
 use anyhow::{Context, Result};
 use forge_diff::syntax::{
-    DeclarationIndex, DeclarationPosition, DeclarationReference, DeclarationSymbol,
+    DeclarationIndex, DeclarationIndexTiming, DeclarationPosition, DeclarationReference, DeclarationSymbol,
     SymbolVisibility,
 };
 use schemars::JsonSchema;
@@ -16,6 +18,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
+use std::time::Instant;
 
 /// A resolved declaration in the proposal or an exact source file.
 #[derive(Clone, Debug, Deserialize, Serialize, JsonSchema, Eq, PartialEq)]
@@ -126,6 +129,7 @@ struct IndexedFile {
 #[derive(Clone, Default)]
 struct RustPackage {
     edition: String,
+    source_manifest: Option<PathBuf>,
     dependency: HashMap<String, String>,
     incomplete: bool,
     no_std: bool,
@@ -173,7 +177,29 @@ pub(crate) struct DeclarationResolver {
     warning: Vec<String>,
     typescript: typescript::TypescriptEnvironment,
     rust_library: bool,
+    library_checked: bool,
+    source_cache: Option<cache::RustSourceCache>,
     bytes: usize,
+    /// Correlates navigation work with the currently admitted review input.
+    pub(crate) trace: Option<trace::DeclarationTrace>,
+    work: ResolutionWork,
+}
+
+#[derive(Default, Serialize)]
+struct ResolutionWork {
+    member_calls: usize,
+    max_depth: usize,
+    cycle_or_depth_stops: usize,
+    glob_branches: usize,
+    file_scans: usize,
+    parse_cache_hits: usize,
+    parse_cache_misses: usize,
+    file_load_ms: f64,
+    file_read_ms: f64,
+    file_parse_ms: f64,
+    file_extract_ms: f64,
+    module_probe_ms: f64,
+    module_probes: usize,
 }
 
 type ParseCache = Mutex<BTreeMap<String, Arc<DeclarationIndex>>>;
@@ -192,10 +218,46 @@ impl DeclarationResolver {
         workspace: &Path,
         design: &DeclarationDesign,
         baseline: bool,
+        trace: Option<trace::DeclarationTrace>,
     ) -> Result<Self> {
+        let stage = trace.as_ref().map(|trace| trace.stage("prepare_resolver", Some(baseline)));
         let mut resolver = Self::snapshot(workspace, design, baseline)?;
+        resolver.trace = trace;
         sources::prepare(&mut resolver).await?;
         resolver.typescript_environment()?;
+        if let Some(stage) = stage { stage.complete(resolver.statistics()); }
+        Ok(resolver)
+    }
+
+    /// Enable compatible cached source lookup only for review navigation.
+    pub(crate) fn enable_navigation_sources(&mut self) -> Result<()> {
+        if self.source_cache.is_none() {
+            self.source_cache = Some(cache::RustSourceCache::new(home::cargo_home()?));
+        }
+        Ok(())
+    }
+
+    /// Report whether a reached dependency requires Cargo source acquisition.
+    pub(crate) fn requires_source_fetch(&self) -> bool {
+        self.source_cache.as_ref().is_some_and(|cache| cache.requires_fetch)
+    }
+
+    /// Avoid repeating toolchain discovery when rust-src is unavailable.
+    pub(crate) fn library_sources_checked(&self) -> bool {
+        self.library_checked
+    }
+
+    /// Acquire toolchain sources while retaining lazy manifest-based dependency lookup.
+    pub(crate) async fn navigation(
+        workspace: &Path,
+        design: &DeclarationDesign,
+        baseline: bool,
+        trace: Option<trace::DeclarationTrace>,
+    ) -> Result<Self> {
+        let mut resolver = Self::local(workspace, design, baseline)?;
+        resolver.trace = trace;
+        resolver.enable_navigation_sources()?;
+        sources::standard_library(&mut resolver).await?;
         Ok(resolver)
     }
 
@@ -232,7 +294,11 @@ impl DeclarationResolver {
             warning: Vec::new(),
             typescript: Default::default(),
             rust_library: false,
+            library_checked: false,
+            source_cache: None,
             bytes: 0,
+            trace: None,
+            work: Default::default(),
         };
         let paths = resolver
             .snapshot
@@ -251,6 +317,17 @@ impl DeclarationResolver {
             resolver.load_file(&resolver.workspace.join(path), "", &[])?;
         }
         Ok(resolver)
+    }
+
+    /// Capture graph size and aggregate traversal work without recording source text.
+    pub(crate) fn statistics(&self) -> serde_json::Value {
+        let mut statistics = serde_json::to_value(&self.work).unwrap_or_default();
+        statistics["files"] = serde_json::json!(self.file.len());
+        statistics["packages"] = serde_json::json!(self.package.len());
+        statistics["pending_modules"] = serde_json::json!(self.pending_module.len());
+        statistics["bytes"] = serde_json::json!(self.bytes);
+        statistics["rust_library"] = serde_json::json!(self.rust_library);
+        statistics
     }
 
     fn read(&self, path: &Path) -> Option<String> {
@@ -278,9 +355,16 @@ impl DeclarationResolver {
         if self.file.contains_key(&path) {
             return Ok(true);
         }
+        let stage = self.trace.as_ref().map(|trace| trace.stage("index_file", Some(self.baseline)));
+        let started = Instant::now();
+        let read_started = Instant::now();
         let Some(text) = self.read(&path) else {
+            if let Some(stage) = stage {
+                stage.complete(serde_json::json!({"path":path,"available":false}));
+            }
             return Ok(false);
         };
+        let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
         self.bytes += text.len();
         anyhow::ensure!(
             self.bytes <= 128 * 1024 * 1024 && self.file.len() < 16384,
@@ -299,13 +383,19 @@ impl DeclarationResolver {
             .map_err(|_| anyhow::anyhow!("declaration cache lock poisoned"))?
             .get(&key)
             .cloned();
+        if self.trace.is_some() {
+            if cached.is_some() { self.work.parse_cache_hits += 1; }
+            else { self.work.parse_cache_misses += 1; }
+        }
+        let cache_hit = cached.is_some();
+        let mut timing = DeclarationIndexTiming::default();
         let index = match cached {
             Some(index) => index,
             None => {
-                let index = Arc::new(
-                    DeclarationIndex::extract(&path.to_string_lossy(), &text)
-                        .map_err(|error| anyhow::anyhow!("{}: {error:?}", path.display()))?,
-                );
+                let (index, measured) = DeclarationIndex::extract_timed(&path.to_string_lossy(), &text)
+                    .map_err(|error| anyhow::anyhow!("{}: {error:?}", path.display()))?;
+                timing = measured;
+                let index = Arc::new(index);
                 let mut cache = cache
                     .lock()
                     .map_err(|_| anyhow::anyhow!("declaration cache lock poisoned"))?;
@@ -341,7 +431,19 @@ impl DeclarationResolver {
             },
         );
         if !package.is_empty() {
-            self.module.insert((package.into(), module.to_vec()), path);
+            self.module.insert((package.into(), module.to_vec()), path.clone());
+        }
+        if let Some(stage) = stage {
+            let load_ms = started.elapsed().as_secs_f64() * 1000.0;
+            let parse_ms = timing.parse.as_secs_f64() * 1000.0;
+            let extract_ms = timing.extract.as_secs_f64() * 1000.0;
+            self.work.file_load_ms += load_ms;
+            self.work.file_read_ms += read_ms;
+            self.work.file_parse_ms += parse_ms;
+            self.work.file_extract_ms += extract_ms;
+            stage.complete(serde_json::json!({"path":path,"package":package,"module":module,
+                "available":true,"bytes":text.len(),"cached":cache_hit,"read_ms":read_ms,
+                "parse_ms":parse_ms,"extract_ms":extract_ms,"load_ms":load_ms}));
         }
         Ok(true)
     }
@@ -396,7 +498,13 @@ impl DeclarationResolver {
                 .map(|relative| container.join(relative));
             let direct = container.join(format!("{}.rs", declaration.name));
             let target = explicit.unwrap_or_else(|| {
-                if self.read(&direct).is_some() {
+                let probe_started = Instant::now();
+                let available = self.read(&direct).is_some();
+                if self.trace.is_some() {
+                    self.work.module_probe_ms += probe_started.elapsed().as_secs_f64() * 1000.0;
+                    self.work.module_probes += 1;
+                }
+                if available {
                     direct
                 } else {
                     container.join(&declaration.name).join("mod.rs")
@@ -557,51 +665,68 @@ impl DeclarationResolver {
 
     /// Resolve the exact signature token selected in saved declaration coordinates.
     pub(crate) fn at(&mut self, path: &str, line: u32, column: u32) -> DeclarationResolution {
-        let absolute = normalize(&self.workspace.join(path));
-        let Some(file) = self.file.get(&absolute).cloned() else {
-            return unverified("this file has no Rust or TypeScript declaration index");
-        };
-        if let Some(reference) = file.index.reference.iter().find(|reference| {
-            reference.position.line == line
-                && reference.position.column <= column
-                && (column as usize) < reference.position.column as usize + reference.length
-        }) {
-            return self.resolve_reference(&file, reference, true);
-        }
-        if let Some(symbol) = file.index.symbol.iter().find(|symbol| {
-            symbol.position.line == line
-                && symbol.position.column <= column
-                && column < symbol.position.column + symbol.name.len() as u32
-        }) {
-            return resolved(&file, symbol);
-        }
-        if let Some(import) = file
-            .index
-            .import
-            .iter()
-            .filter(|import| import.position.line == line && import.position.column <= column)
-            .max_by_key(|import| import.position.column)
-        {
-            return if file.package.is_empty() {
-                self.resolve_ts_import(&file, import, &import.path, false, &mut HashSet::new())
-            } else {
-                self.resolve_rust_path(
-                    &file.package,
-                    &joined(&file.module, &import.scope),
-                    &import.path,
-                    false,
-                    RustAccess {
-                        package: &file.package,
-                        scope: &file.module,
-                        navigation: true,
-                    },
-                    &mut HashSet::new(),
-                )
+        let stage = self
+            .trace
+            .as_ref()
+            .map(|trace| trace.stage("resolve", Some(self.baseline)));
+        self.work = Default::default();
+        let before_files = self.file.len();
+        let result = (|| {
+            let absolute = normalize(&self.workspace.join(path));
+            let Some(file) = self.file.get(&absolute).cloned() else {
+                return unverified("this file has no Rust or TypeScript declaration index");
             };
+            if let Some(reference) = file.index.reference.iter().find(|reference| {
+                reference.position.line == line
+                    && reference.position.column <= column
+                    && (column as usize) < reference.position.column as usize + reference.length
+            }) {
+                return self.resolve_reference(&file, reference, true);
+            }
+            if let Some(symbol) = file.index.symbol.iter().find(|symbol| {
+                symbol.position.line == line
+                    && symbol.position.column <= column
+                    && column < symbol.position.column + symbol.name.len() as u32
+            }) {
+                return resolved(&file, symbol);
+            }
+            if let Some(import) = file
+                .index
+                .import
+                .iter()
+                .filter(|import| import.position.line == line && import.position.column <= column)
+                .max_by_key(|import| import.position.column)
+            {
+                return if file.package.is_empty() {
+                    self.resolve_ts_import(&file, import, &import.path, false, &mut HashSet::new())
+                } else {
+                    self.resolve_rust_path(
+                        &file.package,
+                        &joined(&file.module, &import.scope),
+                        &import.path,
+                        false,
+                        RustAccess {
+                            package: &file.package,
+                            scope: &file.module,
+                            navigation: true,
+                        },
+                        &mut HashSet::new(),
+                    )
+                };
+            }
+            unverified("cursor is not on a declaration type or import")
+        })();
+        if let Some(stage) = stage {
+            let mut details = self.statistics();
+            details["path"] = serde_json::json!(path);
+            details["line"] = serde_json::json!(line);
+            details["column"] = serde_json::json!(column);
+            details["loaded_files"] = serde_json::json!(self.file.len() - before_files);
+            details["resolution"] = serde_json::to_value(&result).unwrap_or_default();
+            stage.complete(details);
         }
-        unverified("cursor is not on a declaration type or import")
+        result
     }
-
     fn resolve_reference(
         &mut self,
         file: &IndexedFile,
@@ -774,6 +899,22 @@ impl DeclarationResolver {
                 if self.rust_bound(package, scope, first, value) {
                     return self.rust_member(package, scope, path, value, origin, visited);
                 }
+                if self.package.get(package).and_then(|state| state.dependency.get(first))
+                    .is_some_and(|identity| identity.starts_with("unavailable:")) {
+                    if let Some(mut cache) = self.source_cache.take() {
+                        let stage = self.trace.as_ref().map(|trace| trace.stage("cached_dependency", Some(self.baseline)));
+                        let result = cache.dependency(self, package, first);
+                        let requires_fetch = cache.requires_fetch;
+                        self.source_cache = Some(cache);
+                        if let Some(stage) = stage {
+                            stage.complete(serde_json::json!({"package":package,"alias":first,
+                                "cached":matches!(result, Ok(Some(_))),"requires_fetch":requires_fetch}));
+                        }
+                        if let Err(error) = result {
+                            return unverified(&format!("cached dependency source cannot be located: {error:#}"));
+                        }
+                    }
+                }
                 if let Some(dependency) = self
                     .package
                     .get(package)
@@ -788,28 +929,22 @@ impl DeclarationResolver {
     }
 
     fn rust_bound(&self, package: &str, scope: &[String], name: &str, value: bool) -> bool {
-        self.file
-            .values()
-            .filter(|file| file.package == package)
-            .any(|file| {
-                scope
-                    .strip_prefix(file.module.as_slice())
-                    .is_some_and(|relative| {
-                        file.index.symbol.iter().any(|symbol| {
-                            symbol.scope == relative
-                                && symbol.name == name
-                                && if value {
-                                    symbol.value_namespace
-                                } else {
-                                    symbol.type_namespace
-                                }
-                        }) || file.index.import.iter().any(|import| {
-                            import.scope == relative
-                                && !import.glob
-                                && import.alias.as_deref() == Some(name)
-                        })
-                    })
+        self.rust_scope_file(package, scope).is_some_and(|file| {
+            let relative = scope.strip_prefix(file.module.as_slice()).unwrap();
+            file.index.symbol.iter().any(|symbol| {
+                symbol.scope == relative && symbol.name == name
+                    && if value { symbol.value_namespace } else { symbol.type_namespace }
+            }) || file.index.import.iter().any(|import| {
+                import.scope == relative && !import.glob && import.alias.as_deref() == Some(name)
             })
+        })
+    }
+
+    fn rust_scope_file(&self, package: &str, scope: &[String]) -> Option<&IndexedFile> {
+        (0..=scope.len()).rev().find_map(|depth| {
+            self.module.get(&(package.into(), scope[..depth].to_vec()))
+                .and_then(|path| self.file.get(path))
+        })
     }
 
     fn rust_member(
@@ -821,8 +956,13 @@ impl DeclarationResolver {
         origin: RustAccess<'_>,
         visited: &mut HashSet<String>,
     ) -> DeclarationResolution {
+        if self.trace.is_some() {
+            self.work.member_calls += 1;
+            self.work.max_depth = self.work.max_depth.max(visited.len());
+        }
         let key = format!("{package}:{}:{}:{value}", scope.join("::"), path.join("::"));
         if visited.len() > 256 || !visited.insert(key.clone()) {
+            if self.trace.is_some() { self.work.cycle_or_depth_stops += 1; }
             return unverified("cyclic or excessively deep re-export chain");
         }
         let result = self.rust_member_inner(package, scope, path, value, origin, visited);
@@ -863,12 +1003,8 @@ impl DeclarationResolver {
         }
         let first = &path[0];
         let mut results = Vec::new();
-        let files = self
-            .file
-            .values()
-            .filter(|file| file.package == package)
-            .cloned()
-            .collect::<Vec<_>>();
+        let files = self.rust_scope_file(package, scope).cloned().into_iter().collect::<Vec<_>>();
+        if self.trace.is_some() { self.work.file_scans += files.len(); }
         for file in &files {
             let relative = scope.strip_prefix(file.module.as_slice());
             let Some(relative) = relative else {
@@ -959,6 +1095,7 @@ impl DeclarationResolver {
                     results.push(unverified("re-export is conditionally compiled"));
                     continue;
                 }
+                if self.trace.is_some() { self.work.glob_branches += 1; }
                 let target = joined(&import.path, path);
                 let result = self.resolve_rust_path(
                     package,
