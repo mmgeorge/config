@@ -121,6 +121,7 @@ M.view_specs = {
       hints = { composer = function() return "help (normal)" end } },
   },
   plan_review = {
+    { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
     { id = "jump_entity", label = "definition", desc = "Jump to the selected declaration type or import", modes = "n", pinned = true },
     { id = "toggle_public", label = "public", desc = "Toggle public-only declarations", modes = "n", pinned = true },
     { id = "toggle", label = "fold", desc = "Toggle the current declaration diff file or hunk", modes = "n", pinned = true },

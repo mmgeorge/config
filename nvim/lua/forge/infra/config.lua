@@ -269,6 +269,7 @@ M.defaults = {
       help = "?",
     },
     plan_review = {
+      visual_line_with_gutter = "W",
       toggle = "<Tab>",
       toggle_public = "<S-Tab>",
       open = "<CR>",

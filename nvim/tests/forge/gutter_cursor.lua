@@ -36,6 +36,14 @@ local ok, failure = xpcall(function()
   position = vim.fn.getcurpos()
   assert(position[3] == 1 and position[4] == 0, "gutter selection retained cursor offset")
   assert(session.gutter_selection.first == 2 and session.gutter_selection.last == 2)
+  local screenpos, set_extmark = vim.fn.screenpos, vim.api.nvim_buf_set_extmark
+  local overlay
+  vim.fn.screenpos = function() return { row = 2, col = 99 } end
+  vim.api.nvim_buf_set_extmark = function(_, _, _, _, options) overlay = options end
+  require("forge.gutter").highlight(session, vim.api.nvim_get_current_win(), 1, 0)
+  vim.fn.screenpos, vim.api.nvim_buf_set_extmark = screenpos, set_extmark
+  assert(overlay and overlay.virt_text_win_col == 0,
+    "gutter highlight did not start at the window text boundary")
   vim.api.nvim_win_set_cursor(0, { 3, 0 })
   vim.api.nvim_exec_autocmds("CursorMoved", { buffer = session.buffer })
   assert(session.gutter_selection.first == 2 and session.gutter_selection.last == 3,

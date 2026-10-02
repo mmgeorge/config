@@ -59,7 +59,8 @@ function M.highlight(session, window, row, namespace)
       chunks[#chunks + 1] = { chunk.text, "Visual" }
     end
     local screen = vim.fn.screenpos(window, row + 1, entry.position.column + 1)
-    local column = screen.col - origin
+    local column = entry.position.column == 0 and 0
+      or screen.col - origin - vim.fn.getwininfo(window)[1].textoff
     if screen.row > 0 and column >= 0 then
       vim.api.nvim_buf_set_extmark(session.buffer, namespace, row, entry.position.column, {
         virt_text = chunks, virt_text_win_col = column, priority = 65535, hl_mode = "replace", ephemeral = true,

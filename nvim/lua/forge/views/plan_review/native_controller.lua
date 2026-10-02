@@ -274,6 +274,7 @@ end
 local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review) end)
+  command_set.register(set, "visual_line_with_gutter", review.owner.gutter_selection.start)
   for _, name in ipairs({ "open", "jump_entity", "comment", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
   command_set.register(set, "abort_plan", function()

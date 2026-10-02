@@ -138,6 +138,28 @@ local success, failure = xpcall(function()
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<S-Tab>", true, false, true), "xt", false)
   await(function() return review.public_only == false end, "first Shift+Tab did not show All")
   visibility_label(false)
+  local selection_row
+  for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if line:find("pub second:", 1, true) then selection_row = row break end
+  end
+  vim.api.nvim_win_set_cursor(review.win, { assert(selection_row), 0 })
+  local clipboard, previous_clipboard = nil, vim.g.clipboard
+  vim.g.clipboard = { name = "Plan gutter fixture", copy = {
+    ["+"] = function(lines, kind) clipboard = { lines = lines, kind = kind } end, ["*"] = function() end,
+  }, paste = { ["+"] = function() return { {}, "V" } end, ["*"] = function() return { {}, "V" } end } }
+  local select = vim.fn.maparg("W", "n", false, true)
+  assert(select.buffer == 1 and select.callback, "plan review did not bind W")
+  select.callback()
+  assert(vim.api.nvim_get_mode().mode == "V" and review.owner.replica.gutter_selection.first == selection_row,
+    "W did not select the plan diff gutter")
+  local bounds = assert(require("forge.gutter").bounds(review.owner.replica, selection_row))
+  local prefix = {}
+  for _, entry in ipairs(bounds.gutter) do for _, chunk in ipairs(entry.chunk) do prefix[#prefix + 1] = chunk.text end end
+  vim.fn.maparg("<Space>l", "x", false, true).callback()
+  assert(clipboard and clipboard.kind == "V" and clipboard.lines[1]:sub(1, #table.concat(prefix)) == table.concat(prefix)
+    and clipboard.lines[1]:find("pub second:", 1, true), "plan copy omitted the gutter or source")
+  assert(review.owner.replica.gutter_selection == nil and vim.api.nvim_get_mode().mode == "n", "plan copy retained gutter selection")
+  vim.g.clipboard = previous_clipboard
   assert(text(review.buf):find(document.design.document.description, 1, true), "change description is missing")
   assert(text(review.buf):find("Task:\n" .. document.design.document.task, 1, true), "task overview is missing or misplaced")
   assert(text(review.buf):find("  pub second: u64,", 1, true), "compact member did not receive display indentation")

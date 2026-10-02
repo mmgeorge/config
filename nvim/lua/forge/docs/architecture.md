@@ -1996,6 +1996,11 @@ The native open result supplies the visibility state to Lua. The winbar always d
 `Showing: Public` or `Showing: All` using the normal status styling. Refreshes preserve the current mode,
 and reopening starts in Public without changing saved plan artifacts.
 
+Plan reviews attach the shared native gutter-selection owner from `document_commands`. `W` selects
+whole lines including diff gutters, and the temporary visual `<Space>l` mapping copies the displayed
+gutter and source. Selection cleanup and mapping restoration follow the same lifecycle as other diff
+views.
+
 Shift+Tab toggles public declaration visibility through a revision-validated layout action.
 Tree-sitter classifies visibility on both diff sides, including inherited trait and enum
 visibility. Filtering removes private rows and their comments from the projection, prunes

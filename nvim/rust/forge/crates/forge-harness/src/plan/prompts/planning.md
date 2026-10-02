@@ -41,6 +41,11 @@ principal responsibility boundaries and how they cooperate, using concrete names
 Include important lifecycle behavior, ordering rules, error boundaries, or limits that help a reviewer
 judge the design. Explain why a boundary or constraint matters instead of merely naming it.
 
+Use Markdown inline code in `task` and `description` whenever referring to a specific code
+identifier, including types, traits, interfaces, functions, methods, fields, enum variants,
+modules, and plugins. For example, write `HelloGamePlugin`, `GameConfig`, and `RoundEntity`.
+Also format concrete file paths and commands as inline code. Keep ordinary prose unformatted.
+
 Select details that explain the change. Do not inventory every feature, object, manifest entry,
 dependency version, or validation command. Include those details only when they explain a design
 decision or user-visible constraint. Do not repeat the task verbatim, write execution instructions,
@@ -54,7 +59,7 @@ separates the requested outcome from the proposed mechanism:
 ```json
 {
   "task": "Support asynchronous texture replacement with observable progress and cancellation while keeping textures used by submitted frames valid.",
-  "description": "The proposal gives callers a TextureRequest for each pending replacement so they can observe loading and cancel it before publication. TextureStreaming coordinates decoding and upload, while TextureRegistry owns the published texture version.\n\nTextureRegistry publishes replacements at frame boundaries after upload completes. It retains previous allocations until their final GPU use completes, so a replacement cannot invalidate a texture still used by a submitted frame."
+  "description": "The proposal gives callers a `TextureRequest` for each pending replacement so they can observe loading and cancel it before publication. `TextureStreaming` coordinates decoding and upload, while `TextureRegistry` owns the published texture version.\n\n`TextureRegistry` publishes replacements at frame boundaries after upload completes. It retains previous allocations until their final GPU use completes, so a replacement cannot invalidate a texture still used by a submitted frame."
 }
 ```
 
@@ -69,7 +74,7 @@ atomic patch:
 +  "task": "Support observable, cancellable texture requests.",
 @@
 -  "description": ""
-+  "description": "TextureStreaming returns observable request handles and supports cancellation."
++  "description": "`TextureStreaming` returns observable request handles and supports cancellation."
 *** End Patch
 ```
 

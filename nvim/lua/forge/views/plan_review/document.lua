@@ -64,6 +64,7 @@ function M.attach(options, callback)
         if closed and closed.kind == "Deferred" then return false end
       end
     end
+    if owner.gutter_selection then owner.gutter_selection.close() end
     owner.closed = true
     if owner.pending_submit then
       local pending = owner.pending_submit
@@ -283,6 +284,7 @@ function M.attach(options, callback)
       owner.close() callback(nil, "Physical plan review changed before attachment: " .. adopted.kind) return
     end
     if options.configure_view then options.configure_view(owner.view, owner) end
+    owner.gutter_selection = require("forge.document_commands").attach_selection(owner.replica, { normalize = false })
     owner.public_only = opened.public_only
     owner.saved_source_digest, owner.version = opened.saved_source_digest, opened.version
     owner.focused_annotation = options.recovery and next(options.recovery.draft) or nil

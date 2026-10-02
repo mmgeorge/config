@@ -45,20 +45,14 @@ local function selected_rows(session)
   return rows
 end
 
-function M.attach(session, options)
-  local normalize_gutter = options.view == "diff" or options.view == "status"
-  local handler = vim.tbl_extend("force", {
-    toggle = function()
-      if vim.fn.foldlevel(".") > 0 then vim.cmd("normal! za") end
-      if options.changed then options.changed() end
-    end,
-    collapse_parent = function()
-      if vim.fn.foldlevel(".") > 0 then vim.cmd("normal! zc") end
-      if options.changed then options.changed() end
-    end,
-  }, options.handler or {})
-  local owner = { binding = {}, mapping = {}, selection = false, window = {} }
-  local group = vim.api.nvim_create_augroup("ForgeDocumentCommands" .. session.buffer, { clear = true })
+---Own visual selection and copying of native diff gutters for any document view.
+---@param session table
+---@param options { normalize: boolean }
+---@return table
+function M.attach_selection(session, options)
+  local normalize_gutter = options.normalize
+  local owner = { selection = false }
+  local group = vim.api.nvim_create_augroup("ForgeGutterSelection" .. session.buffer, { clear = true })
   local prior_clipboard, clipboard_callback
   local function clear_selection()
     if not owner.selection then return end
@@ -75,7 +69,8 @@ function M.attach(session, options)
     prior_clipboard, clipboard_callback = nil, nil
     if normalize_gutter then gutter.normalize(session, false) end
   end
-  handler.visual_line_with_gutter = handler.visual_line_with_gutter or function()
+  function owner.start()
+    if owner.closed or session.status ~= "Applied" or session.applying then return end
     clear_selection()
     prior_clipboard = vim.fn.maparg("<Space>l", "x", false, true)
     vim.cmd("normal! V")
@@ -91,6 +86,41 @@ function M.attach(session, options)
     vim.keymap.set("x", "<Space>l", clipboard_callback,
       { buffer = session.buffer, silent = true, desc = "Copy selected source with gutters" })
   end
+  vim.api.nvim_create_autocmd("ModeChanged", { group = group, callback = function()
+    local mode = vim.api.nvim_get_mode().mode
+    if mode ~= "v" and mode ~= "V" and mode ~= "\22" then clear_selection() end
+  end })
+  vim.api.nvim_create_autocmd({ "CursorMoved", "BufEnter", "WinEnter" }, {
+    group = group, buffer = session.buffer, callback = function()
+      if normalize_gutter or owner.selection then gutter.normalize(session, owner.selection) end
+    end,
+  })
+  vim.api.nvim_create_autocmd("BufLeave", { group = group, buffer = session.buffer, callback = clear_selection })
+  function owner.close()
+    if owner.closed then return end
+    owner.closed = true
+    clear_selection()
+    pcall(vim.api.nvim_del_augroup_by_id, group)
+  end
+  return owner
+end
+
+function M.attach(session, options)
+  local normalize_gutter = options.view == "diff" or options.view == "status"
+  local handler = vim.tbl_extend("force", {
+    toggle = function()
+      if vim.fn.foldlevel(".") > 0 then vim.cmd("normal! za") end
+      if options.changed then options.changed() end
+    end,
+    collapse_parent = function()
+      if vim.fn.foldlevel(".") > 0 then vim.cmd("normal! zc") end
+      if options.changed then options.changed() end
+    end,
+  }, options.handler or {})
+  local owner = { binding = {}, mapping = {}, window = {} }
+  local group = vim.api.nvim_create_augroup("ForgeDocumentCommands" .. session.buffer, { clear = true })
+  local selection = M.attach_selection(session, { normalize = normalize_gutter })
+  handler.visual_line_with_gutter = handler.visual_line_with_gutter or selection.start
   handler.help = handler.help or function()
     keymaps.show_bindings_help(owner.binding, "Forge Commands")
   end
@@ -174,21 +204,11 @@ function M.attach(session, options)
   vim.api.nvim_create_autocmd("WinClosed", { group = group,
     callback = function(event) owner.release_window(tonumber(event.match)) end })
   update_winbar()
-  vim.api.nvim_create_autocmd("ModeChanged", { group = group, callback = function()
-    local mode = vim.api.nvim_get_mode().mode
-    if mode ~= "v" and mode ~= "V" and mode ~= "\22" then clear_selection() end
-  end })
-  vim.api.nvim_create_autocmd({ "CursorMoved", "BufEnter", "WinEnter" }, {
-    group = group, buffer = session.buffer, callback = function()
-      if normalize_gutter or owner.selection then gutter.normalize(session, owner.selection) end
-    end,
-  })
-  vim.api.nvim_create_autocmd("BufLeave", { group = group, buffer = session.buffer, callback = clear_selection })
   vim.api.nvim_create_autocmd("BufWipeout", { group = group, buffer = session.buffer, callback = function() owner.close() end })
   function owner.close()
     owner.closed = true
     for window in pairs(owner.window) do owner.release_window(window) end
-    clear_selection()
+    selection.close()
     pcall(vim.api.nvim_del_augroup_by_id, group)
     if vim.api.nvim_buf_is_valid(session.buffer) then
       vim.api.nvim_buf_call(session.buffer, function()
