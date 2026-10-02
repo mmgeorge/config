@@ -1,6 +1,7 @@
 //! Scope and reference extraction shared by declaration validation and navigation.
 
 use super::{DeclarationOverview, DeclarationPosition, SyntaxError, SyntaxLanguage};
+use std::collections::HashMap;
 use std::time::{Duration, Instant};
 use tree_sitter::{Node, Parser};
 
@@ -22,6 +23,7 @@ pub struct DeclarationSymbol {
     pub visibility: SymbolVisibility,
     pub type_namespace: bool,
     pub value_namespace: bool,
+    pub macro_namespace: bool,
     pub conditional: bool,
     pub global: bool,
     pub parameter: bool,
@@ -35,6 +37,7 @@ pub struct DeclarationReference {
     pub length: usize,
     pub scope: Vec<String>,
     pub value_namespace: bool,
+    pub macro_namespace: bool,
     pub conditional: bool,
 }
 
@@ -149,6 +152,7 @@ impl DeclarationIndex {
             language,
             &[],
             "",
+            0,
             false,
             false,
             false,
@@ -218,6 +222,7 @@ fn walk(
     language: SyntaxLanguage,
     scope: &[String],
     attributes: &str,
+    ordinal: usize,
     exported: bool,
     conditional: bool,
     global: bool,
@@ -229,7 +234,6 @@ fn walk(
     }
     let rust = language == SyntaxLanguage::Rust;
     let kind = node.kind();
-    let conditional = conditional || rust && attributes.contains("cfg");
     if matches!(
         kind,
         "block"
@@ -264,6 +268,7 @@ fn walk(
                 language,
                 &[],
                 "",
+                0,
                 false,
                 conditional,
                 true,
@@ -307,6 +312,7 @@ fn walk(
                 language,
                 scope,
                 "",
+                0,
                 kind == "export_statement",
                 conditional,
                 global,
@@ -326,6 +332,7 @@ fn walk(
                 language,
                 scope,
                 "",
+                0,
                 kind == "export_statement",
                 conditional,
                 global,
@@ -424,6 +431,7 @@ fn walk(
                     position: position(name),
                     visibility: visibility(node, source, exported, rust),
                     type_namespace,
+                    macro_namespace: kind == "mod_item",
                     value_namespace: !matches!(
                         kind,
                         "interface_declaration"
@@ -467,7 +475,7 @@ fn walk(
         kind,
         "function_type" | "constructor_type" | "conditional_type" | "index_signature"
     ) {
-        nested.push(synthetic_scope(node, node.kind()));
+        nested.push(synthetic_scope(ordinal, node.kind()));
     }
     if kind == "infer_type" {
         if let Some(name) = children(node)
@@ -480,6 +488,7 @@ fn walk(
                 position: position(name),
                 visibility: SymbolVisibility::Private,
                 type_namespace: true,
+                macro_namespace: false,
                 value_namespace: false,
                 conditional,
                 global: false,
@@ -499,6 +508,7 @@ fn walk(
                 position: position(*target),
                 length: text.len(),
                 scope: scope.to_vec(),
+                macro_namespace: false,
                 value_namespace: true,
                 conditional,
             });
@@ -527,13 +537,14 @@ fn walk(
                 .trim()
                 .to_owned();
             nested.push(owner_text);
-            nested.push(synthetic_scope(node, "impl"));
+            nested.push(synthetic_scope(ordinal, "impl"));
             index.symbol.push(DeclarationSymbol {
                 name: "Self".into(),
                 scope: nested.clone(),
                 position: position(owner),
                 visibility: SymbolVisibility::Private,
                 type_namespace: true,
+                macro_namespace: false,
                 value_namespace: false,
                 conditional,
                 global: false,
@@ -548,6 +559,7 @@ fn walk(
             position: position(node),
             visibility: SymbolVisibility::Private,
             type_namespace: true,
+            macro_namespace: false,
             value_namespace: false,
             conditional,
             global: false,
@@ -577,23 +589,32 @@ fn walk(
             position: position(node),
             length: text.len(),
             scope: scope.to_vec(),
+            macro_namespace: false,
             value_namespace: kind == "scoped_identifier" || kind == "identifier",
             conditional,
         });
         return Ok(());
     }
     let mut preceding = String::new();
+    let mut preceding_conditional = false;
+    let mut sibling_count = HashMap::new();
     let mut child_cursor = node.walk();
     for child in node.named_children(&mut child_cursor) {
+        let count = sibling_count.entry(child.kind()).or_insert(0);
+        let child_ordinal = *count;
+        *count += 1;
         match child.kind() {
             "attribute_item" if rust => {
+                rust_attribute(child, source, &nested, conditional, index);
                 preceding.push_str(contents(child, source));
+                preceding_conditional |= gates_declaration(child, source);
                 continue;
             }
             "line_comment" | "block_comment" | "comment" => continue,
             _ => {}
         }
         let attributes = std::mem::take(&mut preceding);
+        let attribute_conditional = std::mem::take(&mut preceding_conditional);
         if name_node.is_some_and(|name| name.id() == child.id()) {
             continue;
         }
@@ -640,8 +661,9 @@ fn walk(
             language,
             child_scope,
             &attributes,
+            child_ordinal,
             child_exported,
-            conditional,
+            conditional || attribute_conditional,
             child_global,
             index,
             depth + 1,
@@ -650,8 +672,53 @@ fn walk(
     Ok(())
 }
 
-fn synthetic_scope(node: Node<'_>, role: &str) -> String {
-    format!("@{role}:{}", node.start_byte())
+// Derive names use Rust's macro namespace, independently of same-named traits.
+fn rust_attribute(node: Node<'_>, source: &str, scope: &[String], conditional: bool, index: &mut DeclarationIndex) {
+    let Some(attribute) = children(node).into_iter().find(|child| child.kind() == "attribute") else { return; };
+    let parts = children(attribute);
+    let Some(name) = parts.first() else { return; };
+    let Some(arguments) = parts.iter().find(|child| child.kind() == "token_tree") else { return; };
+    match contents(*name, source) {
+        "derive" => {
+            let mut path = Vec::new();
+            let mut first = None;
+            let mut cursor = arguments.walk();
+            for token in arguments.children(&mut cursor) {
+                if token.kind() == "identifier" {
+                    first.get_or_insert(token);
+                    path.push(contents(token, source).to_owned());
+                } else if matches!(token.kind(), "," | ")") {
+                    if let Some(start) = first.take() {
+                        index.reference.push(DeclarationReference {
+                            path: std::mem::take(&mut path), position: position(start),
+                            length: token.start_byte() - start.start_byte(), scope: scope.to_vec(),
+                            value_namespace: false, macro_namespace: true, conditional,
+                        });
+                    }
+                }
+            }
+        }
+        "proc_macro_derive" => {
+            if let Some(name) = children(*arguments).into_iter().find(|child| child.kind() == "identifier") {
+                index.symbol.push(DeclarationSymbol {
+                    name: contents(name, source).into(), scope: scope.to_vec(), position: position(name),
+                    visibility: SymbolVisibility::Public, type_namespace: false, value_namespace: false,
+                    macro_namespace: true, conditional, global: false, parameter: false,
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+// Only cfg gates the item. cfg_attr may add derives without removing its declaration.
+fn gates_declaration(node: Node<'_>, source: &str) -> bool {
+    node.kind() == "identifier" && contents(node, source) == "cfg"
+        || children(node).into_iter().any(|child| gates_declaration(child, source))
+}
+
+fn synthetic_scope(ordinal: usize, role: &str) -> String {
+    format!("@{role}:{ordinal}")
 }
 
 fn rust_import(
@@ -860,6 +927,13 @@ mod tests {
             assert!(index.symbol.iter().any(|symbol| symbol.parameter && symbol.name == parameter
                 && symbol.scope == method.scope));
         }
+    }
+
+    #[test]
+    fn optional_derives_do_not_gate_declarations() {
+        let index = DeclarationIndex::extract("lib.rs", "#[cfg_attr(feature = \"serialize\", derive(Serialize))]\n#[doc = \"cfg is mentioned here\"]\npub struct Transform;\n#[cfg_attr(feature = \"optional\", cfg(feature = \"enabled\"))]\npub struct Gated;\n").unwrap();
+        assert!(!index.symbol.iter().find(|symbol| symbol.name == "Transform").unwrap().conditional);
+        assert!(index.symbol.iter().find(|symbol| symbol.name == "Gated").unwrap().conditional);
     }
 
     #[test]

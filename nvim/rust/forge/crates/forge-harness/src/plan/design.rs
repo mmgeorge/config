@@ -63,6 +63,17 @@ impl Default for DeclarationDesign {
 }
 
 impl DeclarationDesign {
+    /// Format and validate one submission using the shared lazy source resolver.
+    pub(crate) async fn validated(&self, workspace: &Path) -> Result<Self> {
+        let mut design = self.formatted()?;
+        design.check_workspace(workspace)?;
+        let mut resolver = crate::declaration::DeclarationResolver::prepare(workspace, &design, false, None).await?;
+        let report = resolver.validate_sources(&design).await?;
+        report.ensure_valid()?;
+        design.validation = Some(report);
+        Ok(design)
+    }
+
     /// Capture eligible working-tree declarations without modifying the checkout.
     pub fn capture(workspace: &Path) -> Result<Self> {
         let result = std::process::Command::new("git")

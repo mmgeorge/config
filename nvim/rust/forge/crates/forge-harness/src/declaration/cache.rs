@@ -1,15 +1,22 @@
-//! Selects cached Cargo sources for navigation without resolving the project graph.
+//! Selects cached Cargo sources for validation and navigation without resolving the project graph.
 
 use super::*;
 use semver::{Version, VersionReq};
 
-/// Retains source candidates and reached manifests for one immutable review snapshot.
+/// Distinguishes registered source from missing or unsupported dependency source.
+pub(super) enum DependencySource {
+    /// Identifies the registered package whose library can be loaded lazily.
+    Available(String),
+    /// Retains why Cargo acquisition is needed for this reached dependency.
+    Unavailable { reason: String },
+}
+
+/// Retains source candidates and reached manifests for one immutable declaration snapshot.
+#[derive(Clone)]
 pub(super) struct RustSourceCache {
     root: PathBuf,
-    registry: Option<BTreeMap<String, Vec<(Version, PathBuf)>>>,
+    registry: Option<Arc<BTreeMap<String, Vec<(Version, PathBuf)>>>>,
     manifest: HashMap<PathBuf, Arc<toml::Value>>,
-    /// Requests Cargo acquisition only after a reached dependency lacks cached sources.
-    pub(super) requires_fetch: bool,
 }
 
 impl RustSourceCache {
@@ -19,7 +26,6 @@ impl RustSourceCache {
             root,
             registry: None,
             manifest: HashMap::new(),
-            requires_fetch: false,
         }
     }
 
@@ -29,17 +35,17 @@ impl RustSourceCache {
         resolver: &mut DeclarationResolver,
         package: &str,
         alias: &str,
-    ) -> Result<Option<String>> {
+    ) -> Result<DependencySource> {
         let Some(path) = resolver
             .package
             .get(package)
             .and_then(|state| state.source_manifest.clone())
         else {
-            return Ok(None);
+            return Ok(DependencySource::Unavailable { reason: "dependency manifest is unavailable".into() });
         };
         let manifest = self.read_manifest(resolver, &path)?;
         let Some(mut specification) = dependency_specification(&manifest, alias).cloned() else {
-            return Ok(None);
+            return Ok(DependencySource::Unavailable { reason: format!("dependency alias `{alias}` has no manifest declaration") });
         };
         let mut directory = path.parent().unwrap().to_path_buf();
         if specification
@@ -70,7 +76,7 @@ impl RustSourceCache {
                 }
             }
             let Some((parent, dependency)) = inherited else {
-                return Ok(None);
+                return Ok(DependencySource::Unavailable { reason: format!("workspace dependency `{alias}` is unavailable") });
             };
             directory = parent;
             specification = dependency;
@@ -79,8 +85,7 @@ impl RustSourceCache {
             normalize(&directory.join(path).join("Cargo.toml"))
         } else {
             if specification.get("git").is_some() || specification.get("registry").is_some() {
-                self.requires_fetch = true;
-                return Ok(None);
+                return Ok(DependencySource::Unavailable { reason: "Git or custom registry source requires Cargo acquisition".into() });
             }
             let name = specification
                 .get("package")
@@ -96,18 +101,15 @@ impl RustSourceCache {
                 .or_else(|| specification.get("version").and_then(toml::Value::as_str));
             let Some(requirement) = requirement.and_then(|value| VersionReq::parse(value).ok())
             else {
-                self.requires_fetch = true;
-                return Ok(None);
+                return Ok(DependencySource::Unavailable { reason: "dependency version cannot be selected from the source cache".into() });
             };
             let Some(root) = self.registry_source(&name, &requirement)? else {
-                self.requires_fetch = true;
-                return Ok(None);
+                return Ok(DependencySource::Unavailable { reason: format!("no cached source matches `{name}` {requirement}") });
             };
             root.join("Cargo.toml")
         };
         if resolver.read(&target).is_none() {
-            self.requires_fetch = true;
-            return Ok(None);
+            return Ok(DependencySource::Unavailable { reason: format!("dependency manifest {} is unavailable", target.display()) });
         }
         let identity = if let Some((identity, _)) = resolver
             .package
@@ -118,43 +120,20 @@ impl RustSourceCache {
         } else {
             let manifest = self.read_manifest(resolver, &target)?;
             let identity = format!("cached:{}", target.display());
-            let edition = manifest
-                .get("package")
-                .and_then(|package| package.get("edition"))
-                .and_then(toml::Value::as_str)
-                .unwrap_or("2021")
-                .to_owned();
             let dependency = dependency_aliases(&manifest)
                 .into_iter()
                 .map(|alias| (alias.clone(), format!("unavailable:{alias}")))
                 .collect();
-            resolver.package.insert(
-                identity.clone(),
-                RustPackage {
-                    edition,
-                    dependency,
-                    source_manifest: Some(target.clone()),
-                    ..Default::default()
-                },
-            );
+            resolver.register_package(identity.clone(), target.clone(), &manifest, dependency);
             let root = manifest
                 .get("lib")
                 .and_then(|library| library.get("path"))
                 .and_then(toml::Value::as_str)
                 .unwrap_or("src/lib.rs");
-            resolver.pending_module.insert(
-                (identity.clone(), Vec::new()),
-                (normalize(&target.parent().unwrap().join(root)), false),
-            );
+            resolver.register_root(&identity, target.parent().unwrap().join(root))?;
             identity
         };
-        resolver
-            .package
-            .get_mut(package)
-            .unwrap()
-            .dependency
-            .insert(alias.into(), identity.clone());
-        Ok(Some(identity))
+        Ok(DependencySource::Available(identity))
     }
 
     fn read_manifest(
@@ -205,7 +184,7 @@ impl RustSourceCache {
             for candidates in registry.values_mut() {
                 candidates.sort_by(|left, right| right.0.cmp(&left.0).then(left.1.cmp(&right.1)));
             }
-            self.registry = Some(registry);
+            self.registry = Some(Arc::new(registry));
         }
         Ok(self
             .registry

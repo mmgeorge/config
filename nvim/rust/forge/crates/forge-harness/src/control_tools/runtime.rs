@@ -189,14 +189,9 @@ impl ControlToolRuntime {
                 );
                 document.validate_for_submission()?;
                 if let Some(design) = &document.design {
-                    let mut design = design.formatted()?;
                     let workspace = self.context.workspace_root.as_deref().context("design submission has no workspace root")?;
-                    design.check_workspace(workspace)?;
-                    let mut resolver = crate::declaration::DeclarationResolver::prepare(workspace, &design, false, None).await?;
-                    let report = resolver.validate(&design);
-                    report.ensure_valid()?;
-                    let warning = report.warnings();
-                    design.validation = Some(report);
+                    let design = design.validated(workspace).await?;
+                    let warning = design.validation.as_ref().unwrap().warnings();
                     let mut submitted = document.clone();
                     submitted.design = Some(design);
                     self.plan_document = Some(submitted);

@@ -142,8 +142,6 @@ impl PlanReviewStore {
                     .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
                 resolver.0.trace = trace.cloned();
                 resolver.1.trace = trace.cloned();
-                resolver.0.enable_navigation_sources()?;
-                resolver.1.enable_navigation_sources()?;
             }
             let anchor = document.target.get(&target).context("plan review source target is missing")?;
             let row = document.document.block(&input.block).and_then(|block| block.text.row(input.position.row))
@@ -155,30 +153,26 @@ impl PlanReviewStore {
                 crate::declaration::DeclarationResolution::Resolved { .. } | crate::declaration::DeclarationResolution::Intrinsic) {
                 return Ok(());
             }
-            if document.source.resolver_sources.get().is_some() { return Ok(()); }
             let resolver = document.source.resolver.get().unwrap().lock()
                 .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
-            let requires_fetch = resolver.0.requires_source_fetch() || resolver.1.requires_source_fetch();
-            if resolver.0.library_sources_checked() && resolver.1.library_sources_checked() && !requires_fetch { return Ok(()); }
-            (Arc::clone(&document.source.resolver), Arc::clone(&document.source.resolver_sources), document.source.workspace.clone(), design.clone(), requires_fetch)
+            let requires_fetch = (resolver.0.requires_source_fetch(), resolver.1.requires_source_fetch());
+            if resolver.0.library_sources_checked() && resolver.1.library_sources_checked() && !requires_fetch.0 && !requires_fetch.1 { return Ok(()); }
+            (Arc::clone(&document.source.resolver), Arc::clone(&document.source.resolver_sources), design.clone(),
+                (resolver.0.clone(), resolver.1.clone()), requires_fetch)
         };
         let stage = trace.map(|trace| trace.stage("prepare_external", None));
-        if !captured.4 {
-            let proposed = crate::declaration::DeclarationResolver::navigation(&captured.2, &captured.3, false, trace.cloned()).await?;
-            let baseline = crate::declaration::DeclarationResolver::navigation(&captured.2, &captured.3, true, trace.cloned()).await?;
-            *captured.0.get().context("declaration resolver is unavailable")?.lock()
-                .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))? = (proposed, baseline);
-            if let Some(stage) = stage { stage.complete(serde_json::json!({"cargo":false})); }
-            return Ok(());
-        }
-        captured.1.get_or_try_init(|| async {
-            let proposed = crate::declaration::DeclarationResolver::prepare(&captured.2, &captured.3, false, trace.cloned()).await?;
-            let baseline = crate::declaration::DeclarationResolver::prepare(&captured.2, &captured.3, true, trace.cloned()).await?;
+        let prepare = async {
+            let (mut proposed, mut baseline) = captured.3;
+            proposed.prepare_sources(&captured.2).await?;
+            baseline.prepare_sources(&captured.2).await?;
             *captured.0.get().context("declaration resolver is unavailable")?.lock()
                 .map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))? = (proposed, baseline);
             Ok::<_, anyhow::Error>(())
-        }).await?;
-        if let Some(stage) = stage { stage.complete(serde_json::json!({})); }
+        };
+        let cargo = captured.4.0 || captured.4.1;
+        prepare.await?;
+        if cargo { let _ = captured.1.set(()); }
+        if let Some(stage) = stage { stage.complete(serde_json::json!({"cargo":cargo})); }
         Ok(())
     }
 

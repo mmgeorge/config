@@ -47,9 +47,9 @@ pub(super) fn project(resolver: &mut DeclarationResolver) -> Result<()> {
     Ok(())
 }
 
-pub(super) async fn prepare(resolver: &mut DeclarationResolver) -> Result<()> {
+pub(super) async fn acquire(resolver: &mut DeclarationResolver) -> Result<bool> {
     if !resolver.snapshot.keys().any(|path| path.ends_with(".rs")) {
-        return Ok(());
+        return Ok(false);
     }
     let manifests = resolver
         .snapshot
@@ -58,31 +58,7 @@ pub(super) async fn prepare(resolver: &mut DeclarationResolver) -> Result<()> {
         .map(|(path, text)| (path.clone(), text.clone()))
         .collect::<Vec<_>>();
     if manifests.is_empty() {
-        resolver.package.insert(
-            "workspace".into(),
-            RustPackage {
-                edition: "2024".into(),
-                ..Default::default()
-            },
-        );
-        let paths = resolver
-            .snapshot
-            .keys()
-            .filter(|path| path.ends_with(".rs"))
-            .cloned()
-            .collect::<Vec<_>>();
-        for path in paths {
-            let stem = Path::new(&path)
-                .file_stem()
-                .and_then(|stem| stem.to_str())
-                .unwrap_or("");
-            let module = if matches!(stem, "lib" | "main") {
-                Vec::new()
-            } else {
-                vec![stem.into()]
-            };
-            resolver.load_rust(&resolver.workspace.join(path), "workspace", &module, 0)?;
-        }
+        return Ok(false);
     } else {
         match cargo_graph(resolver, &manifests).await {
             Ok((graph, mirror)) => {
@@ -92,7 +68,7 @@ pub(super) async fn prepare(resolver: &mut DeclarationResolver) -> Result<()> {
             },
             Err(error) => {
                 resolver.warning.push(format!("Cargo dependency resolution is unavailable: {error:#}. External references remain unverified."));
-                install_project_fallback(resolver, &manifests)?;
+                return Ok(false);
             }
         }
     }
@@ -102,7 +78,7 @@ pub(super) async fn prepare(resolver: &mut DeclarationResolver) -> Result<()> {
     let stage = resolver.trace.as_ref().map(|trace| trace.stage("standard_library", Some(resolver.baseline)));
     standard_library(resolver).await?;
     if let Some(stage) = stage { stage.complete(resolver.statistics()); }
-    Ok(())
+    Ok(true)
 }
 
 fn loose_project_files(resolver: &mut DeclarationResolver) -> Result<()> {
@@ -163,9 +139,18 @@ async fn cargo_graph(
     tokio::fs::create_dir_all(&mirror).await?;
     let cached_graph = mirror.join("graph.json");
     if let Ok(bytes) = tokio::fs::read(&cached_graph).await {
-        if let Ok(graph) = serde_json::from_slice(&bytes) {
-            if let Some(stage) = stage { stage.complete(serde_json::json!({"cached":true})); }
-            return Ok((graph, mirror));
+        if let Ok(graph) = serde_json::from_slice::<crate::rustdoc::SourceGraph>(&bytes) {
+            let missing_module = resolver.source_request.keys().any(|request| {
+                let path = Path::new(request);
+                path.is_absolute() && !path.is_file()
+            });
+            let roots_available = graph.packages.iter().flat_map(|package| &package.targets)
+                .filter(|target| target.kind.iter().any(|kind| matches!(kind.as_str(), "lib" | "rlib" | "proc-macro")))
+                .all(|target| target.src_path.is_file());
+            if !missing_module && roots_available {
+                if let Some(stage) = stage { stage.complete(serde_json::json!({"cached":true})); }
+                return Ok((graph, mirror));
+            }
         }
     }
     for (path, text) in manifests {
@@ -317,24 +302,15 @@ fn install_graph(
             .strip_prefix(mirror)
             .map(|relative| resolver.workspace.join(relative))
             .unwrap_or_else(|_| manifest.clone());
-        let edition = resolver
+        let manifest = resolver
             .read(&source_manifest)
             .and_then(|text| toml::from_str::<toml::Value>(&text).ok())
-            .and_then(|manifest| {
-                manifest
-                    .get("package")
-                    .and_then(|package| package.get("edition"))
-                    .and_then(toml::Value::as_str)
-                    .map(str::to_owned)
-            })
-            .unwrap_or_else(|| "2021".into());
-        resolver.package.insert(
+            .unwrap_or(toml::Value::Table(Default::default()));
+        resolver.register_package(
             package.id.clone(),
-            RustPackage {
-                edition,
-                dependency: dependencies.get(&package.id).cloned().unwrap_or_default(),
-                ..Default::default()
-            },
+            source_manifest,
+            &manifest,
+            dependencies.get(&package.id).cloned().unwrap_or_default(),
         );
     }
     for package in &graph.packages {
@@ -350,14 +326,7 @@ fn install_graph(
                 .strip_prefix(mirror)
                 .map(|relative| resolver.workspace.join(relative))
                 .unwrap_or(root);
-            if root.starts_with(&resolver.workspace) {
-                resolver.load_rust(&root, &package.id, &[], 0)?;
-            } else {
-                resolver.pending_module.insert(
-                    (package.id.clone(), Vec::new()),
-                    (root, false),
-                );
-            }
+            resolver.register_root(&package.id, root)?;
         }
     }
     for package in &graph.packages {
@@ -400,22 +369,10 @@ fn install_project_fallback(
             .parent()
             .unwrap()
             .to_path_buf();
-        let edition = manifest
-            .get("package")
-            .and_then(|package| package.get("edition"))
-            .and_then(toml::Value::as_str)
-            .unwrap_or("2015")
-            .to_owned();
         let identity = path.clone();
-        let mut state = RustPackage {
-            edition,
-            source_manifest: Some(normalize(&resolver.workspace.join(path))),
-            ..Default::default()
-        };
-        for alias in cache::dependency_aliases(&manifest) {
-            state.dependency.insert(alias.clone(), format!("unavailable:{alias}"));
-        }
-        resolver.package.insert(identity.clone(), state);
+        let dependency = cache::dependency_aliases(&manifest).into_iter()
+            .map(|alias| (alias.clone(), format!("unavailable:{alias}"))).collect();
+        resolver.register_package(identity.clone(), resolver.workspace.join(path), &manifest, dependency);
         let root = manifest
             .get("lib")
             .and_then(|library| library.get("path"))
@@ -428,7 +385,7 @@ fn install_project_fallback(
                     directory.join("src/main.rs")
                 }
             });
-        resolver.load_rust(&root, &identity, &[], 0)?;
+        resolver.register_root(&identity, root)?;
     }
     Ok(())
 }

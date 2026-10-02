@@ -141,6 +141,7 @@ struct RustAccess<'scope> {
     package: &'scope str,
     scope: &'scope [String],
     navigation: bool,
+    macro_namespace: bool,
 }
 
 fn accessible(
@@ -163,6 +164,7 @@ fn accessible(
 }
 
 /// Owns a snapshot's module graph and the same resolution evidence used by jumps.
+#[derive(Clone)]
 pub(crate) struct DeclarationResolver {
     workspace: PathBuf,
     snapshot: BTreeMap<String, String>,
@@ -179,13 +181,15 @@ pub(crate) struct DeclarationResolver {
     rust_library: bool,
     library_checked: bool,
     source_cache: Option<cache::RustSourceCache>,
+    source_request: BTreeMap<String, String>,
+    source_acquired: bool,
     bytes: usize,
     /// Correlates navigation work with the currently admitted review input.
     pub(crate) trace: Option<trace::DeclarationTrace>,
     work: ResolutionWork,
 }
 
-#[derive(Default, Serialize)]
+#[derive(Clone, Default, Serialize)]
 struct ResolutionWork {
     member_calls: usize,
     max_depth: usize,
@@ -206,14 +210,17 @@ type ParseCache = Mutex<BTreeMap<String, Arc<DeclarationIndex>>>;
 static PARSE_CACHE: OnceLock<ParseCache> = OnceLock::new();
 
 impl DeclarationResolver {
-    /// Validate direct store callers using locally available project evidence.
+    /// Index snapshot declarations and discover dependency sources only when reached.
     pub(crate) fn local(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
         let mut resolver = Self::snapshot(workspace, design, baseline)?;
         sources::project(&mut resolver)?;
         resolver.typescript_environment()?;
+        if !resolver.package.is_empty() {
+            resolver.source_cache = Some(cache::RustSourceCache::new(home::cargo_home()?));
+        }
         Ok(resolver)
     }
-    /// Capture configured sources without modifying the reviewed workspace.
+    /// Prepare cached sources and toolchain roots without resolving the Cargo graph.
     pub(crate) async fn prepare(
         workspace: &Path,
         design: &DeclarationDesign,
@@ -221,25 +228,16 @@ impl DeclarationResolver {
         trace: Option<trace::DeclarationTrace>,
     ) -> Result<Self> {
         let stage = trace.as_ref().map(|trace| trace.stage("prepare_resolver", Some(baseline)));
-        let mut resolver = Self::snapshot(workspace, design, baseline)?;
+        let mut resolver = Self::local(workspace, design, baseline)?;
         resolver.trace = trace;
-        sources::prepare(&mut resolver).await?;
-        resolver.typescript_environment()?;
+        resolver.prepare_sources(design).await?;
         if let Some(stage) = stage { stage.complete(resolver.statistics()); }
         Ok(resolver)
     }
 
-    /// Enable compatible cached source lookup only for review navigation.
-    pub(crate) fn enable_navigation_sources(&mut self) -> Result<()> {
-        if self.source_cache.is_none() {
-            self.source_cache = Some(cache::RustSourceCache::new(home::cargo_home()?));
-        }
-        Ok(())
-    }
-
     /// Report whether a reached dependency requires Cargo source acquisition.
     pub(crate) fn requires_source_fetch(&self) -> bool {
-        self.source_cache.as_ref().is_some_and(|cache| cache.requires_fetch)
+        !self.source_acquired && !self.source_request.is_empty()
     }
 
     /// Avoid repeating toolchain discovery when rust-src is unavailable.
@@ -247,18 +245,41 @@ impl DeclarationResolver {
         self.library_checked
     }
 
-    /// Acquire toolchain sources while retaining lazy manifest-based dependency lookup.
-    pub(crate) async fn navigation(
-        workspace: &Path,
-        design: &DeclarationDesign,
-        baseline: bool,
-        trace: Option<trace::DeclarationTrace>,
-    ) -> Result<Self> {
-        let mut resolver = Self::local(workspace, design, baseline)?;
-        resolver.trace = trace;
-        resolver.enable_navigation_sources()?;
-        sources::standard_library(&mut resolver).await?;
-        Ok(resolver)
+    /// Extend available evidence while retaining indexes and outstanding source requests.
+    pub(crate) async fn prepare_sources(&mut self, design: &DeclarationDesign) -> Result<()> {
+        if !self.package.is_empty() && !self.library_checked {
+            sources::standard_library(self).await?;
+        }
+        if self.requires_source_fetch() {
+            self.acquire(design).await?;
+        }
+        Ok(())
+    }
+
+    /// Retry unavailable reached sources once through Cargo without modifying the workspace.
+    pub(crate) async fn acquire(&mut self, design: &DeclarationDesign) -> Result<()> {
+        let mut acquired = Self::snapshot(&self.workspace, design, self.baseline)?;
+        acquired.trace = self.trace.clone();
+        acquired.source_request = self.source_request.clone();
+        acquired.source_acquired = true;
+        if !sources::acquire(&mut acquired).await? {
+            self.source_acquired = true;
+            self.warning.extend(acquired.warning);
+            return Ok(());
+        }
+        acquired.typescript_environment()?;
+        *self = acquired;
+        Ok(())
+    }
+
+    /// Validate with cached evidence, acquiring only missing reached dependency sources.
+    pub(crate) async fn validate_sources(&mut self, design: &DeclarationDesign) -> Result<DeclarationValidation> {
+        let report = self.validate(design);
+        if self.requires_source_fetch() {
+            self.prepare_sources(design).await?;
+            return Ok(self.validate(design));
+        }
+        Ok(report)
     }
 
     /// Create an isolated lexical snapshot before acquiring external evidence.
@@ -296,6 +317,8 @@ impl DeclarationResolver {
             rust_library: false,
             library_checked: false,
             source_cache: None,
+            source_request: BTreeMap::new(),
+            source_acquired: false,
             bytes: 0,
             trace: None,
             work: Default::default(),
@@ -465,6 +488,11 @@ impl DeclarationResolver {
         }
         if !self.load_file(&path, package, module)? {
             self.package.entry(package.into()).or_default().incomplete = true;
+            if !path.starts_with(&self.workspace)
+                && self.package.get(package).is_some_and(|state| state.source_manifest.is_some())
+            {
+                self.source_request.insert(path.to_string_lossy().into_owned(), "module source is unavailable".into());
+            }
             return Ok(());
         }
         let index = self.file[&path].index.clone();
@@ -538,6 +566,35 @@ impl DeclarationResolver {
         Ok(())
     }
 
+    fn register_package(
+        &mut self,
+        identity: String,
+        manifest_path: PathBuf,
+        manifest: &toml::Value,
+        dependency: HashMap<String, String>,
+    ) {
+        let edition = manifest.get("package")
+            .and_then(|package| package.get("edition"))
+            .and_then(toml::Value::as_str)
+            .unwrap_or("2015").to_owned();
+        self.package.insert(identity, RustPackage {
+            edition,
+            source_manifest: Some(normalize(&manifest_path)),
+            dependency,
+            ..Default::default()
+        });
+    }
+
+    fn register_root(&mut self, package: &str, root: PathBuf) -> Result<()> {
+        let root = normalize(&root);
+        if root.starts_with(&self.workspace) {
+            self.load_rust(&root, package, &[], 0)?;
+        } else {
+            self.pending_module.insert((package.into(), Vec::new()), (root, false));
+        }
+        Ok(())
+    }
+
     /// Validate imports and signature references only in proposed changed files.
     pub(crate) fn validate(&mut self, design: &DeclarationDesign) -> DeclarationValidation {
         let changed = design.changed_paths().into_iter().collect::<HashSet<_>>();
@@ -579,6 +636,7 @@ impl DeclarationResolver {
         }
         for file in files {
             for reference in &file.index.reference {
+                if reference.macro_namespace { continue; }
                 let result = self.resolve_reference(&file, reference, false);
                 record(
                     &mut report,
@@ -616,6 +674,7 @@ impl DeclarationResolver {
                             package: &file.package,
                             scope: &file.module,
                             navigation: false,
+                            macro_namespace: false,
                         },
                         &mut HashSet::new(),
                     );
@@ -629,6 +688,7 @@ impl DeclarationResolver {
                                 package: &file.package,
                                 scope: &file.module,
                                 navigation: false,
+                                macro_namespace: false,
                             },
                             &mut HashSet::new(),
                         )
@@ -709,6 +769,7 @@ impl DeclarationResolver {
                             package: &file.package,
                             scope: &file.module,
                             navigation: true,
+                            macro_namespace: false,
                         },
                         &mut HashSet::new(),
                     )
@@ -753,11 +814,12 @@ impl DeclarationResolver {
                     package: &file.package,
                     scope: &scope,
                     navigation,
+                    macro_namespace: reference.macro_namespace,
                 },
                 &mut HashSet::new(),
             );
             let bound = reference.path.first().is_some_and(|name| {
-                self.rust_bound(&file.package, &scope[..depth], name, reference.value_namespace)
+                self.rust_bound(&file.package, &scope[..depth], name, reference.value_namespace, reference.macro_namespace)
             });
             if bound
                 || matches!(
@@ -787,6 +849,7 @@ impl DeclarationResolver {
                     package: &file.package,
                     scope: &scope,
                     navigation,
+                    macro_namespace: reference.macro_namespace,
                 },
                 &mut HashSet::new(),
             );
@@ -823,6 +886,7 @@ impl DeclarationResolver {
                     package: library,
                     scope: &[],
                     navigation,
+                    macro_namespace: reference.macro_namespace,
                 },
                 &mut HashSet::new(),
             );
@@ -896,7 +960,7 @@ impl DeclarationResolver {
                 }
             }
             _ => {
-                if self.rust_bound(package, scope, first, value) {
+                if self.rust_bound(package, scope, first, value, origin.macro_namespace) {
                     return self.rust_member(package, scope, path, value, origin, visited);
                 }
                 if self.package.get(package).and_then(|state| state.dependency.get(first))
@@ -904,11 +968,24 @@ impl DeclarationResolver {
                     if let Some(mut cache) = self.source_cache.take() {
                         let stage = self.trace.as_ref().map(|trace| trace.stage("cached_dependency", Some(self.baseline)));
                         let result = cache.dependency(self, package, first);
-                        let requires_fetch = cache.requires_fetch;
                         self.source_cache = Some(cache);
+                        let cached = match &result {
+                            Ok(cache::DependencySource::Available(identity)) => {
+                                self.package.get_mut(package).unwrap().dependency.insert(first.into(), identity.clone());
+                                true
+                            }
+                            Ok(cache::DependencySource::Unavailable { reason }) => {
+                                self.source_request.insert(format!("{package}:{first}"), reason.clone());
+                                false
+                            }
+                            Err(error) => {
+                                self.source_request.insert(format!("{package}:{first}"), format!("{error:#}"));
+                                false
+                            }
+                        };
                         if let Some(stage) = stage {
                             stage.complete(serde_json::json!({"package":package,"alias":first,
-                                "cached":matches!(result, Ok(Some(_))),"requires_fetch":requires_fetch}));
+                                "cached":cached,"requires_fetch":self.requires_source_fetch()}));
                         }
                         if let Err(error) = result {
                             return unverified(&format!("cached dependency source cannot be located: {error:#}"));
@@ -928,12 +1005,12 @@ impl DeclarationResolver {
         }
     }
 
-    fn rust_bound(&self, package: &str, scope: &[String], name: &str, value: bool) -> bool {
+    fn rust_bound(&self, package: &str, scope: &[String], name: &str, value: bool, macro_namespace: bool) -> bool {
         self.rust_scope_file(package, scope).is_some_and(|file| {
             let relative = scope.strip_prefix(file.module.as_slice()).unwrap();
             file.index.symbol.iter().any(|symbol| {
                 symbol.scope == relative && symbol.name == name
-                    && if value { symbol.value_namespace } else { symbol.type_namespace }
+                    && if macro_namespace { symbol.macro_namespace } else if value { symbol.value_namespace } else { symbol.type_namespace }
             }) || file.index.import.iter().any(|import| {
                 import.scope == relative && !import.glob && import.alias.as_deref() == Some(name)
             })
@@ -1013,7 +1090,9 @@ impl DeclarationResolver {
             for symbol in file.index.symbol.iter().filter(|symbol| {
                 symbol.scope == relative
                     && &symbol.name == first
-                    && if value {
+                    && if origin.macro_namespace {
+                        symbol.macro_namespace
+                    } else if value {
                         symbol.value_namespace
                     } else {
                         symbol.type_namespace
@@ -1042,6 +1121,10 @@ impl DeclarationResolver {
                         visited,
                     ));
                 }
+            }
+            // A qualified path enters its lexical container before considering same-named aliases.
+            if path.len() > 1 && !results.is_empty() {
+                return combine(results, || self.missing_rust(package, &joined(scope, path).join("::")), origin.navigation);
             }
             for import in file.index.import.iter().filter(|import| {
                 import.scope == relative && !import.glob && import.alias.as_ref() == Some(first)

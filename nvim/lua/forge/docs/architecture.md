@@ -1897,6 +1897,11 @@ from saved declarations. Opening a working or historical design does not rewrite
 review digest, or increment its version. Formatting-only proposal changes disappear after both sides
 are canonicalized.
 
+Rust derive attributes retain navigation references in the macro namespace. Procedural derive exports
+use their declared macro name, so `#[derive(Component)]` follows re-exports to the macro implementation
+while a signature's `Component` still resolves to the trait. These references support navigation only
+and do not add macro-expansion or derive validation to submission.
+
 Submission validates every proposed declaration and checks changed source digests and vacant new
 paths. It freezes canonical JSON and saves a diff projection and navigation index for the reviewed
 revision. JSON owns the design identity. Opening working or historical designs rebuilds the presentation
@@ -1908,15 +1913,21 @@ diff gutters, and tree-sitter syntax decorations. Opening adopts a generated loa
 PlanReview winbar before requesting the snapshot, without displaying or parsing the saved Markdown
 projection. Declaration jumps first resolve against captured project declarations. Only unresolved
 jumps discover dependency and standard-library sources independently of opening and highlighting.
-Navigation reads manifest aliases and selects the highest compatible cached registry version,
+Validation and navigation share manifest lookup and select the highest compatible cached registry version,
 without consulting Cargo.lock or invoking Cargo metadata. It follows renamed, path, inherited
 workspace, and target-specific dependency declarations as each alias is reached. Missing reached
 sources and unsupported source kinds request Cargo acquisition through the isolated metadata
-mirror. Unreached dependencies do not trigger acquisition. Exact submission validation continues
-to use Cargo's resolved graph. Captured project roots remain indexed immediately. Dependency and
+mirror. Missing library or child-module files request acquisition even when their manifests exist.
+Unreached dependencies do not trigger acquisition. Cached version selection applies to validation
+as well as navigation and does not prove compatibility with the eventual locked build. Exact
+version requirements remain exact. Both submission entry points use DeclarationDesign's shared
+formatting, workspace check, cached reference validation, and acquisition retry. Captured project
+roots remain indexed immediately. Dependency and
 standard-library roots use the same pending-module lookup as their children, so only modules
 reached by navigation or validation are parsed. Loaded indexes remain available for subsequent
-lookups within the review. Each Rust scope selects its owning file through the module map rather
+lookups within the review. Asynchronous preparation retains shared immutable indexes and swaps
+the baseline/proposed resolver pair only after both sides are prepared. Failed Cargo acquisition
+preserves evidence already found in cached sources. Each Rust scope selects its owning file through the module map rather
 than scanning every indexed file in the crate. Wildcard lookup retains ambiguity checks across
 all applicable branches. Local bindings and explicit imports take precedence over wildcard imports.
 Rust re-export paths resolve names in their containing module before dependency or crate-root
@@ -1934,7 +1945,8 @@ byte count, cache outcome, read duration, parser duration, and declaration-extra
 Resolver aggregates also measure child-module path probes separately from indexed file reads.
 Cached-dependency records identify the alias, cache outcome, and need for source acquisition.
 Declaration extraction carries outer attributes forward while walking siblings, and uses source
-positions to distinguish anonymous scopes. Neither operation rescans preceding documentation
+per-kind sibling counters to distinguish anonymous scopes independently of byte positions.
+Original-source mapping therefore survives declaration formatting and body removal. Neither operation rescans preceding documentation
 or sibling declarations.
 Interrupted phases retain their elapsed time on errors or cancellation. Logging changes no lookup rules and emits no notifications or review sections.
 Validation evidence remains internal to submission and is omitted from review sections and
