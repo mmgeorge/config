@@ -205,7 +205,7 @@ local function refresh_winbar(review)
   local detail = plan.historical_revision and ("Revision " .. plan.historical_revision .. " • historical • read-only")
     or plan.state == "accepted" and "Accepted plan • read-only projection • C adds comments"
     or "Awaiting review • read-only projection • C adds comments"
-  if review.public_only then detail = detail .. " • public only" end
+  detail = detail .. " • Showing: " .. (review.public_only and "Public" or "All")
   keymaps.apply_view_winbar(review.win, "PlanReview", "plan_review", review.command_set, detail)
 end
 
@@ -220,6 +220,7 @@ local function action(review, name)
     if failure then notice(failure) return end
     if name == "toggle_public" then
       review.public_only = result.public_only
+      review.owner.public_only = result.public_only
       refresh_winbar(review)
     elseif name == "comment" then
       local _, row = review.owner.replica.sequence:position(result.block)
@@ -354,6 +355,7 @@ function M.open(plan)
       return
     end
     review.owner = owner
+    review.public_only = owner.public_only
     apply_task_folds(review, owner.view.window)
     local set = commands(review)
     review.command_set = set

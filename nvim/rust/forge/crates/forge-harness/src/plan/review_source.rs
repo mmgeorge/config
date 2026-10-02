@@ -57,7 +57,7 @@ impl PlanFileStore {
         Ok(PlanReviewSource {
             resolver: Default::default(),
             resolver_sources: Default::default(),
-            public_only: false,
+            public_only: true,
             historical: true,
             path: path.with_extension("md"),
             workspace: self.workspace.clone(),
@@ -123,7 +123,7 @@ impl PlanFileStore {
         Ok(PlanReviewSource {
             resolver: Default::default(),
             resolver_sources: Default::default(),
-            public_only: false,
+            public_only: true,
             historical: false,
             path: directory.join("working.md"),
             workspace: self.workspace.clone(),

@@ -1991,6 +1991,11 @@ free functions named `main` and their documentation and attributes as binary ent
 associated methods named `main` still follow the normal visibility filter. Saved declaration text and canonical
 comment coordinates retain all trait implementation members for execution.
 
+New working, accepted, and historical review attachments start with public declaration visibility.
+The native open result supplies the visibility state to Lua. The winbar always displays
+`Showing: Public` or `Showing: All` using the normal status styling. Refreshes preserve the current mode,
+and reopening starts in Public without changing saved plan artifacts.
+
 Shift+Tab toggles public declaration visibility through a revision-validated layout action.
 Tree-sitter classifies visibility on both diff sides, including inherited trait and enum
 visibility. Filtering removes private rows and their comments from the projection, prunes

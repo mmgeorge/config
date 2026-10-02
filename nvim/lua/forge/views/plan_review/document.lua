@@ -283,6 +283,7 @@ function M.attach(options, callback)
       owner.close() callback(nil, "Physical plan review changed before attachment: " .. adopted.kind) return
     end
     if options.configure_view then options.configure_view(owner.view, owner) end
+    owner.public_only = opened.public_only
     owner.saved_source_digest, owner.version = opened.saved_source_digest, opened.version
     owner.focused_annotation = options.recovery and next(options.recovery.draft) or nil
     owner.ready = true

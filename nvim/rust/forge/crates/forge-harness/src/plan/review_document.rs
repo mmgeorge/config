@@ -113,7 +113,7 @@ impl PlanReviewStore {
         admission.check()?;
         let opened = serde_json::json!({"snapshot":document.snapshot(), "saved_source_digest":document.saved_digest(),
             "plan_id":document.source.document.plan_id, "version":document.source.document.version,
-            "path":document.source.path});
+            "path":document.source.path, "public_only":document.source.public_only});
         store.insert(document.id.clone(), (document, admission));
         Ok(opened)
     }
@@ -866,6 +866,7 @@ mod tests {
             .submit_document_revision("session", "plan", 2, 2)
             .unwrap();
         let source = store.capture_revision_source("session", "plan", 1).unwrap();
+        assert!(source.public_only, "historical review did not default to Public");
         assert_eq!(source.document.overview, "Original overview");
         let mut historical = PlanReviewDocument::new(
             DocumentId("history".into()),
@@ -949,7 +950,9 @@ mod tests {
         canonical.design = Some(design);
         store.write_working_document("session", "plan", &canonical).unwrap();
         let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
-        let source = store.capture_review_source("session", "plan", 1, &digest).unwrap();
+        let mut source = store.capture_review_source("session", "plan", 1, &digest).unwrap();
+        assert!(source.public_only);
+        source.public_only = false;
         let document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
         let resolver = Arc::clone(&document.source.resolver);
         assert!(resolver.get().is_none(), "opening acquired dependency sources");
@@ -1105,7 +1108,9 @@ mod tests {
         canonical.design = Some(design);
         file.write_working_document("session", "plan", &canonical).unwrap();
         let (_, _, digest) = file.submit_document_revision("session", "plan", 1, 1).unwrap();
-        let source = file.capture_review_source("session", "plan", 1, &digest).unwrap();
+        let mut source = file.capture_review_source("session", "plan", 1, &digest).unwrap();
+        assert!(source.public_only);
+        source.public_only = false;
         let dependency_sources = Arc::clone(&source.resolver_sources);
         let document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
         let review = PlanReviewStore::default();
