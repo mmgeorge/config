@@ -102,6 +102,120 @@ fn invalid_import_blocks_but_missing_prelude_does_not() {
 }
 
 #[test]
+fn rust_facade_navigation_follows_relative_reexports_and_retains_validation_uncertainty() {
+    let fixture = tempfile::tempdir().unwrap();
+    let workspace = fixture.path().join("app");
+    std::fs::create_dir_all(&workspace).unwrap();
+    let (_, mut resolver) = local(
+        &workspace,
+        &[(
+            "lib.rs",
+            "use facade::prelude::*;\npub struct State;\npub fn update(shared: Res<State>, unique: ResMut<State>);\n",
+        )],
+    );
+    resolver
+        .package
+        .get_mut("workspace")
+        .unwrap()
+        .dependency
+        .insert("facade".into(), "facade".into());
+    for (package, dependency) in [
+        ("facade", Some(("internal", "internal"))),
+        ("internal", Some(("ecs", "ecs"))),
+        ("ecs", None),
+    ] {
+        resolver.package.insert(
+            package.into(),
+            RustPackage {
+                dependency: dependency
+                    .into_iter()
+                    .map(|(alias, target)| (alias.into(), target.into()))
+                    .collect(),
+                ..Default::default()
+            },
+        );
+    }
+    for (path, contents) in [
+        ("facade/lib.rs", "pub use internal::*;\n"),
+        (
+            "internal/lib.rs",
+            "pub mod prelude;\npub use ecs as engine;\npub mod looping { pub use crate::looping::*; }\n",
+        ),
+        (
+            "internal/prelude.rs",
+            "pub use crate::engine::prelude::*;\npub use crate::looping::*;\n#[cfg(feature=\"optional\")]\npub use optional::*;\n",
+        ),
+        (
+            "ecs/lib.rs",
+            "mod system;\npub mod prelude { pub use crate::system::{Res, ResMut}; }\n",
+        ),
+        (
+            "ecs/system/mod.rs",
+            "mod parameter;\npub use parameter::*;\n",
+        ),
+        (
+            "ecs/system/parameter.rs",
+            "pub struct Res<T> { pub value: T }\npub struct ResMut<T> { pub value: T }\n",
+        ),
+    ] {
+        let destination = fixture.path().join(path);
+        std::fs::create_dir_all(destination.parent().unwrap()).unwrap();
+        std::fs::write(destination, contents).unwrap();
+    }
+    for package in ["facade", "internal", "ecs"] {
+        resolver
+            .load_rust(
+                &fixture.path().join(package).join("lib.rs"),
+                package,
+                &[],
+                0,
+            )
+            .unwrap();
+    }
+    for (name, column, line) in [("Res", 22, 1), ("ResMut", 42, 2)] {
+        let result = resolver.at("lib.rs", 3, column);
+        assert!(
+            matches!(result, DeclarationResolution::Resolved { ref destination }
+            if destination.name == name && destination.path.ends_with("parameter.rs") && destination.line == line && !destination.proposed),
+            "{result:?}"
+        );
+    }
+    let strict = resolver.resolve_rust_path(
+        "workspace",
+        &[],
+        &["facade".into(), "prelude".into(), "Res".into()],
+        false,
+        RustAccess {
+            package: "workspace",
+            scope: &[],
+            navigation: false,
+        },
+        &mut HashSet::new(),
+    );
+    assert!(
+        matches!(strict, DeclarationResolution::Unverified { .. }),
+        "{strict:?}"
+    );
+}
+
+#[test]
+fn rust_navigation_does_not_choose_between_distinct_glob_destinations() {
+    let root = tempfile::tempdir().unwrap();
+    let (_, mut resolver) = local(
+        root.path(),
+        &[(
+            "lib.rs",
+            "pub mod left { pub struct Item; }\npub mod right { pub struct Item; }\nuse crate::left::*;\nuse crate::right::*;\npub fn inspect(value: Item);\n",
+        )],
+    );
+    let result = resolver.at("lib.rs", 5, 22);
+    assert!(
+        matches!(result, DeclarationResolution::Ambiguous { .. }),
+        "{result:?}"
+    );
+}
+
+#[test]
 fn prelude_exports_resolve_to_defining_enum() {
     let root = tempfile::tempdir().unwrap();
     let (_, mut resolver) = local(
@@ -477,4 +591,39 @@ fn conditional_module_references_remain_unverified() {
             .any(|diagnostic| diagnostic.reason.contains("conditionally compiled")),
         "{report:?}"
     );
+}
+
+#[tokio::test]
+#[ignore = "acquires Bevy sources through Cargo"]
+async fn bevy_prelude_navigation_reaches_resource_definitions() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(
+        workspace.path().join("rust-toolchain.toml"),
+        "[toolchain]\nchannel='1.94.0'\n",
+    )
+    .unwrap();
+    let design = design(&[
+        (
+            "Cargo.toml",
+            "[package]\nname='bevy-navigation'\nversion='0.1.0'\nedition='2024'\n[dependencies]\nbevy={version='=0.19.1',default-features=false}\n",
+        ),
+        (
+            "src/lib.rs",
+            "use bevy::prelude::*;\npub struct MovementInput;\npub fn update(shared: Res<MovementInput>, unique: ResMut<MovementInput>);\n",
+        ),
+    ]);
+    let mut resolver = DeclarationResolver::prepare(workspace.path(), &design, false)
+        .await
+        .unwrap();
+    for (name, column) in [("Res", 22), ("ResMut", 50)] {
+        let result = resolver.at("src/lib.rs", 3, column);
+        assert!(
+            matches!(result, DeclarationResolution::Resolved { ref destination }
+            if destination.name == name && destination.path.replace('\\', "/").contains("bevy_ecs-0.19.1/src/change_detection/params.rs") && !destination.proposed),
+            "{name}: {result:?}; warnings={:?}",
+            resolver.warning
+        );
+    }
+    assert!(!workspace.path().join("Cargo.toml").exists());
+    assert!(!workspace.path().join("Cargo.lock").exists());
 }

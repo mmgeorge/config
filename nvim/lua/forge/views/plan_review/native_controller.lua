@@ -359,9 +359,6 @@ function M.open(plan)
     review.command_set = set
     keymaps.setup_view_keymaps(native_buffer, "plan_review", set)
     refresh_winbar(review)
-    for _, warning in ipairs(plan.validation_warning or {}) do
-      notifications.warn(("%s: %s"):format(warning.path or "Rust API", warning.message or "validation unavailable"), "PlanReview validation")
-    end
   end)
 end
 

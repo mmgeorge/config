@@ -136,6 +136,7 @@ struct RustPackage {
 struct RustAccess<'scope> {
     package: &'scope str,
     scope: &'scope [String],
+    navigation: bool,
 }
 
 fn accessible(
@@ -470,7 +471,7 @@ impl DeclarationResolver {
         }
         for file in files {
             for reference in &file.index.reference {
-                let result = self.resolve_reference(&file, reference);
+                let result = self.resolve_reference(&file, reference, false);
                 record(
                     &mut report,
                     &self.workspace,
@@ -506,6 +507,7 @@ impl DeclarationResolver {
                         RustAccess {
                             package: &file.package,
                             scope: &file.module,
+                            navigation: false,
                         },
                         &mut HashSet::new(),
                     );
@@ -518,6 +520,7 @@ impl DeclarationResolver {
                             RustAccess {
                                 package: &file.package,
                                 scope: &file.module,
+                                navigation: false,
                             },
                             &mut HashSet::new(),
                         )
@@ -563,7 +566,7 @@ impl DeclarationResolver {
                 && reference.position.column <= column
                 && (column as usize) < reference.position.column as usize + reference.length
         }) {
-            return self.resolve_reference(&file, reference);
+            return self.resolve_reference(&file, reference, true);
         }
         if let Some(symbol) = file.index.symbol.iter().find(|symbol| {
             symbol.position.line == line
@@ -590,6 +593,7 @@ impl DeclarationResolver {
                     RustAccess {
                         package: &file.package,
                         scope: &file.module,
+                        navigation: true,
                     },
                     &mut HashSet::new(),
                 )
@@ -602,6 +606,7 @@ impl DeclarationResolver {
         &mut self,
         file: &IndexedFile,
         reference: &DeclarationReference,
+        navigation: bool,
     ) -> DeclarationResolution {
         if reference.conditional {
             return unverified("reference is conditionally compiled");
@@ -622,31 +627,13 @@ impl DeclarationResolver {
                 RustAccess {
                     package: &file.package,
                     scope: &scope,
+                    navigation,
                 },
                 &mut HashSet::new(),
             );
-            let bound = self
-                .file
-                .values()
-                .filter(|candidate| candidate.package == file.package)
-                .any(|candidate| {
-                    scope[..depth]
-                        .strip_prefix(candidate.module.as_slice())
-                        .is_some_and(|relative| {
-                            candidate.index.symbol.iter().any(|symbol| {
-                                symbol.scope == relative
-                                    && reference.path.first() == Some(&symbol.name)
-                                    && if reference.value_namespace {
-                                        symbol.value_namespace
-                                    } else {
-                                        symbol.type_namespace
-                                    }
-                            }) || candidate.index.import.iter().any(|import| {
-                                import.scope == relative
-                                    && import.alias.as_ref() == reference.path.first()
-                            })
-                        })
-                });
+            let bound = reference.path.first().is_some_and(|name| {
+                self.rust_bound(&file.package, &scope[..depth], name, reference.value_namespace)
+            });
             if bound
                 || matches!(
                     result,
@@ -674,6 +661,7 @@ impl DeclarationResolver {
                 RustAccess {
                     package: &file.package,
                     scope: &scope,
+                    navigation,
                 },
                 &mut HashSet::new(),
             );
@@ -709,6 +697,7 @@ impl DeclarationResolver {
                 RustAccess {
                     package: library,
                     scope: &[],
+                    navigation,
                 },
                 &mut HashSet::new(),
             );
@@ -782,6 +771,9 @@ impl DeclarationResolver {
                 }
             }
             _ => {
+                if self.rust_bound(package, scope, first, value) {
+                    return self.rust_member(package, scope, path, value, origin, visited);
+                }
                 if let Some(dependency) = self
                     .package
                     .get(package)
@@ -793,6 +785,31 @@ impl DeclarationResolver {
                 self.rust_member(package, &[], path, value, origin, visited)
             }
         }
+    }
+
+    fn rust_bound(&self, package: &str, scope: &[String], name: &str, value: bool) -> bool {
+        self.file
+            .values()
+            .filter(|file| file.package == package)
+            .any(|file| {
+                scope
+                    .strip_prefix(file.module.as_slice())
+                    .is_some_and(|relative| {
+                        file.index.symbol.iter().any(|symbol| {
+                            symbol.scope == relative
+                                && symbol.name == name
+                                && if value {
+                                    symbol.value_namespace
+                                } else {
+                                    symbol.type_namespace
+                                }
+                        }) || file.index.import.iter().any(|import| {
+                            import.scope == relative
+                                && !import.glob
+                                && import.alias.as_deref() == Some(name)
+                        })
+                    })
+            })
     }
 
     fn rust_member(
@@ -907,7 +924,11 @@ impl DeclarationResolver {
                     scope,
                     &target,
                     value,
-                    RustAccess { package, scope },
+                    RustAccess {
+                        package,
+                        scope,
+                        ..origin
+                    },
                     visited,
                 );
                 results.push(self.exported_resolution(result, import.visibility));
@@ -915,25 +936,50 @@ impl DeclarationResolver {
         }
         // Lexical declarations and explicit imports take precedence over wildcard imports.
         if !results.is_empty() {
-            return combine(results, || self.missing_rust(package, &joined(scope, path).join("::")));
+            return combine(
+                results,
+                || self.missing_rust(package, &joined(scope, path).join("::")),
+                origin.navigation,
+            );
         }
         for file in &files {
-            let Some(relative) = scope.strip_prefix(file.module.as_slice()) else { continue; };
-            for import in file.index.import.iter().filter(|import| import.scope == relative && import.glob) {
-                if !accessible(import.visibility, package, scope, origin) { continue; }
+            let Some(relative) = scope.strip_prefix(file.module.as_slice()) else {
+                continue;
+            };
+            for import in file
+                .index
+                .import
+                .iter()
+                .filter(|import| import.scope == relative && import.glob)
+            {
+                if !accessible(import.visibility, package, scope, origin) {
+                    continue;
+                }
                 if import.conditional {
                     results.push(unverified("re-export is conditionally compiled"));
                     continue;
                 }
                 let target = joined(&import.path, path);
-                let result = self.resolve_rust_path(package, scope, &target, value,
-                    RustAccess { package, scope }, visited);
+                let result = self.resolve_rust_path(
+                    package,
+                    scope,
+                    &target,
+                    value,
+                    RustAccess {
+                        package,
+                        scope,
+                        ..origin
+                    },
+                    visited,
+                );
                 results.push(self.exported_resolution(result, import.visibility));
             }
         }
-        combine(results, || {
-            self.missing_rust(package, &joined(scope, path).join("::"))
-        })
+        combine(
+            results,
+            || self.missing_rust(package, &joined(scope, path).join("::")),
+            origin.navigation,
+        )
     }
 
     fn missing_rust(&self, package: &str, name: &str) -> DeclarationResolution {
@@ -1008,6 +1054,7 @@ fn resolved(file: &IndexedFile, symbol: &DeclarationSymbol) -> DeclarationResolu
 fn combine(
     results: Vec<DeclarationResolution>,
     missing: impl FnOnce() -> DeclarationResolution,
+    navigation: bool,
 ) -> DeclarationResolution {
     let mut destinations = Vec::new();
     let mut uncertain = None;
@@ -1019,7 +1066,8 @@ fn combine(
                 }
             }
             DeclarationResolution::Intrinsic => return DeclarationResolution::Intrinsic,
-            DeclarationResolution::Unverified { .. } | DeclarationResolution::Ambiguous { .. } => {
+            DeclarationResolution::Ambiguous { .. } => return result,
+            DeclarationResolution::Unverified { .. } => {
                 uncertain = Some(result)
             }
             DeclarationResolution::Invalid { .. } => {}
@@ -1030,7 +1078,8 @@ fn combine(
             reason: "multiple accessible declarations resolve this name".into(),
         };
     }
-    if let Some(result) = uncertain {
+    // Navigation can use one concrete destination without claiming feature availability.
+    if let Some(result) = uncertain.filter(|_| !navigation || destinations.is_empty()) {
         return result;
     }
     match destinations.pop() {

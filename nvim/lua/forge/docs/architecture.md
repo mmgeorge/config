@@ -1909,6 +1909,13 @@ PlanReview winbar before requesting the snapshot, without displaying or parsing 
 projection. Declaration jumps first resolve against captured project declarations. Only unresolved
 jumps acquire dependency and standard-library sources, once per review, independently of opening
 and highlighting. Local bindings and explicit imports take precedence over wildcard imports.
+Rust re-export paths resolve names in their containing module before dependency or crate-root
+lookup. Navigation follows facade crates and nested wildcard re-exports to the defining source.
+One concrete destination remains navigable when other branches lack evidence. Multiple concrete
+destinations remain ambiguous. Submission validation retains uncertainty from incomplete branches,
+and conditional compilation remains unverified without evaluating feature gates.
+Validation evidence remains internal to submission and is omitted from review sections and
+warning notifications.
 Automatic comment-focus requests wait for navigation responses so they cannot supersede a jump.
 Cursor movement still invalidates a pending navigation result. Failed attachment closes the review
 tab and reports the error.

@@ -1,5 +1,6 @@
 vim.loader.enable(false)
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
+local bevy_navigation = vim.g.forge_test_bevy == true
 print("plan_declaration_presentation_host fixtures: " .. workspace .. " | " .. data)
 assert(vim.fn.mkdir(workspace .. "/src", "p") == 1)
 assert(vim.fn.mkdir(data, "p") == 1)
@@ -16,6 +17,7 @@ local compact = table.concat({ "pub struct Registry { pub first: u64, pub second
   "struct HiddenState;", "pub fn inspect_hidden(value: HiddenState);", "pub fn optional_input(value: Option<MovementInput>);",
   "pub fn engine_handle(value: engine::Engine);", "fn hidden_helper();" }, "\n")
 compact = "/// Registry keeps the published handles and exposes the shared declarations used by callers throughout the application.\n" .. compact
+if bevy_navigation then compact = "use bevy::prelude::*;\n" .. compact end
 vim.fn.writefile({ '{"declaration_line_width":60}' }, workspace .. "/.forge.json")
 vim.fn.writefile(vim.split(compact, "\n", { plain = true }), workspace .. "/src/change.rs")
 vim.fn.writefile({ "/// Exposes movement declarations.", "mod change;", "/// Consumes movement declarations.", "mod input_consumer;" }, workspace .. "/src/lib.rs")
@@ -26,6 +28,7 @@ assert(vim.fn.mkdir(engine .. "/src", "p") == 1)
 vim.fn.writefile({ '[package]', 'name = "engine"', 'version = "1.2.0"', 'edition = "2024"', '[features]', 'render = []' }, engine .. "/Cargo.toml")
 vim.fn.writefile({ 'pub struct Engine;' }, engine .. "/src/lib.rs")
 local manifest = '[package]\nname = "arena"\nversion = "0.1.0"\nedition = "2024"\n\n[dependencies]\nengine = { path = ' .. vim.json.encode((engine:gsub("\\", "/"))) .. ', default-features = false, features = ["render"] }\n'
+if bevy_navigation then manifest = manifest .. 'bevy = { version = "=0.19.1", default-features = false }\n' end
 vim.fn.writefile(vim.split(manifest:gsub("\n$", ""), "\n", { plain = true }), workspace .. "/Cargo.toml")
 local configuration = {
   ["package.json"] = '{"name":"arena","version":"0.1.0"}\n',
@@ -42,9 +45,12 @@ local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "
 assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
-local errors = {}
+local errors, validation_notifications = {}, {}
 vim.notify = function(message, level)
   if level == vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end
+  if tostring(message):find("review validation warning fixture", 1, true) then
+    validation_notifications[#validation_notifications + 1] = tostring(message)
+  end
 end
 package.loaded["forge.builder"] = { ensure = function(callback)
   vim.schedule(function() callback({ ok = true, path = executable }) end)
@@ -73,6 +79,7 @@ local success, failure = xpcall(function()
   require("forge.views.harness.controller").submit()
   await(function() return not state.busy and state.active_plan end, "mock design did not arrive")
   local plan = state.active_plan
+  plan.validation_warning = { { path = "lib.rs", message = "review validation warning fixture" } }
   local artifact_path = plan.working_path:gsub("%.md$", ".json")
   local artifact = bytes(artifact_path)
   local document = vim.json.decode(artifact)
@@ -124,7 +131,8 @@ local success, failure = xpcall(function()
   assert(text(review.buf):find("  pub second: u64,", 1, true), "compact member did not receive display indentation")
   assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "full view did not abbreviate trait implementation")
   assert(not text(review.buf):find("fn default", 1, true), "full view exposed trait implementation members")
-  assert(text(review.buf):find("Validation:", 1, true), "validation evidence is missing")
+  assert(not text(review.buf):find("Validation:", 1, true), "review exposed validation evidence")
+  assert(#validation_notifications == 0, "opening review emitted validation notifications")
   assert(text(review.buf):find("pub fn new", 1, true), "full view hid inherent methods")
   for path in pairs(configuration) do
     assert(text(review.buf):find("Modified " .. path, 1, true), "configuration diff is missing: " .. path)
@@ -288,6 +296,34 @@ local success, failure = xpcall(function()
     "returning from dependency source lost the review attachment")
   assert(vim.bo[review.buf].filetype == "forge" and vim.wo[review.win].winbar:find("PlanReview", 1, true),
     "returning from dependency source lost review presentation")
+  if bevy_navigation then
+    for _, public_only in ipairs({ false, true }) do
+      if public_only then
+        public_key()
+        await(function() return review.public_only == true end, "Bevy test did not filter visibility")
+      end
+      for _, name in ipairs({ "Res", "ResMut" }) do
+        local row = declaration_row(name .. "<MovementInput>")
+        local line = vim.api.nvim_buf_get_lines(review.buf, row - 1, row, false)[1]
+        vim.api.nvim_win_set_cursor(review.win, { row, line:find(name .. "<", 1, true) - 1 })
+        vim.api.nvim_feedkeys(".", "xt", false)
+        await(function()
+          return vim.api.nvim_buf_get_name(0):gsub("\\", "/"):find("bevy_ecs-0.19.1/src/change_detection/params.rs", 1, true)
+            and vim.api.nvim_get_current_line():find("pub struct " .. name .. "<", 1, true)
+        end, "Bevy prelude navigation did not reach " .. name)
+        local column = vim.api.nvim_win_get_cursor(0)[2]
+        assert(vim.api.nvim_get_current_line():sub(column + 1):find(name .. "<", 1, true) == 1,
+          "Bevy definition selected the wrong column")
+        vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-o>", true, false, true), "xt", false)
+        await(function() return vim.api.nvim_get_current_buf() == review.buf and review.owner.attached() end,
+          "returning from Bevy source lost the review attachment")
+        assert(vim.wo[review.win].winbar:find("PlanReview", 1, true), "returning from Bevy lost the navbar")
+        jump_to_movement(name .. "<MovementInput>")
+      end
+    end
+    public_key()
+    await(function() return review.public_only == false end, "Bevy test did not restore visibility")
+  end
   local attribute_row = declaration_row("#[derive(Facet,")
   assert(closed(enum_row) == enum_row, "Rust enum did not start collapsed")
   toggle(attribute_row)

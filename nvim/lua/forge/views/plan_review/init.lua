@@ -338,12 +338,6 @@ function M.open(plan)
   local set = commands(plan, review)
   review.command_set = set
   session.harness.plan_review = review
-  for _, warning in ipairs(plan.validation_warning or {}) do
-    notifications.warn(
-      ("%s: %s"):format(warning.path or "Rust API", warning.message or "validation unavailable"),
-      "PlanReview validation"
-    )
-  end
   keymaps.setup_view_keymaps(buf, "plan_review", set)
   refresh_review_winbar(buf, awaiting_review_status)
 end

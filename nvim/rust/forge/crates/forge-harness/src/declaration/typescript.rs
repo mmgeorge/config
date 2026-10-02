@@ -488,6 +488,7 @@ impl DeclarationResolver {
                         })
                         .collect(),
                     || invalid("import does not expose the requested type"),
+                    false,
                 );
             }
         }
@@ -535,7 +536,7 @@ impl DeclarationResolver {
                     reference.path.join(".")
                 ))
             }
-        })
+        }, false)
     }
 
     pub(super) fn resolve_ts_import(
@@ -699,7 +700,7 @@ impl DeclarationResolver {
                     names.join(".")
                 ))
             }
-        })
+        }, false)
     }
 
     fn ts_module(&self, origin: &Path, source: &str, config: &TypescriptConfig) -> Option<PathBuf> {

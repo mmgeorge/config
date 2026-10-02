@@ -445,23 +445,6 @@ fn rows(
             text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
         });
     }
-    if let Some(validation) = &design.validation {
-        let start = overview.len();
-        overview.push(forge_diff::projection::header(BlockId("plan:section:validation".into()), vec![TextChunk { text: "Validation:".into(), capture: "ForgeStatusHeader".into() }], 0)?);
-        overview.push(BufferBlock { id:BlockId("plan:validation:summary".into()), text:BufferText::from_rows([format!("Checked {} declaration references. {} warnings.", validation.checked, validation.diagnostic.len())])?, metadata:Default::default() });
-        for (index, diagnostic) in validation.diagnostic.iter().enumerate() {
-            let message = format!("{}:{}:{}: {}", diagnostic.path, diagnostic.line, diagnostic.column + 1, diagnostic.reason);
-            for (line, text) in message.lines().enumerate() {
-                overview.push(BufferBlock {
-                    id: BlockId(format!("plan:validation:{index}:{line}")),
-                    text: BufferText::from_rows([text])?,
-                    metadata: Default::default(),
-                });
-            }
-        }
-        fold(&mut overview, start, "plan:section:validation")?;
-        overview.push(BufferBlock { id:BlockId("plan:section:validation:separator".into()),text:BufferText::from_rows([""])?,metadata:Default::default() });
-    }
     let changes_start = overview.len();
     overview.push(forge_diff::projection::header(
         BlockId("plan:section:changes".into()),
@@ -720,7 +703,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn multiline_validation_preserves_declaration_targets_and_folds() {
+    fn validation_evidence_stays_out_of_review_projection() {
         let mut document = crate::plan::document::test_fixture("validation", "Validation");
         let mut design = super::super::DeclarationDesign::default();
         design.proposed.insert("lib.rs".into(), "pub struct State;\n".into());
@@ -734,13 +717,9 @@ mod tests {
         document.design = Some(design);
         for public_only in [false, true] {
             let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only).unwrap();
-            let diagnostic = block.iter().find(|block| block.id.0 == "plan:validation:0:1").unwrap();
-            assert_eq!(diagnostic.text.row_count(), 1);
-            assert_eq!(diagnostic.text.row(0), Some("  dependency source is unavailable"));
+            assert!(block.iter().all(|block| !block.id.0.contains("validation")));
             let declaration = block.iter().find(|block| block.text.row(0) == Some("pub struct State;")).unwrap();
             assert!(declaration.metadata.target.iter().any(|range| target.contains_key(&range.id)));
-            let validation = block.iter().find(|block| block.id.0 == "plan:section:validation").unwrap();
-            assert!(validation.metadata.fold.iter().any(|fold| fold.end.block == diagnostic.id && fold.end.position.row == 1));
         }
     }
 
