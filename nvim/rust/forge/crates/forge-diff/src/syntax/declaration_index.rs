@@ -116,7 +116,13 @@ impl DeclarationIndex {
         parser
             .set_language(&language.grammar())
             .map_err(|error| SyntaxError::Query(error.to_string()))?;
-        let tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
+        let mut tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
+        if language == SyntaxLanguage::Rust && tree.root_node().has_error() && source.contains("pub macro") {
+            let mut projection = source.as_bytes().to_vec();
+            if project_public_macros(tree.root_node(), source, &mut projection, 0) {
+                tree = parser.parse(&projection, None).ok_or(SyntaxError::Cancelled)?;
+            }
+        }
         let parse = started.elapsed();
         let started = Instant::now();
         let mut index = Self {
@@ -234,6 +240,7 @@ fn walk(
     }
     let rust = language == SyntaxLanguage::Rust;
     let kind = node.kind();
+    let public_macro = rust && kind == "function_item" && contents(node, source).trim_start().starts_with("pub macro ");
     if matches!(
         kind,
         "block"
@@ -430,15 +437,15 @@ fn walk(
                     scope: scope.to_vec(),
                     position: position(name),
                     visibility: visibility(node, source, exported, rust),
-                    type_namespace,
-                    macro_namespace: kind == "mod_item",
+                    type_namespace: type_namespace && !public_macro,
+                    macro_namespace: public_macro || kind == "mod_item",
                     value_namespace: !matches!(
                         kind,
                         "interface_declaration"
                             | "type_alias_declaration"
                             | "type_item"
                             | "trait_item"
-                    ) && !parameter,
+                    ) && !parameter && !public_macro,
                     conditional,
                     global: global || !rust && !index.external_module && scope.is_empty(),
                     parameter,
@@ -670,6 +677,43 @@ fn walk(
         )?;
     }
     Ok(())
+}
+
+// Recover unsupported public macro signatures without shifting source coordinates.
+fn project_public_macros(node: Node<'_>, source: &str, projection: &mut [u8], depth: usize) -> bool {
+    if depth > 128 { return false; }
+    let mut changed = false;
+    if node.kind() == "identifier" && contents(node, source) == "macro"
+        && source[..node.start_byte()].trim_end().ends_with("pub")
+    {
+        let tail = &source[node.end_byte()..];
+        let name_start = node.end_byte() + tail.len() - tail.trim_start().len();
+        let name_length = source[name_start..].bytes().take_while(|byte| byte.is_ascii_alphanumeric() || *byte == b'_').count();
+        let name_end = name_start + name_length;
+        let tail = &source[name_end..];
+        let start = name_end + tail.len() - tail.trim_start().len();
+        if name_length > 0 && source.as_bytes().get(start) == Some(&b'(') {
+            let mut nesting = 0;
+            for (offset, byte) in source.as_bytes()[start..].iter().enumerate() {
+                if *byte == b'(' { nesting += 1; }
+                if *byte == b')' {
+                    nesting -= 1;
+                    if nesting == 0 {
+                        projection[node.byte_range()].copy_from_slice(b"fn   ");
+                        for byte in &mut projection[start + 1..start + offset] {
+                            if !matches!(*byte, b'\n' | b'\r') { *byte = b' '; }
+                        }
+                        changed = true;
+                        break;
+                    }
+                }
+            }
+        }
+    }
+    for child in children(node) {
+        changed |= project_public_macros(child, source, projection, depth + 1);
+    }
+    changed
 }
 
 // Derive names use Rust's macro namespace, independently of same-named traits.
@@ -926,6 +970,16 @@ mod tests {
         for (method, parameter) in [(first, "T"), (second, "U")] {
             assert!(index.symbol.iter().any(|symbol| symbol.parameter && symbol.name == parameter
                 && symbol.scope == method.scope));
+        }
+    }
+
+    #[test]
+    fn builtin_macro_declarations_retain_macro_names() {
+        let source = "pub mod macros { #[rustc_builtin_macro] pub macro Debug($item:item) { /* compiler built-in */ } pub macro Clone($item:item) { /* compiler built-in */ } }";
+        let index = DeclarationIndex::extract("lib.rs", source).unwrap();
+        for name in ["Debug", "Clone"] {
+            let symbol = index.symbol.iter().find(|symbol| symbol.name == name && symbol.macro_namespace && symbol.scope == ["macros"]).unwrap();
+            assert_eq!(symbol.position.column, source.find(&format!("{name}(")).unwrap() as u32);
         }
     }
 

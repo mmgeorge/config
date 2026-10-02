@@ -892,3 +892,37 @@ fn derive_navigation_selects_macro_instead_of_same_named_trait() {
     assert!(matches!(result, DeclarationResolution::Resolved { ref destination }
         if destination.name == "Component" && destination.path.ends_with("traits.rs")), "{result:?}");
 }
+
+#[tokio::test]
+#[ignore = "requires installed nightly-2026-04-01 rust-src"]
+async fn builtin_derives_follow_rust_prelude_without_selecting_traits() {
+    let workspace = tempfile::tempdir().unwrap();
+    std::fs::write(workspace.path().join("rust-toolchain.toml"), "[toolchain]\nchannel='nightly-2026-04-01'\n").unwrap();
+    let attribute = "#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]";
+    let declaration = format!("{attribute}\npub struct Model;\npub fn inspect(value: &dyn std::fmt::Debug);\n");
+    let design = design(&[("Cargo.toml", "[package]\nname='app'\nversion='0.1.0'\nedition='2024'\n"), ("src/lib.rs", &declaration)]);
+    let mut resolver = DeclarationResolver::local(workspace.path(), &design, false).unwrap();
+    let library = Path::new("D:/.rust/toolchains/nightly-2026-04-01-x86_64-pc-windows-msvc/lib/rustlib/src/rust/library");
+    assert!(library.join("core/src/lib.rs").is_file());
+    for name in ["core", "alloc", "std"] {
+        resolver.package.insert(name.into(), RustPackage {
+            dependency: ["core", "alloc", "std"].into_iter().map(|dependency| (dependency.into(), dependency.into())).collect(),
+            ..Default::default()
+        });
+        resolver.pending_module.insert((name.into(), Vec::new()), (library.join(name).join("src/lib.rs"), false));
+    }
+    resolver.rust_library = true;
+    for name in ["Debug", "Clone", "Copy", "PartialEq", "Eq", "Hash"] {
+        let column = attribute.rfind(name).unwrap() as u32;
+        let result = resolver.at("src/lib.rs", 1, column);
+        let DeclarationResolution::Resolved { destination } = result else { panic!("{name}: {result:?}"); };
+        assert_eq!(destination.name, name);
+        let source = std::fs::read_to_string(&destination.path).unwrap();
+        let line = source.lines().nth(destination.line as usize - 1).unwrap();
+        assert!(line.contains(&format!("pub macro {name}")), "{name}: {destination:?}: {line}");
+    }
+    let result = resolver.at("src/lib.rs", 3, 35);
+    let DeclarationResolution::Resolved { destination } = result else { panic!("trait: {result:?}"); };
+    let source = std::fs::read_to_string(&destination.path).unwrap();
+    assert!(source.lines().nth(destination.line as usize - 1).unwrap().contains("trait Debug"));
+}

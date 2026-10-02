@@ -1901,6 +1901,10 @@ Rust derive attributes retain navigation references in the macro namespace. Proc
 use their declared macro name, so `#[derive(Component)]` follows re-exports to the macro implementation
 while a signature's `Component` still resolves to the trait. These references support navigation only
 and do not add macro-expansion or derive validation to submission.
+Built-in derives use the same macro lookup through the selected Rust standard prelude. Source indexing
+recovers unsupported `pub macro` signatures in a parser-only projection with unchanged byte offsets.
+Destinations retain the original source text and positions. Missing rust-src keeps the existing
+unavailable-source outcome.
 
 Submission validates every proposed declaration and checks changed source digests and vacant new
 paths. It freezes canonical JSON and saves a diff projection and navigation index for the reviewed
