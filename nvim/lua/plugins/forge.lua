@@ -9,6 +9,18 @@ return {
       "ForgeGitConfigCacheReset",
     },
     init = function()
+      vim.api.nvim_create_user_command("ForgeBuild", function()
+        local builder = require("forge.builder")
+        builder.build(function(result)
+          if not result.ok then
+            vim.notify(result.message or "Forge build failed", vim.log.levels.ERROR, { title = "ForgeBuild" })
+            return
+          end
+          local artifact_path = result.path or builder.binary_path()
+          vim.notify("Forge executable built: " .. artifact_path .. "\nRestart Neovim to load the rebuilt host.",
+            vim.log.levels.INFO, { title = "ForgeBuild" })
+        end)
+      end, { desc = "Build the Forge executable with Cargo" })
       vim.api.nvim_create_user_command("ForgeStatus", function()
         local started_at = vim.uv.hrtime()
         local log = require("forge.startup_log")

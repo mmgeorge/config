@@ -2639,6 +2639,12 @@ does not scan source inputs, hash executables, or compare build receipts.
 `forge.builder.build_command()` describes the Cargo invocation, and `binary_path()` selects its output under
 `stdpath("cache")/rust-sidecar/forge/build`.
 
+`:ForgeBuild` is registered before the plugin loads and calls `forge.builder.build()`
+to run Cargo even when the executable already exists. Concurrent explicit builds and
+startup requests share one build result. Cargo runs from the crate directory to select
+its Rust toolchain. Build failures report the complete compiler diagnostic. A successful
+build reports the artifact path and requests a Neovim restart to load the rebuilt host.
+
 Forge defaults to the optimized Cargo `release` profile for development and profiling.
 Release builds retain level-one debug information. Set `vim.g.forge_build_profile` to `"dev"`
 or `"release"` before loading Forge to select the corresponding `debug` or `release`

@@ -22,6 +22,7 @@
 ---@field artifact_root fun(): string
 ---@field binary_path fun(): string
 ---@field build_command fun(): string[]
+---@field build fun(callback: fun(result: RustSidecarExecutableResult)) Runs Cargo asynchronously even when the executable exists. Concurrent build and ensure callers share one result.
 ---@field ensure fun(callback: fun(result: RustSidecarExecutableResult)) Builds a missing executable asynchronously and shares the result with pending callers.
 ---@field acquire fun(path: string, callback: fun(lease?: RustSidecarLease, failure?: string)) Copies the executable asynchronously for one process.
 ---@field _set_crate_dir_for_test fun(crate_dir: string?)
@@ -144,6 +145,7 @@ function M.new(spec)
     return command
   end
 
+  ---@param callback fun(result: RustSidecarExecutableResult)
   function builder.ensure(callback)
     if build_callback then
       build_callback[#build_callback + 1] = callback
@@ -155,6 +157,16 @@ function M.new(spec)
       callback({ ok = true, path = path })
       return
     end
+    builder.build(callback)
+  end
+
+  ---@param callback fun(result: RustSidecarExecutableResult)
+  function builder.build(callback)
+    if build_callback then
+      build_callback[#build_callback + 1] = callback
+      return
+    end
+    local path = builder.binary_path()
     if vim.fn.executable("cargo") ~= 1 then
       callback({ ok = false, message = "Cannot build Rust sidecar: cargo is not executable on PATH" })
       return
@@ -201,7 +213,7 @@ function M.new(spec)
     end
     notify_progress()
     local started, failure = pcall(vim.system, command,
-      { text = true, stdout = true, stderr = function(stream_error, data)
+      { cwd = builder.crate_dir(), text = true, stdout = true, stderr = function(stream_error, data)
         if stream_error then compiler_output[#compiler_output + 1] = tostring(stream_error) end
         if not data then return end
         compiler_output[#compiler_output + 1] = data

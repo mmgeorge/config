@@ -71,6 +71,7 @@ local succeeded, failure = xpcall(function()
     assert(vim.deep_equal(command, builder.build_command()))
     assert(vim.tbl_contains(command, "--release") and vim.tbl_contains(command, "--locked"))
     assert(options.text and options.stdout and options.stderr)
+    assert(options.cwd == root, "Cargo did not use the crate's toolchain directory")
     stderr = options.stderr
     complete_build = callback
   end
@@ -95,6 +96,18 @@ local succeeded, failure = xpcall(function()
   builder.ensure(function(result) assert(result.ok) end)
   assert(spawned == 1, "existing executable triggered another build")
 
+  available, concurrent = nil, nil
+  ---@type RustSidecarExecutableResult?
+  local startup_result
+  builder.build(function(result) available = result end)
+  builder.build(function(result) concurrent = result end)
+  builder.ensure(function(result) startup_result = result end)
+  assert(spawned == 2 and not available and not concurrent and not startup_result,
+    "explicit builds and startup did not share the active Cargo process")
+  complete_build({ code = 0, signal = 0, stdout = "", stderr = "" })
+  assert(vim.wait(1000, function() return available ~= nil and concurrent ~= nil and startup_result ~= nil end, 5))
+  assert(available.ok and concurrent.ok and startup_result.ok)
+
   vim.fn.delete(builder.binary_path())
   available = nil
   builder.ensure(function(result) available = result end)
@@ -111,7 +124,7 @@ local succeeded, failure = xpcall(function()
 
   available = nil
   builder.ensure(function(result) available = result end)
-  assert(spawned == 3, "failed build could not be retried")
+  assert(spawned == 4, "failed build could not be retried")
   complete_build({ code = 0, signal = 0, stdout = "", stderr = "" })
   assert(vim.wait(1000, function() return available ~= nil end, 5))
   assert(not available.ok and available.message:find("produced no executable", 1, true))
