@@ -1,6 +1,61 @@
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{BufferBlock, TextPosition, TextRange};
 use forge_buffer::text::BufferText;
+
+use crate::exchange::{Exchange, ExchangeNode};
+use crate::turn::{MessageDelivery, TurnItem};
+
+use super::question::QuestionHistory;
+
+pub(super) struct ExchangeLayout<'exchange> {
+    pub questions: QuestionHistory<'exchange>,
+    pub activity: Vec<&'exchange ExchangeNode>,
+    pub continuation: Vec<&'exchange ExchangeNode>,
+}
+
+impl<'exchange> ExchangeLayout<'exchange> {
+    /// Preserves visible node order and ends the activity fold before the first outer response.
+    /// Question clarifications retain their branch ownership. Missing turn or message references fail.
+    pub fn new(exchange: &'exchange Exchange) -> Result<Self> {
+        let questions = QuestionHistory::new(exchange);
+        let mut activity = exchange
+            .node_list
+            .iter()
+            .filter(|node| !questions.nested.contains(node.id()))
+            .collect::<Vec<_>>();
+        let mut response_position = activity.len();
+        for (position, node) in activity.iter().enumerate() {
+            let ExchangeNode::TurnContent {
+                turn_id,
+                item: TurnItem::Message { id },
+                ..
+            } = node
+            else {
+                continue;
+            };
+            let turn = exchange
+                .turn
+                .iter()
+                .find(|turn| turn.id() == turn_id)
+                .context("timeline content references a missing provider turn")?;
+            let message = turn
+                .messages()
+                .iter()
+                .find(|message| message.id() == id)
+                .context("timeline content references a missing message")?;
+            if message.delivery() == MessageDelivery::Final {
+                response_position = position;
+                break;
+            }
+        }
+        let continuation = activity.split_off(response_position);
+        Ok(Self {
+            questions,
+            activity,
+            continuation,
+        })
+    }
+}
 
 /// Materializes Markdown padding once so native wrapping shares the parser's content origin.
 pub(super) fn materialize(block: &mut BufferBlock) -> Result<()> {

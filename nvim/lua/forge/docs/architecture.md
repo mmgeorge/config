@@ -69,8 +69,8 @@ Ordinary close marks the replica closed and removes that lifecycle callback befo
 an owned buffer, so reentrant owner cleanup cannot attempt a second deletion.
 
 `forge.status`, `forge.local_diff`, `forge.source_document`, and `forge.walkthrough`
-bind native services to editor views. The Harness controller binds independent native
-transcript and composer documents. Shared document commands resolve configured bindings,
+bind native services to editor views. The Harness controller binds a native transcript document and a Lua-owned
+composer buffer. Shared document commands resolve configured bindings,
 help, selections, and gutters from native metadata. Physical source rows contain source
 text, while decorations provide gutters and selection presentation without changing text.
 
@@ -459,7 +459,22 @@ independent turns without treating one session as globally active.
 `session.lua` mirrors that boundary through `harness_by_id`: each live session owns a transcript buffer, composer
 buffer, windows, queue, busy state, and subscriptions inside one real Neovim tab.
 
+Lua owns the complete unsent Harness draft. Opening a transcript and typing in HarnessInput never
+transmit draft text or local edit revisions to Rust. Ctrl-s captures at most 64 KiB and 4096 rows,
+then sends one `prompt.submit` request with complete text and a monotonically increasing token
+bound to the transcript document lifetime. Rust tracks submission admission without retaining a
+composer document. A `prompt_submission` acceptance clears only the unchanged captured draft.
+Retraction restores its exact rows only while the cleared buffer retains its changedtick.
+Newer typing survives both transitions. Rejection retains the draft, and closing or replacing
+the presentation invalidates late transitions. Plan preparation and Git checkpoint capture still
+precede acceptance.
+
 Rust projects the semantic timeline and its synthetic bottom status from the same session-scoped durable owners.
+`ExchangeLayout` preserves the exchange's ordered nodes while assigning question clarifications to their branches.
+The activity summary fold ends before the first outer final response. That response and later question groups,
+messages, tools, and plan events retain their relative order outside the summary fold. The transcript renderer
+consumes those ordered ranges directly without deferring responses to the end of the exchange. Clarification
+responses remain inside their question branch folds. Streaming, completion, and reload use the same layout.
 `PlanStateMachine` validates question, feedback, submission, review, acceptance, cancellation, and failure
 transitions. `PlanQuestionLedger` records answers, skips, and withdrawals before generation resumes. It matches both
 the provider's logical id and a canonical digest of the user-visible content, so a resolved decision cannot become
@@ -2405,7 +2420,7 @@ exit status for test or whitespace failures. It preserves production logs.
 `tests/forge/mock_backend.lua` injects a fake git backend so
 tests never touch a real repo. `diff_architecture.lua` guards the render-engine extraction
 boundaries. The native Harness fixtures isolate host lifecycle and recovery, document adoption and
-composer acknowledgement, controller transitions, transport ordering, session creation, provider
+submission acceptance and draft preservation, controller transitions, transport ordering, session creation, provider
 catalogues, tool output, saved diffs, and wire-version rejection.
 
 The Rust suite runs with `cargo +1.94.0 test --locked --workspace --manifest-path

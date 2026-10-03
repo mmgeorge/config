@@ -1,4 +1,3 @@
-pub mod composer;
 mod changes;
 mod markdown_math;
 mod layout;

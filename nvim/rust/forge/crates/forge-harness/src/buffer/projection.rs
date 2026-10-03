@@ -105,6 +105,7 @@ struct TimelineRenderer<'profile> {
     expanded_tool: &'profile std::collections::HashSet<String>,
 }
 
+#[derive(Clone, Copy)]
 enum MarkdownRole {
     Response,
     Commentary,
@@ -623,14 +624,14 @@ impl TimelineRenderer<'_> {
         TranscriptRenderer::heading_marker(&mut heading, &capture);
         self.push(heading)?;
         let section = self.begin_section(0);
-        let questions = super::question::QuestionHistory::new(interaction);
-        let visible = interaction.node_list.iter().filter(|node| !questions.nested.contains(node.id())).collect::<Vec<_>>();
-        let (response, trailing_plan) = self.content(interaction, agents, depth, &visible, Some(&questions), true)?;
+        let layout = super::layout::ExchangeLayout::new(interaction)?;
+        self.content(interaction, agents, depth, &layout.activity, Some(&layout.questions), MarkdownRole::Response)?;
         self.finish_section(
             section,
             &format!("{}:exchange", interaction.id),
             interaction.completed_at_ms.is_some(),
         );
+        self.content(interaction, agents, depth, &layout.continuation, Some(&layout.questions), MarkdownRole::Response)?;
         if let Some(diff) = &interaction.attributed_diff_text {
             self.diff(
                 &format!("{}:changes", interaction.id),
@@ -655,12 +656,6 @@ impl TimelineRenderer<'_> {
                 )?;
             }
         }
-        for (id, text) in response {
-            self.markdown(&id, text, MarkdownRole::Response)?;
-        }
-        for event in trailing_plan {
-            self.plan_event(event)?;
-        }
         Ok(())
     }
 
@@ -671,9 +666,8 @@ impl TimelineRenderer<'_> {
         depth: usize,
         visible: &[&'exchange ExchangeNode],
         questions: Option<&super::question::QuestionHistory<'exchange>>,
-        defer_final: bool,
-    ) -> Result<(Vec<(String, &'exchange str)>, Vec<&'exchange crate::plan::ExchangePlanEvent>)> {
-        let mut response = Vec::new();
+        response_role: MarkdownRole,
+    ) -> Result<()> {
         let mut question_turn = std::collections::HashSet::new();
         let mut preceding_turn = None;
         for node in interaction.node_list.iter() {
@@ -691,30 +685,6 @@ impl TimelineRenderer<'_> {
                 if let Some(turn_id) = preceding_turn { question_turn.insert(turn_id); }
             }
         }
-        let final_position = defer_final.then_some(()).and_then(|_| {
-            visible.iter().rposition(|node| {
-                if let ExchangeNode::TurnContent {
-                    turn_id,
-                    item: crate::turn::TurnItem::Message { id },
-                    ..
-                } = node
-                {
-                    interaction
-                        .turn
-                        .iter()
-                        .find(|turn| turn.id() == turn_id)
-                        .and_then(|turn| turn.messages().iter().find(|message| message.id() == id))
-                        .is_some_and(|message| {
-                            message.delivery() == crate::turn::MessageDelivery::Final
-                        })
-                } else {
-                    false
-                }
-            }).filter(|position| !visible[position + 1..].iter().any(|node| matches!(node,
-                ExchangeNode::ExchangeInput { .. } | ExchangeNode::QuestionPresented { .. }
-            )))
-        });
-        let mut trailing_plan = Vec::new();
         let mut rendered_tool = std::collections::HashSet::new();
         for (position, node) in visible.iter().enumerate() {
             if let Some(group) = questions.and_then(|history| history.group.get(node.id())) {
@@ -743,10 +713,8 @@ impl TimelineRenderer<'_> {
                                 continue;
                             }
                             let final_message = message.delivery() == crate::turn::MessageDelivery::Final;
-                            if final_message && Some(position) == final_position {
-                                response.push((id.clone(), message.text()));
-                            } else if final_message {
-                                self.markdown(id, message.text(), if defer_final { MarkdownRole::Response } else { MarkdownRole::Message })?;
+                            if final_message {
+                                self.markdown(id, message.text(), response_role)?;
                             } else {
                                 self.markdown(id, message.text(), MarkdownRole::Commentary)?;
                             }
@@ -758,9 +726,7 @@ impl TimelineRenderer<'_> {
                             let group = visible.iter().skip(position).take_while(|node| matches!(node,
                                 ExchangeNode::TurnContent { turn_id: owner, item: crate::turn::TurnItem::Tool { .. }, .. } if owner == turn_id));
                             let mut calls = Vec::new();
-                            let mut group_count = 0;
                             for node in group {
-                                group_count += 1;
                                 let ExchangeNode::TurnContent {
                                     id,
                                     item: crate::turn::TurnItem::Tool { id: tool_id },
@@ -784,10 +750,14 @@ impl TimelineRenderer<'_> {
                             if calls.is_empty() { continue; }
                             let start = self.block.len();
                             let count = calls.len();
+                            let last_tool_id = &calls.last().expect("nonempty tool group").1.id;
+                            let followed_in_turn = turn.items().iter().rposition(|item| matches!(item,
+                                crate::turn::TurnItem::Tool { id } if id == last_tool_id
+                            )).is_some_and(|position| position + 1 < turn.items().len());
                             let settled = calls
                                 .iter()
                                 .all(|(_, tool)| tool.state() != crate::turn::ToolState::Running)
-                                && (position + group_count < visible.len()
+                                && (followed_in_turn
                                     || turn.state() != crate::turn::TurnState::Running);
                             let failed = calls.iter().filter(|(_, tool)| tool.failed).count();
                             let mut label = format!(
@@ -826,11 +796,7 @@ impl TimelineRenderer<'_> {
                     }
                 }
                 ExchangeNode::PlanEvent { event } => {
-                    if final_position.is_some_and(|final_position| position > final_position) {
-                        trailing_plan.push(event.as_ref());
-                    } else {
-                        self.plan_event(event)?;
-                    }
+                    self.plan_event(event)?;
                 }
                 ExchangeNode::ExchangeInput { prompt } => {
                     if matches!(prompt.intent, crate::exchange::InputIntent::Clarification | crate::exchange::InputIntent::Answer)
@@ -942,7 +908,7 @@ impl TimelineRenderer<'_> {
                 }
             }
         }
-        Ok((response, trailing_plan))
+        Ok(())
     }
 
     fn question_group(
@@ -1010,7 +976,7 @@ impl TimelineRenderer<'_> {
         self.prompt.push(block.id.clone());
         self.push(block)?;
         let section = self.begin_section(2);
-        self.content(exchange, agents, depth, &clarification.content, None, false)?;
+        self.content(exchange, agents, depth, &clarification.content, None, MarkdownRole::Message)?;
         self.finish_section(section, &id, closed);
         Ok(())
     }
@@ -1577,6 +1543,130 @@ mod tests {
                     .iter()
                     .any(|decoration| decoration.capture == "ForgeHarnessPlan")
             );
+        }
+    }
+
+    #[test]
+    fn outer_responses_keep_order_across_answered_questions_and_continued_turns() {
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary};
+        use crate::exchange::{ExchangeKind, ExchangeNode, ExchangeState, InputIntent, QuestionInput};
+
+        for planning_question in [None, Some(false), Some(true)] {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"ordered", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Plan a game", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            })).unwrap();
+            exchange.resume(0).unwrap();
+            let mut event = BackendEvent {
+                address: Some(ProviderAddress { thread_id:"thread".into(), turn_id:"initial".into() }),
+                turn_boundary: Some(TurnBoundary::Started), kind:"turn_started".into(), text:None,
+                data:serde_json::Value::Null, activity:None, summary:None, task_update:None,
+            };
+            exchange.observe_turn(&event, 0).unwrap();
+            event.turn_boundary = None;
+            event.kind = "assistant_message".into();
+            event.text = Some("Inspecting the repository".into());
+            event.data = json!({"phase":"commentary"});
+            exchange.observe_turn(&event, 1).unwrap();
+            event.text = Some("The repository contains only .git. Three choices are pending.".into());
+            event.data = json!({"phase":"final_answer"});
+            exchange.observe_turn(&event, 2).unwrap();
+            event.text = None;
+            event.turn_boundary = Some(TurnBoundary::Finished { outcome:crate::turn::TurnOutcome::Completed });
+            exchange.observe_turn(&event, 3).unwrap();
+
+            if let Some(planning) = planning_question {
+                let question: crate::plan::PlanQuestionSet = serde_json::from_value(json!({
+                    "id":"format", "questions":[{"id":"game", "header":"Game format",
+                        "question":"Which game format?", "options":[
+                            {"label":"2D arena survival", "description":"Top-down combat"}
+                        ], "allow_freeform":true}]
+                })).unwrap();
+                exchange.node_list.push(if planning {
+                    exchange.kind = ExchangeKind::PlanDraft;
+                    serde_json::from_value(json!({"kind":"plan_event", "event":{
+                        "id":"presented", "node_count":exchange.node_list.len(),
+                        "content":{"kind":"lifecycle", "title":"Game", "lifecycle":{
+                            "id":"presented", "session_id":"session", "plan_id":"plan",
+                            "kind":"question_asked", "model_revision":0, "user_revision":0,
+                            "question":question, "created_at_ms":3
+                        }}
+                    }})).unwrap()
+                } else {
+                    ExchangeNode::QuestionPresented { id:"presented".into(), question, answer:None }
+                });
+                exchange.append_question_input(InputIntent::Answer, "Game format: 2D arena survival".into(), QuestionInput {
+                    set_id:"format".into(), question_id:None, answer:vec![crate::plan::PlanQuestionAnswer {
+                        question_id:"game".into(), response:crate::plan::PlanQuestionResponse::Selected {
+                            option:"2D arena survival".into(), feedback:None,
+                        },
+                    }],
+                }, 4).unwrap();
+            }
+            event.address.as_mut().unwrap().turn_id = "continuation".into();
+            event.turn_boundary = Some(TurnBoundary::Started);
+            exchange.observe_turn(&event, 5).unwrap();
+            event.turn_boundary = None;
+            event.text = Some("The design will use a 2D arena survival loop.".into());
+            event.data = json!({"phase":"commentary"});
+            exchange.observe_turn(&event, 6).unwrap();
+
+            let render = |exchange: &Exchange| project_at(&TimelineEntry::Exchange {
+                id:exchange.id.clone(), created_at_ms:0, exchange:exchange.clone(), agent_by_id:HashMap::new(),
+            }, &WidthProfile::default(), 10).unwrap();
+            let initial = render(&exchange);
+            let response_position = initial.entry.block.iter().position(|block|
+                block.text.wire_rows().join("\n").contains("Three choices are pending")
+            ).unwrap();
+            let prefix = initial.entry.block[..=response_position].iter()
+                .map(|block| block.id.clone()).collect::<Vec<_>>();
+
+            event.text = None;
+            event.kind = "tool".into();
+            for tool_count in 1..=3 {
+                event.activity = Some(ToolActivity {
+                    id:format!("lookup-{tool_count}"), kind:ToolActivityKind::Command,
+                    title:format!("lookup_{tool_count}"), output:Some("found".into()),
+                    output_delta:false, status:Some("completed".into()), change:Default::default(),
+                });
+                exchange.observe_turn(&event, 6 + tool_count).unwrap();
+                let projected = render(&exchange);
+                let blocks = &projected.entry.block;
+                assert_eq!(blocks[..=response_position].iter().map(|block| block.id.clone()).collect::<Vec<_>>(), prefix,
+                    "later tools moved an earlier response");
+                let text = blocks.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+                let response = text.find("Three choices are pending").unwrap();
+                let continuation = text.find("The design will use").unwrap();
+                assert!(response < continuation && continuation < text.find("lookup_1").unwrap());
+                if planning_question.is_some() {
+                    let question = text.find("Questions · 1/1 answered").unwrap();
+                    assert!(response < question && question < continuation);
+                    assert_eq!(text.matches("You answered: 2D arena survival").count(), 1);
+                }
+                let summary = blocks.iter().find(|block| block.id.0 == "ordered:summary").unwrap();
+                assert_eq!(summary.metadata.fold[0].end.block, blocks[response_position - 1].id,
+                    "activity fold hid an outer response or later turn");
+                if planning_question == Some(true) && tool_count == 3 {
+                    println!("ORDERED_RESPONSE_FIXTURE:{}", serde_json::to_string(blocks).unwrap());
+                }
+            }
+            event.activity = None;
+            event.kind = "assistant_message".into();
+            event.text = Some("The design is ready for review.".into());
+            event.data = json!({"phase":"final_answer"});
+            exchange.observe_turn(&event, 10).unwrap();
+            event.text = None;
+            event.turn_boundary = Some(TurnBoundary::Finished { outcome:crate::turn::TurnOutcome::Completed });
+            exchange.observe_turn(&event, 11).unwrap();
+            exchange.finish(ExchangeState::Complete, 11).unwrap();
+            let completed = render(&exchange);
+            let restored: Exchange = serde_json::from_value(serde_json::to_value(&exchange).unwrap()).unwrap();
+            assert_eq!(completed.entry.block, render(&restored).entry.block);
+            assert_eq!(completed.entry.block[..=response_position].iter().map(|block| block.id.clone()).collect::<Vec<_>>(), prefix);
+            let text = completed.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+            assert!(text.find("lookup_3").unwrap() < text.find("The design is ready").unwrap());
+            assert_eq!(text.matches("Three choices are pending").count(), 1);
         }
     }
 

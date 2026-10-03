@@ -558,7 +558,7 @@ local function on_event(event, payload)
       state.goal = type(execution.goal) == "table" and execution.goal.state ~= "cleared" and execution.goal or nil
       state.goal_execution = type(execution.goal_execution) == "table" and execution.goal_execution or nil
       M.refresh_winbar()
-    elseif payload.kind == "composer_patch" then
+    elseif payload.kind == "prompt_submission" then
       if state.presentation then state.presentation.receive(payload) end
     elseif payload.kind == "approval_requested" then
       local request = payload.data or payload

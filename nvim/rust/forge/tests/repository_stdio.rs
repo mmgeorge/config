@@ -1639,7 +1639,7 @@ async fn status_context_and_source_documents_share_the_host_without_harness() {
 }
 
 #[tokio::test]
-async fn harness_documents_keep_composer_revisions_and_close_lifetimes_separate() {
+async fn harness_submits_complete_text_with_document_lifetime_admission() {
     let fixture = tempfile::tempdir().unwrap();
     git(fixture.path(), &["init", "--quiet"]);
     let mut host = Host::start().await;
@@ -1677,49 +1677,22 @@ async fn harness_documents_keep_composer_revisions_and_close_lifetimes_separate(
             4,
             "harness.document",
             json!({
-                "operation":"open", "document":"transcript", "composer":"composer", "view":"view",
-                "width":{"columns":80,"tabstop":4}, "initial":["startup draft"]
+                "operation":"open", "document":"transcript", "view":"view",
+                "width":{"columns":80,"tabstop":4}
             }),
         )
         .await;
-    assert_eq!(
-        opened["result"]["composer"]["block"][0]["text"],
-        json!(["startup draft"]),
-        "{opened}"
-    );
-    assert_eq!(opened["result"]["composer"]["revision"], 0, "{opened}");
+    assert!(opened["result"].get("composer").is_none(), "{opened}");
     let transcript_revision = opened["result"]["transcript"]["revision"].clone();
-    let edited = host
+    let oversized = host
         .request(
             5,
-            "harness.document",
-            json!({
-                "operation":"edit_composer", "edit":{"document":"composer","region":"composer",
-                    "base":0,"sequence":1,"text":["newer λ", "", "draft"]}
-            }),
+            "prompt.submit",
+            json!({"text":format!("x{}", "\n".repeat(4096)),
+                "submission":{"document":"transcript","token":1}}),
         )
         .await;
-    assert_eq!(edited["result"]["accepted"], true, "{edited}");
-    assert_eq!(
-        edited["result"]["acknowledgement"]["revision"], 1,
-        "{edited}"
-    );
-    assert_eq!(edited["result"]["patch"]["base"], 0, "{edited}");
-    assert_eq!(edited["result"]["patch"]["next"], 1, "{edited}");
-    let composer = host
-        .request(
-            6,
-            "harness.document",
-            json!({
-                "operation":"snapshot","document":"composer"
-            }),
-        )
-        .await;
-    assert_eq!(
-        composer["result"]["block"][0]["text"],
-        json!(["newer λ", "", "draft"]),
-        "{composer}"
-    );
+    assert!(oversized.get("error").is_some(), "{oversized}");
     let synchronized = host
         .request(
             7,
@@ -1735,7 +1708,7 @@ async fn harness_documents_keep_composer_revisions_and_close_lifetimes_separate(
             21,
             "prompt.submit",
             json!({
-                "mode":"chat", "composer":{"document":"composer","revision":1}
+                "mode":"chat", "text":"newer λ\n\ndraft", "submission":{"document":"transcript","token":1}
             }),
         )
         .await;
@@ -1744,23 +1717,20 @@ async fn harness_documents_keep_composer_revisions_and_close_lifetimes_separate(
         host.progress
             .iter()
             .any(|event| event["event"] == "backend_event"
-                && event["payload"]["kind"] == "composer_patch"),
-        "missing native composer admission event"
+                && event["payload"]["kind"] == "prompt_submission"
+                && event["payload"]["data"]
+                    == json!({"document":"transcript","token":1,"state":"accepted"})),
+        "missing prompt admission event"
     );
-    let cleared = host
+    let duplicate = host
         .request(
             22,
-            "harness.document",
-            json!({
-                "operation":"snapshot","document":"composer"
-            }),
+            "prompt.submit",
+            json!({"text":"duplicate",
+        "submission":{"document":"transcript","token":1}}),
         )
         .await;
-    assert_eq!(
-        cleared["result"]["block"][0]["text"],
-        json!([""]),
-        "{cleared}"
-    );
+    assert!(duplicate.get("error").is_some(), "{duplicate}");
     let closed = host
         .request(
             8,
@@ -1774,10 +1744,9 @@ async fn harness_documents_keep_composer_revisions_and_close_lifetimes_separate(
     let stale = host
         .request(
             9,
-            "harness.document",
-            json!({
-                "operation":"snapshot","document":"composer"
-            }),
+            "prompt.submit",
+            json!({"text":"late prompt",
+        "submission":{"document":"transcript","token":2}}),
         )
         .await;
     assert!(

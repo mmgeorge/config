@@ -9,7 +9,7 @@ local completion_visible = false
 package.loaded["blink.cmp"] = { hide = function() completion_visible = false end }
 client.host_accepting = function() return true end
 local state = session.harness
-local generation, submitted, receive, delayed_edit, navigated, sync_count = 1, nil, nil, nil, nil, 0
+local generation, submitted, receive, navigated, sync_count = 1, nil, nil, nil, 0
 local initial = {}
 local goal_request = {}
 local submitted_callback
@@ -30,9 +30,8 @@ client.request_for = function(session_id, method, params, callback)
   if method == "history.record" then vim.schedule(function() callback({}) end) return end
   assert(method == "harness.document")
   if params.operation == "open" then
-    initial[#initial + 1] = params.initial[1]
-    vim.schedule(function() callback({ transcript = snapshot(params.document, "Native transcript"), composer = snapshot(params.composer, params.initial[1], true) }) end)
-  elseif params.operation == "edit_composer" then delayed_edit = callback
+    initial[#initial + 1] = params
+    vim.schedule(function() callback({ transcript = snapshot(params.document, "Native transcript") }) end)
   elseif params.operation == "navigate_prompt" then
     navigated = params.input
     vim.schedule(function() callback({ anchor = { block = "body", position = { row = 0, column = 0 } } }) end)
@@ -130,17 +129,12 @@ local success, failure = xpcall(function()
   completion_visible = true
   controller.submit()
   assert(not completion_visible, "native submission retained completion for the consumed draft")
-  assert(submitted and submitted.composer and not submitted.text)
+  assert(submitted and submitted.submission and submitted.text == "native draft")
   assert(vim.wait(2500, function() return sync_count > sync_before_submission end, 20),
     "busy Harness did not refresh the native transcript status")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "native draft", "controller cleared before native admission")
-  local metadata = snapshot(state.presentation.composer_id, "", true).block[1].metadata
-  metadata.editable_region[1].revision = 1
-  receive("backend_event", { kind = "composer_patch", data = { document = state.presentation.composer_id, base = 0, next = 1,
-    base_rows = 1, next_rows = 1, base_blocks = 1, next_blocks = 1, block_edit = {}, removed_block = {},
-    text_edit = { { start_row = 0, removed_rows = 1, text = { "" } } },
-    metadata_edit = { { block = "body", row_count = 1, metadata = metadata } },
-  } }, "native-controller")
+  receive("backend_event", { kind = "prompt_submission", data = { document = state.presentation.document,
+    token = submitted.submission.token, state = "accepted" } }, "native-controller")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
   local original_state_request = client.request
   local recovered_state = false
@@ -153,13 +147,10 @@ local success, failure = xpcall(function()
   state.state_sync_pending = false
   client.request = original_state_request
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "draft after host collection" })
-  require("forge.editable").flush(state.presentation.composer.editable)
-  assert(delayed_edit)
   generation = 2
   controller.render()
   assert(vim.wait(1000, function() return state.presentation and state.presentation.ready and state.presentation.host_generation == 2 end))
-  delayed_edit({ accepted = true })
-  assert(initial[2] == "draft after host collection")
+  assert(initial[2].initial == nil, "new host received an unsent draft")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "draft after host collection")
   submitted = nil
   state.busy = false

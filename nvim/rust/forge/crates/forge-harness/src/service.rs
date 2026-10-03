@@ -313,7 +313,7 @@ impl HarnessService {
         let _activity = self.admit().await?;
         let registry = self.registry().await?;
         let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
-        let mut composer_admission = None;
+        let mut prompt_admission = None;
         if matches!(
             method,
             HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges
@@ -339,40 +339,41 @@ impl HarnessService {
                 .params
                 .as_object_mut()
                 .context("prompt submission requires an object")?;
-            params.remove("_composer_admission");
-            if let Some(composer) = params.remove("composer") {
+            params.remove("_prompt_admission");
+            if let Some(submission) = params.remove("submission") {
                 let document = serde_json::from_value::<forge_buffer::identity::DocumentId>(
-                    composer
+                    submission
                         .get("document")
                         .cloned()
-                        .context("composer document is required")?,
+                        .context("submission document is required")?,
                 )?;
-                let revision = serde_json::from_value::<forge_buffer::identity::RegionRevision>(
-                    composer
-                        .get("revision")
-                        .cloned()
-                        .context("composer revision is required")?,
-                )?;
+                let token = submission
+                    .get("token")
+                    .and_then(Value::as_u64)
+                    .context("submission token is required")?;
+                let text = params
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .context("prompt text is required")?;
                 let controller = registry.resolve(&session_id).await?;
-                let submission = controller
+                controller
                     .presentation
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                    .begin_submission(&document, revision)?;
-                params.insert("text".into(), Value::String(submission.text));
+                    .begin_submission(&document, token, text)?;
                 params.insert(
-                    "_composer_admission".into(),
-                    json!({"document":document,"token":submission.token}),
+                    "_prompt_admission".into(),
+                    json!({"document":document,"token":token}),
                 );
-                composer_admission = Some(ComposerAdmission {
+                prompt_admission = Some(PromptAdmission {
                     presentation: Arc::clone(&controller.presentation),
                     document,
-                    token: submission.token,
+                    token,
                 });
             }
         }
         let result = route_request(registry, session_id, request, method, sink).await;
-        drop(composer_admission);
+        drop(prompt_admission);
         result
     }
 
@@ -501,13 +502,13 @@ struct SessionController {
     permission: Arc<crate::backend::approval::PermissionCoordinator>,
 }
 
-struct ComposerAdmission {
+struct PromptAdmission {
     presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
     document: forge_buffer::identity::DocumentId,
     token: u64,
 }
 
-impl Drop for ComposerAdmission {
+impl Drop for PromptAdmission {
     fn drop(&mut self) {
         if let Ok(mut presentation) = self.presentation.lock() {
             let _ = presentation.complete_submission(&self.document, self.token, false);

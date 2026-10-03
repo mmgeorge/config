@@ -479,7 +479,7 @@ pub struct HarnessBroker {
     agent_registry: AgentRegistry,
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
-    composer_admission: Option<(forge_buffer::identity::DocumentId, u64)>,
+    prompt_admission: Option<(forge_buffer::identity::DocumentId, u64)>,
     active_wait_projection: Option<ActiveWait>,
     timeline_reconciled_after_dispatch: bool,
     turn_cancellation: Arc<TurnCancellation>,
@@ -657,7 +657,7 @@ impl HarnessBroker {
             agent_registry,
             child_exchange_runtime_by_agent: HashMap::new(),
             presentation,
-            composer_admission: None,
+            prompt_admission: None,
             active_wait_projection: None,
             timeline_reconciled_after_dispatch: false,
             turn_cancellation: Arc::new(TurnCancellation::new()),
@@ -1862,55 +1862,55 @@ impl HarnessBroker {
             execution: self.store.list_plan_execution(&self.session.id)?,
             plan: self.store.list_plan(&self.session.id)?,
         };
-        self.composer_admission = params
-            .get("_composer_admission")
+        self.prompt_admission = params
+            .get("_prompt_admission")
             .map(|value| -> Result<_> {
                 Ok((
                     serde_json::from_value(
                         value
                             .get("document")
                             .cloned()
-                            .context("composer admission document missing")?,
+                            .context("prompt admission document missing")?,
                     )?,
                     value
                         .get("token")
                         .and_then(Value::as_u64)
-                        .context("composer admission token missing")?,
+                        .context("prompt admission token missing")?,
                 ))
             })
             .transpose()?;
-        let submitted_composer = self.composer_admission.clone();
+        let submitted_prompt = self.prompt_admission.clone();
         let mut result = self.submit_prompt_inner(params).await;
-        let mut composer_event = Vec::new();
-        self.settle_composer_admission(result.is_ok(), &mut composer_event)
+        let mut submission_event = Vec::new();
+        self.settle_prompt_admission(result.is_ok(), &mut submission_event)
             .await?;
         if let Ok((_, event)) = &mut result {
-            event.append(&mut composer_event);
+            event.append(&mut submission_event);
         }
         if result
             .as_ref()
             .is_err_and(|error| error.downcast_ref::<TurnRetracted>().is_some())
         {
             self.restore_retracted_control_state(snapshot).await?;
-            if let Some((document, token)) = submitted_composer {
-                let patch = self
+            if let Some((document, token)) = submitted_prompt {
+                let transition = self
                     .presentation
                     .lock()
                     .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
                     .retract_submission(&document, token)?;
-                if let Some(patch) = patch {
+                if let Some(transition) = transition {
                     self.emit_backend_event(
                         BackendEvent {
                             address: None,
                             turn_boundary: None,
-                            kind: "composer_patch".into(),
+                            kind: "prompt_submission".into(),
                             text: None,
-                            data: serde_json::to_value(patch)?,
+                            data: transition,
                             activity: None,
                             summary: None,
                             task_update: None,
                         },
-                        &mut composer_event,
+                        &mut submission_event,
                     )
                     .await?;
                 }
@@ -1919,27 +1919,27 @@ impl HarnessBroker {
         result
     }
 
-    async fn settle_composer_admission(
+    async fn settle_prompt_admission(
         &mut self,
         admitted: bool,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        let Some((document, token)) = self.composer_admission.take() else {
+        let Some((document, token)) = self.prompt_admission.take() else {
             return Ok(());
         };
-        let patch = self
+        let transition = self
             .presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
             .complete_submission(&document, token, admitted)?;
-        if let Some(patch) = patch {
+        if let Some(transition) = transition {
             self.emit_backend_event(
                 BackendEvent {
                     address: None,
                     turn_boundary: None,
-                    kind: "composer_patch".into(),
+                    kind: "prompt_submission".into(),
                     text: None,
-                    data: serde_json::to_value(patch)?,
+                    data: transition,
                     activity: None,
                     summary: None,
                     task_update: None,
@@ -3045,7 +3045,7 @@ Planning continuation: turn {} of {}.",
         }
         interaction.resume(self.clock.now_ms())?;
         self.store.save_exchange(&interaction)?;
-        self.settle_composer_admission(true, &mut event).await?;
+        self.settle_prompt_admission(true, &mut event).await?;
         self.emit_live_interaction(
             BackendEvent {
                 address: None,

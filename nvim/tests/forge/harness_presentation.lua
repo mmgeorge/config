@@ -27,10 +27,10 @@ local ok, failure = xpcall(function()
     is_alive = function() return true end, notice = function(message) error(message) end,
   }, function(value, error_message) assert(not error_message, error_message) attached = value end)
   local opened = requests[1].params
-  assert(opened.initial[1] == "draft")
+  assert(opened.initial == nil and opened.composer == nil, "opening transmitted an unsent draft")
   local history = snapshot(opened.document, "native transcript")
   history.block[1].text = { "native transcript", "previous exchange", "previous answer" }
-  requests[1].callback({ transcript = history, composer = snapshot(opened.composer, "draft", true) })
+  requests[1].callback({ transcript = history })
   assert(attached == owner and owner.ready)
   assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "native transcript")
   assert(vim.bo[composer].modifiable and not vim.bo[transcript].modifiable)
@@ -45,38 +45,63 @@ local ok, failure = xpcall(function()
   requests[3].callback({ patch = {} })
   assert(vim.api.nvim_win_get_cursor(window)[1] == 1, "background sync moved a reader away from history")
   vim.api.nvim_buf_set_text(composer, 0, 0, 0, 5, { "first typed prompt" })
-  require("forge.editable").flush(owner.composer.editable)
-  local edit = requests[4].params.edit
-  assert(edit.base == 0 and edit.sequence == 1, "initial draft consumed local edit sequence")
-  local typed_tick = vim.api.nvim_buf_get_changedtick(composer)
-  local edited_metadata = snapshot(opened.composer, "first typed prompt", true).block[1].metadata
-  edited_metadata.editable_region[1].revision = 1
-  requests[4].callback({ accepted = true, acknowledgement = { document = opened.composer, region = "composer", revision = 1, sequence = 1 },
-    patch = { document = opened.composer, base = 0, next = 1, base_rows = 1, next_rows = 1, base_blocks = 1, next_blocks = 1,
-      block_edit = {}, removed_block = {}, text_edit = { { start_row = 0, removed_rows = 1, text = { "first typed prompt" } } },
-      metadata_edit = { { block = "body", row_count = 1, metadata = edited_metadata } },
-    },
-  })
-  assert(owner.composer.revision == 1 and vim.bo[composer].modifiable)
-  assert(vim.api.nvim_buf_get_changedtick(composer) == typed_tick, "composer acknowledgement rewrote typing")
+  assert(#requests == 3, "typing sent a composer request")
   owner.follow_tail()
   assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit agent action did not follow the tail")
   vim.api.nvim_win_set_cursor(window, { 1, 0 })
   owner.submit(function() end)
   assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit submission did not resume following the transcript tail")
-  assert(requests[5].method == "prompt.submit" and requests[5].params.composer.revision == 1)
-  assert(not requests[5].params.text, "composer submitted independently parsed Lua text")
-  local cleared_metadata = snapshot(opened.composer, "", true).block[1].metadata
-  cleared_metadata.editable_region[1].revision = 2
-  assert(owner.receive({ kind = "composer_patch", data = { document = opened.composer, base = 1, next = 2,
-    base_rows = 1, next_rows = 1, base_blocks = 1, next_blocks = 1, block_edit = {}, removed_block = {},
-    text_edit = { { start_row = 0, removed_rows = 1, text = { "" } } },
-    metadata_edit = { { block = "body", row_count = 1, metadata = cleared_metadata } },
-  } }))
-  assert(vim.bo[composer].modifiable and vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "")
+  local submission = requests[4]
+  assert(submission.method == "prompt.submit" and submission.params.text == "first typed prompt")
+  assert(submission.params.submission.document == opened.document and not submission.params.composer)
+  local function transition(state, token)
+    return owner.receive({ kind = "prompt_submission", data = { document = opened.document,
+      token = token or submission.params.submission.token, state = state } })
+  end
+  assert(not transition("accepted", 99), "stale acceptance cleared a draft")
+  assert(transition("accepted"))
+  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "")
+  assert(transition("retracted"))
+  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "first typed prompt")
+  submission.callback(nil, "turn_retracted")
+
+  owner.submit(function() end)
+  submission = requests[#requests]
+  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "newer draft", "λ" })
+  assert(transition("accepted"))
+  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "newer draft", "acceptance overwrote newer typing")
+  assert(transition("retracted"))
+  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "newer draft", "retraction overwrote newer typing")
+  submission.callback(nil, "turn_retracted")
+
+  owner.submit(function() end)
+  submission = requests[#requests]
+  assert(submission.params.text == "newer draft\nλ", "submission lost multiline Unicode text")
+  assert(transition("accepted"))
+  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "typed after acceptance" })
+  assert(transition("retracted"))
+  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance")
+  submission.callback(nil, "turn_retracted")
+
+  owner.submit(function() end)
+  submission = requests[#requests]
+  submission.callback(nil, "admission failed")
+  assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance", "failure lost the draft")
+  local request_count = #requests
+  for _, source in ipairs({ { " " }, { string.rep("x", 65537) }, vim.fn["repeat"]({ "row" }, 4097) }) do
+    vim.api.nvim_buf_set_lines(composer, 0, -1, false, source)
+    local rejected
+    owner.submit(function(result, submission_error) rejected = not result and submission_error end)
+    assert(rejected and #requests == request_count, "invalid draft reached Rust")
+  end
+  vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "draft at close" })
+  owner.submit(function() error("closed presentation delivered a late callback") end)
+  submission = requests[#requests]
   assert(owner.close())
-  assert(requests[6].params.operation == "close")
-  assert(not vim.api.nvim_buf_is_valid(transcript) and not vim.api.nvim_buf_is_valid(composer))
+  assert(requests[#requests].params.operation == "close")
+  assert(not transition("accepted"), "closed presentation accepted a late submission event")
+  submission.callback({})
+  assert(not vim.api.nvim_buf_is_valid(composer), "closing the workspace retained its owned composer buffer")
 
   transcript = vim.api.nvim_create_buf(false, true)
   composer = vim.api.nvim_create_buf(false, true)
@@ -85,16 +110,15 @@ local ok, failure = xpcall(function()
   require("forge.views.harness.presentation").open({ session_id = "test-session",
     transcript_buffer = transcript, composer_buffer = composer, transcript_window = window,
     is_alive = function() return true end,
-  }, function(value, error_message) assert(not value) rejected = error_message end)
-  local delayed = requests[7]
+  }, function(value, error_message) assert(value and not error_message) rejected = false end)
+  local delayed = requests[#requests]
   vim.api.nvim_buf_set_lines(composer, 0, -1, false, { "new startup draft" })
   local changedtick = vim.api.nvim_buf_get_changedtick(composer)
-  delayed.callback({ transcript = snapshot(delayed.params.document, "stale transcript"),
-    composer = snapshot(delayed.params.composer, "", true) })
-  assert(rejected and rejected:find("startup text changed", 1, true))
+  delayed.callback({ transcript = snapshot(delayed.params.document, "stale transcript") })
+  assert(rejected == false, "typing during startup rejected the transcript")
   assert(vim.api.nvim_buf_is_valid(composer) and vim.api.nvim_buf_get_changedtick(composer) == changedtick)
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "new startup draft")
-  assert(requests[8].params.operation == "close")
+
   vim.api.nvim_buf_delete(transcript, { force = true })
   vim.api.nvim_buf_delete(composer, { force = true })
 
@@ -107,8 +131,7 @@ local ok, failure = xpcall(function()
     is_alive = function() return true end, notice = function(message) notices[#notices + 1] = message end,
   }, function(value, error_message) assert(value and not error_message) end)
   local initial = requests[#requests]
-  initial.callback({ transcript = snapshot(initial.params.document, "retained history"),
-    composer = snapshot(initial.params.composer, "", true) })
+  initial.callback({ transcript = snapshot(initial.params.document, "retained history") })
   for _ = 1, 3 do
     owner.sync()
     requests[#requests].callback(nil, "transcript projection requires reopening: duplicate block identity")

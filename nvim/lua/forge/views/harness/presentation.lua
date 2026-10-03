@@ -2,7 +2,6 @@ local M = {}
 local client = require("forge.client")
 local replica = require("forge.buffer")
 local input = require("forge.input")
-local editable = require("forge.editable")
 local transcript_options = {
   margin = 0,
   scrolloff = 3,
@@ -13,7 +12,7 @@ local transcript_options = {
 
 function M.open(options, callback)
   local identity = "harness:" .. options.session_id .. ":" .. tostring(vim.uv.hrtime())
-  local owner = { document = identity, composer_id = identity .. ":composer", closed = false, syncing = false, pending = false, output = {},
+  local owner = { document = identity, submission_sequence = 0, closed = false, syncing = false, pending = false, output = {},
     session_id = options.session_id, host_generation = client.host_generation(), views = {},
     timeline_key = "main", timeline_view = {} }
   local function alive()
@@ -55,10 +54,6 @@ function M.open(options, callback)
       done(params.operation == "close" and {} or nil, params.operation ~= "close" and "Harness host generation changed" or nil)
       return
     end
-    if params.operation == "edit_composer" or (params.operation == "snapshot" and params.document == owner.composer_id) then
-      client.request_for(options.session_id, "harness.document", params, done)
-      return
-    end
     if #queued >= 63 and params.operation ~= "close" then done(nil, "Harness presentation request capacity is full") return end
     queued[#queued + 1] = { params = params, done = done }
     dispatch_next()
@@ -84,17 +79,6 @@ function M.open(options, callback)
     end
     return view_for(vim.api.nvim_get_current_win()) or view_for(options.transcript_window)
   end
-  local function submit_ready()
-    local pending = owner.pending_submit
-    if not pending or not alive() or editable.suspend_generated_text(owner.composer.editable) then return end
-    owner.pending_submit = nil
-    if vim.api.nvim_buf_get_changedtick(options.composer_buffer) ~= pending.changedtick then
-      pending.callback(nil, "Composer changed while awaiting its edit acknowledgement")
-      return
-    end
-    local region = owner.composer.editable.region.composer
-    client.request_for(options.session_id, "prompt.submit", { composer = { document = owner.composer_id, revision = region.revision } }, pending.callback)
-  end
   local function recovery(document)
     request({ operation = "snapshot", document = document.document }, function(snapshot, failure)
       if not alive() then return end
@@ -108,59 +92,32 @@ function M.open(options, callback)
     end)
   end
   local transcript_tick = vim.api.nvim_buf_get_changedtick(options.transcript_buffer)
-  local composer_tick = vim.api.nvim_buf_get_changedtick(options.composer_buffer)
   local function reject_open(message)
     owner.closed = true
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     if owner.view then input.close(owner.view) end
     if owner.transcript and not owner.transcript.generated_owned then replica.close(owner.transcript) end
-    if owner.composer and not owner.composer.generated_owned then replica.close(owner.composer) end
     request({ operation = "close", document = identity }, function() end)
     callback(nil, message)
   end
   owner.transcript = replica.open(identity, { buffer = options.transcript_buffer, generated = true, preserve_view = true,
     expected_changedtick = transcript_tick, filetype = "ForgeHarness", notice = notice,
     recover = function() recovery(owner.transcript) end })
-  owner.composer = replica.open(owner.composer_id, { buffer = options.composer_buffer, generated = true,
-    expected_changedtick = composer_tick, filetype = "ForgeHarnessInput", notice = notice,
-    editable = { notice = notice, send = function(edit)
-      if not alive() then return false end
-      request({ operation = "edit_composer", edit = edit }, function(result, failure)
-        if not alive() then return end
-        if failure or not result or not result.accepted then
-          notice(failure or "Harness composer changed before edit acknowledgement")
-          if owner.pending_submit then
-            local pending = owner.pending_submit
-            owner.pending_submit = nil
-            pending.callback(nil, failure or "Composer edit was not accepted")
-          end
-          return
-        end
-        local applied = replica.acknowledge_edit(owner.composer, result.acknowledgement, result.patch)
-        if applied.kind == "Applied" then vim.bo[options.composer_buffer].modifiable = true end
-        if applied.kind ~= "Applied" and applied.kind ~= "Deferred" then notice("Harness composer acknowledgement failed: " .. tostring(applied.kind)) end
-        submit_ready()
-      end)
-      return true
-    end } })
   owner.view = input.open(owner.transcript, options.transcript_window, transcript_options)
   owner.views[options.transcript_window] = owner.view
-  request({ operation = "open", document = identity, composer = owner.composer_id, view = owner.view.id,
-    width = require("forge.width").capture(options.transcript_window),
-    initial = vim.api.nvim_buf_get_lines(options.composer_buffer, 0, -1, false) }, function(opened, failure)
+  request({ operation = "open", document = identity, view = owner.view.id,
+    width = require("forge.width").capture(options.transcript_window) }, function(opened, failure)
     if not alive() then
       request({ operation = "close", document = identity }, function() end)
       return
     end
     if failure then reject_open(failure) return end
-    if vim.api.nvim_buf_get_changedtick(options.transcript_buffer) ~= transcript_tick
-        or vim.api.nvim_buf_get_changedtick(options.composer_buffer) ~= composer_tick then
+    if vim.api.nvim_buf_get_changedtick(options.transcript_buffer) ~= transcript_tick then
       reject_open("Harness startup text changed before native adoption")
       return
     end
     local transcript = replica.apply_snapshot(owner.transcript, opened.transcript)
-    local composer = replica.apply_snapshot(owner.composer, opened.composer)
-    if transcript.kind ~= "Applied" or composer.kind ~= "Applied" then
+    if transcript.kind ~= "Applied" then
       reject_open("Harness native documents could not be adopted")
       return
     end
@@ -389,25 +346,51 @@ function M.open(options, callback)
 
   function owner.submit(callback)
     if not alive() or not owner.ready then callback(nil, "Harness documents are not ready") return end
-    if owner.pending_submit then callback(nil, "Composer submission already awaits its edit acknowledgement") return end
-    owner.pending_submit = { changedtick = vim.api.nvim_buf_get_changedtick(options.composer_buffer), callback = callback }
-    if not editable.flush(owner.composer.editable) then
-      owner.pending_submit = nil
-      callback(nil, "Composer edit could not be sent")
+    if owner.submission then callback(nil, "Composer submission is already active") return end
+    local row_count = vim.api.nvim_buf_line_count(options.composer_buffer)
+    if row_count > 4096 or vim.api.nvim_buf_get_offset(options.composer_buffer, row_count) - 1 > 65536 then
+      callback(nil, "Prompt exceeds 64 KiB or 4096 rows")
       return
     end
+    local source = vim.api.nvim_buf_get_lines(options.composer_buffer, 0, -1, false)
+    local text = table.concat(source, "\n")
+    if not text:find("%S") then
+      callback(nil, "Prompt requires nonempty text within 64 KiB and 4096 rows")
+      return
+    end
+    owner.submission_sequence = owner.submission_sequence + 1
+    local submission = { token = owner.submission_sequence, source = source,
+      changedtick = vim.api.nvim_buf_get_changedtick(options.composer_buffer) }
+    owner.submission = submission
     owner.follow_tail()
-    submit_ready()
+    client.request_for(options.session_id, "prompt.submit", {
+      text = text, submission = { document = identity, token = submission.token },
+    }, function(result, failure)
+      if owner.closed or owner.host_generation ~= client.host_generation() or owner.submission ~= submission then return end
+      owner.submission = nil
+      callback(result, failure)
+    end)
   end
 
   function owner.receive(event)
-    if not alive() or not owner.ready or event.kind ~= "composer_patch" then return false end
-    local patch = event.data
-    if type(patch) ~= "table" or patch.document ~= owner.composer_id then return false end
-    local applied = replica.apply_patch(owner.composer, patch)
-    if applied.kind == "Applied" then vim.bo[options.composer_buffer].modifiable = true
-    elseif applied.kind ~= "Deferred" then notice("Harness composer transition failed: " .. tostring(applied.kind)) end
-    submit_ready()
+    if not alive() or not owner.ready or event.kind ~= "prompt_submission" then return false end
+    local transition = event.data
+    local submission = owner.submission
+    if type(transition) ~= "table" or transition.document ~= identity or not submission
+        or transition.token ~= submission.token or not vim.api.nvim_buf_is_valid(options.composer_buffer) then return false end
+    local changedtick = vim.api.nvim_buf_get_changedtick(options.composer_buffer)
+    if transition.state == "accepted" and not submission.accepted then
+      submission.accepted = true
+      if changedtick == submission.changedtick then
+        vim.api.nvim_buf_set_lines(options.composer_buffer, 0, -1, false, { "" })
+        submission.cleared_tick = vim.api.nvim_buf_get_changedtick(options.composer_buffer)
+      end
+    elseif transition.state == "retracted" and submission.cleared_tick then
+      if changedtick == submission.cleared_tick then
+        vim.api.nvim_buf_set_lines(options.composer_buffer, 0, -1, false, submission.source)
+      end
+      submission.cleared_tick = nil
+    end
     return true
   end
 
@@ -415,11 +398,6 @@ function M.open(options, callback)
     if owner.closed then return true end
     local collected = owner.host_generation ~= client.host_generation()
       or not vim.api.nvim_buf_is_valid(options.composer_buffer) or not vim.api.nvim_buf_is_valid(options.transcript_buffer)
-    if collected then replica.invalidate(owner.composer)
-    else
-      local composer = replica.close(owner.composer, close_options)
-      if composer and composer.kind == "Deferred" then return false end
-    end
     owner.closed = true
     if owner.terminals then owner.terminals.close() end
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
@@ -429,6 +407,9 @@ function M.open(options, callback)
     for _, view in pairs(owner.views) do input.close(view) end
     owner.views = {}
     if collected then replica.invalidate(owner.transcript) else replica.close(owner.transcript, close_options) end
+    if not collected and not (close_options and close_options.preserve_buffer) then
+      vim.api.nvim_buf_delete(options.composer_buffer, { force = true })
+    end
     request({ operation = "close", document = identity }, function(_, failure)
       if failure then notice(failure) end
     end)

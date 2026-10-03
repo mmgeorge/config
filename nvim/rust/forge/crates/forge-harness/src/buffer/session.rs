@@ -1,10 +1,8 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result, ensure};
-use forge_buffer::editable::{LocalEdit, LocalEditResult};
-use forge_buffer::identity::{
-    DocumentId, DocumentRevision, InputSequence, RegionRevision, TargetId, ViewId,
-};
+use forge_buffer::editable::LocalEdit;
+use forge_buffer::identity::{DocumentId, DocumentRevision, InputSequence, TargetId, ViewId};
 use forge_buffer::input::DocumentInput;
 use forge_buffer::patch::{BufferPatch, BufferSnapshot};
 use forge_buffer::width::WidthProfile;
@@ -17,7 +15,6 @@ use crate::timeline::{
     stream::{TimelineOperation, TimelinePatch, TimelineStream},
 };
 
-use super::composer::{ComposerDocument, ComposerSubmission};
 use super::document::{TranscriptChange, TranscriptDocument};
 use super::output::OutputDocument;
 use super::projection::{ProjectedEntry, TranscriptAction, project};
@@ -41,8 +38,9 @@ struct OpenPresentation {
     last_width: WidthProfile,
     transcript: TranscriptDocument,
     transcript_id: DocumentId,
-    composer: ComposerDocument,
-    composer_id: DocumentId,
+    submission_sequence: u64,
+    pending_submission: Option<u64>,
+    accepted_submission: Option<u64>,
     entry: HashMap<String, EntryPresentation>,
     action: HashMap<TargetId, TranscriptAction>,
     tool: HashMap<String, ToolOutputView>,
@@ -66,7 +64,6 @@ struct EntryPresentation {
 pub struct PresentationOpen {
     pub syntax_pending: bool,
     pub transcript: BufferSnapshot,
-    pub composer: BufferSnapshot,
 }
 
 #[derive(Serialize)]
@@ -122,10 +119,8 @@ pub enum PresentationRequest {
     },
     Open {
         document: DocumentId,
-        composer: DocumentId,
         view: ViewId,
         width: WidthProfile,
-        initial: forge_buffer::text::BufferText,
     },
     Sync {
         document: DocumentId,
@@ -144,9 +139,6 @@ pub enum PresentationRequest {
     SelectAgent {
         document: DocumentId,
         run_id: Option<String>,
-    },
-    EditComposer {
-        edit: LocalEdit,
     },
     Close {
         document: DocumentId,
@@ -272,8 +264,7 @@ impl SessionPresentation {
                 ensure!(
                     open.output.len() < 8
                         && !open.output.contains_key(&document)
-                        && document != open.transcript_id
-                        && document != open.composer_id,
+                        && document != open.transcript_id,
                     "tool document admission is full or identity is already used"
                 );
                 let source = open
@@ -322,13 +313,9 @@ impl SessionPresentation {
             PresentationRequest::BackgroundTerminals | PresentationRequest::TerminateTerminal { .. } | PresentationRequest::Recap { .. } | PresentationRequest::SessionName { .. } => anyhow::bail!("provider operation requires the provider owner"),
             PresentationRequest::Open {
                 document,
-                composer,
                 view,
                 width,
-                initial,
-            } => Ok(to_value(
-                self.open(document, composer, view, width, initial)?,
-            )?),
+            } => Ok(to_value(self.open(document, view, width)?)?),
             PresentationRequest::Sync { document, revision } => {
                 Ok(to_value(self.sync(&document, revision)?)?)
             }
@@ -337,21 +324,6 @@ impl SessionPresentation {
                 TranscriptAction::Diff { .. } => Ok(json!({"kind":"diff"})),
                 action => Ok(to_value(action)?),
             },
-            PresentationRequest::EditComposer { edit } => Ok(match self.edit_composer(edit)? {
-                LocalEditResult::Accepted {
-                    acknowledgement,
-                    patch,
-                } => json!({"accepted":true,"acknowledgement":acknowledgement,"patch":patch}),
-                LocalEditResult::Conflict { current } => {
-                    json!({"accepted":false,"reason":"conflict","current":current})
-                }
-                LocalEditResult::UnknownRegion => {
-                    json!({"accepted":false,"reason":"unknown_region"})
-                }
-                LocalEditResult::StaleSequence => {
-                    json!({"accepted":false,"reason":"stale_sequence"})
-                }
-            }),
             PresentationRequest::Close { document } => {
                 self.close(&document)?;
                 Ok(json!({"closed":true}))
@@ -415,20 +387,13 @@ impl SessionPresentation {
     pub fn open(
         &mut self,
         document: DocumentId,
-        composer: DocumentId,
         view: ViewId,
         width: WidthProfile,
-        initial: forge_buffer::text::BufferText,
     ) -> Result<PresentationOpen> {
         document.validate()?;
-        composer.validate()?;
-        ensure!(
-            document != composer,
-            "transcript and composer require independent document identities"
-        );
         if let Some(open) = self.open.as_mut() {
             ensure!(
-                open.transcript_id == document && open.composer_id == composer,
+                open.transcript_id == document,
                 "session presentation is already owned by another document lifetime"
             );
             if open.transcript.views.open(view.clone(), width)? {
@@ -438,10 +403,8 @@ impl SessionPresentation {
             return Ok(PresentationOpen {
                 syntax_pending: syntax_pending(open),
                 transcript: open.transcript.snapshot()?,
-                composer: open.composer.snapshot(),
             });
         }
-        let composer_document = ComposerDocument::new(composer.clone(), initial)?;
         let mut projected = Vec::new();
         let mut retained_bytes = 0;
         for (index, entry) in self.timeline.entry_list().iter().enumerate() {
@@ -478,7 +441,6 @@ impl SessionPresentation {
                     .values()
                     .any(|action| matches!(action, TranscriptAction::Diff { .. })),
             transcript: transcript.snapshot()?,
-            composer: composer_document.snapshot(),
         };
         self.open = Some(OpenPresentation {
             expanded_tool: HashSet::new(),
@@ -488,8 +450,9 @@ impl SessionPresentation {
             last_width: width,
             transcript,
             transcript_id: document,
-            composer: composer_document,
-            composer_id: composer,
+            submission_sequence: 0,
+            pending_submission: None,
+            accepted_submission: None,
             entry,
             action,
             tool,
@@ -680,8 +643,6 @@ impl SessionPresentation {
             .context("session presentation is not open")?;
         if let Some(output) = open.output.get(document) {
             Ok(output.snapshot())
-        } else if document == &open.composer_id {
-            Ok(open.composer.snapshot())
         } else {
             self.document(document)?.transcript.snapshot()
         }
@@ -783,78 +744,69 @@ impl SessionPresentation {
         )
     }
 
-    pub fn edit_composer(&mut self, edit: LocalEdit) -> Result<LocalEditResult> {
-        let open = self
-            .open
-            .as_mut()
-            .context("session presentation is not open")?;
-        ensure!(
-            edit.document == open.composer_id,
-            "composer edit belongs to another document"
-        );
-        open.composer.edit(edit)
-    }
-
     pub fn begin_submission(
         &mut self,
-        composer: &DocumentId,
-        revision: RegionRevision,
-    ) -> Result<ComposerSubmission> {
-        let open = self
-            .open
-            .as_mut()
-            .context("session presentation is not open")?;
-        ensure!(
-            &open.composer_id == composer,
-            "composer submission belongs to another document"
-        );
-        open.composer.begin_submission(revision)
-    }
-
-    pub fn settle_submission(
-        &mut self,
-        composer: &DocumentId,
+        document: &DocumentId,
         token: u64,
-        admitted: bool,
-    ) -> Result<Option<BufferPatch>> {
-        let open = self
-            .open
-            .as_mut()
-            .context("session presentation is not open")?;
+        text: &str,
+    ) -> Result<()> {
+        self.document(document)?;
         ensure!(
-            &open.composer_id == composer,
-            "composer acknowledgement belongs to another document"
+            text.len() <= 65536 && text.split('\n').count() <= 4096 && !text.trim().is_empty(),
+            "prompt requires nonempty text within 64 KiB and 4096 rows"
         );
-        open.composer.settle_submission(token, admitted)
+        let open = self.open.as_mut().expect("validated presentation");
+        ensure!(
+            open.pending_submission.is_none(),
+            "prompt submission is already pending"
+        );
+        ensure!(
+            token > open.submission_sequence && token <= forge_buffer::MAX_COUNTER,
+            "prompt submission token is stale or invalid"
+        );
+        open.submission_sequence = token;
+        open.pending_submission = Some(token);
+        open.accepted_submission = None;
+        Ok(())
     }
 
     pub fn complete_submission(
         &mut self,
-        composer: &DocumentId,
+        document: &DocumentId,
         token: u64,
         admitted: bool,
-    ) -> Result<Option<BufferPatch>> {
+    ) -> Result<Option<serde_json::Value>> {
         let Some(open) = self.open.as_mut() else {
             return Ok(None);
         };
-        if &open.composer_id != composer || open.composer.pending_token() != Some(token) {
+        if &open.transcript_id != document || open.pending_submission != Some(token) {
             return Ok(None);
         }
-        open.composer.settle_submission(token, admitted)
+        open.pending_submission = None;
+        if !admitted {
+            return Ok(None);
+        }
+        open.accepted_submission = Some(token);
+        Ok(Some(
+            serde_json::json!({"document":document,"token":token,"state":"accepted"}),
+        ))
     }
 
     pub fn retract_submission(
         &mut self,
-        composer: &DocumentId,
+        document: &DocumentId,
         token: u64,
-    ) -> Result<Option<BufferPatch>> {
+    ) -> Result<Option<serde_json::Value>> {
         let Some(open) = self.open.as_mut() else {
             return Ok(None);
         };
-        if &open.composer_id != composer {
+        if &open.transcript_id != document || open.accepted_submission != Some(token) {
             return Ok(None);
         }
-        open.composer.retract_submission(token)
+        open.accepted_submission = None;
+        Ok(Some(
+            serde_json::json!({"document":document,"token":token,"state":"retracted"}),
+        ))
     }
 
     pub fn close(&mut self, document: &DocumentId) -> Result<()> {
@@ -1028,7 +980,10 @@ fn refresh_activity(open: &mut OpenPresentation, source: &[TimelineEntry]) -> Re
                 _ => false,
             };
             if ticking {
-                projected.push((index, project(entry, width, index > 0, &open.expanded_tool)?));
+                projected.push((
+                    index,
+                    project(entry, width, index > 0, &open.expanded_tool)?,
+                ));
             }
         }
     }
@@ -1245,7 +1200,6 @@ fn retain_patches(open: &mut OpenPresentation, patches: Vec<BufferPatch>) -> Res
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_buffer::text::BufferText;
 
     #[tokio::test]
     async fn markdown_responses_keep_source_without_native_syntax_jobs() -> Result<()> {
@@ -1295,10 +1249,8 @@ mod tests {
         let document = DocumentId("transcript:markdown".into());
         let opened = owner.open(
             document.clone(),
-            DocumentId("composer:markdown".into()),
             ViewId("markdown".into()),
             WidthProfile::default(),
-            BufferText::from_rows([""])?,
         )?;
         assert!(!opened.syntax_pending);
         assert!(owner.capture_syntax(&document)?.is_none());
@@ -1344,10 +1296,8 @@ mod tests {
         let document = DocumentId("transcript:syntax".into());
         owner.open(
             document.clone(),
-            DocumentId("composer:syntax".into()),
             ViewId("syntax".into()),
             WidthProfile::default(),
-            BufferText::from_rows([""])?,
         )?;
         let job = owner.capture_syntax(&document)?.expect("saved diff work");
         let blocks = job.analyze(&engine).await?;
@@ -1487,16 +1437,34 @@ mod tests {
         owner.initialize(vec![interaction_entry("first")])?;
         let document = DocumentId("transcript:toggle".into());
         let view = ViewId("view:toggle".into());
-        let opened = owner.open(document.clone(), DocumentId("composer:toggle".into()), view.clone(), WidthProfile::default(), BufferText::from_rows([""])?)?;
+        let opened = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         let block = BlockId("first:turn:1:tool:tool".into());
         let mut input = DocumentInput {
             document: document.clone(), revision: opened.transcript.revision, view: view.clone(),
             sequence: InputSequence(1), action: "activate".into(), block: block.clone(),
             position: TextPosition { row: 5, column: 6 }, target: Some(TargetId(block.0.clone())),
         };
-        assert_eq!(owner.dispatch(PresentationRequest::ToggleTool { input: input.clone() })?["expanded"], true);
-        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: input.clone() }).is_err());
-        owner.dispatch(PresentationRequest::Resize { document: document.clone(), view, width: WidthProfile { columns: 65, ..WidthProfile::default() } })?;
+        assert_eq!(
+            owner.dispatch(PresentationRequest::ToggleTool {
+                input: input.clone()
+            })?["expanded"],
+            true
+        );
+        assert!(
+            owner
+                .dispatch(PresentationRequest::ToggleTool {
+                    input: input.clone()
+                })
+                .is_err()
+        );
+        owner.dispatch(PresentationRequest::Resize {
+            document: document.clone(),
+            view,
+            width: WidthProfile {
+                columns: 65,
+                ..WidthProfile::default()
+            },
+        })?;
         let snapshot = owner.snapshot(&document)?;
         let expanded = snapshot.block.iter().find(|candidate| candidate.id == block).unwrap();
         assert!(expanded.text.wire_rows().contains(&"      sixth"));
@@ -1520,13 +1488,7 @@ mod tests {
         ])?;
         let document = DocumentId("transcript:actions".into());
         let view = ViewId("view:actions".into());
-        let opened = owner.open(
-            document.clone(),
-            DocumentId("composer:actions".into()),
-            view.clone(),
-            WidthProfile::default(),
-            BufferText::from_rows([""])?,
-        )?;
+        let opened = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         assert!(
             opened
                 .transcript
@@ -1624,10 +1586,8 @@ mod tests {
             let document = DocumentId(format!("transcript:{nesting}"));
             let opened = owner.open(
                 document.clone(),
-                DocumentId(format!("composer:{nesting}")),
                 ViewId(format!("view:{nesting}")),
                 WidthProfile::default(),
-                BufferText::from_rows(["draft"])?,
             )?;
             let mut event = BackendEvent {
                 address: Some(ProviderAddress {
@@ -1700,7 +1660,7 @@ mod tests {
     }
 
     #[test]
-    fn selected_agent_updates_keep_the_composer_and_document_lifetime() -> Result<()> {
+    fn selected_agent_updates_keep_the_submission_and_document_lifetime() -> Result<()> {
         use crate::agent::{Agent, AgentState};
         let TimelineEntry::Exchange {
             exchange: interaction,
@@ -1728,14 +1688,12 @@ mod tests {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![interaction_entry("main"), agent.clone()])?;
         let document = DocumentId("transcript:scope".into());
-        let composer = DocumentId("composer:scope".into());
         let initial = owner.open(
             document.clone(),
-            composer.clone(),
             ViewId("view:scope".into()),
             WidthProfile::default(),
-            BufferText::from_rows(["retained draft"])?,
         )?;
+        owner.begin_submission(&document, 1, "retained submission")?;
         owner.dispatch(PresentationRequest::SelectAgent {
             document: document.clone(),
             run_id: Some("child-run".into()),
@@ -1755,7 +1713,7 @@ mod tests {
                 .any(|block| block.id.0 == "main:prompt")
         );
         owner.reconcile(vec![interaction_entry("other-main"), agent])?;
-        assert_eq!(owner.snapshot(&composer)?, initial.composer);
+        assert_eq!(owner.open.as_ref().unwrap().pending_submission, Some(1));
         owner.dispatch(PresentationRequest::SelectAgent {
             document: document.clone(),
             run_id: None,
@@ -1790,10 +1748,8 @@ mod tests {
         let document = DocumentId("transcript:timer".into());
         let opened = owner.open(
             document.clone(),
-            DocumentId("composer:timer".into()),
             ViewId("view:timer".into()),
             WidthProfile::default(),
-            BufferText::from_rows(["draft"])?,
         )?;
         let open = owner.open.as_ref().unwrap();
         let (entry_id, pointer) = open
@@ -1815,7 +1771,41 @@ mod tests {
     }
 
     #[test]
-    fn active_projection_and_composer_have_independent_revisions() -> Result<()> {
+    fn submission_admission_rejects_stale_tokens_and_closed_lifetimes() -> Result<()> {
+        let mut owner = SessionPresentation::new("session".into());
+        let document = DocumentId("transcript:admission".into());
+        owner.open(document.clone(), ViewId("view:admission".into()), WidthProfile::default())?;
+        assert!(owner.begin_submission(&document, 0, "draft").is_err());
+        assert!(owner.begin_submission(&document, 1, " ").is_err());
+        assert!(owner.begin_submission(&document, 1, &"x".repeat(65537)).is_err());
+        assert!(owner.begin_submission(&document, 1, &"\n".repeat(4096)).is_err());
+        owner.begin_submission(&document, 1, "complete λ\n\ndraft")?;
+        assert!(owner.begin_submission(&document, 2, "duplicate pending").is_err());
+        assert!(owner.complete_submission(&document, 2, true)?.is_none());
+        assert!(owner.complete_submission(&document, 1, false)?.is_none());
+        assert!(owner.begin_submission(&document, 1, "stale token").is_err());
+        owner.begin_submission(&document, 2, "next draft")?;
+        assert_eq!(owner.complete_submission(&document, 2, true)?,
+            Some(serde_json::json!({"document":document,"token":2,"state":"accepted"})));
+        assert!(owner.complete_submission(&document, 2, true)?.is_none());
+        assert_eq!(owner.retract_submission(&document, 2)?,
+            Some(serde_json::json!({"document":document,"token":2,"state":"retracted"})));
+        assert!(owner.retract_submission(&document, 2)?.is_none());
+        owner.begin_submission(&document, 3, "pending at close")?;
+        owner.close(&document)?;
+        assert!(owner.begin_submission(&document, 4, "late prompt").is_err());
+        assert!(owner.complete_submission(&document, 3, true)?.is_none());
+        let replacement = DocumentId("transcript:replacement".into());
+        owner.open(replacement.clone(), ViewId("view:replacement".into()), WidthProfile::default())?;
+        owner.begin_submission(&replacement, 1, "new lifetime")?;
+        assert!(owner.complete_submission(&document, 3, true)?.is_none());
+        assert!(owner.retract_submission(&document, 2)?.is_none());
+        assert!(owner.complete_submission(&replacement, 1, true)?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn active_projection_preserves_pending_submission() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![TimelineEntry::Status {
             id: "status".into(),
@@ -1823,15 +1813,12 @@ mod tests {
             status: SessionPhase::Idle,
         }])?;
         let document = DocumentId("transcript:test".into());
-        let composer = DocumentId("composer:test".into());
         let opened = owner.open(
             document.clone(),
-            composer.clone(),
             ViewId("view:test".into()),
             WidthProfile::default(),
-            BufferText::from_rows(["draft"])?,
         )?;
-        let composer_before = serde_json::to_value(&opened.composer)?;
+        owner.begin_submission(&document, 1, "draft")?;
         owner.reconcile(vec![TimelineEntry::Status {
             id: "status".into(),
             created_at_ms: 0,
@@ -1840,14 +1827,7 @@ mod tests {
         let synced = owner.sync(&document, opened.transcript.revision)?;
         assert!(!synced.patch.is_empty());
         assert!(synced.snapshot.is_none());
-        assert_eq!(
-            serde_json::to_value(owner.snapshot(&composer)?)?,
-            composer_before
-        );
-        assert_eq!(
-            owner.begin_submission(&composer, RegionRevision(0))?.text,
-            "draft"
-        );
+        assert_eq!(owner.open.as_ref().unwrap().pending_submission, Some(1));
         assert!(
             owner
                 .sync(&document, DocumentRevision(forge_buffer::MAX_COUNTER))
@@ -1865,13 +1845,10 @@ mod tests {
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
         }])?;
         let document = DocumentId("transcript:hidden".into());
-        let composer = DocumentId("composer:hidden".into());
         let opened = owner.open(
             document.clone(),
-            composer.clone(),
             ViewId("view:old".into()),
             WidthProfile::default(),
-            BufferText::from_rows(["draft"])?,
         )?;
         owner.dispatch(PresentationRequest::CloseView {
             document: document.clone(),
@@ -1892,7 +1869,7 @@ mod tests {
             },
         })?;
         assert_eq!(owner.open.as_ref().unwrap().last_width.columns, 6);
-        assert_eq!(owner.snapshot(&composer)?, opened.composer);
+
         assert!(
             !owner
                 .sync(&document, opened.transcript.revision)?
@@ -1908,19 +1885,15 @@ mod tests {
         owner.initialize(Vec::new())?;
         owner.open(
             DocumentId("transcript:first".into()),
-            DocumentId("composer:first".into()),
             ViewId("view:first".into()),
             WidthProfile::default(),
-            BufferText::from_rows([""])?,
         )?;
         assert!(
             owner
                 .open(
                     DocumentId("transcript:other".into()),
-                    DocumentId("composer:other".into()),
                     ViewId("view:other".into()),
                     WidthProfile::default(),
-                    BufferText::from_rows(["newer draft"])?
                 )
                 .is_err()
         );
@@ -1936,27 +1909,18 @@ mod tests {
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
         }])?;
         let document = DocumentId("transcript:width".into());
-        let composer = DocumentId("composer:width".into());
         let first = ViewId("view:first".into());
         let second = ViewId("view:second".into());
-        owner.open(
-            document.clone(),
-            composer.clone(),
-            first.clone(),
-            WidthProfile::default(),
-            BufferText::from_rows([""])?,
-        )?;
+        owner.open(document.clone(), first.clone(), WidthProfile::default())?;
         let timeline_revision = owner.revision();
         let initial = owner.snapshot(&document)?.revision;
         owner.open(
             document.clone(),
-            composer,
             second.clone(),
             WidthProfile {
                 columns: 4,
                 ..WidthProfile::default()
             },
-            BufferText::from_rows([""])?,
         )?;
         assert_eq!(owner.snapshot(&document)?.revision, initial);
         owner.dispatch(PresentationRequest::Resize {

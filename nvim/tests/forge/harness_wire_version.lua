@@ -7,7 +7,7 @@ local original_ensure = builder.ensure
 local ok, failure = xpcall(function()
   require("forge").setup({ harness = { backend = "mock" }, harness_logging = false })
   builder.ensure = function(callback) callback({ ok = true, path = "injected-forge" }) end
-  for _, version in ipairs({ 0, 2, 4, "5", false }) do
+  for _, version in ipairs({ 0, 2, 4, 5, "6", false }) do
     client._reset_for_test()
     local initialize_requests, shutdown_requests, method_list = 0, 0, {}
     client._set_launcher_for_test(function(_, options)
