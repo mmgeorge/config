@@ -766,6 +766,7 @@ impl PlanReviewDocument {
             None,
             &self.source.declaration_syntax,
             public_only,
+            self.source.trace.as_ref(),
         )?;
         let patch = self.document.edit(0..self.document.block_count(), block)?;
         self.source.public_only = public_only;

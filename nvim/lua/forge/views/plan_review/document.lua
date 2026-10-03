@@ -3,6 +3,7 @@ local client = require("forge.client")
 local buffer = require("forge.buffer")
 local input = require("forge.input")
 local editable = require("forge.editable")
+local perf = require("forge.infra.perf")
 
 ---@param window integer
 ---@return table
@@ -260,11 +261,17 @@ function M.attach(options, callback)
     end
     return false
   end
+  local open_started = perf.now()
   request({ operation = "plan_open", document = owner.document, view = owner.view.id,
     plan_id = options.plan.id, digest = options.plan.review_digest, revision = options.plan.historical_revision,
     saved_source_digest = options.recovery and options.recovery.saved_source_digest or nil,
     focused_annotation = options.recovery and next(options.recovery.draft) or nil,
     width = require("forge.width").capture(options.window) }, function(opened, failure)
+    perf.event("harness", "plan.review.open_response", {
+      elapsed_ms = perf.elapsed_ms(open_started),
+      status = failure and "error" or "ok",
+      count = opened and opened.snapshot and #opened.snapshot.block or 0,
+    })
     if not alive() then owner.close() return end
     if failure then owner.close() callback(nil, failure) return end
     if vim.fs.normalize(vim.api.nvim_buf_get_name(options.buffer)) ~= vim.fs.normalize(opened.path) then
@@ -283,6 +290,10 @@ function M.attach(options, callback)
     if adopted.kind ~= "Applied" then
       owner.close() callback(nil, "Physical plan review changed before attachment: " .. adopted.kind) return
     end
+    perf.event("harness", "plan.review.snapshot_applied", {
+      elapsed_ms = perf.elapsed_ms(open_started),
+      count = #opened.snapshot.block,
+    })
     if options.configure_view then options.configure_view(owner.view, owner) end
     owner.gutter_selection = require("forge.document_commands").attach_selection(owner.replica, { normalize = false })
     owner.public_only = opened.public_only

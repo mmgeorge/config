@@ -107,7 +107,7 @@ impl DeclarationIndex {
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
         if !matches!(
             language,
-            SyntaxLanguage::Rust | SyntaxLanguage::Typescript | SyntaxLanguage::Tsx
+            SyntaxLanguage::Rust | SyntaxLanguage::Typescript | SyntaxLanguage::Tsx | SyntaxLanguage::Lua
         ) {
             return Err(SyntaxError::Language(path.into()));
         }
@@ -129,6 +129,10 @@ impl DeclarationIndex {
             incomplete: tree.root_node().has_error(),
             ..Self::default()
         };
+        if language == SyntaxLanguage::Lua {
+            lua_imports(tree.root_node(), source, &mut index);
+            return Ok((index, DeclarationIndexTiming { parse, extract: started.elapsed() }));
+        }
         index.external_module = children(tree.root_node())
             .iter()
             .any(|node| matches!(node.kind(), "import_statement" | "export_statement"));
@@ -166,6 +170,28 @@ impl DeclarationIndex {
             0,
         )?;
         Ok((index, DeclarationIndexTiming { parse, extract: started.elapsed() }))
+    }
+}
+
+fn lua_imports(root: Node<'_>, source: &str, index: &mut DeclarationIndex) {
+    for statement in children(root) {
+        if !matches!(statement.kind(), "variable_declaration" | "assignment_statement" | "function_call") { continue; }
+        let text = contents(statement, source);
+        let Some(call) = text.find("require") else { continue };
+        let prefix = text[..call].trim_end();
+        if statement.kind() == "function_call" && !prefix.is_empty() { continue; }
+        if statement.kind() != "function_call" && !prefix.ends_with('=') { continue; }
+        if call > 0 && (text.as_bytes()[call - 1].is_ascii_alphanumeric() || text.as_bytes()[call - 1] == b'_') { continue; }
+        let tail = text[call + "require".len()..].trim_start();
+        let Some(tail) = tail.strip_prefix('(').map(str::trim_start) else { continue };
+        let Some(quote) = tail.chars().next().filter(|quote| matches!(quote, '\'' | '"')) else { continue };
+        let Some((module, rest)) = tail[1..].split_once(quote) else { continue };
+        if !rest.trim_start().starts_with(')') { continue; }
+        index.import.push(DeclarationImport {
+            scope: Vec::new(), path: Vec::new(), source: Some(module.into()), alias: None,
+            glob: false, namespace: false, export: false, visibility: SymbolVisibility::Private,
+            position: position(statement), conditional: false,
+        });
     }
 }
 

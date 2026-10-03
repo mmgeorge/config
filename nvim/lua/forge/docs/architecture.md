@@ -1932,6 +1932,20 @@ diff gutters, and tree-sitter syntax decorations. Opening adopts a generated loa
 PlanReview winbar before requesting the snapshot, without displaying or parsing the saved Markdown
 projection. Declaration jumps first resolve against captured project declarations. Only unresolved
 jumps discover dependency and standard-library sources independently of opening and highlighting.
+Review file layout derives Cargo, Node, and pnpm workspace membership, package ownership, target
+roots, and local file relationships from the captured declaration snapshot. It traverses unchanged
+intermediary files before selecting changed
+diffs, orders configuration before the source it governs, keeps packages contiguous, and visits
+source components depth first. Strongly connected components bound cycles and each changed file
+appears once. Unresolved relationships fall back to directory and path order. Both saved and native
+reviews consume this order before generating hunks, while file and navigation identities follow
+stable source paths. Layout discovery never acquires dependencies or rereads the working tree.
+With Harness logging enabled, `plan.review.capture` records saved-source capture and rendering,
+`plan.review.syntax` records syntax preparation, `plan.review.file_order` records visible layout time
+and emitted file count, and `plan.review.projection` records declaration projection time and row count
+in the Harness trace. The Neovim Harness performance log records `plan.review.open_response` and
+`plan.review.snapshot_applied` from the client request start. These events run on review open or
+refresh, outside Neovim and Harness startup.
 Validation and navigation share manifest lookup and select the highest compatible cached registry version,
 without consulting Cargo.lock or invoking Cargo metadata. It follows renamed, path, inherited
 workspace, and target-specific dependency declarations as each alias is reached. Missing reached

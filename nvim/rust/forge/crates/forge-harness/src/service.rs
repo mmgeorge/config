@@ -114,6 +114,7 @@ impl HarnessService {
                 saved_source_digest,
                 focused_annotation,
             } => {
+                let capture_started = Instant::now();
                 let admission = controller.plan_review.admit(document.clone())?;
                 let mut source = {
                     let broker = controller.broker.lock().await;
@@ -126,6 +127,18 @@ impl HarnessService {
                         broker.capture_plan_review(plan_id, digest)?
                     }
                 };
+                if source.document.design.is_some() {
+                    let trace = registry.runtime.trace();
+                    if trace.status().enabled {
+                        source.trace = Some(crate::plan::review_source::ReviewTrace {
+                            store: trace,
+                            session_id: session_id.clone(),
+                        });
+                    }
+                }
+                if let Some(trace) = &source.trace {
+                    trace.record("plan.review.capture", capture_started.elapsed(), source.document.design.as_ref().map_or(0, |design| design.proposed.len()));
+                }
                 admission.check()?;
                 if let Some(expected) = saved_source_digest {
                     ensure!(
@@ -133,6 +146,7 @@ impl HarnessService {
                         "saved plan source changed before recovering annotations"
                     );
                 }
+                let syntax_started = Instant::now();
                 if let Some(design) = &source.document.design {
                     for path in design.changed_paths() {
                         for (side,text) in [("baseline",design.baseline.get(&path).map(|file| &file.text)),("proposed",design.proposed.get(&path))] {
@@ -166,6 +180,9 @@ impl HarnessService {
                             anyhow::anyhow!("PlanReview syntax analysis failed: {error:?}")
                         })?,
                 );
+                }
+                if let Some(trace) = &source.trace {
+                    trace.record("plan.review.syntax", syntax_started.elapsed(), source.declaration_syntax.len());
                 }
                 admission.check()?;
                 let document = crate::plan::review_document::PlanReviewDocument::new(

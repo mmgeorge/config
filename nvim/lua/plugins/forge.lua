@@ -32,7 +32,7 @@ return {
     end,
     opts = {
       diff_logging = true,
-      harness_logging = false,
+      harness_logging = true,
       status_cursor_prewarm = true,
       status_cursor_prewarm_max_hunks = 2,
       walkthrough_inventory = "sem",

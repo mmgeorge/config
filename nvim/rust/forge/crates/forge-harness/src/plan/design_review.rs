@@ -1,4 +1,5 @@
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{HashMap, HashSet};
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
@@ -14,12 +15,13 @@ use forge_diff::source::{Representation, SourcePair, SourceVersion};
 use forge_diff::syntax::{DeclarationFolding, DeclarationOverview, DeclarationPresentation, DeclarationVisibility};
 
 use super::review_annotation::ReviewAnnotation;
+use super::review_source::ReviewTrace;
 use super::{
     PlanDocument, PlanNavigationAnchor, PlanNavigationIndex, PlanReviewTarget, RenderedPlan,
 };
 
 pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
-    let (block, navigation, _) = rows(document, &HashMap::new(), false, false)?;
+    let (block, navigation, _) = rows(document, &HashMap::new(), false, false, None)?;
     let markdown = block
         .iter()
         .flat_map(|block| block.text.wire_rows())
@@ -39,8 +41,9 @@ pub(super) fn project(
     focused: Option<&str>,
     syntax: &HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
     public_only: bool,
+    trace: Option<&ReviewTrace>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
-    let (source, navigation, hidden) = rows(document, syntax, public_only, true)?;
+    let (source, navigation, hidden) = rows(document, syntax, public_only, true, trace)?;
     let mut target = HashMap::new();
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
@@ -56,7 +59,7 @@ pub(super) fn project(
             .block;
         }
         if let Some(anchor) = navigation.resolve_line(index as u32 + 1) {
-            let id = TargetId(format!("plan:declaration:row:{index}"));
+            let id = TargetId(format!("plan:declaration:{}", row.id.0));
             row.metadata.target.push(TargetRange {
                 id: id.clone(),
                 range: TextRange {
@@ -130,6 +133,7 @@ fn rows(
     syntax: &HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
     public_only: bool,
     inspection: bool,
+    trace: Option<&ReviewTrace>,
 ) -> Result<(Vec<BufferBlock>, PlanNavigationIndex, HashSet<BlockId>)> {
     let design = document
         .design
@@ -139,12 +143,14 @@ fn rows(
     let mut hidden = HashSet::new();
     let mut visibility = HashMap::<(String, String), DeclarationVisibility>::new();
     let mut presentation = HashMap::<(String, String), DeclarationPresentation>::new();
-    let destinations = design.moved.values().collect::<BTreeSet<_>>();
-    for path in design.changed_paths() {
-        if destinations.contains(&path) {
-            continue;
-        }
-        let destination = design.moved.get(&path).unwrap_or(&path);
+    let started = Instant::now();
+    let ordered_files = super::review_file_layout::order(design);
+    if let Some(trace) = trace {
+        trace.record("plan.review.file_order", started.elapsed(), ordered_files.len());
+    }
+    for file in ordered_files {
+        let path = file.baseline;
+        let destination = file.proposed;
         let before = design
             .baseline
             .get(&path)
@@ -153,8 +159,8 @@ fn rows(
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let after = design
             .proposed
-            .get(destination)
-            .map(|text| DeclarationOverview::present(destination, text))
+            .get(&destination)
+            .map(|text| DeclarationOverview::present(&destination, text))
             .transpose()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let diff = forge_diff::raw::compute_hunks(SourcePair {
@@ -179,7 +185,7 @@ fn rows(
         })?;
         let old_name = format!("a/{path}");
         let new_name = format!("b/{destination}");
-        if diff.hunks().is_empty() && before.is_some() && after.is_some() && path == *destination {
+        if diff.hunks().is_empty() && before.is_some() && after.is_some() && path == destination {
             continue;
         }
         forge_diff::unified::write_file_header(&old_name, &new_name, &mut patch)?;
@@ -224,11 +230,11 @@ fn rows(
             if inspection {
                 visibility.insert(
                     (destination.clone(), "proposed".into()),
-                    DeclarationVisibility::analyze(destination, &after.text, public_only)
+                    DeclarationVisibility::analyze(&destination, &after.text, public_only)
                         .map_err(|error| anyhow::anyhow!("{error:?}"))?,
                 );
             }
-            presentation.insert((destination.clone(), "proposed".into()), after);
+            presentation.insert((destination, "proposed".into()), after);
         }
     }
     let patch = String::from_utf8(patch)?;
@@ -240,7 +246,7 @@ fn rows(
         plan_version: document.version,
         anchor: Vec::new(),
     };
-    for (file_index, file) in parsed.file.iter().enumerate() {
+    for file in &parsed.file {
         let start = block.len();
         let path = file
             .new_path
@@ -273,7 +279,8 @@ fn rows(
             .flat_map(|hunk| &hunk.row)
             .filter(|row| row.kind == RowKind::Removed)
             .count() as u64;
-        let id = format!("plan:design:file:{file_index}");
+        let identity = file.old_path.as_deref().unwrap_or(path);
+        let id = format!("plan:design:file:{}", super::digest(identity.as_bytes()));
         block.push(forge_diff::projection::header(
             BlockId(id.clone()),
             status.header(&display, Some((added, removed)), false),
@@ -716,7 +723,7 @@ mod tests {
         });
         document.design = Some(design);
         for public_only in [false, true] {
-            let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only).unwrap();
+            let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None).unwrap();
             assert!(block.iter().all(|block| !block.id.0.contains("validation")));
             let declaration = block.iter().find(|block| block.text.row(0) == Some("pub struct State;")).unwrap();
             assert!(declaration.metadata.target.iter().any(|range| target.contains_key(&range.id)));
@@ -731,7 +738,7 @@ mod tests {
         design.proposed.insert("config.rs".into(), "#[derive(Debug)]\npub enum ConfigError {\n  /// Invalid arena size.\n  ArenaSize,\n  Radius,\n}\n\npub struct State {\n  pub count: u64,\n  private: u64,\n}\n\nimpl State {\n  pub fn count(&self) -> u64;\n  fn hidden();\n}\n\npub struct Empty {\n  private: u64,\n}\n".into());
         document.design = Some(design);
         for public_only in [false, true] {
-            let (block, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only).unwrap();
+            let (block, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None).unwrap();
             let index: HashMap<_, _> = block.iter().enumerate().map(|(row, block)| (block.id.clone(), row)).collect();
             let mut declarations = 0;
             for (row, owner) in block.iter().enumerate() {
@@ -791,6 +798,7 @@ mod tests {
                 None,
                 &HashMap::new(),
                 public_only,
+                None,
             )
             .unwrap();
             let description = block
@@ -870,6 +878,7 @@ mod tests {
             None,
             &HashMap::new(),
             true,
+            None,
         )
         .unwrap();
         let text = block
@@ -908,6 +917,7 @@ mod tests {
             None,
             &HashMap::new(),
             true,
+            None,
         )
         .unwrap();
         assert!(
@@ -1016,6 +1026,7 @@ mod tests {
             Some("review"),
             &HashMap::new(),
             false,
+            None,
         )
         .unwrap();
         assert!(block.iter().any(|block| !block.metadata.gutter.is_empty()));
@@ -1057,5 +1068,42 @@ mod tests {
         )
         .unwrap();
         assert_eq!(annotation[0].subject.len(), 2);
+    }
+
+    #[test]
+    fn saved_review_traverses_unchanged_files_and_keeps_file_ids_stable() {
+        let mut document = crate::plan::document::test_fixture("plan", "Review");
+        let mut design = super::super::DeclarationDesign::default();
+        for (path, baseline, proposed) in [
+            ("a.ts", "import './b';\nexport type A = string;\n", "import './b';\nexport type A = number;\n"),
+            ("b.ts", "import './c';\n", "import './c';\n"),
+            ("c.ts", "export type C = string;\n", "export type C = number;\n"),
+        ] {
+            design.baseline.insert(path.into(), super::super::DeclarationFile { text: baseline.into(), source_digest: String::new() });
+            design.proposed.insert(path.into(), proposed.into());
+        }
+        document.design = Some(design);
+        let reopened: PlanDocument = serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap();
+        let rendered = render(&reopened).unwrap();
+        let (block, _, _) = rows(&reopened, &HashMap::new(), false, false, None).unwrap();
+        let directory = tempfile::tempdir().unwrap();
+        let store = std::sync::Arc::new(crate::trace::TraceStore::open(directory.path()).unwrap());
+        store.configure(true).unwrap();
+        let trace = ReviewTrace { store: store.clone(), session_id: "review-test".into() };
+        rows(&reopened, &HashMap::new(), false, false, Some(&trace)).unwrap();
+        let recorded = std::fs::read_to_string(store.status().path).unwrap();
+        assert!(recorded.contains("\"event\":\"plan.review.file_order\""));
+        assert!(recorded.contains("\"count\":2"));
+        let file_headers = block.iter().filter(|row| row.id.0.starts_with("plan:design:file:") && !row.id.0.contains(":hunk:")).collect::<Vec<_>>();
+        assert_eq!(file_headers.len(), 2);
+        assert!(file_headers[0].text.row(0).unwrap().contains("a.ts"));
+        assert!(file_headers[1].text.row(0).unwrap().contains("c.ts"));
+        assert!(!rendered.markdown.contains("Modified b.ts"));
+        let stable_id = file_headers[1].id.clone();
+        let design = document.design.as_mut().unwrap();
+        design.baseline.insert("0.ts".into(), super::super::DeclarationFile { text: "export type Zero = string;\n".into(), source_digest: String::new() });
+        design.proposed.insert("0.ts".into(), "export type Zero = number;\n".into());
+        let (block, _, _) = rows(&document, &HashMap::new(), false, false, None).unwrap();
+        assert!(block.iter().any(|row| row.id == stable_id && row.text.row(0).unwrap().contains("c.ts")));
     }
 }

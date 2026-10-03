@@ -791,6 +791,7 @@ fn retained(kind: &str, language: SyntaxLanguage) -> bool {
             "function_declaration"
                 | "variable_declaration"
                 | "assignment_statement"
+                | "function_call"
                 | "comment"
                 | "return_statement"
         ),
@@ -863,6 +864,12 @@ fn project_node(
                 {
                     let mut walk = expressions.walk();
                     if let Some(value) = expressions.named_children(&mut walk).next() {
+                        if !prefix.contains(',')
+                            && expressions.named_child_count() == 1
+                            && lua_literal_require(&source[value.byte_range()]).is_some()
+                        {
+                            return text.into();
+                        }
                         let name = prefix.trim_start_matches("local ").trim();
                         if value.kind() == "function_definition" && !name.contains(',') {
                             if let Some(parameters) = value.child_by_field_name("parameters") {
@@ -887,6 +894,9 @@ fn project_node(
                 return prefix.into();
             }
         }
+    }
+    if language == SyntaxLanguage::Lua && node.kind() == "function_call" {
+        return if lua_literal_require(text).is_some() { text.into() } else { String::new() };
     }
     if roles.get(&node.id()) == Some(&"design.callable") {
         if language == SyntaxLanguage::Lua {
@@ -1022,6 +1032,14 @@ fn project_lua_table(table: Node<'_>, owner: &str, source: &str, output: &mut St
             _ => output.push_str(&binding),
         }
     }
+}
+
+fn lua_literal_require(source: &str) -> Option<&str> {
+    let argument = source.trim().strip_prefix("require")?.trim_start().strip_prefix('(')?.trim_start();
+    let quote = argument.chars().next()?;
+    if !matches!(quote, '\'' | '"') { return None; }
+    let (module, rest) = argument[1..].split_once(quote)?;
+    rest.trim_start().starts_with(')').then_some(module)
 }
 
 fn flatten(text: &str) -> String {
@@ -1394,5 +1412,17 @@ return M
             }
             assert_eq!(DeclarationOverview::parse(path, saved).unwrap(), saved);
         }
+    }
+
+    #[test]
+    fn lua_top_level_literal_imports_survive_declaration_round_trip() {
+        let source = "local module = require('plugin.module')\nrequire(\"plugin.setup\")\nlocal label = \"require('fake')\"\n-- require('comment.only')\nfunction run()\n  require('runtime.only')\nend\n";
+        let overview = DeclarationOverview::extract("init.lua", source).unwrap();
+        assert!(overview.contains("require('plugin.module')"));
+        assert!(overview.contains("require(\"plugin.setup\")"));
+        assert!(!overview.contains("runtime.only"));
+        let formatted = DeclarationOverview::format_with_width("init.lua", &overview, 80).unwrap();
+        let index = crate::syntax::DeclarationIndex::extract("init.lua", &formatted).unwrap();
+        assert_eq!(index.import.iter().filter_map(|import| import.source.as_deref()).collect::<Vec<_>>(), ["plugin.module", "plugin.setup"]);
     }
 }

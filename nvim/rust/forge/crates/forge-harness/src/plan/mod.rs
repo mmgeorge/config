@@ -11,6 +11,7 @@ mod deviation;
 mod document;
 mod design;
 mod design_review;
+mod review_file_layout;
 pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest};
 mod edit;
 pub(crate) mod event;
@@ -1099,7 +1100,7 @@ mod test {
         assert!(rendered.markdown.contains("Modified Cargo.toml"));
         assert!(rendered.markdown.contains("engine = { version = \"1.3\""));
         assert!(rendered.markdown.contains("config/arena.toml"));
-        let (rows, targets) = design_review::project(&submitted, &Default::default(), &[], &Default::default(), None, &Default::default(), true).unwrap();
+        let (rows, targets) = design_review::project(&submitted, &Default::default(), &[], &Default::default(), None, &Default::default(), true, None).unwrap();
         let text = rows.iter().flat_map(|row| row.text.wire_rows()).collect::<Vec<_>>().join("\n");
         assert!(text.contains("Modified Cargo.toml"));
         assert!(text.contains("speed = 200"));
@@ -1147,7 +1148,7 @@ mod test {
         let (submitted, rendered, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
         assert!(rendered.markdown.contains("Modified package.json"));
         for public_only in [false, true] {
-            let (rows, targets) = design_review::project(&submitted, &Default::default(), &[], &Default::default(), None, &Default::default(), public_only).unwrap();
+            let (rows, targets) = design_review::project(&submitted, &Default::default(), &[], &Default::default(), None, &Default::default(), public_only, None).unwrap();
             let text = rows.iter().flat_map(|row| row.text.wire_rows()).collect::<Vec<_>>().join("\n");
             for (path, baseline, proposed, _) in configurations {
                 assert!(text.contains(path));

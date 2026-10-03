@@ -7,6 +7,7 @@ use std::path::Path;
 const SOURCE_CAPACITY: u64 = 8 * 1024 * 1024;
 
 pub(crate) struct PlanReviewSource {
+    pub trace: Option<ReviewTrace>,
     pub resolver: std::sync::Arc<tokio::sync::OnceCell<std::sync::Mutex<(crate::declaration::DeclarationResolver, crate::declaration::DeclarationResolver)>>>,
     pub resolver_sources: std::sync::Arc<tokio::sync::OnceCell<()>>,
     pub historical: bool,
@@ -20,6 +21,24 @@ pub(crate) struct PlanReviewSource {
     pub syntax: Option<forge_diff::syntax::SyntaxHandle>,
     pub declaration_syntax:
         std::collections::HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
+}
+
+pub(crate) struct ReviewTrace {
+    pub store: std::sync::Arc<crate::trace::TraceStore>,
+    pub session_id: String,
+}
+
+impl ReviewTrace {
+    pub fn record(&self, event: &str, elapsed: std::time::Duration, count: usize) {
+        self.store.record(
+            &self.session_id,
+            event,
+            serde_json::json!({
+                "elapsed_ms": elapsed.as_secs_f64() * 1000.0,
+                "count": count,
+            }),
+        );
+    }
 }
 
 impl PlanFileStore {
@@ -55,6 +74,7 @@ impl PlanFileStore {
             (saved, None)
         };
         Ok(PlanReviewSource {
+            trace: None,
             resolver: Default::default(),
             resolver_sources: Default::default(),
             public_only: true,
@@ -121,6 +141,7 @@ impl PlanFileStore {
             None
         };
         Ok(PlanReviewSource {
+            trace: None,
             resolver: Default::default(),
             resolver_sources: Default::default(),
             public_only: true,

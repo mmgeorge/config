@@ -11,6 +11,7 @@ use forge_buffer::markdown::MarkdownRenderer;
 use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 use std::collections::HashMap;
+use std::time::Instant;
 
 pub(crate) fn project(
     source: &PlanReviewSource,
@@ -20,7 +21,12 @@ pub(crate) fn project(
     focused: Option<&str>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     if source.document.design.is_some() {
-        return super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax,source.public_only);
+        let started = Instant::now();
+        let result = super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax,source.public_only,source.trace.as_ref());
+        if let Some(trace) = &source.trace {
+            trace.record("plan.review.projection", started.elapsed(), result.as_ref().map_or(0, |(block, _)| block.len()));
+        }
+        return result;
     }
     let rendered = MarkdownRenderer::source(
         BlockId("plan:markdown".into()),
