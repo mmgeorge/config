@@ -17,6 +17,24 @@ fn local(root: &Path, files: &[(&str, &str)]) -> (DeclarationDesign, Declaration
 }
 
 #[test]
+fn external_module_navigation_selects_the_module_file() {
+    let root = tempfile::tempdir().unwrap();
+    for (declaration, destination) in [
+        ("pub mod assets;\n", "assets.rs"),
+        ("pub mod assets;\n", "assets/mod.rs"),
+        ("#[path = \"asset_impl.rs\"]\npub mod assets;\n", "asset_impl.rs"),
+    ] {
+        let (_, mut resolver) = local(root.path(), &[("lib.rs", declaration), (destination, "pub struct Asset;\n")]);
+        let line = declaration.lines().count() as u32;
+        let result = resolver.at("lib.rs", line, 8);
+        assert!(matches!(result, DeclarationResolution::Resolved { destination: ref target }
+            if target.module_file && Path::new(&target.path).ends_with(destination) && target.line == 1), "{result:?}");
+    }
+    let (_, mut resolver) = local(root.path(), &[("lib.rs", "pub mod assets { pub struct Asset; }\n")]);
+    assert!(matches!(resolver.at("lib.rs", 1, 8), DeclarationResolution::Resolved { destination } if !destination.module_file));
+}
+
+#[test]
 fn rust_aliases_generics_and_source_positions_agree() {
     let root = tempfile::tempdir().unwrap();
     let (design, mut resolver) = local(

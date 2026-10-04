@@ -28,6 +28,9 @@ pub struct DeclarationDestination {
     pub column: u32,
     pub proposed: bool,
     pub name: String,
+    /// Select the external module's file rather than a declaration token within it.
+    #[serde(default)]
+    pub module_file: bool,
 }
 
 /// Evidence distinguishing invalid references from unavailable analysis.
@@ -748,6 +751,32 @@ impl DeclarationResolver {
                     && symbol.position.column <= column
                     && column < symbol.position.column + symbol.name.len() as u32
             }) {
+                if let Some(module) = file.index.module.iter().find(|module| {
+                    !module.inline && module.name == symbol.name && module.scope == symbol.scope
+                }) {
+                    if module.conditional {
+                        return unverified("module is conditionally compiled");
+                    }
+                    let mut scope = joined(&file.module, &module.scope);
+                    scope.push(module.name.clone());
+                    let destination = self
+                        .module
+                        .get(&(file.package.clone(), scope))
+                        .and_then(|path| self.file.get(path));
+                    return match destination {
+                        Some(destination) => DeclarationResolution::Resolved {
+                            destination: DeclarationDestination {
+                                path: destination.path.to_string_lossy().into_owned(),
+                                line: 1,
+                                column: 0,
+                                proposed: destination.proposed,
+                                name: module.name.clone(),
+                                module_file: true,
+                            },
+                        },
+                        None => unverified("module source is unavailable"),
+                    };
+                }
                 return resolved(&file, symbol);
             }
             if let Some(import) = file
@@ -1267,6 +1296,7 @@ fn resolved(file: &IndexedFile, symbol: &DeclarationSymbol) -> DeclarationResolu
             column: position.column,
             proposed: file.proposed,
             name: symbol.name.clone(),
+            module_file: false,
         },
     }
 }

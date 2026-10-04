@@ -439,6 +439,25 @@ impl PlanReviewDocument {
             DeclarationResolution::Intrinsic => return Ok(serde_json::json!({"message":"This is a language intrinsic with no source declaration."})),
             DeclarationResolution::Invalid { reason } | DeclarationResolution::Ambiguous { reason } | DeclarationResolution::Unverified { reason } => return Ok(serde_json::json!({"message":reason})),
         };
+        if destination.module_file {
+            let relative = std::path::Path::new(&destination.path).strip_prefix(&self.source.workspace).ok().map(|path| path.to_string_lossy().replace('\\', "/"));
+            if let Some(relative) = &relative {
+                for block in self.document.blocks(self.document.revision(), 0..self.document.block_count())? {
+                    if block.metadata.target.iter().any(|target| self.target.get(&target.id).is_some_and(|anchor| matches!(&anchor.target, super::PlanReviewTarget::File { path } if path == relative))) {
+                        return Ok(serde_json::json!({"jump":{"block":block.id,"position":{"row":0,"column":0}}}));
+                    }
+                }
+                let text = if side == "baseline" { design.baseline.get(relative).map(|file| &file.text) } else { design.proposed.get(relative) };
+                if destination.proposed || !std::path::Path::new(&destination.path).is_file() {
+                    if let Some(text) = text {
+                        let presentation = forge_diff::syntax::DeclarationOverview::present(relative, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                        let snapshot = BufferDocument::new(DocumentId(format!("plan:declaration:{}",uuid::Uuid::new_v4())), vec![forge_buffer::block::BufferBlock { id: forge_buffer::identity::BlockId("declarations".into()), text:forge_buffer::text::BufferText::from_rows(presentation.text.lines())?, metadata:Default::default() }])?.snapshot();
+                        return Ok(serde_json::json!({"declarations":snapshot,"filetype":forge_diff::syntax::DeclarationOverview::filetype(relative),"selection":{"row":0,"column":0}}));
+                    }
+                }
+            }
+            return Ok(serde_json::json!({"source":{"path":destination.path,"line":1,"column":0}}));
+        }
         if !destination.proposed && side != "baseline" {
             return Ok(serde_json::json!({"source": {"path":destination.path, "line":destination.line, "column":destination.column}}));
         }
@@ -996,6 +1015,43 @@ mod tests {
         assert!(result["declarations"].is_object(), "{result}");
         assert!(result["selection"]["row"].is_number());
         assert!(document.source.public_only);
+    }
+
+    #[test]
+    fn module_declaration_jump_selects_the_file_diff() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Module navigation");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Expose the assets module.".into();
+        design.document.description = "Keep asset declarations in their own module.".into();
+        design.proposed.insert("lib.rs".into(), "pub mod assets;\npub mod stable;\n".into());
+        design.proposed.insert("assets.rs".into(), "pub struct Asset;\n".into());
+        design.baseline.insert("stable.rs".into(), crate::plan::DeclarationFile { text: "pub struct Stable;\n".into(), source_digest: String::new() });
+        design.proposed.insert("stable.rs".into(), "pub struct Stable;\n".into());
+        std::fs::write(temporary.path().join("stable.rs"), "pub struct Stable;\n").unwrap();
+        canonical.design = Some(design.clone());
+        store.write_working_document("session", "plan", &canonical).unwrap();
+        let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let source = store.capture_review_source("session", "plan", 1, &digest).unwrap();
+        let captured_design = source.document.design.as_ref().unwrap();
+        source.resolver.set(Mutex::new((
+            crate::declaration::DeclarationResolver::local(temporary.path(), captured_design, false).unwrap(),
+            crate::declaration::DeclarationResolver::local(temporary.path(), captured_design, true).unwrap(),
+        ))).ok().unwrap();
+        let document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
+        let snapshot = document.snapshot();
+        let block = snapshot.block.iter().find(|block| block.text.row(0).is_some_and(|row| row.contains("pub mod assets"))).unwrap();
+        let row = block.text.row(0).unwrap();
+        let anchor = block.metadata.target.iter().find_map(|target| document.target.get(&target.id)).unwrap().clone();
+        let result = document.describe(anchor, "jump_entity", row, row.find("assets").unwrap()).unwrap();
+        let jump: forge_buffer::block::BlockAnchor = serde_json::from_value(result["jump"].clone()).unwrap();
+        assert!(document.document.block(&jump.block).unwrap().text.row(0).unwrap().contains("assets.rs"), "{result}");
+        let block = snapshot.block.iter().find(|block| block.text.row(0).is_some_and(|row| row.contains("pub mod stable"))).unwrap();
+        let row = block.text.row(0).unwrap();
+        let anchor = block.metadata.target.iter().find_map(|target| document.target.get(&target.id)).unwrap().clone();
+        let result = document.describe(anchor.clone(), "jump_entity", row, row.find("stable").unwrap()).unwrap();
+        assert!(result["source"]["path"].as_str().is_some_and(|path| path.ends_with("stable.rs")), "{result}, {anchor:?}, {row:?}");
     }
 
     #[test]

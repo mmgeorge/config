@@ -1940,6 +1940,10 @@ source components depth first. Strongly connected components bound cycles and ea
 appears once. Unresolved relationships fall back to directory and path order. Both saved and native
 reviews consume this order before generating hunks, while file and navigation identities follow
 stable source paths. Layout discovery never acquires dependencies or rereads the working tree.
+Declaration navigation on an external Rust `mod` name resolves its indexed child-module path,
+including `mod.rs` and explicit `#[path]` targets. It selects the file header when the module has
+a displayed diff, opens unchanged source files, and uses the captured declaration snapshot when
+the proposed file has no physical source. Inline module names retain declaration-token navigation.
 With Harness logging enabled, `plan.review.capture` records saved-source capture and rendering,
 `plan.review.syntax` records syntax preparation, `plan.review.file_order` records visible layout time
 and emitted file count, and `plan.review.projection` records declaration projection time and row count

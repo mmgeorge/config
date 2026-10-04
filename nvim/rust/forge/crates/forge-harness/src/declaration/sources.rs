@@ -22,12 +22,16 @@ pub(super) fn project(resolver: &mut DeclarationResolver) -> Result<()> {
                 ..Default::default()
             },
         );
-        let paths = resolver
+        let mut paths = resolver
             .snapshot
             .keys()
             .filter(|path| path.ends_with(".rs"))
             .cloned()
             .collect::<Vec<_>>();
+        paths.sort_by_key(|path| {
+            let entry = matches!(Path::new(path).file_stem().and_then(|stem| stem.to_str()), Some("lib" | "main"));
+            (!entry, path.clone())
+        });
         for path in paths {
             let stem = Path::new(&path)
                 .file_stem()
