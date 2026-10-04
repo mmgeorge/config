@@ -19,9 +19,18 @@ and `cargo test` do not replace building the executable Neovim launches.
 
 Use `require("forge.builder").build_command()` to resolve the manual Cargo command
 and `require("forge.builder").binary_path()` to identify the runtime artifact.
-The default profile is `release` for development, runtime verification, and profiling.
+Use the release configuration for development, tests, runtime verification, and
+profiling. Run Cargo tests with `--release --locked` and the same target directory
+as the release executable. Keep the toolchain, inherited Cargo configuration,
+compiler flags, and profile settings consistent across these commands so shared
+artifacts remain reusable. Do not introduce a separate development profile or
+switch to debug builds unless the user explicitly requests it.
+This prevents separate debug and release dependency builds, duplicated
+compilation work, and cache churn from inconsistent build settings. Test
+executables remain distinct artifacts, but tests must reuse the release
+configuration rather than create a second profile's dependency artifacts.
 Set `vim.g.forge_build_profile` before Forge loads only when explicitly testing a
-different profile. Cargo output belongs under
+user-requested different profile. Cargo output belongs under
 `stdpath("cache")/rust-sidecar/forge/build`, not the crate's default `target`
 directory. Pass `--bin forge --locked` and the selected profile. Invoke Cargo
 with `nvim/rust/forge` as its working directory so Cargo selects that directory's
@@ -36,6 +45,11 @@ same inherited Cargo configuration used for that artifact directory. Verify the
 rebuilt executable in a fresh test host and report the command, timeout, exit
 status, and artifact path. Existing hosts retain their process-owned executable
 copy until shutdown, so they do not adopt a rebuild automatically.
+
+Let release builds finish without a fixed elapsed-time cutoff. Poll running
+builds and provide progress updates without terminating them solely because they
+exceed a command timeout. Keep bounded timeouts for test execution and other
+commands.
 
 Forge startup must never compile, scan compiler inputs, compare source freshness,
 compute executable fingerprints, or maintain build receipts. It launches the
