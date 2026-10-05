@@ -101,7 +101,7 @@ Original request:
     /// Build a semantic revision request from reviewed plan state.
     pub fn revision(
         document_json: &str,
-        annotation_json: &str,
+        review_feedback: &str,
         overall_comment: Option<&str>,
     ) -> String {
         let comment = overall_comment
@@ -120,8 +120,8 @@ Current declaration design:
 {document_json}
 ```
 
-Semantic annotations:
-{annotation_json}"#
+Review comments:
+{review_feedback}"#
         )
     }
 
@@ -239,17 +239,17 @@ mod test {
     }
 
     #[test]
-    fn revision_sends_canonical_json_and_semantic_annotations_without_markdown() {
+    fn revision_sends_canonical_json_and_contextual_review_comments() {
         let prompt = PlanPrompt::revision(
             r#"{"plan_id":"plan","entity_changes":[]}"#,
-            r#"[{"json_path":"/entity_changes/0","label":"PlanDocument","target":{"target_type":"entity","name":"PlanDocument"}}]"#,
+            "src/controls.rs\n```text\n8  -   direction: Vec2,\n8  +   velocity: Vec2,\n```\n\n8: Why replace direction with velocity?",
             Some("Tighten ownership"),
         );
 
         assert!(prompt.contains(r#""plan_id":"plan""#));
-        assert!(prompt.contains("Semantic annotations"));
-        assert!(prompt.contains("PlanDocument"));
-        assert!(prompt.contains("baseline/proposed side"));
+        assert!(prompt.contains("Review comments"));
+        assert!(prompt.contains("8: Why replace direction with velocity?"));
+        assert!(!prompt.contains("Semantic annotations"));
         assert!(prompt.contains("harness_design_apply_patch"));
         assert!(!prompt.contains("Current rendered plan"));
     }

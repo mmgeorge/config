@@ -2574,6 +2574,16 @@ submission is queued and return focus to Harness. The document owner retains the
 captured comments until the response arrives. Success releases the owner. Failure
 reopens the retained review without discarding unsaved feedback.
 
+Revision requests retain structured comment anchors in the lifecycle record. The
+planning prompt presents those comments beside file excerpts from the saved
+baseline and proposal. Excerpts include three diff rows before and after each
+selected row and merge overlapping context within a file. Each row has one line
+number, with `-` for baseline removals and `+` for proposed additions. Unchanged
+rows use proposed line numbers. Comments follow as `8: body` or `8–12: body`.
+Section and file comments retain their bodies without inventing source lines.
+Feedback formatting completes before the broker changes the plan state, so an
+invalid saved anchor cannot leave a revision request without its comments.
+
 Submitted declaration plans retain a file delta between consecutive proposed
 snapshots. The first submission compares source declarations with the proposal.
 The transcript renders these deltas through the shared change tree, independently

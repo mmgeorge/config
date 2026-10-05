@@ -240,8 +240,11 @@ context, or version and retry. Never bypass validation with ordinary filesystem 
 
 ## Review revisions and boundaries
 
-Resolve feedback against its revision, file, baseline/proposed side, saved text line and byte column, and selected declaration.
-Comment labels quote the formatted declaration, while target coordinates refer to saved text.
+Review feedback shows file excerpts with one line number per row. `-` marks removed baseline text,
+`+` marks proposed additions, and unmarked rows provide context. Removed rows use baseline line
+numbers. Other rows use proposed line numbers. Comments follow each excerpt as `8: comment` or
+`8–12: comment`. Replacements can share a line number. These excerpts are review context, not patch
+input. Resolve each comment against the saved design and preserve its intended context.
 Read current proposed files before revising them. Preserve useful decisions and submit the new version.
 
 Other configuration formats, project documentation, implementation bodies, dependency graphs,

@@ -5034,6 +5034,12 @@ Planning continuation: turn {} of {}.",
                 .is_none_or(|comment| comment.len() <= 65536),
             "overall plan review comment exceeds 64 KiB"
         );
+        let document_json = document.model_json()?;
+        let instruction = PlanPrompt::revision(
+            &document_json,
+            &crate::plan::render_review_feedback(&document, &annotation)?,
+            overall_comment.as_deref(),
+        );
         plan.acceptance = None;
         PlanStateMachine::apply(&mut plan, PlanEvent::ChangesRequested, self.clock.now_ms())?;
         plan.generation.reset();
@@ -5057,12 +5063,6 @@ Planning continuation: turn {} of {}.",
             created_at_ms: self.clock.now_ms(),
         };
         self.store.save_plan_lifecycle(&lifecycle)?;
-        let document_json = document.model_json()?;
-        let instruction = PlanPrompt::revision(
-            &document_json,
-            &serde_json::to_string_pretty(&annotation)?,
-            overall_comment.as_deref(),
-        );
         let leading_event = self.event(
             "plan_changes_requested",
             json!({ "plan": &plan, "lifecycle": &lifecycle }),
