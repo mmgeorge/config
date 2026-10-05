@@ -22,7 +22,7 @@ local owner
   }, function(value, error_message) assert(not error_message, error_message) owner = value end)
   local source = {}
   for row = 1, 105 do
-    source[row] = { id = "source:" .. row, text = "Source row " .. row, source_line = row,
+    source[row] = { id = "source:" .. row, target = "source:" .. row, text = "Source row " .. row, source_line = row,
       block = "plan:source", position = { row = row - 1, column = 0 }, metadata = {} }
   end
   local text = {}

@@ -121,8 +121,7 @@ local function toggle_task_fold(review)
   end
 end
 
-local function close_review(review)
-  if not review.owner.close() then notice("Plan review has an explicit operation in progress") return false end
+local function hide_review(review)
   if vim.api.nvim_tabpage_is_valid(review.tab) and review.tab ~= review.return_tab and vim.fn.tabpagenr("$") > 1 then
     vim.api.nvim_set_current_tabpage(review.tab)
     vim.cmd("tabclose")
@@ -131,6 +130,11 @@ local function close_review(review)
     vim.api.nvim_set_current_tabpage(review.return_tab)
     if vim.api.nvim_win_is_valid(review.return_win) then vim.api.nvim_set_current_win(review.return_win) end
   end
+end
+
+local function close_review(review)
+  if not review.owner.close() then notice("Plan review has an explicit operation in progress") return false end
+  hide_review(review)
   if session.harness.plan_review == review and not vim.bo[review.buf].modified then session.harness.plan_review = nil end
   return true
 end
@@ -261,13 +265,13 @@ local function submit(review, method, params)
   session.harness.busy = true
   local controller = require("forge.views.harness.controller")
   controller.refresh_winbar()
-  review.owner.submit(method, params, function(result, failure)
+  local queued = review.owner.submit(method, params, function(result, failure)
     session.harness.busy = false
     controller.refresh_winbar()
     if failure then
       notice(failure)
-      if review.owner.closed and not session.harness.plan_review
-        and session.harness.session and session.harness.session.id == review.session_id then M.open(review.plan) end
+      if session.harness.session and session.harness.session.id == review.session_id
+        and (not session.harness.plan_review or session.harness.plan_review == review) then M.open(review.plan) end
       return
     end
     local current = session.harness.plan_review
@@ -279,6 +283,7 @@ local function submit(review, method, params)
     controller.render()
     if method == "plan.acceptance.begin" then vim.schedule(function() controller.present_plan_question(true) end) end
   end)
+  if queued and (review.owner.submission_pending or review.owner.pending_operation) then hide_review(review) end
 end
 
 local function commands(review)

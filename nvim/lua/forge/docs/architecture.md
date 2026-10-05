@@ -2549,6 +2549,18 @@ and PR comments share this engine. Source extmarks preserve navigation identitie
 through local row changes. `forge/draft_source.lua` maps generated source coordinates
 to physical rows for syntax, folds, navigation, and selections. The native snapshot
 installs diff gutters once. The plan comment projection must not reinstall them.
+The plan adapter captures native fold preferences before local comment rendering
+and restores them after source rows move. Expanding or collapsing a comment must
+preserve folds opened by navigation as well as folds changed through Tab.
+Only rows with plan comment targets anchor annotations. Each source identity
+receives one comment editor even when several projected rows share its line
+number, preventing an empty duplicate editor from overwriting the draft body.
+Plan comment bodies attach the shared native editable-region guard. Local
+presentation runs with that guard suspended and reanchors the body ranges after
+rendering. Counted deletions, joins, and other edits crossing a header, footer, or
+source boundary restore the accepted buffer and preserve draft bytes. Plan windows
+use the native number column rather than inheriting the transcript's sign-only
+status column when a dirty buffer is reopened.
 
 Document adapters serialize explicit operations and retain the latest queued
 explicit capture. They must dispatch that retained value without recapturing newer
@@ -2556,6 +2568,11 @@ unsaved typing. Save completion updates accepted baselines without overwriting d
 text. Dirty close hides and retains the buffer. Conflicts preserve the draft for
 explicit recovery. Remote operations retain the host's durable mutation queue and
 uncertain-outcome recovery rather than replaying publication automatically.
+
+Plan acceptance and revision requests hide the review tab as soon as the explicit
+submission is queued and return focus to Harness. The document owner retains the
+captured comments until the response arrives. Success releases the owner. Failure
+reopens the retained review without discarding unsaved feedback.
 
 ## 19. Physical buffer replica
 

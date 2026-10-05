@@ -108,14 +108,15 @@ function M.attach(options, callback)
     end
   end
   function owner.submit(method, params, receive)
-    if not owner.attached() then receive(nil, "Plan review is not ready") return end
+    if not owner.attached() then receive(nil, "Plan review is not ready") return false end
     local capture = comments.capture(options.buffer)
     local view = owner.current_view()
     local captured, failure = input.capture(owner.replica, view, method)
-    if not captured then receive(nil, failure) return end
+    if not captured then receive(nil, failure) return false end
     params = vim.deepcopy(params or {})
     params.review, params.draft_annotation, params.draft_source_digest = captured, capture, owner.saved_source_digest
     enqueue_operation({ method = method, params = params, capture = capture, receive = receive })
+    return true
   end
   local function save(capture)
     if not owner.attached() then return end
@@ -137,8 +138,12 @@ function M.attach(options, callback)
     local source = assert(opened.source_row, "Plan review source rows are missing")
     owner.source = source
     local source_lines = {}
-    for _, row in ipairs(source) do source_lines[#source_lines + 1] = row.text end
+    for _, row in ipairs(source) do
+      source_lines[#source_lines + 1] = row.text
+      row.annotation_anchor = row.target ~= nil and row.target ~= vim.NIL
+    end
     local namespace = vim.api.nvim_create_namespace("ForgePlanDraftSource" .. options.buffer)
+    local retained_folds, projection_attached
     local function paint(_, _, projection)
       owner.source_generation = (owner.source_generation or 0) + 1
       vim.api.nvim_buf_clear_namespace(options.buffer, namespace, 0, -1)
@@ -159,20 +164,26 @@ function M.attach(options, callback)
         end
       end
       if owner.comment_state and options.configure_view then options.configure_view(owner.view, owner) end
+      if retained_folds then require("forge.folds").restore(owner.replica, retained_folds) retained_folds = nil end
     end
     owner.replica.physical_row = nil
     owner.comment_state = comments.attach(options.buffer, options.window, source_lines, annotation, {
       source_provider = function() return source end, after_render = paint,
+      before_render = function()
+        if projection_attached then retained_folds = require("forge.folds").capture(owner.replica) end
+      end,
       baseline = recovered and baseline or nil,
       readonly = options.plan.historical_revision ~= nil,
+      guard_source = true,
     })
     require("forge.draft_source").attach(owner.replica, owner.comment_state, source)
+    projection_attached = true
   end
   owner.replica = buffer.open(owner.document, { buffer = options.buffer, generated = true, preserve_view = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice })
   local function open_view(window)
     local columns = require("forge.window_presentation").capture(window)
-    columns.number, columns.relativenumber, columns.statuscolumn = true, false, vim.go.statuscolumn
+    columns.number, columns.relativenumber, columns.statuscolumn = true, false, ""
     local view = input.open(owner.replica, window, { columns = columns, virtualedit = "", conceal = { level = 3, cursor = "" },
       wrapping = { indent = columns.breakindent, options = columns.breakindentopt } })
     owner.views[window] = view

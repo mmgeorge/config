@@ -22,7 +22,7 @@ local ok, failure = xpcall(function()
   }, function(value, error_message) assert(not error_message, error_message) owner = value end)
   local source = {}
   for row = 1, 105 do
-    source[row] = { id = "source:" .. row, text = "Source row " .. row, source_line = row,
+    source[row] = { id = "source:" .. row, target = "source:" .. row, text = "Source row " .. row, source_line = row,
       block = "plan:source", position = { row = row - 1, column = 0 }, metadata = {} }
   end
   local text = {}
@@ -88,8 +88,10 @@ local ok, failure = xpcall(function()
   assert(comments.capture(native_buffer)[1].source.body == "typing after submit")
   assert(owner.close() and not owner.closed, "closing collected an unsaved annotation")
   local alternate = vim.api.nvim_create_buf(false, true)
+  vim.wo.statuscolumn = "%s"
   vim.api.nvim_win_set_buf(0, alternate)
   vim.api.nvim_win_set_buf(0, native_buffer)
+  assert(vim.wo.number and vim.wo.statuscolumn == "", "reopening the draft inherited a status column without line numbers")
   assert(comments.capture(native_buffer)[1].source.body == "typing after submit", "hide and reopen lost the draft")
   owner.submit("plan.request_changes", { comment = "reentrant completion" }, function(result, error_message)
     assert(result and not error_message, error_message)
