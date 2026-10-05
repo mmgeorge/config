@@ -11,7 +11,7 @@ end
 local task_model = require("forge.views.plan_review.task_model")
 local entity_info = require("forge.views.plan_review.entity_info")
 local entity_navigation = require("forge.views.plan_review.entity_navigation")
-local comment_view = require("forge.views.plan_review.comment")
+local comment_view = require("forge.draft_comments")
 
 vim.o.columns = math.max(vim.o.columns, 160)
 

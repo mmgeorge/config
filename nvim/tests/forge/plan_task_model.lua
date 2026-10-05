@@ -41,7 +41,7 @@ end
 local fixture_dir = vim.fn.tempname()
 local ok, failure = pcall(function()
   require("forge").setup({ harness = { backend = "mock" } })
-  local comment_view = require("forge.views.plan_review.comment")
+  local comment_view = require("forge.draft_comments")
   local plan_fold = require("forge.views.plan_review.fold")
   local task_model = require("forge.views.plan_review.task_model")
   local task_tree = require("forge.render.task_tree")

@@ -56,17 +56,20 @@ end
 vim.api.nvim_set_decoration_provider(namespace, {
   on_win = function(_, _, buffer)
     local session = sessions[buffer]
-    return session and session.status == "Applied" and not session.applying and not session.editable.suspended or false
+    if session and session.prepare_source then session.prepare_source() end
+    return session and session.status == "Applied" and not session.applying or false
   end,
   on_line = function(_, window, buffer, row)
     local session = sessions[buffer]
-    if not session or session.status ~= "Applied" or session.applying or session.editable.suspended then return end
+    if not session or session.status ~= "Applied" or session.applying then return end
     if session.draw_header and session.draw_header(row, namespace) then return end
-    local node = session.sequence:locate(row)
+    local location = session.decoration_location and session.decoration_location(row)
+      or not session.decoration_location and require("forge.buffer").locate(session, row, 0)
+    local node = location and session.sequence.node[location.block]
     if not node then return end
-    local _, start = session.sequence:position(node.id)
-    emit(node.entry.visible_decoration, buffer, row, row - start)
-    local source_overlay = node.entry.source_overlay_row[row - start]
+    local relative = location.position.row
+    emit(node.entry.visible_decoration, buffer, row, relative)
+    local source_overlay = node.entry.source_overlay_row[relative]
     if source_overlay or node.entry.source_highlight then
       local mode = vim.api.nvim_get_mode().mode:sub(1, 1):lower()
       if mode == "\22" then mode = "v" end
@@ -78,7 +81,7 @@ vim.api.nvim_set_decoration_provider(namespace, {
       end
       local reveal = vim.wo[window].conceallevel == 0
         or (selected and not vim.wo[window].concealcursor:find(mode, 1, true))
-      if not reveal then emit(node.entry.source_highlight, buffer, row, row - start) end
+      if not reveal then emit(node.entry.source_highlight, buffer, row, relative) end
       for _, overlay in ipairs(source_overlay or {}) do
         local right_aligned = overlay.capture == "ForgeRightAlignedOwner"
         if not reveal or right_aligned then

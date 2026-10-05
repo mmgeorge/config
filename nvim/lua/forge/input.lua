@@ -110,7 +110,7 @@ function M.capture(session, view, action)
   then
     return nil, "input view is no longer current"
   end
-  if editable.suspend_generated_text(session.editable) then return nil, "local edits require acknowledgement" end
+  if session.editable.fault then return nil, session.editable.fault end
   assert(type(action) == "string" and #action > 0 and #action <= 256 and not action:find("%c"), "invalid input action")
   assert(view.sequence < MAX_COUNTER, "input sequence exhausted")
   local cursor = vim.api.nvim_win_get_cursor(view.window)
@@ -118,6 +118,7 @@ function M.capture(session, view, action)
   if not location then return nil, "input has no document block" end
   view.sequence = view.sequence + 1
   view.cursor = cursor
+  view.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
   view.effect = {}
   return { document = session.document, revision = session.revision, view = view.id, sequence = view.sequence,
     action = action, block = location.block, position = location.position, target = location.target }

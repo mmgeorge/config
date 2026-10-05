@@ -38,6 +38,10 @@ pub enum ReviewCommentCommand {
         comment: CommentId,
         action: CommentSaveAction,
     },
+    SaveDraft {
+        region: RegionId,
+        action: CommentSaveAction,
+    },
     Reconcile {
         comment: CommentId,
     },
@@ -66,6 +70,8 @@ pub struct ReviewCommentSnapshot {
     pub saving: bool,
     pub deleted: bool,
     pub viewer_did_author: bool,
+    pub anchor: Option<CommentAnchor>,
+    pub reply_to: Option<CommentId>,
 }
 
 pub(crate) enum PreparedComment {
@@ -316,6 +322,8 @@ impl ReviewDocument {
                     .is_some_and(|save| save.comment() == comment),
             deleted: record.deleted,
             viewer_did_author: record.viewer_did_author,
+            anchor: record.anchor.clone(),
+            reply_to: record.reply_to,
         })
     }
 
@@ -323,6 +331,13 @@ impl ReviewDocument {
         &mut self,
         command: ReviewCommentCommand,
     ) -> Result<PreparedComment> {
+        let command = match command {
+            ReviewCommentCommand::SaveDraft { region, action } => ReviewCommentCommand::Save {
+                comment: self.comments.identity_for_region(&region)?,
+                action,
+            },
+            command => command,
+        };
         if let ReviewCommentCommand::Snapshot { comment } = command {
             return Ok(PreparedComment::Snapshot(self.comment_snapshot(comment)?));
         }
@@ -582,7 +597,9 @@ impl ReviewDocument {
                     },
                 })
             }
-            ReviewCommentCommand::Snapshot { .. } => unreachable!(),
+            ReviewCommentCommand::Snapshot { .. } | ReviewCommentCommand::SaveDraft { .. } => {
+                unreachable!()
+            }
         }
     }
 

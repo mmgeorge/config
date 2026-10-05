@@ -4,38 +4,51 @@ local comment_box = require("forge.render.comment_box")
 local comment_editor = require("forge.render.comment_editor")
 local notifications = require("forge.infra.notifications")
 
-local namespace = vim.api.nvim_create_namespace("ForgePlanReviewComment")
+local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 
----@class ForgePlanAnnotation
----@field id integer
+---@class ForgeDraftComment
+---@field id integer|string
 ---@field source_line integer
 ---@field end_source_line integer
 ---@field body string
 ---@field focused boolean?
+---@field new boolean?
+---@field readonly boolean?
 
----@class ForgePlanCommentRange
----@field annotation ForgePlanAnnotation
+---@class ForgeDraftCommentCapture
+---@field id string
+---@field source {start_line: integer, end_line: integer, body: string}
+
+---@class ForgeDraftCommentRange
+---@field annotation ForgeDraftComment
 ---@field compact boolean
 ---@field first_row integer
 ---@field last_row integer
 ---@field header_mark integer?
 ---@field footer_mark integer?
 
----@class ForgePlanCommentState
+---@class ForgeDraftCommentState
 ---@field buf integer
 ---@field win integer
 ---@field source_lines string[]
----@field source_provider? fun(width: integer): ForgePlanSourceRow[]
----@field annotation_list ForgePlanAnnotation[]
+---@field source_provider? fun(width: integer): ForgeDraftSourceRow[]
+---@field annotation_list ForgeDraftComment[]
 ---@field source_mark { mark: integer, source_line: integer }[]
----@field range_list ForgePlanCommentRange[]
+---@field range_list ForgeDraftCommentRange[]
 ---@field group integer
 ---@field next_id integer
 ---@field rendering boolean
+---@field generation integer?
+---@field namespace integer
+---@field readonly boolean
+---@field heading string
+---@field source_label fun(annotation: ForgeDraftComment): string
+---@field editable_source? fun(row: integer): boolean
+---@field baseline ForgeDraftCommentCapture[]
 ---@field before_render? fun(buf: integer, win: integer?)
----@field after_render? fun(buf: integer, win: integer?, projection: ForgePlanCommentProjection)
+---@field after_render? fun(buf: integer, win: integer?, projection: ForgeDraftCommentProjection)
 
----@class ForgePlanSourceRow
+---@class ForgeDraftSourceRow
 ---@field id string
 ---@field text string
 ---@field source_line integer
@@ -44,15 +57,19 @@ local namespace = vim.api.nvim_create_namespace("ForgePlanReviewComment")
 ---@field default_folded? boolean
 ---@field ancestor_ids? string[]
 
----@class ForgePlanCommentOptions
----@field source_provider? fun(width: integer): ForgePlanSourceRow[]
+---@class ForgeDraftCommentOptions
+---@field readonly? boolean
+---@field heading? string
+---@field source_label? fun(annotation: ForgeDraftComment): string
+---@field editable_source? fun(row: integer): boolean
+---@field source_provider? fun(width: integer): ForgeDraftSourceRow[]
 ---@field before_render? fun(buf: integer, win: integer?)
----@field after_render? fun(buf: integer, win: integer?, projection: ForgePlanCommentProjection)
+---@field after_render? fun(buf: integer, win: integer?, projection: ForgeDraftCommentProjection)
 
----@type table<integer, ForgePlanCommentState>
+---@type table<integer, ForgeDraftCommentState>
 local state_by_buf = {}
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 ---@return integer?
 local function displayed_window(state)
   if state.win > 0 and vim.api.nvim_win_is_valid(state.win) and vim.api.nvim_win_get_buf(state.win) == state.buf then
@@ -66,13 +83,13 @@ local function displayed_window(state)
   return nil
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 ---@param modifiable boolean
 local function set_modifiable(state, modifiable)
   if vim.api.nvim_buf_is_valid(state.buf) then vim.bo[state.buf].modifiable = modifiable end
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 ---@param mark integer?
 ---@return integer?
 local function mark_row(state, mark)
@@ -81,48 +98,44 @@ local function mark_row(state, mark)
   return #position > 0 and position[1] or nil
 end
 
----@param state ForgePlanCommentState
----@param range ForgePlanCommentRange
+---@param state ForgeDraftCommentState
+---@param range ForgeDraftCommentRange
 ---@return integer?, integer?
 local function full_range_rows(state, range)
   return mark_row(state, range.header_mark), mark_row(state, range.footer_mark)
 end
 
----@param state ForgePlanCommentState
----@param range ForgePlanCommentRange
+---@param state ForgeDraftCommentState
+---@param range ForgeDraftCommentRange
 local function sync_range_body(state, range)
   if range.compact then return end
   local header_row, footer_row = full_range_rows(state, range)
   if not header_row or not footer_row or footer_row <= header_row then return end
   local body_lines = vim.api.nvim_buf_get_lines(state.buf, header_row + 1, footer_row, false)
-  range.annotation.body = comment_editor.normalize_body_text(table.concat(body_lines, "\n"))
+  range.annotation.body = table.concat(body_lines, "\n")
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 local function sync_focused_body(state)
   for _, range in ipairs(state.range_list) do
     if range.annotation.focused then sync_range_body(state, range) end
   end
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 ---@param row integer
----@return ForgePlanAnnotation?, ForgePlanCommentRange?
+---@return ForgeDraftComment?, ForgeDraftCommentRange?
 local function annotation_at_row(state, row)
   for _, range in ipairs(state.range_list) do
-    if range.compact then
-      if row >= range.first_row and row <= range.last_row then return range.annotation, range end
-    else
-      local header_row, footer_row = full_range_rows(state, range)
-      if header_row and footer_row and row >= header_row and row <= footer_row then
-        return range.annotation, range
-      end
+    local header_row, footer_row = full_range_rows(state, range)
+    if header_row and footer_row and row >= header_row and row <= footer_row then
+      return range.annotation, range
     end
   end
   return nil, nil
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 ---@param row integer
 ---@return integer?
 local function source_line_at_row(state, row)
@@ -132,7 +145,7 @@ local function source_line_at_row(state, row)
   return nil
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 ---@param first_row integer
 ---@param last_row integer
 ---@return integer?, integer?
@@ -149,7 +162,7 @@ local function source_range_at_rows(state, first_row, last_row)
   return start_source_line, end_source_line
 end
 
----@param annotation ForgePlanAnnotation
+---@param annotation ForgeDraftComment
 ---@return string
 local function annotation_line_label(annotation)
   if annotation.source_line == annotation.end_source_line then
@@ -178,9 +191,9 @@ local function flatten_segmented_line(segmented_line)
   return text, highlight_list
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 ---@param annotation_id integer
----@return ForgePlanAnnotation?
+---@return ForgeDraftComment?
 local function find_annotation(state, annotation_id)
   for _, annotation in ipairs(state.annotation_list) do
     if annotation.id == annotation_id then return annotation end
@@ -188,8 +201,8 @@ local function find_annotation(state, annotation_id)
   return nil
 end
 
----@param state ForgePlanCommentState
----@param annotation ForgePlanAnnotation
+---@param state ForgeDraftCommentState
+---@param annotation ForgeDraftComment
 local function remove_annotation(state, annotation)
   for index, candidate in ipairs(state.annotation_list) do
     if candidate == annotation then
@@ -199,22 +212,22 @@ local function remove_annotation(state, annotation)
   end
 end
 
----@class ForgePlanCommentRenderTarget
+---@class ForgeDraftCommentRenderTarget
 ---@field annotation_id integer?
 ---@field source_line integer?
 
----@class ForgePlanCommentProjection
+---@class ForgeDraftCommentProjection
 ---@field line_list string[]
 ---@field source_row_by_line table<integer, integer>
----@field range_list ForgePlanCommentRange[]
+---@field range_list ForgeDraftCommentRange[]
 ---@field compact_highlight_list { row: integer, start_col: integer, end_col: integer, hl: string }[]
 ---@field source_highlight_list { row: integer, start_col: integer, end_col: integer, hl: string }[]
 ---@field source_record_list { row: integer, source_line: integer }[]
 ---@field line_meta_list table[]
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 ---@param width integer
----@return ForgePlanCommentProjection
+---@return ForgeDraftCommentProjection
 local function build_projection(state, width)
   local projection = {
     line_list = {},
@@ -227,26 +240,28 @@ local function build_projection(state, width)
   }
   local annotation_by_source = {}
   local source_count = math.max(1, #state.source_lines)
+  local source_row_list = {}
+  if state.source_provider then
+    source_row_list = state.source_provider(width) or {}
+    for _, source_row in ipairs(source_row_list) do
+      source_count = math.max(source_count, tonumber(source_row.source_line) or 1)
+    end
+  else
+    for source_line = 1, source_count do
+      source_row_list[#source_row_list + 1] = {
+        id = ("source:%d"):format(source_line),
+        text = state.source_lines[source_line] or "",
+        source_line = source_line,
+        ancestor_ids = {},
+      }
+    end
+  end
   for _, annotation in ipairs(state.annotation_list) do
     annotation.source_line = math.max(1, math.min(tonumber(annotation.source_line) or 1, source_count))
     annotation.end_source_line =
       math.max(annotation.source_line, math.min(tonumber(annotation.end_source_line) or annotation.source_line, source_count))
     annotation_by_source[annotation.end_source_line] = annotation_by_source[annotation.end_source_line] or {}
     table.insert(annotation_by_source[annotation.end_source_line], annotation)
-  end
-
-  local source_row_list = {}
-  if state.source_provider then
-    source_row_list = state.source_provider(width) or {}
-  else
-    for source_line = 1, source_count do
-      source_row_list[#source_row_list + 1] = {
-        id = ("plan:source:%d"):format(source_line),
-        text = state.source_lines[source_line] or "",
-        source_line = source_line,
-        ancestor_ids = {},
-      }
-    end
   end
 
   for source_index, source_row in ipairs(source_row_list) do
@@ -258,6 +273,7 @@ local function build_projection(state, width)
     projection.source_record_list[#projection.source_record_list + 1] = {
       row = row,
       source_line = source_line,
+      source_index = source_index,
     }
     local text_offset = 0
     for _, segment in ipairs(source_row.segments or {}) do
@@ -280,14 +296,14 @@ local function build_projection(state, width)
       local first_row = #projection.line_list
       if annotation.focused then
         projection.line_list[#projection.line_list + 1] = comment_editor.rule_line(
-          " Plan comment ",
-          " " .. annotation_line_label(annotation) .. " ",
+          " " .. state.heading .. " ",
+          " " .. state.source_label(annotation) .. " ",
           width
         )
         projection.line_meta_list[#projection.line_list] = {
           ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}),
         }
-        for _, body_line in ipairs(comment_editor.body_lines(annotation.body)) do
+        for _, body_line in ipairs(vim.split(annotation.body, "\n", { plain = true })) do
           projection.line_list[#projection.line_list + 1] = body_line
           projection.line_meta_list[#projection.line_list] = {
             ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}),
@@ -301,9 +317,9 @@ local function build_projection(state, width)
         local descriptor = {
           id = annotation.id,
           anchor = { line = source_line },
-          heading = " Plan comment • " .. annotation_line_label(annotation) .. " ",
-          body_lines = comment_editor.body_lines(annotation.body),
-          readonly = false,
+          heading = " " .. state.heading .. " • " .. state.source_label(annotation) .. " ",
+          body_lines = vim.split(annotation.body, "\n", { plain = true }),
+          readonly = annotation.readonly == true,
         }
         for _, segmented_line in ipairs(comment_box.build_box_lines(descriptor, width + 1)) do
           local text, highlight_list = flatten_segmented_line(segmented_line)
@@ -334,15 +350,25 @@ local function build_projection(state, width)
   return projection
 end
 
----@param state ForgePlanCommentState
----@param projection ForgePlanCommentProjection
+---@param state ForgeDraftCommentState
+---@param projection ForgeDraftCommentProjection
 local function apply_projection(state, projection)
-  vim.api.nvim_buf_set_lines(state.buf, 0, -1, false, projection.line_list)
+  local previous = vim.api.nvim_buf_get_lines(state.buf, 0, -1, false)
+  local change_list = vim.diff(table.concat(previous, "\n") .. "\n",
+    table.concat(projection.line_list, "\n") .. "\n", { result_type = "indices", algorithm = "histogram" })
+  for index = #change_list, 1, -1 do
+    local change = change_list[index]
+    local start = change[2] == 0 and change[1] or change[1] - 1
+    local replacement = {}
+    for row = change[3], change[3] + change[4] - 1 do replacement[#replacement + 1] = projection.line_list[row] end
+    vim.api.nvim_buf_set_lines(state.buf, start, start + change[2], false, replacement)
+  end
   state.source_mark = {}
   state.range_list = projection.range_list
   for _, record in ipairs(projection.source_record_list) do
     state.source_mark[#state.source_mark + 1] = {
       source_line = record.source_line,
+      source_index = record.source_index,
       mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, record.row, 0, {
         right_gravity = false,
       }),
@@ -361,6 +387,8 @@ local function apply_projection(state, projection)
     })
   end
   for _, range in ipairs(projection.range_list) do
+    range.header_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.first_row, 0, { right_gravity = false })
+    range.footer_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.last_row, 0, { right_gravity = true })
     if not range.compact then
       range.header_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.first_row, 0, {
         right_gravity = false,
@@ -377,12 +405,18 @@ local function apply_projection(state, projection)
       end
     end
   end
-  vim.bo[state.buf].modified = false
+  local captured = {}
+  for _, annotation in ipairs(state.annotation_list) do
+    captured[#captured + 1] = { id = tostring(annotation.id), source = {
+      start_line = annotation.source_line, end_line = annotation.end_source_line, body = annotation.body } }
+  end
+  vim.bo[state.buf].modified = not vim.deep_equal(captured, state.baseline)
+  state.generation = (state.generation or 0) + 1
 end
 
----@param state ForgePlanCommentState
----@param projection ForgePlanCommentProjection
----@param target ForgePlanCommentRenderTarget?
+---@param state ForgeDraftCommentState
+---@param projection ForgeDraftCommentProjection
+---@param target ForgeDraftCommentRenderTarget?
 ---@return integer?
 local function target_row(state, projection, target)
   if target and target.annotation_id then
@@ -398,7 +432,7 @@ local function target_row(state, projection, target)
   return target and target.source_line and projection.source_row_by_line[target.source_line] or nil
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 ---@param win integer?
 local function sync_cursor_modifiable(state, win)
   local cursor_row = win and vim.api.nvim_win_get_cursor(win)[1] - 1 or -1
@@ -407,11 +441,14 @@ local function sync_cursor_modifiable(state, win)
   if cursor_range and not cursor_range.compact then
     header_row, footer_row = full_range_rows(state, cursor_range)
   end
-  set_modifiable(state, header_row ~= nil and cursor_row > header_row and cursor_row < footer_row)
+  local allowed = not state.readonly and cursor_range and not cursor_range.annotation.readonly
+    and header_row ~= nil and cursor_row > header_row and cursor_row < footer_row
+  if state.editable_source then allowed = allowed or state.editable_source(cursor_row) end
+  set_modifiable(state, allowed == true)
 end
 
----@param state ForgePlanCommentState
----@param target ForgePlanCommentRenderTarget?
+---@param state ForgeDraftCommentState
+---@param target ForgeDraftCommentRenderTarget?
 local function render(state, target)
   if not vim.api.nvim_buf_is_valid(state.buf) then return end
   state.rendering = true
@@ -419,10 +456,18 @@ local function render(state, target)
   local win = displayed_window(state)
   if state.before_render then state.before_render(state.buf, win) end
   vim.api.nvim_buf_clear_namespace(state.buf, namespace, 0, -1)
-
+  -- Neovim caches gutter width until layout. Measuring earlier can wrap the rule labels.
+  if win then vim.api.nvim__redraw({ win = win, statuscolumn = true, flush = true }) end
   local width = comment_editor.display_width(win, state.buf)
   local projection = build_projection(state, width)
   apply_projection(state, projection)
+  if win then vim.api.nvim__redraw({ win = win, statuscolumn = true, flush = true }) end
+  local actual_width = comment_editor.display_width(win, state.buf)
+  if actual_width ~= width then
+    vim.api.nvim_buf_clear_namespace(state.buf, namespace, 0, -1)
+    projection = build_projection(state, actual_width)
+    apply_projection(state, projection)
+  end
   if state.after_render then state.after_render(state.buf, win, projection) end
   local requested_row = target_row(state, projection, target)
   if win and requested_row then vim.api.nvim_win_set_cursor(win, { requested_row + 1, 0 }) end
@@ -430,15 +475,17 @@ local function render(state, target)
   state.rendering = false
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 local function handle_cursor_moved(state)
   if state.rendering or not vim.api.nvim_buf_is_valid(state.buf) then return end
+  if state.readonly then set_modifiable(state, false) return end
   local win = displayed_window(state)
   if not win then return end
   sync_focused_body(state)
   local row = vim.api.nvim_win_get_cursor(win)[1] - 1
   local annotation, range = annotation_at_row(state, row)
   if annotation then
+    if annotation.readonly then sync_cursor_modifiable(state, win) return end
     if not annotation.focused then
       for _, candidate in ipairs(state.annotation_list) do candidate.focused = candidate == annotation end
       render(state, { annotation_id = annotation.id })
@@ -460,14 +507,14 @@ local function handle_cursor_moved(state)
     end
   end
   if focused_annotation then
-    if vim.trim(focused_annotation.body) == "" then remove_annotation(state, focused_annotation) end
+    if focused_annotation.new and vim.trim(focused_annotation.body) == "" then remove_annotation(state, focused_annotation) end
     render(state, { source_line = source_line or focused_annotation.end_source_line })
   else
-    set_modifiable(state, false)
+    sync_cursor_modifiable(state, win)
   end
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 local function handle_resize(state)
   if state.rendering or not displayed_window(state) then return end
   sync_focused_body(state)
@@ -477,9 +524,9 @@ local function handle_resize(state)
   render(state, annotation and { annotation_id = annotation.id } or { source_line = source_line })
 end
 
----@param state ForgePlanCommentState
+---@param state ForgeDraftCommentState
 local function install_autocmd(state)
-  local group = vim.api.nvim_create_augroup("ForgePlanReviewComment" .. tostring(state.buf), { clear = true })
+  local group = vim.api.nvim_create_augroup("ForgeDraftComment" .. tostring(state.buf), { clear = true })
   state.group = group
   vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI" }, {
     group = group,
@@ -490,7 +537,10 @@ local function install_autocmd(state)
     group = group,
     buffer = state.buf,
     callback = function()
-      if not state.rendering then sync_focused_body(state) end
+      if not state.rendering then
+        sync_focused_body(state)
+        vim.bo[state.buf].modified = not vim.deep_equal(M.capture(state.buf), state.baseline)
+      end
     end,
   })
   vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, {
@@ -510,13 +560,15 @@ end
 ---@param buf integer
 ---@param win integer
 ---@param source_lines string[]
----@param annotation_list ForgePlanAnnotation[]
----@param opts? ForgePlanCommentOptions
----@return ForgePlanCommentState
+---@param annotation_list ForgeDraftComment[]
+---@param opts? ForgeDraftCommentOptions
+---@return ForgeDraftCommentState
 function M.attach(buf, win, source_lines, annotation_list, opts)
   opts = opts or {}
-  vim.wo[win].number = true
-  vim.wo[win].relativenumber = false
+  if win > 0 and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
+    vim.wo[win].number = true
+    vim.wo[win].relativenumber = false
+  end
   local previous = state_by_buf[buf]
   if previous then pcall(vim.api.nvim_del_augroup_by_id, previous.group) end
   local next_id = 1
@@ -534,20 +586,109 @@ function M.attach(buf, win, source_lines, annotation_list, opts)
     group = 0,
     next_id = next_id,
     rendering = false,
+    namespace = namespace,
+    readonly = opts.readonly == true,
+    heading = opts.heading or "Plan comment",
+    source_label = opts.source_label or annotation_line_label,
+    editable_source = opts.editable_source,
+    baseline = vim.deepcopy(opts.baseline or {}),
     source_provider = opts.source_provider,
     before_render = opts.before_render,
     after_render = opts.after_render,
   }
   state_by_buf[buf] = state
+  for _, annotation in ipairs(opts.baseline and {} or annotation_list) do
+    state.baseline[#state.baseline + 1] = { id = tostring(annotation.id), source = {
+      start_line = annotation.source_line, end_line = annotation.end_source_line, body = annotation.body } }
+  end
   install_autocmd(state)
   render(state)
   return state
 end
 
 ---@param buf integer
-function M.add_at_cursor(buf)
+---@return ForgeDraftCommentCapture[]
+function M.capture(buf)
+  local state = assert(state_by_buf[buf], "comment view is not attached")
+  sync_focused_body(state)
+  local captured = {}
+  for _, annotation in ipairs(state.annotation_list) do
+    captured[#captured + 1] = { id = tostring(annotation.id), source = {
+      start_line = annotation.source_line, end_line = annotation.end_source_line, body = annotation.body } }
+  end
+  return captured
+end
+
+---@param buf integer
+---@param captured ForgeDraftCommentCapture[]
+function M.saved(buf, captured)
+  local state = assert(state_by_buf[buf], "comment view is not attached")
+  state.baseline = vim.deepcopy(captured)
+  for _, annotation in ipairs(state.annotation_list) do
+    for _, saved in ipairs(captured) do
+      if tostring(annotation.id) == saved.id then annotation.new = nil break end
+    end
+  end
+  vim.bo[buf].modified = not vim.deep_equal(M.capture(buf), state.baseline)
+end
+
+---@param buf integer
+function M.delete_at_cursor(buf)
   local state = state_by_buf[buf]
-  if not state then return end
+  if not state or state.readonly then return end
+  sync_focused_body(state)
+  local row = vim.api.nvim_win_get_cursor(state.win)[1] - 1
+  local annotation = annotation_at_row(state, row)
+  if not annotation or annotation.readonly then return end
+  local source_line = annotation.end_source_line
+  remove_annotation(state, annotation)
+  render(state, { source_line = source_line })
+end
+
+---@param buf integer
+---@param id integer|string
+---@return boolean
+function M.focus(buf, id)
+  local state = state_by_buf[buf]
+  local annotation = state and find_annotation(state, id)
+  if not annotation or state.readonly or annotation.readonly then return false end
+  sync_focused_body(state)
+  for _, candidate in ipairs(state.annotation_list) do candidate.focused = candidate == annotation end
+  render(state, { annotation_id = id })
+  return true
+end
+
+---@param buf integer
+---@param annotation ForgeDraftComment
+---@param start_insert? boolean
+---@return ForgeDraftComment?
+function M.add(buf, annotation, start_insert)
+  local state = state_by_buf[buf]
+  if not state or state.readonly then return nil end
+  assert(annotation.id ~= nil and not find_annotation(state, annotation.id), "comment identity is already present")
+  assert(type(annotation.body) == "string", "comment body is required")
+  sync_focused_body(state)
+  local win = displayed_window(state)
+  if not win then return nil end
+  for _, candidate in ipairs(state.annotation_list) do candidate.focused = false end
+  annotation.focused, annotation.new = true, true
+  state.annotation_list[#state.annotation_list + 1] = annotation
+  render(state, { annotation_id = annotation.id })
+  if start_insert ~= false then
+    vim.schedule(function()
+      local displayed = displayed_window(state)
+      if displayed and vim.api.nvim_get_current_win() == displayed then vim.cmd("startinsert") end
+    end)
+  end
+  return annotation
+end
+
+---@param buf integer
+---@param start_insert? boolean
+function M.add_at_cursor(buf, start_insert)
+  local state = state_by_buf[buf]
+  if not state or state.readonly then return end
+  sync_focused_body(state)
   local win = displayed_window(state)
   if not win then return end
   local mode = vim.fn.mode(1)
@@ -559,24 +700,19 @@ function M.add_at_cursor(buf)
   end
   local source_line, end_source_line = source_range_at_rows(state, first_row, last_row)
   if not source_line or not end_source_line then
-    notifications.error("Selected PlanReview rows have no semantic plan lines", "ForgePlanReview")
+    notifications.error("Selected rows have no source identity", "Forge comments")
     return
   end
-  for _, annotation in ipairs(state.annotation_list) do annotation.focused = false end
   local annotation = {
     id = state.next_id,
     source_line = source_line,
     end_source_line = end_source_line,
     body = "",
     focused = true,
+    new = true,
   }
   state.next_id = state.next_id + 1
-  state.annotation_list[#state.annotation_list + 1] = annotation
-  render(state, { annotation_id = annotation.id })
-  vim.schedule(function()
-    local win = displayed_window(state)
-    if win and vim.api.nvim_get_current_win() == win then vim.cmd("startinsert") end
-  end)
+  M.add(buf, annotation, start_insert)
 end
 
 ---@param buf integer

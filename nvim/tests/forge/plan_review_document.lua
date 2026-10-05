@@ -29,11 +29,21 @@ local success, failure = xpcall(function()
   }, function(value, error_message) assert(not error_message, error_message) attached = value end)
   local open = requests[1].params
   requests[1].callback({ path = path, version = 1, saved_source_digest = "saved",
+    annotation = {}, source_row = {
+      { id = "source:1", text = "# Native plan", source_line = 1, block = "plan:source", position = { row = 0, column = 0 }, target = "plan:source:1", metadata = { gutter = { { position = { row = 0, column = 0 }, priority = 100, chunk = { { text = " 1 + ", capture = "Normal" } } } } } },
+      { id = "source:2", text = "", source_line = 2, block = "plan:source", position = { row = 1, column = 0 }, metadata = {} },
+      { id = "source:3", text = "Task", source_line = 3, block = "plan:source", position = { row = 2, column = 0 }, metadata = {} },
+    },
     snapshot = { document = open.document, revision = 0, block = { { id = "plan:source",
-      text = { "# Native plan", "", "Task" }, metadata = { decoration = {}, editable_region = {}, target = {
+      text = { "# Native plan", "", "Task" }, metadata = { gutter = { { position = { row = 0, column = 0 }, priority = 100, chunk = { { text = " 1 + ", capture = "Normal" } } } }, decoration = {}, editable_region = {}, target = {
         { id = "plan:source:1", range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = 13 } } },
       } } } } } })
   assert(attached == owner and owner.saved_source_digest == "saved")
+  local gutter_count = 0
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(native_buffer, -1, 0, -1, { details = true })) do
+      if mark[4].virt_text and mark[4].virt_text[1][1] == " 1 + " then gutter_count = gutter_count + 1 end
+  end
+  assert(gutter_count == 1, "plan comment projection duplicated the snapshot gutter")
   assert(vim.wo.number and not vim.wo.relativenumber and vim.wo.signcolumn == "yes"
     and vim.wo.statuscolumn == vim.go.statuscolumn, "plan review did not restore absolute source columns")
   assert(vim.wo.conceallevel == 3 and vim.wo.concealcursor == "", "plan review did not apply Markdown concealment")
@@ -59,7 +69,8 @@ local success, failure = xpcall(function()
   assert(not owner.is_current(action.params.input), "follow-up effect retained authority after newer physical typing")
   action.callback({ json_path = "/title" })
   assert(selected == nil, "late source action replaced newer physical typing")
-  assert(owner.close() == false, "unacknowledged physical typing was discarded by close")
+  assert(owner.close(), "closing should retain the unsaved native buffer")
+  assert(not owner.closed, "closing an unsaved draft disposed its owner")
   generation = 2
   assert(owner.close())
   assert(vim.api.nvim_buf_is_valid(native_buffer) and vim.api.nvim_buf_get_lines(native_buffer, 0, 1, false)[1] == "new # Native plan")

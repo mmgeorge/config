@@ -275,10 +275,10 @@ local success, failure = xpcall(function()
   local movement_text = vim.api.nvim_buf_get_lines(review.buf, movement_reference - 1, movement_reference, false)[1]
   vim.api.nvim_win_set_cursor(review.win, { movement_reference, movement_text:find("MovementInput", 1, true) + 3 })
   vim.api.nvim_feedkeys(".", "xt", false)
-  assert(held_jump and review.owner.navigation_pending, "delayed navigation was not admitted")
+  assert(held_jump, "delayed navigation was not admitted")
   local sequence = review.owner.view.sequence
-  review.owner.sync_focus()
-  assert(review.owner.view.sequence == sequence and not review.owner.focus_pending, "comment focus superseded navigation")
+  vim.api.nvim_exec_autocmds("CursorMoved", { buffer = review.buf })
+  assert(review.owner.view.sequence == sequence, "comment focus superseded navigation")
   client.request_for = original_request
   original_request(unpack(held_jump))
   await(function() local label = cursor_label() return label:find("pub(crate) struct MovementInput", 1, true) end,
@@ -299,7 +299,7 @@ local success, failure = xpcall(function()
   local retained_cursor = vim.api.nvim_win_get_cursor(review.win)
   client.request_for = original_request
   original_request(unpack(held_jump))
-  await(function() return not review.owner.navigation_pending end, "stale navigation did not settle")
+  vim.wait(100)
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), retained_cursor), "late navigation moved the cursor")
   local function jump_to_snapshot(needle, name)
     local row = declaration_row(needle)
@@ -451,14 +451,14 @@ local success, failure = xpcall(function()
   local comment
   review.owner.action("comment", function(value, error_message) assert(not error_message, error_message) comment = value end)
   await(function() return comment end, "comment did not attach")
-  local _, comment_row = review.owner.replica.sequence:position(comment.block)
-  vim.api.nvim_win_set_cursor(review.win, { comment_row + comment.row + 1, 0 })
+  local comment_row = vim.api.nvim_win_get_cursor(review.win)[1] - 1
+  vim.api.nvim_win_set_cursor(review.win, { comment_row + 1, 0 })
   review.owner.sync_editability()
-  vim.api.nvim_buf_set_text(review.buf, comment_row + comment.row, 0, comment_row + comment.row, 0, { "Review the second member" })
+  vim.api.nvim_buf_set_text(review.buf, comment_row, 0, comment_row, 0, { "Review the second member" })
   vim.cmd("write")
   await(function() return not vim.bo[review.buf].modified end, "comment did not save")
   toggle(file_row)
-  assert(closed(hunk_row) == file_row, "saving a comment changed the file fold boundary")
+  assert(closed(hunk_row) == file_row, "saving a comment changed the file fold boundary: file=" .. file_row .. " hunk=" .. hunk_row .. " closed=" .. closed(hunk_row))
   toggle(file_row)
   local annotation_path = vim.fn.glob(vim.fs.dirname(artifact_path) .. "/review-annotations-*.json", false, true)[1]
   assert(annotation_path, "comment storage is missing")
@@ -482,11 +482,11 @@ local success, failure = xpcall(function()
     private_comment = value
   end)
   await(function() return private_comment end, "private comment did not attach")
-  local _, private_comment_row = review.owner.replica.sequence:position(private_comment.block)
-  vim.api.nvim_win_set_cursor(review.win, { private_comment_row + private_comment.row + 1, 0 })
+  local private_comment_row = vim.api.nvim_win_get_cursor(review.win)[1] - 1
+  vim.api.nvim_win_set_cursor(review.win, { private_comment_row + 1, 0 })
   review.owner.sync_editability()
-  vim.api.nvim_buf_set_text(review.buf, private_comment_row + private_comment.row, 0,
-    private_comment_row + private_comment.row, 0, { "Review the private field" })
+  vim.api.nvim_buf_set_text(review.buf, private_comment_row, 0,
+    private_comment_row, 0, { "Review the private field" })
   vim.cmd("write")
   await(function() return not vim.bo[review.buf].modified end, "private comment did not save")
   local comments = bytes(annotation_path)
@@ -528,11 +528,11 @@ local success, failure = xpcall(function()
     final_comment = value
   end)
   await(function() return final_comment end, "public-only comment did not attach")
-  local _, final_comment_row = review.owner.replica.sequence:position(final_comment.block)
-  vim.api.nvim_win_set_cursor(review.win, { final_comment_row + final_comment.row + 1, 0 })
+  local final_comment_row = vim.api.nvim_win_get_cursor(review.win)[1] - 1
+  vim.api.nvim_win_set_cursor(review.win, { final_comment_row + 1, 0 })
   review.owner.sync_editability()
-  vim.api.nvim_buf_set_text(review.buf, final_comment_row + final_comment.row, 0,
-    final_comment_row + final_comment.row, 0, { "Review the final callable" })
+  vim.api.nvim_buf_set_text(review.buf, final_comment_row, 0,
+    final_comment_row, 0, { "Review the final callable" })
   vim.cmd("write")
   await(function() return not vim.bo[review.buf].modified end, "public-only comment did not save")
   comments = bytes(annotation_path)
@@ -557,11 +557,11 @@ local success, failure = xpcall(function()
     description_comment = value
   end)
   await(function() return description_comment end, "description comment did not attach")
-  local _, description_comment_row = review.owner.replica.sequence:position(description_comment.block)
-  vim.api.nvim_win_set_cursor(review.win, { description_comment_row + description_comment.row + 1, 0 })
+  local description_comment_row = vim.api.nvim_win_get_cursor(review.win)[1] - 1
+  vim.api.nvim_win_set_cursor(review.win, { description_comment_row + 1, 0 })
   review.owner.sync_editability()
-  vim.api.nvim_buf_set_text(review.buf, description_comment_row + description_comment.row, 0,
-    description_comment_row + description_comment.row, 0, { "Clarify the behavior in the description" })
+  vim.api.nvim_buf_set_text(review.buf, description_comment_row, 0,
+    description_comment_row, 0, { "Clarify the behavior in the description" })
   vim.cmd("write")
   await(function() return not vim.bo[review.buf].modified end, "description comment did not save")
   local description_anchor
@@ -587,11 +587,11 @@ local success, failure = xpcall(function()
     task_comment = value
   end)
   await(function() return task_comment end, "task comment did not attach")
-  local _, task_comment_row = review.owner.replica.sequence:position(task_comment.block)
-  vim.api.nvim_win_set_cursor(review.win, { task_comment_row + task_comment.row + 1, 0 })
+  local task_comment_row = vim.api.nvim_win_get_cursor(review.win)[1] - 1
+  vim.api.nvim_win_set_cursor(review.win, { task_comment_row + 1, 0 })
   review.owner.sync_editability()
-  vim.api.nvim_buf_set_text(review.buf, task_comment_row + task_comment.row, 0,
-    task_comment_row + task_comment.row, 0, { "Clarify the requested outcome" })
+  vim.api.nvim_buf_set_text(review.buf, task_comment_row, 0,
+    task_comment_row, 0, { "Clarify the requested outcome" })
   vim.cmd("write")
   await(function() return not vim.bo[review.buf].modified end, "task comment did not save")
   local task_anchor

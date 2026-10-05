@@ -7,7 +7,7 @@ use std::path::PathBuf;
 const MAX_ANNOTATION_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct ReviewAnnotation {
+pub struct ReviewAnnotation {
     pub id: String,
     pub source: PlanAnnotationInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -16,7 +16,7 @@ pub(crate) struct ReviewAnnotation {
 
 /// Binds a review selection to immutable saved declaration positions.
 #[derive(Clone, Serialize, Deserialize)]
-pub(crate) struct ReviewAnnotationAnchor {
+pub struct ReviewAnnotationAnchor {
     pub start: super::PlanReviewTarget,
     pub end: super::PlanReviewTarget,
 }

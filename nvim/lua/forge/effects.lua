@@ -35,8 +35,6 @@ function M.apply(session, view, effect)
     return "Discarded"
   end
   if view.effect[effect.id] then return "Duplicate" end
-  if effect.kind ~= "notify" and session.editable
-    and require("forge.editable").suspend_generated_text(session.editable) then return "Discarded" end
   if effect.kind ~= "notify" and view.cursor
     and not vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), view.cursor)
   then return "Discarded" end
@@ -49,6 +47,7 @@ function M.apply(session, view, effect)
       local position = assert(effect.position, "cursor position is missing")
       assert(position.row >= 0 and position.row < node.entry.row_count and position.row == math.floor(position.row), "cursor row is outside block")
       local _, start_row = session.sequence:position(effect.block)
+      start_row = require("forge.buffer").physical_row(session, start_row)
       local row = vim.api.nvim_buf_get_lines(session.buffer, start_row + position.row, start_row + position.row + 1, true)[1]
       local byte = row:byte(position.column + 1)
       assert(position.column >= 0 and position.column <= #row and position.column == math.floor(position.column)

@@ -126,18 +126,21 @@ fn git(root: &std::path::Path, arguments: &[&str]) -> String {
     String::from_utf8(output.stdout).unwrap().trim().to_owned()
 }
 async fn fixture(stale: bool) -> (tempfile::TempDir, WalkthroughService, DocumentId) {
-    let directory = tempfile::tempdir().unwrap();
-    git(directory.path(), &["init", "--initial-branch=main"]);
-    git(directory.path(), &["config", "user.name", "Forge Test"]);
-    git(
-        directory.path(),
-        &["config", "user.email", "forge@example.invalid"],
-    );
-    git(directory.path(), &["config", "core.autocrlf", "false"]);
-    std::fs::write(directory.path().join("source.rs"), "fn captured() {}\n").unwrap();
-    git(directory.path(), &["add", "source.rs"]);
-    git(directory.path(), &["commit", "-m", "base"]);
-    let head = git(directory.path(), &["rev-parse", "HEAD"]);
+    let (directory, head) = tokio::task::spawn_blocking(|| {
+        let directory = tempfile::tempdir().unwrap();
+        git(directory.path(), &["init", "--initial-branch=main"]);
+        git(directory.path(), &["config", "user.name", "Forge Test"]);
+        git(
+            directory.path(),
+            &["config", "user.email", "forge@example.invalid"],
+        );
+        git(directory.path(), &["config", "core.autocrlf", "false"]);
+        std::fs::write(directory.path().join("source.rs"), "fn captured() {}\n").unwrap();
+        git(directory.path(), &["add", "source.rs"]);
+        git(directory.path(), &["commit", "-m", "base"]);
+        let head = git(directory.path(), &["rev-parse", "HEAD"]);
+        (directory, head)
+    }).await.unwrap();
     let store = Arc::new(RepositoryStore::default());
     let repository = store
         .open(directory.path().to_owned())

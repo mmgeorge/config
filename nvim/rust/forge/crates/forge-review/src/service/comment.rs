@@ -29,9 +29,16 @@ impl ReviewService {
     pub async fn comment(
         &self,
         id: &DocumentId,
+        capture: Vec<crate::edit::RegionEdit>,
+        draft: Vec<crate::comments::DraftComment>,
         command: ReviewCommentCommand,
     ) -> Result<ReviewCommentResult> {
+        ensure!(
+            capture.iter().all(|edit| &edit.document == id),
+            "capture belongs to another review"
+        );
         if let ReviewCommentCommand::Snapshot { comment } = command {
+            ensure!(capture.is_empty() && draft.is_empty(), "snapshot cannot adopt a draft capture");
             let owner = self.owner(id)?;
             let snapshot = owner
                 .document
@@ -48,26 +55,27 @@ impl ReviewService {
             .try_acquire_owned()
             .context("review job admission is full")?;
         let guard = self.remote_guard(id)?;
-        let (prepared, capture, resource) = {
-            let mut document = guard
-                .owner
-                .document
-                .lock()
-                .expect("review document poisoned");
-            let prepared = document.prepare_comment(command)?;
-            let capture = capture_comment(&document, &prepared)?;
-            let resource = RecoveryResource {
-                repository: document.target.repository.clone(),
-                kind: RecoveryResourceKind::PullRequest,
-                number: document.target.number,
-            };
-            (prepared, capture, resource)
-        };
         let service = self.clone();
         let (sender, receiver) = oneshot::channel();
         self.spawn(async move {
             let _job = job;
             let result = async {
+                let (prepared, capture, resource) = {
+                    let mut document = guard
+                        .owner
+                        .document
+                        .lock()
+                        .expect("review document poisoned");
+                    document.capture_draft(capture, draft)?;
+                    let prepared = document.prepare_comment(command)?;
+                    let capture = capture_comment(&document, &prepared)?;
+                    let resource = RecoveryResource {
+                        repository: document.target.repository.clone(),
+                        kind: RecoveryResourceKind::PullRequest,
+                        number: document.target.number,
+                    };
+                    (prepared, capture, resource)
+                };
                 if let PreparedComment::Recovery {
                     comment,
                     resolution,

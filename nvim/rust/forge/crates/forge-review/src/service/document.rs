@@ -37,6 +37,8 @@ impl std::ops::Deref for ReviewEditResult {
 #[derive(Debug, Serialize)]
 pub struct ReviewMaterialization {
     pub field: Vec<crate::review::ReviewField>,
+    pub comment: Vec<crate::review::ReviewCommentSnapshot>,
+    pub inline_anchor: std::collections::BTreeMap<TargetId, crate::comments::CommentAnchor>,
     /// Durations in microseconds for the current presentation.
     pub timing: std::collections::BTreeMap<&'static str, u64>,
     pub snapshot: BufferSnapshot,
@@ -723,6 +725,23 @@ impl ReviewService {
         }
         Ok(ReviewMaterialization {
             field: document.snapshot()?.field,
+            inline_anchor: document
+                .projection_target
+                .iter()
+                .filter_map(|(identity, target)| {
+                    if let super::thread_projection::ReviewTarget::InlineComment { anchor } = target
+                    {
+                        Some((identity.clone(), anchor.clone()))
+                    } else {
+                        None
+                    }
+                })
+                .collect(),
+            comment: document
+                .comments
+                .records()
+                .map(|(identity, _)| document.comment_snapshot(identity))
+                .collect::<Result<Vec<_>>>()?,
             timing: std::collections::BTreeMap::from([
                 (
                     "capture_us",

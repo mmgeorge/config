@@ -56,17 +56,55 @@ fold boundaries without copying unrelated document blocks.
 `ForgeRuntime` composes the shared repository, analysis, GitHub, and document services.
 Opening a non-Harness view does not create a Harness session.
 
-`forge.buffer` applies native patches to physical buffers. Local editing acknowledgements
-and generated readonly updates share a bounded revision queue. The adapter preserves newer
-typing, untouched block metadata, and native editing attachments while adopting contiguous
-revisions. Generated decorations remain suspended while local text is unresolved.
-An ordinary close defers while edits are pending. After host generation collection,
+`forge.buffer` applies native patches to physical buffers. Neovim owns unsent PR and issue
+field text. Explicit saves capture region bodies and revisions together. A queued save retains
+that capture rather than reading newer unsaved text when dispatch starts. Completion advances
+accepted baselines without replacing newer typing. Generated text updates defer while native
+drafts remain, while source decorations resolve their shifted physical rows.
+Ordinary PR and issue close hides retained drafts. The eight-document PR cache evicts only
+clean hidden buffers and retains additional documents when every candidate contains a draft.
+After host generation collection,
 explicit invalidation revokes the old replica and preserves physical text for replacement
-admission. Stale patches and acknowledgements cannot address the replacement owner.
+admission. Stale patches cannot address the replacement owner.
 Each replica installs its buffer-wipe invalidation before feature-owner cleanup handlers.
 External wipes revoke the replica while retaining Neovim's ownership of the active deletion.
 Ordinary close marks the replica closed and removes that lifecycle callback before deleting
 an owned buffer, so reentrant owner cleanup cannot attempt a second deletion.
+
+`forge.draft_comments` owns local compact and full-width comment presentation. PlanReview
+uses it for creation, focus, collapse, raw body editing, and full-collection captures without
+editing requests to Rust. Source extmarks retain semantic identities independently from
+physical comment rows. Providers may supply sparse source identities. Read-only comments
+reject focus promotion and deletion, while an owner callback admits editable source fields.
+The renderer forces status-column layout before measuring rule width so line-number growth
+cannot wrap the heading label. `forge.review_comments` uses the same renderer for inline PR
+draft creation, focus, collapse, and local deletion. Native field extmarks retain other unsaved
+text through those transitions. `forge.draft_source` caches source identities once per buffer
+change or local render generation and maps navigation, syntax, and fold boundaries independently
+from inserted comment rows. Materialization supplies immutable diff anchors for local creation.
+Conversation and reply drafts use the same local creation path. Reply drafts retain the remote
+parent identity and source anchor, reuse one unsent body per parent, and remain unavailable in
+batched mode. Compact read-only comments expose their identity for reply selection without
+admitting body edits. Existing conversation entries retain their explicit-open lifecycle.
+
+Plan document recovery retains current local annotations and the latest queued explicit
+operation independently. After replacement admission validates the source digest, the queued
+operation keeps its original annotation capture. A queued submission receives the replacement
+document, revision, view, and sequence identities before dispatch. Completion closes the current
+review only when its physical buffer and plan identity match the originating submission.
+An operation already dispatched to the obsolete host is not replayed by this recovery path.
+Explicit PR comment saves capture only the selected body,
+and batched review submission captures the summary and comments without accepting PR fields.
+Generated patches defer while a local PR projection owns inserted comment rows. The adapter
+coalesces those updates, detaches the clean local projection, and adopts a full host snapshot
+before rebuilding source mappings. Pending native text prevents that replacement.
+Review capture admission accepts client-owned comment region identities, immutable source
+anchors, and optional reply parents with their bodies. `CommentStore` stages numeric identities
+and validates reply ownership before `EditStore` reserves every field body. Both stores commit
+only after the complete capture passes. New bodies retain an empty saved baseline. Repeated
+captures preserve accepted identities and revisions. Comment save can resolve a captured region
+to its numeric identity, and restoration retains that region when reopening saved draft state.
+Materialization returns comment body snapshots and anchors for local presentation ownership.
 
 `forge.status`, `forge.local_diff`, `forge.source_document`, and `forge.walkthrough`
 bind native services to editor views. The Harness controller binds a native transcript document and a Lua-owned
@@ -1988,12 +2026,12 @@ or sibling declarations.
 Interrupted phases retain their elapsed time on errors or cancellation. Logging changes no lookup rules and emits no notifications or review sections.
 Validation evidence remains internal to submission and is omitted from review sections and
 warning notifications.
-Automatic comment-focus requests wait for navigation responses so they cannot supersede a jump.
-Cursor movement still invalidates a pending navigation result. Failed attachment closes the review
-tab and reports the error.
-Review submission waits for queued document requests and saved edits before capturing its input.
-The replica stays attached and disables editing until the submission acknowledgement arrives,
-preventing an early close request from invalidating approval.
+Comment focus and raw body edits remain local to Neovim. Cursor movement invalidates a pending
+navigation result. Submission captures input and annotations when the user invokes the action,
+then queues that immutable capture behind an active explicit operation. The replica stays attached
+and permits newer typing while the request runs. Completion preserves newer text and closes the
+matching review only after submission settles. Failed replacement attachment retains the original
+buffer and owner.
 Modified declaration files retain complete context
 so spacing changes cannot remove comment targets from a hunk. Unchanged context rows retain both
 baseline and proposed positions, with proposed positions owning ordinary row actions. File and hunk
@@ -2492,81 +2530,54 @@ never shows them). See `.rulesync/rules/forge.md` -> Linting for the full triage
 
 ## 18. Migration editable-region ordering
 
-`forge/editable.lua` owns the pending local-edit state machine for the planned generic buffer
-adapter. Native attachment and edit capture are implemented, but existing review and Harness
-views do not call this owner yet. Save and submit actions, transport, and snapshot application
-must use it during adapter adoption.
+`forge/editable.lua` owns native region anchors and locally pending full text. Each
+physical document owns one monotonic sequence. Each region owns its accepted revision
+and latest pending value. Native `on_bytes` validates the changed range, shifts later
+anchors, captures the changed field, and suspends generated text synchronously. It
+never sends an edit request and owns no debounce timer or acknowledgement state.
 
-Each document owns one monotonic edit sequence. Each registered region owns an accepted region
-revision, at most one in-flight sequence and base revision, and the latest pending full text.
-Recording newer text replaces the pending value without replacing the in-flight identity. Returned
-text is copied so a transport consumer cannot mutate the retained recovery value.
+Explicit save and submit actions call `capture_draft` to obtain immutable full-text
+captures. Captures include document identity, region identity, accepted base revision,
+sequence, and exact text. Selection limits an operation to its intended fields.
+`saved_capture` advances accepted revisions and clears only pending values whose
+sequence matches the completed capture. Newer typing remains pending and dirty.
+Rust validates complete capture sets atomically before adopting submitted text.
 
-Acknowledgement requires the matching document, region, exact in-flight sequence, and next region
-revision. It clears pending text only when that text belongs to the acknowledged sequence. Newer
-text remains pending and its next request uses the advanced region revision. Generated text stays
-suspended for the whole document until every region is acknowledged and a snapshot contains every
-accepted region revision. A new edit arriving during reconciliation keeps suspension active.
+`forge/draft_comments.lua` owns local comment creation, deletion, focus, collapse,
+and the transition between compact boxes and full-width raw editable bodies. Plan
+and PR comments share this engine. Source extmarks preserve navigation identities
+through local row changes. `forge/draft_source.lua` maps generated source coordinates
+to physical rows for syntax, folds, navigation, and selections. The native snapshot
+installs diff gutters once. The plan comment projection must not reinstall them.
 
-A remote conflict or disconnect retains pending text and stops automatic retransmission. Explicit
-resolution supplies the reconciled remote region revision and preserved or merged local text.
-Unknown regions remain errors rather than silently creating state. Native attachment owns one
-debounce timer and region byte-coordinate anchors for a supplied buffer. `on_bytes` checks the
-old changed range against those anchors, shifts later anchors, captures the complete changed
-region, and suspends generated text synchronously. It scans editable regions, not feature-domain
-nodes. Cross-boundary changes and buffer reloads preserve native text and enter a fault state
-that cannot reconcile automatically. Detachment closes the timer and invalidates callbacks.
+Document adapters serialize explicit operations and retain the latest queued
+explicit capture. They must dispatch that retained value without recapturing newer
+unsaved typing. Save completion updates accepted baselines without overwriting draft
+text. Dirty close hides and retains the buffer. Conflicts preserve the draft for
+explicit recovery. Remote operations retain the host's durable mutation queue and
+uncertain-outcome recovery rather than replaying publication automatically.
 
-The debounce defaults to 120 ms of quiet with a 500 ms maximum accumulation interval, subject
-to Neovim event-loop scheduling. `flush` bypasses that delay for save and submit callers. An
-acknowledgement schedules another flush when newer pending text exists. Failed transport
-admission retains text and enters explicit conflict reconciliation instead of replaying requests.
-Tests use real Neovim buffers, but they do not prove existing live view adoption.
+## 19. Physical buffer replica
 
+`forge/buffer.lua` owns the physical buffer, metadata namespace, applied revision,
+changedtick, block sequence, and native editable owner. Feature adapters own their
+domain state and explicit operation lifecycle.
 
-The Rust `forge-buffer` document now provides `accept_local_edit`. Its request and acknowledgement
-fields match the Lua ordering owner's document, region, base revision, sequence, and full-text
-contract. Rust uses the region-owner index to find the affected block. Region acceptance does not
-require a matching generated layout revision. Conflict and stale-sequence results leave state
-unchanged. Accepted edits advance both region and document revisions and return a generated patch
-alongside the acknowledgement. The adapter must continue withholding that patch while native
-local edits are pending, then reconcile from an agreed snapshot.
+Patch preflight checks base revision and counts, changedtick, decoration handles,
+disjoint text and block edits, retirement, resulting row coverage, and metadata byte
+boundaries. Clean incremental patches share unchanged metadata and avoid copying
+unrelated source rows. Application runs synchronously on the main loop. Native
+extmarks move with unchanged text. Revision publication follows successful text,
+metadata, and row-count checks. Partial API failure marks the session desynchronized
+and preserves diagnostic and recovery state without claiming rollback.
 
-Region replacement preserves surrounding text and shifts later metadata. Intersecting generated
-targets and decorations are invalidated. The feature renderer must regenerate them from accepted
-source text. The Rust API and Lua owner remain disconnected from the runtime transport and existing feature
-buffers until generic adapter adoption.
-
-
-## 19. Migration physical buffer replica
-
-`forge/buffer.lua` now owns a generated scratch buffer, one decoration namespace, applied revision,
-changedtick, generic block order, block-relative metadata, and its editable-state owner. Existing
-feature views do not use this module yet. Its state contains no status tree, diff model, review
-reducer, or Harness timeline.
-
-Patch preflight checks the base revision and counts, native changedtick, decoration handles,
-descending disjoint text and block edits, exact block retirement, resulting row coverage, and
-metadata byte boundaries. It reads required resulting rows from replacement text or the native
-buffer without keeping a second full document text. Unchanged metadata tables are shared while
-preparing candidate block records. Block order currently uses an array, and preflight still scans
-all block metadata and native decoration handles. Indexed native preflight and visible decoration
-providers remain necessary for the migration performance contract.
-
-Application runs synchronously on the main loop without yielding between native operations. The
-transport must dispatch it from its scheduled callback. Text edits apply bottom-up. Unchanged
-native decoration handles move with the buffer. Changed or moved blocks replace their decoration
-records. Revision publication follows successful text, metadata, and native row-count checks.
-A partial API failure keeps the old revision, marks the session desynchronized, suppresses its
-native decorations, and invokes diagnostic and recovery callbacks. It does not claim rollback.
-
-Snapshot recovery validates the complete candidate before replacing native text and metadata.
-Pending local edits defer patches, snapshots, and buffer deletion. After every local edit is
-acknowledged, a snapshot must contain each accepted region revision before reconciliation can
-resume generated text. Native edit callbacks detach for generated mutation and reattach with the
-resulting region coordinates. This prevents generated snapshots from becoming new local edits.
-The module preserves the logical zero-row document despite Neovim's required physical empty row.
-
+Pending local drafts defer generated patches and snapshots. Locally projected
+comment buffers also defer ordinary patches until their adapter can rebuild a clean
+projection. Adapters coalesce refresh demand rather than mixing local edit patches
+with generated patches. Snapshot recovery validates the complete candidate before
+replacing text and metadata. Generated mutation detaches native edit callbacks and
+reattaches them with the resulting region coordinates. The replica preserves logical
+zero-row documents despite Neovim's required physical empty row.
 
 ## 20. Host output admission during migration
 
@@ -4177,6 +4188,13 @@ Lua consumers awaiting their service cutovers.
 
 ## 77. Native issue details and retained persistence
 
+The native issue adapter gives its retained buffer a `forge://issue/` name and uses `acwrite` ownership.
+Neovim therefore routes `:write` through BufWriteCmd into an explicit immutable field capture. Cursor
+and insert transitions enable editing only inside a native editable region. Projection delivery
+rechecks that boundary, so generated headings and comment presentation stay protected while issue
+fields remain editable. Typing sends no host request. Dirty close hides the buffer without saving,
+and reopening the same issue restores that buffer with its current unsaved text.
+
 GithubRemote now exposes typed IssueDetailRequest and IssueDetail results. GhClient routes issue
 detail reads through `gh issue view` with an explicit hostname-qualified repository. Detail and page
 requests share one native command runner and the same four-request admission pool. Process output
@@ -4433,6 +4451,12 @@ counters, and failed admission leave the field unchanged. The buffer integration
 generated rows before accepting a Unicode multiline field edit and verifies matching region
 acknowledgements from EditStore and BufferDocument despite their different layout revisions.
 
+prepare_capture validates all fields and reserves their text without changing the store. Its proposed
+snapshots let a document prepare its buffer projection before committing either state. Dropping the
+prepared capture releases its reservations. Issue captures validate the proposed title and assignees
+before projection preparation, so scalar validation and missing projection blocks cannot partially
+adopt another field in the same capture.
+
 begin_save retains immutable submitted text, revision, and sequence. Confirmation advances only
 that submitted baseline, so newer local text remains dirty. A pending write followed by a local
 revert still admits a compensating submission. Callers must execute writes in submission order.
@@ -4449,9 +4473,10 @@ current or baseline value. A retained submission keeps its charge after its stor
 reserves new text before changing field state, including the transient overlap with replaced text.
 This bound excludes allocator overhead and metadata and does not establish global memory acceptance.
 
-This crate is a tested ownership foundation. The production ReviewDocument, host service routing,
-native edit acknowledgement flow, and replacement of Lua baseline ownership remain open. No
-production consumer currently relies on EditStore, and no migration gate closes from these tests.
+Production ReviewDocument uses EditStore to retain explicitly captured text and confirmed baselines.
+Neovim owns unsaved typing. Save, comment publication, and batched submission carry immutable captures
+into the admitted service task. The router does not adopt captures separately, and rejected concurrent
+operations leave the document unchanged. No per-keystroke acknowledgment participates in editing.
 
 ## 84. Host-owned review field lifecycle
 
@@ -4469,12 +4494,11 @@ admission. Document identities do not repeat within a host lifetime. The current
 owns title and body fields and their save batch. PR rendering, comment ownership, and its planned
 BufferDocument composition remain migration boundaries.
 
-review.region_edit accepts full native field text against the host document and region revision.
-It returns the accepted edit sequence and new region revision. Local edits remain admissible
-while review.save submits the captured title and body in one updatePullRequest mutation. A second
-save for that document is rejected while its first remote operation runs. Omitted clean fields
-remain unchanged. Confirmation advances only captured baselines, and rejection leaves them intact.
-A remote panic or delivery error leaves explicit uncertainty rather than an implicit retry.
+Explicit review saves carry immutable full-field captures with document identity, region revision,
+and sequence. Typing remains in Neovim and sends no per-edit request. The host validates the capture
+before submitting title and body in one updatePullRequest mutation. Omitted clean fields remain
+unchanged. Confirmation advances captured baselines. A remote panic or delivery error retains
+explicit uncertainty rather than implicitly replaying the mutation.
 
 review.reconcile reads current remote text through the same resource owner and updates unresolved
 baselines without replacing local text or reposting the write. A failed observation retains the
@@ -4497,21 +4521,21 @@ established by the host API alone.
 The PR view binds title and description regions through forge.review to one ReviewService document.
 The initial host observation supplies saved baselines. If native text still matches the initial
 rendered field, the view adopts current remote text. If the user typed while the read was pending,
-the view preserves that text and sends a region edit. The adapter validates document identity,
+the view preserves that text as a local draft. The adapter validates document identity,
 field revisions, edit sequences, field bounds, and dirty-state consistency before adopting results.
 
-Text-change events retain the latest native values. One request at a time advances the accepted
-region revision. A save captures its requested title/body values and waits for their acknowledgements
-before dispatching review.save. Later native typing remains in the buffer while that captured save
-runs. After settlement, the adapter adopts the host baseline and flushes newer native text. Lua
-compares native values with the adopted baseline for presentation, but never chooses which submitted
-text became saved. The previous Lua title/body mutation and baseline-advancement path is removed.
+Text-change events retain native values and capture sequences locally. An explicit save captures
+title, description, and reviewer text before dispatching review.save. A queued save retains that
+capture while later typing continues. Settlement advances the captured region revisions and adopts
+host baselines while preserving newer pending text. Lua compares native values with confirmed or
+explicitly queued values for presentation. It does not publish newer typing implicitly.
 github.pull_request.transition_async now handles lifecycle transitions only.
 
 Failed saves observe the host snapshot and reconcile an uncertain result without reposting. Failure
 notifications remain visible even after the originating buffer closes. A failed acknowledgement or
-lost host preserves native text and stops automatic edit dispatch. A subsequent explicit save may
-open a fresh host document from remote truth before retrying the user's captured intent. Host
+lost host preserves native text and stops operation dispatch against the obsolete identity. Reopening
+the retained PR validates a replacement host snapshot and restores local fields and comment boxes
+into the same buffer. Baseline or inline-revision conflicts retain the original document. Host
 document identities include a service UUID, so an old document request cannot resolve to a new
 host's document with the same ordinal. Closing during open releases the late document, and closing
 before save dispatch completes the caller without sending a mutation.
@@ -4726,15 +4750,15 @@ Refreshed remote conflicts require a matching region revision before KeepLocal o
 
 The guard retains an active native operation after its request receiver or document view closes. On
 panic or an abandoned active save, it conservatively records uncertainty and releases the active flag.
-The service does not claim durable preservation of already-completed uncertain captures after document
-removal or host restart. Persistent receipts and closed-document recovery remain required migration
-boundaries. Deleted comments retain native text for the pending recovery presentation.
+The service retains submitted mutations and uncertain outcomes through the durable recovery store.
+Replacement hosts restore those records and require explicit reconciliation before another publication.
+Deleted comments retain native text for the pending recovery presentation.
 
-The real Forge host fixture verifies native loading, acknowledged edits, confirmed baseline adoption,
+The real Forge host fixture verifies native loading, captured text, confirmed baseline adoption,
 lost responses, newer text, and reconciliation with exactly two mutation attempts. Isolated service
 tests cover held writes, snapshot access during save, PR/comment exclusion, closure through shutdown,
 remote panic, foreign document targets, and revision-checked refresh conflict resolution. Native create
-and reply operations, full comment loading, and the Lua PR comment consumer cutover remain open.
+and reply operations use client-owned draft definitions carried by explicit captures.
 
 
 ## 92. Native conversation-comment creation
@@ -4765,15 +4789,14 @@ Lua comment consumer migration remain separate unfinished boundaries.
 
 ## 93. Review-owned conversation drafts and creation adoption
 
-The review.comment draft_conversation command allocates a stable comment owner and body region in the
-document's shared CommentStore and EditStore. Acknowledged region edits populate the local draft.
-Saving a conversation draft captures its exact text, generates a native receipt, and dispatches
-GithubService creation through the existing document guard and retained service task. Empty drafts
-and deletion of an unsaved draft fail before capture or remote dispatch.
+Neovim allocates a stable local comment identity and body region without contacting the host.
+Explicit publication sends the draft definition and exact body text together. The admitted service
+task adopts them into CommentStore and EditStore, generates a native receipt, and dispatches
+GithubService creation through the document guard. Empty bodies fail before remote dispatch.
 
 Confirmed creation adopts the returned remote identity into the same comment owner. Subsequent save
 and delete commands use the existing-comment path. Saved-baseline settlement uses the captured body,
-so edits acknowledged during creation remain dirty against the submitted baseline. The comment and
+so newer local typing remains dirty against the submitted baseline. The comment and
 region identities remain stable across creation and later mutations.
 
 A failed PR identity preflight returns a proven rejection before mutation admission begins. A proven
@@ -4781,15 +4804,15 @@ rejection releases the capture and permits an explicit retry. Unknown creation r
 capture and draft without adopting a target. PR reconciliation cannot clear this uncertainty, and
 existing-comment reconciliation cannot substitute an arbitrary observed node. Creation recovery still
 requires positively correlated evidence and persistent receipt storage. Active creation survives
-caller cancellation and document removal through service shutdown. Durable recovery after a completed
-uncertain operation loses its document or host remains unfinished.
+caller cancellation and document removal through service shutdown. Replacement hosts restore uncertain
+creation records without reposting the submitted body.
 
 Five service tests cover creation followed by edit and deletion, newer text during a held creation,
 rejection and failed preflight followed by explicit retry, uncertainty isolation, and caller/document closure during an
-active write. A native Forge host fixture verifies draft allocation, acknowledged text, GraphQL
+active write. A native Forge host fixture verifies draft capture, exact text, GraphQL
 creation, receipt correlation, unchanged local identities, and exact saved-baseline adoption. These
-tests issue no live GitHub mutations. Inline creation, replies, pending reviews, full comment loading,
-persistent recovery, and the Lua comment consumer cutover remain open.
+tests issue no live GitHub mutations. Service tests also cover inline creation, replies, batched reviews,
+and uncertain creation recovery after host replacement.
 
 
 ## PR buffer loading
@@ -4802,7 +4825,7 @@ The Lua adapter retains up to eight PR documents and their native buffers for th
 
 Title, description, and requested reviewers have native editable regions. Cursor entry unlocks the selected region and restores native editing bindings. Unsaved fields display `*`. Both `<C-s>` and `:w` immediately capture native values as a local save intent and clear their markers and the buffer's modified flag. Lua keeps this presentation baseline separate from the host's confirmed baseline. Typing after the local save restores the affected field's marker.
 
-Save actions remove trailing CR and LF characters from native input before capturing the local save intent. Internal line breaks and spaces remain unchanged. PR fields, issue fields, comment saves, and batched review inputs use the shared editable-region normalization. The edit updates region anchors and enters the ordinary acknowledgement flow before remote dispatch.
+Explicit save and submission actions preserve the exact native field text, including CR characters, Unicode, internal line breaks, and trailing empty rows. Capture does not rewrite the buffer. Native anchors follow local edits, and immutable captures cross the host boundary only for explicit operations.
 
 The PR and review `b` command remains available over editable fields in normal and visual mode. It sends a distinct `browse` action with the captured document, view, revision, and position. Rust preserves explicit browser targets and otherwise opens the PR page from its captured host, repository, and number. Browsing cannot activate lifecycle changes, file expansion, or comment editing. Issue browsing uses its source target or issue URL. Notification browsing uses the selected notification URL and reports missing URLs and launch failures.
 
@@ -4810,9 +4833,11 @@ PR file headers own working-file opening through the `open` action and diff load
 
 Editable regions protect their surrounding rows and headings independently of cursor-based `modifiable` settings. The shared Lua guard retains the last permitted buffer text, updating only affected rows for accepted edits and generated patches. A cross-boundary edit captures extmarks before Neovim moves them, suspends projection effects, and restores the retained text and marks on the next main-loop callback. Rejection leaves accepted field edits and native region anchors intact, sends no invalid edit to Rust, and keeps the fields editable. Only a failed restoration faults the document.
 
-Lua retains one active save and at most one queued intent. Repeated saves replace the queued intent with the latest native values. Local edit acknowledgements precede each background `review.save` request. Rust saves title and description together, then applies reviewer additions and removals through the durable mutation queue. Completion adopts the host's confirmed baselines without replacing native text. The latest queued intent continues to control markers while the earlier request settles. Lua refreshes the presentation after the save queue drains and tracks that reconciliation separately. A refresh started before a save completes cannot restore older field baselines.
+Lua retains one active publication operation and at most one queued explicit action across field saves, comment publication, batched submission, and lifecycle changes. Each action captures its input when invoked. A newer queued action replaces the previous queued action and reports supersession to its callback. Completion dispatches the retained action without recapturing later typing. Unresolved submission recovery holds publication until its outcome is settled. Rust saves title and description together, then applies reviewer additions and removals through the durable mutation queue. Completion adopts confirmed baselines without replacing native text. The queued capture continues to control markers while the earlier request settles. Presentation refresh waits while local drafts remain pending. A deferred refresh does not mark reconciliation as active, and a refresh started before a save completes cannot restore older field baselines.
 
-Rejected and missing save results discard queued save intents, restore markers against the confirmed baselines, and notify the failure. Uncertain field saves automatically start `review.reconcile` without reposting mutations. Rust reads the current remote fields or reviewer set before settling the durable capture. Matching title/body observations verify the submitted operation. Reviewer changes always close the unknown operation after reading the current reviewer set because GitHub provides no reviewer-operation identity to link. A differing title/body observation also closes the unknown operation. Recovery establishes the observed baseline without claiming that a closed-unknown request succeeded. Lua rolls an unchanged failed capture back to that baseline and preserves text edited after submission. Failed observations retain the capture and local text, leave native editing enabled, and expose `gR` to retry recovery. Reopening an uncertain document also starts recovery.
+Rejected and missing save results retain later explicit captures, restore markers against confirmed baselines, and notify the failure. Uncertain field saves start `review.reconcile` without reposting mutations and hold later publication until recovery settles. Rust reads current remote fields or the reviewer set before settling the durable capture. Matching title/body observations verify the submitted operation. Reviewer changes close the unknown operation after observing the current reviewer set because GitHub provides no reviewer-operation identity to link. Differing title/body observations also close the unknown operation. Recovery establishes the observed baseline without claiming that a closed-unknown request succeeded and preserves all locally owned text. Failed observations retain captures, keep native editing enabled, and expose `gR` to retry recovery. An explicit save during recovery retains its capture for later dispatch.
+
+Uncertain comment snapshots hold later publication without replacing its queued capture. The `gR` recovery picker offers remote observation, a linked confirmed comment ID, not-dispatched rejection, and close-unknown resolution. Cancellation sends no request. Comment recovery bypasses only the comment-uncertainty guard and retains the queued publication action. Successful settlement resumes that action, while failed recovery keeps it held. The same picker presents batched submission resolution through `gB`.
 
 Reviewer completion excludes the authenticated user only in the reviewer input. Ordinary `@` mentions still include that user. Lua validates manually entered reviewer names case-insensitively before dispatch. Rust repeats validation before any field write and again before the reviewer phase, so a self-review request cannot produce a partial title/body save or bypass validation by changing during an earlier write. The buffer enables the shared `@` username and `#` issue completion sources, with metadata refreshed at open and issue queries served from the local index.
 

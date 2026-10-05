@@ -5,11 +5,12 @@ require("forge.integrations.gh").current_pr_async = function(_, callback) lookup
 require("forge.views.commands").open_pr = function(pr) opened = pr end
 local window = vim.api.nvim_get_current_win()
 local origin = vim.api.nvim_get_current_buf()
+local head = "initial-head"
 local owner = require("forge.views.status.status_context").attach({
   document_id = "loading-test", workspace = vim.fn.getcwd(),
   present = function() end, is_alive = function() return true end,
   capture_input = function() return {} end, is_input_current = function() return true end,
-  get_info = function() return {} end,
+  get_info = function() return { head = head } end,
   get_about_source = function() return { file = {} } end,
 })
 owner.refresh()
@@ -19,6 +20,7 @@ assert(owner.pending_pr and vim.api.nvim_get_current_buf() == origin,
 lookup({ ok = true, pr = { number = 2, title = "PR title", repo = "owner/repo" } })
 assert(opened and opened.number == 2, "pending ogp was not continued after lookup")
 opened = nil
+head = "replacement-head"
 owner.refresh()
 owner.open_pull_request(window)
 local replacement = vim.api.nvim_create_buf(false, true)

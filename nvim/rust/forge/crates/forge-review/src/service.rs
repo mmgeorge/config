@@ -248,111 +248,122 @@ impl ReviewService {
     pub async fn submit_batched(
         &self,
         id: &DocumentId,
+        capture: Vec<RegionEdit>,
+        draft: Vec<crate::comments::DraftComment>,
         verdict: ReviewVerdict,
     ) -> Result<ReviewBatchedSubmissionDelivery> {
         use forge_github::recovery::RecoveryPhase;
         use forge_github::review_mutation::ReviewMutationRequest;
+        ensure!(
+            capture.iter().all(|edit| &edit.document == id),
+            "capture belongs to another review"
+        );
         let job = Arc::clone(&self.job_admission)
             .try_acquire_owned()
             .context("review job admission is full")?;
         let guard = self.remote_guard(id)?;
-        let operation_id = uuid::Uuid::new_v4().to_string();
-        let (target, mutation, sequence, draft) = {
-            let mut document = guard
-                .owner
-                .document
-                .lock()
-                .expect("review document poisoned");
-            let (mutation, sequence) =
-                document.begin_batched_submission(operation_id.clone(), verdict)?;
-            (
-                document.target.clone(),
-                mutation,
-                sequence,
-                document.draft_payload()?,
-            )
-        };
-        let resource = forge_github::recovery::RecoveryResource {
-            repository: target.repository.clone(),
-            kind: forge_github::recovery::RecoveryResourceKind::PullRequest,
-            number: target.number,
-        };
-        self.github
-            .review_draft_write(resource.clone(), draft)
-            .await?;
         let service = self.clone();
         let (sender, receiver) = oneshot::channel();
         self.spawn(async move {
             let _job = job;
-            let mut dispatch_attempted = false;
-            let outcome = async {
-                let actor = guard
-                    .owner
-                    .remote
-                    .read_actor(target.repository.clone())
-                    .await?;
-                dispatch_attempted = true;
-                service
-                    .github
-                    .review_mutation(
-                        guard.owner.remote.clone(),
-                        ReviewMutationRequest {
-                            parent_node_id: Some(target.node_id.clone()),
-                            resource: resource.clone(),
-                            operation_id: operation_id.clone(),
-                            actor_node_id: actor.node_id,
-                            edit_sequence: Some(sequence),
-                            draft_target: Some("review:submission".into()),
-                            mutation,
-                        },
-                    )
-                    .await
-            }
-            .await;
-            let (outcome_name, confirmed, terminal) = match &outcome {
-                Ok(record) => match &record.state {
-                    RecoveryPhase::Confirmed { .. } => ("confirmed", true, true),
-                    RecoveryPhase::Rejected { .. } => ("rejected", false, true),
-                    _ => ("outcome_unknown", false, false),
-                },
-                Err(error)
-                    if !dispatch_attempted
-                        || error.is::<forge_github::service::MutationNotStarted>() =>
-                {
-                    ("rejected", false, true)
-                }
-                Err(_) => ("outcome_unknown", false, false),
-            };
             let result = async {
-                let _publication = guard.owner.publication.lock().await;
-                let (snapshot, viewed_file, draft) = {
+                let operation_id = uuid::Uuid::new_v4().to_string();
+                let (target, mutation, sequence, draft) = {
                     let mut document = guard
                         .owner
                         .document
                         .lock()
                         .expect("review document poisoned");
-                    document.settle_batched_submission(confirmed, terminal)?;
+                    document.capture_draft(capture, draft)?;
+                    let (mutation, sequence) =
+                        document.begin_batched_submission(operation_id.clone(), verdict)?;
                     (
-                        document.snapshot()?,
-                        document.viewed_file.iter().cloned().collect(),
+                        document.target.clone(),
+                        mutation,
+                        sequence,
                         document.draft_payload()?,
                     )
                 };
-                if terminal {
+                let resource = forge_github::recovery::RecoveryResource {
+                    repository: target.repository.clone(),
+                    kind: forge_github::recovery::RecoveryResourceKind::PullRequest,
+                    number: target.number,
+                };
+                service.github
+                    .review_draft_write(resource.clone(), draft)
+                    .await?;
+                let mut dispatch_attempted = false;
+                let outcome = async {
+                    let actor = guard
+                        .owner
+                        .remote
+                        .read_actor(target.repository.clone())
+                        .await?;
+                    dispatch_attempted = true;
                     service
                         .github
-                        .recovery_settle_draft(resource.clone(), operation_id.clone(), draft)
-                        .await?;
-                } else {
-                    service.github.review_draft_write(resource, draft).await?;
+                        .review_mutation(
+                            guard.owner.remote.clone(),
+                            ReviewMutationRequest {
+                                parent_node_id: Some(target.node_id.clone()),
+                                resource: resource.clone(),
+                                operation_id: operation_id.clone(),
+                                actor_node_id: actor.node_id,
+                                edit_sequence: Some(sequence),
+                                draft_target: Some("review:submission".into()),
+                                mutation,
+                            },
+                        )
+                        .await
                 }
-                Ok(ReviewBatchedSubmissionDelivery {
-                    mode: ReviewMode::Batched,
-                    viewed_file,
-                    snapshot,
-                    outcome: outcome_name.into(),
-                    operation_id: (!terminal).then_some(operation_id),
-                })
+                .await;
+                let (outcome_name, confirmed, terminal) = match &outcome {
+                    Ok(record) => match &record.state {
+                        RecoveryPhase::Confirmed { .. } => ("confirmed", true, true),
+                        RecoveryPhase::Rejected { .. } => ("rejected", false, true),
+                        _ => ("outcome_unknown", false, false),
+                    },
+                    Err(error)
+                        if !dispatch_attempted
+                            || error.is::<forge_github::service::MutationNotStarted>() =>
+                    {
+                        ("rejected", false, true)
+                    }
+                    Err(_) => ("outcome_unknown", false, false),
+                };
+                let result = async {
+                    let _publication = guard.owner.publication.lock().await;
+                    let (snapshot, viewed_file, draft) = {
+                        let mut document = guard
+                            .owner
+                            .document
+                            .lock()
+                            .expect("review document poisoned");
+                        document.settle_batched_submission(confirmed, terminal)?;
+                        (
+                            document.snapshot()?,
+                            document.viewed_file.iter().cloned().collect(),
+                            document.draft_payload()?,
+                        )
+                    };
+                    if terminal {
+                        service
+                            .github
+                            .recovery_settle_draft(resource.clone(), operation_id.clone(), draft)
+                            .await?;
+                    } else {
+                        service.github.review_draft_write(resource, draft).await?;
+                    }
+                    Ok(ReviewBatchedSubmissionDelivery {
+                        mode: ReviewMode::Batched,
+                        viewed_file,
+                        snapshot,
+                        outcome: outcome_name.into(),
+                        operation_id: (!terminal).then_some(operation_id),
+                    })
+                }
+                .await;
+                result
             }
             .await;
             drop(guard);
@@ -782,7 +793,16 @@ impl ReviewService {
     }
 
     /// Saves PR text and requested reviewers in order, retaining admitted work after receiver cancellation.
-    pub async fn save(&self, id: &DocumentId) -> Result<ReviewSaveResult> {
+    pub async fn save(
+        &self,
+        id: &DocumentId,
+        capture: Vec<RegionEdit>,
+        draft: Vec<crate::comments::DraftComment>,
+    ) -> Result<ReviewSaveResult> {
+        ensure!(
+            capture.iter().all(|edit| &edit.document == id),
+            "capture belongs to another review"
+        );
         let job = Arc::clone(&self.job_admission)
             .try_acquire_owned()
             .context("review job admission is full")?;
@@ -792,14 +812,15 @@ impl ReviewService {
         self.spawn(async move {
             let _job = job;
             let result = async {
-                let repository = guard
-                    .owner
-                    .document
-                    .lock()
-                    .expect("review document poisoned")
-                    .target
-                    .repository
-                    .clone();
+                let repository = {
+                    let mut document = guard
+                        .owner
+                        .document
+                        .lock()
+                        .expect("review document poisoned");
+                    document.capture_draft(capture, draft)?;
+                    document.target.repository.clone()
+                };
                 let actor = guard.owner.remote.read_actor(repository).await?;
                 guard
                     .owner

@@ -1,4 +1,4 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Context, Result, ensure};
 use forge_buffer::MAX_COUNTER;
@@ -118,6 +118,16 @@ pub struct CommentRecord {
     pub deleted: bool,
 }
 
+/// Client-owned comment identity and immutable source coordinates admitted with its captured body.
+/// Reply declarations retain the existing remote parent's anchor and permit one draft per parent.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DraftComment {
+    pub region: RegionId,
+    pub anchor: Option<CommentAnchor>,
+    pub reply_to: Option<CommentId>,
+}
+
 #[derive(Clone, Copy, Debug)]
 pub struct CommentLimits {
     pub comments: usize,
@@ -154,6 +164,112 @@ pub struct CommentStore {
 }
 
 impl CommentStore {
+    /// Resolves an accepted region to its document-owned numeric comment identity.
+    /// Unadmitted or retired regions return an error without allocating a comment.
+    pub fn identity_for_region(&self, region: &RegionId) -> Result<CommentId> {
+        self.region
+            .get(region)
+            .copied()
+            .context("unknown comment region")
+    }
+
+    /// Admits comment definitions and field bodies together after all validation and text reservation.
+    /// Invalid anchors, reply ownership, reused identities, missing bodies, and capacity failures
+    /// preserve existing comments and fields. Retries retain the accepted numeric identity.
+    pub fn accept_capture(
+        &mut self,
+        edits: &mut EditStore,
+        capture: Vec<RegionEdit>,
+        draft: Vec<DraftComment>,
+    ) -> Result<()> {
+        self.check_owner(edits)?;
+        let mut declared = BTreeSet::new();
+        let mut reply = BTreeSet::new();
+        let mut prepared = Vec::new();
+        let mut next_comment = self.next_comment;
+        for draft in draft {
+            draft.region.validate()?;
+            ensure!(
+                declared.insert(draft.region.clone()),
+                "duplicate draft comment"
+            );
+            ensure!(
+                draft.region.0.starts_with("draft-comment/") && draft.region.0.ends_with("/body"),
+                "invalid local comment identity"
+            );
+            if let Some(anchor) = &draft.anchor {
+                anchor.validate()?;
+            }
+            if let Some(parent) = draft.reply_to {
+                ensure!(
+                    self.mode == ReviewMode::Overview,
+                    "inline replies require PR overview mode"
+                );
+                let record = self.record(parent)?;
+                ensure!(
+                    record.remote.is_some() && record.anchor.is_some() && !record.deleted,
+                    "inline reply requires a remote review comment"
+                );
+                ensure!(
+                    record.anchor == draft.anchor,
+                    "reply anchor differs from its parent"
+                );
+                ensure!(reply.insert(parent), "duplicate reply draft");
+                if let Some(existing) = self.reply.get(&parent) {
+                    ensure!(
+                        self.record(*existing)?.region == draft.region,
+                        "reply draft already exists"
+                    );
+                }
+            }
+            if let Some(existing) = self.region.get(&draft.region) {
+                let record = self.record(*existing)?;
+                ensure!(
+                    record.anchor == draft.anchor && record.reply_to == draft.reply_to,
+                    "captured comment identity changed"
+                );
+                self.validate_capture(edits, &draft.region)?;
+                continue;
+            }
+            ensure!(
+                self.comment.len().saturating_add(prepared.len()) < self.limits.comments
+                    && next_comment < MAX_COUNTER,
+                "comment admission is full"
+            );
+            next_comment += 1;
+            prepared.push((
+                CommentId(next_comment),
+                CommentRecord {
+                    region: draft.region,
+                    remote: None,
+                    anchor: draft.anchor,
+                    viewer_did_author: true,
+                    reply_to: draft.reply_to,
+                    deleted: false,
+                },
+            ));
+        }
+        for edit in &capture {
+            if self.contains_region(&edit.region) {
+                self.validate_capture(edits, &edit.region)?;
+            }
+        }
+        let new_region = prepared
+            .iter()
+            .map(|(_, record)| record.region.clone())
+            .collect::<Vec<_>>();
+        edits.prepare_capture(capture, &new_region)?.commit();
+        for (identity, record) in prepared {
+            if let Some(parent) = record.reply_to {
+                self.reply.insert(parent, identity);
+            }
+            self.region.insert(record.region.clone(), identity);
+            self.comment.insert(identity, record);
+        }
+        self.next_comment = next_comment;
+        Ok(())
+    }
+
     pub(crate) fn set_mode(&mut self, mode: ReviewMode) -> Result<()> {
         ensure!(
             self.pending.is_empty(),
@@ -331,6 +447,17 @@ impl CommentStore {
 
     pub fn contains_region(&self, region: &RegionId) -> bool {
         self.region.contains_key(region)
+    }
+
+    pub fn validate_capture(&self, edits: &EditStore, region: &RegionId) -> Result<()> {
+        self.check_owner(edits)?;
+        let id = self.region.get(region).context("unknown comment region")?;
+        let comment = self.record(*id)?;
+        ensure!(
+            comment.viewer_did_author && !comment.deleted,
+            "comment is read-only or deleted"
+        );
+        Ok(())
     }
 
     pub fn record(&self, id: CommentId) -> Result<&CommentRecord> {
@@ -549,7 +676,9 @@ impl CommentStore {
             "comment admission is full"
         );
         let id = CommentId(self.next_comment + 1);
-        record.region = RegionId(format!("comment-{}/body", id.0));
+        if record.region.0.is_empty() {
+            record.region = RegionId(format!("comment-{}/body", id.0));
+        }
         edits.insert(record.region.clone(), RegionRevision(0), body)?;
         self.next_comment = id.0;
         if let Some(remote) = &record.remote {

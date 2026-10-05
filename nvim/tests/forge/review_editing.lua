@@ -38,7 +38,6 @@ local function snapshot()
   } }
 end
 local save_callback, reconcile_callback
-local hold_edits, pending_edit = false, nil
 adapter._set_runner_for_test(function(method, params, callback)
   if method == "review.open" then callback({ document = "editing", field = vim.deepcopy(field) })
   elseif method == "github.actor" then callback({ login = "viewer" })
@@ -48,38 +47,21 @@ adapter._set_runner_for_test(function(method, params, callback)
   elseif method == "review.view" or method == "review.close" then callback({})
   elseif method == "review.load" then callback({ diagnostic = {} })
   elseif method == "review.act" then actions = actions + 1 error("editable text dispatched an action")
-  elseif method == "review.region_edit" then
-    if hold_edits then
-      local receive = callback
-      callback = function(result) pending_edit = function() receive(result) end end
-    end
-    local before = snapshot()
-    local selected
-    for _, value in ipairs(field) do if value.region == params.region then selected = value end end
-    assert(selected and params.base == selected.revision)
-    selected.text, selected.sequence, selected.revision = params.text, params.sequence, params.base + 1
-    local start, previous_count = 0, 0
-    for _, value in ipairs(before.block) do
-      if value.id == "region:" .. params.region then previous_count = #value.text break end
-      start = start + #value.text
-    end
-    local changed = field_block(selected)
-    local count = 0
-    for _, value in ipairs(before.block) do count = count + #value.text end
-    revision = revision + 1
-    callback({ document = "editing", region = params.region, sequence = params.sequence, revision = selected.revision,
-      patch = { document = "editing", base = revision - 1, next = revision, base_rows = count,
-        next_rows = count - previous_count + #changed.text, base_blocks = 6, next_blocks = 6,
-        removed_block = {}, block_edit = {},
-        text_edit = { { start_row = start, removed_rows = previous_count, text = changed.text } },
-        metadata_edit = { { block = changed.id, row_count = #changed.text, metadata = changed.metadata } },
-      } })
+  elseif method == "review.region_edit" then error("typing sent a per-edit request")
   elseif method == "review.save" then
     saves = saves + 1
+    assert(#(params.capture or {}) > 0, "explicit save omitted its field capture")
+    local before_capture = vim.deepcopy(field)
+    for _, captured in ipairs(params.capture or {}) do
+      local selected
+      for _, value in ipairs(field) do if value.region == captured.region then selected = value end end
+      assert(selected and captured.base == selected.revision)
+      selected.text, selected.sequence, selected.revision = captured.text, captured.sequence, captured.base + 1
+    end
     local captured = vim.deepcopy(field)
     save_callback = function(failure, outcome)
-      if failure then callback(nil, failure) return end
-      if outcome == "missing" then callback({}) return end
+      if failure then field = before_capture callback(nil, failure) return end
+      if outcome == "missing" then field = before_capture callback({}) return end
       outcome = outcome or "confirmed"
       if outcome == "confirmed" then
         for position, value in ipairs(field) do value.baseline = captured[position].text end
@@ -140,7 +122,15 @@ for _, entry in ipairs({ { row = 1, label = "Title" }, { row = 3, label = "Revie
       assert(vim.deep_equal(marker_rows(), { entry.row }), "editing marker missing")
       local marks = vim.api.nvim_buf_get_extmarks(state.replica.buffer, state.replica.namespace,
         { entry.row - 1, 0 }, { entry.row - 1, -1 }, { details = true })
-      assert(marks[1][4].virt_text[1][1] == entry.label .. "*: ")
+      local heading
+      for _, mark in ipairs(marks) do
+        if mark[4].virt_text then
+          for _, chunk in ipairs(mark[4].virt_text) do
+            if chunk[1] == entry.label .. "*: " then heading = chunk[1] end
+          end
+        end
+      end
+      assert(heading, "editable heading did not show its active marker")
       assert(not vim.bo.modified, "entering insert mode dirtied the value")
     end)
     if not success then insert_failure = failure end
@@ -179,14 +169,14 @@ assert(not state.replica.editable.fault, state.replica.editable.fault)
 assert(vim.api.nvim_get_current_line() == "Second line", "native o did not extend the description")
 assert(vim.deep_equal(marker_rows(), { 1, 3, 4 }), vim.inspect(marker_rows()))
 assert(vim.bo.modified)
-assert(vim.wait(1000, function() return not require("forge.editable").suspend_generated_text(state.replica.editable) end))
+assert(require("forge.editable").suspend_generated_text(state.replica.editable), "local typing lost its pending capture")
 cursor(2)
 assert(not vim.bo.modifiable, "read-only metadata was unlocked")
 cursor(6)
 keys("<C-S>")
 assert(not vim.bo.modified and #marker_rows() == 0, "save waited for GitHub before clearing markers")
 assert(vim.wait(1000, function() return saves == 1 end))
-assert(state.saving and not state.save_pending, "in-flight save was not retained locally")
+assert(state.saving and not state.pending_operation, "in-flight save was not retained locally")
 adapter.refresh(state)
 assert(state.refresh_pending and not state.rendering, "refresh raced a pending save")
 save_callback("injected save rejection")
@@ -200,7 +190,10 @@ keys("A newer<Esc>")
 assert(vim.bo.modified and vim.deep_equal(marker_rows(), { 1 }), "new typing stayed optimistically clean")
 save_callback()
 assert(vim.wait(1000, function() return not state.saving and not state.rendering end))
-assert(vim.bo.modified and vim.deep_equal(marker_rows(), { 1 }), "save cleared text typed after submission")
+assert(vim.bo.modified and vim.deep_equal(marker_rows(), { 1 }), vim.inspect({
+  message = "save cleared text typed after submission", modified = vim.bo.modified,
+  marker = marker_rows(), text = vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false), field = state.fields, errors = errors,
+}))
 keys("A<C-S><Esc>")
 assert(vim.wait(1000, function() return saves == 3 end))
 save_callback()
@@ -212,23 +205,19 @@ assert(vim.wait(1000, function() return saves == 4 end))
 save_callback()
 assert(vim.wait(1000, function() return not vim.bo.modified and #marker_rows() == 0 end))
 assert(vim.wait(1000, function() return not state.saving and not state.reconciling end))
-hold_edits = true
 keys("A delayed<Esc>")
 adapter.save(state)
-assert(not vim.bo.modified and #marker_rows() == 0, "save waited for the local edit acknowledgement")
-assert(state.save_pending and not state.saving and saves == 4)
-hold_edits = false
-assert(pending_edit, "edit was not flushed on save")
-pending_edit()
+assert(not vim.bo.modified and #marker_rows() == 0, "explicit capture did not clear its submitted markers")
+assert(state.saving and not state.pending_operation)
 assert(vim.wait(1000, function() return saves == 5 end))
 adapter.save(state)
-assert(saves == 5 and not state.save_pending, "unchanged save duplicated an in-flight request")
+assert(saves == 5 and not state.pending_operation, "unchanged save duplicated an in-flight request")
 keys("A queued<Esc>")
 adapter.save(state)
-assert(state.save_pending and saves == 5 and not vim.bo.modified and #marker_rows() == 0)
+assert(state.pending_operation and saves == 5 and not vim.bo.modified and #marker_rows() == 0)
 keys("A latest<Esc>")
 adapter.save(state)
-assert(state.save_pending and saves == 5 and not vim.bo.modified)
+assert(state.pending_operation and saves == 5 and not vim.bo.modified)
 save_callback()
 assert(vim.wait(1000, function() return saves == 6 end), "queued save was dropped")
 assert(not vim.bo.modified and #marker_rows() == 0, "older completion restored queued markers")
@@ -242,7 +231,7 @@ for _, outcome in ipairs({ "rejected", "outcome_unknown", "missing" }) do
   assert(vim.wait(1000, function() return state.saving ~= nil end))
   keys("A retry<Esc>")
   adapter.save(state)
-  assert(state.save_pending and not vim.bo.modified)
+  assert(state.pending_operation and not vim.bo.modified)
   local before = saves
   save_callback(nil, outcome)
   if outcome == "outcome_unknown" then
@@ -252,44 +241,47 @@ for _, outcome in ipairs({ "rejected", "outcome_unknown", "missing" }) do
     assert(vim.wait(1000, function() return not state.save_recovering end))
     assert(state.save_uncertain and vim.bo.modifiable, "failed recovery disabled editing")
     reconcile_callback = nil
-    keys("gR")
-    assert(vim.wait(1000, function() return reconcile_callback ~= nil end), "gR did not retry field recovery")
+    keys("A pending recovery<Esc>")
+    local recovery_capture = vim.api.nvim_get_current_line()
+    adapter.save(state)
+    assert(state.pending_operation.text.title == recovery_capture, "save during recovery lost its explicit capture")
+    assert(vim.wait(1000, function() return reconcile_callback ~= nil end), "explicit save did not retry field recovery")
     reconcile_callback({ field = vim.deepcopy(field), uncertain = false })
     assert(vim.wait(1000, function() return not state.save_recovering end))
   end
+  assert(vim.wait(1000, function() return saves == before + 1 end), "explicit queued capture was discarded")
+  assert(state.saving and not state.pending_operation)
+  keys("A retained<Esc>")
+  save_callback()
   assert(vim.wait(1000, function() return not state.saving and not state.reconciling end))
-  assert(not state.save_pending and saves == before, "failed save automatically retried a queued request")
   assert(vim.bo.modified and vim.deep_equal(marker_rows(), { 1 }), "failure lost unsaved state")
 end
 keys("A rollback<Esc>")
+local retained_recovery_text = vim.api.nvim_get_current_line()
 adapter.save(state)
 assert(vim.wait(1000, function() return state.saving ~= nil end))
 reconcile_callback = nil
 save_callback(nil, "outcome_unknown")
 assert(vim.wait(1000, function() return reconcile_callback ~= nil end))
 reconcile_callback({ field = vim.deepcopy(field), uncertain = false })
-assert(vim.wait(1000, function()
-  return not state.save_recovering and not require("forge.editable").suspend_generated_text(state.replica.editable)
-end))
-assert(vim.api.nvim_get_current_line() == field[1].baseline, "unchanged rejected capture did not roll back to observed text")
-assert(not vim.bo.modified and #marker_rows() == 0)
+assert(vim.wait(1000, function() return not state.save_recovering end))
+assert(vim.api.nvim_get_current_line() == retained_recovery_text, "save recovery replaced locally owned text")
+assert(vim.bo.modified and vim.deep_equal(marker_rows(), { 1 }))
 cursor(6)
 keys("A<CR><CR><Esc>")
-local description = field[3].text:gsub("[\r\n]+$", "")
-for _, region in ipairs({ "reviewers", "title" }) do
-  local bounds = state.replica.editable.native.anchor[region]
-  vim.api.nvim_buf_set_text(state.replica.buffer, bounds.finish.row, bounds.finish.column,
-    bounds.finish.row, bounds.finish.column, { "", "", "" })
-end
+local description_anchor = state.replica.editable.native.anchor.body
+local description = table.concat(vim.api.nvim_buf_get_text(state.replica.buffer,
+  description_anchor.start.row, description_anchor.start.column,
+  description_anchor.finish.row, description_anchor.finish.column, {}), "\n")
+assert(description:sub(-2) == "\n\n", "fixture omitted trailing empty description rows")
+local before_save_text = vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false)
 adapter.save(state)
-assert(not vim.bo.modified and #marker_rows() == 0, "trim delayed optimistic save")
-for _, region in ipairs({ "title", "reviewers" }) do
-  local bounds = state.replica.editable.native.anchor[region]
-  assert(bounds.start.row == bounds.finish.row, "save retained trailing lines in " .. region)
-end
+assert(not vim.bo.modified and #marker_rows() == 0, "explicit capture delayed submitted markers")
+assert(vim.deep_equal(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false), before_save_text),
+  "save transformed locally owned buffer text")
 local anchor = state.replica.editable.native.anchor.body
 assert(table.concat(vim.api.nvim_buf_get_text(state.replica.buffer, anchor.start.row, anchor.start.column,
-  anchor.finish.row, anchor.finish.column, {}), "\n") == description, "save retained trailing description lines")
+  anchor.finish.row, anchor.finish.column, {}), "\n") == description, "save changed trailing description rows")
 assert(vim.wait(1000, function() return state.saving ~= nil end))
 assert(field[3].text == description and description:find("\nSecond line", 1, true), "save changed internal paragraphs")
 save_callback()
@@ -313,7 +305,7 @@ cursor(3)
 keys("A @ViEwEr<Esc>")
 local before_self = saves
 adapter.save(state)
-assert(saves == before_self and not state.save_pending and vim.bo.modified, "self reviewer was submitted")
+assert(saves == before_self and not state.pending_operation and vim.bo.modified, "self reviewer was submitted")
 assert(completion(6, "@al", users)[1].textEdit.newText == "@alice")
 local issues = require("github.issue_source").new()
 assert(completion(6, "#issue", issues)[1].textEdit.newText == "#42")
@@ -321,8 +313,7 @@ assert(warmed_users == 1 and warmed_issues == 1, "completion performed another r
 assert(actions == 0 and vim.deep_equal(errors, { "injected save rejection", "Review save was rejected",
   "injected observation failure. Press gR to retry recovery. Your edits are retained.",
   "Missing native review save result", "You cannot request a review from yourself (@viewer)" }), vim.inspect(errors))
-require("forge.editable").flush(state.replica.editable)
-assert(vim.wait(1000, function() return not require("forge.editable").suspend_generated_text(state.replica.editable) end))
+assert(require("forge.editable").suspend_generated_text(state.replica.editable), "unsaved completion text lost its local capture")
 vim.api.nvim_buf_delete(state.replica.buffer, { force = true })
 adapter._set_runner_for_test(nil)
 print("review_editing: immediate save markers, queued saves, reconciliation failures, native fields, and completion passed")

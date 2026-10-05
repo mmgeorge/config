@@ -26,17 +26,18 @@ local function task_folds(review, owner)
   for id, record in pairs(state and state.record or {}) do
     if id:match("^plan:design:") or id:match("^plan:section:") then
       local _, block_row = replica.sequence:position(record.owner)
+      block_row = buffer.physical_row(replica, block_row)
       local heading_row = block_row
       if record.fold.heading_start then
-        heading_row = select(2, replica.sequence:position(record.fold.heading_start.block)) + record.fold.heading_start.position.row
+        heading_row = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold.heading_start.block)) + record.fold.heading_start.position.row)
       end
-      local finish_block_row = select(2, replica.sequence:position(record.fold["end"].block))
+      local finish_block_row = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold["end"].block)))
       result[#result + 1] = {
         id = id,
         owner = record.owner,
         heading_start_line = heading_row + 1,
-        start_line = block_row + record.fold.start.row + 1,
-        end_line = finish_block_row + record.fold["end"].position.row + 1,
+        start_line = buffer.physical_row(replica, select(2, replica.sequence:position(record.owner)) + record.fold.start.row) + 1,
+        end_line = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold["end"].block)) + record.fold["end"].position.row + 1),
         record = record,
       }
     end
@@ -58,13 +59,13 @@ local function default_closed_folds(review, owner)
   for id, record in pairs(state and state.record or {}) do
     if record.fold.closed and not (id:match("^plan:design:") or id:match("^plan:section:")) then
       local _, block_row = replica.sequence:position(record.owner)
-      local finish_block_row = select(2, replica.sequence:position(record.fold["end"].block))
+      local finish_block_row = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold["end"].block)))
       result[#result + 1] = {
         id = id,
         owner = record.owner,
-        heading_start_line = block_row + 1,
-        start_line = block_row + record.fold.start.row + 1,
-        end_line = finish_block_row + record.fold["end"].position.row + 1,
+        heading_start_line = buffer.physical_row(replica, block_row) + 1,
+        start_line = buffer.physical_row(replica, block_row + record.fold.start.row) + 1,
+        end_line = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold["end"].block)) + record.fold["end"].position.row + 1),
         record = record,
       }
     end
@@ -121,7 +122,7 @@ local function toggle_task_fold(review)
 end
 
 local function close_review(review)
-  if not review.owner.close() then notice("Plan review is awaiting a saved acknowledgement") return false end
+  if not review.owner.close() then notice("Plan review has an explicit operation in progress") return false end
   if vim.api.nvim_tabpage_is_valid(review.tab) and review.tab ~= review.return_tab and vim.fn.tabpagenr("$") > 1 then
     vim.api.nvim_set_current_tabpage(review.tab)
     vim.cmd("tabclose")
@@ -130,7 +131,7 @@ local function close_review(review)
     vim.api.nvim_set_current_tabpage(review.return_tab)
     if vim.api.nvim_win_is_valid(review.return_win) then vim.api.nvim_set_current_win(review.return_win) end
   end
-  if session.harness.plan_review == review then session.harness.plan_review = nil end
+  if session.harness.plan_review == review and not vim.bo[review.buf].modified then session.harness.plan_review = nil end
   return true
 end
 
@@ -223,6 +224,11 @@ local function action(review, name)
       review.owner.public_only = result.public_only
       refresh_winbar(review)
     elseif name == "comment" then
+      if result.local_draft then
+        vim.cmd("silent! normal! zv")
+        vim.cmd("startinsert")
+        return
+      end
       local _, row = review.owner.replica.sequence:position(result.block)
       local view = review.owner.current_view()
       if row and view then
@@ -264,7 +270,11 @@ local function submit(review, method, params)
         and session.harness.session and session.harness.session.id == review.session_id then M.open(review.plan) end
       return
     end
-    if not review.owner.closed then close_review(review) end
+    local current = session.harness.plan_review
+    local completed = current and current.buf == review.buf and current.plan.id == review.plan.id
+      and current.plan.review_digest == review.plan.review_digest
+      and current.plan.historical_revision == review.plan.historical_revision and current or review
+    if not completed.owner.closed then close_review(completed) end
     if result then controller.activate_snapshot(result) end
     controller.render()
     if method == "plan.acceptance.begin" then vim.schedule(function() controller.present_plan_question(true) end) end
@@ -275,7 +285,7 @@ local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review) end)
   command_set.register(set, "visual_line_with_gutter", review.owner.gutter_selection.start)
-  for _, name in ipairs({ "open", "jump_entity", "comment", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({ "open", "jump_entity", "entity_info", "schema", "comment", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
   command_set.register(set, "abort_plan", function()
     if not review.plan.historical_revision and session.harness.active_plan
@@ -313,10 +323,12 @@ function M.open(plan)
       previous.owner.refresh_views()
       return
     end
-    local failure
-    recovery, failure = previous.owner.recovery()
-    if not recovery then notice(failure) return end
-    previous.owner.close()
+    if not previous.owner.closed then
+      local failure
+      recovery, failure = previous.owner.recovery()
+      if not recovery then notice(failure) return end
+      previous.owner.close()
+    end
   elseif previous and not close_review(previous) then return end
   local origin = session.harness.transcript_win
   if not origin or not vim.api.nvim_win_is_valid(origin) then origin = vim.api.nvim_get_current_win() end
@@ -329,12 +341,14 @@ function M.open(plan)
     native_buffer = vim.api.nvim_create_buf(false, true)
     vim.api.nvim_buf_set_name(native_buffer, plan.working_path)
   end
-  vim.bo[native_buffer].buftype = "nofile"
-  vim.bo[native_buffer].filetype = "forge"
-  vim.bo[native_buffer].modifiable = true
-  vim.api.nvim_buf_set_lines(native_buffer, 0, -1, false, { "Loading plan review…" })
-  vim.bo[native_buffer].modified = false
-  vim.bo[native_buffer].modifiable = false
+  if not recovery then
+    vim.bo[native_buffer].buftype = "nofile"
+    vim.bo[native_buffer].filetype = "forge"
+    vim.bo[native_buffer].modifiable = true
+    vim.api.nvim_buf_set_lines(native_buffer, 0, -1, false, { "Loading plan review…" })
+    vim.bo[native_buffer].modified = false
+    vim.bo[native_buffer].modifiable = false
+  end
   vim.cmd("tabnew")
   vim.api.nvim_win_set_buf(0, native_buffer)
   local window = vim.api.nvim_get_current_win()
@@ -349,9 +363,11 @@ function M.open(plan)
   keymaps.apply_view_winbar(window, "PlanReview", "plan_review", loading_commands, "Loading review")
   review.owner = require("forge.views.plan_review.document").attach({ plan = plan, session_id = review.session_id,
     buffer = native_buffer, window = window, recovery = recovery, notice = notice,
+    recovery_provider = recovery and function() return previous.owner.recovery() end or nil,
     configure_view = function(view, owner) apply_task_folds(review, view.window, owner) end }, function(owner, failure)
     if failure then
       discard_failed_attachment(review)
+      if recovery then session.harness.plan_review = previous end
       notice(failure)
       return
     end

@@ -7,10 +7,10 @@ use std::path::{Path, PathBuf};
 use crate::session::{ExecutionMode, continuation::ContinuationBudget};
 
 mod audit;
-mod deviation;
-mod document;
 mod design;
 mod design_review;
+mod deviation;
+mod document;
 mod review_file_layout;
 pub use design::{DeclarationDesign, DeclarationFile, DesignPatchRequest};
 mod edit;
@@ -22,6 +22,7 @@ mod render;
 mod resolution;
 mod review_annotation;
 pub(crate) use review_annotation::resolve_annotations;
+pub use review_annotation::{ReviewAnnotation, ReviewAnnotationAnchor};
 pub(crate) mod review_document;
 mod review_projection;
 pub(crate) mod review_source;
@@ -455,15 +456,22 @@ impl PlanElicitation {
     /// Reopen a reviewed decision without consuming its prior selection as user feedback.
     pub fn begin_clarification(&mut self, question_id: &str) -> Result<()> {
         let question_index = if question_id == self.question_set.id {
-            self.current_index.min(self.question_set.questions.len().saturating_sub(1))
+            self.current_index
+                .min(self.question_set.questions.len().saturating_sub(1))
         } else {
-            self.question_set.questions.iter()
+            self.question_set
+                .questions
+                .iter()
                 .position(|question| question.id == question_id)
                 .context("clarification question not found")?
         };
-        let question = self.question_set.questions.get(question_index)
+        let question = self
+            .question_set
+            .questions
+            .get(question_index)
             .context("clarification requires a question")?;
-        self.answer.retain(|answer| answer.question_id != question.id);
+        self.answer
+            .retain(|answer| answer.question_id != question.id);
         self.current_index = question_index;
         self.clarification_active = true;
         Ok(())
@@ -714,15 +722,27 @@ pub struct PlanExecutionRecord {
 
 impl PlanExecutionRecord {
     /// Sum owning provider execution within a task, excluding gaps between turns.
-    pub(crate) fn task_duration_ms<'a>(&self, task_path: &str,
-        exchanges: impl Iterator<Item = &'a crate::exchange::Exchange>, end_ms: i64) -> i64 {
-        let Some(start_ms) = self.scheduler.task.iter()
-            .find(|task| task.task_path == task_path).and_then(|task| task.started_at_ms) else {
+    pub(crate) fn task_duration_ms<'a>(
+        &self,
+        task_path: &str,
+        exchanges: impl Iterator<Item = &'a crate::exchange::Exchange>,
+        end_ms: i64,
+    ) -> i64 {
+        let Some(start_ms) = self
+            .scheduler
+            .task
+            .iter()
+            .find(|task| task.task_path == task_path)
+            .and_then(|task| task.started_at_ms)
+        else {
             return 0;
         };
-        exchanges.filter(|exchange| exchange.execution_id.as_deref() == Some(self.id.as_str()))
+        exchanges
+            .filter(|exchange| exchange.execution_id.as_deref() == Some(self.id.as_str()))
             .flat_map(|exchange| &exchange.turn)
-            .fold(0i64, |duration, turn| duration.saturating_add(turn.duration_between(start_ms, end_ms)))
+            .fold(0i64, |duration, turn| {
+                duration.saturating_add(turn.duration_between(start_ms, end_ms))
+            })
     }
 
     /// Append one durable scheduler event at its causal exchange position.
@@ -876,7 +896,13 @@ impl PlanFileStore {
         expected_version: u64,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let document = self.read_working_document(session_id, plan_id)?;
-        self.submit_validated_document_revision(session_id, plan_id, revision, expected_version, document)
+        self.submit_validated_document_revision(
+            session_id,
+            plan_id,
+            revision,
+            expected_version,
+            document,
+        )
     }
 
     /// Freeze one externally validated document without re-reading stale derived state.
@@ -904,8 +930,15 @@ impl PlanFileStore {
         }
         document.validate_for_submission()?;
         if let Some(design) = &mut document.design {
-            if design.validation.as_ref().is_none_or(|report| report.fingerprint != crate::declaration::fingerprint(design)) {
-                design.validation = Some(crate::declaration::DeclarationResolver::local(&self.workspace, design, false)?.validate(design));
+            if design
+                .validation
+                .as_ref()
+                .is_none_or(|report| report.fingerprint != crate::declaration::fingerprint(design))
+            {
+                design.validation = Some(
+                    crate::declaration::DeclarationResolver::local(&self.workspace, design, false)?
+                        .validate(design),
+                );
             }
             design.validation.as_ref().unwrap().ensure_valid()?;
         }
@@ -1083,7 +1116,14 @@ mod test {
     #[test]
     fn manifest_changes_capture_patch_submit_and_remain_visible_without_source_writes() {
         let temporary = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(temporary.path()).status().unwrap().success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(temporary.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let manifest = "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nengine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n";
         fs::write(temporary.path().join("Cargo.toml"), manifest).unwrap();
         let design = DeclarationDesign::capture(temporary.path()).unwrap();
@@ -1093,72 +1133,174 @@ mod test {
         let patch = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n-engine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n+engine = { version = \"1.3\", default-features = false, features = [\"render\", \"input\"] }\n*** Add File: config/arena.toml\n+[arena]\n+speed = 200\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Enable engine input and configure arena speed.\"\n*** End Patch";
         let mut document = document::test_fixture("plan", "Arena dependencies");
         document.design = Some(design.patch(patch).unwrap());
-        document.design.as_mut().unwrap().document.task = "Enable keyboard input with configurable arena movement.".into();
+        document.design.as_mut().unwrap().document.task =
+            "Enable keyboard input with configurable arena movement.".into();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
-        store.write_working_document("session", "plan", &document).unwrap();
-        let (submitted, rendered, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        store
+            .write_working_document("session", "plan", &document)
+            .unwrap();
+        let (submitted, rendered, checksum) = store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
         assert!(rendered.markdown.contains("Modified Cargo.toml"));
         assert!(rendered.markdown.contains("engine = { version = \"1.3\""));
         assert!(rendered.markdown.contains("config/arena.toml"));
-        let (rows, targets) = design_review::project(&submitted, &Default::default(), &[], &Default::default(), None, &Default::default(), true, None).unwrap();
-        let text = rows.iter().flat_map(|row| row.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        let (rows, targets) = design_review::project(
+            &submitted,
+            &Default::default(),
+            &[],
+            &Default::default(),
+            None,
+            &Default::default(),
+            true,
+            None,
+        )
+        .unwrap();
+        let text = rows
+            .iter()
+            .flat_map(|row| row.text.wire_rows())
+            .collect::<Vec<_>>()
+            .join("\n");
         assert!(text.contains("Modified Cargo.toml"));
         assert!(text.contains("speed = 200"));
         assert!(targets.values().any(|anchor| matches!(&anchor.target, PlanReviewTarget::Declaration { path, side, .. } if path == "Cargo.toml" && side == "proposed")));
-        assert_eq!(store.capture_review_source("session", "plan", 1, &checksum).unwrap().document.design, submitted.design);
-        assert_eq!(fs::read_to_string(temporary.path().join("Cargo.toml")).unwrap(), manifest);
+        assert_eq!(
+            store
+                .capture_review_source("session", "plan", 1, &checksum)
+                .unwrap()
+                .document
+                .design,
+            submitted.design
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("Cargo.toml")).unwrap(),
+            manifest
+        );
         assert!(!temporary.path().join("config/arena.toml").exists());
     }
 
     #[test]
     fn configuration_changes_capture_validate_submit_and_render_with_saved_targets() {
         let temporary = tempfile::tempdir().unwrap();
-        assert!(std::process::Command::new("git").args(["init", "--quiet"]).current_dir(temporary.path()).status().unwrap().success());
+        assert!(
+            std::process::Command::new("git")
+                .args(["init", "--quiet"])
+                .current_dir(temporary.path())
+                .status()
+                .unwrap()
+                .success()
+        );
         let configurations = [
-            ("package.json", "{\"name\":\"before\"}\n", "{\"name\":\"after\"}\n", "{\"name\":}"),
-            ("tsconfig.json", "{\"strict\":false,}\n", "{// Checking\n\"strict\":true,}\n", "{\"strict\":true \"other\":false}"),
-            ("ci.yaml", "script: |\n  echo before\n", "script: |\n  echo after\n", "script: [unclosed"),
-            ("App.csproj", "<Project><Name>before</Name></Project>\n", "<Project><Name>after</Name></Project>\n", "<Project><Name></Project>"),
+            (
+                "package.json",
+                "{\"name\":\"before\"}\n",
+                "{\"name\":\"after\"}\n",
+                "{\"name\":}",
+            ),
+            (
+                "tsconfig.json",
+                "{\"strict\":false,}\n",
+                "{// Checking\n\"strict\":true,}\n",
+                "{\"strict\":true \"other\":false}",
+            ),
+            (
+                "ci.yaml",
+                "script: |\n  echo before\n",
+                "script: |\n  echo after\n",
+                "script: [unclosed",
+            ),
+            (
+                "App.csproj",
+                "<Project><Name>before</Name></Project>\n",
+                "<Project><Name>after</Name></Project>\n",
+                "<Project><Name></Project>",
+            ),
         ];
         for (path, baseline, _, _) in configurations {
             fs::write(temporary.path().join(path), baseline).unwrap();
         }
-        fs::write(temporary.path().join("plan.json"), "{\"project_setting\":true}").unwrap();
+        fs::write(
+            temporary.path().join("plan.json"),
+            "{\"project_setting\":true}",
+        )
+        .unwrap();
         let mut design = DeclarationDesign::capture(temporary.path()).unwrap();
         assert!(!design.baseline.contains_key("plan.json"));
         for (path, baseline, proposed, invalid) in configurations {
             assert_eq!(design.baseline[path].text, baseline);
             let before = design.clone();
-            let invalid_patch = format!("*** Begin Patch\n*** Update File: {path}\n@@\n-{}\n+{invalid}\n*** End Patch", baseline.trim_end());
+            let invalid_patch = format!(
+                "*** Begin Patch\n*** Update File: {path}\n@@\n-{}\n+{invalid}\n*** End Patch",
+                baseline.trim_end()
+            );
             assert!(design.patch(&invalid_patch).is_err(), "{path}");
             assert_eq!(design, before);
-            let removed = baseline.lines().map(|line| format!("-{line}")).collect::<Vec<_>>().join("\n");
-            let added = proposed.lines().map(|line| format!("+{line}")).collect::<Vec<_>>().join("\n");
+            let removed = baseline
+                .lines()
+                .map(|line| format!("-{line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
+            let added = proposed
+                .lines()
+                .map(|line| format!("+{line}"))
+                .collect::<Vec<_>>()
+                .join("\n");
             design = design.patch(&format!("*** Begin Patch\n*** Update File: {path}\n@@\n{removed}\n{added}\n*** End Patch")).unwrap();
         }
         design = design.patch("*** Begin Patch\n*** Add File: settings.jsonc\n+{\"enabled\":true,}\n*** End Patch").unwrap();
-        design = design.patch("*** Begin Patch\n*** Delete File: settings.jsonc\n*** End Patch").unwrap();
+        design = design
+            .patch("*** Begin Patch\n*** Delete File: settings.jsonc\n*** End Patch")
+            .unwrap();
         assert!(!design.proposed.contains_key("settings.jsonc"));
         design.document.task = "Update project configuration across supported formats.".into();
-        design.document.description = "Update package metadata, type checks, CI, and the XML project.".into();
+        design.document.description =
+            "Update package metadata, type checks, CI, and the XML project.".into();
         let mut document = document::test_fixture("plan", "Configuration");
         document.design = Some(design);
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
-        store.write_working_document("session", "plan", &document).unwrap();
-        let (submitted, rendered, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        store
+            .write_working_document("session", "plan", &document)
+            .unwrap();
+        let (submitted, rendered, checksum) = store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
         assert!(rendered.markdown.contains("Modified package.json"));
         for public_only in [false, true] {
-            let (rows, targets) = design_review::project(&submitted, &Default::default(), &[], &Default::default(), None, &Default::default(), public_only, None).unwrap();
-            let text = rows.iter().flat_map(|row| row.text.wire_rows()).collect::<Vec<_>>().join("\n");
+            let (rows, targets) = design_review::project(
+                &submitted,
+                &Default::default(),
+                &[],
+                &Default::default(),
+                None,
+                &Default::default(),
+                public_only,
+                None,
+            )
+            .unwrap();
+            let text = rows
+                .iter()
+                .flat_map(|row| row.text.wire_rows())
+                .collect::<Vec<_>>()
+                .join("\n");
             for (path, baseline, proposed, _) in configurations {
                 assert!(text.contains(path));
                 assert!(text.contains(proposed.lines().last().unwrap()));
                 assert!(targets.values().any(|anchor| matches!(&anchor.target, PlanReviewTarget::Declaration { path: target_path, side, .. } if target_path == path && side == "proposed")));
-                assert_eq!(fs::read_to_string(temporary.path().join(path)).unwrap(), baseline);
+                assert_eq!(
+                    fs::read_to_string(temporary.path().join(path)).unwrap(),
+                    baseline
+                );
                 assert_eq!(submitted.design.as_ref().unwrap().proposed[path], proposed);
             }
         }
-        assert_eq!(store.capture_review_source("session", "plan", 1, &checksum).unwrap().document.design, submitted.design);
+        assert_eq!(
+            store
+                .capture_review_source("session", "plan", 1, &checksum)
+                .unwrap()
+                .document
+                .design,
+            submitted.design
+        );
     }
 
     #[test]
@@ -1168,33 +1310,77 @@ mod test {
         fs::write(temporary.path().join("registry.rs"), source).unwrap();
         let mut document = document::test_fixture("plan", "Registry");
         let mut design = DeclarationDesign::default();
-        design.document.task = "Format registry declarations without changing their interface.".into();
+        design.document.task =
+            "Format registry declarations without changing their interface.".into();
         design.document.description = "Preserve the registry interface.".into();
         design.line_width = 60;
-        design.baseline.insert("registry.rs".into(), DeclarationFile {
-            text: forge_diff::syntax::DeclarationOverview::extract("registry.rs", source).unwrap(),
-            source_digest: digest(source.as_bytes()),
-        });
-        design.proposed.insert("registry.rs".into(), "pub struct Registry {\n pub first: u64,\n pub second: u64\n}\n".into());
+        design.baseline.insert(
+            "registry.rs".into(),
+            DeclarationFile {
+                text: forge_diff::syntax::DeclarationOverview::extract("registry.rs", source)
+                    .unwrap(),
+                source_digest: digest(source.as_bytes()),
+            },
+        );
+        design.proposed.insert(
+            "registry.rs".into(),
+            "pub struct Registry {\n pub first: u64,\n pub second: u64\n}\n".into(),
+        );
         document.design = Some(design);
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
-        store.write_working_document("session", "plan", &document).unwrap();
-        let (submitted, rendered, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        store
+            .write_working_document("session", "plan", &document)
+            .unwrap();
+        let (submitted, rendered, checksum) = store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
         let design = submitted.design.as_ref().unwrap();
-        assert!(design.changed_paths().is_empty(), "formatting created a false design change");
+        assert!(
+            design.changed_paths().is_empty(),
+            "formatting created a false design change"
+        );
         assert!(rendered.markdown.contains("No declaration changes"));
-        assert_eq!(design.proposed["registry.rs"], "pub struct Registry {\n  pub first: u64,\n  pub second: u64,\n}\n");
-        assert_eq!(store.read_working_document("session", "plan").unwrap().design, submitted.design);
-        assert_eq!(store.capture_review_source("session", "plan", 1, &checksum).unwrap().document.design, submitted.design);
-        assert_eq!(fs::read_to_string(temporary.path().join("registry.rs")).unwrap(), source);
+        assert_eq!(
+            design.proposed["registry.rs"],
+            "pub struct Registry {\n  pub first: u64,\n  pub second: u64,\n}\n"
+        );
+        assert_eq!(
+            store
+                .read_working_document("session", "plan")
+                .unwrap()
+                .design,
+            submitted.design
+        );
+        assert_eq!(
+            store
+                .capture_review_source("session", "plan", 1, &checksum)
+                .unwrap()
+                .document
+                .design,
+            submitted.design
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("registry.rs")).unwrap(),
+            source
+        );
         let request = DesignPatchRequest { plan_id: "plan".into(), expected_version: 1, title: None,
             patch: "*** Begin Patch\n*** Update File: registry.rs\n@@\n-  pub second: u64,\n+  pub second: String,\n*** End Patch".into() };
         let revised = submitted.patch_design(request).unwrap();
-        store.write_working_document("session", "plan", &revised).unwrap();
-        let (submitted, _, _) = store.submit_validated_document_revision("session", "plan", 2, 2, revised).unwrap();
-        assert_eq!(submitted.design.as_ref().unwrap().changed_paths(), vec!["registry.rs"]);
+        store
+            .write_working_document("session", "plan", &revised)
+            .unwrap();
+        let (submitted, _, _) = store
+            .submit_validated_document_revision("session", "plan", 2, 2, revised)
+            .unwrap();
+        assert_eq!(
+            submitted.design.as_ref().unwrap().changed_paths(),
+            vec!["registry.rs"]
+        );
         assert_eq!(submitted.design.as_ref().unwrap().line_width, 60);
-        assert_eq!(fs::read_to_string(temporary.path().join("registry.rs")).unwrap(), source);
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("registry.rs")).unwrap(),
+            source
+        );
     }
 
     #[test]
@@ -1588,13 +1774,26 @@ mod test {
     fn clarification_reopens_only_the_question_being_reconsidered() {
         let mut elicitation = PlanElicitation::new(PlanQuestionSet {
             id: "set".into(),
-            questions: ["scope", "testing"].into_iter().map(|id| PlanQuestion {
-                id: id.into(), header: id.into(), question: id.into(),
-                options: Vec::new(), allow_freeform: true,
-            }).collect(),
+            questions: ["scope", "testing"]
+                .into_iter()
+                .map(|id| PlanQuestion {
+                    id: id.into(),
+                    header: id.into(),
+                    question: id.into(),
+                    options: Vec::new(),
+                    allow_freeform: true,
+                })
+                .collect(),
         });
         for id in ["scope", "testing"] {
-            elicitation.answer(id, PlanQuestionResponse::Other { text: "chosen".into() }).unwrap();
+            elicitation
+                .answer(
+                    id,
+                    PlanQuestionResponse::Other {
+                        text: "chosen".into(),
+                    },
+                )
+                .unwrap();
         }
         assert!(elicitation.current_question().is_none());
         elicitation.begin_clarification("scope").unwrap();

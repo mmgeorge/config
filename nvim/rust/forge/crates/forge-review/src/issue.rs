@@ -55,6 +55,7 @@ pub struct IssueEditResult {
 #[derive(Serialize)]
 pub struct IssueFieldState {
     pub region: RegionId,
+    pub baseline: String,
     pub revision: RegionRevision,
     pub sequence: forge_buffer::identity::EditSequence,
     pub dirty: bool,
@@ -406,6 +407,7 @@ impl IssueDocument {
                 let field = self.edits.snapshot(&region)?;
                 Ok(IssueFieldState {
                     region,
+                    baseline: field.baseline.to_owned(),
                     revision: field.revision,
                     sequence: field.sequence,
                     dirty: field.dirty,
@@ -419,6 +421,49 @@ impl IssueDocument {
     /// Validates both replicas before committing one field edit and its incremental patch.
     pub fn edit(&mut self, edit: RegionEdit) -> Result<IssueEditResult> {
         Ok(self.prepare_edit(edit)?.commit())
+    }
+
+    pub fn capture_draft(&mut self, capture: Vec<RegionEdit>) -> Result<()> {
+        for edit in &capture {
+            ensure!(
+                ISSUE_FIELD.contains(&edit.region.0.as_str()),
+                "unknown issue field"
+            );
+            if edit.region.0 != "body" {
+                ensure!(
+                    !edit.text.contains(['\n', '\r']) && edit.text.len() <= 16 * 1024,
+                    "invalid issue scalar field"
+                );
+            }
+        }
+        let captured = self.edits.prepare_capture(capture, &[])?;
+        let title = captured.snapshot(&RegionId("title".into()))?;
+        ensure!(
+            !title.text.trim().is_empty() && title.text.len() <= 1024,
+            "invalid issue title"
+        );
+        assignee_logins(captured.snapshot(&RegionId("assignees".into()))?.text)?;
+        let changes = ISSUE_FIELD
+            .iter()
+            .map(|name| {
+                let region = RegionId((*name).into());
+                let block = field_snapshot_block(region.clone(), captured.snapshot(&region)?)?;
+                let index = self
+                    .buffer
+                    .block_index(&block.id)
+                    .context("issue field is missing")?;
+                Ok(forge_buffer::sequence::SequenceEdit {
+                    range: index..index + 1,
+                    block: vec![block],
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let projection = self.buffer.prepare_edits(changes)?;
+        captured.commit();
+        if let Some(projection) = projection {
+            projection.commit();
+        }
+        Ok(())
     }
 
     pub fn prepare_edit(&mut self, edit: RegionEdit) -> Result<PreparedIssueEdit<'_>> {
@@ -827,6 +872,63 @@ mod tests {
         assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
         assert_eq!(document.draft_payload().unwrap(), draft);
         edit(&mut document, "body", 0, 1, "accepted");
+    }
+
+    #[test]
+    fn failed_issue_capture_preserves_fields_and_projection() {
+        let mut document = issue_document();
+        let index = document.buffer.block_index(&BlockId("region:body".into())).unwrap();
+        document.buffer.edit_many(vec![forge_buffer::sequence::SequenceEdit {
+            range: index..index + 1,
+            block: vec![],
+        }]).unwrap();
+        let before = serde_json::to_value(document.snapshot()).unwrap();
+        let draft = document.draft_payload().unwrap();
+        let failure = document.capture_draft(vec![RegionEdit {
+            document: DocumentId("issue-document".into()),
+            region: RegionId("body".into()),
+            base: RegionRevision(0),
+            sequence: EditSequence(1),
+            text: "candidate\r\nλ\n".into(),
+        }]).unwrap_err();
+        assert!(failure.to_string().contains("issue field is missing"));
+        assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
+        assert_eq!(document.draft_payload().unwrap(), draft);
+    }
+
+    #[test]
+    fn invalid_issue_capture_rejects_every_field_before_adoption() {
+        for (region, text) in [("title", "  "), ("assignees", "invalid/login")] {
+            let mut document = issue_document();
+            let before = serde_json::to_value(document.snapshot()).unwrap();
+            let draft = document.draft_payload().unwrap();
+            assert!(document.capture_draft(vec![RegionEdit {
+                document: DocumentId("issue-document".into()),
+                region: RegionId("body".into()),
+                base: RegionRevision(0),
+                sequence: EditSequence(1),
+                text: "candidate body".into(),
+            }, RegionEdit {
+                document: DocumentId("issue-document".into()),
+                region: RegionId(region.into()),
+                base: RegionRevision(0),
+                sequence: EditSequence(2),
+                text: text.into(),
+            }]).is_err());
+            assert_eq!(serde_json::to_value(document.snapshot()).unwrap(), before);
+            assert_eq!(document.draft_payload().unwrap(), draft);
+        }
+    }
+
+    #[test]
+    fn issue_field_metadata_retains_saved_baseline_during_local_capture() {
+        let mut document = issue_document();
+        edit(&mut document, "body", 0, 1, "local\r\nλ\n");
+        let field = document.fields().unwrap().into_iter().find(|field| field.region.0 == "body").unwrap();
+        assert_eq!(field.baseline, "exact\r\nbody\n");
+        assert!(field.dirty);
+        let encoded = serde_json::to_value(field).unwrap();
+        assert_eq!(encoded["baseline"], "exact\r\nbody\n");
     }
 
     #[test]

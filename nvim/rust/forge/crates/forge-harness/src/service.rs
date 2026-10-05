@@ -65,27 +65,44 @@ impl HarnessService {
         match &request {
             crate::buffer::session::PresentationRequest::Recap { model }
             | crate::buffer::session::PresentationRequest::SessionName { model } => {
-                let purpose = if matches!(&request, crate::buffer::session::PresentationRequest::SessionName { .. }) {
+                let purpose = if matches!(
+                    &request,
+                    crate::buffer::session::PresentationRequest::SessionName { .. }
+                ) {
                     crate::backend::TextGeneration::SessionName
-                } else { crate::backend::TextGeneration::Recap };
-                let history = controller.presentation.lock()
-                    .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?.conversation_history()?;
+                } else {
+                    crate::backend::TextGeneration::Recap
+                };
+                let history = controller
+                    .presentation
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                    .conversation_history()?;
                 let request = controller.catalog_request.read().await.clone();
-                let text = controller.backend.generate_text(request, purpose, model, &history).await?;
+                let text = controller
+                    .backend
+                    .generate_text(request, purpose, model, &history)
+                    .await?;
                 return Ok(json!({"text": purpose.validate(&text)?}));
             }
             crate::buffer::session::PresentationRequest::TerminateTerminal { id } => {
                 let request = controller.catalog_request.read().await.clone();
-                tokio::time::timeout(Duration::from_secs(8),
-                    controller.backend.terminate_terminal(request, id)).await
-                    .context("background terminal termination timed out")??;
+                tokio::time::timeout(
+                    Duration::from_secs(8),
+                    controller.backend.terminate_terminal(request, id),
+                )
+                .await
+                .context("background terminal termination timed out")??;
                 return Ok(json!({}));
             }
             crate::buffer::session::PresentationRequest::BackgroundTerminals => {
                 let request = controller.catalog_request.read().await.clone();
-                let snapshot = tokio::time::timeout(Duration::from_secs(8),
-                    controller.backend.background_terminals(request)).await
-                    .context("background terminal query timed out")??;
+                let snapshot = tokio::time::timeout(
+                    Duration::from_secs(8),
+                    controller.backend.background_terminals(request),
+                )
+                .await
+                .context("background terminal query timed out")??;
                 return Ok(serde_json::to_value(snapshot)?);
             }
             crate::buffer::session::PresentationRequest::Highlight { document } => {
@@ -120,8 +137,10 @@ impl HarnessService {
                     let broker = controller.broker.lock().await;
                     if let Some(revision) = revision {
                         let source = broker.capture_plan_revision(plan_id, *revision)?;
-                        ensure!(crate::plan::digest(&serde_json::to_vec(&source.document)?) == *digest,
-                            "plan revision changed before opening");
+                        ensure!(
+                            crate::plan::digest(&serde_json::to_vec(&source.document)?) == *digest,
+                            "plan revision changed before opening"
+                        );
                         source
                     } else {
                         broker.capture_plan_review(plan_id, digest)?
@@ -137,7 +156,15 @@ impl HarnessService {
                     }
                 }
                 if let Some(trace) = &source.trace {
-                    trace.record("plan.review.capture", capture_started.elapsed(), source.document.design.as_ref().map_or(0, |design| design.proposed.len()));
+                    trace.record(
+                        "plan.review.capture",
+                        capture_started.elapsed(),
+                        source
+                            .document
+                            .design
+                            .as_ref()
+                            .map_or(0, |design| design.proposed.len()),
+                    );
                 }
                 admission.check()?;
                 if let Some(expected) = saved_source_digest {
@@ -149,40 +176,67 @@ impl HarnessService {
                 let syntax_started = Instant::now();
                 if let Some(design) = &source.document.design {
                     for path in design.changed_paths() {
-                        for (side,text) in [("baseline",design.baseline.get(&path).map(|file| &file.text)),("proposed",design.proposed.get(&path))] {
+                        for (side, text) in [
+                            (
+                                "baseline",
+                                design.baseline.get(&path).map(|file| &file.text),
+                            ),
+                            ("proposed", design.proposed.get(&path)),
+                        ] {
                             let Some(text) = text else { continue };
-                            let presentation = forge_diff::syntax::DeclarationOverview::present(&path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                            let presentation =
+                                forge_diff::syntax::DeclarationOverview::present(&path, text)
+                                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
                             admission.check()?;
-                            let Some(language) = forge_diff::syntax::DeclarationOverview::language(&path) else { continue };
-                            let handle = self.syntax.analyze(SyntaxRequest {
-                                source:forge_diff::source::SourceVersion::new(presentation.text.as_bytes().to_vec(),forge_diff::source::Representation::DisplayOnly)?,
-                                language,
-                                priority:forge_diff::workers::WorkPriority::Visible,
-                                deadline:Some(Instant::now()+Duration::from_secs(10)),
-                            }).await.map_err(|error| anyhow::anyhow!("Declaration syntax analysis failed: {error:?}"))?;
-                            source.declaration_syntax.insert((path.clone(),side.into()),handle);
+                            let Some(language) =
+                                forge_diff::syntax::DeclarationOverview::language(&path)
+                            else {
+                                continue;
+                            };
+                            let handle = self
+                                .syntax
+                                .analyze(SyntaxRequest {
+                                    source: forge_diff::source::SourceVersion::new(
+                                        presentation.text.as_bytes().to_vec(),
+                                        forge_diff::source::Representation::DisplayOnly,
+                                    )?,
+                                    language,
+                                    priority: forge_diff::workers::WorkPriority::Visible,
+                                    deadline: Some(Instant::now() + Duration::from_secs(10)),
+                                })
+                                .await
+                                .map_err(|error| {
+                                    anyhow::anyhow!("Declaration syntax analysis failed: {error:?}")
+                                })?;
+                            source
+                                .declaration_syntax
+                                .insert((path.clone(), side.into()), handle);
                         }
                     }
                 } else {
-                source.syntax = Some(
-                    self.syntax
-                        .analyze(SyntaxRequest {
-                            source: forge_diff::source::SourceVersion::new(
-                                source.rendered.markdown.as_bytes().to_vec(),
-                                forge_diff::source::Representation::Raw,
-                            )?,
-                            language: SyntaxLanguage::Markdown,
-                            priority: forge_diff::workers::WorkPriority::Visible,
-                            deadline: Some(Instant::now() + Duration::from_secs(10)),
-                        })
-                        .await
-                        .map_err(|error| {
-                            anyhow::anyhow!("PlanReview syntax analysis failed: {error:?}")
-                        })?,
-                );
+                    source.syntax = Some(
+                        self.syntax
+                            .analyze(SyntaxRequest {
+                                source: forge_diff::source::SourceVersion::new(
+                                    source.rendered.markdown.as_bytes().to_vec(),
+                                    forge_diff::source::Representation::Raw,
+                                )?,
+                                language: SyntaxLanguage::Markdown,
+                                priority: forge_diff::workers::WorkPriority::Visible,
+                                deadline: Some(Instant::now() + Duration::from_secs(10)),
+                            })
+                            .await
+                            .map_err(|error| {
+                                anyhow::anyhow!("PlanReview syntax analysis failed: {error:?}")
+                            })?,
+                    );
                 }
                 if let Some(trace) = &source.trace {
-                    trace.record("plan.review.syntax", syntax_started.elapsed(), source.declaration_syntax.len());
+                    trace.record(
+                        "plan.review.syntax",
+                        syntax_started.elapsed(),
+                        source.declaration_syntax.len(),
+                    );
                 }
                 admission.check()?;
                 let document = crate::plan::review_document::PlanReviewDocument::new(
@@ -196,40 +250,43 @@ impl HarnessService {
             }
             crate::buffer::session::PresentationRequest::PlanAction { input } => {
                 let trace = if input.action == "jump_entity" {
-                    crate::declaration::trace::DeclarationTrace::new(registry.runtime.trace(), &session_id, input)
-                } else { None };
+                    crate::declaration::trace::DeclarationTrace::new(
+                        registry.runtime.trace(),
+                        &session_id,
+                        input,
+                    )
+                } else {
+                    None
+                };
                 let total = trace.as_ref().map(|trace| trace.stage("total", None));
                 if input.action == "jump_entity" {
-                    controller.plan_review.prepare_declaration_jump(input, trace.as_ref()).await?;
+                    controller
+                        .plan_review
+                        .prepare_declaration_jump(input, trace.as_ref())
+                        .await?;
                 }
                 let stage = trace.as_ref().map(|trace| trace.stage("action", None));
                 let result = controller.plan_review.action(input.clone())?;
-                if let Some(stage) = stage { stage.complete(json!({})); }
+                if let Some(stage) = stage {
+                    stage.complete(json!({}));
+                }
                 let result = serde_json::to_value(result)?;
-                if let Some(stage) = total { stage.complete(json!({})); }
+                if let Some(stage) = total {
+                    stage.complete(json!({}));
+                }
                 return Ok(result);
             }
-            crate::buffer::session::PresentationRequest::PlanAddAnnotation { input, end } => {
-                return controller
-                    .plan_review
-                    .add_annotation(input.clone(), end.clone());
-            }
-            crate::buffer::session::PresentationRequest::PlanFocusAnnotation { input } => {
-                return controller.plan_review.focus_annotation(input.clone());
-            }
-            crate::buffer::session::PresentationRequest::PlanDeleteAnnotation { input } => {
-                return controller.plan_review.delete_annotation(input.clone());
-            }
-            crate::buffer::session::PresentationRequest::PlanEdit { edit } => {
-                return Ok(match controller.plan_review.edit(edit.clone())? {
-                    forge_buffer::editable::LocalEditResult::Accepted {
-                        acknowledgement,
-                        patch,
-                    } => {
-                        json!({"accepted":true,"acknowledgement":acknowledgement,"patch":patch})
-                    }
-                    rejected => json!({"accepted":false,"reason":format!("{rejected:?}")}),
-                });
+            crate::buffer::session::PresentationRequest::PlanSaveAnnotations {
+                document,
+                saved_source_digest,
+                annotation,
+            } => {
+                controller.plan_review.save_annotations(
+                    document,
+                    saved_source_digest,
+                    annotation.clone(),
+                )?;
+                return Ok(json!({"saved":true}));
             }
             crate::buffer::session::PresentationRequest::PlanView {
                 document,
@@ -342,6 +399,17 @@ impl HarnessService {
             if let Some(review) = params.remove("review") {
                 let input = serde_json::from_value::<forge_buffer::input::DocumentInput>(review)?;
                 let controller = registry.resolve(&session_id).await?;
+                if let Some(annotation) = params.remove("draft_annotation") {
+                    let digest = params
+                        .remove("draft_source_digest")
+                        .and_then(|value| value.as_str().map(str::to_owned))
+                        .context("plan annotation capture requires its saved source digest")?;
+                    controller.plan_review.save_annotations(
+                        &input.document,
+                        &digest,
+                        serde_json::from_value(annotation)?,
+                    )?;
+                }
                 let captured = controller.plan_review.submission(input)?;
                 for (key, value) in captured
                     .as_object()
@@ -681,17 +749,34 @@ async fn route_request(
         let trace = registry.runtime.trace();
         match method {
             HarnessMethod::TraceConfigure => {
-                let enabled = request.params.get("enabled").and_then(Value::as_bool).context("trace enabled is required")?;
+                let enabled = request
+                    .params
+                    .get("enabled")
+                    .and_then(Value::as_bool)
+                    .context("trace enabled is required")?;
                 if request.params.get("default_only").and_then(Value::as_bool) == Some(true) {
                     trace.configure_default(enabled)?;
-                } else { trace.configure(enabled)?; }
+                } else {
+                    trace.configure(enabled)?;
+                }
             }
-            HarnessMethod::TraceToggle => { trace.toggle()?; }
-            HarnessMethod::TraceClear => { trace.clear()?; }
-            HarnessMethod::TraceSessionClear => { trace.clear_session(&session_id)?; }
+            HarnessMethod::TraceToggle => {
+                trace.toggle()?;
+            }
+            HarnessMethod::TraceClear => {
+                trace.clear()?;
+            }
+            HarnessMethod::TraceSessionClear => {
+                trace.clear_session(&session_id)?;
+            }
             _ => {}
         }
-        message_sink.send_response(Response::success(request.id, serde_json::to_value(trace.session_status(&session_id))?)?).await?;
+        message_sink
+            .send_response(Response::success(
+                request.id,
+                serde_json::to_value(trace.session_status(&session_id))?,
+            )?)
+            .await?;
         return Ok(());
     }
     if method == HarnessMethod::SessionResume {
@@ -799,7 +884,9 @@ async fn route_new_session(
     )?;
     let child_controller = registry.resolve(&child.id).await?;
     let snapshot = child_controller.broker.lock().await.snapshot()?;
-    message_sink.send_response(Response::success(request.id, snapshot)?).await?;
+    message_sink
+        .send_response(Response::success(request.id, snapshot)?)
+        .await?;
     message_sink.send(Message::Event(SessionEvent {
         session_id: child.id.clone(),
         event: "session_created".into(),
@@ -847,7 +934,9 @@ async fn route_session_fork(
         "timing": preparation.timing,
         "provider_pending": true,
     });
-    message_sink.send_response(Response::success(request.id, snapshot)?).await?;
+    message_sink
+        .send_response(Response::success(request.id, snapshot)?)
+        .await?;
     message_sink.send(Message::Event(SessionEvent {
         session_id: child_session_id.clone(),
         event: "session_created".into(),
@@ -904,7 +993,9 @@ async fn resume_session(
         .context("session.resume requires session_id")?;
     let controller = registry.resolve(target_session_id).await?;
     let snapshot = controller.broker.lock().await.snapshot()?;
-    message_sink.send_response(Response::success(request.id, snapshot)?).await?;
+    message_sink
+        .send_response(Response::success(request.id, snapshot)?)
+        .await?;
     Ok(())
 }
 
@@ -1066,8 +1157,12 @@ async fn route_control_request(
             )?)
         }
         HarnessMethod::BackendMcp => {
-            let server_list = controller.mcp_discovery.lock().await
-                .snapshot(controller.backend.clone(), catalog_request.clone()).await?;
+            let server_list = controller
+                .mcp_discovery
+                .lock()
+                .await
+                .snapshot(controller.backend.clone(), catalog_request.clone())
+                .await?;
             Some(Response::success(request.id, server_list)?)
         }
         HarnessMethod::BackendMcpSetEnabled => {
@@ -1362,8 +1457,14 @@ mod tests {
     async fn trace_controls_complete_while_a_turn_owns_the_broker() {
         let fixture = tempfile::tempdir().unwrap();
         let service = service();
-        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
-        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await
+            .unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let registry = service.registry.lock().await.clone().unwrap();
         let controller = registry.resolve(&session_id).await.unwrap();
         let owner = controller.broker.lock().await;
@@ -1374,13 +1475,30 @@ mod tests {
             (4, "trace.session.clear", json!({})),
             (5, "trace.configure", json!({"enabled":false})),
         ] {
-            tokio::time::timeout(Duration::from_secs(1),
-                service.dispatch(Some(session_id.clone()), Request { id, method:method.into(), params }, &sink)
-            ).await.expect("trace control waited for the broker").unwrap();
+            tokio::time::timeout(
+                Duration::from_secs(1),
+                service.dispatch(
+                    Some(session_id.clone()),
+                    Request {
+                        id,
+                        method: method.into(),
+                        params,
+                    },
+                    &sink,
+                ),
+            )
+            .await
+            .expect("trace control waited for the broker")
+            .unwrap();
             let frame = output.recv().await.unwrap().unwrap();
             let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
             assert_eq!(value["result"]["enabled"], id != 5);
-            assert!(value["result"]["path"].as_str().unwrap().contains(&session_id));
+            assert!(
+                value["result"]["path"]
+                    .as_str()
+                    .unwrap()
+                    .contains(&session_id)
+            );
         }
         drop(owner);
         service.shutdown(Duration::from_secs(1)).await.unwrap();
@@ -1390,33 +1508,69 @@ mod tests {
     async fn oversized_session_preview_uses_response_parts_and_keeps_broker_alive() {
         let fixture = tempfile::tempdir().unwrap();
         let service = service();
-        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
-        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let opened = service
+            .open_session(1, initialize(&fixture, "mock"))
+            .await
+            .unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
         let registry = service.registry.lock().await.clone().unwrap();
         let controller = registry.resolve(&session_id).await.unwrap();
         let name = "preview history ".repeat(40000);
-        let renamed = controller.broker.lock().await.dispatch(Request {
-            id: 2, method: "session.rename".into(),
-            params: json!({"session_id":session_id, "name":name}),
-        }).await;
+        let renamed = controller
+            .broker
+            .lock()
+            .await
+            .dispatch(Request {
+                id: 2,
+                method: "session.rename".into(),
+                params: json!({"session_id":session_id, "name":name}),
+            })
+            .await;
         assert!(renamed.response.error().is_none());
         let (sink, mut output) = forge_protocol::outbound::channel();
-        service.dispatch(None, Request { id: 3, method: "session.preview".into(),
-            params: json!({"session_id":session_id}) }, &sink).await.unwrap();
+        service
+            .dispatch(
+                None,
+                Request {
+                    id: 3,
+                    method: "session.preview".into(),
+                    params: json!({"session_id":session_id}),
+                },
+                &sink,
+            )
+            .await
+            .unwrap();
         let mut encoded = String::new();
         loop {
             let frame = output.recv().await.unwrap().unwrap();
             assert!(frame.bytes().len() <= forge_protocol::MAX_FRAME_BYTES);
-            let event: forge_protocol::message::RequestEvent = serde_json::from_slice(frame.bytes()).unwrap();
+            let event: forge_protocol::message::RequestEvent =
+                serde_json::from_slice(frame.bytes()).unwrap();
             assert_eq!(event.request_id, 3);
-            if event.event == "result.complete" { break; }
-            let part: forge_protocol::transfer::JsonPart = serde_json::from_value(event.payload).unwrap();
+            if event.event == "result.complete" {
+                break;
+            }
+            let part: forge_protocol::transfer::JsonPart =
+                serde_json::from_value(event.payload).unwrap();
             encoded.push_str(&part.payload);
         }
         let response: Response = serde_json::from_str(&encoded).unwrap();
         assert_eq!(response.result().unwrap()["session"]["name"], name.trim());
-        service.dispatch(None, Request { id: 4, method: "history.record".into(),
-            params: json!({"text":"still alive"}) }, &sink).await.unwrap();
+        service
+            .dispatch(
+                None,
+                Request {
+                    id: 4,
+                    method: "history.record".into(),
+                    params: json!({"text":"still alive"}),
+                },
+                &sink,
+            )
+            .await
+            .unwrap();
         output.check().unwrap();
         service.shutdown(Duration::from_secs(1)).await.unwrap();
     }

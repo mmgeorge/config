@@ -243,9 +243,12 @@ async fn durable_issue_save_retains_newer_typing_and_collected_close() {
     let saving = {
         let service = service.clone();
         let id = id.clone();
-        tokio::spawn(async move { service.save(&id).await })
+        tokio::spawn(async move { service.save(&id, vec![]).await })
     };
     remote.started.notified().await;
+    let before_rejected_capture = serde_json::to_value(service.snapshot(&id).await.unwrap()).unwrap();
+    assert!(service.save(&id, vec![edit(&id, 1, 2, "rejected concurrent capture")]).await.is_err());
+    assert_eq!(serde_json::to_value(service.snapshot(&id).await.unwrap()).unwrap(), before_rejected_capture);
     service.edit(edit(&id, 1, 2, "newer\r\n")).await.unwrap();
     let closing = {
         let service = service.clone();
@@ -318,7 +321,7 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
     let saving = {
         let service = service.clone();
         let id = id.clone();
-        tokio::spawn(async move { service.save(&id).await })
+        tokio::spawn(async move { service.save(&id, vec![]).await })
     };
     remote.started.notified().await;
     remote.release.notify_one();
@@ -361,7 +364,7 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
         RecoveryPhase::OutcomeUnknown { .. }
     ));
     assert!(reopened.fields.iter().any(|field| field.uncertain));
-    assert!(restarted.save(&id).await.is_err());
+    assert!(restarted.save(&id, vec![]).await.is_err());
     assert_eq!(remote.writes.load(Ordering::SeqCst), 1);
 
     let resolved = restarted
@@ -378,7 +381,7 @@ async fn unknown_issue_save_survives_restart_and_requires_explicit_nonreplay_rec
         RecoveryPhase::UserClosedUnknown { .. }
     ));
     assert_eq!(remote.writes.load(Ordering::SeqCst), 1);
-    assert!(restarted.save(&id).await.is_err());
+    assert!(restarted.save(&id, vec![]).await.is_err());
     assert!(restarted.close_collected(&id).await);
 }
 

@@ -45,113 +45,8 @@ function M.record(state, region, rows)
   return state.sequence
 end
 
-function M.take_pending(state, region)
-  local entry = assert(state.region[region], "unknown editable region")
-  if entry.sent or entry.conflict or not entry.pending then
-    return nil
-  end
-  entry.sent = {
-    sequence = entry.pending.sequence,
-    base = entry.revision,
-    text = entry.pending.text,
-  }
-  return {
-    document = state.document,
-    region = region,
-    base = entry.revision,
-    sequence = entry.pending.sequence,
-    text = copy_rows(entry.pending.text),
-  }
-end
-
-function M.acknowledge(state, acknowledgement)
-  local entry = state.region[acknowledgement.region]
-  if acknowledgement.document ~= state.document or not entry or not entry.sent then
-    return false, "acknowledgement has no matching in-flight edit"
-  end
-  if acknowledgement.sequence ~= entry.sent.sequence
-    or not valid_counter(acknowledgement.revision)
-    or acknowledgement.revision ~= entry.sent.base + 1
-  then
-    return false, "acknowledgement does not match the accepted edit"
-  end
-  entry.revision = acknowledgement.revision
-  entry.accepted_text = entry.sent.text
-  if entry.pending.sequence == entry.sent.sequence then
-    entry.pending = nil
-  end
-  entry.sent = nil
-  local native = state.native
-  if entry.pending and native then
-    vim.schedule(function()
-      if state.native == native and native.active then
-        M.flush(state)
-      end
-    end)
-  end
-  return true
-end
-
-function M.conflict(state, response)
-  local entry = state.region[response.region]
-  if response.document ~= state.document or not entry or not entry.sent
-    or response.sequence ~= entry.sent.sequence
-  then
-    return false, "conflict has no matching in-flight edit"
-  end
-  entry.conflict = true
-  entry.sent = nil
-  return true
-end
-
 function M.suspend_generated_text(state)
   return state.suspended or state.native and state.native.rejecting or false
-end
-
-function M.ready_to_reconcile(state)
-  if not state.suspended or state.fault or state.native and state.native.rejecting then
-    return false
-  end
-  for _, entry in pairs(state.region) do
-    if entry.pending or entry.sent or entry.conflict then
-      return false
-    end
-  end
-  return true
-end
-
-function M.reconciled(state, revision_by_region)
-  if not M.ready_to_reconcile(state) then
-    return false, "local edits still require acknowledgement"
-  end
-  for region, entry in pairs(state.region) do
-    if revision_by_region[region] ~= entry.revision then
-      return false, "snapshot does not contain the acknowledged region revision"
-    end
-  end
-  state.suspended = false
-  return true
-end
-
-function M.disconnect(state)
-  for _, entry in pairs(state.region) do
-    entry.sent = nil
-    if entry.pending then
-      entry.conflict = true
-    end
-  end
-  state.suspended = true
-end
-
-function M.resolve(state, region, revision, rows)
-  local entry = assert(state.region[region], "unknown editable region")
-  assert(entry.conflict, "region has no unresolved conflict")
-  assert(valid_counter(revision), "invalid region revision")
-  assert(revision < MAX_COUNTER, "region revision exhausted")
-  local sequence = M.record(state, region, rows)
-  entry.revision = revision
-  entry.conflict = nil
-  return sequence
 end
 
 function M.recoverable_text(state, region)
@@ -255,45 +150,45 @@ function M.trim_trailing_newlines(state, region)
   return trimmed
 end
 
-function M.flush(state)
-  local native = state.native
-  if not native or not native.active or state.fault then
-    return false
-  end
-  native.timer:stop()
-  native.deadline = nil
-  for region in pairs(state.region) do
-    local request = M.take_pending(state, region)
-    if request then
-      local ok, sent = pcall(native.send, request)
-      if not ok or sent ~= true then
-        M.disconnect(state)
-        return false
-      end
+
+
+---@param state table
+---@param selected? table<string, boolean>
+---@return table[]
+function M.capture_draft(state, selected)
+  assert(not state.fault, state.fault)
+  local captured = {}
+  for region, entry in pairs(state.region) do
+    if (not selected or selected[region]) and entry.pending then
+      captured[#captured + 1] = { document = state.document, region = region,
+        base = entry.revision, sequence = entry.pending.sequence,
+        text = table.concat(entry.pending.text, "\n") }
     end
   end
-  return true
+  table.sort(captured, function(left, right) return left.region < right.region end)
+  return captured
 end
 
-local function schedule_flush(state)
-  local native = state.native
-  local now = vim.uv.hrtime() / 1000000
-  native.deadline = native.deadline or (now + native.max_delay)
-  native.generation = native.generation + 1
-  local generation = native.generation
-  native.timer:start(math.max(1, math.floor(math.min(native.delay, native.deadline - now))), 0,
-    vim.schedule_wrap(function()
-      if state.native == native and native.active and native.generation == generation then
-        M.flush(state)
-      end
-    end))
+---@param state table
+---@param captured table[]
+function M.saved_capture(state, captured)
+  for _, capture in ipairs(captured) do
+    local entry = state.region[capture.region]
+    if entry then
+      entry.revision = capture.base + 1
+      if entry.pending and entry.pending.sequence == capture.sequence then entry.pending = nil end
+    end
+  end
+  state.suspended = false
+  for _, entry in pairs(state.region) do
+    if entry.pending then state.suspended = true end
+  end
 end
 
 local function native_fault(state, message)
   state.suspended = true
   state.fault = message
   local native = state.native
-  native.timer:stop()
   if native.notice then
     vim.schedule(function()
       if native.active then
@@ -368,8 +263,6 @@ function M.detach(state)
   end
   native.active = false
   native.generation = native.generation + 1
-  native.timer:stop()
-  native.timer:close()
   state.native = nil
 end
 
@@ -399,12 +292,26 @@ function M.update_regions(state, anchor, region_state, removed, resolve)
   end
 end
 
+---@param state table
+---@param anchor table<string, ForgeEditableAnchor>
+function M.reanchor(state, anchor)
+  local native = assert(state.native, "native editing is not attached")
+  assert(native.applying, "local presentation must guard buffer mutations")
+  local replacement = {}
+  local layout_revision = (native.layout_revision or 0) + 1
+  for region, positions in pairs(anchor) do
+    assert(state.region[region], "presentation references an unknown draft region")
+    native_rows(native.buffer, positions)
+    replacement[region] = vim.deepcopy(positions)
+    replacement[region].layout_revision = layout_revision
+  end
+  native.layout_revision = layout_revision
+  native.anchor = replacement
+end
+
 function M.attach(state, buffer, region_ranges, options)
   assert(not state.native, "native editing is already attached")
   assert(vim.api.nvim_buf_is_valid(buffer), "invalid native buffer")
-  assert(type(options.send) == "function", "local edit sender is required")
-  local delay, max_delay = options.delay or 120, options.max_delay or 500
-  assert(delay >= 1 and delay <= max_delay and max_delay <= 1000, "invalid edit debounce bounds")
   local anchor = {}
   for region, positions in pairs(region_ranges) do
     assert(state.region[region], "native range has no registered region")
@@ -417,8 +324,8 @@ function M.attach(state, buffer, region_ranges, options)
     anchor[region] = vim.deepcopy(positions)
   end
   local native = {
-    buffer = buffer, anchor = anchor, send = options.send, notice = options.notice, restored = options.restored,
-    delay = delay, max_delay = max_delay, timer = assert(vim.uv.new_timer()), active = true, generation = 0,
+    buffer = buffer, anchor = anchor, notice = options.notice, restored = options.restored,
+    active = true, generation = 0,
     shadow = vim.api.nvim_buf_get_lines(buffer, 0, -1, false), modified = vim.bo[buffer].modified,
   }
   state.native = native
@@ -487,7 +394,6 @@ function M.attach(state, buffer, region_ranges, options)
         native_fault(state, tostring(failure))
         return
       end
-      schedule_flush(state)
     end,
     on_reload = function()
       if not native.active then
@@ -497,7 +403,6 @@ function M.attach(state, buffer, region_ranges, options)
     end,
     on_detach = function()
       if native.active then
-        M.disconnect(state)
         M.detach(state)
       end
     end,

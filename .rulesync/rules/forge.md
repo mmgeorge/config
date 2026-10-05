@@ -46,10 +46,11 @@ rebuilt executable in a fresh test host and report the command, timeout, exit
 status, and artifact path. Existing hosts retain their process-owned executable
 copy until shutdown, so they do not adopt a rebuild automatically.
 
-Let release builds finish without a fixed elapsed-time cutoff. Poll running
-builds and provide progress updates without terminating them solely because they
-exceed a command timeout. Keep bounded timeouts for test execution and other
-commands.
+Use a 300-second (5-minute) limit for code builds, including release builds and
+test compilation. Poll running builds and provide progress updates within that
+limit. Optimization and linking require more time than ordinary commands, so
+do not apply their 120-second limit to builds. Keep bounded timeouts for test
+execution and other commands.
 
 Forge startup must never compile, scan compiler inputs, compare source freshness,
 compute executable fingerprints, or maintain build receipts. It launches the
@@ -159,14 +160,17 @@ In the PR view (`ogp`), the PR title and description are editable in place
 — unlocked exactly while the cursor sits on the title line or inside the
 description block (regions tracked with extmarks), locked everywhere else,
 so every native editing command works in the regions. Unsynced fields show
-an inline `*` before their label. `:w` clears the markers immediately and
-syncs through `forge.review` and the `review.*` host document routes. Rust owns
-accepted revisions, submitted captures, and saved title/body baselines, using
-the same GithubService resource queue as PR lifecycle changes. Lua flushes
-region edits and waits for acknowledgements before a captured save. Native
-typing after that capture remains local until the save settles, then flushes
-as newer edits. Completion adopts only host baselines and must not render over
-newer native text. Empty descriptions contain an empty editable row, and raw
+an inline `*` before their label. `:w` captures the complete selected fields
+and sends one explicit save through `forge.review` and the `review.*` host
+document routes. Neovim owns draft typing, comment creation, focus, collapse,
+and deletion of unsent comments. These transitions never send edit or focus
+requests. Rust atomically accepts complete captures and owns accepted revisions,
+submitted operations, and saved baselines, using the same GithubService resource
+queue as PR lifecycle changes. Keep one explicit operation active per document
+and retain the latest pending explicit capture without recapturing later typing.
+Completion clears only captured text that has not changed. Newer native text
+remains local and dirty, and generated refreshes defer while drafts remain.
+Empty descriptions contain an empty editable row, and raw
 description text preserves trailing rows and CR characters. Folded descriptions
 retain their field text without claiming adjacent generated rows. Uncertain
 results reconcile through the host without reposting. Failures

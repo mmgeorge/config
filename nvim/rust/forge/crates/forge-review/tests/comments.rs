@@ -1,4 +1,4 @@
-use forge_buffer::identity::{DocumentId, EditSequence, RegionRevision};
+use forge_buffer::identity::{DocumentId, EditSequence, RegionId, RegionRevision};
 use forge_github::model::GithubRepositoryId;
 use forge_github::pull_request::PullRequestTarget;
 use forge_review::comments::*;
@@ -61,6 +61,103 @@ fn change(comments: &CommentStore, edits: &mut EditStore, comment: CommentId, bo
         text: body.into(),
     };
     comments.accept(edits, edit).unwrap();
+}
+
+#[test]
+fn explicit_capture_admits_local_comments_and_fields_atomically() {
+    let (mut comments, mut edits) = stores(ReviewMode::Batched);
+    let summary = RegionId("review_summary".into());
+    let region = RegionId("draft-comment/client-1/body".into());
+    edits
+        .insert(summary.clone(), RegionRevision(0), "Original".into())
+        .unwrap();
+    let capture = |base| {
+        vec![
+            RegionEdit {
+                document: DocumentId("review".into()),
+                region: region.clone(),
+                base: RegionRevision(0),
+                sequence: EditSequence(1),
+                text: "Local body\r\n\n".into(),
+            },
+            RegionEdit {
+                document: DocumentId("review".into()),
+                region: summary.clone(),
+                base: RegionRevision(base),
+                sequence: EditSequence(1),
+                text: "Captured summary".into(),
+            },
+        ]
+    };
+    let declaration = || {
+        vec![DraftComment {
+            region: region.clone(),
+            anchor: Some(anchor()),
+            reply_to: None,
+        }]
+    };
+    assert!(
+        comments
+            .accept_capture(&mut edits, capture(9), declaration())
+            .is_err()
+    );
+    assert!(!comments.contains_region(&region));
+    assert!(edits.snapshot(&region).is_err());
+    assert_eq!(edits.snapshot(&summary).unwrap().text, "Original");
+    comments
+        .accept_capture(&mut edits, capture(0), declaration())
+        .unwrap();
+    assert!(comments.contains_region(&region));
+    let body = edits.snapshot(&region).unwrap();
+    assert_eq!(
+        (body.text, body.baseline, body.revision, body.sequence),
+        ("Local body\r\n\n", "", RegionRevision(1), EditSequence(1))
+    );
+    assert_eq!(edits.snapshot(&summary).unwrap().text, "Captured summary");
+    comments
+        .accept_capture(&mut edits, capture(0), declaration())
+        .unwrap();
+    assert_eq!(edits.snapshot(&region).unwrap().revision, RegionRevision(1));
+}
+
+#[test]
+fn explicit_capture_rejects_missing_body_and_changed_identity_without_consuming_admission() {
+    let (mut comments, mut edits) = stores(ReviewMode::Batched);
+    let region = RegionId("draft-comment/client-1/body".into());
+    let declaration = || {
+        vec![DraftComment {
+            region: region.clone(),
+            anchor: Some(anchor()),
+            reply_to: None,
+        }]
+    };
+    assert!(
+        comments
+            .accept_capture(&mut edits, vec![], declaration())
+            .is_err()
+    );
+    assert!(!comments.contains_region(&region));
+    let body = || {
+        vec![RegionEdit {
+            document: DocumentId("review".into()),
+            region: region.clone(),
+            base: RegionRevision(0),
+            sequence: EditSequence(1),
+            text: "Draft".into(),
+        }]
+    };
+    comments
+        .accept_capture(&mut edits, body(), declaration())
+        .unwrap();
+    let mut changed = declaration();
+    changed[0].anchor.as_mut().unwrap().last_line = 13;
+    assert!(
+        comments
+            .accept_capture(&mut edits, body(), changed)
+            .is_err()
+    );
+    assert_eq!(edits.snapshot(&region).unwrap().text, "Draft");
+    assert_eq!(comments.record(CommentId(1)).unwrap().region, region);
 }
 
 #[test]

@@ -26,11 +26,10 @@ enum IssueRequest {
     Snapshot {
         document: DocumentId,
     },
-    Edit {
-        edit: RegionEdit,
-    },
     Save {
         document: DocumentId,
+        #[serde(default)]
+        capture: Vec<RegionEdit>,
     },
     Refresh {
         document: DocumentId,
@@ -81,9 +80,8 @@ pub(super) async fn route(host: &ForgeRuntime, params: Value) -> Result<Value> {
         IssueRequest::Snapshot { document } => {
             serde_json::to_value(host.issues.snapshot(&document).await?)?
         }
-        IssueRequest::Edit { edit } => serde_json::to_value(host.issues.edit(edit).await?)?,
-        IssueRequest::Save { document } => {
-            serde_json::to_value(host.issues.save(&document).await?)?
+        IssueRequest::Save { document, capture } => {
+            serde_json::to_value(host.issues.save(&document, capture).await?)?
         }
         IssueRequest::Refresh { document } => {
             serde_json::to_value(host.issues.refresh(&document).await?)?

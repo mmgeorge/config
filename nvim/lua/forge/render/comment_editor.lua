@@ -52,7 +52,7 @@ function M.display_width(win, buf)
     local wininfo = vim.fn.getwininfo(displayed_win)[1]
     width = width - (tonumber(wininfo and wininfo.textoff) or 0)
   end
-  return math.max(40, width - 1)
+  return math.max(1, width - 1)
 end
 
 --- Formats a horizontal rule line filled with dashes between left and right labels.

@@ -47,7 +47,7 @@ adapter._set_runner_for_test(function(method, params, callback)
   elseif method == "review.load" then
     section_request[#section_request + 1] = params.document
     callback({ diagnostic = {} })
-  elseif method == "review.region_edit" then pending[#pending + 1] = { request = params, callback = callback }
+  elseif method == "review.region_edit" then error("typing sent a per-edit request")
   elseif method == "review.view" then callback(vim.NIL)
   elseif method == "review.thread" then
     local previous = revision
@@ -88,9 +88,10 @@ adapter._set_runner_for_test(function(method, params, callback)
     callback({ submission = { mode = "batched", viewed_file = {}, snapshot = {}, outcome = "confirmed", operation_id = vim.NIL }, fresh_required = false })
   elseif method == "review.save" then
     save_count = save_count + 1
-    callback({ snapshot = { uncertain = false }, remote = { outcome = "confirmed" } })
+    pending[#pending + 1] = { capture = vim.deepcopy(params.capture), callback = callback }
   elseif method == "review.comment" then
     comment_request[#comment_request + 1] = params.command
+    if params.capture and params.capture[1] then current = params.capture[1].text end
     local parent = params.command.parent
     callback({ snapshot = { comment = parent and 2 or 1, parent = parent, region = "body", text = current }, patch = vim.NIL })
   elseif method == "review.close" then closed[#closed + 1] = params.document callback({ closed = true })
@@ -127,6 +128,24 @@ assert(vim.deep_equal(header_request.initial, shared_snapshot), "status refresh 
 for _, key in ipairs({ "<C-S>", "<Tab>", "gR", "q" }) do
   assert(vim.fn.maparg(key, "n", false, true).buffer == 1, "native review omitted " .. key .. " action")
 end
+state.comment_by_region = { body = { comment = 1, uncertain = true } }
+vim.fn.maparg("gR", "n", false, true).callback()
+assert(vim.bo.filetype == "ForgeReviewRecovery")
+assert(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == "o  Observe remote state")
+vim.fn.maparg("q", "n", false, true).callback()
+assert(#comment_request == 0 and state.comment_by_region.body.uncertain)
+vim.fn.maparg("gR", "n", false, true).callback()
+vim.fn.maparg("r", "n", false, true).callback()
+assert(vim.wait(1000, function() return not state.comment_running end))
+assert(comment_request[1].operation == "recover" and comment_request[1].comment == 1)
+assert(comment_request[1].resolution.resolution == "not_dispatched")
+comment_request = {}
+state.submission_recovery = "unresolved-submission"
+vim.fn.maparg("gB", "n", false, true).callback()
+assert(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == "l  Link confirmed review ID")
+vim.fn.maparg("<Esc>", "n", false, true).callback()
+assert(state.submission_recovery == "unresolved-submission")
+state.submission_recovery = nil
 assert(vim.fn.maparg("l", "n", false, true).buffer ~= 1, "l must retain cursor movement, not open a lifecycle picker")
 assert(state.replica.fold.record["fixture:body"].fold.closed,
   "native review did not retain the stable default fold metadata")
@@ -194,79 +213,50 @@ local function type_text(text)
   local previous = vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1]
   vim.api.nvim_buf_set_text(state.replica.buffer, 0, 0, 0, #previous, { text })
   editable.capture(state.replica.editable, "body")
-  editable.flush(state.replica.editable)
 end
 local function confirm(index)
   local selected = assert(pending[index])
-  local edit = selected.request
-  local previous = revision
-  current, revision = edit.text, revision + 1
-  selected.callback({ document = edit.document, region = edit.region, sequence = edit.sequence, revision = edit.base + 1,
-    patch = { document = edit.document, base = previous, next = revision, base_rows = 1, next_rows = 1,
-      base_blocks = 1, next_blocks = 1, removed_block = {}, block_edit = {},
-      text_edit = { { start_row = 0, removed_rows = 1, text = { current } } },
-      metadata_edit = { { block = "body", row_count = 1, metadata = metadata(current, revision) } } } })
+  local captured = assert(selected.capture[1])
+  current, revision = captured.text, revision + 1
+  selected.callback({ snapshot = { uncertain = false, field = {
+    { region = "body", baseline = current, text = current, revision = captured.base + 1 },
+  } }, remote = { outcome = "confirmed" } })
 end
+state.fields = { { region = "body", baseline = current, text = current, revision = 0 } }
 type_text("first")
-assert(#pending == 1)
-assert(pending[1].request.sequence > 100, "restored durable edit sequence was not adopted before typing")
-type_text("newer")
+assert(#pending == 0, "typing sent a per-edit request")
+assert(editable.capture_draft(state.replica.editable)[1].sequence > 100,
+  "restored durable capture sequence was not adopted")
 adapter.save(state)
-assert(save_count == 0, "save bypassed local acknowledgements")
+assert(save_count == 1 and #pending == 1)
+type_text("queued")
+adapter.save(state)
+assert(save_count == 1, "queued save overlapped publication")
+type_text("newer")
 confirm(1)
-assert(vim.wait(1000, function() return #pending == 2 end))
-assert(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1] == "newer")
+assert(vim.wait(1000, function() return save_count == 2 end))
+assert(pending[2].capture[1].text == "queued", "queued save recaptured later typing")
 confirm(2)
-assert(vim.wait(1000, function() return save_count == 1 end))
-assert(state.replica.revision == 2)
+assert(vim.wait(1000, function() return not state.saving end))
+assert(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1] == "newer")
+assert(vim.bo[state.replica.buffer].modified, "queued completion cleared newer typing")
+adapter.save(state)
+confirm(3)
+assert(vim.wait(1000, function() return not state.saving and not state.rendering end))
+assert(not vim.bo[state.replica.buffer].modified)
 type_text("comment capture")
 vim.api.nvim_win_set_cursor(state.window, { 1, 0 })
-assert(adapter.add_comment(state))
-assert(#action_request == 0, "inline comment activation bypassed local acknowledgement")
-local command = { operation = "save", comment = 1, action = "save" }
+assert(not adapter.add_comment(state), "absent local comment view created a host draft")
 local comment_delivered = false
-assert(adapter.comment(state, command, function(delivery, failure)
-  assert(not failure and delivery.snapshot.text == "comment capture")
-  comment_delivered = true
-end))
-command.action = "delete"
-assert(#comment_request == 0, "comment bypassed local acknowledgement")
-assert(not adapter.comment(state, { operation = "draft_conversation" }), "queued comment was overwritten")
-confirm(3)
+state.comment_by_region = { body = { comment = 1, region = "body" } }
+assert(adapter.comment(state, { operation = "save_draft", region = "body", action = "save" },
+  function(delivery, failure)
+    assert(not failure and delivery.snapshot.text == "comment capture")
+    comment_delivered = true
+  end))
 assert(vim.wait(1000, function() return comment_delivered end))
-assert(#action_request == 1 and action_request[1].target == "body-action")
-assert(action_request[1].revision == state.replica.revision, "action captured a pre-acknowledgement revision")
-assert(comment_request[1].action == "save", "queued command did not retain its capture")
-local drafted_comment = false
-assert(adapter.comment(state, { operation = "draft_conversation" }, function(delivery, failure)
-  assert(not failure and delivery.snapshot.region == "body")
-  drafted_comment = true
-end))
-assert(vim.wait(1000, function() return drafted_comment and state.comment_focus and state.comment_focus.comment == 1 end),
-  "drafted conversation comment did not focus its editable region")
-local saved_comment = false
-assert(adapter.save_comment(state, "save", function(delivery, failure)
-  assert(not failure and delivery.snapshot.comment == 1)
-  saved_comment = true
-end))
-assert(vim.wait(1000, function() return saved_comment end), "focused comment did not save")
-local replied_comment = false
-assert(adapter.reply_comment(state, function(delivery, failure)
-  assert(not failure and delivery.snapshot.parent == 1)
-  replied_comment = true
-end))
-assert(vim.wait(1000, function() return replied_comment and state.comment_focus and state.comment_focus.comment == 2 end),
-  "reply did not focus the created draft")
-local deleted_comment = false
-assert(adapter.save_comment(state, "delete", function(_, failure)
-  assert(not failure)
-  deleted_comment = true
-end))
-assert(vim.wait(1000, function() return deleted_comment and state.comment_focus == nil end),
-  "deleted comment retained focus")
-assert(comment_request[#comment_request - 2].operation == "save" and comment_request[#comment_request - 2].action == "save")
-assert(comment_request[#comment_request - 1].operation == "draft_reply" and comment_request[#comment_request - 1].parent == 1)
-assert(comment_request[#comment_request].operation == "save" and comment_request[#comment_request].action == "delete")
+assert(#action_request == 0, "comment save dispatched generic activation")
+assert(comment_request[1].action == "save")
 hold_action = true
 assert(adapter.activate(state))
 assert(delayed_action)
@@ -275,10 +265,11 @@ delayed_action()
 assert(vim.wait(1000, function() return not state.action_running end))
 assert(vim.api.nvim_win_get_cursor(state.window)[2] == 2, "late native focus moved a newer user cursor")
 type_text("close with accepted text")
-assert(#pending == 4)
+assert(#pending == 3, "typing sent a request before close")
 adapter.close(state)
-assert(state.active and #closed == 0, "close discarded an in-flight edit")
-confirm(4)
+assert(state.active and state.hidden and #closed == 0, "close discarded a local draft")
+assert(editable.capture_draft(state.replica.editable)[1].text == "close with accepted text")
+vim.api.nvim_buf_delete(state.replica.buffer, { force = true })
 assert(vim.wait(1000, function() return not state.active end))
 assert(closed[1] == "review-adapter")
 assert(#errors == 0, table.concat(errors, "\n"))
@@ -353,4 +344,4 @@ delayed_discovery({ document = "late-discovered" })
 assert(vim.wait(1000, function() return closed[4] == "late-discovered" end), "superseded native discovery leaked its document")
 assert(not late.active and not late.shown)
 adapter._set_runner_for_test(nil)
-print("review_document: native projection, incremental edit/save/close, and late-open cleanup passed")
+print("review_document: native projection, captured saves, dirty close, and late-open cleanup passed")

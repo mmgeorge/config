@@ -193,7 +193,7 @@ impl ReviewService {
                 let drafted = self
                     .comment(
                         &input.document,
-                        crate::review::ReviewCommentCommand::DraftInline { anchor },
+                        vec![], vec![], crate::review::ReviewCommentCommand::DraftInline { anchor },
                     )
                     .await?;
                 if let Some(patch) = drafted.patch {
@@ -223,7 +223,7 @@ impl ReviewService {
                 let imported = self
                     .comment(
                         &input.document,
-                        crate::review::ReviewCommentCommand::LoadThreadComment {
+                        vec![], vec![], crate::review::ReviewCommentCommand::LoadThreadComment {
                             thread_node_id: thread,
                             comment_node_id: comment,
                         },
@@ -237,7 +237,7 @@ impl ReviewService {
                     match self
                         .comment(
                             &input.document,
-                            crate::review::ReviewCommentCommand::DraftReply {
+                            vec![], vec![], crate::review::ReviewCommentCommand::DraftReply {
                                 parent: selected.comment,
                             },
                         )

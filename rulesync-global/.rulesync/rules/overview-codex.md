@@ -99,8 +99,11 @@ globs:
 - **Never** read or set environment variables via shell commands. If one is required and unset, ask the user.
 - Call commands directly without `cmd /c`. Prefer simple serial commands over
   complex chains.
-- Set an explicit command timeout (defaulting to 30 seconds or less). Never
-  exceed 120 seconds without user approval.
+- Set an explicit command timeout. Use a 300-second (5-minute) limit for code
+  builds, including release builds and test compilation. Build optimization and
+  linking need more time than ordinary commands, so do not apply the 120-second
+  limit to builds. Default other commands to 30 seconds or less and never exceed
+  120 seconds for those commands without user approval.
 - Treat a timeout as diagnostic evidence. Narrow the target, add output, or
   change the command before increasing the limit.
 

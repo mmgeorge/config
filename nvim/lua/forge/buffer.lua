@@ -205,17 +205,17 @@ local function change_sequence(sequence, patch, entries)
   end
 end
 
-function M.preflight(session, patch, adoption, projection)
+function M.preflight(session, patch)
   assert(session.status == "Applied", "document requires snapshot recovery")
   if not session.fragment then
   assert(vim.api.nvim_buf_is_valid(session.buffer), "native buffer is invalid")
-  assert(adoption or vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "native changedtick differs")
+  assert(vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "native changedtick differs")
   assert(session.sentinel and #vim.api.nvim_buf_get_extmark_by_id(session.buffer, session.namespace, session.sentinel, {}) == 2,
     "native document anchor is missing")
   end
   assert(patch.document == session.document and patch.base == session.revision, "patch base differs")
   assert(not session.physical or #array(patch.text_edit) == 0, "physical buffer only accepts metadata patches")
-  assert(counter(patch.next) == counter(patch.base) + (adoption or 1), "patch revision advance differs")
+  assert(counter(patch.next) == counter(patch.base) + 1, "patch revision advance differs")
   assert(patch.base_rows == session.row_count and patch.base_blocks == session.sequence:count(), "patch base counts differ")
   counter(patch.next_rows)
   counter(patch.next_blocks)
@@ -283,8 +283,6 @@ function M.preflight(session, patch, adoption, projection)
     end
   end
   local function read_row(row)
-    if projection and projection.read_row then return projection.read_row(row) end
-    if adoption then return assert(vim.api.nvim_buf_get_lines(session.buffer, row, row + 1, true)[1], "missing adopted row") end
     local delta = 0
     for index = #patch.text_edit, 1, -1 do
       local edit = patch.text_edit[index]
@@ -308,7 +306,7 @@ function M.preflight(session, patch, adoption, projection)
       end
     end
   end
-  if not (projection and projection.keep_sequence) then session.sequence:begin() end
+  session.sequence:begin()
   local ok, failure = pcall(function()
     change_sequence(session.sequence, patch, entries)
     assert(session.sequence:rows() == patch.next_rows, "block row coverage differs")
@@ -325,7 +323,7 @@ function M.preflight(session, patch, adoption, projection)
     end
     folds.validate(session.sequence, changed, retired, session.fold, read_row)
   end)
-  if not (projection and projection.keep_sequence) then session.sequence:rollback() end
+  session.sequence:rollback()
   if not ok then error(failure) end
   return { block = entries, position = position, region = region, changed = changed, retired = retired,
     released_region = released_region, region_owner = region_owner }
@@ -436,19 +434,12 @@ local function attach_regions(session, prepared)
   end
 end
 
-local function commit_patch(session, patch, adoption, projection)
-  if not adoption and editable.suspend_generated_text(session.editable) then
+local function commit_patch(session, patch)
+  if editable.suspend_generated_text(session.editable) then
     return { kind = "Deferred", edit_sequence = session.editable.sequence }
   end
-  local ok, prepared = pcall(M.preflight, session, patch, adoption, projection)
+  local ok, prepared = pcall(M.preflight, session, patch)
   if not ok then return M.fail_apply(session, prepared) end
-  if adoption then
-    local revision = {}
-    for id, entry in pairs(session.editable.region) do revision[id] = entry.revision end
-    for id, value in pairs(prepared.region) do revision[id] = value end
-    local reconciled, failure = editable.reconciled(session.editable, revision)
-    if not reconciled then return M.fail_apply(session, failure) end
-  end
   local retained_view = buffer_view.capture(session, function(id)
     local entry = not prepared.retired[id] and (prepared.block[id] or session.block[id])
     return entry ~= nil and entry ~= false and entry.row_count > 0
@@ -467,7 +458,7 @@ local function commit_patch(session, patch, adoption, projection)
       vim.bo[session.buffer].readonly = false
       vim.bo[session.buffer].modifiable = true
     end
-    session.fold_pending = projection and projection.text_edit or adoption and {} or patch.text_edit
+    session.fold_pending = patch.text_edit
     for index, edit in ipairs(session.fold_pending) do
       session.fold_pending_index = index + 1
       local finish = edit.start_row + edit.removed_rows
@@ -496,34 +487,11 @@ local function commit_patch(session, patch, adoption, projection)
   return { kind = "Applied", revision = session.revision }
 end
 
-local function adopt_local_result(session, result)
-  if result.kind then return result end
-  local applied = commit_patch(session, result.patch, result.revisions, result.projection)
-  if applied.kind == "Applied" then
-    session.local_patch = nil
-    for _, following in ipairs(result.following) do
-      applied = M.apply_patch(session, following)
-      if applied.kind ~= "Applied" then break end
-    end
-  end
-  return applied
-end
-
 function M.apply_patch(session, patch)
   if session.status == "Closed" then return { kind = "Closed" } end
-  if session.local_patch or editable.suspend_generated_text(session.editable) then
-    local ok, result = pcall(require("forge.local_edit_patch").generated, session, patch)
-    if not ok then return M.fail_apply(session, result) end
-    return adopt_local_result(session, result)
-  end
+  if session.local_projection then return { kind = "Deferred" } end
+  if editable.suspend_generated_text(session.editable) then return { kind = "Deferred" } end
   return commit_patch(session, patch)
-end
-
-function M.acknowledge_edit(session, acknowledgement, patch)
-  if session.status == "Closed" then return { kind = "Closed" } end
-  local ok, result = pcall(require("forge.local_edit_patch").prepare, session, acknowledgement, patch)
-  if not ok then return M.fail_apply(session, result) end
-  return adopt_local_result(session, result)
 end
 
 function M.apply_snapshot(session, snapshot)
@@ -533,8 +501,7 @@ function M.apply_snapshot(session, snapshot)
   then
     return { kind = "SourceChanged", changedtick = vim.api.nvim_buf_get_changedtick(session.buffer) }
   end
-  local reconciling = editable.suspend_generated_text(session.editable)
-  if reconciling and not editable.ready_to_reconcile(session.editable) then
+  if editable.suspend_generated_text(session.editable) then
     return { kind = "Deferred", edit_sequence = session.editable.sequence }
   end
   local ok, prepared = pcall(function()
@@ -566,12 +533,6 @@ function M.apply_snapshot(session, snapshot)
       for _, editable_region in ipairs(entry.metadata.editable_region) do region_owner[editable_region.id] = id end
     end
     folds.validate(sequence, changed, {}, nil, function(row) return text[row + 1] end)
-    if reconciling then
-      for id, entry in pairs(session.editable.region) do
-        assert(region[id] == entry.revision, "snapshot does not contain acknowledged region revision")
-      end
-      require("forge.local_edit_patch").validate_snapshot(session.editable, block, text)
-    end
     return { sequence = sequence, block = block, text = text, region = region, changed = changed,
       position = position, region_owner = region_owner, retired = {} }
   end)
@@ -601,9 +562,6 @@ function M.apply_snapshot(session, snapshot)
     end
     install_metadata(session, prepared, true)
     if not session.physical then vim.bo[session.buffer].modifiable = false end
-    if reconciling then
-      assert(editable.reconciled(session.editable, prepared.region))
-    end
     attach_regions(session, prepared)
   end)
   session.applying = nil
@@ -613,7 +571,6 @@ function M.apply_snapshot(session, snapshot)
   session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
   session.status, session.diagnostic = "Applied", nil
   session.expected_changedtick = nil
-  session.local_patch = nil
   decorations.attach(session)
   folds.refresh(session)
   buffer_view.restore(session, retained_view)
@@ -645,7 +602,7 @@ local function release(session, preserve_buffer)
   session.sequence = BlockSequence.new()
 end
 
---- Releases a replica after local edit acknowledgement, optionally retaining its physical buffer.
+--- Releases a clean replica, optionally retaining its physical buffer. Drafts defer release.
 ---@param session table
 ---@param options? {preserve_buffer?: boolean}
 function M.close(session, options)
@@ -677,6 +634,27 @@ end
 ---@return {block: string, position: {row: integer, column: integer}, target: string?}?
 function M.locate(session, row, column)
   if session.locate then return session.locate(row, column) end
+  local native = session.editable.native
+  if native then
+    local low, high = 0, session.sequence:count() - 1
+    local selected
+    while low <= high do
+      local index = math.floor((low + high) / 2)
+      local candidate = session.sequence:at(index)
+      local _, source_row = session.sequence:position(candidate.id)
+      local physical = M.physical_row(session, source_row)
+      if physical <= row then selected = candidate low = index + 1 else high = index - 1 end
+    end
+    if not selected then return nil end
+    local _, source_row = session.sequence:position(selected.id)
+    local offset = row - M.physical_row(session, source_row)
+    local target_id
+    for _, target in ipairs(selected.entry.metadata.target) do
+      local position = { row = offset, column = column }
+      if before_or_equal(target.range.start, position) and not before_or_equal(target.range["end"], position) then target_id = target.id break end
+    end
+    return { block = selected.id, position = { row = offset, column = column }, target = target_id }
+  end
   local node = session.sequence:locate(row)
   if not node then return nil end
   local _, start_row = session.sequence:position(node.id)
@@ -689,6 +667,29 @@ function M.locate(session, row, column)
     end
   end
   return { block = node.id, position = position, target = target_id }
+end
+
+---@param session table
+---@param row integer Canonical generated source row.
+---@return integer
+function M.physical_row(session, row)
+  if session.physical_row then return session.physical_row(row) end
+  local native = session.editable.native
+  if not native then return row end
+  local delta, preceding = 0, -1
+  for region, anchor in pairs(native.anchor) do
+    local owner = session.region_owner[region]
+    if owner then
+      local _, start = session.sequence:position(owner)
+      for _, metadata in ipairs(session.block[owner].metadata.editable_region) do
+        local finish = start + metadata.range["end"].row
+        if metadata.id == region and finish < row and finish > preceding then
+          delta, preceding = anchor.finish.row - finish, finish
+        end
+      end
+    end
+  end
+  return row + delta
 end
 
 ---@class ForgeBufferFragment

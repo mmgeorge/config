@@ -2,11 +2,16 @@ local fixture = dofile(vim.fn.getcwd() .. "/nvim/tests/forge/support/status_fixt
 vim.opt.runtimepath:prepend(vim.fn.getcwd() .. "/nvim")
 local generation, accepting = 1, true
 local requests, notices = {}, {}
+local subscription = {}
 local delayed
 vim.notify = function(message) notices[#notices + 1] = tostring(message) end
 package.loaded["forge.client"] = {
   host_generation = function() return generation end,
   host_accepting = function() return accepting end,
+  subscribe_document = function(document, callback)
+    subscription[document] = callback
+    return function() subscription[document] = nil end
+  end,
   request_host = function(method, params, callback)
     assert(accepting, "document request resurrected a stopped host")
     requests[#requests + 1] = { method, params.operation }
@@ -60,4 +65,5 @@ local late_source = source.open({ workspace = vim.fn.getcwd(), path = "late.txt"
 generation = 4
 assert(vim.wait(1000, function() return not late_source.active end))
 assert(late_source.replica.status == "Closed", "late source open remained usable after host collection")
+assert(next(subscription) == nil, "closed status retained its document subscription")
 print("native document host generation lifecycle passed")

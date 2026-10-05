@@ -1,7 +1,6 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 
 use anyhow::{Context, Result, ensure};
-use forge_buffer::editable::LocalEdit;
 use forge_buffer::identity::{DocumentId, DocumentRevision, InputSequence, TargetId, ViewId};
 use forge_buffer::input::DocumentInput;
 use forge_buffer::patch::{BufferPatch, BufferSnapshot};
@@ -77,9 +76,15 @@ pub struct PresentationSync {
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PresentationRequest {
     BackgroundTerminals,
-    Recap { model: String },
-    SessionName { model: String },
-    TerminateTerminal { id: String },
+    Recap {
+        model: String,
+    },
+    SessionName {
+        model: String,
+    },
+    TerminateTerminal {
+        id: String,
+    },
     Highlight {
         document: DocumentId,
     },
@@ -96,18 +101,10 @@ pub enum PresentationRequest {
     PlanAction {
         input: DocumentInput,
     },
-    PlanAddAnnotation {
-        input: DocumentInput,
-        end: Option<DocumentInput>,
-    },
-    PlanFocusAnnotation {
-        input: DocumentInput,
-    },
-    PlanDeleteAnnotation {
-        input: DocumentInput,
-    },
-    PlanEdit {
-        edit: LocalEdit,
+    PlanSaveAnnotations {
+        document: DocumentId,
+        saved_source_digest: String,
+        annotation: Vec<crate::plan::ReviewAnnotation>,
     },
     PlanView {
         document: DocumentId,
@@ -186,10 +183,7 @@ impl SessionPresentation {
             }
             PresentationRequest::PlanOpen { .. }
             | PresentationRequest::PlanAction { .. }
-            | PresentationRequest::PlanAddAnnotation { .. }
-            | PresentationRequest::PlanFocusAnnotation { .. }
-            | PresentationRequest::PlanDeleteAnnotation { .. }
-            | PresentationRequest::PlanEdit { .. }
+            | PresentationRequest::PlanSaveAnnotations { .. }
             | PresentationRequest::PlanView { .. }
             | PresentationRequest::PlanClose { .. } => {
                 anyhow::bail!("plan review requires the physical storage owner")
@@ -242,12 +236,22 @@ impl SessionPresentation {
                 let TranscriptAction::Tool { call_id } = self.action(input)? else {
                     anyhow::bail!("transcript target is not a tool output");
                 };
-                let open = self.open.as_mut().context("session presentation is not open")?;
+                let open = self
+                    .open
+                    .as_mut()
+                    .context("session presentation is not open")?;
                 let expanded = !open.expanded_tool.remove(&call_id);
-                if expanded { open.expanded_tool.insert(call_id.clone()); }
-                if let Err(error) = reflow(open, self.timeline.entry_list(), self.timeline.revision()) {
-                    if expanded { open.expanded_tool.remove(&call_id); }
-                    else { open.expanded_tool.insert(call_id); }
+                if expanded {
+                    open.expanded_tool.insert(call_id.clone());
+                }
+                if let Err(error) =
+                    reflow(open, self.timeline.entry_list(), self.timeline.revision())
+                {
+                    if expanded {
+                        open.expanded_tool.remove(&call_id);
+                    } else {
+                        open.expanded_tool.insert(call_id);
+                    }
                     return Err(error);
                 }
                 Ok(json!({"expanded": expanded}))
@@ -310,7 +314,12 @@ impl SessionPresentation {
             PresentationRequest::ToolExport { .. } => {
                 anyhow::bail!("tool export requires the initialized storage owner")
             }
-            PresentationRequest::BackgroundTerminals | PresentationRequest::TerminateTerminal { .. } | PresentationRequest::Recap { .. } | PresentationRequest::SessionName { .. } => anyhow::bail!("provider operation requires the provider owner"),
+            PresentationRequest::BackgroundTerminals
+            | PresentationRequest::TerminateTerminal { .. }
+            | PresentationRequest::Recap { .. }
+            | PresentationRequest::SessionName { .. } => {
+                anyhow::bail!("provider operation requires the provider owner")
+            }
             PresentationRequest::Open {
                 document,
                 view,
@@ -958,7 +967,10 @@ fn refresh_activity(open: &mut OpenPresentation, source: &[TimelineEntry]) -> Re
                         exchange: exchange.clone(),
                         agent_by_id: HashMap::new(),
                     };
-                    projected.push((index, project(&entry, width, index > 0, &open.expanded_tool)?));
+                    projected.push((
+                        index,
+                        project(&entry, width, index > 0, &open.expanded_tool)?,
+                    ));
                 }
             }
         }
@@ -1255,12 +1267,20 @@ mod tests {
         assert!(!opened.syntax_pending);
         assert!(owner.capture_syntax(&document)?.is_none());
         let before = owner.snapshot(&document)?;
-        assert!(before.block.iter().any(|block| block.metadata.markdown
-            && block.text.wire_rows().contains(&"```ts")));
+        assert!(
+            before
+                .block
+                .iter()
+                .any(|block| block.metadata.markdown && block.text.wire_rows().contains(&"```ts"))
+        );
         owner.reconcile(vec![entry_for("```js\nconst value: number = 1;\n```")])?;
         let after = owner.snapshot(&document)?;
-        assert!(after.block.iter().any(|block| block.metadata.markdown
-            && block.text.wire_rows().contains(&"```js")));
+        assert!(
+            after
+                .block
+                .iter()
+                .any(|block| block.metadata.markdown && block.text.wire_rows().contains(&"```js"))
+        );
         assert!(owner.capture_syntax(&document)?.is_none());
         owner.close(&document)?;
         assert!(owner.open.is_none());
@@ -1440,9 +1460,14 @@ mod tests {
         let opened = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
         let block = BlockId("first:turn:1:tool:tool".into());
         let mut input = DocumentInput {
-            document: document.clone(), revision: opened.transcript.revision, view: view.clone(),
-            sequence: InputSequence(1), action: "activate".into(), block: block.clone(),
-            position: TextPosition { row: 5, column: 6 }, target: Some(TargetId(block.0.clone())),
+            document: document.clone(),
+            revision: opened.transcript.revision,
+            view: view.clone(),
+            sequence: InputSequence(1),
+            action: "activate".into(),
+            block: block.clone(),
+            position: TextPosition { row: 5, column: 6 },
+            target: Some(TargetId(block.0.clone())),
         };
         assert_eq!(
             owner.dispatch(PresentationRequest::ToggleTool {
@@ -1466,13 +1491,24 @@ mod tests {
             },
         })?;
         let snapshot = owner.snapshot(&document)?;
-        let expanded = snapshot.block.iter().find(|candidate| candidate.id == block).unwrap();
+        let expanded = snapshot
+            .block
+            .iter()
+            .find(|candidate| candidate.id == block)
+            .unwrap();
         assert!(expanded.text.wire_rows().contains(&"      sixth"));
         input.revision = snapshot.revision;
         input.sequence = InputSequence(2);
-        assert_eq!(owner.dispatch(PresentationRequest::ToggleTool { input })?["expanded"], false);
+        assert_eq!(
+            owner.dispatch(PresentationRequest::ToggleTool { input })?["expanded"],
+            false
+        );
         let snapshot = owner.snapshot(&document)?;
-        let collapsed = snapshot.block.iter().find(|candidate| candidate.id == block).unwrap();
+        let collapsed = snapshot
+            .block
+            .iter()
+            .find(|candidate| candidate.id == block)
+            .unwrap();
         assert!(collapsed.text.wire_rows().contains(&"      …(2 hidden)"));
         assert!(!collapsed.text.wire_rows().contains(&"      sixth"));
         Ok(())
@@ -1774,29 +1810,53 @@ mod tests {
     fn submission_admission_rejects_stale_tokens_and_closed_lifetimes() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
         let document = DocumentId("transcript:admission".into());
-        owner.open(document.clone(), ViewId("view:admission".into()), WidthProfile::default())?;
+        owner.open(
+            document.clone(),
+            ViewId("view:admission".into()),
+            WidthProfile::default(),
+        )?;
         assert!(owner.begin_submission(&document, 0, "draft").is_err());
         assert!(owner.begin_submission(&document, 1, " ").is_err());
-        assert!(owner.begin_submission(&document, 1, &"x".repeat(65537)).is_err());
-        assert!(owner.begin_submission(&document, 1, &"\n".repeat(4096)).is_err());
+        assert!(
+            owner
+                .begin_submission(&document, 1, &"x".repeat(65537))
+                .is_err()
+        );
+        assert!(
+            owner
+                .begin_submission(&document, 1, &"\n".repeat(4096))
+                .is_err()
+        );
         owner.begin_submission(&document, 1, "complete λ\n\ndraft")?;
-        assert!(owner.begin_submission(&document, 2, "duplicate pending").is_err());
+        assert!(
+            owner
+                .begin_submission(&document, 2, "duplicate pending")
+                .is_err()
+        );
         assert!(owner.complete_submission(&document, 2, true)?.is_none());
         assert!(owner.complete_submission(&document, 1, false)?.is_none());
         assert!(owner.begin_submission(&document, 1, "stale token").is_err());
         owner.begin_submission(&document, 2, "next draft")?;
-        assert_eq!(owner.complete_submission(&document, 2, true)?,
-            Some(serde_json::json!({"document":document,"token":2,"state":"accepted"})));
+        assert_eq!(
+            owner.complete_submission(&document, 2, true)?,
+            Some(serde_json::json!({"document":document,"token":2,"state":"accepted"}))
+        );
         assert!(owner.complete_submission(&document, 2, true)?.is_none());
-        assert_eq!(owner.retract_submission(&document, 2)?,
-            Some(serde_json::json!({"document":document,"token":2,"state":"retracted"})));
+        assert_eq!(
+            owner.retract_submission(&document, 2)?,
+            Some(serde_json::json!({"document":document,"token":2,"state":"retracted"}))
+        );
         assert!(owner.retract_submission(&document, 2)?.is_none());
         owner.begin_submission(&document, 3, "pending at close")?;
         owner.close(&document)?;
         assert!(owner.begin_submission(&document, 4, "late prompt").is_err());
         assert!(owner.complete_submission(&document, 3, true)?.is_none());
         let replacement = DocumentId("transcript:replacement".into());
-        owner.open(replacement.clone(), ViewId("view:replacement".into()), WidthProfile::default())?;
+        owner.open(
+            replacement.clone(),
+            ViewId("view:replacement".into()),
+            WidthProfile::default(),
+        )?;
         owner.begin_submission(&replacement, 1, "new lifetime")?;
         assert!(owner.complete_submission(&document, 3, true)?.is_none());
         assert!(owner.retract_submission(&document, 2)?.is_none());

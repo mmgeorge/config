@@ -17,7 +17,7 @@ use forge_github::review_mutation::{
 };
 use serde::{Deserialize, Serialize};
 
-use crate::comments::{CommentLimits, CommentStore};
+use crate::comments::{CommentLimits, CommentStore, DraftComment};
 use crate::edit::{EditBudget, EditLimits, EditStore, RegionEdit, SaveOutcome, SaveSubmission};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Serialize, serde::Deserialize)]
@@ -181,6 +181,28 @@ impl ReviewDocument {
             );
         }
         Ok(self.edits.accept(edit)?)
+    }
+
+    /// Captures permitted fields without projecting typing-time document patches.
+    pub fn capture_draft(
+        &mut self,
+        capture: Vec<RegionEdit>,
+        draft: Vec<DraftComment>,
+    ) -> Result<()> {
+        for edit in &capture {
+            if self.comments.contains_region(&edit.region) {
+                self.comments.validate_capture(&self.edits, &edit.region)?;
+            }
+            if matches!(edit.region.0.as_str(), "title" | "reviewers") {
+                ensure!(
+                    !edit.text.contains(['\n', '\r']) && edit.text.len() <= 4096,
+                    "invalid PR single-line field"
+                );
+            }
+        }
+        self.comments
+            .accept_capture(&mut self.edits, capture, draft)?;
+        Ok(())
     }
 
     /// Captures one dirty field group as a mutation while retaining unsubmitted fields.

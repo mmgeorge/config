@@ -2,416 +2,266 @@ local M = {}
 local client = require("forge.client")
 local buffer = require("forge.buffer")
 local input = require("forge.input")
-local editable = require("forge.editable")
+local comments = require("forge.draft_comments")
 local perf = require("forge.infra.perf")
 
----@param window integer
+---@param options table
+---@param callback fun(owner: table?, failure: string?)
 ---@return table
-local function review_view_options(window)
-  local columns = require("forge.window_presentation").capture(window)
-  columns.number, columns.relativenumber = true, false
-  columns.statuscolumn = vim.go.statuscolumn
-  return { columns = columns, virtualedit = "", conceal = { level = 3, cursor = "" },
-    wrapping = { indent = columns.breakindent, options = columns.breakindentopt } }
-end
-
 function M.attach(options, callback)
-  local owner = { document = "plan:review:" .. tostring(vim.uv.hrtime()), generation = client.host_generation(), closed = false, views = {} }
-  local action_tick = setmetatable({}, { __mode = "k" })
-  ---Whether the review retains an applied replica and active native edit attachment.
-  ---@return boolean
-  function owner.attached()
-    return owner.ready == true and owner.replica.status == "Applied"
-      and owner.replica.editable.native ~= nil and owner.replica.editable.native.active
-  end
+  local owner = { document = "plan:review:" .. vim.uv.hrtime(), generation = client.host_generation(), views = {} }
   local function alive()
     return not owner.closed and owner.generation == client.host_generation() and client.host_accepting()
       and vim.api.nvim_buf_is_valid(options.buffer)
-      and (not owner.ready or owner.attached())
-  end
-  local queue, active = {}, false
-  local submit_ready
-  local function dispatch()
-    if active or #queue == 0 then return end
-    active = true
-    local next_request = table.remove(queue, 1)
-    local function receive(result, failure)
-      local accepted, callback_error = pcall(next_request.receive, result, failure)
-      active = false
-      dispatch()
-      if submit_ready then submit_ready() end
-      if not accepted and options.notice then options.notice(tostring(callback_error)) end
-    end
-    if owner.generation ~= client.host_generation() then
-      receive(nil, "Plan review host generation changed")
-    else client.request_for(options.session_id, "harness.document", next_request.params, receive) end
   end
   local function request(params, receive)
-    if params.operation == "plan_edit" then
-      client.request_for(options.session_id, "harness.document", params, receive)
-      return
+    if not alive() then receive(nil, "Plan host is unavailable. The local draft remains in its buffer.") return end
+    client.request_for(options.session_id, "harness.document", params, function(result, failure)
+      if owner.closed or not vim.api.nvim_buf_is_valid(options.buffer) then return end
+      if not alive() then receive(nil, "Plan host was collected. The local draft remains in its buffer.")
+      else receive(result, failure) end
+    end)
+  end
+  function owner.attached() return alive() and owner.ready == true end
+  function owner.current_view()
+    local window = vim.api.nvim_get_current_win()
+    return owner.views[window] or owner.views[vim.fn.win_findbuf(options.buffer)[1]]
+  end
+  function owner.is_current(captured)
+    local view = owner.current_view()
+    return captured and alive() and view and captured.revision == owner.replica.revision
+      and view.changedtick == vim.api.nvim_buf_get_changedtick(options.buffer)
+      and view.sequence == captured.sequence and vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), view.cursor)
+  end
+  function owner.sync_editability()
+    if not owner.ready or not owner.comment_state then return end
+    local view = owner.current_view()
+    if view then
+      local position = vim.api.nvim_win_get_cursor(view.window)
+      local editable = false
+      for _, range in ipairs(owner.comment_state.range_list) do
+        if not range.compact then
+          local header = vim.api.nvim_buf_get_extmark_by_id(options.buffer, owner.comment_state.namespace, range.header_mark, {})
+          local footer = vim.api.nvim_buf_get_extmark_by_id(options.buffer, owner.comment_state.namespace, range.footer_mark, {})
+          editable = editable or #header == 2 and #footer == 2 and position[1] - 1 > header[1] and position[1] - 1 < footer[1]
+        end
+      end
+      vim.bo[options.buffer].modifiable = editable and not options.plan.historical_revision
     end
-    if #queue >= 63 and params.operation ~= "plan_close" then receive(nil, "Plan review request admission is full") return end
-    queue[#queue + 1] = { params = params, receive = receive }
-    dispatch()
+  end
+  function owner.recovery()
+    if not owner.ready then return nil, "Plan review is not ready" end
+    return { annotation = comments.capture(options.buffer), saved_source_digest = owner.saved_source_digest,
+      pending_operation = owner.pending_operation and vim.deepcopy(owner.pending_operation) }
   end
   function owner.close()
+    if owner.saving or owner.submission_pending then return false end
+    if vim.bo[options.buffer].modified then return true end
     if owner.closed then return true end
-    if owner.submission_pending then return false end
-    if owner.replica then
-      if owner.generation ~= client.host_generation() or not vim.api.nvim_buf_is_valid(options.buffer) then buffer.invalidate(owner.replica)
-      else
-        local closed = buffer.close(owner.replica, { preserve_buffer = true })
-        if closed and closed.kind == "Deferred" then return false end
-      end
-    end
-    if owner.gutter_selection then owner.gutter_selection.close() end
     owner.closed = true
-    if owner.pending_submit then
-      local pending = owner.pending_submit
-      owner.pending_submit = nil
-      pending.callback(nil, "Plan review closed before submission admission")
-    end
+    comments.detach(options.buffer, false)
+    if owner.gutter_selection then owner.gutter_selection.close() end
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     for _, view in pairs(owner.views) do input.close(view) end
-    if owner.generation == client.host_generation() and client.host_accepting() then
-      request({ operation = "plan_close", document = owner.document }, function(_, failure)
+    buffer.close(owner.replica, { preserve_buffer = true })
+    client.request_for(options.session_id, "harness.document", { operation = "plan_close", document = owner.document }, function(_, failure)
+      if failure and options.notice then options.notice(failure) end
+    end)
+    return true
+  end
+  local dispatch_operation
+  local function enqueue_operation(operation)
+    if owner.saving or owner.submission_pending or owner.completing then
+      local previous = owner.pending_operation
+      owner.pending_operation = operation
+      if previous and previous.receive then previous.receive(nil, "A newer explicit plan operation replaced this queued operation") end
+    else dispatch_operation(operation) end
+  end
+  dispatch_operation = function(operation)
+    local function complete(result, failure)
+      owner.saving, owner.submission_pending = false, false
+      if not failure then comments.saved(options.buffer, operation.capture) end
+      owner.completing = true
+      local received, callback_failure = pcall(function()
+        if operation.receive then operation.receive(result, failure)
+        elseif failure and options.notice then options.notice(failure) end
+      end)
+      owner.completing = false
+      local pending = owner.pending_operation
+      if pending and alive() then
+        owner.pending_operation = nil
+        dispatch_operation(pending)
+      end
+      if not received then error(callback_failure, 0) end
+    end
+    if operation.method then
+      owner.submission_pending = true
+      client.request_for(options.session_id, operation.method, operation.params, function(result, failure)
+        if owner.generation ~= client.host_generation() or not client.host_accepting() then
+          complete(nil, "Plan host is unavailable. The local draft remains in its buffer.")
+        else complete(result, failure) end
+      end)
+    else
+      owner.saving = true
+      request({ operation = "plan_save_annotations", document = owner.document,
+        saved_source_digest = owner.saved_source_digest, annotation = operation.capture }, complete)
+    end
+  end
+  function owner.submit(method, params, receive)
+    if not owner.attached() then receive(nil, "Plan review is not ready") return end
+    local capture = comments.capture(options.buffer)
+    local view = owner.current_view()
+    local captured, failure = input.capture(owner.replica, view, method)
+    if not captured then receive(nil, failure) return end
+    params = vim.deepcopy(params or {})
+    params.review, params.draft_annotation, params.draft_source_digest = captured, capture, owner.saved_source_digest
+    enqueue_operation({ method = method, params = params, capture = capture, receive = receive })
+  end
+  local function save(capture)
+    if not owner.attached() then return end
+    enqueue_operation({ capture = capture or comments.capture(options.buffer) })
+  end
+  local function attach_projection(opened)
+    local recovered = options.recovery ~= nil
+    local captured = options.recovery and options.recovery.annotation or opened.annotation or {}
+    local baseline = {}
+    for _, item in ipairs(opened.annotation or {}) do
+      baseline[#baseline + 1] = { id = tostring(item.id), source = vim.deepcopy(item.source) }
+    end
+    options.recovery = nil
+    local annotation = {}
+    for _, item in ipairs(captured) do
+      annotation[#annotation + 1] = { id = item.id, source_line = item.source.start_line,
+        end_source_line = item.source.end_line, body = item.source.body }
+    end
+    local source = assert(opened.source_row, "Plan review source rows are missing")
+    owner.source = source
+    local source_lines = {}
+    for _, row in ipairs(source) do source_lines[#source_lines + 1] = row.text end
+    local namespace = vim.api.nvim_create_namespace("ForgePlanDraftSource" .. options.buffer)
+    local function paint(_, _, projection)
+      owner.source_generation = (owner.source_generation or 0) + 1
+      vim.api.nvim_buf_clear_namespace(options.buffer, namespace, 0, -1)
+      owner.projection = projection
+      for _, record in ipairs(projection.source_record_list) do
+        local row = source[record.source_index]
+        local metadata = row.metadata or {}
+        for _, decoration_list in ipairs({ metadata.decoration or {} }) do
+          for _, decoration in ipairs(decoration_list) do
+            local span = decoration.range
+            if span.start.row <= row.position.row and span["end"].row >= row.position.row then
+              local start = span.start.row == row.position.row and span.start.column or 0
+              local finish = span["end"].row == row.position.row and span["end"].column or #row.text
+              if finish > start then vim.api.nvim_buf_set_extmark(options.buffer, namespace, record.row, start,
+                { end_col = math.min(finish, #row.text), hl_group = decoration.capture, priority = decoration.priority }) end
+            end
+          end
+        end
+      end
+      if owner.comment_state and options.configure_view then options.configure_view(owner.view, owner) end
+    end
+    owner.replica.physical_row = nil
+    owner.comment_state = comments.attach(options.buffer, options.window, source_lines, annotation, {
+      source_provider = function() return source end, after_render = paint,
+      baseline = recovered and baseline or nil,
+      readonly = options.plan.historical_revision ~= nil,
+    })
+    require("forge.draft_source").attach(owner.replica, owner.comment_state, source)
+  end
+  owner.replica = buffer.open(owner.document, { buffer = options.buffer, generated = true, preserve_view = true,
+    expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice })
+  local function open_view(window)
+    local columns = require("forge.window_presentation").capture(window)
+    columns.number, columns.relativenumber, columns.statuscolumn = true, false, vim.go.statuscolumn
+    local view = input.open(owner.replica, window, { columns = columns, virtualedit = "", conceal = { level = 3, cursor = "" },
+      wrapping = { indent = columns.breakindent, options = columns.breakindentopt } })
+    owner.views[window] = view
+    if owner.ready and alive() then
+      request({ operation = "plan_view", document = owner.document, view = view.id, width = owner.source_width }, function(_, failure)
         if failure and options.notice then options.notice(failure) end
       end)
     end
-    return true
-  end
-  local function finish_save()
-    if submit_ready then submit_ready() end
-    local pending = owner.pending_action
-    if pending and not editable.suspend_generated_text(owner.replica.editable) then
-      owner.pending_action = nil
-      if vim.api.nvim_win_is_valid(pending.window)
-        and vim.deep_equal(vim.api.nvim_win_get_cursor(pending.window), pending.cursor) then
-        owner.action(pending.action, pending.receive)
-      end
-    end
-    if owner.sync_focus then vim.schedule(owner.sync_focus) end
-    if owner.sync_editability then owner.sync_editability() end
-    if not owner.pending_save or editable.suspend_generated_text(owner.replica.editable) then return end
-    local tick = owner.pending_save
-    owner.pending_save = nil
-    if tick == vim.api.nvim_buf_get_changedtick(options.buffer) then vim.bo[options.buffer].modified = false end
-  end
-  function owner.sync_editability()
-    if not alive() or not owner.ready then return end
-    local view = owner.current_view()
-    if not view then return end
-    local cursor = vim.api.nvim_win_get_cursor(view.window)
-    local position = { row = cursor[1] - 1, column = cursor[2] }
-    vim.bo[options.buffer].modifiable = not owner.focus_pending and not owner.add_pending
-      and not owner.submission_pending
-      and editable.guard_region(owner.replica.editable, position, position) ~= nil
-  end
-  -- Focus changes wait for edit acknowledgements before replacing comment presentation.
-  function owner.sync_focus()
-    if options.plan.historical_revision then return end
-    if not alive() or not owner.ready or owner.focus_pending or owner.add_pending or owner.navigation_pending or owner.pending_submit or owner.submission_pending then return end
-    if editable.suspend_generated_text(owner.replica.editable) then editable.flush(owner.replica.editable) return end
-    local view = owner.current_view()
-    if not view or vim.api.nvim_get_current_win() ~= view.window then return end
-    local cursor = vim.api.nvim_win_get_cursor(view.window)
-    local location = buffer.locate(owner.replica, cursor[1] - 1, cursor[2])
-    if not location then return end
-    local focused = location.block:match("^plan:annotation:(.+)$")
-    if focused == owner.focused_annotation then return end
-    local captured, failure = input.capture(owner.replica, view, "focus_annotation")
-    if not captured then return end
-    owner.focus_pending = true
-    vim.bo[options.buffer].modifiable = false
-    request({ operation = "plan_focus_annotation", input = captured }, function(result, error)
-      owner.focus_pending = false
-      if not alive() then return end
-      vim.bo[options.buffer].modifiable = true
-      if error then owner.sync_editability() if options.notice then options.notice(error) end return end
-      local current = vim.api.nvim_win_get_cursor(view.window)
-      local retained = buffer.locate(owner.replica, current[1] - 1, current[2])
-      if result.patch and result.patch ~= vim.NIL then
-        local adopted = buffer.apply_patch(owner.replica, result.patch)
-        if adopted.kind ~= "Applied" then
-          if options.notice then options.notice("Plan comment focus requires reconciliation: " .. adopted.kind) end
-          return
-        end
-      end
-      owner.focused_annotation = type(result.focused) == "string" and result.focused or nil
-      vim.bo[options.buffer].modifiable = true
-      vim.bo[options.buffer].modified = false
-      if retained then
-        local _, row = owner.replica.sequence:position(retained.block)
-        if row then
-          local body = retained.block == captured.block and focused ~= nil
-          vim.api.nvim_win_set_cursor(view.window, { row + (body and 1 or retained.position.row) + 1, body and 0 or retained.position.column })
-          if body then vim.api.nvim_win_call(view.window, function() vim.cmd("silent! normal! zv") end) end
-        end
-      end
-      owner.sync_editability()
-      vim.schedule(owner.sync_focus)
-    end)
-  end
-  submit_ready = function()
-    local pending = owner.pending_submit
-    if not pending or not alive() or active or #queue > 0 or editable.suspend_generated_text(owner.replica.editable) then return end
-    owner.pending_submit = nil
-    if pending.tick ~= vim.api.nvim_buf_get_changedtick(options.buffer) then
-      pending.callback(nil, "Plan review changed while awaiting saved annotation acknowledgement") return
-    end
-    local view = owner.current_view()
-    if not view then pending.callback(nil, "Plan review view is closed") return end
-    local captured, failure = input.capture(owner.replica, view, pending.method)
-    if not captured then pending.callback(nil, failure) return end
-    pending.params.review = captured
-    owner.submission_pending = true
-    vim.bo[options.buffer].modifiable = false
-    client.request_for(options.session_id, pending.method, pending.params, function(result, failure)
-      owner.submission_pending = nil
-      pending.callback(result, failure)
-      owner.sync_editability()
-    end)
-  end
-  function owner.submit(method, params, receive)
-    if not alive() or not owner.ready or owner.pending_submit or owner.submission_pending then receive(nil, "Plan review is not ready for submission") return end
-    owner.pending_submit = { method = method, params = params or {}, callback = receive,
-      tick = vim.api.nvim_buf_get_changedtick(options.buffer) }
-    editable.flush(owner.replica.editable)
-    submit_ready()
-  end
-  function owner.recovery()
-    local state = owner.replica and owner.replica.editable
-    if not state or state.fault then return nil, "Plan review contains text outside its editable annotation regions" end
-    local draft = {}
-    for region in pairs(state.region) do
-      local captured, failure = pcall(editable.capture, state, region)
-      if not captured then return nil, tostring(failure) end
-      draft[region] = editable.recoverable_text(state, region)
-    end
-    return { draft = draft, saved_source_digest = owner.saved_source_digest }
-  end
-  owner.replica = buffer.open(owner.document, { buffer = options.buffer, generated = true, preserve_view = true,
-    expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice,
-    editable = { notice = options.notice, send = function(edit)
-      if not alive() then return false end
-      request({ operation = "plan_edit", edit = edit }, function(result, failure)
-        if not alive() then return end
-        if failure or not result or not result.accepted then
-          if options.notice then options.notice(failure or "Plan annotation edit conflicted with its saved source") end
-          if owner.pending_submit then
-            local pending = owner.pending_submit
-            owner.pending_submit = nil
-            pending.callback(nil, failure or "Plan annotation edit was not saved")
-          end
-          return
-        end
-        local adopted = buffer.acknowledge_edit(owner.replica, result.acknowledgement, result.patch)
-        if adopted.kind == "Applied" then
-          vim.bo[options.buffer].modifiable = true
-          if not editable.suspend_generated_text(owner.replica.editable) then vim.bo[options.buffer].modified = false end
-        end
-        finish_save()
-      end)
-      return true
-    end } })
-  owner.view = input.open(owner.replica, options.window, review_view_options(options.window))
-  owner.views[options.window] = owner.view
-  local function adopt_view(result, failure)
-    if not alive() then return end
-    if failure then if options.notice then options.notice(failure) end return end
-    if result.patch and result.patch ~= vim.NIL then
-      local adopted = buffer.apply_patch(owner.replica, result.patch)
-      if adopted.kind == "Applied" then owner.sync_editability() end
-    end
-  end
-  local function view_for(window)
-    if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= options.buffer then return nil end
-    if owner.views[window] then return owner.views[window] end
-    local view = input.open(owner.replica, window, review_view_options(window))
-    owner.views[window] = view
-    if options.configure_view then options.configure_view(view, owner) end
-    request({ operation = "plan_view", document = owner.document, view = view.id,
-      width = require("forge.width").capture(window) }, adopt_view)
     return view
   end
-  function owner.current_view()
-    return view_for(vim.api.nvim_get_current_win()) or view_for(vim.fn.win_findbuf(options.buffer)[1] or -1)
-  end
+  owner.view = open_view(options.window)
+  owner.source_width = require("forge.width").capture(options.window)
+  local started = perf.now()
+  request({ operation = "plan_open", document = owner.document, view = owner.view.id,
+    plan_id = options.plan.id, digest = options.plan.review_digest, revision = options.plan.historical_revision,
+    saved_source_digest = options.recovery and options.recovery.saved_source_digest,
+    width = owner.source_width }, function(opened, failure)
+    perf.event("harness", "plan.review.open_response", { elapsed_ms = perf.elapsed_ms(started), status = failure and "error" or "ok" })
+    if failure then callback(nil, failure) return end
+    if options.recovery_provider then
+      local recovered, recovery_failure = options.recovery_provider()
+      if not recovered then callback(nil, recovery_failure) return end
+      if recovered.saved_source_digest ~= opened.saved_source_digest then
+        callback(nil, "Plan source changed while recovering the draft") return
+      end
+      options.recovery = recovered
+      owner.replica.expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)
+    end
+    local adopted = buffer.apply_snapshot(owner.replica, opened.snapshot)
+    if adopted.kind ~= "Applied" then callback(nil, adopted.kind) return end
+    owner.public_only, owner.saved_source_digest, owner.version = opened.public_only, opened.saved_source_digest, opened.version
+    local pending = options.recovery and options.recovery.pending_operation
+    attach_projection(opened)
+    owner.ready = true
+    if options.configure_view then options.configure_view(owner.view, owner) end
+    vim.bo[options.buffer].buftype = "acwrite"
+    if options.plan.historical_revision then vim.bo[options.buffer].modifiable = false end
+    owner.gutter_selection = require("forge.document_commands").attach_selection(owner.replica, { normalize = false })
+    owner.group = vim.api.nvim_create_augroup("ForgePlanDocument" .. options.buffer, { clear = true })
+    vim.api.nvim_create_autocmd("BufWriteCmd", { group = owner.group, buffer = options.buffer, callback = function() save() end })
+    vim.api.nvim_create_autocmd("BufWinEnter", { group = owner.group, buffer = options.buffer, callback = function()
+      local window = vim.api.nvim_get_current_win()
+      if not owner.views[window] then open_view(window) end
+    end })
+    callback(owner)
+    if pending then
+      if pending.method then
+        local captured = pending.params.review
+        captured.document, captured.revision, captured.view = owner.document, owner.replica.revision, owner.view.id
+        owner.view.sequence = owner.view.sequence + 1
+        captured.sequence = owner.view.sequence
+      end
+      enqueue_operation(pending)
+    end
+  end)
   function owner.refresh_views()
-    if not alive() or not owner.ready then return end
     for window, view in pairs(owner.views) do
       if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= options.buffer then
         input.close(view)
         owner.views[window] = nil
-        request({ operation = "plan_view", document = owner.document, view = view.id }, adopt_view)
       end
     end
-    for _, window in ipairs(vim.fn.win_findbuf(options.buffer)) do view_for(window) end
+    for _, window in ipairs(vim.fn.win_findbuf(options.buffer)) do
+      if not owner.views[window] then open_view(window) end
+    end
   end
-  function owner.is_current(captured)
-    if not alive() or owner.replica.revision ~= captured.revision then return false end
-    if action_tick[captured] and action_tick[captured] ~= vim.api.nvim_buf_get_changedtick(options.buffer) then return false end
-    for _, view in pairs(owner.views) do
-      if view.id == captured.view then
-        return view.active and view.sequence == captured.sequence and vim.api.nvim_win_is_valid(view.window)
-          and vim.api.nvim_win_get_buf(view.window) == options.buffer
-          and vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), view.cursor)
-      end
-    end
-    return false
-  end
-  local open_started = perf.now()
-  request({ operation = "plan_open", document = owner.document, view = owner.view.id,
-    plan_id = options.plan.id, digest = options.plan.review_digest, revision = options.plan.historical_revision,
-    saved_source_digest = options.recovery and options.recovery.saved_source_digest or nil,
-    focused_annotation = options.recovery and next(options.recovery.draft) or nil,
-    width = require("forge.width").capture(options.window) }, function(opened, failure)
-    perf.event("harness", "plan.review.open_response", {
-      elapsed_ms = perf.elapsed_ms(open_started),
-      status = failure and "error" or "ok",
-      count = opened and opened.snapshot and #opened.snapshot.block or 0,
-    })
-    if not alive() then owner.close() return end
-    if failure then owner.close() callback(nil, failure) return end
-    if vim.fs.normalize(vim.api.nvim_buf_get_name(options.buffer)) ~= vim.fs.normalize(opened.path) then
-      owner.close() callback(nil, "Physical plan review path changed before attachment") return
-    end
-    if options.recovery then
-      local region = {}
-      for _, block in ipairs(opened.snapshot.block) do
-        for _, editable_region in ipairs(block.metadata.editable_region or {}) do region[editable_region.id] = true end
-      end
-      for id in pairs(options.recovery.draft) do
-        if not region[id] then owner.close() callback(nil, "A retained plan annotation is missing from saved storage") return end
-      end
-    end
-    local adopted = buffer.apply_snapshot(owner.replica, opened.snapshot)
-    if adopted.kind ~= "Applied" then
-      owner.close() callback(nil, "Physical plan review changed before attachment: " .. adopted.kind) return
-    end
-    perf.event("harness", "plan.review.snapshot_applied", {
-      elapsed_ms = perf.elapsed_ms(open_started),
-      count = #opened.snapshot.block,
-    })
-    if options.configure_view then options.configure_view(owner.view, owner) end
-    owner.gutter_selection = require("forge.document_commands").attach_selection(owner.replica, { normalize = false })
-    owner.public_only = opened.public_only
-    owner.saved_source_digest, owner.version = opened.saved_source_digest, opened.version
-    owner.focused_annotation = options.recovery and next(options.recovery.draft) or nil
-    owner.ready = true
-    vim.bo[options.buffer].modified = false
-    vim.bo[options.buffer].modifiable = true
-    vim.bo[options.buffer].buftype = "acwrite"
-    if options.recovery then
-      local restore = {}
-      for id, text in pairs(options.recovery.draft) do
-        restore[#restore + 1] = { anchor = vim.deepcopy(owner.replica.editable.native.anchor[id]), text = text }
-      end
-      table.sort(restore, function(left, right) return left.anchor.start.row > right.anchor.start.row end)
-      for _, retained in ipairs(restore) do
-        local start, finish = retained.anchor.start, retained.anchor.finish
-        if not vim.deep_equal(vim.api.nvim_buf_get_text(options.buffer, start.row, start.column, finish.row, finish.column, {}), retained.text) then
-          vim.api.nvim_buf_set_text(options.buffer, start.row, start.column, finish.row, finish.column, retained.text)
-        end
-      end
-    end
-    owner.group = vim.api.nvim_create_augroup("ForgePlanDocument" .. options.buffer, { clear = true })
-    vim.api.nvim_create_autocmd({ "CursorMoved", "CursorMovedI", "InsertEnter", "InsertLeave", "BufEnter" }, { group = owner.group, buffer = options.buffer,
-      callback = function() owner.sync_editability() vim.schedule(owner.sync_focus) end })
-    vim.api.nvim_create_autocmd({ "BufWinEnter", "BufWinLeave", "WinClosed" }, { group = owner.group,
-      callback = function() vim.schedule(owner.refresh_views) end })
-    vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, { group = owner.group, callback = function()
-      if owner.resize_scheduled then return end
-      owner.resize_scheduled = true
-      vim.schedule(function()
-        owner.resize_scheduled = false
-        if not alive() then return end
-        owner.refresh_views()
-        for window, view in pairs(owner.views) do
-          request({ operation = "plan_view", document = owner.document, view = view.id,
-            width = require("forge.width").capture(window) }, adopt_view)
-        end
-      end)
-    end })
-    vim.api.nvim_create_autocmd("BufWipeout", { group = owner.group, buffer = options.buffer,
-      callback = function() vim.schedule(owner.close) end })
-    vim.api.nvim_create_autocmd("BufWriteCmd", { group = owner.group, buffer = options.buffer, callback = function()
-      if not alive() then return end
-      owner.pending_save = vim.api.nvim_buf_get_changedtick(options.buffer)
-      editable.flush(owner.replica.editable)
-      finish_save()
-    end })
-    callback(owner)
-    owner.sync_editability()
-  end)
   function owner.action(action, receive)
-    if not alive() or not owner.ready or owner.pending_submit or owner.submission_pending then return end
-    if owner.add_pending or owner.focus_pending then return end
-    local view = owner.current_view()
-    if not view then return end
-    local layout_action = action == "comment" or action == "delete" or action == "toggle_public"
-    if action == "delete" then
-      local cursor = vim.api.nvim_win_get_cursor(view.window)
-      local location = buffer.locate(owner.replica, cursor[1] - 1, cursor[2])
-      if not location or not location.block:match("^plan:annotation:") then return end
+    if not owner.attached() then return false end
+    if action == "comment" then comments.add_at_cursor(options.buffer, false) receive({ local_draft = true }, nil) return true end
+    if action == "delete" then comments.delete_at_cursor(options.buffer) receive({}, nil) return true end
+    if action == "toggle_public" and vim.bo[options.buffer].modified then
+      if options.notice then options.notice("Save plan annotations before changing the source projection") end
+      return false
     end
-    if layout_action and editable.suspend_generated_text(owner.replica.editable) then
-      owner.pending_action = { action = action, receive = receive, window = view.window,
-        cursor = vim.api.nvim_win_get_cursor(view.window) }
-      editable.flush(owner.replica.editable)
-      return
-    end
-    local selection
-    if action == "comment" and vim.fn.mode(1):match("^[vV\022]") then
-      local cursor = vim.api.nvim_win_get_cursor(view.window)
-      local start = vim.fn.getpos("v")
-      local first, last
-      for row = math.min(start[2], cursor[1]), math.max(start[2], cursor[1]) do
-        local location = buffer.locate(owner.replica, row - 1, 0)
-        if location and location.target then first = first or row last = row end
+    local captured, failure = input.capture(owner.replica, owner.current_view(), action)
+    if not captured then receive(nil, failure) return false end
+    request({ operation = "plan_action", input = captured }, function(result, error)
+      if not owner.is_current(captured) then return end
+      if not error and result.patch and result.patch ~= vim.NIL then
+        comments.detach(options.buffer, false)
+        owner.replica.locate, owner.replica.physical_row = nil, nil
+        owner.replica.prepare_source, owner.replica.decoration_location, owner.replica.fold_location = nil, nil, nil
+        local applied = buffer.apply_snapshot(owner.replica, result.snapshot)
+        if applied.kind ~= "Applied" then receive(nil, applied.kind, captured) return end
+        attach_projection(result)
       end
-      if not first then if options.notice then options.notice("Selected plan rows have no semantic targets") end return end
-      vim.api.nvim_win_set_cursor(view.window, { first, 0 })
-      selection = input.capture(owner.replica, view, action)
-      vim.api.nvim_win_set_cursor(view.window, { last, 0 })
-      vim.cmd("normal! \027")
-    end
-    local captured, failure = input.capture(owner.replica, view, action)
-    if not captured then if options.notice then options.notice(failure) end return end
-    local action_cursor = vim.api.nvim_win_get_cursor(view.window)
-    local tick = vim.api.nvim_buf_get_changedtick(options.buffer)
-    action_tick[captured] = tick
-    if action == "jump_entity" then owner.navigation_pending = (owner.navigation_pending or 0) + 1 end
-    owner.add_pending = layout_action
-    if owner.add_pending then vim.bo[options.buffer].modifiable = false end
-    request({ operation = action == "comment" and "plan_add_annotation"
-        or action == "delete" and "plan_delete_annotation" or "plan_action",
-      input = selection or captured, ["end"] = selection and captured or nil }, function(anchor, action_error)
-      if action == "jump_entity" then
-        owner.navigation_pending = owner.navigation_pending - 1
-        if owner.navigation_pending == 0 then owner.navigation_pending = nil vim.schedule(owner.sync_focus) end
-      end
-      owner.add_pending = false
-      local current = owner.is_current(captured)
-      if not layout_action and not current then return end
-      if not alive() then return end
-      if layout_action then vim.bo[options.buffer].modifiable = true end
-      if not action_error and layout_action then
-        local adopted = buffer.apply_patch(owner.replica, anchor.patch)
-        if adopted.kind ~= "Applied" then if options.notice then options.notice("Plan annotation layout requires reconciliation: " .. adopted.kind) end return end
-        vim.bo[options.buffer].modifiable = true
-        vim.bo[options.buffer].modified = false
-        owner.focused_annotation = action == "comment" and anchor.region or nil
-        if action == "delete" then
-          local line = math.min(action_cursor[1], vim.api.nvim_buf_line_count(options.buffer))
-          vim.api.nvim_win_set_cursor(view.window, { math.max(1, line), 0 })
-        end
-      end
-      if current or action_error or action == "toggle_public" then receive(anchor, action_error, captured)
-      else vim.schedule(owner.sync_focus) end
-      owner.sync_editability()
+      receive(result, error, captured)
     end)
+    return true
   end
   return owner
 end

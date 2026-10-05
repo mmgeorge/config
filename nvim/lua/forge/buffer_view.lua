@@ -67,7 +67,8 @@ function M.restore(session, retained)
         local column = saved.column
         if closed >= 0 then row, column = closed - 1, 0 end
         local line = vim.api.nvim_buf_get_lines(session.buffer, row, row + 1, true)[1] or ""
-        column = math.min(column, math.max(0, #line - 1))
+        local insertion = vim.api.nvim_get_current_win() == saved.window and vim.fn.mode(1):match("^[iR]") ~= nil
+        column = math.min(column, math.max(0, #line - (insertion and 0 or 1)))
         while column > 0 do
           local byte = line:byte(column + 1)
           if not byte or byte < 128 or byte >= 192 then break end

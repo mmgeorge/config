@@ -179,22 +179,11 @@ pub struct PreparedRegionEdit<'store> {
 impl PreparedRegionEdit<'_> {
     pub fn snapshot(&self) -> Result<FieldSnapshot<'_>, EditError> {
         let previous = self.store.snapshot(&self.acknowledgement.region)?;
-        let converged = previous.remote == Some(self.text.value.as_ref());
-        let baseline = if converged {
-            self.text.value.as_ref()
-        } else {
-            previous.baseline
-        };
-        Ok(FieldSnapshot {
-            text: &self.text.value,
-            baseline,
-            revision: self.acknowledgement.revision,
-            sequence: self.acknowledgement.sequence,
-            dirty: self.text.value.as_ref() != baseline,
-            pending_saves: previous.pending_saves,
-            uncertain: previous.uncertain,
-            remote: if converged { None } else { previous.remote },
-        })
+        Ok(updated_field_snapshot(
+            previous,
+            &self.text,
+            &self.acknowledgement,
+        ))
     }
     pub fn commit(self) -> EditAcknowledgement {
         let field = self
@@ -217,7 +206,164 @@ impl PreparedRegionEdit<'_> {
     }
 }
 
+/// Reserves a complete capture without changing fields until the owner commits it.
+pub struct PreparedCapture<'store> {
+    store: &'store mut EditStore,
+    update: Vec<(Arc<StoredText>, EditAcknowledgement)>,
+    insertion: Vec<(RegionId, EditableField)>,
+}
+
+impl PreparedCapture<'_> {
+    pub fn snapshot(&self, region: &RegionId) -> Result<FieldSnapshot<'_>, EditError> {
+        if let Some((_, field)) = self
+            .insertion
+            .iter()
+            .find(|(identity, _)| identity == region)
+        {
+            return Ok(FieldSnapshot {
+                text: &field.current.value,
+                baseline: &field.baseline.value,
+                revision: field.revision,
+                sequence: field.sequence,
+                dirty: field.current.value != field.baseline.value,
+                pending_saves: 0,
+                uncertain: false,
+                remote: None,
+            });
+        }
+        let previous = self.store.snapshot(region)?;
+        let Some((text, acknowledgement)) = self
+            .update
+            .iter()
+            .find(|(_, update)| &update.region == region)
+        else {
+            return Ok(previous);
+        };
+        Ok(updated_field_snapshot(previous, text, acknowledgement))
+    }
+
+    pub fn commit(self) {
+        for (text, acknowledgement) in self.update {
+            PreparedRegionEdit {
+                store: self.store,
+                text,
+                acknowledgement,
+            }
+            .commit();
+        }
+        for (region, field) in self.insertion {
+            self.store.used_region.insert(region.clone());
+            self.store.field.insert(region, field);
+        }
+    }
+}
+
+fn updated_field_snapshot<'field>(
+    previous: FieldSnapshot<'field>,
+    text: &'field StoredText,
+    acknowledgement: &EditAcknowledgement,
+) -> FieldSnapshot<'field> {
+    let converged = previous.remote == Some(text.value.as_ref());
+    let baseline = if converged {
+        text.value.as_ref()
+    } else {
+        previous.baseline
+    };
+    FieldSnapshot {
+        text: &text.value,
+        baseline,
+        revision: acknowledgement.revision,
+        sequence: acknowledgement.sequence,
+        dirty: text.value.as_ref() != baseline,
+        pending_saves: previous.pending_saves,
+        uncertain: previous.uncertain,
+        remote: if converged { None } else { previous.remote },
+    }
+}
+
 impl EditStore {
+    /// Adopts an explicit draft capture after every field passes validation and memory admission.
+    ///
+    /// Duplicate regions, foreign document identities, invalid text or counters, stale region
+    /// revisions or sequences, and capacity failures leave all fields unchanged. Repeating an
+    /// already accepted capture with identical text, sequence, and base revision is idempotent.
+    /// New region declarations require unused identities, revision zero, a positive sequence,
+    /// and a body in the same capture. Callers omit accepted identities from new declarations
+    /// when retrying. New fields retain an empty saved baseline until explicit save settlement.
+    pub fn prepare_capture(
+        &mut self,
+        capture: Vec<RegionEdit>,
+        new_region: &[RegionId],
+    ) -> Result<PreparedCapture<'_>, EditError> {
+        let mut declared = BTreeSet::new();
+        for region in new_region {
+            region.validate()?;
+            if !declared.insert(region.clone()) || self.used_region.contains(region) {
+                return Err(EditError::Invalid(
+                    "captured region identity was already used",
+                ));
+            }
+        }
+        if self.field.len().saturating_add(declared.len()) > self.limits.active_fields
+            || self.used_region.len().saturating_add(declared.len()) > self.limits.region_lifetimes
+        {
+            return Err(EditError::Capacity("review region admission is full"));
+        }
+        let mut region = BTreeSet::new();
+        let mut prepared = Vec::new();
+        let mut inserted = Vec::new();
+        for edit in capture {
+            if edit.document != self.document {
+                return Err(EditError::WrongOwner);
+            }
+            if !region.insert(edit.region.clone()) {
+                return Err(EditError::Invalid("duplicate captured field"));
+            }
+            if declared.contains(&edit.region) {
+                edit.document.validate()?;
+                edit.base.validate()?;
+                edit.sequence.validate()?;
+                if edit.base.0 != 0 || edit.sequence.0 == 0 {
+                    return Err(EditError::Invalid(
+                        "new draft requires revision zero and a positive sequence",
+                    ));
+                }
+                self.validate_text(&edit.text)?;
+                let current = self.budget.retain(edit.text)?;
+                let baseline = self.budget.retain(String::new())?;
+                inserted.push((
+                    edit.region,
+                    EditableField {
+                        current,
+                        baseline,
+                        revision: RegionRevision(1),
+                        sequence: edit.sequence,
+                        settled_save: 0,
+                        remote: None,
+                    },
+                ));
+                continue;
+            }
+            let current = self.snapshot(&edit.region)?;
+            if current.sequence == edit.sequence
+                && edit.base.0.checked_add(1) == Some(current.revision.0)
+                && current.text == edit.text
+            {
+                continue;
+            }
+            let candidate = self.prepare_accept(edit)?;
+            prepared.push((candidate.text, candidate.acknowledgement));
+        }
+        if !declared.is_subset(&region) {
+            return Err(EditError::Invalid("new draft has no captured body"));
+        }
+        Ok(PreparedCapture {
+            store: self,
+            update: prepared,
+            insertion: inserted,
+        })
+    }
+
     pub fn document_id(&self) -> &DocumentId {
         &self.document
     }

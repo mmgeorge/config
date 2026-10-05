@@ -412,6 +412,135 @@ fn wire_edit_rejects_layout_revision_and_unknown_fields() {
 }
 
 #[test]
+fn explicit_capture_validates_all_fields_before_adopting_any() {
+    let budget = EditBudget::new(1024).unwrap();
+    let mut store = store(&budget);
+    let title = RegionId("title".into());
+    store
+        .insert(title.clone(), RegionRevision(0), "original title".into())
+        .unwrap();
+    let body = RegionEdit {
+        document: DocumentId("review".into()),
+        region: region(),
+        base: RegionRevision(0),
+        sequence: EditSequence(1),
+        text: "captured body".into(),
+    };
+    let invalid_title = RegionEdit {
+        document: DocumentId("review".into()),
+        region: title.clone(),
+        base: RegionRevision(9),
+        sequence: EditSequence(2),
+        text: "captured title".into(),
+    };
+    let retained = budget.retained_bytes();
+    assert!(
+        store
+            .prepare_capture(vec![copy_capture(&body), copy_capture(&invalid_title)], &[])
+            .is_err()
+    );
+    assert_eq!(store.snapshot(&region()).unwrap().text, "old");
+    assert_eq!(store.snapshot(&title).unwrap().text, "original title");
+    assert_eq!(budget.retained_bytes(), retained);
+    let valid_title = RegionEdit {
+        base: RegionRevision(0),
+        ..invalid_title
+    };
+    store
+        .prepare_capture(vec![copy_capture(&body), copy_capture(&valid_title)], &[])
+        .unwrap()
+        .commit();
+    assert_eq!(store.snapshot(&region()).unwrap().text, "captured body");
+    assert_eq!(store.snapshot(&title).unwrap().text, "captured title");
+    let retained = budget.retained_bytes();
+    store
+        .prepare_capture(vec![copy_capture(&body), valid_title], &[])
+        .unwrap()
+        .commit();
+    assert_eq!(
+        store.snapshot(&region()).unwrap().revision,
+        RegionRevision(1)
+    );
+    assert_eq!(budget.retained_bytes(), retained);
+    assert!(
+        store
+            .prepare_capture(
+                vec![RegionEdit {
+                    document: DocumentId("foreign".into()),
+                    ..copy_capture(&body)
+                }],
+                &[]
+            )
+            .is_err()
+    );
+    assert!(
+        store
+            .prepare_capture(vec![copy_capture(&body), body], &[])
+            .is_err()
+    );
+    assert_eq!(
+        store.snapshot(&region()).unwrap().revision,
+        RegionRevision(1)
+    );
+}
+
+#[test]
+fn explicit_capture_capacity_failure_rolls_back_all_reservations() {
+    let budget = EditBudget::new(12).unwrap();
+    let mut store = store(&budget);
+    let title = RegionId("title".into());
+    store
+        .insert(title.clone(), RegionRevision(0), "title".into())
+        .unwrap();
+    let capture = vec![
+        RegionEdit {
+            document: DocumentId("review".into()),
+            region: region(),
+            base: RegionRevision(0),
+            sequence: EditSequence(1),
+            text: "body".into(),
+        },
+        RegionEdit {
+            document: DocumentId("review".into()),
+            region: title.clone(),
+            base: RegionRevision(0),
+            sequence: EditSequence(2),
+            text: "replacement".into(),
+        },
+    ];
+    assert!(store.prepare_capture(capture, &[]).is_err());
+    assert_eq!(
+        store.snapshot(&region()).unwrap().revision,
+        RegionRevision(0)
+    );
+    assert_eq!(store.snapshot(&title).unwrap().revision, RegionRevision(0));
+    assert_eq!(budget.retained_bytes(), 8);
+}
+
+#[test]
+fn prepared_capture_abort_preserves_fields_and_releases_reserved_text() {
+    let budget = EditBudget::new(128).unwrap();
+    let mut store = store(&budget);
+    let retained = budget.retained_bytes();
+    let captured = store.prepare_capture(vec![RegionEdit {
+        document: DocumentId("review".into()),
+        region: region(),
+        base: RegionRevision(0),
+        sequence: EditSequence(1),
+        text: "candidate body".into(),
+    }], &[]).unwrap();
+    let proposed = captured.snapshot(&region()).unwrap();
+    assert_eq!(proposed.text, "candidate body");
+    assert_eq!(proposed.baseline, "old");
+    assert_eq!(proposed.revision, RegionRevision(1));
+    assert_eq!(budget.retained_bytes(), retained + "candidate body".len());
+    drop(captured);
+    assert_eq!(store.snapshot(&region()).unwrap().text, "old");
+    assert_eq!(store.snapshot(&region()).unwrap().revision, RegionRevision(0));
+    assert_eq!(budget.retained_bytes(), retained);
+}
+
+#[test]
 fn merge_conflict_retains_all_versions_and_rejects_over_budget_replacement() {
     use forge_review::edit::{ConflictResolution, MergeOutcome};
     let budget = EditBudget::new(14).unwrap();
@@ -535,4 +664,8 @@ fn merge_and_resolution_counter_exhaustion_preserve_retained_state() {
     ));
     assert_eq!(store.snapshot(&region()).unwrap().text, "local");
     assert_eq!(budget.retained_bytes(), 5);
+}
+
+fn copy_capture(edit: &RegionEdit) -> RegionEdit {
+    serde_json::from_value(serde_json::to_value(edit).unwrap()).unwrap()
 }

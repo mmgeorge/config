@@ -14,7 +14,13 @@ client.host_accepting = function() return true end
 client.request_for = function(_, method, params, callback)
   assert(method == "harness.document")
   if params.operation == "plan_open" then
-    callback({ path = path, version = 1, saved_source_digest = "saved", snapshot = {
+    local source_row = {}
+    for index, text in ipairs(source) do
+      source_row[#source_row + 1] = { id = "plan:source:" .. index, text = text,
+        source_line = index, block = "plan:source", position = { row = index - 1, column = 0 }, metadata = {} }
+    end
+    callback({ path = path, version = 1, saved_source_digest = "saved", source_row = source_row,
+      annotation = {}, snapshot = {
       document = params.document, revision = 0, block = { {
         id = "plan:source", text = source, metadata = { decoration = {}, editable_region = {}, target = {} },
       } },
@@ -37,7 +43,7 @@ local success, failure = xpcall(function()
   assert(vim.fs.normalize(vim.api.nvim_buf_get_name(review.buf)) == vim.fs.normalize(path))
   assert(vim.deep_equal(vim.fn.readfile(path), source),
     "public PlanReview import changed the physical plan source")
-  for _, command in ipairs({ "toggle", "open", "jump_entity", "entity_info", "rename_entity", "schema", "comment", "delete", "accept", "request_changes", "close", "help" }) do
+  for _, command in ipairs({ "toggle", "open", "jump_entity", "entity_info", "schema", "comment", "delete", "accept", "request_changes", "close", "help" }) do
     assert(review.command_set.action_by_id[command], "public PlanReview command is missing: " .. command)
   end
 

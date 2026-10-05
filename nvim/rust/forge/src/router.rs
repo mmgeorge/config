@@ -123,6 +123,10 @@ struct ReviewOpenParams {
 #[serde(deny_unknown_fields)]
 struct ReviewDocumentParams {
     document: DocumentId,
+    #[serde(default)]
+    capture: Vec<RegionEdit>,
+    #[serde(default)]
+    draft_comment: Vec<forge_review::comments::DraftComment>,
 }
 
 #[derive(Deserialize)]
@@ -223,6 +227,10 @@ struct ReviewSetViewedParams {
 struct ReviewSubmitBatchedParams {
     document: DocumentId,
     verdict: forge_review::review::ReviewVerdict,
+    #[serde(default)]
+    capture: Vec<RegionEdit>,
+    #[serde(default)]
+    draft_comment: Vec<forge_review::comments::DraftComment>,
 }
 
 #[derive(Deserialize)]
@@ -254,6 +262,10 @@ enum HarnessSourceRequest {
 struct ReviewCommentParams {
     document: DocumentId,
     command: ReviewCommentCommand,
+    #[serde(default)]
+    capture: Vec<RegionEdit>,
+    #[serde(default)]
+    draft_comment: Vec<forge_review::comments::DraftComment>,
 }
 
 #[derive(Deserialize)]
@@ -369,7 +381,6 @@ pub(crate) enum RoutedMethod {
     PullRequest,
     Comment,
     ReviewOpen,
-    ReviewEdit,
     ReviewSnapshot,
     ReviewMaterialize,
     ReviewSection,
@@ -451,7 +462,6 @@ fn decode_method(method: &str) -> Result<RoutedMethod> {
         "github.comment" => Ok(RoutedMethod::Comment),
         "review.open_pr" => Ok(RoutedMethod::ReviewOpen),
         "review.open" => Ok(RoutedMethod::ReviewOpen),
-        "review.region_edit" => Ok(RoutedMethod::ReviewEdit),
         "review.snapshot" => Ok(RoutedMethod::ReviewSnapshot),
         "review.materialize" => Ok(RoutedMethod::ReviewMaterialize),
         "review.section" => Ok(RoutedMethod::ReviewSection),
@@ -790,7 +800,7 @@ impl HostRouter {
                 let result = self
                     .host
                     .review
-                    .comment(&params.document, params.command)
+                    .comment(&params.document, params.capture, params.draft_comment, params.command)
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
@@ -831,11 +841,6 @@ impl HostRouter {
                     ),
                 };
                 send_completed_result(sink, request.id, snapshot).await?;
-            }
-            RoutedMethod::ReviewEdit => {
-                let edit: RegionEdit = serde_json::from_value(request.params)?;
-                let acknowledgement = self.host.review.region_edit(edit).await?;
-                send_completed_result(sink, request.id, acknowledgement).await?;
             }
             RoutedMethod::ReviewFile => {
                 let params: ReviewFileParams = serde_json::from_value(request.params)?;
@@ -947,7 +952,7 @@ impl HostRouter {
                 let result = self
                     .host
                     .review
-                    .submit_batched(&params.document, params.verdict)
+                    .submit_batched(&params.document, params.capture, params.draft_comment, params.verdict)
                     .await?;
                 send_completed_result(sink, request.id, result).await?;
             }
@@ -1055,7 +1060,10 @@ impl HostRouter {
                         send_completed_result(
                             sink,
                             request.id,
-                            self.host.review.save(&params.document).await?,
+                            self.host
+                                .review
+                                .save(&params.document, params.capture, params.draft_comment)
+                                .await?,
                         )
                         .await?
                     }
@@ -1301,7 +1309,9 @@ async fn send_completed_result(
     request_id: u64,
     result: impl Serialize,
 ) -> Result<()> {
-    Ok(sink.send_response(Response::success(request_id, result)?).await?)
+    Ok(sink
+        .send_response(Response::success(request_id, result)?)
+        .await?)
 }
 
 fn revision_page(

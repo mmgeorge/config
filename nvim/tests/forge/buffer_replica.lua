@@ -96,18 +96,17 @@ local ok, failure = xpcall(function()
   vim.bo[session.buffer].modifiable = true
   vim.api.nvim_buf_set_text(session.buffer, 0, 0, 0, 8, { "typed" })
   assert(editable.suspend_generated_text(session.editable))
-  editable.flush(session.editable)
-  assert(#sent == 1 and sent[1].text[1] == "typed")
-  assert(editable.acknowledge(session.editable, {
-    document = "editable", region = "body", sequence = sent[1].sequence, revision = 1,
-  }))
+  local captured = editable.capture_draft(session.editable)
+  assert(#sent == 0 and captured[1].text == "typed", "native typing must not send an edit request")
+  assert(replica.apply_snapshot(session, initial).kind == "Deferred", "generated snapshots must preserve pending drafts")
+  editable.saved_capture(session.editable, captured)
   source.text = { "typed" }
   source.metadata.editable_region[1].revision = 1
   source.metadata.editable_region[1].range["end"].column = 5
   initial.revision = 1
   assert(replica.apply_snapshot(session, initial).kind == "Applied")
   assert(not editable.suspend_generated_text(session.editable))
-  assert(session.editable.sequence == sent[1].sequence, "generated snapshot was recaptured as local typing")
+  assert(session.editable.sequence == captured[1].sequence, "generated snapshot was recaptured as local typing")
   assert(not session.editable.fault)
   assert(session.editable.native and session.editable.native.active)
   assert(vim.api.nvim_buf_get_lines(session.buffer, 0, 1, true)[1] == "typed")

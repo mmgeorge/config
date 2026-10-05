@@ -20,13 +20,18 @@ adapter._set_runner_for_test(function(method, params, callback)
       block = { { id = "body", text = { text }, metadata = metadata(text, revision) } } },
       fields = { { region = "body", revision = revision, sequence = 100 } } }
     if params.number == 8 then opening = function() callback(result) end else callback(result) end
-  elseif params.operation == "edit" then pending[#pending + 1] = { edit = params.edit, callback = callback }
+  elseif params.operation == "edit" then error("typing must not send an edit request")
   elseif params.operation == "act" then
     browse_input = params.input
     local effect = vim.deepcopy(params.input)
     effect.id, effect.kind, effect.url = "issue-browse-test", "browser", "https://enterprise.example/owner/other/issues/7"
     callback({ effect = effect })
-  elseif params.operation == "save" then saves = saves + 1 callback({ fields = {} })
+  elseif params.operation == "save" then
+    saves = saves + 1
+    pending[#pending + 1] = { capture = vim.deepcopy(params.capture), document = params.document, callback = callback }
+  elseif params.operation == "snapshot" then
+    callback({ document = params.document, revision = revision,
+      block = { { id = "body", text = { text }, metadata = metadata(text, revision) } } })
   elseif params.operation == "resolve" then
     resolves[#resolves + 1] = vim.deepcopy(params)
     callback({ fields = {}, recovery = { capture = { operation_id = params.operation_id },
@@ -46,6 +51,9 @@ vim.wo[0].winbar = "origin"
 local state = adapter.open(options)
 options.repository.name = "changed"
 assert(vim.wait(1000, function() return state.shown end))
+assert(vim.bo[state.replica.buffer].modifiable, "issue field remained read-only on entry")
+assert(vim.api.nvim_buf_get_name(state.replica.buffer):find("forge://issue/", 1, true),
+  "issue buffer lacks a name for native write commands")
 assert(captured.repository.name == "other" and captured.repository.hostname == "enterprise.example")
 assert(captured.database:gsub("\\", "/"):find("enterprise.example/repos/owner/other/issues/issues.redb", 1, true))
 assert(vim.b[state.replica.buffer].github_user_completion == true, "native issue did not enable assignee completion")
@@ -86,36 +94,44 @@ local function type_text(value)
   local previous = vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1]
   vim.api.nvim_buf_set_text(state.replica.buffer, 0, 0, 0, #previous, { value })
   editable.capture(state.replica.editable, "body")
-  editable.flush(state.replica.editable)
+  assert(#editable.capture_draft(state.replica.editable) > 0, "native typing must remain locally captured")
 end
 local function confirm(index)
   local selected = assert(pending[index])
-  local edit = selected.edit
-  local previous = revision
+  local edit = assert(selected.capture[1])
   text, revision = edit.text, revision + 1
-  selected.callback({ document = edit.document, region = edit.region, sequence = edit.sequence,
-    revision = edit.base + 1, patch = { document = edit.document, base = previous, next = revision,
-      base_rows = 1, next_rows = 1, base_blocks = 1, next_blocks = 1,
-      removed_block = {}, block_edit = {},
-      text_edit = { { start_row = 0, removed_rows = 1, text = { text } } },
-      metadata_edit = { { block = "body", row_count = 1, metadata = metadata(text, revision) } } } })
+  selected.callback({ fields = { { region = "body", revision = revision, sequence = edit.sequence } } })
 end
-type_text("captured")
-assert(pending[1].edit.sequence > 100, "restored draft reused an earlier edit sequence")
+vim.cmd("normal! gg0c$captured")
+assert(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1] == "captured",
+  "normal issue editing required a forced modifiable option")
+assert(#pending == 0, "native typing sent an edit request")
+vim.cmd("write")
+assert(pending[1].capture[1].sequence > 100, "restored draft reused an earlier edit sequence")
+assert(pending[1].capture[1].text == "captured")
 type_text("newer\r")
 adapter.save(state)
-assert(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1] == "newer",
-  "issue save retained a trailing carriage return")
-assert(saves == 0)
+assert(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1] == "newer\r",
+  "issue save changed raw carriage return text")
+assert(saves == 1)
+type_text("unsaved after second save")
 confirm(1)
 assert(vim.wait(1000, function() return #pending == 2 end))
-assert(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1] == "newer")
+assert(pending[2].capture[1].text == "newer\r", "queued issue save recaptured newer typing")
+assert(pending[2].capture[1].base == 1, "queued capture did not use the accepted revision")
 confirm(2)
-assert(vim.wait(1000, function() return saves == 1 end))
-type_text("durable before close")
+assert(vim.wait(1000, function() return not state.saving end))
+assert(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, 1, false)[1] == "unsaved after second save")
+assert(vim.bo[state.replica.buffer].modified, "save cleared newer typing")
 adapter.close(state)
 assert(#closed == 0 and state.active)
+assert(state.hidden and vim.api.nvim_get_current_buf() == state.origin, "close did not hide the unsaved issue")
+local reopened = adapter.open({ repository = state.repository, number = 7, on_error = error })
+assert(reopened == state and vim.api.nvim_get_current_buf() == state.replica.buffer, "reopening discarded the native draft")
+adapter.save(state)
 confirm(3)
+assert(vim.wait(1000, function() return not state.saving and not vim.bo[state.replica.buffer].modified end))
+adapter.close(state)
 assert(vim.wait(1000, function() return not state.active end))
 assert(closed[1] == state.document)
 assert(vim.wo[0].winbar == "origin", "native issue close did not restore the invoking winbar")
@@ -135,4 +151,4 @@ assert(closed[3] == stale.document and not stale.replica)
 assert(#errors == 2 and errors[1]:find("closed without confirmation", 1, true)
   and errors[2]:find("fresh remote observation", 1, true), table.concat(errors, "\n"))
 adapter._set_runner_for_test(nil)
-print("issue_document: captured host/repository, recovery gating, newer typing, save/close acknowledgement, and stale open cleanup passed")
+print("issue_document: explicit captures, queued saves, newer typing, draft close/reopen, recovery, and stale open cleanup passed")

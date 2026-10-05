@@ -21,13 +21,13 @@ end
 
 local function fold_start(session, record)
   local _, start = session.sequence:position(record.owner)
-  return start + record.fold.start.row + 1
+  return require("forge.buffer").physical_row(session, start + record.fold.start.row) + 1
 end
 
 local function fold_end(session, record)
   local _, finish = session.sequence:position(record.fold["end"].block)
-  return finish + record.fold["end"].position.row
-    + (record.fold["end"].position.column > 0 and 1 or 0)
+  return require("forge.buffer").physical_row(session, finish + record.fold["end"].position.row
+    + (record.fold["end"].position.column > 0 and 1 or 0))
 end
 
 local function close_open_fold(row)
@@ -476,6 +476,11 @@ end
 function M.expression()
   local session = sessions[vim.api.nvim_get_current_buf()]
   if not session or (session.status ~= "Applied" and not session.applying) then return 0 end
+  if session.fold_location then
+    local source, boundary = session.fold_location(vim.v.lnum - 1)
+    local level, starts = session.sequence:fold_level(source)
+    return boundary and starts and level > 0 and (">" .. level) or level
+  end
   if session.editable.suspended and not session.applying then return 0 end
   local row, delta = vim.v.lnum - 1, 0
   for index = #(session.fold_pending or {}), session.fold_pending_index or 1, -1 do

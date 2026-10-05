@@ -1,4 +1,4 @@
-local comment_view = require("forge.views.plan_review.comment")
+local comment_view = require("forge.draft_comments")
 local entity_info = require("forge.views.plan_review.entity_info")
 local notifications = require("forge.infra.notifications")
 
