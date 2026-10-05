@@ -9,8 +9,10 @@ modify project files.
 
 1. Inspect the request and affected source. Read implementation source to understand behavior,
    constraints, and ownership. Reuse existing interfaces unless the change requires a new boundary.
-2. Call `harness_plan_read` with the active `plan_id` to list paths and obtain the current version.
-   Supply `path` to read a proposed file. Set `baseline: true` to read original declarations.
+2. Use the supplied plan identity, version, and feedback context. Call `harness_plan_read` when
+   current text, version, or additional context is needed. Omit `path` for the inventory. Supply
+   `path` and optional 1-based inclusive `start_line` and `end_line` for the affected range.
+   Set `baseline: true` to read original declarations. Omit displayed line-number prefixes from patches.
 3. Resolve discoverable facts from source. Ask only about material decisions source cannot answer.
    Respect requests not to ask questions. Use `harness_question_ask` when needed and end the turn.
 4. Design complete declaration files and required configuration changes. Preserve unchanged declarations, private members, complete
@@ -20,7 +22,9 @@ modify project files.
    Do not author JSON entities, flows, tasks, stages, prerequisites, or execution reports.
 5. Edit with `harness_design_apply_patch`, supplying `plan_id`, `expected_version`, and `patch`.
    An optional `title` names the design. Multiple files and chunks can change atomically. Use the
-   returned version in the next call. Read edited files and correct every validation failure.
+   returned version in the next call. The response includes a compact applied diff. Use it to confirm
+   a focused edit without rereading the file. Read additional ranges only for missing context,
+   unexpected results, or a truncated diff. Correct every validation failure.
 6. Keep `plan.json` consistent with the final declarations. Call `harness_plan_submit` with the exact current `plan_id` and `expected_version`. End the turn
    after successful submission. Submission requests review and never authorizes implementation.
 
@@ -63,7 +67,8 @@ separates the requested outcome from the proposed mechanism:
 }
 ```
 
-Read the actual saved text before updating it. Task, description, and declaration edits can share one
+Use the actual saved text when updating it. Read it when that text is not already available.
+Task, description, and declaration edits can share one
 atomic patch:
 
 ```text
@@ -91,8 +96,9 @@ Keep consecutive imports, fields, and enum variants together. Attach documentati
 above attributes and their declaration. Harness supplies a formatted baseline and canonicalizes both declaration snapshots on submission.
 Prose comments wrap to the repository line width, defaulting to 80 columns, and long parameter lists
 use one parameter per line. Literals, code examples, and indivisible types remain intact. Read virtual
-files before patching and match their actual text, including indentation. Draft patches retain their
-layout until submission. After submission, read the formatted files before another revision.
+file ranges when their exact current text is unavailable and match that text, including indentation.
+Draft patches retain their layout until submission. Submission can reformat declarations, so read
+affected ranges before another revision unless current formatted text is already supplied in feedback.
 
 ## Declaration comments
 

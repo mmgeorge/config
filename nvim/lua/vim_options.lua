@@ -63,6 +63,7 @@ vim.opt.foldlevelstart = 99
 vim.opt.foldmethod = "expr"
 vim.opt.foldexpr = "v:lua.vim.treesitter.foldexpr()"
 vim.opt.foldenable = true
+vim.opt.foldopen:remove("hor")
 
 -- vim.o.foldmethod = "expr"
 -- vim.o.foldexpr = "nvim_treesitter#foldexpr()"

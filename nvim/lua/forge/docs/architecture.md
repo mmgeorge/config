@@ -1912,10 +1912,16 @@ while Rust owns resolution and source coordinates.
 
 `DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves
 inside Harness-owned `plans/<session>/<plan>/working.json`. The provider receives the plan identity,
-version, request, and path inventory. `harness_plan_read` reads one virtual file or its baseline.
+version, request, and path inventory. `harness_plan_read` reads one virtual file or its baseline as
+numbered plain text. Optional 1-based inclusive line bounds require a file path. The response retains
+the active version, selected side, actual range, and total line count. Inventory reads remain structured.
 `harness_design_apply_patch` applies familiar Add File, Update File, Delete File, Move to, and
 context chunks atomically. Invalid syntax, paths, bodies, stale versions, or unmatched context change
-nothing. Every patch that changes the proposal increments the version. The baseline remains immutable.
+nothing. Every patch that changes the proposal increments the version. Patch confirmation includes
+the applied declaration and overview deltas with three context lines, capped at 16 KiB with explicit
+truncation. The agent can confirm focused edits without a second read. The baseline remains immutable.
+Successful submission retains inconclusive reference warnings in the saved validation evidence and
+returns only acceptance and version to the provider. Proven-invalid references still return actionable errors.
 `plan/prompts/planning.md` owns the complete declaration planning instructions, and
 `plan/prompts/system.md` owns the general provider control contract.
 
@@ -2087,7 +2093,12 @@ annotation storage remain unchanged. Declaration inspection projects Tree-sitter
 hunk folds. Rust structs, enums, traits, impls, and inline modules, plus TypeScript classes,
 interfaces, enums, and namespaces can fold when their bodies span multiple rows. Fold headings
 include attached documentation and attributes for Tab activation, while folding starts at the
-opening brace so those attachments remain visible. The shared fold component appends a validated
+opening brace so those attachments remain visible.
+Tab inside a declaration closes the innermost containing declaration through the same shared fold
+selector used for headings. Closing from its body moves the cursor to the opening row, and the plan
+view retains that fold preference across refresh. The Neovim configuration removes `hor` from
+`foldopen`, so native horizontal movement preserves closed folds without custom movement mappings.
+The shared fold component appends a validated
 `collapsed_suffix` to the highlighted opening row, producing `{...}` without changing source text.
 Fold summaries stack row backgrounds, syntax, and inline captures in decoration priority order.
 The shared full-width background policy applies to gutters and the collapsed body marker as well.

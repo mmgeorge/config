@@ -272,31 +272,48 @@ end
 
 ---@param session table
 ---@param window integer
+---@param options? { include_body?: fun(id: string): boolean, on_toggled?: fun(id: string, closed: boolean) }
 ---@return boolean
-function M.toggle_heading(session, window)
+function M.toggle_heading(session, window, options)
   if not session or session.status ~= "Applied" or not vim.api.nvim_win_is_valid(window)
     or vim.api.nvim_win_get_buf(window) ~= session.buffer then return false end
   local row = vim.api.nvim_win_get_cursor(window)[1]
-  for _, record in pairs(session.fold and session.fold.record or {}) do
+  local selected, selected_start, selected_finish
+  for id, record in pairs(session.fold and session.fold.record or {}) do
     local start = fold_start(session, record)
+    local finish = fold_end(session, record)
     local heading = record.fold.heading_start
-    local first = heading and (select(2, session.sequence:position(heading.block)) + heading.position.row + 1) or start
-    if row >= first and row <= start then
-      vim.api.nvim_win_call(window, function()
-        local opening = vim.fn.foldclosed(start) == start
-        vim.cmd(tostring(start) .. (opening and (record.fold.expand_children and "foldopen!" or "foldopen") or "foldclose"))
-        if opening and record.fold.collapse_children then
-          local finish, children = fold_end(session, record), {}
-          for _, child in pairs(session.fold.record) do
-            local start = fold_start(session, child)
-            if start > fold_start(session, record) and fold_end(session, child) <= finish then children[#children + 1] = start end
-          end
-          table.sort(children, function(left, right) return left > right end)
-          for _, start in ipairs(children) do close_open_fold(start) end
-        end
-      end)
-      return true
+    local first = heading and (require("forge.buffer").physical_row(session,
+      select(2, session.sequence:position(heading.block)) + heading.position.row) + 1) or start
+    local last = options and options.include_body and options.include_body(id) and finish or start
+    if row >= first and row <= last and (not selected or finish - start < selected_finish - selected_start) then
+      selected, selected_start, selected_finish = record, start, finish
     end
+  end
+  if selected then
+    local record, start = selected, selected_start
+    vim.api.nvim_win_call(window, function()
+      local cursor = vim.api.nvim_win_get_cursor(window)
+      local opening = vim.fn.foldclosed(start) == start
+      vim.cmd(tostring(start) .. (opening and (record.fold.expand_children and "foldopen!" or "foldopen") or "foldclose"))
+      if not opening and cursor[1] > start then
+        local text = vim.api.nvim_buf_get_lines(session.buffer, start - 1, start, false)[1] or ""
+        vim.api.nvim_win_set_cursor(window, { start, math.min(cursor[2], math.max(0, #text - 1)) })
+      end
+      if opening and record.fold.collapse_children then
+        local finish, children = fold_end(session, record), {}
+        for _, child in pairs(session.fold.record) do
+          local start = fold_start(session, child)
+          if start > fold_start(session, record) and fold_end(session, child) <= finish then children[#children + 1] = start end
+        end
+        table.sort(children, function(left, right) return left > right end)
+        for _, start in ipairs(children) do close_open_fold(start) end
+      end
+      if options and options.on_toggled then
+        options.on_toggled(record.fold.id, vim.fn.foldclosed(start) == start)
+      end
+    end)
+    return true
   end
   return false
 end

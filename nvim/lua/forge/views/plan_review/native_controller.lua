@@ -106,19 +106,10 @@ end
 local function toggle_task_fold(review)
   local view = review.owner.current_view()
   if not view then return end
-  local cursor_line = vim.api.nvim_win_get_cursor(view.window)[1]
-  local selected
-  for _, fold in ipairs(task_folds(review)) do
-    if (cursor_line >= fold.heading_start_line and cursor_line <= fold.start_line)
-      and (not selected or fold.end_line < selected.end_line) then selected = fold end
-  end
-  if not selected then return end
-  if require("forge.folds").toggle_heading(review.owner.replica, view.window) then
-    local folded = vim.api.nvim_win_call(view.window, function()
-      return vim.fn.foldclosed(selected.start_line) == selected.start_line
-    end)
-    set_task_folded(review, selected.id, folded)
-  end
+  require("forge.folds").toggle_heading(review.owner.replica, view.window, {
+    include_body = function(id) return id:match(":declaration$") ~= nil end,
+    on_toggled = function(id, closed) set_task_folded(review, id, closed) end,
+  })
 end
 
 local function hide_review(review)

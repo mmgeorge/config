@@ -113,9 +113,21 @@ impl ControlToolRuntime {
                 anyhow::ensure!(!self.context.has_active_elicitation, "resolve pending Harness questions before editing the design");
                 let request = output.design_patch.pop().context("design patch has no request")?;
                 let document = self.plan_document.as_ref().context("design patch has no active design")?;
-                self.plan_document = Some(document.patch_design(request)?);
+                let updated = document.patch_design(request)?;
+                let delta = crate::plan::revision::DeclarationDelta::between(Some(document), &updated)?;
+                let mut confirmation = format!("{}{}", delta.document, delta.files);
+                const MAX_CONFIRMATION_BYTES: usize = 16 * 1024;
+                if confirmation.len() > MAX_CONFIRMATION_BYTES {
+                    let mut boundary = MAX_CONFIRMATION_BYTES;
+                    while !confirmation.is_char_boundary(boundary) { boundary -= 1; }
+                    confirmation.truncate(boundary);
+                    confirmation.push_str("\n[Applied diff truncated. Read affected ranges for additional context.]\n");
+                } else if confirmation.is_empty() {
+                    confirmation.push_str("No declaration changes.\n");
+                }
+                self.plan_document = Some(updated);
                 if self.context.plan_state == Some(PlanState::AwaitingReview) { self.context.plan_state = Some(PlanState::Revising); }
-                Ok(ControlToolResult { invocation:Some(invocation), message:self.plan_version_message("Declaration patch accepted") })
+                Ok(ControlToolResult { invocation:Some(invocation), message:format!("{}\n{confirmation}", self.plan_version_message("Declaration patch accepted")) })
             }
             "harness_repository_status"
             | "harness_repository_changed_paths"
@@ -165,7 +177,7 @@ impl ControlToolRuntime {
                     "requested plan id does not match the active plan"
                 );
                 let message = if let Some(design) = &document.design {
-                        serde_json::to_string(&serde_json::json!({"plan_id":document.plan_id,"version":document.version,"file":design.read(invocation.arguments.get("path").and_then(serde_json::Value::as_str),invocation.arguments.get("baseline").and_then(serde_json::Value::as_bool).unwrap_or(false))?}))?
+                        read_design(document, design, &invocation.arguments)?
                     } else { document.model_json()? };
                 Ok(ControlToolResult { invocation: Some(invocation), message })
             }
@@ -191,12 +203,11 @@ impl ControlToolRuntime {
                 if let Some(design) = &document.design {
                     let workspace = self.context.workspace_root.as_deref().context("design submission has no workspace root")?;
                     let design = design.validated(workspace).await?;
-                    let warning = design.validation.as_ref().unwrap().warnings();
                     let mut submitted = document.clone();
                     submitted.design = Some(design);
                     self.plan_document = Some(submitted);
                     self.terminal = true;
-                    return Ok(ControlToolResult { invocation:Some(invocation), message:format!("{}\n{}", self.plan_version_message("Declaration design submitted for review"), serde_json::to_string(&warning)?) });
+                    return Ok(ControlToolResult { invocation:Some(invocation), message:self.plan_version_message("Declaration design submitted for review") });
                 }
                 let workspace_root = self
                     .context
@@ -344,6 +355,32 @@ impl ControlToolRuntime {
     }
 }
 
+/// Presents an exact declaration range without JSON escaping or implementation bodies.
+fn read_design(document: &PlanDocument, design: &crate::plan::DeclarationDesign, arguments: &serde_json::Value) -> Result<String> {
+    use std::fmt::Write;
+    let path = arguments.get("path").and_then(serde_json::Value::as_str);
+    let start = arguments.get("start_line").and_then(serde_json::Value::as_u64);
+    let end = arguments.get("end_line").and_then(serde_json::Value::as_u64);
+    anyhow::ensure!(path.is_some() || (start.is_none() && end.is_none()), "line ranges require a file path");
+    let file = design.read(path, arguments.get("baseline").and_then(serde_json::Value::as_bool).unwrap_or(false))?;
+    let Some(path) = path else {
+        return Ok(serde_json::to_string(&serde_json::json!({"plan_id":document.plan_id,"version":document.version,"file":file}))?);
+    };
+    let text = file["text"].as_str().context("declaration read has no text")?;
+    let total = text.lines().count();
+    let start = start.unwrap_or(1);
+    let end = end.unwrap_or(total as u64);
+    anyhow::ensure!(end >= start || (total == 0 && start == 1 && end == 0), "end_line precedes start_line");
+    anyhow::ensure!(start <= total as u64 || (total == 0 && start == 1), "start_line is outside the file ({total} lines)");
+    let end = end.min(total as u64);
+    let side = file["side"].as_str().unwrap_or("proposed");
+    let mut message = format!("Plan {} · version {}\n{path} ({side}) · lines {start}-{end} of {total}\n", document.plan_id, document.version);
+    for (index, line) in text.lines().enumerate().skip(start.saturating_sub(1) as usize).take(end.saturating_sub(start).saturating_add(1) as usize) {
+        writeln!(message, "{}: {line}", index + 1)?;
+    }
+    Ok(message)
+}
+
 #[cfg(test)]
 mod test {
     use super::*;
@@ -406,6 +443,68 @@ mod test {
 
 
 
+
+    #[tokio::test]
+    async fn focused_declaration_reads_and_patches_return_exact_context() {
+        let mut context = planning_context();
+        let source = "/// Describes an arena.\npub struct Arena;\n\n/// Returns the number of targets.\npub fn collectible_count() -> u32;\n";
+        let workspace = context.workspace_root.as_ref().unwrap();
+        std::fs::create_dir_all(workspace.join("src")).unwrap();
+        std::fs::write(workspace.join("src/lib.rs"), source).unwrap();
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.proposed.insert("src/lib.rs".into(), source.into());
+        design.baseline.insert("src/lib.rs".into(), crate::plan::DeclarationFile { text: source.into(), source_digest: crate::plan::digest(source.as_bytes()) });
+        design.document.task = "Rename the count accessor.".into();
+        design.document.description = "Preserve the target count while renaming its accessor.".into();
+        context.plan_document.as_mut().unwrap().design = Some(design);
+        let mut runtime = ControlToolRuntime::new(context);
+        let read = |arguments| ControlToolInvocation { name: "harness_plan_read".into(), arguments };
+        let result = runtime.invoke(read(json!({"plan_id":"plan", "path":"src/lib.rs", "start_line":4, "end_line":5}))).await.unwrap();
+        assert!(result.message.contains("lines 4-5 of 5"));
+        assert!(result.message.contains("4: /// Returns the number of targets.\n5: pub fn collectible_count() -> u32;\n"));
+        assert!(!result.message.contains("pub struct Arena") && !result.message.contains("\\n"));
+        for arguments in [json!({"plan_id":"plan", "start_line":1}), json!({"plan_id":"plan", "path":"src/lib.rs", "start_line":6}), json!({"plan_id":"plan", "path":"src/lib.rs", "start_line":5, "end_line":4})] {
+            assert!(runtime.invoke(read(arguments)).await.is_err());
+        }
+        let result = runtime.invoke(ControlToolInvocation { name:"harness_design_apply_patch".into(), arguments:json!({"plan_id":"plan", "expected_version":1, "patch":"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;\n*** End Patch"}) }).await.unwrap();
+        assert!(result.message.contains("version is 2") && result.message.contains("-pub fn collectible_count() -> u32;\n+pub fn get_collectable_count() -> u32;"));
+        let baseline = runtime.invoke(read(json!({"plan_id":"plan", "path":"src/lib.rs", "baseline":true, "start_line":5, "end_line":99}))).await.unwrap();
+        assert!(baseline.message.contains("(baseline) · lines 5-5 of 5") && baseline.message.contains("collectible_count()"));
+        let submitted = runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(), arguments:json!({"plan_id":"plan", "expected_version":2}) }).await.unwrap();
+        assert_eq!(submitted.message, "Declaration design submitted for review. Active canonical version is 2.");
+        assert!(runtime.plan_document().unwrap().design.as_ref().unwrap().validation.is_some());
+    }
+
+    #[tokio::test]
+    async fn declaration_submission_keeps_unverified_evidence_out_of_tool_output() {
+        let mut context = planning_context();
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Expose a generated interface.".into();
+        design.document.description = "Keep generated declarations outside the hand-authored API.".into();
+        design.proposed.insert("src/lib.rs".into(), "/// Declares generated types supplied during implementation.\npub mod generated;\nuse generated::*;\n/// Accepts the generated request.\npub fn inspect(value: Generated);\n".into());
+        context.plan_document.as_mut().unwrap().design = Some(design);
+        let mut runtime = ControlToolRuntime::new(context);
+        let result = runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(), arguments:json!({"plan_id":"plan","expected_version":1}) }).await.unwrap();
+        assert_eq!(result.message, "Declaration design submitted for review. Active canonical version is 1.");
+        let validation = runtime.plan_document().unwrap().design.as_ref().unwrap().validation.as_ref().unwrap();
+        assert!(!validation.warnings().is_empty(), "unverified evidence was discarded");
+    }
+
+    #[tokio::test]
+    async fn large_patch_confirmation_is_bounded_without_losing_the_applied_design() {
+        let mut context = planning_context();
+        context.plan_document.as_mut().unwrap().design = Some(crate::plan::DeclarationDesign::default());
+        let mut declaration = "/// Describes the public response.\npub struct Response {\n".to_owned();
+        for index in 0..500 {
+            declaration.push_str(&format!("  /// Retains the café response value for slot {index}.\n  pub response_{index}: u32,\n"));
+        }
+        declaration.push_str("}\n");
+        let added = declaration.lines().map(|line| format!("+{line}\n")).collect::<String>();
+        let mut runtime = ControlToolRuntime::new(context);
+        let confirmed = runtime.invoke(ControlToolInvocation { name:"harness_design_apply_patch".into(), arguments:json!({"plan_id":"plan","expected_version":1,"patch":format!("*** Begin Patch\n*** Add File: src/response.rs\n{added}*** End Patch")}) }).await.unwrap();
+        assert!(confirmed.message.contains("Applied diff truncated") && confirmed.message.len() < 17 * 1024);
+        assert_eq!(runtime.plan_document().unwrap().design.as_ref().unwrap().proposed["src/response.rs"], declaration);
+    }
 
     #[tokio::test]
     async fn declaration_submit_returns_reference_errors_and_allows_repair() {
