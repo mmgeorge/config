@@ -53,6 +53,8 @@ pub enum HarnessMethod {
     PlanRustdocSource,
     #[serde(rename = "plan.request_changes")]
     PlanRequestChanges,
+    #[serde(rename = "plan.questions.answer")]
+    PlanAnswerQuestions,
     #[serde(rename = "plan.cancel")]
     PlanCancel,
     #[serde(rename = "plan.activate")]
@@ -145,6 +147,7 @@ impl HarnessMethod {
                 | Self::ExchangeResume
                 | Self::PlanAccept
                 | Self::PlanRequestChanges
+                | Self::PlanAnswerQuestions
                 | Self::QuestionAsk
                 | Self::QuestionContinue
                 | Self::GoalSet

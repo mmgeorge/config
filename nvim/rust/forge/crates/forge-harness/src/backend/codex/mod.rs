@@ -844,7 +844,7 @@ impl Backend for CodexBackend {
         history: &str,
     ) -> Result<String> {
         self.trace.record(&request.harness_session_id, "codex.generation.request", json!({
-            "purpose": if purpose == super::TextGeneration::SessionName { "session_name" } else { "recap" },
+            "purpose": purpose.name(),
             "model":model,
         }));
         let (mut process, mut output) = self.catalog_process(&request).await?;

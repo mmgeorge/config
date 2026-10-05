@@ -79,6 +79,9 @@ pub struct FoldRange {
     #[serde(default)]
     /// Close descendant folds when this heading is explicitly opened.
     pub collapse_children: bool,
+    #[serde(default)]
+    /// Open descendant folds when this heading is explicitly opened.
+    pub expand_children: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

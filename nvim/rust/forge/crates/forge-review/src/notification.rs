@@ -700,7 +700,7 @@ fn reproject(document: &mut NotificationDocument) -> Result<Option<BufferPatch>>
                     .push(forge_buffer::block::FoldRange {
                         collapsed_suffix: None,
                         heading_start: None,
-                        collapse_children: false,
+                        collapse_children: false, expand_children: false,
                         id: forge_buffer::identity::FoldId(format!(
                             "notification:{}:detail",
                             record.id

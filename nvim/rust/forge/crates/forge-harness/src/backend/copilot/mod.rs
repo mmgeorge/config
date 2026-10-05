@@ -391,7 +391,7 @@ fn capability() -> BackendCapability {
 impl Backend for CopilotBackend {
     async fn generate_text(&self, request: BackendCatalogRequest, purpose: super::TextGeneration, model: &str, history: &str) -> Result<String> {
         self.trace.record(&request.harness_session_id, "copilot.generation.request", json!({
-            "purpose": if purpose == super::TextGeneration::SessionName { "session_name" } else { "recap" },
+            "purpose": purpose.name(),
             "model":model,"instructions":purpose.instructions(),"history":history}));
         let result = text_generation::generate(&self.command, &request.workspace, purpose, model, history).await;
         self.trace.record(&request.harness_session_id, "copilot.generation.result", match &result {

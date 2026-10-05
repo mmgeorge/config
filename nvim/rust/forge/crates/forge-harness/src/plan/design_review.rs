@@ -511,7 +511,7 @@ fn declaration_folds(
         let fold_id = FoldId(format!("{}:declaration", block[opening].id.0));
         block[opening].metadata.fold.push(FoldRange { collapsed_suffix: Some(suffix), heading_start,
             id: fold_id, start: TextPosition { row: 0, column: 0 }, end: endpoint,
-            closed, collapse_children: false });
+            closed, collapse_children: false, expand_children: false });
         installed.push((opening, closing));
     }
     Ok(())
@@ -781,6 +781,9 @@ mod tests {
         let anchor = rendered.navigation.resolve_line(4).unwrap();
         assert_eq!(anchor.json_path, "/design/document/description");
         let annotation = ReviewAnnotation {
+                parent_id: None,
+                kind: Default::default(),
+                reply: None,
             id: "description".into(),
             anchor: None,
             source: super::super::PlanAnnotationInput {
@@ -862,6 +865,9 @@ mod tests {
             .find(|anchor| anchor.label.contains("secret:"))
             .unwrap();
         let annotation = ReviewAnnotation {
+                parent_id: None,
+                kind: Default::default(),
+                reply: None,
             id: "private".into(),
             anchor: None,
             source: super::super::PlanAnnotationInput {
@@ -1010,6 +1016,9 @@ mod tests {
         let after = rendered.navigation.anchor.iter().find(|anchor| matches!(&anchor.target,PlanReviewTarget::Declaration { side,.. } if side == "proposed")).unwrap();
         assert_ne!(before.json_path, after.json_path);
         let comment = ReviewAnnotation {
+                parent_id: None,
+                kind: Default::default(),
+                reply: None,
             anchor: None,
             id: "review".into(),
             source: super::super::PlanAnnotationInput {

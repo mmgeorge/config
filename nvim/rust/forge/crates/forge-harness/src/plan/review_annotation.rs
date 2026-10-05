@@ -9,9 +9,45 @@ const MAX_ANNOTATION_BYTES: usize = 1024 * 1024;
 #[derive(Clone, Serialize, Deserialize)]
 pub struct ReviewAnnotation {
     pub id: String,
+    /// Links a follow-up to its earlier message and inherited source range.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_id: Option<String>,
     pub source: PlanAnnotationInput,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub anchor: Option<ReviewAnnotationAnchor>,
+    #[serde(default, skip_serializing_if = "ReviewAnnotationKind::is_comment")]
+    /// Identifies whether saving this annotation asks the model a question.
+    pub kind: ReviewAnnotationKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Retains the answer independently of the user's editable text.
+    pub reply: Option<ReviewQuestionReply>,
+}
+
+/// Distinguishes revision feedback from questions that leave the proposal unchanged.
+#[derive(Clone, Copy, Default, Eq, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewAnnotationKind {
+    #[default]
+    /// Feedback applied when the user requests a revision.
+    Comment,
+    /// A request for an explanation that leaves the proposal unchanged.
+    Question,
+}
+
+impl ReviewAnnotationKind {
+    fn is_comment(&self) -> bool { *self == Self::Comment }
+}
+
+/// Binds a persisted answer to the exact question text it answered.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct ReviewQuestionReply {
+    /// Exact question body used to generate this answer.
+    pub question_body: String,
+    /// Concise explanation shown in the attached read-only box.
+    pub body: String,
+    /// Execution duration recorded by the question's main-conversation exchange.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub duration_ms: Option<u64>,
 }
 
 /// Binds a review selection to immutable saved declaration positions.
@@ -70,28 +106,13 @@ impl ReviewAnnotationStore {
         &self.annotation
     }
 
-    /// Rebuild display ranges from saved targets, including older comments with row-only anchors.
+    /// Rebuild display ranges from saved semantic targets.
     pub(crate) fn reanchor(
         &mut self,
-        saved: &super::PlanNavigationIndex,
         current: &super::PlanNavigationIndex,
     ) -> Result<()> {
         for annotation in &mut self.annotation {
-            if annotation.anchor.is_none() {
-                annotation.anchor = Some(ReviewAnnotationAnchor {
-                    start: saved
-                        .resolve_line(annotation.source.start_line)
-                        .context("saved comment start has no declaration target")?
-                        .target
-                        .clone(),
-                    end: saved
-                        .resolve_line(annotation.source.end_line)
-                        .context("saved comment end has no declaration target")?
-                        .target
-                        .clone(),
-                });
-            }
-            let anchor = annotation.anchor.as_ref().expect("resolved comment anchor");
+            let anchor = annotation.anchor.as_ref().context("plan comment has no saved semantic anchor")?;
             let start = find_target(current, &anchor.start)
                 .context("comment start is absent from the formatted design")?;
             let end = find_target(current, &anchor.end)
@@ -205,8 +226,46 @@ fn validate(annotation: &[ReviewAnnotation]) -> Result<()> {
             annotation.source.body.len() <= 65536 && !annotation.source.body.contains('\0'),
             "plan annotation exceeds 64 KiB or contains NUL"
         );
+        if let Some(parent_id) = &annotation.parent_id {
+            ensure!(identities.contains(parent_id) && parent_id != &annotation.id,
+                "annotation parent must precede its follow-up");
+        }
+        if let Some(reply) = &annotation.reply {
+            ensure!(annotation.kind == ReviewAnnotationKind::Question
+                && reply.question_body == annotation.source.body
+                && !reply.body.trim().is_empty() && reply.body.len() <= 8192
+                && !reply.body.contains('\0'), "invalid plan question reply");
+        }
+    }
+    for item in annotation {
+        if let Some(parent_id) = &item.parent_id {
+            let parent = annotation.iter().find(|parent| &parent.id == parent_id).expect("validated parent");
+            ensure!(parent.source.start_line == item.source.start_line
+                && parent.source.end_line == item.source.end_line,
+                "follow-up must retain its parent's source range");
+        }
     }
     Ok(())
+}
+
+/// Render only this conversation in saved order, including authoritative model replies.
+pub(crate) fn thread_context(annotation: &[ReviewAnnotation], selected: &ReviewAnnotation) -> String {
+    fn root<'annotation>(annotation: &'annotation [ReviewAnnotation], mut item: &'annotation ReviewAnnotation) -> &'annotation str {
+        while let Some(parent_id) = &item.parent_id {
+            item = annotation.iter().find(|parent| &parent.id == parent_id).expect("validated parent");
+        }
+        &item.id
+    }
+    let selected_root = root(annotation, selected);
+    let mut context = String::new();
+    for item in annotation.iter().filter(|item| root(annotation, item) == selected_root) {
+        let heading = if item.kind == ReviewAnnotationKind::Question { "Plan question" } else { "Plan comment" };
+        context.push_str(&format!("{heading}:\n{}\n\n", item.source.body));
+        if let Some(reply) = &item.reply {
+            context.push_str(&format!("Plan answer:\n{}\n\n", reply.body));
+        }
+    }
+    context
 }
 
 #[cfg(test)]
@@ -239,6 +298,9 @@ mod tests {
         let mut store = ReviewAnnotationStore::open(source_path.clone(), checksum.clone()).unwrap();
         store
             .replace(vec![ReviewAnnotation {
+                parent_id: None,
+                kind: Default::default(),
+                reply: None,
                 id: "comment".into(),
                 source: PlanAnnotationInput {
                     start_line: 8,
@@ -253,58 +315,11 @@ mod tests {
             .unwrap();
         let mut reopened = ReviewAnnotationStore::open(source_path.clone(), checksum).unwrap();
         index.anchor[0].line = 12;
-        reopened.reanchor(&index, &index).unwrap();
+        reopened.reanchor(&index).unwrap();
         assert_eq!(reopened.annotation()[0].source.end_line, 12);
         assert_eq!(reopened.annotation()[0].source.body, "Review second");
         reopened.replace(reopened.annotation().to_vec()).unwrap();
         assert_eq!(std::fs::read(source_path).unwrap(), b"saved design");
-    }
-
-    #[test]
-    fn older_row_only_comments_resolve_through_the_saved_navigation_index() {
-        let temporary = tempfile::tempdir().unwrap();
-        let source_path = temporary.path().join("working.json");
-        std::fs::write(&source_path, b"saved design").unwrap();
-        let mut store = ReviewAnnotationStore::open(source_path, digest(b"saved design")).unwrap();
-        store
-            .replace(vec![ReviewAnnotation {
-                id: "legacy".into(),
-                source: PlanAnnotationInput {
-                    start_line: 4,
-                    end_line: 4,
-                    body: "Review this member".into(),
-                },
-                anchor: None,
-            }])
-            .unwrap();
-        let target = super::super::PlanReviewTarget::Declaration {
-            path: "registry.rs".into(),
-            side: "proposed".into(),
-            line: 3,
-            column: None,
-        };
-        let saved = super::super::PlanNavigationIndex {
-            plan_id: "plan".into(),
-            plan_version: 1,
-            anchor: vec![super::super::PlanNavigationAnchor {
-                line: 4,
-                target,
-                json_path: "old line".into(),
-                path: Some("registry.rs".into()),
-                label: "member".into(),
-            }],
-        };
-        let mut current = saved.clone();
-        current.anchor[0].line = 9;
-        if let super::super::PlanReviewTarget::Declaration { column, .. } =
-            &mut current.anchor[0].target
-        {
-            *column = Some(4);
-        }
-        store.reanchor(&saved, &current).unwrap();
-        assert_eq!(store.annotation()[0].source.end_line, 9);
-        assert_eq!(store.annotation()[0].source.body, "Review this member");
-        assert!(store.annotation()[0].anchor.is_some());
     }
 
     #[test]
@@ -316,6 +331,9 @@ mod tests {
         let mut first = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
         let mut stale = ReviewAnnotationStore::open(source.clone(), checksum.clone()).unwrap();
         let annotation = vec![ReviewAnnotation {
+                parent_id: None,
+                kind: Default::default(),
+                reply: None,
             anchor: None,
             id: "comment".into(),
             source: PlanAnnotationInput {

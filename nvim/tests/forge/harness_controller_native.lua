@@ -28,6 +28,7 @@ client.request_for = function(session_id, method, params, callback)
     return
   end
   if method == "history.record" then vim.schedule(function() callback({}) end) return end
+  if method == "backend.models" then callback({}) return end
   assert(method == "harness.document")
   if params.operation == "open" then
     initial[#initial + 1] = params
@@ -47,6 +48,25 @@ local success, failure = xpcall(function()
   controller.attach()
   controller.render()
   assert(vim.wait(1000, function() return state.presentation and state.presentation.ready end))
+  local null_snapshot = vim.json.decode([[{
+    "goal": null, "goal_execution": null, "active_plan": null,
+    "active_elicitation": null, "active_wait": null,
+    "approval": [], "artifact": [], "timeline": [], "prompt_history": null
+  }]])
+  null_snapshot.session = state.session
+  controller.activate_snapshot(null_snapshot)
+  assert(state.goal == nil and state.active_elicitation == nil, "startup retained nullable state")
+  local original_state_request = client.request
+  local synchronized = false
+  client.request = function(method, _, callback)
+    assert(method == "state.get")
+    callback(null_snapshot)
+    synchronized = true
+  end
+  receive("plan_changes_requested", {}, "native-controller")
+  assert(synchronized and not state.state_sync_pending, "reject snapshot synchronization did not settle")
+  assert(state.goal == nil and state.active_elicitation == nil, "reject snapshot retained nullable state")
+  client.request = original_state_request
   assert(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)[1] == "Native transcript")
   assert(vim.wo[state.transcript_win].breakindent, "native attachment discarded Harness continuation indentation")
   assert(vim.wo[state.composer_win].winbar:find("submit", 1, true), "composer has no submit hint")

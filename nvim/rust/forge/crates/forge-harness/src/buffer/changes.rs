@@ -79,9 +79,10 @@ impl ChangeTree {
             .filter(|row| row.kind == RowKind::Removed)
             .count();
         let count = patch.file.len();
+        let unit = if declaration.is_some_and(|(_, document)| document) { "section" } else { "file" };
         let summary = format!(
             "▸ {label} {count} {} +{added} -{removed}{suffix}",
-            if count == 1 { "file" } else { "files" }
+            if count == 1 { unit.into() } else { format!("{unit}s") }
         );
         let mut heading = renderer.literal(BlockId(id.into()), &summary, 2)?;
         decorate_counts(&mut heading, added, removed);
@@ -217,11 +218,11 @@ impl ChangeTree {
                     }
                     tree.push(block)?;
                 }
-                tree.fold(hunk_start, &hunk_id)?;
+                tree.fold(hunk_start, &hunk_id, false)?;
             }
-            tree.fold(file_start, &file_id)?;
+            tree.fold(file_start, &file_id, true)?;
         }
-        tree.fold(0, id)?;
+        tree.fold(0, id, false)?;
         Ok(tree)
     }
 
@@ -262,7 +263,7 @@ impl ChangeTree {
         Ok(())
     }
 
-    fn fold(&mut self, start: usize, id: &str) -> Result<()> {
+    fn fold(&mut self, start: usize, id: &str, expand_children: bool) -> Result<()> {
         self.reserve(id.len() + 512)?;
         let last = self.block.last().expect("change heading exists");
         let end = BlockAnchor {
@@ -279,6 +280,7 @@ impl ChangeTree {
             true,
             start == 0,
         );
+        self.block[start].metadata.fold[0].expand_children = expand_children;
         Ok(())
     }
 }
@@ -399,6 +401,8 @@ mod tests {
         assert!(folds.iter().skip(1).all(|fold| !fold.collapse_children));
         let file = &tree.block[1];
         let hunk = &tree.block[2];
+        assert!(file.metadata.fold[0].expand_children);
+        assert!(!hunk.metadata.fold[0].expand_children && !tree.block[0].metadata.fold[0].expand_children);
         assert_eq!(file.text.row(0), Some("Modified test.rs +1 -1"));
         assert_eq!(hunk.text.row(0), Some("@@ -10,2 +20,2 @@ fn test"));
         assert_eq!(file.metadata.gutter, hunk.metadata.gutter);

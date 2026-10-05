@@ -110,6 +110,8 @@ function M.validate(sequence, changed, retired, state, read_row)
     assert(fold.collapsed_suffix == nil or (type(fold.collapsed_suffix) == "string"
       and #fold.collapsed_suffix <= 1024 and not fold.collapsed_suffix:find("%c")), "invalid fold summary suffix")
     assert(fold.collapse_children == nil or type(fold.collapse_children) == "boolean", "invalid fold child policy")
+    assert(fold.expand_children == nil or type(fold.expand_children) == "boolean", "invalid fold expansion policy")
+    assert(not (fold.collapse_children and fold.expand_children), "conflicting fold child policies")
     local previous = state and state.record[fold.id]
     assert(not previous or previous.owner == owner or changed[previous.owner] or retired[previous.owner],
       "duplicate fold identity")
@@ -282,7 +284,7 @@ function M.toggle_heading(session, window)
     if row >= first and row <= start then
       vim.api.nvim_win_call(window, function()
         local opening = vim.fn.foldclosed(start) == start
-        vim.cmd(tostring(start) .. (opening and "foldopen" or "foldclose"))
+        vim.cmd(tostring(start) .. (opening and (record.fold.expand_children and "foldopen!" or "foldopen") or "foldclose"))
         if opening and record.fold.collapse_children then
           local finish, children = fold_end(session, record), {}
           for _, child in pairs(session.fold.record) do

@@ -90,6 +90,8 @@ pub enum PromptMode {
     Chat,
     Plan,
     PlanDiscussion,
+    /// Answer an anchored review question in the main conversation without plan mutations.
+    PlanQuestion,
     ExecutePlan,
     GoalContinuation,
     RequestChanges,
@@ -644,6 +646,13 @@ impl MockBackend {
 
 #[async_trait]
 impl Backend for MockBackend {
+    async fn generate_text(&self, _request: BackendCatalogRequest, purpose: TextGeneration, _model: &str, _history: &str) -> Result<String> {
+        if let Some(delay) = self.delay { tokio::time::sleep(delay).await; }
+        purpose.validate(match purpose {
+            TextGeneration::Recap => "The current request is recorded. Review the next proposed change.",
+            TextGeneration::SessionName => "Review proposed changes",
+        })
+    }
     fn descriptor(&self) -> BackendDescriptor {
         BackendDescriptor {
             kind: BackendKind::Mock,
@@ -693,7 +702,9 @@ impl Backend for MockBackend {
             address: None,
             turn_boundary: None,
             kind: "assistant_message".into(),
-            text: Some(format!("Mock response: {}", request.input.text())),
+            text: Some(if request.mode == PromptMode::PlanQuestion {
+                "This declaration defines the proposed interface and separates its responsibility from the surrounding code. Implementation details remain outside the declaration plan.".into()
+            } else { format!("Mock response: {}", request.input.text()) }),
             data: Value::Null,
             activity: None,
             summary: None,

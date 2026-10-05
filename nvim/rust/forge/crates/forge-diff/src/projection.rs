@@ -73,6 +73,7 @@ pub fn fold_header(
         end,
         closed,
         collapse_children,
+        expand_children: false,
     }];
 }
 

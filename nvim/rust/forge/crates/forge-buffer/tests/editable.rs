@@ -97,7 +97,7 @@ fn local_edit_rebases_external_and_same_block_folds_in_one_atomic_patch() {
     body.metadata.fold.push(FoldRange {
         collapsed_suffix: None,
         heading_start: None,
-        collapse_children: false,
+        collapse_children: false, expand_children: false,
         id: FoldId("trailing".into()),
         start: TextPosition { row: 1, column: 0 },
         end: BlockAnchor {
@@ -113,7 +113,7 @@ fn local_edit_rebases_external_and_same_block_folds_in_one_atomic_patch() {
             fold: vec![FoldRange {
                 collapsed_suffix: None,
                 heading_start: None,
-                collapse_children: false,
+                collapse_children: false, expand_children: false,
                 id: FoldId("comment".into()),
                 start: TextPosition { row: 0, column: 0 },
                 end: BlockAnchor {

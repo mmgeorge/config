@@ -850,7 +850,7 @@ fn fold(block: &mut [BufferBlock], header: usize, id: &str, closed: bool) {
     header.metadata.fold.push(FoldRange {
         collapsed_suffix: None,
         heading_start: None,
-        collapse_children: false,
+        collapse_children: false, expand_children: false,
         id: FoldId(format!("walkthrough:{id}")),
         start: TextPosition {
             row: header.text.row_count().saturating_sub(1),

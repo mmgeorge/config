@@ -195,7 +195,7 @@ pub(crate) fn project(
         block[start_block].metadata.fold.push(FoldRange {
             collapsed_suffix: None,
             heading_start: None,
-            collapse_children: false,
+            collapse_children: false, expand_children: false,
             id: FoldId(format!("plan:heading:{source_row}")),
             start: TextPosition { row: 0, column: 0 },
             end,
@@ -264,7 +264,7 @@ pub(crate) fn project(
             .push(FoldRange {
                 collapsed_suffix: None,
                 heading_start,
-                collapse_children: false,
+                collapse_children: false, expand_children: false,
                 id: FoldId(fold_id),
                 start: TextPosition { row: 0, column: 0 },
                 end: endpoint,
@@ -293,7 +293,7 @@ pub(crate) fn project(
             collapsed_suffix: None,
             heading_start: None,
             id: FoldId(format!("plan:file-tree:{source_start}")),
-            collapse_children: false,
+            collapse_children: false, expand_children: false,
             start: TextPosition { row: 0, column: 0 },
             end: endpoint,
             closed: true,
@@ -1204,6 +1204,9 @@ mod tests {
             .find(|anchor| anchor.json_path == "/overview")
             .unwrap();
         let annotation = ReviewAnnotation {
+                parent_id: None,
+                kind: Default::default(),
+                reply: None,
             anchor: None,
             id: "note".into(),
             source: PlanAnnotationInput {

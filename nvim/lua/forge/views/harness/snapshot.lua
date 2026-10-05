@@ -3,9 +3,19 @@ local HarnessSnapshot = {}
 local timeline_cache = require("forge.views.harness.timeline_cache")
 local prompt_history = require("forge.views.harness.prompt_history")
 
+---Convert nullable snapshot fields to absent Lua values without changing the wire response.
+local function presentation_value(value)
+  if value == vim.NIL then return nil end
+  if type(value) ~= "table" then return value end
+  local projected = {}
+  for key, field in pairs(value) do projected[key] = presentation_value(field) end
+  return projected
+end
+
 ---@param state table
 ---@param result table
 function HarnessSnapshot.apply(state, result)
+  result = presentation_value(result)
   local previous_session_id = state.session and state.session.id or nil
   local previous_context_usage = state.session and state.session.context_usage or nil
   state.session = result.session

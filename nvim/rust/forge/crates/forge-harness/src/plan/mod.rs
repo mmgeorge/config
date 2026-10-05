@@ -25,7 +25,7 @@ mod review_annotation;
 mod review_feedback;
 pub(crate) use review_feedback::render as render_review_feedback;
 pub(crate) use review_annotation::resolve_annotations;
-pub use review_annotation::{ReviewAnnotation, ReviewAnnotationAnchor};
+pub use review_annotation::{ReviewAnnotation, ReviewAnnotationAnchor, ReviewAnnotationKind, ReviewQuestionReply};
 pub(crate) mod review_document;
 mod review_projection;
 pub(crate) mod review_source;

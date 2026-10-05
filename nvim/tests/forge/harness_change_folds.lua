@@ -12,7 +12,7 @@ for _, range in ipairs({ { "summary", 0, 12 }, { "first", 1, 8 }, { "first-hunk"
   { "next-hunk", 5, 8 }, { "second", 8, 12 }, { "second-hunk", 9, 12 } }) do
   metadata.fold[#metadata.fold + 1] = { id = range[1], start = { row = range[2], column = 0 },
     ["end"] = { block = "changes", position = { row = range[3], column = 0 } }, closed = true,
-    collapse_children = range[1] == "summary" }
+    collapse_children = range[1] == "summary", expand_children = range[1] == "first" or range[1] == "second" }
 end
 local snapshot = { document = replica.document, revision = 0,
   block = { { id = "changes", text = rows, metadata = metadata } } }
@@ -29,8 +29,8 @@ tab(1)
 assert(vim.fn.foldclosed(2) == 2, "opening Changed exposed the first file's hunks")
 assert(vim.fn.foldclosed(9) == 9, "opening Changed exposed the second file's hunks")
 tab(2)
-assert(vim.fn.foldclosed(3) == 3 and vim.fn.foldclosed(6) == 6, "opening file exposed hunk bodies")
-assert(vim.fn.foldtextresult(3) == "@@ -1,2 +1,2 @@", "hunk indentation differs from file")
+assert(vim.fn.foldclosed(3) == -1 and vim.fn.foldclosed(6) == -1, "opening file did not expose every hunk body")
+assert(vim.fn.foldclosed(9) == 9, "opening first file opened its sibling")
 tab(1)
 local saved = folds.capture(replica)
 snapshot.revision = 1
@@ -39,19 +39,22 @@ folds.restore(replica, saved)
 tab(1)
 assert(vim.fn.foldclosed(2) == 2, "reopening Changed restored an expanded file")
 tab(2)
-assert(vim.fn.foldclosed(3) == 3 and vim.fn.foldclosed(9) == 9, "refresh lost child fold choices")
+assert(vim.fn.foldclosed(3) == -1 and vim.fn.foldclosed(6) == -1 and vim.fn.foldclosed(9) == 9, "refresh lost file expansion policy")
 tab(2)
 tab(1)
 tab(1)
 assert(vim.fn.foldclosed(2) == 2 and vim.fn.foldclosed(9) == 9, "parent toggle reset file folds")
 tab(2)
 tab(3)
-assert(vim.fn.foldclosed(4) == -1, "hunk did not expose its body")
+assert(vim.fn.foldclosed(3) == 3, "hunk could not be folded independently")
+tab(2)
+tab(2)
+assert(vim.fn.foldclosed(3) == -1 and vim.fn.foldclosed(6) == -1, "reopening file retained a closed hunk")
 tab(1)
 tab(1)
 assert(vim.fn.foldclosed(2) == 2, "Changed restored an expanded hunk")
 tab(2)
-assert(vim.fn.foldclosed(3) == 3, "Changed did not reset descendant hunk folds")
+assert(vim.fn.foldclosed(3) == -1 and vim.fn.foldclosed(6) == -1, "reopening file after summary did not expand its hunks")
 tab(2)
 vim.api.nvim_win_set_cursor(window, { 1, 0 })
 vim.keymap.set("n", "<Tab>", function() folds.toggle_heading(replica, window) end, { buffer = replica.buffer })

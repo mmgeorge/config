@@ -577,7 +577,7 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
-    plan_review: crate::plan::review_document::PlanReviewStore,
+    plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     broker: Mutex<HarnessBroker>,
     presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
     cancellation: Arc<TurnCancellation>,
@@ -606,7 +606,7 @@ impl SessionController {
     fn new(broker: HarnessBroker) -> Arc<Self> {
         let catalog_request = broker.backend_catalog_request();
         Arc::new(Self {
-            plan_review: crate::plan::review_document::PlanReviewStore::default(),
+            plan_review: Arc::clone(&broker.plan_review),
             presentation: broker.presentation(),
             cancellation: broker.turn_cancellation(),
             backend: broker.backend_handle(),

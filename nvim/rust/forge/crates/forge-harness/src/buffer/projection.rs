@@ -890,7 +890,7 @@ impl TimelineRenderer<'_> {
                     if let Some(declaration) = &change.declaration {
                         self.diff(&change.id, "Proposed changes", &change.diff_text, "", None, Some((declaration, false)))?;
                         self.diff(&format!("{}:document", change.id), "Plan overview", &declaration.document_diff, "",
-                            Some(("plan.json", "Task and Description")), Some((declaration, true)))?;
+                            None, Some((declaration, true)))?;
                         continue;
                     }
                     let label = visible
@@ -1208,7 +1208,7 @@ impl TimelineRenderer<'_> {
         self.block[start].metadata.fold.push(FoldRange {
             collapsed_suffix: None,
             heading_start: None,
-            collapse_children: false,
+            collapse_children: false, expand_children: false,
             id: FoldId(identity.into()),
             start: TextPosition { row: 0, column: 0 },
             end: anchor,
@@ -2114,7 +2114,7 @@ mod tests {
                 diff_text: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub struct Old;\n+pub struct New;\n".into(),
                 declaration: Some(crate::exchange::DeclarationRevision {
                     plan_id: "plan".into(), revision: 3,
-                    document_diff: "--- a/plan.json\n+++ b/plan.json\n@@ -1 +1 @@\n-old overview\n+new overview\n".into(),
+                    document_diff: "--- a/Description\n+++ b/Description\n@@ -1 +1 @@\n-old overview\n+new overview\n".into(),
                 }),
             },
         });
@@ -2125,10 +2125,11 @@ mod tests {
             (0..block.text.row_count()).map(|row| block.text.row(row).unwrap())).collect::<Vec<_>>().join("\n");
         assert!(text.contains("Proposed changes 1 file +1 -1"));
         assert!(text.contains("Modified src/lib.rs +1 -1"));
-        assert!(text.contains("Modified Task and Description +1 -1"));
+        assert!(text.contains("Plan overview 1 section +1 -1"));
+        assert!(text.contains("Modified Description +1 -1"));
         assert!(!text.contains("Artifact:") && !text.contains("working.md"));
         assert!(projected.action.values().any(|action| matches!(action,
-            super::TranscriptAction::Declaration { path, revision: 3, document: true, .. } if path == "plan.json")));
+            super::TranscriptAction::Declaration { path, revision: 3, document: true, .. } if path == "Description")));
     }
 
     #[test]

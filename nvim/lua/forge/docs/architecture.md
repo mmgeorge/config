@@ -547,6 +547,10 @@ remain transport evidence for approvals, context metadata, and diagnostics. They
 inside Lua. Initial load, explicit reconciliation, resume, and preview carry full snapshots. Normal streaming carries
 only the changed top-level entries.
 
+Lua's `snapshot.lua` projects JSON nulls to absent Lua values before assigning Harness state.
+Startup, session activation, and state reconciliation share this boundary. Nested optional fields
+receive the same conversion without mutating the transport response or other protocols' null semantics.
+
 The projector consumes `QuestionAnswered` as transition evidence instead of publishing a second feedback row because
 the continuation interaction owns that visible user action. It also nests durable child-agent turns under their
 provider and spawning-interaction identities before serialization. Lua's `timeline_cache.lua` validates the session
@@ -2584,10 +2588,51 @@ Section and file comments retain their bodies without inventing source lines.
 Feedback formatting completes before the broker changes the plan state, so an
 invalid saved anchor cannot leave a revision request without its comments.
 
+PlanReview uses `A` to create a `Plan question` through the same draft editor as
+`C`. `Ctrl-S` saves captured feedback and submits nonempty unanswered questions.
+The shared draft-comment component supports per-item headings and multiple
+read-only replies. Focusing any member expands the entire thread to full width.
+Answers retain read-only ranges outside the parent's guarded editing region.
+Reply updates preserve local draft text and cursor position. The document owner
+retains pending and completed replies across source projection refreshes.
+`C` and `A` on a message or answer inherit its source range and record a parent
+message identity. The core groups those entries into one conversation and expands
+all members when any member has focus. Each editable entry keeps its own guarded
+body. Linked entries share heading dividers in the focused view and a single
+outer border in the compact view. Shared divider hit testing belongs to the
+following message, while its predecessor's editable region ends at that divider.
+Parent deletion requires removing its follow-ups first.
+
+`plan.questions.answer` captures native review identity and semantic anchors,
+then admits a read-only discussion turn in the main provider conversation through
+the broker's existing serialized interaction and timeline pipeline. The timeline
+shows the user's question and the provider's answer. Its instruction requests one
+or two sentences using conversation history, the saved declaration design, and
+the selected source excerpt. It leaves plan state and source unchanged. Questions
+and answers also persist in the annotation store, with
+each answer bound to the question's exact body. Answers retain the exchange's
+measured execution duration. The answer divider
+renders `Thought for N seconds`, with no invented timing for answers without
+recorded duration.
+Saving unchanged answered questions makes no new model request. Editing a question invalidates its answer,
+and a late response cannot attach to different text. Ordinary revision requests
+include only revision comments as requested changes. Follow-up questions and
+revision comments also carry their entire saved conversation, including model
+answers, alongside the original anchored source excerpt. The annotation store
+rejects missing or forward parents and mismatched inherited source ranges.
+Row-only annotation migration is unsupported.
+
 Submitted declaration plans retain a file delta between consecutive proposed
-snapshots. The first submission compares source declarations with the proposal.
+snapshots with three surrounding context lines per hunk. Distant edits retain
+separate hunks. The first submission compares source declarations with the proposal.
+Timeline file headings request recursive expansion through the shared fold
+metadata. Opening a file reveals all of its hunks. Opening a change summary
+retains collapsed file headings, and individual hunks remain independently foldable.
 The transcript renders these deltas through the shared change tree, independently
-of the Task and Description delta. PlanReview continues to compare source with
+of the Task and Description delta. Overview revisions compare the plain prose
+of each section, omit unchanged sections, and retain paragraph breaks. Their
+navigation opens that section's immutable text rather than internal JSON.
+PlanReview continues to compare source with
 the complete proposal. Transcript declaration targets retain the plan identity,
 submitted revision, path, and side. `plan.declaration` reads that immutable
 snapshot, and navigation opens a read-only declaration buffer. Removed rows open

@@ -460,6 +460,8 @@ pub struct HarnessBroker {
     diff: Arc<forge_diff::engine::DiffEngine>,
     store: SqliteStore,
     plan_file: PlanFileStore,
+    /// Shares admitted review documents between view requests and serialized question turns.
+    pub(crate) plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     workspace_kind: WorkspaceKind,
     data_root: PathBuf,
     client_id: String,
@@ -651,6 +653,7 @@ impl HarnessBroker {
             permission_coordinator,
             trace,
             rustdoc: Arc::clone(&runtime.rustdoc),
+            plan_review: Arc::new(crate::plan::review_document::PlanReviewStore::default()),
             event_sink: None,
             clock,
             exchange_runtime: None,
@@ -1104,6 +1107,7 @@ impl HarnessBroker {
             HarnessMethod::PlanRustdocHover => self.rustdoc_hover(params).await,
             HarnessMethod::PlanRustdocSource => self.rustdoc_source(params).await,
             HarnessMethod::PlanRequestChanges => self.request_plan_changes(params).await,
+            HarnessMethod::PlanAnswerQuestions => self.answer_plan_review_questions(params).await,
             HarnessMethod::PlanCancel => self.cancel_plan(),
             HarnessMethod::PlanActivate => self.activate_plan(params),
             HarnessMethod::PlanDeclaration => self.read_plan_declaration(params),
@@ -1154,6 +1158,46 @@ impl HarnessBroker {
                 anyhow::bail!("Harness control method requires the process coordinator")
             }
         }
+    }
+
+    async fn answer_plan_review_questions(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let input: forge_buffer::input::DocumentInput = serde_json::from_value(
+            params.get("review").cloned().context("plan question requires its review identity")?,
+        )?;
+        let digest = params.get("draft_source_digest").and_then(Value::as_str)
+            .context("plan question requires its source digest")?;
+        let annotation = serde_json::from_value(params.get("draft_annotation").cloned()
+            .context("plan questions require captured annotations")?)?;
+        let document = input.document.clone();
+        self.plan_review.save_annotations(&document, digest, annotation)?;
+        let question = self.plan_review.questions(input)?;
+        let mut event = Vec::new();
+        for question in question {
+            let instructions = "Answer this plan review question in 1-2 sentences using the current conversation and supplied design context. Return only the answer, with inline backticks for code names. Do not edit or implement the plan, submit a revision, or ask a follow-up question.";
+            self.trace.record(&self.session.id, "plan.question.requested", json!({
+                "id":question.id,"model":self.session.model,"instructions":instructions,"context":question.prompt,
+                "backend_session_id":self.session.backend_session_id,"conversation":"main"
+            }));
+            let mut admission = ExchangeAdmission::chat(question.body.clone());
+            admission.plan_id = self.session.active_plan_id.clone();
+            let (result, mut update) = self.run_interaction(
+                format!("{instructions}\n\n{}", question.prompt),
+                PromptMode::PlanQuestion,
+                Some(admission),
+            ).await?;
+            event.append(&mut update);
+            let exchange: Exchange = serde_json::from_value(result.get("exchange").cloned()
+                .context("plan question completed without its exchange")?)?;
+            let answer = exchange.turn.iter().flat_map(|turn| turn.messages())
+                .filter(|message| message.kind() == crate::turn::MessageKind::Assistant
+                    && message.delivery() == crate::turn::MessageDelivery::Final)
+                .map(|message| message.text()).collect::<Vec<_>>().join("\n\n");
+            anyhow::ensure!(!answer.trim().is_empty(), "plan question completed without an answer");
+            anyhow::ensure!(answer.len() <= 8_192, "plan question answer exceeds the display limit");
+            self.plan_review.answer(&document, &question, answer.clone(), exchange.duration_ms)?;
+            self.trace.record(&self.session.id, "plan.question.answered", json!({"id":question.id,"answer":answer,"duration_ms":exchange.duration_ms}));
+        }
+        Ok((json!({"annotation":self.plan_review.annotations(&document)?}), event))
     }
 
     async fn rustdoc_hover(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -5193,7 +5237,11 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let document = self.plan_file.read_submitted_document(&self.session.id, &plan_id, revision)?;
         let design = document.design.context("plan has no declaration snapshot")?;
         let text = if params.get("document").and_then(Value::as_bool).unwrap_or(false) {
-            serde_json::to_string_pretty(&design.document)?
+            match path.as_str() {
+                "Task" => design.document.task.clone(),
+                "Description" => design.document.description.clone(),
+                _ => anyhow::bail!("unknown plan overview section"),
+            }
         } else if baseline {
             design.baseline.get(&path).context("declaration baseline not found")?.text.clone()
         } else {
@@ -6513,7 +6561,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             effort: self.session.effort.clone(),
             context_window: self.session.context_window.clone(),
             fast_mode: self.session.fast_mode,
-            execution_mode: if matches!(mode,PromptMode::Plan | PromptMode::PlanDiscussion) { ExecutionMode::Read } else { self.session.execution_mode },
+            execution_mode: if matches!(mode,PromptMode::Plan | PromptMode::PlanDiscussion | PromptMode::PlanQuestion) { ExecutionMode::Read } else { self.session.execution_mode },
             backend_session_id: self.session.backend_session_id.clone(),
             control_context: self.control_turn_context(mode),
         }
@@ -6823,6 +6871,14 @@ mod test {
         assert_eq!(revised.model_revision,2);
         let source = broker.capture_plan_review(&revised.id,revised.review_digest.as_deref().unwrap()).unwrap();
         assert!(source.rendered.markdown.contains("reviewed_change"));
+        let overview = &source.document.design.as_ref().unwrap().document;
+        for (path, expected) in [("Task", &overview.task), ("Description", &overview.description)] {
+            let (snapshot, _) = broker.read_plan_declaration(json!({"plan_id":revised.id,
+                "revision":2,"document":true,"path":path})).unwrap();
+            assert_eq!(snapshot["text"].as_str().unwrap(), expected);
+        }
+        assert!(broker.read_plan_declaration(json!({"plan_id":revised.id,
+            "revision":2,"document":true,"path":"unknown"})).is_err());
         let session_id = broker.session.id.clone();
         drop(broker);
         let mut initialize = initialize;
@@ -7712,6 +7768,55 @@ mod test {
         assert_eq!(exchange.state, ExchangeState::Complete);
         assert!(!exchange.awaiting_input);
         assert_eq!(backend.turn.load(Ordering::SeqCst), 5);
+    }
+
+    #[tokio::test]
+    async fn review_questions_use_main_conversation_and_persist_in_timeline_without_revising() {
+        use forge_buffer::identity::{DocumentId, InputSequence, ViewId};
+        use forge_buffer::input::DocumentInput;
+        use crate::plan::review_document::PlanReviewDocument;
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.backend = crate::backend::build(broker.backend_launch.clone(),
+            Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace)).unwrap().into();
+        broker.submit_prompt_inner(json!({"text":"/plan revise the API"})).await.unwrap();
+        let before = broker.snapshot().unwrap().active_plan.unwrap();
+        let thread = broker.session.backend_session_id.clone();
+        let source = broker.plan_file.capture_review_source(&broker.session.id, &before.id,
+            before.model_revision, before.review_digest.as_deref().unwrap()).unwrap();
+        let line = source.rendered.navigation.anchor.iter()
+            .find(|anchor| matches!(anchor.target, crate::plan::PlanReviewTarget::Declaration { .. })).unwrap().line;
+        let digest = source.saved_digest.clone();
+        let id = DocumentId("review-question".into());
+        let view = ViewId("view".into());
+        let review = PlanReviewDocument::new(id.clone(), view.clone(), source,
+            forge_buffer::width::WidthProfile::default(), None).unwrap();
+        let snapshot = review.snapshot();
+        let target = snapshot.block[0].metadata.target[0].clone();
+        let input = DocumentInput { document:id.clone(),revision:snapshot.revision,view,sequence:InputSequence(1),
+            action:"plan.questions.answer".into(),block:snapshot.block[0].id.clone(),position:target.range.start,target:Some(target.id) };
+        let admission = broker.plan_review.admit(id.clone()).unwrap();
+        broker.plan_review.insert(review, admission).unwrap();
+        let params = json!({"review":input,"draft_source_digest":digest,"draft_annotation":[{
+            "id":"question","kind":"question","source":{"start_line":line,"end_line":line,"body":"Why this API?"}
+        }]});
+        let result = broker.dispatch(Request { id:2,method:"plan.questions.answer".into(),params:params.clone() }).await;
+        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        let snapshot = broker.snapshot().unwrap();
+        let after = snapshot.active_plan.as_ref().unwrap();
+        assert_eq!(after.review_digest, before.review_digest);
+        assert_eq!(after.model_revision, before.model_revision);
+        assert_eq!(broker.session.backend_session_id, thread);
+        assert_eq!(snapshot.exchange.last().unwrap().prompt, "Why this API?");
+        assert!(timeline_text(&snapshot).contains("This declaration defines the proposed interface"));
+        assert!(result.response.result().unwrap()["annotation"][0]["reply"]["body"].as_str().unwrap().contains("This declaration"));
+        let count = snapshot.exchange.len();
+        let mut params = params;
+        params["review"]["sequence"] = json!(2);
+        let repeated = broker.dispatch(Request { id:3,method:"plan.questions.answer".into(),params }).await;
+        assert!(repeated.response.error().is_none());
+        assert_eq!(broker.snapshot().unwrap().exchange.len(), count);
     }
 
     fn submit_test_plan(request: &BackendRequest, output: &mut crate::backend::BackendOutput, overview: &str) {

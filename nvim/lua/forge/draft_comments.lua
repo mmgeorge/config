@@ -9,24 +9,35 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 
 ---@class ForgeDraftComment
 ---@field id integer|string
+---@field parent_id string? Earlier editable message in the same conversation.
 ---@field source_line integer
 ---@field end_source_line integer
 ---@field body string
 ---@field focused boolean?
 ---@field new boolean?
 ---@field readonly boolean?
+---@field kind string? Opaque workflow tag retained in explicit captures.
+---@field heading string? Per-comment heading overrides the view default.
+---@field replies {heading: string, body_lines: string[]}[]?
+---@field replies_body string? Restricts replies to the parent body they answer.
 
 ---@class ForgeDraftCommentCapture
 ---@field id string
 ---@field source {start_line: integer, end_line: integer, body: string}
+---@field kind string?
 
 ---@class ForgeDraftCommentRange
+---@field reply_index integer?
+---@field reply_start_list integer[]?
 ---@field annotation ForgeDraftComment
 ---@field compact boolean
 ---@field first_row integer
 ---@field last_row integer
 ---@field header_mark integer?
 ---@field footer_mark integer?
+---@field reply_mark integer?
+---@field reply_start_row integer?
+---@field readonly boolean?
 
 ---@class ForgeDraftCommentState
 ---@field buf integer
@@ -113,7 +124,7 @@ end
 ---@param state ForgeDraftCommentState
 ---@param range ForgeDraftCommentRange
 local function sync_range_body(state, range)
-  if range.compact then return end
+  if range.compact or range.readonly then return end
   local header_row, footer_row = full_range_rows(state, range)
   if not header_row or not footer_row or footer_row <= header_row then return end
   local body_lines = vim.api.nvim_buf_get_lines(state.buf, header_row + 1, footer_row, false)
@@ -131,14 +142,24 @@ end
 ---@param state ForgeDraftCommentState
 ---@param row integer
 ---@return ForgeDraftComment?, ForgeDraftCommentRange?
+---@return boolean? readonly_reply
 local function annotation_at_row(state, row)
-  for _, range in ipairs(state.range_list) do
+  for index = #state.range_list, 1, -1 do
+    local range = state.range_list[index]
     local header_row, footer_row = full_range_rows(state, range)
     if header_row and footer_row and row >= header_row and row <= footer_row then
-      return range.annotation, range
+      local reply_row = range.reply_mark and mark_row(state, range.reply_mark)
+      return range.annotation, range, range.readonly or reply_row and row >= reply_row or false
     end
   end
   return nil, nil
+end
+
+---@param annotation ForgeDraftComment
+---@return ForgeDraftCommentCapture
+local function capture_annotation(annotation)
+  return { id = tostring(annotation.id), kind = annotation.kind, parent_id = annotation.parent_id, source = {
+    start_line = annotation.source_line, end_line = annotation.end_source_line, body = annotation.body } }
 end
 
 ---@param state ForgeDraftCommentState
@@ -203,14 +224,37 @@ end
 ---@return ForgeDraftComment?
 local function find_annotation(state, annotation_id)
   for _, annotation in ipairs(state.annotation_list) do
-    if annotation.id == annotation_id then return annotation end
+    if tostring(annotation.id) == tostring(annotation_id) then return annotation end
   end
   return nil
+end
+
+--- Resolve the shared focus owner for a conversation without changing source identity.
+local function thread_root(state, annotation)
+  for _ = 1, #state.annotation_list do
+    local parent = annotation.parent_id and find_annotation(state, annotation.parent_id)
+    if not parent then return annotation end
+    annotation = parent
+  end
+  error("cyclic comment thread")
+end
+
+local function focus_thread(state, annotation)
+  local root = thread_root(state, annotation)
+  for _, candidate in ipairs(state.annotation_list) do
+    candidate.focused = thread_root(state, candidate) == root
+  end
 end
 
 ---@param state ForgeDraftCommentState
 ---@param annotation ForgeDraftComment
 local function remove_annotation(state, annotation)
+  for _, candidate in ipairs(state.annotation_list) do
+    if candidate.parent_id == tostring(annotation.id) then
+      notifications.error("Remove follow-ups before deleting their parent", "Forge comments")
+      return
+    end
+  end
   for index, candidate in ipairs(state.annotation_list) do
     if candidate == annotation then
       table.remove(state.annotation_list, index)
@@ -269,7 +313,15 @@ local function build_projection(state, width)
       annotation_row_by_source[tonumber(source_row.source_line) or source_index] = source_index
     end
   end
-  for _, annotation in ipairs(state.annotation_list) do
+  local ordered = {}
+  for _, root in ipairs(state.annotation_list) do
+    if not root.parent_id then
+      for _, candidate in ipairs(state.annotation_list) do
+        if thread_root(state, candidate) == root then ordered[#ordered + 1] = candidate end
+      end
+    end
+  end
+  for _, annotation in ipairs(ordered) do
     annotation.source_line = math.max(1, math.min(tonumber(annotation.source_line) or 1, source_count))
     annotation.end_source_line =
       math.max(annotation.source_line, math.min(tonumber(annotation.end_source_line) or annotation.source_line, source_count))
@@ -305,13 +357,23 @@ local function build_projection(state, width)
     if anchors_annotation then
       for _, annotation in ipairs(annotation_by_source[source_line] or {}) do
       local first_row = #projection.line_list
+      local heading = annotation.heading or state.heading
+      local replies = annotation.replies
+      if annotation.replies_body and annotation.replies_body ~= annotation.body then replies = nil end
+      local reply_start_row, reply_start_list
+      local previous = projection.range_list[#projection.range_list]
+      local shared_divider = annotation.parent_id and previous
+        and previous.compact == not annotation.focused
+        and thread_root(state, previous.annotation) == thread_root(state, annotation)
+      if shared_divider then first_row = #projection.line_list - 1 end
       if annotation.focused then
-        projection.line_list[#projection.line_list + 1] = comment_editor.rule_line(
-          " " .. state.heading .. " ",
+        local heading_row = shared_divider and #projection.line_list or #projection.line_list + 1
+        projection.line_list[heading_row] = comment_editor.rule_line(
+          " " .. heading .. " ",
           " " .. state.source_label(annotation) .. " ",
           width
         )
-        projection.line_meta_list[#projection.line_list] = {
+        projection.line_meta_list[heading_row] = {
           ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}),
         }
         for _, body_line in ipairs(vim.split(annotation.body, "\n", { plain = true })) do
@@ -328,15 +390,30 @@ local function build_projection(state, width)
         local descriptor = {
           id = annotation.id,
           anchor = { line = source_line },
-          heading = " " .. state.heading .. " • " .. state.source_label(annotation) .. " ",
+          heading = " " .. heading .. " • " .. state.source_label(annotation) .. " ",
           body_lines = vim.split(annotation.body, "\n", { plain = true }),
           readonly = annotation.readonly == true,
+          replies = replies,
+          continuation = shared_divider,
         }
-        for _, segmented_line in ipairs(comment_box.build_box_lines(descriptor, width + 1)) do
+        local box_lines = comment_box.build_box_lines(descriptor, width + 1)
+        reply_start_row = box_lines.reply_start_row and first_row + box_lines.reply_start_row
+        reply_start_list = {}
+        for _, reply_row in ipairs(box_lines.reply_start_list or {}) do
+          reply_start_list[#reply_start_list + 1] = first_row + reply_row
+        end
+        if shared_divider then
+          for index = #projection.compact_highlight_list, 1, -1 do
+            if projection.compact_highlight_list[index].row == first_row then
+              table.remove(projection.compact_highlight_list, index)
+            end
+          end
+        end
+        for index, segmented_line in ipairs(box_lines) do
           local text, highlight_list = flatten_segmented_line(segmented_line)
-          local row = #projection.line_list
-          projection.line_list[#projection.line_list + 1] = text
-          projection.line_meta_list[#projection.line_list] = {
+          local row = shared_divider and index == 1 and first_row or #projection.line_list
+          projection.line_list[row + 1] = text
+          projection.line_meta_list[row + 1] = {
             ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}),
           }
           for _, highlight in ipairs(highlight_list) do
@@ -354,7 +431,23 @@ local function build_projection(state, width)
         compact = not annotation.focused,
         first_row = first_row,
         last_row = #projection.line_list - 1,
+        reply_start_row = reply_start_row,
+        reply_start_list = reply_start_list,
       }
+      if annotation.focused then
+        for reply_index, reply in ipairs(replies or {}) do
+          local first_reply_row = #projection.line_list - 1
+          projection.line_list[#projection.line_list] = comment_editor.rule_line(" " .. reply.heading .. " ", "", width)
+          local reply_lines = comment_box.wrap_text(table.concat(reply.body_lines or {}, "\n"), width)
+          reply_lines[#reply_lines + 1] = comment_editor.footer_line(width)
+          for _, line in ipairs(reply_lines) do
+            projection.line_list[#projection.line_list + 1] = line
+            projection.line_meta_list[#projection.line_list] = { ancestor_ids = vim.deepcopy(source_row.ancestor_ids or {}) }
+          end
+          projection.range_list[#projection.range_list + 1] = { annotation = annotation, compact = false,
+            readonly = true, reply_index = reply_index, first_row = first_reply_row, last_row = #projection.line_list - 1 }
+        end
+      end
       end
     end
   end
@@ -401,6 +494,7 @@ local function apply_projection(state, projection)
   for _, range in ipairs(projection.range_list) do
     range.header_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.first_row, 0, { right_gravity = false })
     range.footer_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.last_row, 0, { right_gravity = true })
+    if range.reply_start_row then range.reply_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.reply_start_row, 0, { right_gravity = false }) end
     if not range.compact then
       range.header_mark = vim.api.nvim_buf_set_extmark(state.buf, namespace, range.first_row, 0, {
         right_gravity = false,
@@ -419,8 +513,7 @@ local function apply_projection(state, projection)
   end
   local captured = {}
   for _, annotation in ipairs(state.annotation_list) do
-    captured[#captured + 1] = { id = tostring(annotation.id), source = {
-      start_line = annotation.source_line, end_line = annotation.end_source_line, body = annotation.body } }
+    captured[#captured + 1] = capture_annotation(annotation)
   end
   vim.bo[state.buf].modified = not vim.deep_equal(captured, state.baseline)
   state.generation = (state.generation or 0) + 1
@@ -435,7 +528,7 @@ local function target_row(state, projection, target)
     local annotation = find_annotation(state, target.annotation_id)
     if annotation then
       for _, range in ipairs(projection.range_list) do
-        if range.annotation == annotation then
+        if range.annotation == annotation and range.reply_index == target.reply_index then
           return annotation.focused and range.first_row + 1 or range.first_row
         end
       end
@@ -448,12 +541,12 @@ end
 ---@param win integer?
 local function sync_cursor_modifiable(state, win)
   local cursor_row = win and vim.api.nvim_win_get_cursor(win)[1] - 1 or -1
-  local _, cursor_range = annotation_at_row(state, cursor_row)
+  local _, cursor_range, reply = annotation_at_row(state, cursor_row)
   local header_row, footer_row = nil, nil
   if cursor_range and not cursor_range.compact then
     header_row, footer_row = full_range_rows(state, cursor_range)
   end
-  local allowed = not state.readonly and cursor_range and not cursor_range.annotation.readonly
+  local allowed = not state.readonly and cursor_range and not reply and not cursor_range.annotation.readonly
     and header_row ~= nil and cursor_row > header_row and cursor_row < footer_row
   if state.editable_source then allowed = allowed or state.editable_source(cursor_row) end
   set_modifiable(state, allowed == true)
@@ -485,7 +578,7 @@ local function render(state, target)
     state.guard = state.guard or editable.new("plan-comment:" .. state.buf)
     local anchor = {}
     for _, range in ipairs(projection.range_list) do
-      if not range.compact and not range.annotation.readonly then
+      if not range.compact and not range.readonly and not range.annotation.readonly then
         local region = tostring(range.annotation.id)
         if not state.guard.region[region] then editable.register(state.guard, region, 0) end
         anchor[region] = { start = { row = range.first_row + 1, column = 0 },
@@ -520,14 +613,21 @@ local function handle_cursor_moved(state)
   if not win then return end
   sync_focused_body(state)
   local row = vim.api.nvim_win_get_cursor(win)[1] - 1
-  local annotation, range = annotation_at_row(state, row)
+  local annotation, range, reply = annotation_at_row(state, row)
   if annotation then
     if annotation.readonly then sync_cursor_modifiable(state, win) return end
     if not annotation.focused then
-      for _, candidate in ipairs(state.annotation_list) do candidate.focused = candidate == annotation end
-      render(state, { annotation_id = annotation.id })
+      local reply_index = range.reply_index
+      if reply then
+        for index, reply_row in ipairs(range.reply_start_list or {}) do
+          if row >= reply_row then reply_index = index end
+        end
+      end
+      focus_thread(state, annotation)
+      render(state, { annotation_id = annotation.id, reply_index = reply_index })
       return
     end
+    if reply then sync_cursor_modifiable(state, win) return end
     if range then
       local header_row, footer_row = full_range_rows(state, range)
       set_modifiable(state, header_row ~= nil and row > header_row and row < footer_row)
@@ -639,8 +739,7 @@ function M.attach(buf, win, source_lines, annotation_list, opts)
   }
   state_by_buf[buf] = state
   for _, annotation in ipairs(opts.baseline and {} or annotation_list) do
-    state.baseline[#state.baseline + 1] = { id = tostring(annotation.id), source = {
-      start_line = annotation.source_line, end_line = annotation.end_source_line, body = annotation.body } }
+    state.baseline[#state.baseline + 1] = capture_annotation(annotation)
   end
   install_autocmd(state)
   render(state)
@@ -654,8 +753,7 @@ function M.capture(buf)
   sync_focused_body(state)
   local captured = {}
   for _, annotation in ipairs(state.annotation_list) do
-    captured[#captured + 1] = { id = tostring(annotation.id), source = {
-      start_line = annotation.source_line, end_line = annotation.end_source_line, body = annotation.body } }
+    captured[#captured + 1] = capture_annotation(annotation)
   end
   return captured
 end
@@ -680,8 +778,8 @@ function M.delete_at_cursor(buf)
   if not state or state.readonly then return end
   sync_focused_body(state)
   local row = vim.api.nvim_win_get_cursor(state.win)[1] - 1
-  local annotation = annotation_at_row(state, row)
-  if not annotation or annotation.readonly then return end
+  local annotation, _, reply = annotation_at_row(state, row)
+  if not annotation or annotation.readonly or reply then return end
   local source_line = annotation.end_source_line
   remove_annotation(state, annotation)
   render(state, { source_line = source_line })
@@ -695,7 +793,7 @@ function M.focus(buf, id)
   local annotation = state and find_annotation(state, id)
   if not annotation or state.readonly or annotation.readonly then return false end
   sync_focused_body(state)
-  for _, candidate in ipairs(state.annotation_list) do candidate.focused = candidate == annotation end
+  focus_thread(state, annotation)
   render(state, { annotation_id = id })
   return true
 end
@@ -715,6 +813,7 @@ function M.add(buf, annotation, start_insert)
   for _, candidate in ipairs(state.annotation_list) do candidate.focused = false end
   annotation.focused, annotation.new = true, true
   state.annotation_list[#state.annotation_list + 1] = annotation
+  focus_thread(state, annotation)
   render(state, { annotation_id = annotation.id })
   if start_insert ~= false then
     vim.schedule(function()
@@ -727,7 +826,8 @@ end
 
 ---@param buf integer
 ---@param start_insert? boolean
-function M.add_at_cursor(buf, start_insert)
+---@param properties? {kind?: string, heading?: string}
+function M.add_at_cursor(buf, start_insert, properties)
   local state = state_by_buf[buf]
   if not state or state.readonly then return end
   sync_focused_body(state)
@@ -741,6 +841,8 @@ function M.add_at_cursor(buf, start_insert)
     first_row = vim.fn.getpos("v")[2] - 1
   end
   local source_line, end_source_line = source_range_at_rows(state, first_row, last_row)
+  local parent = first_row == last_row and annotation_at_row(state, cursor_row) or nil
+  if parent then source_line, end_source_line = parent.source_line, parent.end_source_line end
   if not source_line or not end_source_line then
     notifications.error("Selected rows have no source identity", "Forge comments")
     return
@@ -752,9 +854,40 @@ function M.add_at_cursor(buf, start_insert)
     body = "",
     focused = true,
     new = true,
+    kind = properties and properties.kind,
+    parent_id = parent and tostring(parent.id) or nil,
+    heading = properties and properties.heading,
   }
   state.next_id = state.next_id + 1
   M.add(buf, annotation, start_insert)
+end
+
+--- Update thread presentation in one render without replacing local draft bodies.
+---@param buf integer
+---@param updates {id: integer|string, heading?: string, replies?: {heading: string, body_lines: string[]}[], replies_body?: string}[]
+function M.update(buf, updates)
+  local state = state_by_buf[buf]
+  if not state then return end
+  sync_focused_body(state)
+  local win = displayed_window(state)
+  local cursor_namespace = vim.api.nvim_create_namespace("ForgeDraftCommentCursor")
+  local cursor = win and vim.api.nvim_win_get_cursor(win)
+  local cursor_mark = cursor and vim.api.nvim_buf_set_extmark(buf, cursor_namespace, cursor[1] - 1, cursor[2], { right_gravity = false })
+  for _, update in ipairs(updates) do
+    local annotation = find_annotation(state, update.id)
+    if annotation then
+      annotation.heading = update.heading or annotation.heading
+      annotation.replies = update.replies
+      annotation.replies_body = update.replies_body
+    end
+  end
+  render(state)
+  if cursor_mark and win and vim.api.nvim_win_is_valid(win) then
+    local position = vim.api.nvim_buf_get_extmark_by_id(buf, cursor_namespace, cursor_mark, {})
+    if #position == 2 then vim.api.nvim_win_set_cursor(win, { position[1] + 1, position[2] }) end
+    vim.api.nvim_buf_del_extmark(buf, cursor_namespace, cursor_mark)
+    sync_cursor_modifiable(state, win)
+  end
 end
 
 ---@param buf integer

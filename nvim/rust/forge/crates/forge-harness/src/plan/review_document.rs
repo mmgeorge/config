@@ -1,5 +1,5 @@
 use super::PlanNavigationAnchor;
-use super::review_annotation::{ReviewAnnotation, ReviewAnnotationStore};
+use super::review_annotation::{ReviewAnnotation, ReviewAnnotationKind, ReviewAnnotationStore, ReviewQuestionReply};
 use super::review_source::PlanReviewSource;
 use anyhow::{Context, Result, ensure};
 use forge_buffer::admission::{DocumentAdmission, DocumentAdmissionStore};
@@ -16,6 +16,16 @@ use std::sync::{Arc, Mutex};
 pub(crate) struct PlanReviewStore {
     admission: Arc<DocumentAdmissionStore>,
     document: Mutex<HashMap<DocumentId, (PlanReviewDocument, DocumentAdmission)>>,
+}
+
+/// Captures one unanswered question and the immutable design context used to answer it.
+pub(crate) struct PlanReviewQuestion {
+    /// Stable identity of the question's annotation.
+    pub id: String,
+    /// Exact editable text captured at submission.
+    pub body: String,
+    /// Saved declaration design and anchored review excerpt supplied to the model.
+    pub prompt: String,
 }
 
 impl PlanReviewStore {
@@ -43,6 +53,10 @@ impl PlanReviewStore {
         );
         let mut captured = annotation;
         for annotation in &mut captured {
+            annotation.reply = document.annotation.annotation().iter()
+                .find(|saved| saved.id == annotation.id && saved.kind == annotation.kind
+                    && saved.source.body == annotation.source.body)
+                .and_then(|saved| saved.reply.clone());
             let start = document
                 .source
                 .rendered
@@ -83,9 +97,60 @@ impl PlanReviewStore {
             serde_json::json!({"plan_id":document.source.document.plan_id,
             "digest":super::digest(&serde_json::to_vec(&document.source.document)?),
             "saved_source_digest":document.source.saved_digest,
-            "annotations":document.annotation.annotation().iter().filter(|annotation| !annotation.source.body.trim().is_empty())
-                .map(|annotation| &annotation.source).collect::<Vec<_>>() }),
+            "annotations":document.annotation.annotation().iter().filter(|annotation| annotation.kind == ReviewAnnotationKind::Comment && !annotation.source.body.trim().is_empty())
+                .map(|annotation| {
+                    let mut source = annotation.source.clone();
+                    if annotation.parent_id.is_some() {
+                        let thread = super::review_annotation::thread_context(document.annotation.annotation(), annotation);
+                        source.body = format!("Conversation context:\n{thread}Requested change:\n{}", source.body);
+                    }
+                    source
+                }).collect::<Vec<_>>() }),
         )
+    }
+
+    /// Capture unanswered questions after validating their native document identity.
+    pub(crate) fn questions(&self, input: DocumentInput) -> Result<Vec<PlanReviewQuestion>> {
+        let mut store = self.document.lock().map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store.get_mut(&input.document).context("plan review document is closed")?;
+        admission.check()?;
+        document.validate_input(input)?;
+        ensure!(!document.source.historical, "historical plan revisions are read-only");
+        let design = document.source.document.design.as_ref().context("plan questions require a declaration design")?;
+        let context = serde_json::to_string_pretty(&serde_json::json!({"document":design.document,"proposed":design.proposed}))?;
+        let mut question = Vec::new();
+        for annotation in document.annotation.annotation().iter().filter(|annotation|
+            annotation.kind == ReviewAnnotationKind::Question && annotation.reply.is_none() && !annotation.source.body.trim().is_empty()) {
+            let resolved = super::resolve_annotations(&document.source.rendered, vec![annotation.source.clone()])?;
+            let excerpt = super::render_review_feedback(&document.source.document, &resolved)?;
+            let thread = super::review_annotation::thread_context(document.annotation.annotation(), annotation);
+            let prompt = format!("Saved declaration design:\n{context}\n\nPlan review question and source context:\n{excerpt}\n\nConversation thread:\n{thread}Answer this question:\n{}", annotation.source.body);
+            ensure!(prompt.len() <= 8 * 1024 * 1024, "plan question context exceeds 8 MiB");
+            question.push(PlanReviewQuestion { id:annotation.id.clone(), body:annotation.source.body.clone(), prompt });
+        }
+        Ok(question)
+    }
+
+    /// Persist an answer only while its original question and source snapshot remain current.
+    pub(crate) fn answer(&self, id: &DocumentId, question: &PlanReviewQuestion, body: String, duration_ms: u64) -> Result<Vec<ReviewAnnotation>> {
+        let mut store = self.document.lock().map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store.get_mut(id).context("plan review document is closed")?;
+        admission.check()?;
+        let mut annotation = document.annotation.annotation().to_vec();
+        let selected = annotation.iter_mut().find(|annotation| annotation.id == question.id
+            && annotation.kind == ReviewAnnotationKind::Question && annotation.source.body == question.body)
+            .context("plan question changed before its answer arrived")?;
+        selected.reply = Some(ReviewQuestionReply { question_body:question.body.clone(), body, duration_ms: Some(duration_ms) });
+        document.annotation.replace(annotation.clone())?;
+        Ok(annotation)
+    }
+
+    /// Return persisted comments and answers independently of the visible source filter.
+    pub(crate) fn annotations(&self, id: &DocumentId) -> Result<Vec<ReviewAnnotation>> {
+        let store = self.document.lock().map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store.get(id).context("plan review document is closed")?;
+        admission.check()?;
+        Ok(document.annotation.annotation().to_vec())
     }
 
     pub(crate) fn admit(&self, id: DocumentId) -> Result<DocumentAdmission> {
@@ -732,8 +797,8 @@ impl PlanReviewDocument {
         };
         let mut annotation =
             ReviewAnnotationStore::open(annotation_path, source.saved_digest.clone())?;
-        if let Some(saved) = &source.saved_navigation {
-            annotation.reanchor(saved, &source.rendered.navigation)?;
+        if source.saved_navigation.is_some() {
+            annotation.reanchor(&source.rendered.navigation)?;
         }
         let (block, target) = super::review_projection::project(
             &source,
@@ -925,6 +990,94 @@ impl PlanReviewDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn questions_preserve_design_and_persist_answers_bound_to_current_text() {
+        let temporary = tempfile::tempdir().unwrap();
+        let file = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Question the API.");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Expose shared state.".into();
+        design.document.description = "Use a focused state owner.".into();
+        design.proposed.insert("state.rs".into(), "/// Owns shared state.\npub struct State;\n".into());
+        canonical.design = Some(design);
+        file.write_working_document("session", "plan", &canonical).unwrap();
+        let (_, _, checksum) = file.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let source = file.capture_review_source("session", "plan", 1, &checksum).unwrap();
+        let source_path = source.path.with_extension("json");
+        let original = std::fs::read(&source_path).unwrap();
+        let digest = source.saved_digest.clone();
+        let id = DocumentId("questions".into());
+        let document = PlanReviewDocument::new(id.clone(), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
+        let anchor = document.source.rendered.navigation.anchor.iter().find(|anchor| matches!(&anchor.target, crate::plan::PlanReviewTarget::Declaration {..})).unwrap();
+        let line = anchor.line;
+        let snapshot = document.snapshot();
+        let target = snapshot.block[0].metadata.target[0].clone();
+        let mut input = DocumentInput { document:id.clone(), revision:snapshot.revision, view:ViewId("view".into()),
+            sequence:InputSequence(1), action:"plan.questions.answer".into(), block:snapshot.block[0].id.clone(),
+            position:target.range.start, target:Some(target.id) };
+        let store = PlanReviewStore::default();
+        let admission = store.admit(id.clone()).unwrap();
+        store.insert(document, admission).unwrap();
+        let mut question = ReviewAnnotation { parent_id: None, id:"question".into(), kind:ReviewAnnotationKind::Question, reply:None, anchor:None,
+            source:crate::plan::PlanAnnotationInput { start_line:line, end_line:line, body:"Why use this owner?".into() } };
+        let mut comment = question.clone();
+        comment.id = "comment".into();
+        comment.kind = ReviewAnnotationKind::Comment;
+        comment.source.body = "Keep this interface.".into();
+        store.save_annotations(&id, &digest, vec![question.clone(), comment.clone()]).unwrap();
+        let questions = store.questions(input.clone()).unwrap();
+        assert_eq!(questions.len(), 1);
+        assert!(questions[0].prompt.contains("pub struct State;") && questions[0].prompt.contains("Why use this owner?"));
+        let captured = store.answer(&id, &questions[0], "It isolates ownership.".into(), 3210).unwrap();
+        assert_eq!(captured[0].reply.as_ref().unwrap().body, "It isolates ownership.");
+        store.save_annotations(&id, &digest, vec![question.clone(), comment.clone()]).unwrap();
+        input.sequence = InputSequence(2);
+        assert!(store.questions(input.clone()).unwrap().is_empty(), "answered questions were submitted twice");
+        input.sequence = InputSequence(3);
+        let feedback = store.submission(input.clone()).unwrap();
+        assert_eq!(feedback["annotations"].as_array().unwrap().len(), 1, "questions became revision instructions");
+        assert_eq!(feedback["annotations"][0]["body"], "Keep this interface.");
+        let reopened = file.capture_review_source("session", "plan", 1, &checksum).unwrap();
+        let reopened = PlanReviewDocument::new(DocumentId("reopened".into()), ViewId("other".into()), reopened, WidthProfile::default(), None).unwrap();
+        assert_eq!(reopened.annotation.annotation()[0].reply.as_ref().unwrap().body, "It isolates ownership.");
+        assert_eq!(reopened.annotation.annotation()[0].reply.as_ref().unwrap().duration_ms, Some(3210));
+        let mut followup = question.clone();
+        followup.id = "followup".into();
+        followup.parent_id = Some(question.id.clone());
+        followup.source.body = "How can callers observe it?".into();
+        store.save_annotations(&id, &digest, vec![question.clone(), comment.clone(), followup.clone()]).unwrap();
+        input.sequence = InputSequence(4);
+        let followup_question = store.questions(input.clone()).unwrap();
+        assert_eq!(followup_question.len(), 1);
+        assert!(followup_question[0].prompt.contains("Why use this owner?")
+            && followup_question[0].prompt.contains("It isolates ownership.")
+            && followup_question[0].prompt.contains("pub struct State;"));
+        store.answer(&id, &followup_question[0], "Use a getter.".into(), 1000).unwrap();
+        let mut change = comment.clone();
+        change.id = "change".into();
+        change.parent_id = Some(followup.id.clone());
+        change.source.body = "Add that getter.".into();
+        store.save_annotations(&id, &digest, vec![question.clone(), comment.clone(), followup, change]).unwrap();
+        input.sequence = InputSequence(5);
+        let feedback = store.submission(input.clone()).unwrap();
+        let body = feedback["annotations"][1]["body"].as_str().unwrap();
+        for expected in ["Why use this owner?", "It isolates ownership.", "How can callers observe it?", "Use a getter.", "Add that getter."] {
+            assert!(body.contains(expected), "missing thread entry: {expected}");
+        }
+        assert!(!body.contains("Keep this interface."), "unrelated feedback entered the thread");
+        let reopened = file.capture_review_source("session", "plan", 1, &checksum).unwrap();
+        let reopened = PlanReviewDocument::new(DocumentId("thread-reopened".into()), ViewId("thread-view".into()), reopened, WidthProfile::default(), None).unwrap();
+        assert_eq!(reopened.annotation.annotation()[3].parent_id.as_deref(), Some("followup"));
+        assert_eq!(reopened.annotation.annotation()[2].reply.as_ref().unwrap().body, "Use a getter.");
+        question.source.body = "Why this interface?".into();
+        store.save_annotations(&id, &digest, vec![question.clone(), comment]).unwrap();
+        assert!(store.annotations(&id).unwrap()[0].reply.is_none(), "edited question retained a previous answer");
+        assert!(store.answer(&id, &questions[0], "Stale answer.".into(), 0).is_err());
+        input.sequence = InputSequence(6);
+        assert_eq!(store.questions(input).unwrap()[0].body, question.source.body);
+        assert_eq!(std::fs::read(source_path).unwrap(), original, "answering changed the declaration artifact");
+    }
     use crate::plan::PlanFileStore;
 
     #[test]
@@ -946,6 +1099,9 @@ mod tests {
                 .unwrap();
         annotation
             .replace(vec![ReviewAnnotation {
+                parent_id: None,
+                kind: Default::default(),
+                reply: None,
                 anchor: None,
                 id: "original-comment".into(),
                 source: crate::plan::PlanAnnotationInput {
@@ -1549,6 +1705,9 @@ mod tests {
         let admission = store.admit(document_id.clone()).unwrap();
         store.insert(document, admission).unwrap();
         let annotation = ReviewAnnotation {
+                parent_id: None,
+                kind: Default::default(),
+                reply: None,
             id: "local-comment".into(),
             anchor: None,
             source: super::super::PlanAnnotationInput {

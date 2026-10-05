@@ -209,13 +209,13 @@ local function refresh_winbar(review)
   local plan = review.plan
   local detail = plan.historical_revision and ("Revision " .. plan.historical_revision .. " • historical • read-only")
     or plan.state == "accepted" and "Accepted plan • read-only projection • C adds comments"
-    or "Awaiting review • read-only projection • C adds comments"
+    or "Awaiting review • C comment • A question • Ctrl-S save / ask"
   detail = detail .. " • Showing: " .. (review.public_only and "Public" or "All")
   keymaps.apply_view_winbar(review.win, "PlanReview", "plan_review", review.command_set, detail)
 end
 
 local function action(review, name)
-  if review.plan.historical_revision and (name == "comment" or name == "delete") then return end
+  if review.plan.historical_revision and (name == "comment" or name == "question" or name == "delete") then return end
   local opening_cursor = vim.api.nvim_win_get_cursor(review.win)
   review.owner.action(name, function(result, failure, captured)
     if name == "jump_entity" and (not review.owner.is_current(captured)
@@ -227,7 +227,7 @@ local function action(review, name)
       review.public_only = result.public_only
       review.owner.public_only = result.public_only
       refresh_winbar(review)
-    elseif name == "comment" then
+    elseif name == "comment" or name == "question" then
       if result.local_draft then
         vim.cmd("silent! normal! zv")
         vim.cmd("startinsert")
@@ -290,7 +290,8 @@ local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review) end)
   command_set.register(set, "visual_line_with_gutter", review.owner.gutter_selection.start)
-  for _, name in ipairs({ "open", "jump_entity", "entity_info", "schema", "comment", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({ "open", "jump_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
+  command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
   command_set.register(set, "abort_plan", function()
     if not review.plan.historical_revision and session.harness.active_plan

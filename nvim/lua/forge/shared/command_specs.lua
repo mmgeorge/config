@@ -127,6 +127,8 @@ M.view_specs = {
     { id = "toggle", label = "fold", desc = "Toggle the current declaration diff file or hunk", modes = "n", pinned = true },
     { id = "open", label = "open", desc = "Open the declaration snapshot for this diff line", modes = "n", pinned = true },
     { id = "comment", label = "comment", desc = "Annotate the current plan line or selection", modes = { "n", "x" }, visual = true, pinned = true },
+    { id = "question", label = "ask", desc = "Ask about the current plan line or selection", modes = { "n", "x" }, visual = true, pinned = true },
+    { id = "save", label = "save / ask", desc = "Save feedback and answer new plan questions", modes = { "n", "i" }, pinned = true },
     { id = "delete", label = "delete", desc = "Delete the plan comment under the cursor", modes = "n", pinned = true },
     { id = "accept", label = "accept", desc = "Approve the exact saved declaration design", modes = "n", pinned = true },
     { id = "request_changes", label = "changes", desc = "Request a semantic revision from review comments", modes = "n", pinned = true },

@@ -40,7 +40,7 @@ function M.attach(options, callback)
       local position = vim.api.nvim_win_get_cursor(view.window)
       local editable = false
       for _, range in ipairs(owner.comment_state.range_list) do
-        if not range.compact then
+        if not range.compact and not range.readonly then
           local header = vim.api.nvim_buf_get_extmark_by_id(options.buffer, owner.comment_state.namespace, range.header_mark, {})
           local footer = vim.api.nvim_buf_get_extmark_by_id(options.buffer, owner.comment_state.namespace, range.footer_mark, {})
           editable = editable or #header == 2 and #footer == 2 and position[1] - 1 > header[1] and position[1] - 1 < footer[1]
@@ -70,6 +70,28 @@ function M.attach(options, callback)
     return true
   end
   local dispatch_operation
+  owner.reply_by_id = {}
+  owner.pending_reply_by_id = {}
+  local function show_answers(annotation)
+    local updates = {}
+    for _, item in ipairs(annotation or {}) do
+      if item.kind == "question" then
+        local id = tostring(item.id)
+        local reply = item.reply ~= vim.NIL and item.reply or nil
+        reply = reply or owner.reply_by_id[id]
+        if reply and reply.question_body ~= item.source.body then reply = nil end
+        owner.reply_by_id[id] = reply
+        local pending = owner.pending_reply_by_id[id]
+        local duration_ms = reply and tonumber(reply.duration_ms)
+        local seconds = duration_ms and math.floor(duration_ms / 1000)
+        local heading = seconds and ("Thought for %d %s"):format(seconds, seconds == 1 and "second" or "seconds") or "Answered"
+        updates[#updates + 1] = reply and { id = item.id, replies_body = reply.question_body,
+          replies = { { heading = heading, body_lines = vim.split(reply.body, "\n", { plain = true }) } } }
+          or pending and pending.replies_body == item.source.body and pending or { id = item.id, replies = {} }
+      end
+    end
+    if #updates > 0 then comments.update(options.buffer, updates) end
+  end
   local function enqueue_operation(operation)
     if owner.saving or owner.submission_pending or owner.completing then
       local previous = owner.pending_operation
@@ -103,8 +125,34 @@ function M.attach(options, callback)
       end)
     else
       owner.saving = true
-      request({ operation = "plan_save_annotations", document = owner.document,
-        saved_source_digest = owner.saved_source_digest, annotation = operation.capture }, complete)
+      local pending = {}
+      for _, annotation in ipairs(operation.capture) do
+        local reply = owner.reply_by_id[tostring(annotation.id)]
+        if annotation.kind == "question" and vim.trim(annotation.source.body) ~= ""
+          and (not reply or reply.question_body ~= annotation.source.body) then
+          pending[#pending + 1] = { id = annotation.id, replies_body = annotation.source.body,
+            replies = { { heading = "Plan answer", body_lines = { "Answering…" } } } }
+        end
+      end
+      if #pending == 0 then
+        request({ operation = "plan_save_annotations", document = owner.document,
+          saved_source_digest = owner.saved_source_digest, annotation = operation.capture }, complete)
+      else
+        local captured, failure = input.capture(owner.replica, owner.current_view(), "plan.questions.answer")
+        if not captured then complete(nil, failure) return end
+        for _, update in ipairs(pending) do owner.pending_reply_by_id[tostring(update.id)] = update end
+        comments.update(options.buffer, pending)
+        client.request_for(options.session_id, "plan.questions.answer", { review = captured,
+          draft_source_digest = owner.saved_source_digest, draft_annotation = operation.capture }, function(result, error)
+          if not alive() then complete(nil, "Plan host is unavailable. The local draft remains in its buffer.") return end
+          for _, update in ipairs(pending) do owner.pending_reply_by_id[tostring(update.id)] = nil end
+          if error then
+            for _, update in ipairs(pending) do update.replies = {} end
+            comments.update(options.buffer, pending)
+          else show_answers(result.annotation) end
+          complete(result, error)
+        end)
+      end
     end
   end
   function owner.submit(method, params, receive)
@@ -127,13 +175,14 @@ function M.attach(options, callback)
     local captured = options.recovery and options.recovery.annotation or opened.annotation or {}
     local baseline = {}
     for _, item in ipairs(opened.annotation or {}) do
-      baseline[#baseline + 1] = { id = tostring(item.id), source = vim.deepcopy(item.source) }
+      baseline[#baseline + 1] = { id = tostring(item.id), kind = item.kind, parent_id = item.parent_id, source = vim.deepcopy(item.source) }
     end
     options.recovery = nil
     local annotation = {}
     for _, item in ipairs(captured) do
       annotation[#annotation + 1] = { id = item.id, source_line = item.source.start_line,
-        end_source_line = item.source.end_line, body = item.source.body }
+        end_source_line = item.source.end_line, body = item.source.body, kind = item.kind, parent_id = item.parent_id,
+        heading = item.kind == "question" and "Plan question" or nil }
     end
     local source = assert(opened.source_row, "Plan review source rows are missing")
     owner.source = source
@@ -178,6 +227,7 @@ function M.attach(options, callback)
     })
     require("forge.draft_source").attach(owner.replica, owner.comment_state, source)
     projection_attached = true
+    show_answers(opened.annotation)
   end
   owner.replica = buffer.open(owner.document, { buffer = options.buffer, generated = true, preserve_view = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice })
@@ -252,7 +302,11 @@ function M.attach(options, callback)
   end
   function owner.action(action, receive)
     if not owner.attached() then return false end
-    if action == "comment" then comments.add_at_cursor(options.buffer, false) receive({ local_draft = true }, nil) return true end
+    if action == "comment" or action == "question" then
+      comments.add_at_cursor(options.buffer, false, { kind = action == "question" and "question" or nil,
+        heading = action == "question" and "Plan question" or nil })
+      receive({ local_draft = true }, nil) return true
+    end
     if action == "delete" then comments.delete_at_cursor(options.buffer) receive({}, nil) return true end
     if action == "toggle_public" and vim.bo[options.buffer].modified then
       if options.notice then options.notice("Save plan annotations before changing the source projection") end

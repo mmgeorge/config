@@ -13,6 +13,10 @@ pub enum TextGeneration {
 }
 
 impl TextGeneration {
+    /// Identify isolated provider requests in diagnostic logs.
+    pub(crate) fn name(self) -> &'static str {
+        match self { Self::Recap => "recap", Self::SessionName => "session_name" }
+    }
     /// Supply the task-specific instruction without inheriting main-thread instructions.
     pub(crate) fn instructions(self) -> &'static str {
         match self {
@@ -27,7 +31,7 @@ impl TextGeneration {
 
     /// Reject output that does not fit the requested presentation surface.
     pub(crate) fn validate(self, text: &str) -> Result<String> {
-        if self == Self::Recap {
+        if self != Self::SessionName {
             return validate(text);
         }
         let text = text.trim().trim_matches(['"', '\'']).trim();

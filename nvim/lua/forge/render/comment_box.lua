@@ -9,6 +9,7 @@ local display_text = require("forge.render.display_text")
 ---@field body_lines string[] newline-split body, never empty
 ---@field stale_note string? optional dim note appended below the body
 ---@field replies { heading: string, body_lines: string[] }[]? read-only reply sub-rows
+---@field continuation boolean? Share the preceding message's bottom border as an internal divider.
 
 ---@class ForgeCommentDescriptor : ForgeCommentBoxContent
 ---@field id string? stable identity; drives focus dispatch (required for editable surfaces)
@@ -57,7 +58,7 @@ M.wrap_text = display_text.wrap
 ---@param desc ForgeCommentBoxContent Comment heading, body, and reply metadata.
 ---@param win_width integer Total available window column width.
 ---@param style ForgeCommentBoxStyle? Optional custom highlight group styling.
----@return table[] box_lines Array of row segment arrays for status buffer rendering.
+---@return table[] box_lines Array of row segment arrays with an optional zero-based reply_start_row for readonly thread hit testing.
 function M.build_box_lines(desc, win_width, style)
   style = style or M.default_style
   local inner_width = math.max(4, math.min(M.box_max_inner_width, (tonumber(win_width) or 80) - 8))
@@ -68,7 +69,11 @@ function M.build_box_lines(desc, win_width, style)
   for _, line in ipairs(display_text.wrap(table.concat(desc.body_lines or {}, "\n"), content_width)) do
     content[#content + 1] = { text = line, hl = style.body }
   end
+  local reply_content_start
+  local reply_start_list = {}
   for _, reply in ipairs(desc.replies or {}) do
+    reply_content_start = reply_content_start or #content + 1
+    reply_start_list[#reply_start_list + 1] = #content + 1
     if reply.heading and reply.heading ~= "" then
       content[#content + 1] = {
         text = " " .. truncate_display(vim.trim(reply.heading), math.max(1, inner_width - 5)) .. " ",
@@ -93,10 +98,10 @@ function M.build_box_lines(desc, win_width, style)
   local pad = "  "
   local box_lines = {}
   box_lines[#box_lines + 1] = {
-    { pad .. "╭─", style.border },
+    { pad .. (desc.continuation and "├─" or "╭─"), style.border },
     { heading, style.heading },
     { ("─"):rep(math.max(inner_width - heading_width - 2, 0)), style.border },
-    { "─╮", style.border },
+    { desc.continuation and "─┤" or "─╮", style.border },
   }
   for _, row in ipairs(content) do
     if row.divider then
@@ -117,6 +122,8 @@ function M.build_box_lines(desc, win_width, style)
     end
   end
   box_lines[#box_lines + 1] = { { pad .. "╰" .. ("─"):rep(inner_width) .. "╯", style.border } }
+  box_lines.reply_start_row = reply_content_start
+  box_lines.reply_start_list = reply_start_list
   return box_lines
 end
 

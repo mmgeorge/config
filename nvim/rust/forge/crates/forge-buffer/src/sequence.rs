@@ -791,7 +791,7 @@ mod tests {
         owner.metadata.fold.push(FoldRange {
             collapsed_suffix: None,
             heading_start: Some(BlockAnchor { block: BlockId("block-1".into()), position: TextPosition { row: 0, column: 0 } }),
-            collapse_children: false,
+            collapse_children: false, expand_children: false,
             id: FoldId("task".into()),
             start: TextPosition { row: 0, column: 0 },
             end: BlockAnchor { block: BlockId("block-3".into()), position: TextPosition { row: 1, column: 0 } },
@@ -811,7 +811,7 @@ mod tests {
         first.metadata.fold.push(FoldRange {
             collapsed_suffix: None,
             heading_start: None,
-            collapse_children: false,
+            collapse_children: false, expand_children: false,
             id: FoldId("section".into()),
             start: TextPosition { row: 0, column: 0 },
             end: BlockAnchor {

@@ -72,18 +72,13 @@ impl DeclarationDelta {
                 &mut patch,
             )?;
         }
-        let before_document = previous
-            .map(|design| serde_json::to_string_pretty(&design.document))
-            .transpose()?;
-        let after_document = serde_json::to_string_pretty(&design.document)?;
         let mut document = Vec::new();
-        write_file(
-            "plan.json",
-            "plan.json",
-            before_document.as_deref(),
-            Some(&after_document),
-            &mut document,
-        )?;
+        for (section, before, after) in [
+            ("Task", previous.map(|design| design.document.task.as_str()), design.document.task.as_str()),
+            ("Description", previous.map(|design| design.document.description.as_str()), design.document.description.as_str()),
+        ] {
+            write_file(section, section, before, Some(after), &mut document)?;
+        }
         Ok(Self {
             files: String::from_utf8(patch)?,
             document: String::from_utf8(document)?,
@@ -133,10 +128,7 @@ fn write_file(
             } else {
                 "/dev/null"
             },
-            before
-                .map(str::len)
-                .unwrap_or(0)
-                .max(after.map(str::len).unwrap_or(0)),
+            3,
             patch,
         )?;
     }
@@ -147,6 +139,21 @@ fn write_file(
 mod tests {
     use super::*;
     use forge_diff::patch::UnifiedPatch;
+
+    #[test]
+    fn declaration_changes_bound_context_and_separate_distant_edits() {
+        let before = (1..=60).map(|line| format!("pub struct Item{line};\n")).collect::<String>();
+        let after = before.replace("Item11;", "Changed11;").replace("Item41;", "Changed41;");
+        let mut output = Vec::new();
+        write_file("lib.rs", "lib.rs", Some(&before), Some(&after), &mut output).unwrap();
+        let text = String::from_utf8(output).unwrap();
+        let patch = UnifiedPatch::parse(&text).unwrap();
+        assert_eq!(patch.file[0].hunk.len(), 2);
+        assert_eq!(patch.file[0].hunk[0].header, "@@ -8,7 +8,7 @@");
+        assert_eq!(patch.file[0].hunk[1].header, "@@ -38,7 +38,7 @@");
+        assert!(patch.file[0].hunk.iter().all(|hunk| hunk.row.len() == 8));
+        assert!(!text.contains("Item1;") && !text.contains("Item60;"));
+    }
 
     #[test]
     fn revision_delta_compares_proposals_and_keeps_document_changes_separate() {
@@ -209,8 +216,32 @@ mod tests {
             delta.document.contains("Previous description")
                 && delta.document.contains("Revised description")
         );
+        let overview = UnifiedPatch::parse(&delta.document).unwrap();
+        assert_eq!(overview.file.len(), 1);
+        assert_eq!(overview.file[0].new_path.as_deref(), Some("Description"));
+        assert!(!delta.document.contains("plan.json") && !delta.document.contains("\"description\""));
         let unchanged = DeclarationDelta::between(Some(&current), &current).unwrap();
         assert!(unchanged.files.is_empty() && unchanged.document.is_empty());
+    }
+
+    #[test]
+    fn overview_deltas_preserve_plain_paragraphs_and_separate_changed_sections() {
+        let mut previous = super::super::document::test_fixture("overview", "Overview");
+        let mut design = DeclarationDesign::default();
+        design.document.task = "Original task.".into();
+        design.document.description = "First paragraph.\n\nOriginal second paragraph.".into();
+        previous.design = Some(design);
+        let mut current = previous.clone();
+        let design = current.design.as_mut().unwrap();
+        design.document.task = "Revised task.".into();
+        design.document.description = "First paragraph.\n\nRevised `State` paragraph.".into();
+        let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
+        let patch = UnifiedPatch::parse(&delta.document).unwrap();
+        assert_eq!(patch.file.len(), 2);
+        assert_eq!(patch.file[0].new_path.as_deref(), Some("Task"));
+        assert_eq!(patch.file[1].new_path.as_deref(), Some("Description"));
+        assert!(delta.document.contains("-Original second paragraph.") && delta.document.contains("+Revised `State` paragraph."));
+        assert!(!delta.document.contains("\\n") && !delta.document.contains("\"task\""));
     }
 
     #[test]
