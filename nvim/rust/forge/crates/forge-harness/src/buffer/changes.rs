@@ -21,6 +21,18 @@ pub(super) struct ChangeTree {
     pub bytes: usize,
 }
 
+fn file_action(path: &str, line: usize, previous: bool, declaration: Option<(&crate::exchange::DeclarationRevision, bool)>) -> TranscriptAction {
+    match declaration {
+        Some((declaration, document)) => TranscriptAction::Declaration {
+            plan_id: declaration.plan_id.clone(),
+            revision: if previous && declaration.revision > 1 { declaration.revision - 1 } else { declaration.revision },
+            baseline: previous && declaration.revision == 1,
+            path: path.into(), line, document,
+        },
+        None => TranscriptAction::File { path: path.into(), line },
+    }
+}
+
 impl ChangeTree {
     /// Retain file and hunk rows under stable folds while preserving the raw patch action.
     pub fn render(
@@ -30,6 +42,7 @@ impl ChangeTree {
         suffix: &str,
         text: &str,
         file_label: Option<(&str, &str)>,
+        declaration: Option<(&crate::exchange::DeclarationRevision, bool)>,
     ) -> Result<Self> {
         let mut tree = Self {
             block: Vec::new(),
@@ -119,11 +132,10 @@ impl ChangeTree {
             if let Some(path) = &file.new_path {
                 tree.push_action(
                     heading,
-                    TranscriptAction::File {
-                        path: path.clone(),
-                        line: 1,
-                    },
+                    file_action(path, 1, false, declaration),
                 )?;
+            } else if declaration.is_some() {
+                tree.push_action(heading, file_action(path, 1, true, declaration))?;
             } else {
                 tree.push(heading)?;
             }
@@ -177,7 +189,12 @@ impl ChangeTree {
                             &emphasis[batch_index * 128 + row_index],
                             0,
                         )?;
-                        if let (Some(path), Some(line)) = (&file.new_path, row.new_line) {
+                        let location = if let (Some(path), Some(line)) = (&file.new_path, row.new_line) {
+                            Some((path, line, false))
+                        } else if declaration.is_some() {
+                            file.old_path.as_ref().zip(row.old_line).map(|(path, line)| (path, line, true))
+                        } else { None };
+                        if let Some((path, line, baseline)) = location {
                             let target = TargetId(format!("{}:row:{row_index}", block.id.0));
                             block.metadata.target.push(TargetRange {
                                 id: target.clone(),
@@ -194,10 +211,7 @@ impl ChangeTree {
                             });
                             tree.add_action(
                                 target,
-                                TranscriptAction::File {
-                                    path: path.clone(),
-                                    line: line + 1,
-                                },
+                                file_action(path, line + 1, baseline, declaration),
                             )?;
                         }
                     }
@@ -225,6 +239,7 @@ impl ChangeTree {
         let bytes = match &action {
             TranscriptAction::Diff { text } => text.len(),
             TranscriptAction::File { path, .. } => path.len(),
+            TranscriptAction::Declaration { path, plan_id, .. } => path.len() + plan_id.len(),
             _ => 512,
         };
         self.reserve(bytes + target.0.len() + 128)?;
@@ -322,7 +337,7 @@ mod tests {
             };
             let renderer = TranscriptRenderer::new(&width).unwrap();
             let tree =
-                ChangeTree::render(&renderer, "changes", "Changed", "", &diff, None).unwrap();
+                ChangeTree::render(&renderer, "changes", "Changed", "", &diff, None, None).unwrap();
             let header = &tree.block[1];
             assert_eq!(header.text.row_count(), 1);
             assert_eq!(
@@ -359,6 +374,7 @@ mod tests {
             "Changed",
             " · checkpoint matched",
             diff,
+            None,
             None,
         )
         .unwrap();
@@ -433,7 +449,7 @@ mod tests {
         let renderer = TranscriptRenderer::new(&width).unwrap();
         let source = "--- a/file\n+++ b/file\n@@ -1 +1 @@\n-old\n";
         let tree =
-            ChangeTree::render(&renderer, "bad:changes", "Changed", "", source, None).unwrap();
+            ChangeTree::render(&renderer, "bad:changes", "Changed", "", source, None, None).unwrap();
         assert!(
             tree.block[0]
                 .text
@@ -457,7 +473,7 @@ mod tests {
             "+line\n".repeat(300)
         );
         let tree =
-            ChangeTree::render(&renderer, "large:changes", "Changed", "", &source, None).unwrap();
+            ChangeTree::render(&renderer, "large:changes", "Changed", "", &source, None, None).unwrap();
         let rows = tree
             .block
             .iter()
@@ -491,6 +507,7 @@ mod tests {
             "Changed",
             "",
             &source,
+            None,
             None,
         )
         .unwrap();
@@ -536,4 +553,23 @@ fn metadata_capacity_cannot_bypass_saved_change_tree_admission() {
     assert!(tree.push(block).unwrap_err().to_string().contains("24 MiB"));
     assert!(tree.block.is_empty());
     assert_eq!(tree.bytes, 0);
+}
+
+#[test]
+fn declaration_changes_navigate_immutable_sides_including_removed_rows() {
+    let width = forge_buffer::width::WidthProfile::default();
+    let renderer = TranscriptRenderer::new(&width).unwrap();
+    let diff = "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub struct Before;\n+pub struct After;\ndiff --git a/gone.rs b/gone.rs\ndeleted file mode 100644\n--- a/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-pub struct Gone;\n";
+    for revision in [1, 3] {
+        let declaration = crate::exchange::DeclarationRevision { plan_id: "plan".into(), revision, document_diff: String::new() };
+        let tree = ChangeTree::render(&renderer, "declaration", "Proposed changes", "", diff, None, Some((&declaration, false))).unwrap();
+        assert_eq!(tree.block[0].text.row(0), Some("▸ Proposed changes 2 files +1 -2"));
+        assert!(!tree.action.values().any(|action| matches!(action, TranscriptAction::File { .. })));
+        assert!(tree.action.values().any(|action| matches!(action,
+            TranscriptAction::Declaration { path, revision: target, baseline, line: 1, .. }
+                if path == "gone.rs" && *target == if revision == 1 { 1 } else { 2 } && *baseline == (revision == 1))));
+        assert!(tree.action.values().any(|action| matches!(action,
+            TranscriptAction::Declaration { path, revision: target, baseline: false, .. }
+                if path == "lib.rs" && *target == revision)));
+    }
 }

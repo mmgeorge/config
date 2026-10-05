@@ -35,6 +35,14 @@ pub enum TranscriptAction {
         path: String,
         line: usize,
     },
+    Declaration {
+        plan_id: String,
+        revision: u32,
+        path: String,
+        baseline: bool,
+        document: bool,
+        line: usize,
+    },
     Plan {
         plan_id: String,
         revision: Option<u32>,
@@ -643,6 +651,7 @@ impl TimelineRenderer<'_> {
                     ""
                 },
                 None,
+                None,
             )?;
         }
         if !interaction.attributed_matches_checkpoint {
@@ -652,6 +661,7 @@ impl TimelineRenderer<'_> {
                     "Checkpoint total:",
                     diff,
                     "",
+                    None,
                     None,
                 )?;
             }
@@ -785,6 +795,7 @@ impl TimelineRenderer<'_> {
                                             &diff,
                                             "",
                                             None,
+                                            None,
                                         )?;
                                         self.offset_layout(diff_start, 2);
                                     }
@@ -876,6 +887,12 @@ impl TimelineRenderer<'_> {
                     }
                 }
                 ExchangeNode::ArtifactChange { change } => {
+                    if let Some(declaration) = &change.declaration {
+                        self.diff(&change.id, "Proposed changes", &change.diff_text, "", None, Some((declaration, false)))?;
+                        self.diff(&format!("{}:document", change.id), "Plan overview", &declaration.document_diff, "",
+                            Some(("plan.json", "Task and Description")), Some((declaration, true)))?;
+                        continue;
+                    }
                     let label = visible
                         .iter()
                         .skip(position + 1)
@@ -904,6 +921,7 @@ impl TimelineRenderer<'_> {
                         &change.diff_text,
                         "",
                         label.as_deref().map(|label| (change.path.as_str(), label)),
+                        None,
                     )?
                 }
             }
@@ -1026,6 +1044,7 @@ impl TimelineRenderer<'_> {
         text: &str,
         suffix: &str,
         file_label: Option<(&str, &str)>,
+        declaration: Option<(&crate::exchange::DeclarationRevision, bool)>,
     ) -> Result<()> {
         if text.is_empty() {
             return Ok(());
@@ -1042,6 +1061,7 @@ impl TimelineRenderer<'_> {
             suffix,
             text,
             file_label,
+            declaration,
         )?;
         self.bytes += tree.bytes;
         self.action.extend(tree.action);
@@ -2021,6 +2041,7 @@ mod tests {
                 .push(crate::exchange::ExchangeNode::ArtifactChange {
                     change: crate::exchange::ArtifactChange {
                         id: format!("artifact-{revision}"),
+                        declaration: None,
                         path: path.into(),
                         created_at_ms: revision,
                         diff_text: format!("--- {path}\n+++ {path}\n@@ -1 +1 @@\n-old\n+new\n"),
@@ -2078,6 +2099,36 @@ mod tests {
             super::TranscriptAction::File { path: target, line:1 } if target == path)));
         assert!(projected.action.values().any(|action| matches!(action,
             super::TranscriptAction::Diff { text } if text.contains(path))));
+    }
+
+    #[test]
+    fn declaration_revision_projects_file_deltas_and_overview_as_separate_trees() {
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"revision", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Request plan changes", "kind":"plan_revision", "state":"running",
+            "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[]
+        })).unwrap();
+        exchange.node_list.push(crate::exchange::ExchangeNode::ArtifactChange {
+            change: crate::exchange::ArtifactChange {
+                id: "artifact".into(), path: "working.md".into(), created_at_ms: 1,
+                diff_text: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub struct Old;\n+pub struct New;\n".into(),
+                declaration: Some(crate::exchange::DeclarationRevision {
+                    plan_id: "plan".into(), revision: 3,
+                    document_diff: "--- a/plan.json\n+++ b/plan.json\n@@ -1 +1 @@\n-old overview\n+new overview\n".into(),
+                }),
+            },
+        });
+        let projected = project_at(&TimelineEntry::Exchange {
+            id: exchange.id.clone(), created_at_ms: 0, exchange, agent_by_id: HashMap::new(),
+        }, &WidthProfile::default(), 10).unwrap();
+        let text = projected.entry.block.iter().flat_map(|block|
+            (0..block.text.row_count()).map(|row| block.text.row(row).unwrap())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Proposed changes 1 file +1 -1"));
+        assert!(text.contains("Modified src/lib.rs +1 -1"));
+        assert!(text.contains("Modified Task and Description +1 -1"));
+        assert!(!text.contains("Artifact:") && !text.contains("working.md"));
+        assert!(projected.action.values().any(|action| matches!(action,
+            super::TranscriptAction::Declaration { path, revision: 3, document: true, .. } if path == "plan.json")));
     }
 
     #[test]

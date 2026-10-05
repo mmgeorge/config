@@ -1157,6 +1157,25 @@ function M.open_timeline_entry()
     elseif action.kind == "session" then session_navigation.open_parent(action.session_id)
     elseif action.kind == "agent" then M.select_agent(action.run_id)
     elseif action.kind == "url" then vim.ui.open(action.url)
+    elseif action.kind == "declaration" then
+      client.request_for(state.session.id, "plan.declaration", action, function(snapshot, failure)
+        if failure then notifications.error(failure, "Plan declaration") return end
+        vim.cmd("tabnew")
+        local declaration_buffer = vim.api.nvim_get_current_buf()
+        vim.api.nvim_buf_set_name(declaration_buffer, ("PlanDeclaration://%s/%d/%s/%s"):format(
+          action.plan_id, action.revision, action.baseline and "baseline" or "proposed", action.path)
+          .. "#" .. declaration_buffer)
+        vim.api.nvim_buf_set_lines(declaration_buffer, 0, -1, false, vim.split(snapshot.text, "\n", { plain = true }))
+        vim.bo[declaration_buffer].buftype = "nofile"
+        vim.bo[declaration_buffer].bufhidden = "wipe"
+        vim.bo[declaration_buffer].swapfile = false
+        vim.bo[declaration_buffer].filetype = vim.filetype.match({ filename = action.path }) or ""
+        vim.bo[declaration_buffer].modifiable = false
+        vim.bo[declaration_buffer].readonly = true
+        vim.wo.winbar = ("Plan declaration • revision %d • %s"):format(action.revision, action.path)
+        vim.api.nvim_win_set_cursor(0, { math.max(1, math.min(action.line or 1, vim.api.nvim_buf_line_count(0))), 0 })
+        vim.keymap.set("n", "q", "<Cmd>tabclose<CR>", { buffer = declaration_buffer, silent = true })
+      end)
     elseif action.kind == "file" then
       local path = vim.fs.joinpath(state.session.workspace, action.path)
       if vim.fn.filereadable(path) ~= 1 then

@@ -2574,6 +2574,16 @@ submission is queued and return focus to Harness. The document owner retains the
 captured comments until the response arrives. Success releases the owner. Failure
 reopens the retained review without discarding unsaved feedback.
 
+Submitted declaration plans retain a file delta between consecutive proposed
+snapshots. The first submission compares source declarations with the proposal.
+The transcript renders these deltas through the shared change tree, independently
+of the Task and Description delta. PlanReview continues to compare source with
+the complete proposal. Transcript declaration targets retain the plan identity,
+submitted revision, path, and side. `plan.declaration` reads that immutable
+snapshot, and navigation opens a read-only declaration buffer. Removed rows open
+the previous proposal, or the source baseline on the first submission. Navigation
+never substitutes the current working-tree file for a saved declaration.
+
 ## 19. Physical buffer replica
 
 `forge/buffer.lua` owns the physical buffer, metadata namespace, applied revision,

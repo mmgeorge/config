@@ -1046,6 +1046,7 @@ mod test {
                 path: "plan.md".into(),
                 diff_text: "plan".into(),
                 created_at_ms: 20,
+                declaration: None,
             },
         });
 

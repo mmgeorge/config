@@ -79,6 +79,22 @@ local success, failure = xpcall(function()
   require("forge.views.harness.controller").submit()
   await(function() return not state.busy and state.active_plan end, "mock design did not arrive")
   local plan = state.active_plan
+  local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+  assert(transcript:find("Proposed changes", 1, true) and transcript:find("Modified src/change.rs", 1, true),
+    "submitted declaration plan did not expose individual file changes")
+  assert(transcript:find("Task and Description", 1, true) and not transcript:find("Artifact:", 1, true),
+    "declaration submission still displays the rendered artifact diff")
+  for _, baseline in ipairs({ false, true }) do
+    local declaration, declaration_failure
+    client.request_for(state.session.id, "plan.declaration", { plan_id = plan.id, revision = 1,
+      path = "src/change.rs", baseline = baseline }, function(result, failure)
+      declaration, declaration_failure = result, failure
+    end)
+    await(function() return declaration or declaration_failure end, "saved declaration read did not finish")
+    assert(not declaration_failure, declaration_failure)
+    assert(declaration.text:find(baseline and "pub struct Registry" or "pub fn reviewed_change();", 1, true),
+      "declaration navigation read the wrong submitted side")
+  end
   plan.validation_warning = { { path = "lib.rs", message = "review validation warning fixture" } }
   local artifact_path = plan.working_path:gsub("%.md$", ".json")
   local artifact = bytes(artifact_path)

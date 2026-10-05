@@ -19,6 +19,7 @@ pub use event::{ExchangeAnchor, ExchangePlanEvent, PlanEventContent};
 mod graph;
 mod prompt;
 mod render;
+pub(crate) mod revision;
 mod resolution;
 mod review_annotation;
 pub(crate) use review_annotation::resolve_annotations;

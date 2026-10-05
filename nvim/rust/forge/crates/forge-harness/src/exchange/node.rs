@@ -60,6 +60,16 @@ pub struct ArtifactChange {
     pub path: String,
     pub diff_text: String,
     pub created_at_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub declaration: Option<DeclarationRevision>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Identifies immutable declaration revisions and their separate task and description delta.
+pub struct DeclarationRevision {
+    pub plan_id: String,
+    pub revision: u32,
+    pub document_diff: String,
 }
 
 /// Retains one child-agent row at the position where the child first spawned.

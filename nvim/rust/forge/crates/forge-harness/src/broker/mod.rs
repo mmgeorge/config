@@ -1106,6 +1106,7 @@ impl HarnessBroker {
             HarnessMethod::PlanRequestChanges => self.request_plan_changes(params).await,
             HarnessMethod::PlanCancel => self.cancel_plan(),
             HarnessMethod::PlanActivate => self.activate_plan(params),
+            HarnessMethod::PlanDeclaration => self.read_plan_declaration(params),
             HarnessMethod::PlanList => self.list_replanning_choices(),
             HarnessMethod::PlanScopeDeviationReview => self.select_scope_deviation_review(params),
             HarnessMethod::PlanDeviationResolve => self.resolve_plan_deviation(params).await,
@@ -3401,18 +3402,8 @@ Planning continuation: turn {} of {}.",
                         Ok(report) => report.warning,
                         Err(error) => error.violation,
                     } };
-                let previous_markdown = if plan.model_revision == 0 {
-                    String::new()
-                } else {
-                    crate::plan::render_plan_at(
-                        &self.plan_file.read_submitted_document(
-                            &self.session.id,
-                            &plan.id,
-                            plan.model_revision,
-                        )?,
-                        Path::new(&self.session.workspace),
-                    )?
-                    .markdown
+                let previous_document = if plan.model_revision == 0 { None } else {
+                    Some(self.plan_file.read_submitted_document(&self.session.id, &plan.id, plan.model_revision)?)
                 };
                 let lifecycle_kind = if plan.model_revision == 0 {
                     PlanLifecycleKind::Created
@@ -3464,15 +3455,23 @@ Planning continuation: turn {} of {}.",
                             });
                     }
                 }
+                let (diff_text, declaration) = if document.design.is_some() {
+                    let delta = crate::plan::revision::DeclarationDelta::between(previous_document.as_ref(), &document)?;
+                    (delta.files, Some(crate::exchange::DeclarationRevision {
+                        plan_id: plan.id.clone(), revision: plan.model_revision, document_diff: delta.document,
+                    }))
+                } else {
+                    let previous_markdown = previous_document.as_ref().map(|document|
+                        crate::plan::render_plan_at(document, Path::new(&self.session.workspace)))
+                        .transpose()?.map(|rendered| rendered.markdown).unwrap_or_default();
+                    (crate::plan::render_plan_delta(&plan.working_path, &previous_markdown, &rendered.markdown), None)
+                };
                 interaction.node_list.push(ExchangeNode::ArtifactChange {
                     change: crate::exchange::ArtifactChange {
                         id: format!("{}:artifact:{}", interaction.id, plan.model_revision),
                         path: plan.working_path.clone(),
-                        diff_text: crate::plan::render_plan_delta(
-                            &plan.working_path,
-                            &previous_markdown,
-                            &rendered.markdown,
-                        ),
+                        diff_text,
+                        declaration,
                         created_at_ms: self.clock.now_ms(),
                     },
                 });
@@ -5182,6 +5181,25 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
         anyhow::ensure!(revision > 0 && revision <= plan.model_revision, "plan revision is unavailable");
         self.plan_file.capture_revision_source(&self.session.id, &plan.id, revision)
+    }
+
+    fn read_plan_declaration(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let plan_id = required_text(&params, "plan_id")?;
+        let path = required_text(&params, "path")?;
+        let revision: u32 = serde_json::from_value(params.get("revision").context("missing revision")?.clone())?;
+        let baseline = params.get("baseline").and_then(Value::as_bool).unwrap_or(false);
+        let plan = self.store.load_plan(&plan_id)?.context("plan artifact not found")?;
+        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
+        let document = self.plan_file.read_submitted_document(&self.session.id, &plan_id, revision)?;
+        let design = document.design.context("plan has no declaration snapshot")?;
+        let text = if params.get("document").and_then(Value::as_bool).unwrap_or(false) {
+            serde_json::to_string_pretty(&design.document)?
+        } else if baseline {
+            design.baseline.get(&path).context("declaration baseline not found")?.text.clone()
+        } else {
+            design.proposed.get(&path).context("proposed declaration not found")?.clone()
+        };
+        Ok((json!({ "text": text, "path": path, "revision": revision, "baseline": baseline }), Vec::new()))
     }
 
     fn activate_plan(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
