@@ -82,7 +82,7 @@ local success, failure = xpcall(function()
   local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(transcript:find("Proposed changes", 1, true) and transcript:find("Modified src/change.rs", 1, true),
     "submitted declaration plan did not expose individual file changes")
-  assert(transcript:find("Task and Description", 1, true) and not transcript:find("Artifact:", 1, true),
+  assert(transcript:find("Plan overview 2 sections", 1, true) and not transcript:find("Artifact:", 1, true),
     "declaration submission still displays the rendered artifact diff")
   for _, baseline in ipairs({ false, true }) do
     local declaration, declaration_failure
@@ -202,7 +202,13 @@ local success, failure = xpcall(function()
   end
   local function toggle(row)
     vim.api.nvim_win_set_cursor(review.win, { row, 0 })
+    local replica = review.owner.replica
+    local located = require("forge.buffer").locate(replica, row - 1, 0)
+    local node = located and replica.sequence.node[located.block]
+    local projected = node and #(node.entry.metadata.collapse or {}) > 0 and closed(row) == -1
+    local revision = replica.revision
     review.command_set.action_by_id.toggle.run({})
+    if projected then await(function() return replica.revision > revision end, "container toggle did not settle") end
   end
   assert(closed(description_row) == -1 and closed(changes_row) == -1, "plan sections did not start expanded")
   toggle(task_row)
@@ -275,9 +281,10 @@ local success, failure = xpcall(function()
   visibility_label(false)
   local movement_row = declaration_row("pub(crate) struct MovementInput")
   toggle(movement_row)
-  assert(closed(movement_row) == movement_row, "movement declaration did not fold")
+  assert(cursor_label():find("{...}", 1, true), "movement declaration did not collapse")
   jump_to_movement("ResMut<MovementInput>")
-  assert(closed(movement_row) == -1, "definition jump did not open the destination fold")
+  assert(cursor_label():find("{...}", 1, true), "definition jump lost the collapsed signature")
+  toggle(declaration_row("pub(crate) struct MovementInput"))
 
   local held_jump
   client.request_for = function(session_id, method, params, callback)
@@ -410,31 +417,30 @@ local success, failure = xpcall(function()
   assert(not phases.cargo_metadata, "cached dependency navigation invoked Cargo metadata")
   print("declaration.jump trace verified: " .. trace_status.path)
   local attribute_row = declaration_row("#[derive(Facet,")
-  assert(closed(enum_row) == enum_row, "Rust enum did not start collapsed")
+  assert(text(review.buf):find("pub enum ConfigError {...}", 1, true), "Rust enum did not start collapsed")
   toggle(attribute_row)
-  assert(closed(enum_row) == -1, "Tab did not open the default enum fold")
+  assert(text(review.buf):find("ArenaSize,", 1, true), "Tab did not open the default enum")
   public_key()
   await(function() return review.public_only == true end, "enum default test did not filter")
-  assert(closed(declaration_row("pub enum ConfigError")) == -1, "filtering reset an explicitly opened enum")
+  assert(text(review.buf):find("ArenaSize,", 1, true), "filtering reset an explicitly opened enum")
   public_key()
   await(function() return review.public_only == false end, "enum default test did not restore")
   enum_row = declaration_row("pub enum ConfigError")
   toggle(declaration_row("#[derive(Facet,"))
-  assert(closed(enum_row) == enum_row and closed(attribute_row) == -1,
-    "declaration fold hid attributes or left its body open")
-  local summary = vim.api.nvim_win_call(review.win, function() return vim.fn.foldtextresult(enum_row) end)
+  assert(not text(review.buf):find("ArenaSize,", 1, true) and closed(declaration_row("#[derive(Facet,")) == -1,
+    "declaration collapse hid attributes or left its body open")
+  local summary = vim.api.nvim_buf_get_lines(review.buf, enum_row - 1, enum_row, false)[1]
   assert(summary:find("pub enum ConfigError {...}", 1, true), "declaration fold summary is wrong: " .. summary)
   public_key()
   await(function() return review.public_only == true end, "fold test did not filter private declarations")
   enum_row = declaration_row("pub enum ConfigError")
-  assert(closed(enum_row) == enum_row, "public filtering lost declaration fold intent")
+  assert(text(review.buf):find("pub enum ConfigError {...}", 1, true), "public filtering lost declaration collapse intent")
   public_key()
   await(function() return review.public_only == false end, "fold test did not restore private declarations")
   enum_row = declaration_row("pub enum ConfigError")
-  assert(closed(enum_row) == enum_row, "full visibility lost declaration fold intent")
+  assert(text(review.buf):find("pub enum ConfigError {...}", 1, true), "full visibility lost declaration collapse intent")
   toggle(enum_row)
   assert(closed(declaration_row("ArenaSize,")) == -1, "opening declaration fold did not restore variants")
-  toggle(declaration_row("pub enum ConfigError"))
   vim.api.nvim_win_set_cursor(review.win, { declaration_row("ArenaSize,"), 0 })
   vim.api.nvim_win_call(review.win, function() vim.cmd("normal! zv") end)
   review.owner.action("comment", function(_, error_message) assert(not error_message, error_message) end)
@@ -449,8 +455,31 @@ local success, failure = xpcall(function()
   assert(closed(compact_enum_comment_row) == -1, "leaving the comment closed its explicitly opened enum")
   assert(require("forge.draft_comments").capture(review.buf)[1].source.body == "Keep the enum comment visible",
     "leaving the enum comment lost its draft")
+  vim.cmd("write")
+  await(function() return not vim.bo[review.buf].modified end, "enum comment did not save")
+  local enum_heading = declaration_row("pub enum ConfigError")
+  vim.api.nvim_win_call(review.win, function()
+    vim.fn.winrestview({ lnum = declaration_row("ArenaSize,"), col = 0, topline = math.max(1, enum_heading - 8) })
+  end)
+  local viewport_before = vim.api.nvim_win_call(review.win, vim.fn.winsaveview)
+  local redraw = vim.api.nvim__redraw
+  local intermediate_redraw = 0
+  vim.api.nvim__redraw = function(options)
+    intermediate_redraw = intermediate_redraw + 1
+    return redraw(options)
+  end
+  toggle(declaration_row("ArenaSize,"))
+  vim.api.nvim__redraw = redraw
+  assert(intermediate_redraw == 0, "collapse requested an intermediate redraw")
+  local viewport_after = vim.api.nvim_win_call(review.win, vim.fn.winsaveview)
+  assert(viewport_after.topline == viewport_before.topline, "collapsing to a visible header scrolled the viewport")
+  assert(not text(review.buf):find("Keep the enum comment visible", 1, true), "collapsed enum exposed its body comment")
+  toggle(declaration_row("pub enum ConfigError"))
+  compact_enum_comment_row = declaration_row("Keep the enum comment visible")
   vim.api.nvim_win_set_cursor(review.win, { compact_enum_comment_row, 0 })
   require("forge.draft_comments").delete_at_cursor(review.buf)
+  vim.cmd("write")
+  await(function() return not vim.bo[review.buf].modified end, "enum comment deletion did not save")
   vim.api.nvim_win_set_cursor(review.win, { declaration_row("pub fn new"), 18 })
   public_key()
   await(function() return review.public_only == true end, "cursor test did not hide private declarations")

@@ -270,14 +270,29 @@ function M.register(session)
   sessions[session.buffer] = session
 end
 
+---@class ForgeFoldToggleOptions
+---@field include_body? fun(id: string): boolean
+---@field on_toggled? fun(id: string, closed: boolean)
+---@field on_projected? fun()
+
 ---@param session table
 ---@param window integer
----@param options? { include_body?: fun(id: string): boolean, on_toggled?: fun(id: string, closed: boolean) }
+---@param options? ForgeFoldToggleOptions
 ---@return boolean
 function M.toggle_heading(session, window, options)
   if not session or session.status ~= "Applied" or not vim.api.nvim_win_is_valid(window)
     or vim.api.nvim_win_get_buf(window) ~= session.buffer then return false end
   local row = vim.api.nvim_win_get_cursor(window)[1]
+  if options and options.on_projected then
+    local located = require("forge.buffer").locate(session, row - 1, vim.api.nvim_win_get_cursor(window)[2])
+    local index = located and session.sequence:position(located.block)
+    local node = index and session.sequence:at(index)
+    if node and node.entry.metadata.collapse and #node.entry.metadata.collapse > 0
+      and vim.api.nvim_win_call(window, function() return vim.fn.foldclosed(row) == -1 end) then
+      options.on_projected()
+      return true
+    end
+  end
   local selected, selected_start, selected_finish
   for id, record in pairs(session.fold and session.fold.record or {}) do
     local start = fold_start(session, record)

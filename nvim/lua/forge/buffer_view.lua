@@ -1,5 +1,46 @@
 local M = {}
 
+---@class ForgeRetainedViewport
+---@field window integer
+---@field top? {block: string, position: {row: integer, column: integer}}
+---@field view table Native winsaveview state before the projection changes.
+
+---@param session table
+---@param window integer
+---@param destination {block: string, position: {row: integer, column: integer}}
+---@return ForgeRetainedViewport?
+function M.capture_viewport(session, window, destination)
+  local _, start = session.sequence:position(destination.block)
+  if not start then return nil end
+  local row = require("forge.buffer").physical_row(session, start + destination.position.row) + 1
+  return vim.api.nvim_win_call(window, function()
+    if row < vim.fn.line("w0") or row > vim.fn.line("w$") then return nil end
+    local view = vim.fn.winsaveview()
+    return { window = window, view = view,
+      top = require("forge.buffer").locate(session, view.topline - 1, 0) }
+  end)
+end
+
+---@param session table
+---@param retained ForgeRetainedViewport
+function M.restore_viewport(session, retained)
+  if not vim.api.nvim_win_is_valid(retained.window)
+    or vim.api.nvim_win_get_buf(retained.window) ~= session.buffer then return end
+  vim.api.nvim_win_call(retained.window, function()
+    local view = vim.fn.winsaveview()
+    local top = retained.top
+    -- Resolve the source identity after publication instead of retaining a shifted physical row.
+    if top and session.sequence.node[top.block] then
+      local _, start = session.sequence:position(top.block)
+      view.topline = require("forge.buffer").physical_row(session, start + top.position.row) + 1
+    else
+      view.topline = retained.view.topline
+    end
+    view.topfill, view.leftcol, view.skipcol = retained.view.topfill, retained.view.leftcol, retained.view.skipcol
+    vim.fn.winrestview(view)
+  end)
+end
+
 ---@class ForgeRetainedView
 ---@field window integer
 ---@field block? string

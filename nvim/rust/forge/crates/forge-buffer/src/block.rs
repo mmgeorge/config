@@ -63,6 +63,17 @@ pub struct BlockAnchor {
     pub position: TextPosition,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Identifies a projected container whose body can be hidden independently of native folds.
+pub struct Collapse {
+    /// Stable identity shared by the container's heading and body rows.
+    pub id: FoldId,
+    /// Whether the projection currently hides the body.
+    pub closed: bool,
+    /// Source row retained when the body is collapsed.
+    pub opening: BlockAnchor,
+}
+
 /// Declares a half-open native fold from its owning block to an exact endpoint block.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct FoldRange {
@@ -123,6 +134,9 @@ pub struct ContentLayout {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    /// Enclosing projected containers ordered from innermost to outermost.
+    pub collapse: Vec<Collapse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layout: Option<ContentLayout>,
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
@@ -156,6 +170,8 @@ impl BlockMetadata {
     fn allocated_bytes(&self) -> usize {
         use std::mem::size_of;
         self.target.capacity() * size_of::<TargetRange>()
+            + self.collapse.capacity() * size_of::<Collapse>()
+            + self.collapse.iter().map(|collapse| collapse.id.0.capacity() + collapse.opening.block.0.capacity()).sum::<usize>()
             + self.layout.as_ref().and_then(|layout| layout.marker.as_ref())
                 .map_or(0, |marker| marker.text.capacity() + marker.capture.capacity())
             + self.decoration.capacity() * size_of::<Decoration>()
@@ -256,6 +272,10 @@ impl BufferBlock {
             }
         }
         self.id.validate()?;
+        for collapse in &self.metadata.collapse {
+            collapse.id.validate()?;
+            collapse.opening.block.validate()?;
+        }
         for target in &self.metadata.target {
             target.id.validate()?;
             target.range.validate(&self.text)?;

@@ -562,18 +562,9 @@ local function render(state, target)
   local win = displayed_window(state)
   if state.before_render then state.before_render(state.buf, win) end
   vim.api.nvim_buf_clear_namespace(state.buf, namespace, 0, -1)
-  -- Neovim caches gutter width until layout. Measuring earlier can wrap the rule labels.
-  if win then vim.api.nvim__redraw({ win = win, statuscolumn = true, flush = true }) end
   local width = comment_editor.display_width(win, state.buf)
   local projection = build_projection(state, width)
   apply_projection(state, projection)
-  if win then vim.api.nvim__redraw({ win = win, statuscolumn = true, flush = true }) end
-  local actual_width = comment_editor.display_width(win, state.buf)
-  if actual_width ~= width then
-    vim.api.nvim_buf_clear_namespace(state.buf, namespace, 0, -1)
-    projection = build_projection(state, actual_width)
-    apply_projection(state, projection)
-  end
   if state.guard_source then
     state.guard = state.guard or editable.new("plan-comment:" .. state.buf)
     local anchor = {}

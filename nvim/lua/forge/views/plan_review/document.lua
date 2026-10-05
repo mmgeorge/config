@@ -308,12 +308,21 @@ function M.attach(options, callback)
       receive({ local_draft = true }, nil) return true
     end
     if action == "delete" then comments.delete_at_cursor(options.buffer) receive({}, nil) return true end
-    if action == "toggle_public" and vim.bo[options.buffer].modified then
+    if (action == "toggle_public" or action == "toggle_declaration") and vim.bo[options.buffer].modified then
       if options.notice then options.notice("Save plan annotations before changing the source projection") end
       return false
     end
     local captured, failure = input.capture(owner.replica, owner.current_view(), action)
     if not captured then receive(nil, failure) return false end
+    local viewport
+    if action == "toggle_declaration" then
+      local node = owner.replica.sequence.node[captured.block]
+      local collapse = node and node.entry.metadata.collapse and node.entry.metadata.collapse[1]
+      if collapse then
+        viewport = require("forge.buffer_view").capture_viewport(owner.replica,
+          owner.current_view().window, collapse.opening)
+      end
+    end
     request({ operation = "plan_action", input = captured }, function(result, error)
       if not owner.is_current(captured) then return end
       if not error and result.patch and result.patch ~= vim.NIL then
@@ -323,7 +332,14 @@ function M.attach(options, callback)
         local applied = buffer.apply_snapshot(owner.replica, result.snapshot)
         if applied.kind ~= "Applied" then receive(nil, applied.kind, captured) return end
         attach_projection(result)
+        captured = vim.tbl_extend("force", captured, { revision = owner.replica.revision })
+        local view = owner.current_view()
+        if view and view.id == captured.view then
+          view.cursor = vim.api.nvim_win_get_cursor(view.window)
+          view.changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)
+        end
       end
+      if not error and viewport then result.viewport = viewport end
       receive(result, error, captured)
     end)
     return true

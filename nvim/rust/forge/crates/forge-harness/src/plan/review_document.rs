@@ -338,6 +338,11 @@ impl PlanReviewStore {
             document.validate_input(input)?;
             return document.toggle_public();
         }
+        if action == "toggle_declaration" {
+            let owner = input.block.clone();
+            document.validate_input(input)?;
+            return document.toggle_declaration(&owner);
+        }
         let column = input.position.column;
         let row = document
             .document
@@ -918,23 +923,48 @@ impl PlanReviewDocument {
         );
         self.retain_annotation_revision();
         let public_only = !self.source.public_only;
-        let (block, target) = super::design_review::project(
-            &self.source.document,
+        self.source.public_only = public_only;
+        let projection = super::review_projection::project(
+            &self.source,
             &self.width,
             &[],
             &self.annotation_revision,
             None,
-            &self.source.declaration_syntax,
-            public_only,
-            self.source.trace.as_ref(),
-        )?;
-        let patch = self.document.edit(0..self.document.block_count(), block)?;
+        ).and_then(|(block, target)| {
+            let patch = self.document.edit(0..self.document.block_count(), block)?;
+            Ok((patch, target))
+        });
+        if projection.is_err() { self.source.public_only = !public_only; }
+        let (patch, target) = projection?;
         self.source.public_only = public_only;
         self.focused_annotation = None;
         self.target = target;
         Ok(
             serde_json::json!({"patch":patch, "snapshot":self.snapshot(), "source_row":self.source_rows(), "annotation":self.annotation.annotation(), "public_only":public_only}),
         )
+    }
+
+    fn toggle_declaration(&mut self, owner: &forge_buffer::identity::BlockId) -> Result<serde_json::Value> {
+        let collapse = self.document.block(owner)
+            .and_then(|block| block.metadata.collapse.first()).cloned()
+            .context("cursor is not inside a collapsible declaration")?;
+        self.retain_annotation_revision();
+        let previous = self.source.collapse.insert(collapse.id.clone(), !collapse.closed);
+        let projection = super::review_projection::project(
+            &self.source, &self.width, &[], &self.annotation_revision, None,
+        ).and_then(|(block, target)| {
+            let patch = self.document.edit(0..self.document.block_count(), block)?;
+            Ok((patch, target))
+        });
+        if projection.is_err() {
+            if let Some(previous) = previous { self.source.collapse.insert(collapse.id.clone(), previous); }
+            else { self.source.collapse.remove(&collapse.id); }
+        }
+        let (patch, target) = projection?;
+        self.target = target;
+        self.focused_annotation = None;
+        Ok(serde_json::json!({"patch":patch,"snapshot":self.snapshot(),"source_row":self.source_rows(),
+            "annotation":self.annotation.annotation(),"jump":collapse.opening}))
     }
 
     fn update_view(
@@ -990,6 +1020,50 @@ impl PlanReviewDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn declaration_collapse_preserves_source_and_visibility_choices() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Inspect containers.");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Expose configuration.".into();
+        design.document.description = "Reject invalid configuration.".into();
+        design.proposed.insert("src/lib.rs".into(), "#[derive(Debug)]\n/// Rejects invalid dimensions.\npub enum ConfigError {\n  /// Invalid arena.\n  ArenaSize,\n}\n\n/// Stores configuration.\npub struct Config {\n  /// Internal limit.\n  limit: u32,\n  /// Public count.\n  pub count: u32,\n}\n".into());
+        canonical.design = Some(design);
+        store.write_working_document("session", "plan", &canonical).unwrap();
+        let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let source = store.capture_review_source("session", "plan", 1, &digest).unwrap();
+        let mut document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
+        let find = |document: &PlanReviewDocument, needle: &str| {
+            document.snapshot().block.into_iter().find(|block| block.text.row(0).is_some_and(|row| row.contains(needle))).unwrap()
+        };
+        let opening = find(&document, "pub enum ConfigError");
+        assert!(opening.text.row(0).unwrap().ends_with("{...}"));
+        assert!(opening.metadata.fold.is_empty());
+        assert!(document.snapshot().block.iter().any(|block| block.text.row(0) == Some("#[derive(Debug)]")));
+        assert!(!document.snapshot().block.iter().any(|block| block.text.row(0).is_some_and(|row| row.contains("ArenaSize"))));
+        let identity = opening.metadata.target.clone();
+        document.toggle_declaration(&opening.id).unwrap();
+        let expanded = find(&document, "pub enum ConfigError");
+        assert_eq!(expanded.id, opening.id);
+        assert_eq!(expanded.metadata.target, identity);
+        let member = find(&document, "ArenaSize");
+        let result = document.toggle_declaration(&member.id).unwrap();
+        assert_eq!(result["jump"]["block"], opening.id.0);
+        document.toggle_public().unwrap();
+        assert!(find(&document, "pub enum ConfigError").text.row(0).unwrap().ends_with("{...}"));
+        assert!(find(&document, "limit: u32").metadata.collapse.len() == 1);
+        let config = find(&document, "pub struct Config");
+        document.toggle_declaration(&config.id).unwrap();
+        document.toggle_public().unwrap();
+        assert!(find(&document, "pub struct Config").text.row(0).unwrap().ends_with("{...}"));
+        document.toggle_declaration(&config.id).unwrap();
+        assert!(find(&document, "pub count: u32").metadata.collapse.len() == 1);
+        assert!(!document.snapshot().block.iter().any(|block| block.text.row(0).is_some_and(|row| row.contains("limit: u32"))));
+        document.update_view(ViewId("view".into()), Some(WidthProfile { columns: 60, ..WidthProfile::default() })).unwrap();
+        assert!(find(&document, "pub enum ConfigError").text.row(0).unwrap().ends_with("{...}"));
+    }
 
     #[test]
     fn questions_preserve_design_and_persist_answers_bound_to_current_text() {

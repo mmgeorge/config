@@ -22,7 +22,13 @@ pub(crate) fn project(
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     if source.document.design.is_some() {
         let started = Instant::now();
-        let result = super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax,source.public_only,source.trace.as_ref());
+        let result = super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax,source.public_only,source.trace.as_ref())
+            .and_then(|(block, mut target)| {
+                let block = forge_buffer::collapse::project(block, &source.collapse)?;
+                let visible: std::collections::HashSet<_> = block.iter().flat_map(|block| &block.metadata.target).map(|target| &target.id).collect();
+                target.retain(|id, _| visible.contains(id));
+                Ok((block, target))
+            });
         if let Some(trace) = &source.trace {
             trace.record("plan.review.projection", started.elapsed(), result.as_ref().map_or(0, |(block, _)| block.len()));
         }

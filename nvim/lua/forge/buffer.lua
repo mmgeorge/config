@@ -50,6 +50,13 @@ local function validate_metadata(entry, read_row, region_seen)
       end
     end
   end
+  for _, collapse in ipairs(array(entry.metadata.collapse or {})) do
+    identity(collapse.id)
+    assert(type(collapse.closed) == "boolean", "invalid collapse state")
+    identity(collapse.opening.block)
+    counter(collapse.opening.position.row)
+    counter(collapse.opening.position.column)
+  end
   for _, target in ipairs(array(entry.metadata.target)) do
     identity(target.id)
     validate_range(target.range)

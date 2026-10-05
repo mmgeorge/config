@@ -11,6 +11,7 @@ local M = {}
 ---@field block? string
 ---@field position? {row: integer, column: integer}
 ---@field jump? boolean
+---@field viewport? ForgeRetainedViewport
 ---@field message? string
 ---@field level? integer
 ---@field path? string
@@ -56,6 +57,7 @@ function M.apply(session, view, effect)
       if effect.jump then vim.api.nvim_win_call(view.window, function() vim.cmd("normal! m'") end) end
       vim.api.nvim_win_set_cursor(view.window, { start_row + position.row + 1, position.column })
       vim.api.nvim_win_call(view.window, function() vim.cmd("normal! zv") end)
+      if effect.viewport then require("forge.buffer_view").restore_viewport(session, effect.viewport) end
       view.cursor = vim.api.nvim_win_get_cursor(view.window)
     elseif effect.kind == "open_source" then
       assert(type(effect.workspace) == "string" and #effect.workspace <= 32768

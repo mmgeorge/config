@@ -2089,17 +2089,26 @@ empty file and hunk groups, and rebases fold endpoints to retained blocks. Struc
 visible fields compact to an empty body while retaining attributes and declaration spacing.
 File and hunk fold endpoints include comments attached to their final row. Diff ranges and
 counts continue to describe the full design. Saved declarations, navigation positions, and
-annotation storage remain unchanged. Declaration inspection projects Tree-sitter container bodies as nested native folds beneath file and
-hunk folds. Rust structs, enums, traits, impls, and inline modules, plus TypeScript classes,
-interfaces, enums, and namespaces can fold when their bodies span multiple rows. Fold headings
-include attached documentation and attributes for Tab activation, while folding starts at the
-opening brace so those attachments remain visible.
-Tab inside a declaration closes the innermost containing declaration through the same shared fold
-selector used for headings. Closing from its body moves the cursor to the opening row, and the plan
-view retains that fold preference across refresh. The Neovim configuration removes `hor` from
-`foldopen`, so native horizontal movement preserves closed folds without custom movement mappings.
-The shared fold component appends a validated
-`collapsed_suffix` to the highlighted opening row, producing `{...}` without changing source text.
+annotation storage remain unchanged. Declaration inspection uses `forge-buffer::collapse` to
+project Tree-sitter container bodies beneath native file and hunk folds. Rust structs, enums,
+traits, impls, and inline modules, plus TypeScript classes, interfaces, enums, and namespaces
+can collapse when their bodies span multiple rows. The shared projection keeps documentation
+and attributes visible and appends the compact body suffix to the actual opening-row text.
+The collapsed signature therefore supports ordinary cursor movement, selection, and navigation.
+Hidden rows remain in the declaration artifact. Visible blocks retain their source identities,
+targets, gutters, and syntax metadata, and enclosing native fold endpoints follow retained rows.
+Each visible row identifies its enclosing projected containers, ordered innermost first.
+The shared fold selector routes Tab on such a row to a revision-validated host action.
+Closing from a body moves the cursor to its opening row. The review source owns explicit collapse
+choices across visibility changes and width refreshes. Rust enums start collapsed.
+If that opening row is already visible, the cursor effect restores the pre-action viewport through
+the shared `buffer_view` source identity anchor. A destination outside the viewport follows normal
+cursor scrolling. Restoring a viewport does not restore the old cursor position.
+The shared draft-comment renderer applies its projection without explicit redraws or flushes.
+The action callback completes source publication, decoration attachment, cursor movement, and
+viewport restoration synchronously before Neovim's next normal redraw.
+The Neovim configuration removes `hor` from `foldopen`, so horizontal movement also preserves
+native file and hunk folds without custom movement mappings.
 Fold summaries stack row backgrounds, syntax, and inline captures in decoration priority order.
 The shared full-width background policy applies to gutters and the collapsed body marker as well.
 Display-only trailing fold chunks fill the current window's text width with that background.

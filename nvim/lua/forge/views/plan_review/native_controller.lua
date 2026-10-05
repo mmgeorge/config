@@ -103,11 +103,12 @@ local function apply_task_folds(review, window, owner)
 end
 
 ---@param review table
-local function toggle_task_fold(review)
+---@param on_projected fun()
+local function toggle_task_fold(review, on_projected)
   local view = review.owner.current_view()
   if not view then return end
   require("forge.folds").toggle_heading(review.owner.replica, view.window, {
-    include_body = function(id) return id:match(":declaration$") ~= nil end,
+    on_projected = on_projected,
     on_toggled = function(id, closed) set_task_folded(review, id, closed) end,
   })
 end
@@ -214,7 +215,9 @@ local function action(review, name)
         or vim.api.nvim_win_get_buf(review.win) ~= review.buf
         or not vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), opening_cursor)) then return end
     if failure then notice(failure) return end
-    if name == "toggle_public" then
+    if name == "toggle_declaration" then
+      effect(review, captured, { kind = "cursor", block = result.jump.block, position = result.jump.position, viewport = result.viewport })
+    elseif name == "toggle_public" then
       review.public_only = result.public_only
       review.owner.public_only = result.public_only
       refresh_winbar(review)
@@ -279,7 +282,7 @@ end
 
 local function commands(review)
   local set = command_set.new()
-  command_set.register(set, "toggle", function() toggle_task_fold(review) end)
+  command_set.register(set, "toggle", function() toggle_task_fold(review, function() action(review, "toggle_declaration") end) end)
   command_set.register(set, "visual_line_with_gutter", review.owner.gutter_selection.start)
   for _, name in ipairs({ "open", "jump_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)

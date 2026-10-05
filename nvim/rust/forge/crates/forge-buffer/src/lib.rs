@@ -5,6 +5,7 @@
 
 pub mod admission;
 pub mod block;
+pub mod collapse;
 pub mod document;
 pub mod editable;
 pub mod identity;
