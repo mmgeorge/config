@@ -2114,6 +2114,7 @@ mod tests {
                 diff_text: "--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-pub struct Old;\n+pub struct New;\n".into(),
                 declaration: Some(crate::exchange::DeclarationRevision {
                     plan_id: "plan".into(), revision: 3,
+                    baseline_paths: Default::default(),
                     document_diff: "--- a/Description\n+++ b/Description\n@@ -1 +1 @@\n-old overview\n+new overview\n".into(),
                 }),
             },

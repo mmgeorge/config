@@ -1129,13 +1129,13 @@ mod test {
         );
         let manifest = "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n\n[dependencies]\nengine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n";
         fs::write(temporary.path().join("Cargo.toml"), manifest).unwrap();
-        let design = DeclarationDesign::capture(temporary.path()).unwrap();
-        assert_eq!(design.baseline["Cargo.toml"].text, manifest);
+        let design = DeclarationDesign::open(temporary.path()).unwrap();
+        assert!(design.baseline.is_empty());
         let invalid = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n name = \"arena\"\n+name = \"duplicate\"\n*** End Patch";
-        assert!(design.patch(invalid).is_err());
+        assert!(design.patch(temporary.path(), &Default::default(), invalid).is_err());
         let patch = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n-engine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n+engine = { version = \"1.3\", default-features = false, features = [\"render\", \"input\"] }\n*** Add File: config/arena.toml\n+[arena]\n+speed = 200\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Enable engine input and configure arena speed.\"\n*** End Patch";
         let mut document = document::test_fixture("plan", "Arena dependencies");
-        document.design = Some(design.patch(patch).unwrap());
+        document.design = Some(design.patch(temporary.path(), &Default::default(), patch).unwrap());
         document.design.as_mut().unwrap().document.task =
             "Enable keyboard input with configurable arena movement.".into();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
@@ -1227,16 +1227,16 @@ mod test {
             "{\"project_setting\":true}",
         )
         .unwrap();
-        let mut design = DeclarationDesign::capture(temporary.path()).unwrap();
+        let mut design = DeclarationDesign::open(temporary.path()).unwrap();
         assert!(!design.baseline.contains_key("plan.json"));
         for (path, baseline, proposed, invalid) in configurations {
-            assert_eq!(design.baseline[path].text, baseline);
+            assert_eq!(design.inspect(temporary.path(), Some(path), false).unwrap()["text"], baseline);
             let before = design.clone();
             let invalid_patch = format!(
                 "*** Begin Patch\n*** Update File: {path}\n@@\n-{}\n+{invalid}\n*** End Patch",
                 baseline.trim_end()
             );
-            assert!(design.patch(&invalid_patch).is_err(), "{path}");
+            assert!(design.patch(temporary.path(), &Default::default(), &invalid_patch).is_err(), "{path}");
             assert_eq!(design, before);
             let removed = baseline
                 .lines()
@@ -1248,11 +1248,11 @@ mod test {
                 .map(|line| format!("+{line}"))
                 .collect::<Vec<_>>()
                 .join("\n");
-            design = design.patch(&format!("*** Begin Patch\n*** Update File: {path}\n@@\n{removed}\n{added}\n*** End Patch")).unwrap();
+            design = design.patch(temporary.path(), &Default::default(), &format!("*** Begin Patch\n*** Update File: {path}\n@@\n{removed}\n{added}\n*** End Patch")).unwrap();
         }
-        design = design.patch("*** Begin Patch\n*** Add File: settings.jsonc\n+{\"enabled\":true,}\n*** End Patch").unwrap();
+        design = design.patch(temporary.path(), &Default::default(), "*** Begin Patch\n*** Add File: settings.jsonc\n+{\"enabled\":true,}\n*** End Patch").unwrap();
         design = design
-            .patch("*** Begin Patch\n*** Delete File: settings.jsonc\n*** End Patch")
+            .patch(temporary.path(), &Default::default(), "*** Begin Patch\n*** Delete File: settings.jsonc\n*** End Patch")
             .unwrap();
         assert!(!design.proposed.contains_key("settings.jsonc"));
         design.document.task = "Update project configuration across supported formats.".into();
@@ -1366,9 +1366,9 @@ mod test {
             fs::read_to_string(temporary.path().join("registry.rs")).unwrap(),
             source
         );
-        let request = DesignPatchRequest { plan_id: "plan".into(), expected_version: 1, title: None,
+        let request = DesignPatchRequest { plan_id: "plan".into(), expected_version: 1, title: None, source_digests: Default::default(),
             patch: "*** Begin Patch\n*** Update File: registry.rs\n@@\n-  pub second: u64,\n+  pub second: String,\n*** End Patch".into() };
-        let revised = submitted.patch_design(request).unwrap();
+        let revised = submitted.patch_design(temporary.path(), request).unwrap();
         store
             .write_working_document("session", "plan", &revised)
             .unwrap();

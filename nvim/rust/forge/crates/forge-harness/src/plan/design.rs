@@ -67,6 +67,19 @@ impl DeclarationDesign {
     pub(crate) async fn validated(&self, workspace: &Path) -> Result<Self> {
         let mut design = self.formatted()?;
         design.check_workspace(workspace)?;
+        let paths = design.proposed.keys().filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml")).cloned().collect::<Vec<_>>();
+        for path in paths {
+            for directory in Path::new(&path).ancestors().skip(1) {
+                let lock = directory.join("Cargo.lock").to_string_lossy().replace('\\', "/");
+                if !design.cargo_lock.contains_key(&lock)
+                    && let Some(text) = workspace_source(workspace, &lock)?
+                {
+                    toml::from_str::<toml::Value>(&text).with_context(|| format!("parse {lock}"))?;
+                    design.cargo_lock.insert(lock, text);
+                }
+            }
+        }
+        design.validate()?;
         let mut resolver = crate::declaration::DeclarationResolver::prepare(workspace, &design, false, None).await?;
         let report = resolver.validate_sources(&design).await?;
         report.ensure_valid()?;
@@ -74,23 +87,8 @@ impl DeclarationDesign {
         Ok(design)
     }
 
-    /// Capture eligible working-tree declarations without modifying the checkout.
-    pub fn capture(workspace: &Path) -> Result<Self> {
-        let result = std::process::Command::new("git")
-            .current_dir(workspace)
-            .args([
-                "ls-files",
-                "--cached",
-                "--others",
-                "--exclude-standard",
-                "-z",
-            ])
-            .output()?;
-        ensure!(
-            result.status.success(),
-            "discover declaration files: {}",
-            String::from_utf8_lossy(&result.stderr)
-        );
+    /// Initialize plan settings without discovering or extracting workspace files.
+    pub fn open(workspace: &Path) -> Result<Self> {
         let mut design = Self::default();
         match std::fs::read_to_string(workspace.join(".forge.json")) {
             Ok(config) => {
@@ -110,66 +108,33 @@ impl DeclarationDesign {
             (40..=240).contains(&design.line_width),
             "declaration line width must be between 40 and 240"
         );
-        let mut retained_bytes = 0usize;
-        for bytes in result
-            .stdout
-            .split(|byte| *byte == 0)
-            .filter(|path| !path.is_empty())
-        {
-            let path = std::str::from_utf8(bytes)?.replace('\\', "/");
-            let cargo_lock = Path::new(&path).file_name().is_some_and(|name| name == "Cargo.lock");
-            if path == PLAN_DOCUMENT_PATH || (!cargo_lock && !DeclarationOverview::supports(&path)) {
-                continue;
-            }
-            if cargo_lock {
-                validate_relative_path(&path)?;
-            } else {
-                validate_path(&path)?;
-            }
-            let target = workspace.join(&path);
-            let metadata = match std::fs::symlink_metadata(&target) {
-                Ok(metadata) => metadata,
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(error) => return Err(error.into()),
-            };
-            if !metadata.is_file() || metadata.file_type().is_symlink() {
-                continue;
-            }
-            ensure!(
-                metadata.len() <= 1024 * 1024,
-                "{path}: source exceeds 1 MiB"
-            );
-            let source =
-                std::fs::read_to_string(&target).with_context(|| format!("read {path}"))?;
-            if cargo_lock {
-                toml::from_str::<toml::Value>(&source).with_context(|| format!("parse {path}"))?;
-                retained_bytes += source.len();
-                ensure!(retained_bytes <= 8 * 1024 * 1024, "declaration snapshot exceeds 8 MiB");
-                design.cargo_lock.insert(path, source);
-                continue;
-            }
-            let text = DeclarationOverview::extract(&path, &source)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .with_context(|| format!("extract {path}"))?;
-            let text = DeclarationOverview::format_with_width(&path, &text, design.line_width)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))
-                .with_context(|| format!("format baseline {path}"))?;
-            retained_bytes += text.len();
-            ensure!(
-                retained_bytes <= 8 * 1024 * 1024,
-                "declaration snapshot exceeds 8 MiB"
-            );
-            design.baseline.insert(
-                path.clone(),
-                DeclarationFile {
-                    text: text.clone(),
-                    source_digest: super::digest(source.as_bytes()),
-                },
-            );
-            design.proposed.insert(path, text);
-        }
         design.validate()?;
         Ok(design)
+    }
+
+    fn source(&self, workspace: &Path, path: &str) -> Result<DeclarationFile> {
+        validate_path(path)?;
+        let source = workspace_source(workspace, path)?.with_context(|| format!("declaration file does not exist: {path}"))?;
+        let text = DeclarationOverview::extract(path, &source)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))
+            .with_context(|| format!("extract {path}"))?;
+        let text = DeclarationOverview::format_with_width(path, &text, self.line_width)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        Ok(DeclarationFile { text, source_digest: super::digest(source.as_bytes()) })
+    }
+
+    /// Inspect one uncaptured workspace file without changing the saved design.
+    /// Captured, deleted, and moved paths always use the immutable plan snapshot.
+    pub fn inspect(&self, workspace: &Path, path: Option<&str>, baseline: bool) -> Result<serde_json::Value> {
+        if let Some(path) = path
+            && path != PLAN_DOCUMENT_PATH
+            && !self.baseline.contains_key(path)
+            && !self.proposed.contains_key(path)
+        {
+            let file = self.source(workspace, path)?;
+            return Ok(serde_json::json!({"path":path,"side":"workspace","text":file.text,"source_digest":file.source_digest}));
+        }
+        self.read(path, baseline)
     }
 
     /// Validate every proposed overview before exposing a persisted revision.
@@ -307,7 +272,7 @@ impl DeclarationDesign {
     }
 
     /// Apply a familiar multi-file patch atomically to virtual proposed files.
-    pub fn patch(&self, patch: &str) -> Result<Self> {
+    pub fn patch(&self, workspace: &Path, source_digests: &BTreeMap<String, String>, patch: &str) -> Result<Self> {
         ensure!(patch.len() <= 1024 * 1024, "design patch exceeds 1 MiB");
         let lines = patch.lines().collect::<Vec<_>>();
         ensure!(
@@ -342,6 +307,18 @@ impl DeclarationDesign {
                 );
             } else {
                 validate_path(path)?;
+                if !candidate.proposed.contains_key(path) && !candidate.baseline.contains_key(path) {
+                    if kind == "add" {
+                        ensure!(std::fs::symlink_metadata(workspace.join(path)).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound), "{path}: Add File destination already exists or cannot be inspected");
+                    } else {
+                        let file = candidate.source(workspace, path)?;
+                        if let Some(expected) = source_digests.get(path) {
+                            ensure!(*expected == file.source_digest, "{path}: workspace changed since inspection. Read the declaration file again.");
+                        }
+                        candidate.proposed.insert(path.into(), file.text.clone());
+                        candidate.baseline.insert(path.into(), file);
+                    }
+                }
             }
             ensure!(
                 edited.insert(path.to_owned()),
@@ -357,6 +334,9 @@ impl DeclarationDesign {
                     "plan.json cannot be moved"
                 );
                 validate_path(to)?;
+                if !candidate.baseline.contains_key(to) {
+                    ensure!(std::fs::symlink_metadata(workspace.join(to)).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound), "{to}: move destination already exists or cannot be inspected");
+                }
                 ensure!(
                     to != path
                         && !candidate.proposed.contains_key(to)
@@ -457,6 +437,9 @@ pub struct DesignPatchRequest {
     pub expected_version: u64,
     pub patch: String,
     pub title: Option<String>,
+    /// Checks inspected workspace identities when their baselines are first captured.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub source_digests: BTreeMap<String, String>,
 }
 
 fn validate_path(path: &str) -> Result<()> {
@@ -466,6 +449,24 @@ fn validate_path(path: &str) -> Result<()> {
         "unsupported declaration path: {path}. Supported files are .rs, .ts, .tsx, .lua, JSON/JSONC, TOML, YAML, and XML configuration."
     );
     Ok(())
+}
+
+fn workspace_source(workspace: &Path, path: &str) -> Result<Option<String>> {
+    use std::io::Read;
+    validate_relative_path(path)?;
+    let target = workspace.join(path);
+    let metadata = match std::fs::symlink_metadata(&target) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).with_context(|| format!("inspect {path}")),
+    };
+    ensure!(metadata.is_file() && !metadata.file_type().is_symlink(), "{path}: source is not a regular file");
+    ensure!(std::fs::canonicalize(&target)?.starts_with(std::fs::canonicalize(workspace)?), "{path}: source escapes workspace");
+    ensure!(metadata.len() <= 1024 * 1024, "{path}: source exceeds 1 MiB");
+    let mut source = String::new();
+    std::fs::File::open(&target)?.take(1024 * 1024 + 1).read_to_string(&mut source)?;
+    ensure!(source.len() <= 1024 * 1024, "{path}: source exceeds 1 MiB");
+    Ok(Some(source))
 }
 
 fn validate_relative_path(path: &str) -> Result<()> {
@@ -556,7 +557,53 @@ mod tests {
     use super::*;
 
     #[test]
-    fn capture_uses_repository_width_and_rejects_invalid_configuration() {
+    fn first_edit_captures_only_its_source_and_failed_patches_publish_nothing() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("Foo.rs"), "pub struct Foo;\nimpl Foo { pub fn old(&self) {} }\n").unwrap();
+        std::fs::write(workspace.path().join("unrelated.rs"), "invalid Rust {").unwrap();
+        std::fs::write(workspace.path().join("unrelated.json"), "invalid JSON").unwrap();
+        let design = DeclarationDesign::open(workspace.path()).unwrap();
+        let inspected = design.inspect(workspace.path(), Some("Foo.rs"), false).unwrap();
+        assert!(design.baseline.is_empty() && design.proposed.is_empty());
+        assert!(!inspected["text"].as_str().unwrap().contains("{}"));
+        let digests = BTreeMap::from([("Foo.rs".into(), inspected["source_digest"].as_str().unwrap().into())]);
+        let patch = "*** Begin Patch\n*** Update File: Foo.rs\n@@\n   pub fn old(&self);\n+\n+  pub fn new(&self);\n*** End Patch";
+        let invalid = patch.replace("*** End Patch", "*** Add File: bad.rs\n+fn invalid() {}\n*** End Patch");
+        assert!(design.patch(workspace.path(), &digests, &invalid).is_err());
+        assert!(design.baseline.is_empty() && design.proposed.is_empty());
+        let changed = design.patch(workspace.path(), &digests, patch).unwrap();
+        assert_eq!(changed.baseline.len(), 1);
+        assert_eq!(changed.proposed.len(), 1);
+        assert!(!changed.baseline["Foo.rs"].text.contains("fn new"));
+        assert!(changed.proposed["Foo.rs"].contains("fn new"));
+        std::fs::write(workspace.path().join("Foo.rs"), "pub struct Changed;\n").unwrap();
+        assert!(design.patch(workspace.path(), &digests, patch).is_err());
+        let next = changed.patch(workspace.path(), &digests, "*** Begin Patch\n*** Update File: Foo.rs\n@@\n-  pub fn new(&self);\n+  pub fn revised(&self);\n*** End Patch").unwrap();
+        assert_eq!(next.baseline, changed.baseline);
+        assert!(next.check_workspace(workspace.path()).is_err());
+    }
+
+    #[test]
+    fn lazy_deletes_and_moves_cannot_recapture_or_overwrite_workspace_sources() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("first.rs"), "pub struct First;\n").unwrap();
+        std::fs::write(workspace.path().join("occupied.rs"), "pub struct Occupied;\n").unwrap();
+        let design = DeclarationDesign::open(workspace.path()).unwrap();
+        assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Add File: occupied.rs\n+pub struct Replacement;\n*** End Patch").is_err());
+        assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: first.rs\n*** Move to: occupied.rs\n@@\n pub struct First;\n*** End Patch").is_err());
+        let deleted = design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Delete File: first.rs\n*** End Patch").unwrap();
+        assert!(deleted.inspect(workspace.path(), Some("first.rs"), false).is_err());
+        assert!(deleted.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: first.rs\n@@\n-pub struct First;\n+pub struct Recaptured;\n*** End Patch").is_err());
+        let moved = design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: first.rs\n*** Move to: moved.rs\n@@\n pub struct First;\n*** End Patch").unwrap();
+        let saved: DeclarationDesign = serde_json::from_slice(&serde_json::to_vec(&moved).unwrap()).unwrap();
+        let restored = saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: moved.rs\n*** Move to: first.rs\n@@\n pub struct First;\n*** End Patch").unwrap();
+        assert!(restored.moved.is_empty());
+        assert_eq!(restored.baseline, moved.baseline);
+        assert!(restored.changed_paths().is_empty());
+    }
+
+    #[test]
+    fn initialization_uses_repository_width_without_capturing_sources() {
         let workspace = tempfile::tempdir().unwrap();
         let initialized = std::process::Command::new("git")
             .args(["init", "--quiet"])
@@ -571,13 +618,13 @@ mod tests {
         )
         .unwrap();
         std::fs::write(workspace.path().join("Cargo.lock"), "version = 4\n").unwrap();
-        let design = DeclarationDesign::capture(workspace.path()).unwrap();
+        let design = DeclarationDesign::open(workspace.path()).unwrap();
         assert_eq!(design.line_width, 50);
-        assert_eq!(design.cargo_lock["Cargo.lock"], "version = 4\n");
+        assert!(design.cargo_lock.is_empty());
+        assert!(design.baseline.is_empty());
         assert!(!design.proposed.contains_key("Cargo.lock"));
         assert!(
-            design.baseline["lib.rs"]
-                .text
+            design.inspect(workspace.path(), Some("lib.rs"), false).unwrap()["text"].as_str().unwrap()
                 .lines()
                 .all(|line| line.chars().count() <= 50)
         );
@@ -587,20 +634,21 @@ mod tests {
             r#"{"declaration_line_width":12}"#,
         )
         .unwrap();
-        assert!(DeclarationDesign::capture(workspace.path()).is_err());
+        assert!(DeclarationDesign::open(workspace.path()).is_err());
         std::fs::write(
             workspace.path().join(".forge.json"),
             r#"{"declaration_line_width":"80"}"#,
         )
         .unwrap();
-        assert!(DeclarationDesign::capture(workspace.path()).is_err());
+        assert!(DeclarationDesign::open(workspace.path()).is_err());
     }
 
     #[test]
     fn description_and_declaration_edits_commit_atomically() {
+        let workspace = tempfile::tempdir().unwrap();
         let design = DeclarationDesign::default();
         let patch = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"task\": \"\",\n+  \"task\": \"Support cancellable texture loading.\",\n@@\n-  \"description\": \"\"\n+  \"description\": \"Add cancellable requests.\"\n*** Add File: src/request.rs\n+pub struct Request;\n*** End Patch";
-        let changed = design.patch(patch).unwrap();
+        let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
         assert_eq!(changed.document.task, "Support cancellable texture loading.");
         assert_eq!(changed.document.description, "Add cancellable requests.");
         assert_eq!(changed.changed_paths(), vec!["src/request.rs"]);
@@ -622,18 +670,18 @@ mod tests {
         );
         assert!(
             design
-                .patch(&patch.replace("pub struct Request;", "fn invalid() {}"))
+                .patch(workspace.path(), &Default::default(), &patch.replace("pub struct Request;", "fn invalid() {}"))
                 .is_err()
         );
         assert!(design.document.description.is_empty() && design.proposed.is_empty());
         let invalid = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Change\",\n+  \"tasks\": []\n*** End Patch";
-        assert!(design.patch(invalid).is_err());
+        assert!(design.patch(workspace.path(), &Default::default(), invalid).is_err());
         assert!(
             design
-                .patch("*** Begin Patch\n*** Delete File: plan.json\n*** End Patch")
+                .patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Delete File: plan.json\n*** End Patch")
                 .is_err()
         );
-        assert!(design.patch("*** Begin Patch\n*** Update File: plan.json\n*** Move to: other.rs\n@@\n {}\n*** End Patch").is_err());
+        assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: plan.json\n*** Move to: other.rs\n@@\n {}\n*** End Patch").is_err());
         let mut document = crate::plan::document::test_fixture("description", "Description");
         document.design = Some(design);
         assert!(document.validate_for_submission().is_err());
@@ -641,12 +689,13 @@ mod tests {
         document.validate_for_submission().unwrap();
         document.design.as_mut().unwrap().document.task.clear();
         assert!(document.validate_for_submission().is_err());
-        let oversized = changed.patch(&format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"Add cancellable requests.\"\n+  \"description\": \"{}\"\n*** End Patch", "x".repeat(16 * 1024 + 1)));
+        let oversized = changed.patch(workspace.path(), &Default::default(), &format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"Add cancellable requests.\"\n+  \"description\": \"{}\"\n*** End Patch", "x".repeat(16 * 1024 + 1)));
         assert!(oversized.is_err());
     }
 
     #[test]
     fn saved_layout_survives_validation_round_trip_and_agent_patches() {
+        let workspace = tempfile::tempdir().unwrap();
         let text = "pub struct Registry {\n    first: u64,\n    second: u64,\n}\n\n\nimpl Registry { pub fn first(&self) -> u64; }\n";
         let mut design = DeclarationDesign::default();
         design.baseline.insert(
@@ -661,17 +710,18 @@ mod tests {
         let saved: DeclarationDesign = serde_json::from_slice(&bytes).unwrap();
         saved.validate().unwrap();
         assert_eq!(serde_json::to_vec(&saved).unwrap(), bytes);
-        let changed = saved.patch("*** Begin Patch\n*** Update File: registry.rs\n@@\n-    second: u64,\n+    second: String,\n*** End Patch").unwrap();
+        let changed = saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: registry.rs\n@@\n-    second: u64,\n+    second: String,\n*** End Patch").unwrap();
         assert_eq!(
             changed.proposed["registry.rs"],
             text.replace("second: u64", "second: String")
         );
         assert_eq!(changed.baseline, saved.baseline);
-        assert!(changed.patch("*** Begin Patch\n*** Update File: registry.rs\n@@\n-impl Registry { pub fn first(&self) -> u64; }\n+impl Registry { pub fn first(&self) -> u64 { 1 } }\n*** End Patch").is_err());
+        assert!(changed.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: registry.rs\n@@\n-impl Registry { pub fn first(&self) -> u64; }\n+impl Registry { pub fn first(&self) -> u64 { 1 } }\n*** End Patch").is_err());
     }
 
     #[test]
     fn moves_round_trip_and_cannot_hide_a_deleted_baseline_file() {
+        let workspace = tempfile::tempdir().unwrap();
         let mut design = DeclarationDesign::default();
         for path in ["first.rs", "second.rs"] {
             let text = "pub struct Contract;\n";
@@ -684,21 +734,21 @@ mod tests {
             );
             design.proposed.insert(path.into(), text.into());
         }
-        let moved = design.patch("*** Begin Patch\n*** Update File: first.rs\n*** Move to: moved.rs\n@@\n pub struct Contract;\n*** End Patch").unwrap();
+        let moved = design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: first.rs\n*** Move to: moved.rs\n@@\n pub struct Contract;\n*** End Patch").unwrap();
         assert_eq!(moved.moved["first.rs"], "moved.rs");
-        let restored = moved.patch("*** Begin Patch\n*** Update File: moved.rs\n*** Move to: first.rs\n@@\n pub struct Contract;\n*** End Patch").unwrap();
+        let restored = moved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: moved.rs\n*** Move to: first.rs\n@@\n pub struct Contract;\n*** End Patch").unwrap();
         assert!(restored.moved.is_empty());
         assert!(restored.changed_paths().is_empty());
         let deleted = design
-            .patch("*** Begin Patch\n*** Delete File: second.rs\n*** End Patch")
+            .patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Delete File: second.rs\n*** End Patch")
             .unwrap();
-        assert!(deleted.patch("*** Begin Patch\n*** Update File: first.rs\n*** Move to: second.rs\n@@\n pub struct Contract;\n*** End Patch").is_err());
+        assert!(deleted.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: first.rs\n*** Move to: second.rs\n@@\n pub struct Contract;\n*** End Patch").is_err());
     }
 
     #[test]
     fn patch_is_atomic_and_workspace_changes_block_submission() {
-        let root = tempfile::tempdir().unwrap();
-        std::fs::write(root.path().join("lib.rs"), "pub struct Before;\n").unwrap();
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("lib.rs"), "pub struct Before;\n").unwrap();
         let mut design = DeclarationDesign::default();
         design.baseline.insert(
             "lib.rs".into(),
@@ -711,17 +761,17 @@ mod tests {
             .proposed
             .insert("lib.rs".into(), "pub struct Before;\n".into());
         let patch = "*** Begin Patch\n*** Update File: lib.rs\n@@\n-pub struct Before;\n+pub struct After;\n*** Add File: extra.lua\n+function M.get(id)\n*** End Patch";
-        let updated = design.patch(patch).unwrap();
+        let updated = design.patch(workspace.path(), &Default::default(), patch).unwrap();
         assert_eq!(updated.proposed["lib.rs"], "pub struct After;\n");
-        assert!(updated.check_workspace(root.path()).is_ok());
+        assert!(updated.check_workspace(workspace.path()).is_ok());
         assert!(
             design
-                .patch(&patch.replace("+function M.get(id)", "+function M.get(id) return id end"))
+                .patch(workspace.path(), &Default::default(), &patch.replace("+function M.get(id)", "+function M.get(id) return id end"))
                 .is_err()
         );
         assert_eq!(design.proposed["lib.rs"], "pub struct Before;\n");
-        std::fs::write(root.path().join("lib.rs"), "pub struct Changed;\n").unwrap();
-        assert!(updated.check_workspace(root.path()).is_err());
-        assert!(design.patch("*** Begin Patch\n*** Add File: ../escape.rs\n+pub struct Escaped;\n*** End Patch").is_err());
+        std::fs::write(workspace.path().join("lib.rs"), "pub struct Changed;\n").unwrap();
+        assert!(updated.check_workspace(workspace.path()).is_err());
+        assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Add File: ../escape.rs\n+pub struct Escaped;\n*** End Patch").is_err());
     }
 }

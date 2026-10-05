@@ -9,6 +9,7 @@ use super::{DeclarationDesign, DeclarationFile, PlanDocument};
 pub(crate) struct DeclarationDelta {
     pub files: String,
     pub document: String,
+    pub baseline_paths: std::collections::BTreeSet<String>,
 }
 
 impl DeclarationDelta {
@@ -19,7 +20,7 @@ impl DeclarationDelta {
             .as_ref()
             .expect("declaration delta requires a design");
         let previous = previous.and_then(|document| document.design.as_ref());
-        let baseline = previous
+        let mut baseline = previous
             .map(|design| design.proposed.clone())
             .unwrap_or_else(|| {
                 design
@@ -28,6 +29,15 @@ impl DeclarationDelta {
                     .map(|(path, file)| (path.clone(), file.text.clone()))
                     .collect()
             });
+        let mut baseline_paths = std::collections::BTreeSet::new();
+        if let Some(previous) = previous {
+            for (path, file) in &design.baseline {
+                if !previous.baseline.contains_key(path) && !previous.proposed.contains_key(path) {
+                    baseline.insert(path.clone(), file.text.clone());
+                    baseline_paths.insert(path.clone());
+                }
+            }
+        }
         let mut moved = BTreeMap::new();
         for original in design.baseline.keys() {
             let before = previous
@@ -82,6 +92,7 @@ impl DeclarationDelta {
         Ok(Self {
             files: String::from_utf8(patch)?,
             document: String::from_utf8(document)?,
+            baseline_paths,
         })
     }
 }
@@ -139,6 +150,22 @@ fn write_file(
 mod tests {
     use super::*;
     use forge_diff::patch::UnifiedPatch;
+
+    #[test]
+    fn newly_captured_revision_files_compare_against_source_without_restoring_deletions() {
+        let mut previous = super::super::document::test_fixture("lazy", "Lazy revision");
+        let mut design = DeclarationDesign::default();
+        design.baseline.insert("deleted.rs".into(), DeclarationFile { text: "pub struct Deleted;\n".into(), source_digest: String::new() });
+        previous.design = Some(design);
+        let mut current = previous.clone();
+        let design = current.design.as_mut().unwrap();
+        design.baseline.insert("Foo.rs".into(), DeclarationFile { text: "pub struct Before;\n".into(), source_digest: String::new() });
+        design.proposed.insert("Foo.rs".into(), "pub struct After;\n".into());
+        let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
+        assert!(delta.files.contains("-pub struct Before;") && delta.files.contains("+pub struct After;"));
+        assert!(!delta.files.contains("deleted.rs") && !delta.files.contains("new file mode"));
+        assert_eq!(delta.baseline_paths, ["Foo.rs".into()].into());
+    }
 
     #[test]
     fn declaration_changes_bound_context_and_separate_distant_edits() {

@@ -626,11 +626,11 @@ pub struct PlanDocument {
 
 impl PlanDocument {
     /// Apply one optimistic declaration patch without exposing the immutable baseline to edits.
-    pub fn patch_design(&self, request: super::DesignPatchRequest) -> Result<Self> {
+    pub fn patch_design(&self, workspace: &std::path::Path, request: super::DesignPatchRequest) -> Result<Self> {
         anyhow::ensure!(request.plan_id == self.plan_id, "design plan id does not match the active plan");
         anyhow::ensure!(request.expected_version == self.version, "design version conflict: expected_version must be {}", self.version);
         let mut candidate = self.clone();
-        candidate.design = Some(self.design.as_ref().context("obsolete plan format. Create a new declaration design.")?.patch(&request.patch)?);
+        candidate.design = Some(self.design.as_ref().context("obsolete plan format. Create a new declaration design.")?.patch(workspace, &request.source_digests, &request.patch)?);
         if let Some(title) = request.title {
             anyhow::ensure!(!title.trim().is_empty() && title.len() <= 1024, "design title must contain 1 to 1024 bytes");
             candidate.title = title.trim().into();

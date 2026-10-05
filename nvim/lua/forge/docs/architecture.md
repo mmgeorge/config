@@ -1911,17 +1911,30 @@ revision, view, and cursor guards discard stale responses. Lua owns key binding 
 while Rust owns resolution and source coordinates.
 
 `DeclarationDesign` persists baseline text, original source digests, proposed text, and explicit moves
-inside Harness-owned `plans/<session>/<plan>/working.json`. The provider receives the plan identity,
+inside Harness-owned `plans/<session>/<plan>/working.json`. New plans read `.forge.json` settings
+and start with no captured source files. They perform no repository file discovery or extraction.
+The provider receives the plan identity,
 version, request, and path inventory. `harness_plan_read` reads one virtual file or its baseline as
 numbered plain text. Optional 1-based inclusive line bounds require a file path. The response retains
-the active version, selected side, actual range, and total line count. Inventory reads remain structured.
+the active version, selected side, actual range, and total line count. An uncaptured-path read extracts
+only that workspace file and returns its full-source digest without changing the saved design or version.
+Inventory reads remain structured and list captured and proposed paths rather than workspace files.
 `harness_design_apply_patch` applies familiar Add File, Update File, Delete File, Move to, and
-context chunks atomically. Invalid syntax, paths, bodies, stale versions, or unmatched context change
-nothing. Every patch that changes the proposal increments the version. Patch confirmation includes
+context chunks atomically. The first Update, Delete, or Move captures that path's baseline and source
+digest in the patch candidate. Add and Move reject occupied workspace destinations. Captured removals
+and moves never reload their original source. The control runtime retains inspected digests within a
+turn, and optional `source_digests` preserves read identities across turns. Provider transports retain
+first-capture digests for broker replay, so a source change after acknowledgement also rejects the patch.
+Invalid syntax, paths, bodies, stale versions, source identities, or unmatched context change nothing.
+Every patch that changes the design increments the version. Patch confirmation includes
 the applied declaration and overview deltas with three context lines, capped at 16 KiB with explicit
 truncation. The agent can confirm focused edits without a second read. The baseline remains immutable.
 Successful submission retains inconclusive reference warnings in the saved validation evidence and
 returns only acceptance and version to the provider. Proven-invalid references still return actionable errors.
+Reference validation reads relevant ancestor manifests, lockfiles, and untouched modules on demand
+without adding those source files to the proposal. Lockfile evidence remains separate from editable files.
+Files first captured in a later submitted revision compare against their captured source baseline,
+and removed-row navigation opens that baseline in the current revision rather than a missing prior proposal.
 `plan/prompts/planning.md` owns the complete declaration planning instructions, and
 `plan/prompts/system.md` owns the general provider control contract.
 

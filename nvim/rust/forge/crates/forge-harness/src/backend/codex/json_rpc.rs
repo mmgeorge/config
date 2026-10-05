@@ -352,6 +352,11 @@ impl CodexJsonRpc {
             )
         {
             apply_control_request_result(&message, output, response_success)?;
+            if let (Some(runtime), Some(request)) = (self.control_runtime.as_ref(), output.design_patch.last_mut())
+                && let Some(digests) = runtime.patch_source_digests(request.expected_version)
+            {
+                request.source_digests = digests.clone();
+            }
         }
         let completed_control_lifecycle = repeats_control_invocation
             && control_tool_name(method, message.get("params").unwrap_or(&Value::Null)).is_some()
@@ -718,7 +723,7 @@ impl CodexJsonRpc {
             }
             "harness_design_apply_patch" => {
                 let request = output.design_patch.pop().context("design patch has no request")?;
-                self.plan_document = Some(self.plan_document.as_ref().context("design patch has no active design")?.patch_design(request)?);
+                self.plan_document = Some(self.plan_document.as_ref().context("design patch has no active design")?.patch_design(Path::new(&self.workspace), request)?);
                 return Ok(Some(format!("Declaration patch accepted. Active version: {}",self.plan_document.as_ref().unwrap().version)));
             }
             "harness_plan_read" => {
@@ -735,7 +740,7 @@ impl CodexJsonRpc {
                     "requested plan id does not match the active plan"
                 );
                 if let Some(design) = &document.design {
-                    let value = design.read(invocation.arguments.get("path").and_then(Value::as_str), invocation.arguments.get("baseline").and_then(Value::as_bool).unwrap_or(false))?;
+                    let value = design.inspect(Path::new(&self.workspace), invocation.arguments.get("path").and_then(Value::as_str), invocation.arguments.get("baseline").and_then(Value::as_bool).unwrap_or(false))?;
                     return Ok(Some(serde_json::json!({"plan_id":document.plan_id,"version":document.version,"declarations":value}).to_string()));
                 }
             }

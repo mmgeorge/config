@@ -17,6 +17,23 @@ fn local(root: &Path, files: &[(&str, &str)]) -> (DeclarationDesign, Declaration
 }
 
 #[test]
+fn sparse_proposals_resolve_untouched_manifests_and_modules_without_capturing_them() {
+    let root = tempfile::tempdir().unwrap();
+    std::fs::create_dir(root.path().join("src")).unwrap();
+    std::fs::write(root.path().join("Cargo.toml"), "[package]\nname = \"sparse\"\nversion = \"0.1.0\"\nedition = \"2024\"\n").unwrap();
+    std::fs::write(root.path().join("src/lib.rs"), "pub mod model;\npub mod consumer;\n").unwrap();
+    std::fs::write(root.path().join("src/model.rs"), "pub struct Item;\n").unwrap();
+    let design = design(&[("src/consumer.rs", "use crate::model::Item;\npub struct Consumer { pub item: Item }\n")]);
+    let mut resolver = DeclarationResolver::local(root.path(), &design, false).unwrap();
+    let report = resolver.validate(&design);
+    report.ensure_valid().unwrap();
+    let result = resolver.at("src/consumer.rs", 2, 32);
+    assert!(matches!(result, DeclarationResolution::Resolved { ref destination } if destination.path.ends_with("model.rs")), "{result:?}");
+    assert_eq!(design.proposed.len(), 1);
+    assert!(design.baseline.is_empty());
+}
+
+#[test]
 fn external_module_navigation_selects_the_module_file() {
     let root = tempfile::tempdir().unwrap();
     for (declaration, destination) in [

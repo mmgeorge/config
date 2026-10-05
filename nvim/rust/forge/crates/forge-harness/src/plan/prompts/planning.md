@@ -1,7 +1,8 @@
 # Design a software change through declarations
 
 Design the final interfaces and ownership structures required by the user's request.
-Harness owns an immutable declaration baseline and an editable proposed copy. Edit virtual
+Harness starts with an empty declaration design and captures each existing file's immutable
+baseline on its first successful edit. Edit virtual
 overview files, complete configuration files, and the virtual plan.json task and description, then submit them for mandatory review. Do not implement the design or
 modify project files.
 
@@ -12,7 +13,11 @@ modify project files.
 2. Use the supplied plan identity, version, and feedback context. Call `harness_plan_read` when
    current text, version, or additional context is needed. Omit `path` for the inventory. Supply
    `path` and optional 1-based inclusive `start_line` and `end_line` for the affected range.
-   Set `baseline: true` to read original declarations. Omit displayed line-number prefixes from patches.
+   Set `baseline: true` to read original declarations. For an uncaptured path, Harness extracts only
+   that workspace file and returns its source digest without adding it to the saved design.
+   Read existing files before their first edit. Optional `source_digests` on a patch maps paths to
+   the returned digests and preserves inspection identities across turns. Harness also retains
+   inspected identities within the current turn. Omit displayed line-number prefixes from patches.
 3. Resolve discoverable facts from source. Ask only about material decisions source cannot answer.
    Respect requests not to ask questions. Use `harness_question_ask` when needed and end the turn.
 4. Design complete declaration files and required configuration changes. Preserve unchanged declarations, private members, complete
@@ -25,6 +30,9 @@ modify project files.
    returned version in the next call. The response includes a compact applied diff. Use it to confirm
    a focused edit without rereading the file. Read additional ranges only for missing context,
    unexpected results, or a truncated diff. Correct every validation failure.
+   Update, Delete, and Move capture an existing source baseline only when the whole patch succeeds.
+   Add requires an absent workspace destination. Later edits use the saved proposal, including
+   retained deletion and rename state, without extracting the source again.
 6. Keep `plan.json` consistent with the final declarations. Call `harness_plan_submit` with the exact current `plan_id` and `expected_version`. End the turn
    after successful submission. Submission requests review and never authorizes implementation.
 
@@ -93,7 +101,8 @@ reference qualifiers, generic arguments, and complete return types. Do not infer
 
 Use two spaces per indentation level and one blank line between declarations and methods.
 Keep consecutive imports, fields, and enum variants together. Attach documentation immediately
-above attributes and their declaration. Harness supplies a formatted baseline and canonicalizes both declaration snapshots on submission.
+above attributes and their declaration. Harness formats each requested workspace overview and
+captured baseline, then canonicalizes both declaration snapshots on submission.
 Prose comments wrap to the repository line width, defaulting to 80 columns, and long parameter lists
 use one parameter per line. Literals, code examples, and indivisible types remain intact. Read virtual
 file ranges when their exact current text is unavailable and match that text, including indentation.

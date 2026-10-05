@@ -288,7 +288,7 @@ impl DeclarationResolver {
     /// Create an isolated lexical snapshot before acquiring external evidence.
     fn snapshot(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
         let workspace = dunce::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
-        let snapshot = if baseline {
+        let mut snapshot: BTreeMap<String, String> = if baseline {
             design
                 .baseline
                 .iter()
@@ -297,13 +297,26 @@ impl DeclarationResolver {
         } else {
             design.proposed.clone()
         };
-        let workspace_files = design
+        let workspace_files: HashSet<String> = design
             .baseline
             .keys()
             .chain(design.proposed.keys())
             .cloned()
             .collect();
         let changed = design.changed_paths().into_iter().collect();
+        let source_paths = snapshot.keys().filter(|path| path.ends_with(".rs")).cloned().collect::<Vec<_>>();
+        for path in source_paths {
+            for directory in Path::new(&path).ancestors().skip(1) {
+                let manifest = directory.join("Cargo.toml").to_string_lossy().replace('\\', "/");
+                if snapshot.contains_key(&manifest) || workspace_files.contains(&manifest) {
+                    continue;
+                }
+                if let Ok(text) = std::fs::read_to_string(workspace.join(&manifest)) {
+                    anyhow::ensure!(text.len() <= 1024 * 1024, "{manifest}: manifest exceeds 1 MiB");
+                    snapshot.insert(manifest, text);
+                }
+            }
+        }
         let mut resolver = Self {
             workspace,
             snapshot,
@@ -360,7 +373,7 @@ impl DeclarationResolver {
         let path = normalize(path);
         if let Ok(relative) = path.strip_prefix(&self.workspace) {
             let key = relative.to_string_lossy().replace('\\', "/");
-            // Every eligible workspace declaration comes from the immutable snapshot.
+            // Captured removals stay absent, while untouched dependencies load on demand.
             if matches!(
                 path.extension().and_then(|extension| extension.to_str()),
                 Some("rs" | "ts" | "tsx" | "mts" | "cts" | "toml" | "json" | "jsonc")

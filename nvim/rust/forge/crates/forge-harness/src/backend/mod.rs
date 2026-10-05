@@ -673,12 +673,28 @@ impl Backend for MockBackend {
             if let Some(document) = request.control_context.as_ref().and_then(|context| context.plan_document.as_ref()).filter(|document| document.design.is_some()) {
                 let path = "src/change.rs";
                 let design = document.design.as_ref().unwrap();
-                let patch = if let Some(text) = design.proposed.get(path) {
+                let mut source_digests = std::collections::BTreeMap::new();
+                let patch = if design.proposed.contains_key(path) || std::path::Path::new(&request.workspace).join(path).is_file() {
+                    let inspected = design.inspect(std::path::Path::new(&request.workspace), Some(path), false)?;
+                    if let Some(digest) = inspected["source_digest"].as_str() {
+                        source_digests.insert(path.into(), digest.into());
+                    }
+                    let text = inspected["text"].as_str().ok_or_else(|| anyhow::anyhow!("mock declaration read has no text"))?;
                     let removed = text.lines().map(|line| format!("-{line}\n")).collect::<String>();
                     format!("*** Begin Patch\n*** Update File: {path}\n@@\n{removed}+pub fn reviewed_change();\n*** End Patch")
                 } else { format!("*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n*** End Patch") };
                 let mut patch = patch;
-                for (path, configuration) in &design.proposed {
+                let mut configuration = design.proposed.clone();
+                for path in ["Cargo.toml", "package.json", "tsconfig.json", "ci.yaml", "App.csproj"] {
+                    if !configuration.contains_key(path) && !design.baseline.contains_key(path)
+                        && std::path::Path::new(&request.workspace).join(path).is_file()
+                    {
+                        let inspected = design.inspect(std::path::Path::new(&request.workspace), Some(path), false)?;
+                        configuration.insert(path.into(), inspected["text"].as_str().unwrap().into());
+                        source_digests.insert(path.into(), inspected["source_digest"].as_str().unwrap().into());
+                    }
+                }
+                for (path, configuration) in &configuration {
                     if forge_diff::syntax::ConfigurationFormat::for_path(path).is_none() { continue; }
                     let updated = configuration.replacen("\"0.1.0\"", "\"0.2.0\"", 1);
                     if updated != *configuration {
@@ -689,8 +705,8 @@ impl Backend for MockBackend {
                 }
                 let metadata = serde_json::to_string_pretty(&design.document)?.lines().map(|line| format!("-{line}\n")).collect::<String>();
                 let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{metadata}+{{\n+  \"task\": \"Revise the registry interface.\",\n+  \"description\": \"Revise the registry interface while preserving its ownership boundary.\"\n+}}\n*** End Patch"));
-                let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Design the requested change".into()) };
-                let proposed = document.patch_design(change.clone())?;
+                let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Design the requested change".into()),source_digests };
+                let proposed = document.patch_design(std::path::Path::new(&request.workspace), change.clone())?;
                 return Ok(BackendOutput {
                     backend_session_id:request.backend_session_id.or(Some("mock-session".into())),
                     design_patch:vec![change],plan_submit:Some(PlanSubmitRequest { plan_id:document.plan_id.clone(),expected_version:proposed.version }),

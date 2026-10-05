@@ -70,6 +70,9 @@ pub struct DeclarationRevision {
     pub plan_id: String,
     pub revision: u32,
     pub document_diff: String,
+    /// Selects newly captured source baselines instead of the preceding proposal.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub baseline_paths: std::collections::BTreeSet<String>,
 }
 
 /// Retains one child-agent row at the position where the child first spawned.

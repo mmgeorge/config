@@ -3410,7 +3410,7 @@ Planning continuation: turn {} of {}.",
             }
             for request in std::mem::take(&mut output.design_patch) {
                 let document = self.plan_file.read_working_document(&self.session.id, &plan.id)?;
-                let updated = document.patch_design(request)?;
+                let updated = document.patch_design(Path::new(&self.session.workspace), request)?;
                 self.plan_file.write_working_document(&self.session.id, &plan.id, &updated)?;
                 if plan.state == PlanState::AwaitingReview {
                     PlanStateMachine::apply(&mut plan, PlanEvent::ChangesRequested, self.clock.now_ms())?;
@@ -3502,7 +3502,7 @@ Planning continuation: turn {} of {}.",
                 let (diff_text, declaration) = if document.design.is_some() {
                     let delta = crate::plan::revision::DeclarationDelta::between(previous_document.as_ref(), &document)?;
                     (delta.files, Some(crate::exchange::DeclarationRevision {
-                        plan_id: plan.id.clone(), revision: plan.model_revision, document_diff: delta.document,
+                        plan_id: plan.id.clone(), revision: plan.model_revision, document_diff: delta.document, baseline_paths: delta.baseline_paths,
                     }))
                 } else {
                     let previous_markdown = previous_document.as_ref().map(|document|
@@ -7827,8 +7827,8 @@ mod test {
         let patch = if let Some(previous) = design.proposed.get(path) {
             format!("*** Begin Patch\n*** Update File: {path}\n@@\n{}{}*** End Patch",previous.lines().map(|line| format!("-{line}\n")).collect::<String>(),text.lines().map(|line| format!("+{line}\n")).collect::<String>())
         } else { format!("*** Begin Patch\n*** Add File: {path}\n{}*** End Patch",text.lines().map(|line| format!("+{line}\n")).collect::<String>()) };
-        let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Migration plan".into()) };
-        let changed = document.patch_design(change.clone()).unwrap();
+        let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Migration plan".into()),source_digests:Default::default() };
+        let changed = document.patch_design(Path::new(&request.workspace), change.clone()).unwrap();
         output.design_patch.push(change);
         output.plan_submit = Some(crate::backend::PlanSubmitRequest { plan_id:document.plan_id.clone(),expected_version:changed.version });
     }

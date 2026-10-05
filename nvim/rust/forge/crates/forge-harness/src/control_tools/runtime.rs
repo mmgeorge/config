@@ -5,7 +5,7 @@ use crate::plan::{
 };
 use crate::rustdoc::{RustdocResolver, validate_plan_rust_api};
 use anyhow::{Context, Result};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -71,6 +71,8 @@ pub struct ControlToolRuntime {
     context: ControlTurnContext,
     plan_document: Option<PlanDocument>,
     terminal: bool,
+    inspected: BTreeMap<String, String>,
+    patch_source_digests: BTreeMap<u64, BTreeMap<String, String>>,
 }
 
 /// Returns one accepted invocation or an idempotent provider-visible result.
@@ -87,6 +89,8 @@ impl ControlToolRuntime {
             plan_document: context.plan_document.clone(),
             context,
             terminal: false,
+            inspected: BTreeMap::new(),
+            patch_source_digests: BTreeMap::new(),
         }
     }
 
@@ -100,7 +104,7 @@ impl ControlToolRuntime {
     /// Execute one control invocation from arguments decoded by the provider boundary.
     pub(crate) async fn invoke_decoded(
         &mut self,
-        invocation: ControlToolInvocation,
+        mut invocation: ControlToolInvocation,
         mut output: BackendOutput,
     ) -> Result<ControlToolResult> {
         anyhow::ensure!(
@@ -111,9 +115,20 @@ impl ControlToolRuntime {
             "harness_design_apply_patch" => {
                 self.require_readable_plan()?;
                 anyhow::ensure!(!self.context.has_active_elicitation, "resolve pending Harness questions before editing the design");
-                let request = output.design_patch.pop().context("design patch has no request")?;
+                let mut request = output.design_patch.pop().context("design patch has no request")?;
                 let document = self.plan_document.as_ref().context("design patch has no active design")?;
-                let updated = document.patch_design(request)?;
+                let workspace = self.context.workspace_root.as_deref().context("design patch has no workspace root")?;
+                for (path, digest) in &self.inspected {
+                    request.source_digests.entry(path.clone()).or_insert_with(|| digest.clone());
+                }
+                let updated = document.patch_design(workspace, request.clone())?;
+                for (path, file) in &updated.design.as_ref().unwrap().baseline {
+                    if !document.design.as_ref().unwrap().baseline.contains_key(path) {
+                        request.source_digests.insert(path.clone(), file.source_digest.clone());
+                    }
+                }
+                self.patch_source_digests.insert(request.expected_version, request.source_digests.clone());
+                invocation.arguments["source_digests"] = serde_json::to_value(&request.source_digests)?;
                 let delta = crate::plan::revision::DeclarationDelta::between(Some(document), &updated)?;
                 let mut confirmation = format!("{}{}", delta.document, delta.files);
                 const MAX_CONFIRMATION_BYTES: usize = 16 * 1024;
@@ -177,7 +192,13 @@ impl ControlToolRuntime {
                     "requested plan id does not match the active plan"
                 );
                 let message = if let Some(design) = &document.design {
-                        read_design(document, design, &invocation.arguments)?
+                        let workspace = self.context.workspace_root.as_deref().context("design read has no workspace root")?;
+                        let file = design.inspect(workspace, invocation.arguments.get("path").and_then(serde_json::Value::as_str), invocation.arguments.get("baseline").and_then(serde_json::Value::as_bool).unwrap_or(false))?;
+                        let message = read_design(document, &file, &invocation.arguments)?;
+                        if let (Some(path), Some(digest)) = (file["path"].as_str(), file["source_digest"].as_str()) {
+                            self.inspected.insert(path.into(), digest.into());
+                        }
+                        message
                     } else { document.model_json()? };
                 Ok(ControlToolResult { invocation: Some(invocation), message })
             }
@@ -320,6 +341,11 @@ impl ControlToolRuntime {
         self.plan_document.as_ref()
     }
 
+    /// Retain first-capture identities when transports collect a patch for broker replay.
+    pub(crate) fn patch_source_digests(&self, version: u64) -> Option<&BTreeMap<String, String>> {
+        self.patch_source_digests.get(&version)
+    }
+
     fn require_editable_plan(&self) -> Result<()> {
         self.require_readable_plan()?;
         anyhow::ensure!(
@@ -356,13 +382,12 @@ impl ControlToolRuntime {
 }
 
 /// Presents an exact declaration range without JSON escaping or implementation bodies.
-fn read_design(document: &PlanDocument, design: &crate::plan::DeclarationDesign, arguments: &serde_json::Value) -> Result<String> {
+fn read_design(document: &PlanDocument, file: &serde_json::Value, arguments: &serde_json::Value) -> Result<String> {
     use std::fmt::Write;
     let path = arguments.get("path").and_then(serde_json::Value::as_str);
     let start = arguments.get("start_line").and_then(serde_json::Value::as_u64);
     let end = arguments.get("end_line").and_then(serde_json::Value::as_u64);
     anyhow::ensure!(path.is_some() || (start.is_none() && end.is_none()), "line ranges require a file path");
-    let file = design.read(path, arguments.get("baseline").and_then(serde_json::Value::as_bool).unwrap_or(false))?;
     let Some(path) = path else {
         return Ok(serde_json::to_string(&serde_json::json!({"plan_id":document.plan_id,"version":document.version,"file":file}))?);
     };
@@ -375,6 +400,9 @@ fn read_design(document: &PlanDocument, design: &crate::plan::DeclarationDesign,
     let end = end.min(total as u64);
     let side = file["side"].as_str().unwrap_or("proposed");
     let mut message = format!("Plan {} · version {}\n{path} ({side}) · lines {start}-{end} of {total}\n", document.plan_id, document.version);
+    if let Some(digest) = file["source_digest"].as_str() {
+        writeln!(message, "Source digest: {digest} (uncaptured workspace file)")?;
+    }
     for (index, line) in text.lines().enumerate().skip(start.saturating_sub(1) as usize).take(end.saturating_sub(start).saturating_add(1) as usize) {
         writeln!(message, "{}: {line}", index + 1)?;
     }
@@ -385,6 +413,34 @@ fn read_design(document: &PlanDocument, design: &crate::plan::DeclarationDesign,
 mod test {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn uncaptured_reads_guard_first_edits_and_preserve_broker_replay_identity() {
+        let mut context = planning_context();
+        let workspace = context.workspace_root.clone().unwrap();
+        std::fs::write(workspace.join("Foo.rs"), "pub struct Foo;\n").unwrap();
+        context.plan_document.as_mut().unwrap().design = Some(crate::plan::DeclarationDesign::open(&workspace).unwrap());
+        let initial = context.plan_document.clone().unwrap();
+        let mut runtime = ControlToolRuntime::new(context);
+        let read = ControlToolInvocation { name: "harness_plan_read".into(), arguments: json!({"plan_id":"plan","path":"Foo.rs"}) };
+        let inspected = runtime.invoke(read.clone()).await.unwrap();
+        assert!(inspected.message.contains("Source digest:"));
+        assert_eq!(runtime.plan_document(), Some(&initial));
+        let edit = ControlToolInvocation { name: "harness_design_apply_patch".into(), arguments: json!({"plan_id":"plan","expected_version":1,"patch":"*** Begin Patch\n*** Update File: Foo.rs\n@@\n-pub struct Foo;\n+pub struct Revised;\n*** End Patch"}) };
+        std::fs::write(workspace.join("Foo.rs"), "pub struct Foo;\n// Concurrent implementation edit\n").unwrap();
+        assert!(runtime.invoke(edit.clone()).await.unwrap_err().to_string().contains("changed since inspection"));
+        assert_eq!(runtime.plan_document(), Some(&initial));
+        runtime.invoke(read).await.unwrap();
+        let accepted = runtime.invoke(edit).await.unwrap().invocation.unwrap();
+        let mut output = BackendOutput::default();
+        apply_invocation(&accepted, &mut output).unwrap();
+        let request = output.design_patch.pop().unwrap();
+        assert!(request.source_digests.contains_key("Foo.rs"));
+        let replayed = initial.patch_design(&workspace, request.clone()).unwrap();
+        assert_eq!(runtime.plan_document(), Some(&replayed));
+        std::fs::write(workspace.join("Foo.rs"), "pub struct Foo;\n// Changed after acknowledgement\n").unwrap();
+        assert!(initial.patch_design(&workspace, request).is_err());
+    }
 
     fn planning_context() -> ControlTurnContext {
         let cache_dir = tempfile::tempdir().unwrap().keep();

@@ -25,8 +25,8 @@ fn file_action(path: &str, line: usize, previous: bool, declaration: Option<(&cr
     match declaration {
         Some((declaration, document)) => TranscriptAction::Declaration {
             plan_id: declaration.plan_id.clone(),
-            revision: if previous && declaration.revision > 1 { declaration.revision - 1 } else { declaration.revision },
-            baseline: previous && declaration.revision == 1,
+            revision: if previous && declaration.revision > 1 && !declaration.baseline_paths.contains(path) { declaration.revision - 1 } else { declaration.revision },
+            baseline: previous && (declaration.revision == 1 || declaration.baseline_paths.contains(path)),
             path: path.into(), line, document,
         },
         None => TranscriptAction::File { path: path.into(), line },
@@ -565,7 +565,7 @@ fn declaration_changes_navigate_immutable_sides_including_removed_rows() {
     let renderer = TranscriptRenderer::new(&width).unwrap();
     let diff = "diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-pub struct Before;\n+pub struct After;\ndiff --git a/gone.rs b/gone.rs\ndeleted file mode 100644\n--- a/gone.rs\n+++ /dev/null\n@@ -1 +0,0 @@\n-pub struct Gone;\n";
     for revision in [1, 3] {
-        let declaration = crate::exchange::DeclarationRevision { plan_id: "plan".into(), revision, document_diff: String::new() };
+        let declaration = crate::exchange::DeclarationRevision { plan_id: "plan".into(), revision, document_diff: String::new(), baseline_paths: Default::default() };
         let tree = ChangeTree::render(&renderer, "declaration", "Proposed changes", "", diff, None, Some((&declaration, false))).unwrap();
         assert_eq!(tree.block[0].text.row(0), Some("▸ Proposed changes 2 files +1 -2"));
         assert!(!tree.action.values().any(|action| matches!(action, TranscriptAction::File { .. })));
@@ -576,4 +576,11 @@ fn declaration_changes_navigate_immutable_sides_including_removed_rows() {
             TranscriptAction::Declaration { path, revision: target, baseline: false, .. }
                 if path == "lib.rs" && *target == revision)));
     }
+    let declaration = crate::exchange::DeclarationRevision {
+        plan_id: "plan".into(), revision: 3, document_diff: String::new(),
+        baseline_paths: ["gone.rs".into()].into(),
+    };
+    let tree = ChangeTree::render(&renderer, "lazy", "Proposed changes", "", diff, None, Some((&declaration, false))).unwrap();
+    assert!(tree.action.values().any(|action| matches!(action,
+        TranscriptAction::Declaration { path, revision: 3, baseline: true, line: 1, .. } if path == "gone.rs")));
 }
