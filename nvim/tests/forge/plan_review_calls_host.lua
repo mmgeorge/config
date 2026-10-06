@@ -60,9 +60,39 @@ local success, failure = xpcall(function()
   end
   assert(properties and #properties == 2 and properties[1].kind == "property" and properties[2].kind == "property")
   assert(properties[1].name == "Client::count" and properties[2].name == "Client::count")
+  local original_columns = vim.o.columns
+  vim.o.columns = 48
   require("forge.views.plan_review").open(state.active_plan)
   await(function() return state.plan_review and state.plan_review.owner.ready end, "PlanReview did not open")
   local review = state.plan_review
+  local description_row
+  local paragraph = vim.split(document.design.document.description, "\n", { plain = true })[1]
+  for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if row == paragraph then description_row = index break end
+  end
+  assert(description_row, "PlanReview hard-wrapped the saved description paragraph")
+  assert(vim.wo[review.win].wrap and vim.wo[review.win].linebreak, "PlanReview does not use native word wrapping")
+  vim.o.columns = 160
+  vim.cmd("vsplit")
+  local split_window = vim.api.nvim_get_current_win()
+  local before_resize = vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)
+  local function paragraph_height(window)
+    return vim.api.nvim_win_text_height(window, { start_row = description_row - 1, end_row = description_row - 1 }).all
+  end
+  vim.api.nvim_win_set_width(review.win, 110)
+  vim.cmd("redraw!")
+  local wide_height = paragraph_height(review.win)
+  assert(paragraph_height(split_window) > wide_height, "same-buffer split did not wrap the paragraph at its own width")
+  vim.api.nvim_win_set_width(review.win, 40)
+  vim.cmd("redraw!")
+  assert(paragraph_height(review.win) > wide_height, "narrowing PlanReview did not reflow its paragraph")
+  vim.api.nvim_win_set_width(review.win, 110)
+  vim.cmd("redraw!")
+  assert(paragraph_height(review.win) == wide_height, "widening PlanReview retained obsolete line breaks")
+  assert(vim.deep_equal(before_resize, vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)), "resize rewrote physical plan rows")
+  vim.api.nvim_set_current_win(review.win)
+  vim.api.nvim_win_close(split_window, true)
+  vim.o.columns = original_columns
   local reference_binding = vim.api.nvim_buf_call(review.buf, function() return vim.fn.maparg("of", "n", false, true) end)
   local plan_reference_binding = vim.api.nvim_buf_call(review.buf, function() return vim.fn.maparg("or", "n", false, true) end)
   assert(reference_binding.buffer == 1 and type(reference_binding.callback) == "function", "LSP reference shortcut is not owned by the plan buffer")

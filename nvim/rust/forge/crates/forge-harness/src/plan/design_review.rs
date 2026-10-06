@@ -53,9 +53,7 @@ pub(super) fn project(
         if row.id.0.starts_with("plan:description:") || row.id.0.starts_with("plan:task:") {
             row = forge_buffer::markdown::MarkdownRenderer::source(
                 row.id.clone(),
-                &width
-                    .wrap_plain(&row.text.wire_rows().join("\n"), 0)?
-                    .join("\n"),
+                &row.text.wire_rows().join("\n"),
                 width,
             )?
             .block;
@@ -993,10 +991,10 @@ mod tests {
                 body: "Confirm the cancellation lifecycle".into(),
             },
         };
-        for public_only in [false, true] {
+        for (public_only, columns) in [(false, 40), (true, 40), (false, 120), (true, 120)] {
             let (block, target) = project(
                 &document,
-                &WidthProfile::default(),
+                &WidthProfile { columns, ..WidthProfile::default() },
                 &[annotation.clone()],
                 &HashMap::new(),
                 None,
@@ -1010,7 +1008,11 @@ mod tests {
                 .iter()
                 .find(|block| block.id.0 == "plan:description:0")
                 .unwrap();
-            assert!(description.text.row_count() > 1);
+            assert_eq!(description.text.row_count(), 1);
+            assert_eq!(
+                description.text.row(0),
+                Some(document.design.as_ref().unwrap().document.description.as_str()),
+            );
             let header = block
                 .iter()
                 .find(|block| block.id.0 == "plan:section:description")

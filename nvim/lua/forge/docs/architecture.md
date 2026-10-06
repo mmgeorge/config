@@ -2085,6 +2085,10 @@ exclude plan metadata. Submission requires both fields to be nonempty, with at m
 Review renders the task, description, and declaration diff under `Task:`, `Description:`, and `Changes:`. All
 sections start expanded and use the shared fold-header constructor and native Tab behavior, with
 independent file and hunk folds below Changes. Section endpoints include wrapped text and comments.
+Task and Description retain their complete saved source rows. Neovim owns soft word wrapping in
+each window, so resizing or opening a split reflows paragraphs without reprojecting source rows,
+changing canonical text, or moving comment anchors. The review projection must not hard-wrap these
+fields to the width captured when the review opens.
 Rust, TypeScript, TSX, and Lua source capture extracts declarations and call occurrences from one
 Tree-sitter parse of the requested file. An in-memory cache keys capture results by path, source
 digest, and line width, with at most 16 entries before eviction. Inspection still rereads and checks
