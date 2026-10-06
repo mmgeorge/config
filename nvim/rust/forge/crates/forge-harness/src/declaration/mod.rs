@@ -874,31 +874,236 @@ impl DeclarationResolver {
         self.resolve_reference(&file, &reference, true)
     }
 
-    /// Resolve a call target in its caller's lexical declaration scope.
-    pub(crate) fn callable(&mut self, path: &str, owner: &str, name: &str) -> DeclarationResolution {
+    /// Resolve a named property through its declaring type without method-name fallback.
+    pub(crate) fn property(
+        &mut self,
+        path: &str,
+        owner: &str,
+        name: &str,
+    ) -> DeclarationResolution {
+        let separator = if path.ends_with(".rs") { "::" } else { "." };
+        let parts = name.split(separator).map(str::to_owned).collect::<Vec<_>>();
+        let Some((member, container)) = parts
+            .split_last()
+            .filter(|(_, container)| !container.is_empty())
+        else {
+            return unverified("property access has no resolved declaring type");
+        };
+        let scope = owner
+            .split(separator)
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
         let absolute = normalize(&self.workspace.join(path));
-        let Some(file) = self.file.get(&absolute).cloned() else { return unverified("caller has no declaration index"); };
+        if let Some(file) = self.file.get(&absolute).cloned() {
+            let reference = DeclarationReference {
+                path: parts.clone(),
+                scope: scope.clone(),
+                position: forge_diff::syntax::DeclarationPosition { line: 1, column: 0 },
+                length: name.len(),
+                value_namespace: true,
+                macro_namespace: false,
+                conditional: false,
+            };
+            let resolution = self.resolve_reference(&file, &reference, true);
+            if let DeclarationResolution::Resolved { destination } = &resolution {
+                if self
+                    .file
+                    .get(Path::new(&destination.path))
+                    .is_some_and(|file| {
+                        file.index.symbol.iter().any(|symbol| {
+                            (symbol.property || !path.ends_with(".rs") && symbol.value_namespace)
+                                && symbol.position.line == destination.line
+                                && symbol.position.column == destination.column
+                        })
+                    })
+                {
+                    return resolution;
+                }
+            }
+        }
+        let DeclarationResolution::Resolved { destination } =
+            self.type_target(path, &scope, container)
+        else {
+            return unverified("property receiver type cannot be resolved");
+        };
+        self.property_member(
+            &destination,
+            member,
+            path.ends_with(".rs"),
+            &mut HashMap::new(),
+        )
+    }
+
+    fn property_member(
+        &mut self,
+        destination: &DeclarationDestination,
+        name: &str,
+        rust: bool,
+        owner_resolution: &mut HashMap<(String, u32, u32), Option<DeclarationResolution>>,
+    ) -> DeclarationResolution {
+        let key = (
+            destination.path.clone(),
+            destination.line,
+            destination.column,
+        );
+        if let Some(resolution) = owner_resolution.get(&key) {
+            return resolution
+                .clone()
+                .unwrap_or_else(|| unverified("cyclic member ownership"));
+        }
+        if owner_resolution.len() >= 128 {
+            return unverified("member ownership exceeds its 128 type budget");
+        }
+        owner_resolution.insert(key.clone(), None);
+        let result = (|| {
+            let Some(file) = self.file.get(Path::new(&destination.path)).cloned() else {
+                return unverified("property receiver declaration is unavailable");
+            };
+            let Some(declaration) = file.index.symbol.iter().find(|symbol| {
+                symbol.position.line == destination.line
+                    && symbol.position.column == destination.column
+            }) else {
+                return unverified("property receiver has no unique declaration");
+            };
+            let mut scope = declaration.scope.clone();
+            scope.push(declaration.name.clone());
+            let candidates = file
+                .index
+                .symbol
+                .iter()
+                .filter(|symbol| {
+                    (symbol.property || !rust && symbol.value_namespace)
+                        && symbol.scope == scope
+                        && symbol.name == name
+                })
+                .map(|symbol| {
+                    if symbol.conditional {
+                        unverified("member is conditionally declared")
+                    } else {
+                        resolved(&file, symbol)
+                    }
+                })
+                .collect::<Vec<_>>();
+            if !candidates.is_empty() {
+                return combine(candidates, || unverified("member cannot be resolved"), true);
+            }
+            let owners = file
+                .index
+                .member_owner
+                .iter()
+                .filter(|owner| owner.scope == scope)
+                .collect::<Vec<_>>();
+            if owners.iter().any(|owner| owner.incomplete) {
+                return unverified("member owner has unsupported alias or inheritance syntax");
+            }
+            let mut results = Vec::new();
+            for reference in owners.iter().flat_map(|owner| &owner.base) {
+                let resolution = self.resolve_reference(&file, reference, true);
+                results.push(match resolution {
+                    DeclarationResolution::Resolved { destination } => {
+                        self.property_member(&destination, name, rust, owner_resolution)
+                    }
+                    _ => resolution,
+                });
+            }
+            combine(
+                results,
+                || {
+                    if file.index.incomplete {
+                        unverified("receiver member declarations are incomplete")
+                    } else {
+                        invalid("no member on the resolved receiver type matches this name")
+                    }
+                },
+                false,
+            )
+        })();
+        owner_resolution.insert(key, Some(result.clone()));
+        result
+    }
+
+    /// Resolve a call target in its caller's lexical declaration scope.
+    pub(crate) fn callable(
+        &mut self,
+        path: &str,
+        owner: &str,
+        name: &str,
+    ) -> DeclarationResolution {
+        let absolute = normalize(&self.workspace.join(path));
+        let Some(file) = self.file.get(&absolute).cloned() else {
+            return unverified("caller has no declaration index");
+        };
         let separator = if path.ends_with(".rs") { "::" } else { "." };
         let name = name.split("::<").next().unwrap_or(name);
         let reference = DeclarationReference {
-            path: name.replace(':', if path.ends_with(".rs") { ":" } else { "." }).split(separator).map(str::to_owned).collect(),
+            path: name
+                .replace(':', if path.ends_with(".rs") { ":" } else { "." })
+                .split(separator)
+                .map(str::to_owned)
+                .collect(),
             position: forge_diff::syntax::DeclarationPosition { line: 1, column: 0 },
-            length: name.len(), scope: owner.split(separator).map(str::to_owned).collect(),
-            value_namespace: true, macro_namespace: false, conditional: false,
+            length: name.len(),
+            scope: owner.split(separator).map(str::to_owned).collect(),
+            value_namespace: true,
+            macro_namespace: false,
+            conditional: false,
         };
         let result = self.resolve_reference(&file, &reference, true);
-        if !path.ends_with(".rs") || matches!(result, DeclarationResolution::Resolved { .. } | DeclarationResolution::Ambiguous { .. }) || reference.path.len() < 2 { return result; }
+        let property = match &result {
+            DeclarationResolution::Resolved { destination } => self
+                .file
+                .get(Path::new(&destination.path))
+                .is_some_and(|file| {
+                    file.index.symbol.iter().any(|symbol| {
+                        symbol.property
+                            && symbol.position.line == destination.line
+                            && symbol.position.column == destination.column
+                    })
+                }),
+            _ => false,
+        };
+        if !path.ends_with(".rs")
+            || matches!(result, DeclarationResolution::Ambiguous { .. })
+            || matches!(result, DeclarationResolution::Resolved { .. }) && !property
+            || reference.path.len() < 2
+        {
+            return result;
+        }
         let mut container = reference.clone();
         let member = container.path.pop().unwrap();
         container.value_namespace = false;
-        let DeclarationResolution::Resolved { destination } = self.resolve_reference(&file, &container, true) else { return result; };
-        let Some(target) = self.file.get(std::path::Path::new(&destination.path)) else { return result; };
-        let Some(owner) = target.index.symbol.iter().find(|symbol| symbol.position.line == destination.line && symbol.position.column == destination.column) else { return result; };
+        let DeclarationResolution::Resolved { destination } =
+            self.resolve_reference(&file, &container, true)
+        else {
+            return result;
+        };
+        let Some(target) = self.file.get(std::path::Path::new(&destination.path)) else {
+            return result;
+        };
+        let Some(owner) = target.index.symbol.iter().find(|symbol| {
+            symbol.position.line == destination.line && symbol.position.column == destination.column
+        }) else {
+            return result;
+        };
         let mut scope = owner.scope.clone();
         scope.push(owner.name.clone());
-        let candidates = target.index.symbol.iter().filter(|symbol| symbol.name == member && symbol.value_namespace && !symbol.conditional && symbol.scope.starts_with(&scope)
-            && symbol.scope.len() == scope.len() + 1 && symbol.scope.last().is_some_and(|scope| scope.contains("impl")))
-            .map(|symbol| resolved(target, symbol)).collect::<Vec<_>>();
+        let candidates = target
+            .index
+            .symbol
+            .iter()
+            .filter(|symbol| {
+                symbol.name == member
+                    && symbol.value_namespace
+                    && !symbol.conditional
+                    && symbol.scope.starts_with(&scope)
+                    && symbol.scope.len() == scope.len() + 1
+                    && symbol
+                        .scope
+                        .last()
+                        .is_some_and(|scope| scope.contains("impl"))
+            })
+            .map(|symbol| resolved(target, symbol))
+            .collect::<Vec<_>>();
         combine(candidates, || result, true)
     }
 

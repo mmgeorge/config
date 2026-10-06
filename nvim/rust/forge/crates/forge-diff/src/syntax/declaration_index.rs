@@ -17,6 +17,8 @@ pub enum SymbolVisibility {
 /// A named declaration with its lexical scope and exact source position.
 #[derive(Clone, Debug)]
 pub struct DeclarationSymbol {
+    /// Distinguishes named fields and properties from callable and type declarations.
+    pub property: bool,
     pub name: String,
     pub scope: Vec<String>,
     pub position: DeclarationPosition,
@@ -66,6 +68,17 @@ pub struct DeclarationModule {
     pub conditional: bool,
 }
 
+/// Explicit alias or inheritance evidence for a type's named members.
+#[derive(Clone, Debug)]
+pub struct DeclarationMemberOwner {
+    /// Scope including the declaring type name.
+    pub scope: Vec<String>,
+    /// Base types resolved from the declaration's surrounding lexical scope.
+    pub base: Vec<DeclarationReference>,
+    /// Unsupported base syntax prevents inferred member resolution.
+    pub incomplete: bool,
+}
+
 /// Body-free symbol evidence extracted from one source or declaration document.
 #[derive(Clone, Debug, Default)]
 pub struct DeclarationIndex {
@@ -73,6 +86,7 @@ pub struct DeclarationIndex {
     pub reference: Vec<DeclarationReference>,
     pub import: Vec<DeclarationImport>,
     pub module: Vec<DeclarationModule>,
+    pub member_owner: Vec<DeclarationMemberOwner>,
     pub external_module: bool,
     pub incomplete: bool,
     pub no_std: bool,
@@ -246,6 +260,117 @@ fn visibility(node: Node<'_>, source: &str, exported: bool, rust: bool) -> Symbo
         "" => SymbolVisibility::Private,
         _ => SymbolVisibility::Crate,
     }
+}
+
+fn member_owner(
+    node: Node<'_>,
+    source: &str,
+    language: SyntaxLanguage,
+    scope: &[String],
+    name: &str,
+    conditional: bool,
+) -> Option<DeclarationMemberOwner> {
+    let mut base = Vec::new();
+    let mut incomplete = false;
+    match node.kind() {
+        "type_alias_declaration" | "type_item" => {
+            if let Some(value) = node
+                .child_by_field_name("value")
+                .or_else(|| node.child_by_field_name("type"))
+            {
+                if value.kind() != "object_type" {
+                    base.push(value);
+                }
+            } else {
+                incomplete = true;
+            }
+        }
+        "interface_declaration" => {
+            for clause in children(node)
+                .into_iter()
+                .filter(|child| child.kind() == "extends_type_clause")
+            {
+                base.extend(children(clause));
+            }
+        }
+        "class_declaration" | "abstract_class_declaration" => {
+            for heritage in children(node)
+                .into_iter()
+                .filter(|child| child.kind() == "class_heritage")
+            {
+                for clause in children(heritage)
+                    .into_iter()
+                    .filter(|child| child.kind() == "extends_clause")
+                {
+                    if let Some(value) = clause.child_by_field_name("value").or_else(|| {
+                        children(clause)
+                            .into_iter()
+                            .find(|child| child.kind() != "type_arguments")
+                    }) {
+                        base.push(value);
+                    } else {
+                        incomplete = true;
+                    }
+                }
+            }
+        }
+        _ => return None,
+    }
+    let mut reference = Vec::new();
+    for mut target in base.into_iter().filter(|target| !target.is_extra()) {
+        if matches!(
+            target.kind(),
+            "generic_type" | "generic_type_with_turbofish"
+        ) {
+            if let Some(name) = target
+                .child_by_field_name("name")
+                .or_else(|| target.child_by_field_name("type"))
+            {
+                target = name;
+            } else {
+                incomplete = true;
+                continue;
+            }
+        }
+        if !matches!(
+            target.kind(),
+            "identifier"
+                | "type_identifier"
+                | "nested_type_identifier"
+                | "scoped_type_identifier"
+                | "scoped_identifier"
+                | "member_expression"
+        ) {
+            incomplete = true;
+            continue;
+        }
+        let text = contents(target, source);
+        let path = text
+            .split(if language == SyntaxLanguage::Rust {
+                "::"
+            } else {
+                "."
+            })
+            .map(str::trim)
+            .map(str::to_owned)
+            .collect();
+        reference.push(DeclarationReference {
+            path,
+            position: position(target),
+            length: text.len(),
+            scope: scope.to_vec(),
+            value_namespace: false,
+            macro_namespace: false,
+            conditional,
+        });
+    }
+    let mut owner_scope = scope.to_vec();
+    owner_scope.push(name.to_owned());
+    Some(DeclarationMemberOwner {
+        scope: owner_scope,
+        base: reference,
+        incomplete,
+    })
 }
 
 fn walk(
@@ -436,6 +561,9 @@ fn walk(
             if name_text == "global" && !rust {
                 nested.clear();
             } else {
+                if let Some(owner) = member_owner(node, source, language, scope, &name_text, conditional) {
+                    index.member_owner.push(owner);
+                }
                 let parameter = matches!(
                     kind,
                     "type_parameter"
@@ -459,6 +587,7 @@ fn walk(
                         | "associated_type"
                 ) || parameter;
                 index.symbol.push(DeclarationSymbol {
+                    property: matches!(kind, "field_declaration" | "public_field_definition" | "property_signature"),
                     name: name_text.clone(),
                     scope: scope.to_vec(),
                     position: position(name),
@@ -516,6 +645,7 @@ fn walk(
             .find(|child| child.kind() == "type_identifier")
         {
             index.symbol.push(DeclarationSymbol {
+                    property: false,
                 name: contents(name, source).into(),
                 scope: scope.to_vec(),
                 position: position(name),
@@ -572,6 +702,7 @@ fn walk(
             nested.push(owner_text);
             nested.push(synthetic_scope(ordinal, "impl"));
             index.symbol.push(DeclarationSymbol {
+                    property: false,
                 name: "Self".into(),
                 scope: nested.clone(),
                 position: position(owner),
@@ -587,6 +718,7 @@ fn walk(
     }
     if kind == "trait_item" {
         index.symbol.push(DeclarationSymbol {
+                    property: false,
             name: "Self".into(),
             scope: nested.clone(),
             position: position(node),
@@ -771,6 +903,7 @@ fn rust_attribute(node: Node<'_>, source: &str, scope: &[String], conditional: b
         "proc_macro_derive" => {
             if let Some(name) = children(*arguments).into_iter().find(|child| child.kind() == "identifier") {
                 index.symbol.push(DeclarationSymbol {
+                    property: false,
                     name: contents(name, source).into(), scope: scope.to_vec(), position: position(name),
                     visibility: SymbolVisibility::Public, type_namespace: false, value_namespace: false,
                     macro_namespace: true, conditional, global: false, parameter: false,

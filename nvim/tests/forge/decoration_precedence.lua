@@ -14,10 +14,10 @@ local succeeded, failure = xpcall(function()
       capture = 'Capture' .. index, priority = 100,
     }
   end
-  local entry = { metadata = { visible_decoration = spans } }
+  local entry = { metadata = { target = {}, visible_decoration = spans } }
   decorations.prepare(entry)
-  local sequence = {}
-  function sequence:locate() return { id = 'body', entry = entry } end
+  local sequence = { node = { body = { id = 'body', entry = entry } } }
+  function sequence:locate() return self.node.body end
   function sequence:position() return 1, 0 end
   local session = { buffer = 123, status = 'Applied', editable = {}, sequence = sequence }
   decorations.attach(session)

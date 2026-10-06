@@ -10,7 +10,7 @@ mod audit;
 mod design;
 pub(crate) mod calls;
 mod references;
-pub use calls::{CallSite, CallPosition, FunctionCalls};
+pub use calls::{CallKind, CallSite, CallPosition, FunctionCalls};
 mod design_review;
 mod deviation;
 mod document;
@@ -1181,17 +1181,17 @@ mod test {
                 owner: "introduced".into(),
                 call: vec![
                     CallSite {
-                        name: "introduced".into(),
+                        kind: crate::plan::CallKind::Call, name: "introduced".into(),
                         source: None,
                         unresolved: false,
                     },
                     CallSite {
-                        name: "existing".into(),
+                        kind: crate::plan::CallKind::Call, name: "existing".into(),
                         source: None,
                         unresolved: false,
                     },
                     CallSite {
-                        name: "introduced".into(),
+                        kind: crate::plan::CallKind::Call, name: "introduced".into(),
                         source: None,
                         unresolved: false,
                     },
@@ -1314,6 +1314,7 @@ mod test {
             &Default::default(),
             true,
             None,
+            &Default::default(),
         )
         .unwrap();
         let text = rows
@@ -1435,6 +1436,7 @@ mod test {
                 &Default::default(),
                 public_only,
                 None,
+                &Default::default(),
             )
             .unwrap();
             let text = rows

@@ -124,7 +124,7 @@ M.view_specs = {
     { id = "rename_entity", label = "rename", desc = "Rename a symbol introduced by the plan and its uses", modes = "n", pinned = true },
     { id = "references", label = "references", desc = "Find symbol usages in this plan snapshot", modes = "n", pinned = true },
     { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
-    { id = "jump_entity", label = "definition", desc = "Jump to the selected declaration or Calls definition", modes = "n", pinned = true },
+    { id = "jump_entity", label = "definition", desc = "Jump to the selected declaration, call, or property definition", modes = "n", pinned = true },
     { id = "toggle_public", label = "public", desc = "Toggle public-only declarations", modes = "n", pinned = true },
     { id = "toggle", label = "fold", desc = "Toggle the current declaration diff file or hunk", modes = "n", pinned = true },
     { id = "open", label = "open", desc = "Open the declaration snapshot for this diff line", modes = "n", pinned = true },

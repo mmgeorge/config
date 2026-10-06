@@ -22,7 +22,7 @@ pub(crate) fn project(
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     if source.document.design.is_some() {
         let started = Instant::now();
-        let result = super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax,source.public_only,source.trace.as_ref())
+        let result = super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax,source.public_only,source.trace.as_ref(),&source.revealed)
             .and_then(|(block, mut target)| {
                 let block = forge_buffer::collapse::project(block, &source.collapse)?;
                 let visible: std::collections::HashSet<_> = block.iter().flat_map(|block| &block.metadata.target).map(|target| &target.id).collect();
@@ -313,8 +313,33 @@ pub(crate) fn project(
     Ok((block, target))
 }
 
-fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget, text: &str) {
+pub(super) fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget, text: &str) {
     match target {
+        PlanReviewTarget::Call { name, kind, .. } => {
+            let Some(start) = text.find(name) else { return };
+            let member = name.rfind([':', '.', '#']).map_or(0, |column| column + 1);
+            let mut cursor = 0;
+            while cursor < member {
+                let Some(relative) = name[cursor..member].find(|character: char| character.is_alphabetic() || character == '_') else { break };
+                let opening = cursor + relative;
+                let closing = name[opening..member].find(|character: char| !character.is_alphanumeric() && character != '_').map_or(member, |length| opening + length);
+                let identifier = &name[opening..closing];
+                let capture = if identifier.chars().next().is_some_and(char::is_uppercase) {
+                    "@type"
+                } else if name[closing..].starts_with("::") {
+                    "@module"
+                } else {
+                    "@variable"
+                };
+                append_range(metadata, start + opening, start + closing, capture);
+                cursor = closing;
+            }
+            append_range(metadata, start + member, start + name.len(), match kind {
+                super::CallKind::Property => "@variable.member",
+                super::CallKind::Call if member > 0 => "@function.method.call",
+                super::CallKind::Call => "@function.call",
+            });
+        }
         PlanReviewTarget::Task { title } => {
             append_term(metadata, text, title, "ForgeWalkthroughItemTitle", 0)
         }

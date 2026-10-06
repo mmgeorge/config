@@ -2169,11 +2169,43 @@ selected declaration. Rendered rows map to line and byte-column positions in imm
 including members that originally shared a line. Comments persist endpoint targets and rebuild their
 display ranges when reopened. Syntax decorations use formatted coordinates, independently of those
 saved text positions. Annotation persistence, overall feedback, historical review, and revisions remain.
-PlanReview binds `<Space>f` to semantic rename and `.` to definition navigation, including
-Calls entries. Rename reads only saved plan declarations and Calls. The immutable baseline,
+Property accesses extend the existing function-body occurrence pipeline. Each occurrence has
+an invocation or property kind, target name, source position, and unresolved-binding evidence.
+The collector shares receiver inference for dot access and static string indexing and captures
+Rust construction/destructuring field names. The saved occurrence sequence preserves both kinds
+in extraction order. Invocation-only functions retain the `Calls` interface. Functions with
+properties render separate `Calls` and `Accesses` blocks, with Calls first and one bare target per row. Review sorts
+and deduplicates pairs of target name and kind, while editing retains occurrence order and evidence.
+Older plans omit the invocation kind, preserving their serialized bytes and reviewed digests.
+
+The declaration index identifies property definitions separately from methods. Property resolution
+uses the declaring type and the existing member resolver. Explicit alias and inheritance paths
+are stored in the declaration index. Each member lookup caches at most 128 reached type
+definitions, detects cycles, and reuses completed results across inheritance paths. It never
+searches unrelated declarations by property name. A Rust
+field and method sharing a name retain distinct identities. Unknown receivers, dynamic indexes,
+and unavailable member declarations remain unresolved. The native review target carries the kind
+through rename selection, the reverse-reference picker, filtered context, and definition navigation.
+The review presentation places both categories inside a rendered function body. Rust and
+TypeScript signatures replace their terminating semicolon with an opening brace, and Lua
+signatures retain their header with a rendered `end` boundary. The function fold starts at the
+final signature row and includes both categories and the closing delimiter. It starts collapsed,
+showing `fn signature {...}`. Explicit body spans and original declaration-row mappings preserve
+nested declaration folds, visibility, and navigation without parsing rendered body text. The
+editable tool interface and saved declarations retain their signature-only form. Reference extraction
+aggregates unresolved evidence once per occurrence and resolves each unique target/kind once per
+caller. Function-owner lookups use a prebuilt map rather than repeated signature scans. Saved-side
+reference indexes remain cached for the review revision, and no repository-wide capture is added.
+Editable category lists retain order within each kind. Parsing weaves them through the previous
+kind positions to preserve the saved extraction sequence, then appends additional occurrences.
+
+PlanReview binds `or` and the normal LSP-reference shortcut `of` to the plan reference picker.
+Both buffer-local aliases dispatch the same plan action and override their global mappings only
+inside PlanReview. PlanReview binds `<Space>f` to semantic rename and `.` to definition navigation, including
+Calls and property-use entries. Rename reads only saved plan declarations and their structured uses. The immutable baseline,
 including moved files, distinguishes existing source symbols from definitions introduced by
 the proposed snapshot. Only introduced definitions admit rename. It rewrites resolved imports, signature references, qualified type
-prefixes, and Calls occurrences, then derives function owner names again without reordering
+prefixes, and invocation/property occurrences, then derives function owner names again without reordering
 occurrences. Existing source definitions, historical revisions, collisions, and reserved
 identifiers reject the operation. Unresolved local bindings retain their identity.
 
@@ -2184,18 +2216,27 @@ checks the current plan version and digest, and persists one new submitted revis
 revision artifacts, source files, and baseline declarations remain immutable. Definition
 navigation uses the same snapshot identities as references and rename. Existing captured
 functions navigate to their source positions, while new functions navigate to plan definitions.
+A baseline jump uses a saved declaration snapshot only when its destination was captured.
+An uncaptured workspace destination opens its source position without adding it to the plan.
 
 PlanReview binds `or` to snapshot reverse references and `oX` to abort. Reverse references index
-saved Calls, signature types, imports, and explicit legacy task and flow entity references.
+saved invocations and property accesses, signature types, imports, and explicit legacy task and flow entity references.
 Definitions and free prose do not count as usages. Each saved side owns a cached reference index,
 independent of alphabetical display sorting and public filtering. Resolution permits at most 64
 additional dependency files. Unresolved selections retain their resolution reason, separately from
 a resolved symbol with zero usages or an index failure.
-The shared searchable picker opens for every nonempty result set, including one result. Selection
-checks the originating document revision and cursor. A jump expands enclosing folds in the same
-plan buffer. A filtered or omitted destination receives temporary read-only snapshot context with
-Calls folds, without changing the saved design or visibility preference. Temporary context has no
-annotation source line. Historical references use the selected revision's stored relationships.
+The shared searchable picker opens for every nonempty result set, including one result. Its location,
+caller, kind, and symbol columns use the shared display-width layout. Selection checks the document
+revision and cursor, then previews the usage in the plan window without taking picker focus.
+The preview centers the usage and highlights its row and symbol. One request runs at a time, with
+only the latest pending selection retained. Confirmation keeps the preview destination and clears
+its highlights. Cancellation clears highlights and restores the originating viewport.
+The normal diff projection reveals filtered file sides and opens folds containing the usage,
+retaining syntax, gutters, stable targets, and annotation mappings. It creates no appended context
+section and changes neither the saved design nor the visibility preference. Historical references
+use the selected revision's stored relationships. Unchanged referenced files participate in the
+existing dependency order and render as context hunks. Their rows have no canonical annotation
+source line, and including them preserves the saved source positions of changed files.
 
 Acceptance records the reviewed digest and revision and restores the session's ordinary mode. It
 creates no goal, executor, compaction request, or scheduler. The configuration picker omits the former

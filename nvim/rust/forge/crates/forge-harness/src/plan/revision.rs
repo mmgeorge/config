@@ -74,7 +74,7 @@ impl DeclarationDelta {
             ..DeclarationDesign::default()
         };
         let mut patch = Vec::new();
-        for file in super::review_file_layout::order(&delta) {
+        for file in super::review_file_layout::order(&delta, &Default::default()) {
             let before = delta.baseline.get(&file.baseline).map(|source| super::calls::combined(&file.baseline, &source.text, delta.baseline_calls.get(&file.baseline).map(Vec::as_slice).unwrap_or_default())).transpose()?;
             let after = delta.proposed.get(&file.proposed).map(|text| super::calls::combined(&file.proposed, text, delta.proposed_calls.get(&file.proposed).map(Vec::as_slice).unwrap_or_default())).transpose()?;
             write_file(
@@ -159,7 +159,7 @@ mod tests {
         let mut previous = super::super::document::test_fixture("calls", "Calls");
         let mut design = DeclarationDesign::default();
         design.proposed.insert("main.rs".into(), "fn run();\n".into());
-        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionCalls { owner: "run".into(), call: vec![super::super::CallSite { name: "before".into(), source: None, unresolved: false }] }]);
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionCalls { owner: "run".into(), call: vec![super::super::CallSite { kind: crate::plan::CallKind::Call, name: "before".into(), source: None, unresolved: false }] }]);
         previous.design = Some(design);
         let mut current = previous.clone();
         current.design.as_mut().unwrap().proposed_calls.get_mut("main.rs").unwrap()[0].call[0].name = "after".into();

@@ -105,6 +105,8 @@ pub enum PlanReviewTarget {
         column: Option<u32>,
     },
     Call {
+        #[serde(default, skip_serializing_if = "super::CallKind::is_call")]
+        kind: super::CallKind,
         path: String,
         side: String,
         owner: String,

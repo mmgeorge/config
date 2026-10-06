@@ -4,7 +4,7 @@ use super::review_source::PlanReviewSource;
 use anyhow::{Context, Result, ensure};
 use forge_buffer::admission::{DocumentAdmission, DocumentAdmissionStore};
 use forge_buffer::document::BufferDocument;
-use forge_buffer::block::{TextPosition, TextRange};
+use forge_buffer::block::TextPosition;
 use forge_buffer::identity::{DocumentId, InputSequence, TargetId, ViewId};
 use forge_buffer::input::DocumentInput;
 use forge_buffer::patch::BufferSnapshot;
@@ -519,6 +519,7 @@ impl PlanReviewDocument {
                             side,
                             owner,
                             name,
+                            kind: _,
                         } if side == "proposed" => {
                             let separator = if path.ends_with(".rs") { "::" } else { "." };
                             let normalized = if separator == "." {
@@ -578,8 +579,8 @@ impl PlanReviewDocument {
             position.column
         } else { column as u32 };
         let Some(symbol) = index.selected(&selected_anchor, saved_column) else {
-            if let super::PlanReviewTarget::Call { path, owner, name, .. } = &anchor.target {
-                if let Some(reason) = index.unresolved.get(&(path.clone(), owner.clone(), name.clone())) { return Ok(serde_json::json!({"message":reason})); }
+            if let super::PlanReviewTarget::Call { path, owner, name, kind, .. } = &anchor.target {
+                if let Some(reason) = index.unresolved.get(&(path.clone(), owner.clone(), name.clone(), *kind)) { return Ok(serde_json::json!({"message":reason})); }
             }
             return Ok(serde_json::json!({"message":"The selected symbol has no resolved plan identity."}));
         };
@@ -591,51 +592,60 @@ impl PlanReviewDocument {
     fn reveal_reference(&mut self, id: &str) -> Result<serde_json::Value> {
         let reference = self.reference.lock().map_err(|_| anyhow::anyhow!("plan reference cache lock poisoned"))?.values().flat_map(|index| &index.occurrence).find(|reference| reference.id == id)
             .context("plan reference selection is unavailable")?.clone();
-        for block in self.document.snapshot().block {
-            for target in &block.metadata.target {
-                let Some(anchor) = self.target.get(&target.id) else { continue };
-                let selected = match &anchor.target {
-                    super::PlanReviewTarget::Call { path, side, owner, name } => reference.kind == "call" && path == &reference.path && side == &reference.side && owner == &reference.owner && name == &reference.name,
-                    super::PlanReviewTarget::Declaration { path, side, line, .. } => reference.kind != "call" && path == &reference.path && side == &reference.side && *line == reference.line,
-                    _ => reference.anchor.as_ref().is_some_and(|saved| saved.json_path == anchor.json_path),
-                };
-                if selected {
-                    return Ok(serde_json::json!({"jump":{"block":block.id,"position":{"row":0,"column":if reference.kind == "call" { block.text.row(0).unwrap_or("").find(&reference.name).unwrap_or(0) } else { reference.column as usize }}}}));
+        let locate = |blocks: &[forge_buffer::block::BufferBlock], targets: &HashMap<TargetId, PlanNavigationAnchor>| {
+            blocks.iter().enumerate().find_map(|(index, block)| {
+                block.metadata.target.iter().find_map(|range| {
+                    let anchor = targets.get(&range.id)?;
+                    let selected = match &anchor.target {
+                        super::PlanReviewTarget::Call { path, side, owner, name, kind } => reference.kind == kind.label() && path == &reference.path && side == &reference.side && owner == &reference.owner && name == &reference.name,
+                        super::PlanReviewTarget::Declaration { path, side, line, .. } => !matches!(reference.kind.as_str(), "call" | "property") && path == &reference.path && side == &reference.side && *line == reference.line,
+                        _ => reference.anchor.as_ref().is_some_and(|saved| saved.json_path == anchor.json_path),
+                    };
+                    selected.then(|| (index, forge_buffer::block::BlockAnchor {
+                        block: block.id.clone(), position: TextPosition { row: range.range.start.row,
+                            column: if matches!(reference.kind.as_str(), "call" | "property") { block.text.row(range.range.start.row).unwrap_or("").find(&reference.name).unwrap_or(0) } else { reference.column as usize } },
+                    }))
+                })
+            })
+        };
+        if let Some((_, jump)) = locate(&self.document.snapshot().block, &self.target) {
+            return Ok(serde_json::json!({"jump":jump}));
+        }
+        self.retain_annotation_revision();
+        let previous_revealed = self.source.revealed.clone();
+        let previous_collapse = self.source.collapse.clone();
+        self.source.revealed.retain(|(path, side)| path != &reference.path || side == &reference.side);
+        self.source.revealed.insert((reference.path.clone(), reference.side.clone()));
+        let projection = (|| -> Result<_> {
+            let (mut blocks, mut targets) = super::design_review::project(
+                &self.source.document, &self.width, &[], &self.annotation_revision, None,
+                &self.source.declaration_syntax, self.source.public_only, self.source.trace.as_ref(), &self.source.revealed,
+            )?;
+            let (selected, jump) = locate(&blocks, &targets).context("reference no longer has a display occurrence")?;
+            let endpoint: HashMap<_, _> = blocks.iter().enumerate().map(|(index, block)| (block.id.clone(), index)).collect();
+            for (index, block) in blocks.iter_mut().enumerate() {
+                for fold in &mut block.metadata.fold {
+                    let end = endpoint[&fold.end.block] + usize::from(fold.end.position.row > 0);
+                    if index <= selected && selected < end {
+                        self.source.collapse.insert(fold.id.clone(), false);
+                        fold.closed = false;
+                    }
                 }
             }
+            let blocks = forge_buffer::collapse::project(blocks, &self.source.collapse)?;
+            let visible: std::collections::HashSet<_> = blocks.iter().flat_map(|block| &block.metadata.target).map(|range| range.id.clone()).collect();
+            targets.retain(|id, _| visible.contains(id));
+            ensure!(blocks.iter().any(|block| block.id == jump.block), "reference destination remains collapsed");
+            let patch = self.document.edit(0..self.document.block_count(), blocks)?;
+            Ok((patch, targets, jump))
+        })();
+        if projection.is_err() {
+            self.source.revealed = previous_revealed;
+            self.source.collapse = previous_collapse;
         }
-        let design = self.source.document.design.as_ref().context("declaration design is unavailable")?;
-        let text = if reference.side == "baseline" { design.baseline.get(&reference.path).map(|file| &file.text) } else { design.proposed.get(&reference.path) }.context("referenced file is unavailable")?;
-        let calls = if reference.side == "baseline" { &design.baseline_calls } else { &design.proposed_calls };
-        let presentation = super::calls::present(&reference.path, text, calls.get(&reference.path).map(Vec::as_slice).unwrap_or_default())?;
-        let mut blocks = Vec::new();
-        blocks.push(forge_diff::projection::header(forge_buffer::identity::BlockId(format!("plan:reference:{}:header", reference.id)), vec![forge_buffer::block::TextChunk { text: format!("Reference context: {} ({})", reference.path, reference.side), capture: "ForgeStatusHeader".into() }], 0)?);
-        let mut jump = None;
-        for (row, text) in presentation.declaration.text.lines().enumerate() {
-            let block_id = forge_buffer::identity::BlockId(format!("plan:reference:{}:{row}", reference.id));
-            let target_id = TargetId(block_id.0.clone());
-            let position = presentation.declaration.source[row].unwrap();
-            let target = if let Some((owner, name)) = presentation.call_row.get(&row) {
-                if reference.kind == "call" && owner == &reference.owner && name == &reference.name { jump = Some(forge_buffer::block::BlockAnchor { block: block_id.clone(), position: TextPosition { row: 0, column: text.find(name).unwrap_or(0) } }); }
-                super::PlanReviewTarget::Call { path: reference.path.clone(), side: reference.side.clone(), owner: owner.clone(), name: name.clone() }
-            } else {
-                if reference.kind != "call" && position.line == reference.line { jump = Some(forge_buffer::block::BlockAnchor { block: block_id.clone(), position: TextPosition { row: 0, column: reference.column as usize } }); }
-                super::PlanReviewTarget::Declaration { path: reference.path.clone(), side: reference.side.clone(), line: position.line, column: Some(position.column) }
-            };
-            self.target.insert(target_id.clone(), PlanNavigationAnchor { line: 0, target, json_path: format!("/reference/{id}/{row}"), path: Some(reference.path.clone()), label: text.into() });
-            let mut metadata = forge_buffer::block::BlockMetadata::default();
-            metadata.target.push(forge_buffer::block::TargetRange { id: target_id, range: TextRange { start: TextPosition { row: 0, column: 0 }, end: TextPosition { row: 1, column: 0 } } });
-            blocks.push(forge_buffer::block::BufferBlock { id: block_id, text: forge_buffer::text::BufferText::from_rows([text])?, metadata });
-        }
-        for (row, owner) in &presentation.owner_row {
-            let last = (*row + 1..presentation.declaration.source.len()).take_while(|row| presentation.call_row.contains_key(row)).last().unwrap_or(*row);
-            let end = forge_buffer::block::BlockAnchor { block: blocks[last + 1].id.clone(), position: TextPosition { row: 1, column: 0 } };
-            let heading = forge_buffer::block::BlockAnchor { block: blocks[*row].id.clone(), position: TextPosition { row: 0, column: 0 } };
-            blocks[*row + 1].metadata.fold.push(forge_buffer::block::FoldRange { id: forge_buffer::identity::FoldId(format!("plan:reference:{}:calls:{owner}", reference.id)), start: TextPosition { row: 0, column: 0 }, end, heading_start: Some(heading), collapsed_suffix: Some("...".into()), closed: true, collapse_children: false, expand_children: false });
-        }
-        let jump = jump.context("reference no longer has a display occurrence")?;
-        self.retain_annotation_revision();
-        let patch = self.document.edit(self.document.block_count()..self.document.block_count(), blocks)?;
+        let (patch, targets, jump) = projection?;
+        self.target = targets;
+        self.focused_annotation = None;
         Ok(serde_json::json!({"patch":patch,"snapshot":self.snapshot(),"source_row":self.source_rows(),"annotation":self.annotation.annotation(),"jump":jump}))
     }
 
@@ -806,10 +816,10 @@ impl PlanReviewDocument {
         row: &str,
         column: usize,
     ) -> Result<crate::declaration::DeclarationResolution> {
-        if let super::PlanReviewTarget::Call { path, side, owner, name } = &anchor.target {
+        if let super::PlanReviewTarget::Call { path, side, owner, name, kind } = &anchor.target {
             let design = self.source.document.design.as_ref().context("declaration design is unavailable")?;
             let calls = if side == "baseline" { &design.baseline_calls } else { &design.proposed_calls };
-            if calls.get(path).into_iter().flatten().any(|function| function.owner == *owner && function.call.iter().any(|call| call.name == *name && call.unresolved)) {
+            if calls.get(path).into_iter().flatten().any(|function| function.owner == *owner && function.call.iter().any(|call| call.name == *name && call.kind == *kind && call.unresolved)) {
                 return Ok(crate::declaration::DeclarationResolution::Unverified { reason: "This target includes an opaque local binding in the captured source.".into() });
             }
             let baseline = side == "baseline";
@@ -827,7 +837,8 @@ impl PlanReviewDocument {
             }
             let resolver = self.source.resolver.get().context("declaration resolver is unavailable")?;
             let mut resolver = resolver.lock().map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
-            return Ok(if side == "baseline" { resolver.1.callable(path, owner, name) } else { resolver.0.callable(path, owner, name) });
+            let resolver = if side == "baseline" { &mut resolver.1 } else { &mut resolver.0 };
+            return Ok(match kind { super::CallKind::Call => resolver.callable(path, owner, name), super::CallKind::Property => resolver.property(path, owner, name) });
         }
         let super::PlanReviewTarget::Declaration {
             path,
@@ -964,8 +975,14 @@ impl PlanReviewDocument {
                 design.baseline.get(&relative).map(|file| &file.text)
             } else {
                 design.proposed.get(&relative)
-            }
-            .context("resolved declaration snapshot is unavailable")?;
+            };
+            let Some(text) = text else {
+                anyhow::ensure!(
+                    !destination.proposed,
+                    "resolved declaration snapshot is unavailable"
+                );
+                return Ok(serde_json::json!({"source":{"path":destination.path,"line":destination.line,"column":destination.column}}));
+            };
             let presentation = forge_diff::syntax::DeclarationOverview::present(&relative, text)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
             let display_position = forge_diff::syntax::DeclarationOverview::display_position(
@@ -2170,6 +2187,199 @@ mod tests {
     }
 
     #[test]
+    fn baseline_property_jump_opens_uncaptured_source_without_changing_the_plan() {
+        let temporary = tempfile::tempdir().unwrap();
+        std::fs::write(
+            temporary.path().join("client.ts"),
+            "export interface Client { count: number; }\n",
+        )
+        .unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical =
+            crate::plan::document::test_fixture("plan", "Uncaptured property navigation");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Review a captured caller".into();
+        design.document.description = "Navigate to an uncaptured property definition".into();
+        let caller = "import { Client } from './client';\nexport function run(client: Client): void { client.count; }\n";
+        std::fs::write(temporary.path().join("run.ts"), caller).unwrap();
+        let text = forge_diff::syntax::DeclarationOverview::extract("run.ts", caller).unwrap();
+        design.baseline.insert(
+            "run.ts".into(),
+            crate::plan::DeclarationFile {
+                text: text.clone(),
+                source_digest: crate::plan::digest(caller.as_bytes()),
+            },
+        );
+        design.proposed.insert("run.ts".into(), text);
+        design.baseline_calls.insert(
+            "run.ts".into(),
+            crate::plan::calls::extract(
+                "run.ts",
+                "export function run(client: Client) { client.count; }",
+            )
+            .unwrap(),
+        );
+        canonical.design = Some(design);
+        store
+            .write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (_, _, checksum) = store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let source = store
+            .capture_review_source("session", "plan", 1, &checksum)
+            .unwrap();
+        let document = PlanReviewDocument::new(
+            DocumentId("uncaptured".into()),
+            ViewId("view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        let saved = serde_json::to_vec(&document.source.document).unwrap();
+        let design = document.source.document.design.as_ref().unwrap();
+        assert!(
+            document
+                .source
+                .resolver
+                .set(std::sync::Mutex::new((
+                    crate::declaration::DeclarationResolver::local(temporary.path(), design, false)
+                        .unwrap(),
+                    crate::declaration::DeclarationResolver::local(temporary.path(), design, true)
+                        .unwrap(),
+                )))
+                .is_ok()
+        );
+        let mut anchor = document.target.values().next().unwrap().clone();
+        anchor.target = crate::plan::PlanReviewTarget::Call {
+            path: "run.ts".into(),
+            side: "baseline".into(),
+            owner: "run".into(),
+            name: "Client.count".into(),
+            kind: crate::plan::CallKind::Property,
+        };
+        let result = document
+            .jump_declaration(&anchor, "  Client.count", 10)
+            .unwrap();
+        assert_eq!(
+            std::path::Path::new(result["source"]["path"].as_str().unwrap()),
+            temporary.path().join("client.ts")
+        );
+        assert_eq!(result["source"]["line"], 1);
+        assert_eq!(result["source"]["column"], 26);
+        assert!(result.get("declarations").is_none());
+        assert_eq!(
+            serde_json::to_vec(&document.source.document).unwrap(),
+            saved
+        );
+    }
+    #[test]
+    fn property_navigation_reveals_filtered_uses_and_previews_planned_rename() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Property navigation");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Add a client count property.".into();
+        design.document.description = "Expose property uses for review.".into();
+        design.proposed.insert("client.ts".into(), "/// Tracks requests.\nexport interface Client {\n  /// Current request count.\n  count: number;\n}\n".into());
+        design.proposed.insert("run.ts".into(), "import { Client } from './client';\n/// Updates request count.\nfunction run(client: Client): void;\n".into());
+        design.proposed_calls.insert("run.ts".into(), crate::plan::calls::extract("run.ts", "import { Client } from './client'; function run(client: Client) { client.count++; client.count; }").unwrap());
+        canonical.design = Some(design);
+        store
+            .write_working_document("session", "plan", &canonical)
+            .unwrap();
+        let (_, _, checksum) = store
+            .submit_document_revision("session", "plan", 1, 1)
+            .unwrap();
+        let source = store
+            .capture_review_source("session", "plan", 1, &checksum)
+            .unwrap();
+        let mut document = PlanReviewDocument::new(
+            DocumentId("properties".into()),
+            ViewId("view".into()),
+            source,
+            WidthProfile::default(),
+            None,
+        )
+        .unwrap();
+        let saved = serde_json::to_vec(&document.source.document).unwrap();
+        let block = document
+            .snapshot()
+            .block
+            .into_iter()
+            .find(|block| {
+                block
+                    .text
+                    .row(0)
+                    .is_some_and(|row| row.contains("count: number"))
+            })
+            .unwrap();
+        let anchor = block
+            .metadata
+            .target
+            .iter()
+            .filter_map(|target| document.target.get(&target.id))
+            .find(|anchor| {
+                matches!(
+                    &anchor.target,
+                    crate::plan::PlanReviewTarget::Declaration { .. }
+                )
+            })
+            .unwrap()
+            .clone();
+        let row = block.text.row(0).unwrap();
+        let references = document
+            .references(&anchor, row, row.find("count").unwrap())
+            .unwrap();
+        let property = references["references"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|reference| reference["kind"] == "property")
+            .unwrap();
+        let result = document
+            .reveal_reference(property["id"].as_str().unwrap())
+            .unwrap();
+        let jump: forge_buffer::block::BlockAnchor =
+            serde_json::from_value(result["jump"].clone()).unwrap();
+        let use_block = document.document.block(&jump.block).unwrap();
+        assert_eq!(use_block.text.row(0), Some("    Client.count"));
+        let use_anchor = use_block
+            .metadata
+            .target
+            .iter()
+            .filter_map(|target| document.target.get(&target.id))
+            .next()
+            .unwrap()
+            .clone();
+        let renamed = document
+            .rename(&use_anchor, "    Client.count", 12)
+            .unwrap();
+        assert_eq!(renamed["rename"]["name"], "count");
+        assert!(renamed["rename"]["preview"].as_array().unwrap().len() >= 2);
+        let definition = document
+            .jump_declaration(&use_anchor, "    Client.count", 12)
+            .unwrap();
+        let destination: forge_buffer::block::BlockAnchor =
+            serde_json::from_value(definition["jump"].clone()).unwrap();
+        assert!(
+            document
+                .document
+                .block(&destination.block)
+                .unwrap()
+                .text
+                .row(0)
+                .unwrap()
+                .contains("count: number")
+        );
+        assert_eq!(
+            serde_json::to_vec(&document.source.document).unwrap(),
+            saved
+        );
+    }
+
+    #[test]
     fn references_reveal_filtered_calls_in_the_same_snapshot_without_editing_design() {
         let temporary = tempfile::tempdir().unwrap();
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
@@ -2178,8 +2388,10 @@ mod tests {
         design.document.task = "Define call relationships.".into();
         design.document.description = "Expose sender relationships for review.".into();
         design.proposed.insert("client.ts".into(), "/// Sends a request.\nexport function send(): void;\n".into());
-        design.proposed.insert("run.ts".into(), "import { send } from './client';\n/// Dispatches work.\nfunction run(): void;\n".into());
-        design.proposed_calls.insert("run.ts".into(), vec![crate::plan::FunctionCalls { owner: "run".into(), call: vec![crate::plan::CallSite { name: "send".into(), source: None, unresolved: false }] }]);
+        design.proposed.insert("run.ts".into(), "import { send } from './client';\n/// Dispatches work.\nclass Runner { private run(): void; }\n".into());
+        design.proposed_calls.insert("run.ts".into(), vec![crate::plan::FunctionCalls { owner: "Runner.run".into(), call: vec![crate::plan::CallSite { kind: crate::plan::CallKind::Call, name: "send".into(), source: None, unresolved: false }] }]);
+        design.baseline.insert("run.ts".into(), crate::plan::DeclarationFile { text: design.proposed["run.ts"].clone(), source_digest: String::new() });
+        design.baseline_calls.insert("run.ts".into(), design.proposed_calls["run.ts"].clone());
         canonical.design = Some(design);
         store.write_working_document("session", "plan", &canonical).unwrap();
         let (_, _, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
@@ -2188,6 +2400,7 @@ mod tests {
         let saved = serde_json::to_vec(&document.source.document).unwrap();
         assert!(document.source.public_only);
         assert!(!document.snapshot().block.iter().any(|block| block.text.row(0) == Some("function run(): void;")));
+        let source_line: HashMap<_, _> = document.target.iter().map(|(id, anchor)| (id.clone(), anchor.line)).collect();
         let block = document.snapshot().block.into_iter().find(|block| block.text.row(0).is_some_and(|row| row.contains("export function send"))).unwrap();
         let anchor = block.metadata.target.iter().filter_map(|target| document.target.get(&target.id)).find(|anchor| matches!(&anchor.target, super::super::PlanReviewTarget::Declaration { .. })).unwrap().clone();
         let row = block.text.row(0).unwrap();
@@ -2195,8 +2408,15 @@ mod tests {
         let call = references["references"].as_array().unwrap().iter().find(|reference| reference["kind"] == "call").unwrap();
         let result = document.reveal_reference(call["id"].as_str().unwrap()).unwrap();
         let jump: forge_buffer::block::BlockAnchor = serde_json::from_value(result["jump"].clone()).unwrap();
-        assert_eq!(document.document.block(&jump.block).unwrap().text.row(0), Some("  send"));
-        assert!(document.snapshot().block.iter().any(|block| block.metadata.fold.iter().any(|fold| fold.closed && fold.id.0.contains("calls:run"))));
+        assert_eq!(document.document.block(&jump.block).unwrap().text.row(0).unwrap().trim(), "send");
+        assert!(!document.document.block(&jump.block).unwrap().metadata.gutter.is_empty());
+        assert!(!document.snapshot().block.iter().any(|block| block.id.0.starts_with("plan:reference:")));
+        assert_eq!(document.source_rows().iter().find(|row| row["block"] == jump.block.0).unwrap()["source_line"], 0);
+        for (id, line) in source_line {
+            assert_eq!(document.target.get(&id).unwrap().line, line);
+        }
+        assert!(document.document.block(&jump.block).unwrap().metadata.collapse.iter().any(|fold| !fold.closed && fold.id.0.starts_with("plan:calls:")));
+        assert!(document.document.block(&jump.block).unwrap().metadata.collapse.iter().all(|fold| !fold.closed));
         assert_eq!(serde_json::to_vec(&document.source.document).unwrap(), saved);
         assert!(document.source.public_only);
         let revision = document.document.revision();

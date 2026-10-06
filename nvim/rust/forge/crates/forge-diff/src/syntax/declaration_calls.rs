@@ -4,9 +4,20 @@ use tree_sitter::{Node, Parser};
 
 use super::{DeclarationOverview, SyntaxError, SyntaxLanguage};
 
+/// The semantic operation represented by a function-body reference.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DeclarationCallKind {
+    /// Invokes a callable.
+    Call,
+    /// Reads, writes, or takes a reference to a named property.
+    Property,
+}
+
 /// A source call occurrence, retaining lexical order and receiver evidence.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct DeclarationCall {
+    /// Whether the occurrence invokes a callable or accesses a named property.
+    pub kind: DeclarationCallKind,
     /// Qualified callable name, or a receiver expression without type evidence.
     pub name: String,
     /// One-based source line of the call target.
@@ -584,21 +595,68 @@ fn expression_type(
                 .trim_end_matches('>');
             Some(base_type(inner))
         }
-        "field_expression" | "member_expression" => {
-            let receiver = node
-                .child_by_field_name("value")
-                .or_else(|| node.child_by_field_name("object"))?;
-            let field = node
-                .child_by_field_name("field")
-                .or_else(|| node.child_by_field_name("property"))?;
+        "field_expression"
+        | "member_expression"
+        | "dot_index_expression"
+        | "subscript_expression"
+        | "bracket_index_expression" => {
+            let (receiver, field) = member_access(node, source)?;
             let receiver = expression_type(receiver, source, returns, binding)?;
             returns
-                .get(&format!("field:{receiver}.{}", contents(field, source)))
+                .get(&format!("field:{receiver}.{field}"))
                 .cloned()
                 .flatten()
         }
         _ => None,
     }
+}
+
+fn member_access<'tree>(node: Node<'tree>, source: &str) -> Option<(Node<'tree>, String)> {
+    if !matches!(
+        node.kind(),
+        "field_expression"
+            | "member_expression"
+            | "method_index_expression"
+            | "dot_index_expression"
+            | "subscript_expression"
+            | "bracket_index_expression"
+    ) {
+        return None;
+    }
+    let receiver = node
+        .child_by_field_name("value")
+        .or_else(|| node.child_by_field_name("object"))
+        .or_else(|| node.child_by_field_name("table"))?;
+    let member = node
+        .child_by_field_name("field")
+        .or_else(|| node.child_by_field_name("property"))
+        .or_else(|| node.child_by_field_name("method"))
+        .or_else(|| node.child_by_field_name("index"))?;
+    let name = if matches!(
+        node.kind(),
+        "subscript_expression" | "bracket_index_expression"
+    ) {
+        if member.kind() != "string" {
+            return None;
+        }
+        let text = contents(member, source);
+        let quote = text.chars().next()?;
+        if !matches!(quote, '\'' | '"') || !text.ends_with(quote) {
+            return None;
+        }
+        let value = &text[1..text.len() - 1];
+        if value.is_empty()
+            || !value
+                .chars()
+                .all(|character| character.is_alphanumeric() || character == '_')
+        {
+            return None;
+        }
+        value
+    } else {
+        contents(member, source)
+    };
+    Some((receiver, name.into()))
 }
 
 fn call_name(
@@ -612,43 +670,26 @@ fn call_name(
             return call_name(function, source, returns, binding);
         }
     }
-    if matches!(
-        function.kind(),
-        "field_expression"
-            | "member_expression"
-            | "method_index_expression"
-            | "dot_index_expression"
-    ) {
-        let receiver = function
-            .child_by_field_name("value")
-            .or_else(|| function.child_by_field_name("object"))
-            .or_else(|| function.child_by_field_name("table"));
-        let member = function
-            .child_by_field_name("field")
-            .or_else(|| function.child_by_field_name("property"))
-            .or_else(|| function.child_by_field_name("method"));
-        if let (Some(receiver), Some(member)) = (receiver, member) {
-            if let Some(value) = expression_type(receiver, source, returns, binding) {
-                return format!(
-                    "{value}{}{}",
-                    if function.kind() == "field_expression" {
-                        "::"
-                    } else {
-                        "."
-                    },
-                    contents(member, source)
-                );
-            }
-            let receiver = if matches!(
-                receiver.kind(),
-                "identifier" | "field_expression" | "member_expression" | "dot_index_expression"
-            ) {
-                contents(receiver, source)
-            } else {
-                "<unresolved>"
-            };
-            return format!("{receiver}.{}", contents(member, source));
+    if let Some((receiver, member)) = member_access(function, source) {
+        if let Some(value) = expression_type(receiver, source, returns, binding) {
+            return format!(
+                "{value}{}{member}",
+                if function.kind() == "field_expression" {
+                    "::"
+                } else {
+                    "."
+                }
+            );
         }
+        let receiver = if matches!(
+            receiver.kind(),
+            "identifier" | "field_expression" | "member_expression" | "dot_index_expression"
+        ) {
+            contents(receiver, source)
+        } else {
+            "<unresolved>"
+        };
+        return format!("{receiver}.{member}");
     }
     let name = contents(function, source)
         .chars()
@@ -731,6 +772,7 @@ fn calls(
             if !(language == SyntaxLanguage::Rust && matches!(name.as_str(), "Ok" | "Err" | "Some"))
             {
                 output.push(DeclarationCall {
+                    kind: DeclarationCallKind::Call,
                     name,
                     unresolved: shadowed_target(function, source, returns, binding),
                     line: function.start_position().row as u32 + 1,
@@ -738,6 +780,64 @@ fn calls(
                 });
             }
         }
+    }
+    if language == SyntaxLanguage::Rust
+        && matches!(
+            node.kind(),
+            "field_initializer" | "shorthand_field_initializer" | "field_pattern"
+        )
+    {
+        let field = node
+            .child_by_field_name("field")
+            .or_else(|| node.child_by_field_name("name"))
+            .or_else(|| {
+                let mut cursor = node.walk();
+                node.named_children(&mut cursor)
+                    .find(|child| matches!(child.kind(), "field_identifier" | "identifier"))
+            });
+        let mut parent = node.parent();
+        while let Some(container) = parent {
+            if matches!(container.kind(), "struct_expression" | "struct_pattern") {
+                if let (Some(field), Some(owner)) = (
+                    field,
+                    container
+                        .child_by_field_name("name")
+                        .or_else(|| container.child_by_field_name("type")),
+                ) {
+                    output.push(DeclarationCall {
+                        kind: DeclarationCallKind::Property,
+                        name: format!(
+                            "{}::{}",
+                            base_type(contents(owner, source)),
+                            contents(field, source)
+                        ),
+                        unresolved: false,
+                        line: field.start_position().row as u32 + 1,
+                        column: field.start_position().column as u32,
+                    });
+                }
+                break;
+            }
+            parent = container.parent();
+        }
+    }
+    if matches!(
+        node.kind(),
+        "field_expression"
+            | "member_expression"
+            | "dot_index_expression"
+            | "subscript_expression"
+            | "bracket_index_expression"
+    ) && !invocation_target(node)
+    {
+        output.push(DeclarationCall {
+            kind: DeclarationCallKind::Property,
+            name: call_name(node, source, returns, binding),
+            unresolved: member_access(node, source).is_none()
+                || shadowed_target(node, source, returns, binding),
+            line: node.start_position().row as u32 + 1,
+            column: node.start_position().column as u32,
+        });
     }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
@@ -750,6 +850,24 @@ fn calls(
         *binding = previous;
     }
     Ok(())
+}
+
+fn invocation_target(mut node: Node<'_>) -> bool {
+    while let Some(parent) = node.parent() {
+        if parent.kind() == "generic_function" {
+            node = parent;
+            continue;
+        }
+        return matches!(
+            parent.kind(),
+            "call_expression" | "function_call" | "new_expression"
+        ) && parent
+            .child_by_field_name("function")
+            .or_else(|| parent.child_by_field_name("name"))
+            .or_else(|| parent.child_by_field_name("constructor"))
+            .is_some_and(|target| target.id() == node.id());
+    }
+    false
 }
 
 fn shadowed_target(
@@ -766,37 +884,81 @@ fn shadowed_target(
     if function.kind() == "identifier" {
         return binding.contains_key(contents(function, source));
     }
-    if matches!(
-        function.kind(),
-        "field_expression"
-            | "member_expression"
-            | "method_index_expression"
-            | "dot_index_expression"
-    ) {
-        let receiver = function
-            .child_by_field_name("value")
-            .or_else(|| function.child_by_field_name("object"))
-            .or_else(|| function.child_by_field_name("table"));
-        if let Some(mut receiver) = receiver {
-            if expression_type(receiver, source, returns, binding).is_some() {
-                return false;
-            }
-            while let Some(parent) = receiver
-                .child_by_field_name("value")
-                .or_else(|| receiver.child_by_field_name("object"))
-                .or_else(|| receiver.child_by_field_name("table"))
-            {
-                receiver = parent;
-            }
-            return binding.contains_key(contents(receiver, source));
+    if let Some((mut receiver, _)) = member_access(function, source) {
+        if expression_type(receiver, source, returns, binding).is_some() {
+            return false;
         }
+        while let Some(parent) = receiver
+            .child_by_field_name("value")
+            .or_else(|| receiver.child_by_field_name("object"))
+            .or_else(|| receiver.child_by_field_name("table"))
+        {
+            receiver = parent;
+        }
+        return binding.contains_key(contents(receiver, source));
     }
     false
 }
 
 #[cfg(test)]
 mod tests {
-    use super::DeclarationCalls;
+    use super::{DeclarationCallKind, DeclarationCalls};
+
+    #[test]
+    fn properties_capture_reads_writes_nested_receivers_and_opaque_bindings() {
+        let source = "struct Client { count: usize } struct Service { client: Client } fn run(service: &mut Service, opaque: Unknown) { service.client.count += 1; let before = service.client.count; service.client.send(); opaque.count = 2; let count = 3; let value = Client { count }; let Client { count: current } = value; }";
+        let functions = DeclarationCalls::extract("lib.rs", source, false).unwrap();
+        let run = functions
+            .iter()
+            .find(|function| function.owner == "run")
+            .unwrap();
+        let property = run
+            .call
+            .iter()
+            .filter(|reference| reference.kind == DeclarationCallKind::Property)
+            .map(|reference| reference.name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            property,
+            [
+                "Client::count",
+                "Service::client",
+                "Client::count",
+                "Service::client",
+                "Service::client",
+                "Unknown::count",
+                "Client::count",
+                "Client::count"
+            ]
+        );
+        assert_eq!(
+            run.call
+                .iter()
+                .filter(|reference| reference.kind == DeclarationCallKind::Call)
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            ["Client::send"]
+        );
+        let dynamic = DeclarationCalls::extract("main.ts", "class Client { count: number; run(other: Client, opaque: unknown) { this.count++; other.count = this.count; opaque.count; other[\"count\"]; other.send(); } }", false).unwrap();
+        let run = dynamic
+            .iter()
+            .find(|function| function.owner == "Client.run")
+            .unwrap();
+        assert_eq!(
+            run.call
+                .iter()
+                .filter(|reference| reference.kind == DeclarationCallKind::Property)
+                .map(|reference| reference.name.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "Client.count",
+                "Client.count",
+                "Client.count",
+                "unknown.count",
+                "Client.count"
+            ]
+        );
+    }
 
     #[test]
     fn rust_calls_preserve_occurrences_and_receiver_types() {
@@ -891,6 +1053,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "Client::send",
+                "Service::client",
                 "Client::new",
                 "Client::send",
                 "opaque",

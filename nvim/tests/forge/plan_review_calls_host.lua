@@ -2,7 +2,7 @@ vim.loader.enable(false)
 local root = vim.fn.getcwd()
 local workspace, data = vim.fn.tempname(), vim.fn.tempname()
 assert(vim.fn.mkdir(workspace .. "/src", "p") == 1 and vim.fn.mkdir(data, "p") == 1)
-local source = { "pub fn leaf() {}", "pub fn run() { leaf(); leaf(); }" }
+local source = { "pub fn leaf() {}", "pub fn run() { leaf(); leaf(); }", "pub struct Client { pub count: usize }", "pub fn update(client: &mut Client) { leaf(); client.count += 1; let _count = client.count; }", "/// Describes the following declaration.", "pub struct Following;" }
 vim.fn.writefile(source, workspace .. "/src/change.rs")
 vim.fn.writefile({ "[package]", 'name = "call_navigation"', 'version = "0.1.0"', 'edition = "2021"', "[lib]", 'path = "src/change.rs"' }, workspace .. "/Cargo.toml")
 vim.fn.writefile({ "invalid Rust {" }, workspace .. "/unrelated.rs")
@@ -51,9 +51,22 @@ local success, failure = xpcall(function()
     if callable.owner == "run" then captured = callable.call end
   end
   assert(captured and #captured == 2 and captured[1].name == "leaf" and captured[2].name == "leaf")
+  local properties
+  for _, callable in ipairs(document.design.baseline_calls["src/change.rs"]) do
+    if callable.owner == "update" then
+      assert(#callable.call == 3 and callable.call[1].name == "leaf")
+      properties = vim.tbl_filter(function(occurrence) return occurrence.kind == "property" end, callable.call)
+    end
+  end
+  assert(properties and #properties == 2 and properties[1].kind == "property" and properties[2].kind == "property")
+  assert(properties[1].name == "Client::count" and properties[2].name == "Client::count")
   require("forge.views.plan_review").open(state.active_plan)
   await(function() return state.plan_review and state.plan_review.owner.ready end, "PlanReview did not open")
   local review = state.plan_review
+  local reference_binding = vim.api.nvim_buf_call(review.buf, function() return vim.fn.maparg("of", "n", false, true) end)
+  local plan_reference_binding = vim.api.nvim_buf_call(review.buf, function() return vim.fn.maparg("or", "n", false, true) end)
+  assert(reference_binding.buffer == 1 and type(reference_binding.callback) == "function", "LSP reference shortcut is not owned by the plan buffer")
+  assert(plan_reference_binding.buffer == 1 and plan_reference_binding.callback == reference_binding.callback, "plan reference shortcuts do not share the same action")
   local leaf_row, leaf_column, call_row, call_count = nil, nil, nil, 0
   for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
     if row:find("pub fn leaf", 1, true) then leaf_row, leaf_column = index, row:find("leaf", 1, true) - 1 end
@@ -61,7 +74,10 @@ local success, failure = xpcall(function()
   end
   assert(leaf_row, "baseline signature is absent")
   assert(call_count <= 1, "review did not deduplicate the saved occurrences")
-  assert(call_count == 0 and table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("Calls...", 1, true), "Calls body did not start collapsed")
+  assert(call_count == 0 and table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("pub fn run() {...}", 1, true), "Calls body did not start collapsed")
+  for _, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    assert(not row:match("^%s*Calls$") and not row:match("^%s*Accesses$"), "collapsed functions exposed a body category")
+  end
   local run_row
   for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
     if row:find("pub fn run", 1, true) then run_row = index end
@@ -83,27 +99,126 @@ local success, failure = xpcall(function()
     return true
   end, "Tab did not collapse the Calls body")
   if call_row then assert(vim.fn.foldclosed(call_row) ~= -1, "Calls body did not start folded") end
+  local property_row, property_column
+  for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if row:find("count: usize", 1, true) then property_row, property_column = index, row:find("count", 1, true) - 1 end
+  end
+  assert(property_row, "captured property declaration is absent")
+  assert(table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("pub fn update(client: &mut Client) {...}", 1, true), "property body did not start collapsed")
+  vim.api.nvim_set_current_win(review.win)
+  vim.api.nvim_win_set_cursor(review.win, { property_row, property_column })
+  vim.cmd("silent! normal! zv")
+  vim.keymap.set("n", ",", "<C-o>")
+  vim.cmd("clearjumps")
+  vim.api.nvim_feedkeys("of", "mtx", false)
+  await(function() return picker.is_open() end, "property reference picker did not open")
+  local property_picker = picker._state_for_test()
+  assert(#property_picker.spec.page_list[1].option_list == 1, "duplicate accesses produced duplicate caller results")
+  assert(property_picker.spec.page_list[1].option_list[1].value.kind == "property")
+  local preview_namespace = vim.api.nvim_create_namespace("forge.plan.references.preview")
+  await(function() return #vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 1 end, "property selection did not preview its usage")
+  local preview_mark = vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, { details = true })[1]
+  assert(preview_mark[4].line_hl_group == "Visual" and not preview_mark[4].hl_group, "reference preview must use only the Snacks-style line highlight")
+  assert(vim.api.nvim_get_current_win() == property_picker.win, "preview took focus from the picker")
+  assert(#vim.api.nvim_win_call(review.win, vim.fn.getjumplist)[1] == 0, "property preview added a jump")
+  local property_select = vim.api.nvim_buf_call(property_picker.buf, function() return vim.fn.maparg("<CR>", "n", false, true) end)
+  property_select.callback()
+  await(function() return not picker.is_open() and vim.api.nvim_win_get_cursor(review.win)[1] ~= property_row end, "property selection did not jump")
+  local property_cursor = vim.api.nvim_win_get_cursor(review.win)
+  assert(vim.api.nvim_buf_get_lines(review.buf, property_cursor[1] - 1, property_cursor[1], false)[1]:match("^%s+Client::count$"))
+  local property_location = require("forge.buffer").locate(review.owner.replica, property_cursor[1] - 1, property_cursor[2])
+  local property_style = review.owner.replica.sequence.node[property_location.block].entry.metadata.visible_decoration
+  assert(#property_style == 2 and property_style[1].capture == "@type" and property_style[2].capture == "@variable.member", "property reference lost its semantic highlights in the host")
+  assert(#vim.fn.getjumplist()[1] == 1, "confirmation did not record exactly one origin")
+  vim.api.nvim_feedkeys(",", "mtx", false)
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), { property_row, property_column }), "comma did not return to the property declaration")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-i>", true, false, true), "ntx", false)
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), property_cursor), "forward jump did not return to the selected access")
+  local expanded_body = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
+  assert(expanded_body:find("pub fn update(client: &mut Client) {\n  Calls\n    leaf\n  Accesses\n    Client::count\n}", 1, true), "reference selection did not reveal both categories inside the function body")
+  local following_comment = false
+  for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if row == "/// Describes the following declaration." then
+      following_comment = true
+      local location = require("forge.buffer").locate(review.owner.replica, index - 1, 0)
+      local style = review.owner.replica.sequence.node[location.block].entry.metadata.visible_decoration
+      assert(vim.tbl_contains(vim.tbl_map(function(span) return span.capture end, style), "@comment.documentation.rust"), "synthetic body shifted the following documentation highlight")
+    end
+  end
+  assert(following_comment, "following declaration comment is absent")
+  review.command_set.action_by_id.jump_entity.run({})
+  await(function() return vim.api.nvim_win_get_cursor(review.win)[1] == property_row end, "property definition jump missed its declaration")
   vim.api.nvim_set_current_win(review.win)
   vim.api.nvim_win_set_cursor(review.win, { leaf_row, leaf_column })
   vim.cmd("silent! normal! zv")
-  review.command_set.action_by_id.references.run({})
+  vim.cmd("clearjumps")
+  vim.api.nvim_feedkeys("or", "mtx", false)
   await(function() return picker.is_open() end, "reference picker did not open")
   local active = picker._state_for_test()
   assert(active.spec.page_list[1].search, "reference picker is not searchable")
-  assert(#active.spec.page_list[1].option_list == 1, "duplicate calls produced duplicate caller results")
+  assert(#active.spec.page_list[1].option_list == 2, "calls did not retain both distinct caller results")
   assert(active.spec.page_list[1].option_list[1].value.owner == "run")
+  await(function() return #vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 1 end, "initial call preview is absent")
+  local first_preview = vim.api.nvim_win_get_cursor(review.win)
+  local first_option = active.frame.lines[active.frame.option_range[1].first]
+  local second_option = active.frame.lines[active.frame.option_range[2].first]
+  assert(first_option:find("run", 1, true) == second_option:find("update", 1, true), "caller columns are not aligned")
+  assert(first_option:find("call", 1, true) == second_option:find("call", 1, true), "kind columns are not aligned")
+  local next_reference = vim.api.nvim_buf_call(active.buf, function() return vim.fn.maparg("<Down>", "n", false, true) end)
+  next_reference.callback()
+  await(function() return vim.api.nvim_win_get_cursor(review.win)[1] ~= first_preview[1]
+    and #vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 1 end, "picker movement did not update the preview")
+  assert(vim.api.nvim_get_current_win() == active.win, "reference movement changed focus")
+  local visible_height = require("forge.views.picker.layout").host_bounds({ review.win }).height
+    - vim.api.nvim_win_get_height(active.win) - 2
+  assert(vim.api.nvim_win_call(review.win, vim.fn.winline) <= visible_height, "preview is hidden under the picker")
+  local previous_reference = vim.api.nvim_buf_call(active.buf, function() return vim.fn.maparg("<Up>", "n", false, true) end)
+  previous_reference.callback()
+  await(function() return vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), first_preview)
+    and #vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 1 end, "previous reference did not restore its preview")
   local select = vim.api.nvim_buf_call(active.buf, function() return vim.fn.maparg("<CR>", "n", false, true) end)
   assert(type(select.callback) == "function", "picker confirmation is unavailable")
+  assert(#vim.api.nvim_win_call(review.win, vim.fn.getjumplist)[1] == 0, "reference previews added jumps")
   select.callback()
   await(function() return not picker.is_open() and vim.api.nvim_win_get_cursor(review.win)[1] ~= leaf_row end, "reference selection did not jump")
   assert(vim.api.nvim_win_get_buf(review.win) == review.buf, "reference selection left the plan buffer")
   local cursor = vim.api.nvim_win_get_cursor(review.win)
   local target = vim.api.nvim_buf_get_lines(review.buf, cursor[1] - 1, cursor[1], false)[1]
   assert(target:match("^%s+leaf$"), "reference jump missed the Calls entry: " .. target)
+  local call_location = require("forge.buffer").locate(review.owner.replica, cursor[1] - 1, cursor[2])
+  local call_style = review.owner.replica.sequence.node[call_location.block].entry.metadata.visible_decoration
+  local function_style = vim.tbl_filter(function(span) return span.capture == "@function.call" and span.priority == 200 end, call_style)
+  assert(#function_style == 1 and target:sub(function_style[1].range.start.column + 1, function_style[1].range["end"].column) == "leaf", "call reference lost its function highlight in the host")
+  assert(#vim.fn.getjumplist()[1] == 1, "call confirmation did not record exactly one origin")
+  vim.api.nvim_feedkeys(",", "mtx", false)
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), { leaf_row, leaf_column }), "comma did not return to the function declaration")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-i>", true, false, true), "ntx", false)
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), cursor), "forward jump did not return to the selected call")
+  assert(#vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 0, "confirmed reference retained its preview highlight")
+  for _, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    assert(not row:find("Reference context:", 1, true), "reference selection appended unformatted context")
+  end
   assert(vim.fn.foldclosed(cursor[1]) == -1, "reference destination remains folded")
   review.command_set.action_by_id.jump_entity.run({})
   await(function() return vim.api.nvim_win_get_cursor(review.win)[1] == leaf_row end, "Calls definition jump did not select the plan definition")
   vim.api.nvim_win_set_cursor(review.win, cursor)
+  vim.cmd("clearjumps")
+  review.command_set.action_by_id.references.run({})
+  await(function() return picker.is_open()
+    and #vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 1 end, "cancel fixture did not preview")
+  local cancel_picker = picker._state_for_test()
+  local cancel_next = vim.api.nvim_buf_call(cancel_picker.buf, function() return vim.fn.maparg("<Down>", "n", false, true) end)
+  local cancel_previous = vim.api.nvim_buf_call(cancel_picker.buf, function() return vim.fn.maparg("<Up>", "n", false, true) end)
+  cancel_next.callback()
+  cancel_previous.callback()
+  cancel_next.callback()
+  await(function() return vim.api.nvim_win_get_cursor(review.win)[1] ~= cursor[1]
+    and #vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 1 end, "rapid input did not settle on the latest reference")
+  local cancel = vim.api.nvim_buf_call(cancel_picker.buf, function() return vim.fn.maparg("q", "n", false, true) end)
+  cancel.callback()
+  assert(not picker.is_open() and #vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 0, "cancel retained the preview")
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), cursor), "cancel did not restore the originating cursor")
+  assert(#vim.fn.getjumplist()[1] == 0, "cancelled reference previews added jumps")
   review.command_set.action_by_id.references.run({})
   await(function() return picker.is_open() end, "call reference picker did not reopen")
   active = picker._state_for_test()

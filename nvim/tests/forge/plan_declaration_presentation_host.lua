@@ -336,7 +336,16 @@ local success, failure = xpcall(function()
     vim.api.nvim_feedkeys("q", "xt", false)
     assert(vim.api.nvim_get_current_win() == review.win, "snapshot did not return to review")
   end
-  jump_to_snapshot("pub(crate) fn inspect_remote", "RemoteState")
+  local remote_row = declaration_row("pub(crate) fn inspect_remote")
+  local remote_text = vim.api.nvim_buf_get_lines(review.buf, remote_row - 1, remote_row, false)[1]
+  vim.api.nvim_win_set_cursor(review.win, { remote_row, assert(remote_text:find("SharedState", 1, true)) - 1 })
+  vim.api.nvim_feedkeys(".", "xt", false)
+  await(function() return vim.fs.normalize(vim.api.nvim_buf_get_name(0)) == vim.fs.normalize(workspace .. "/src/input_consumer.rs") end,
+    "uncaptured declaration did not open its source")
+  assert(vim.api.nvim_get_current_line():find("pub(crate) struct RemoteState", 1, true), "source jump selected the wrong declaration")
+  vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-o>", true, false, true), "xt", false)
+  await(function() return vim.api.nvim_get_current_buf() == review.buf and review.owner.attached() end,
+    "returning from uncaptured source lost the review attachment")
   public_key()
   await(function() return review.public_only == true end, "hidden-type test did not filter")
   jump_to_snapshot("pub fn inspect_hidden", "HiddenState")
@@ -464,13 +473,15 @@ local success, failure = xpcall(function()
   local viewport_before = vim.api.nvim_win_call(review.win, vim.fn.winsaveview)
   local redraw = vim.api.nvim__redraw
   local intermediate_redraw = 0
+  local redraw_trace = {}
   vim.api.nvim__redraw = function(options)
     intermediate_redraw = intermediate_redraw + 1
+    redraw_trace[#redraw_trace + 1] = debug.traceback("redraw during collapse", 2)
     return redraw(options)
   end
   toggle(declaration_row("ArenaSize,"))
   vim.api.nvim__redraw = redraw
-  assert(intermediate_redraw == 0, "collapse requested an intermediate redraw")
+  assert(intermediate_redraw == 0, "collapse requested an intermediate redraw\n" .. table.concat(redraw_trace, "\n"))
   local viewport_after = vim.api.nvim_win_call(review.win, vim.fn.winsaveview)
   assert(viewport_after.topline == viewport_before.topline, "collapsing to a visible header scrolled the viewport")
   assert(not text(review.buf):find("Keep the enum comment visible", 1, true), "collapsed enum exposed its body comment")
@@ -561,10 +572,10 @@ local success, failure = xpcall(function()
   end
   assert(text(review.buf):find('<Project Version="0.2.0">', 1, true), "public filter hid XML values")
   assert(text(review.buf):find('"version":"0.2.0"', 1, true), "public filter hid JSON values")
-  assert(text(review.buf):find("fn main();", 1, true), "public filter hid the binary entry point")
+  assert(text(review.buf):find("fn main()", 1, true), "public filter hid the binary entry point")
   assert(text(review.buf):find("pub(crate) struct CrateState;", 1, true), "public filter hid crate visibility")
-  assert(text(review.buf):find("pub(super) fn configure_parent();", 1, true), "public filter hid parent visibility")
-  assert(not text(review.buf):find("fn hidden_helper();", 1, true), "public filter exposed a private helper")
+  assert(text(review.buf):find("pub(super) fn configure_parent()", 1, true), "public filter hid parent visibility")
+  assert(not text(review.buf):find("fn hidden_helper()", 1, true), "public filter exposed a private helper")
   assert(not text(review.buf):find("secret:", 1, true), "public filter exposed a private field")
   assert(text(review.buf):find(document.design.document.description, 1, true), "public filter hid change description")
   assert(text(review.buf):find(document.design.document.task, 1, true), "public filter hid task overview")

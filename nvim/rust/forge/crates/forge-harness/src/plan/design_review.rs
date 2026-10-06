@@ -21,7 +21,7 @@ use super::{
 };
 
 pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
-    let (block, navigation, _) = rows(document, &HashMap::new(), false, false, None)?;
+    let (block, navigation, _, _) = rows(document, &HashMap::new(), false, false, None, &HashSet::new())?;
     let markdown = block
         .iter()
         .flat_map(|block| block.text.wire_rows())
@@ -42,11 +42,13 @@ pub(super) fn project(
     syntax: &HashMap<(String, String), forge_diff::syntax::SyntaxHandle>,
     public_only: bool,
     trace: Option<&ReviewTrace>,
+    revealed: &HashSet<(String, String)>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
-    let (source, navigation, hidden) = rows(document, syntax, public_only, true, trace)?;
+    let (source, navigation, hidden, contextual) = rows(document, syntax, public_only, true, trace, revealed)?;
     let mut target = HashMap::new();
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
+    let mut omitted = 0;
     for (index, mut row) in source.into_iter().enumerate() {
         if row.id.0.starts_with("plan:description:") || row.id.0.starts_with("plan:task:") {
             row = forge_buffer::markdown::MarkdownRenderer::source(
@@ -58,7 +60,12 @@ pub(super) fn project(
             )?
             .block;
         }
+        let context = contextual.contains(&row.id);
+        if context { omitted += 1; }
         if let Some(anchor) = navigation.resolve_line(index as u32 + 1) {
+            if matches!(anchor.target, PlanReviewTarget::Call { .. }) {
+                super::review_projection::append_semantic_style(&mut row.metadata, &anchor.target, row.text.row(0).unwrap_or_default());
+            }
             let id = TargetId(format!("plan:declaration:{}", row.id.0));
             row.metadata.target.push(TargetRange {
                 id: id.clone(),
@@ -70,7 +77,9 @@ pub(super) fn project(
                     },
                 },
             });
-            target.insert(id, anchor.clone());
+            let mut anchor = anchor.clone();
+            anchor.line = if context { 0 } else { anchor.line - omitted };
+            target.insert(id, anchor);
         }
         let row_id = row.id.clone();
         source_end.insert(
@@ -134,17 +143,21 @@ fn rows(
     public_only: bool,
     inspection: bool,
     trace: Option<&ReviewTrace>,
-) -> Result<(Vec<BufferBlock>, PlanNavigationIndex, HashSet<BlockId>)> {
+    revealed: &HashSet<(String, String)>,
+) -> Result<(Vec<BufferBlock>, PlanNavigationIndex, HashSet<BlockId>, HashSet<BlockId>)> {
     let design = document
         .design
         .as_ref()
         .context("declaration review has no design")?;
     let mut patch = Vec::new();
     let mut hidden = HashSet::new();
+    let mut contextual_path = HashSet::new();
+    let mut contextual_block = HashSet::new();
     let mut visibility = HashMap::<(String, String), DeclarationVisibility>::new();
     let mut presentation = HashMap::<(String, String), super::calls::CallPresentation>::new();
     let started = Instant::now();
-    let ordered_files = super::review_file_layout::order(design);
+    let included = revealed.iter().map(|(path, _)| path.clone()).collect();
+    let ordered_files = super::review_file_layout::order(design, &included);
     if let Some(trace) = trace {
         trace.record("plan.review.file_order", started.elapsed(), ordered_files.len());
     }
@@ -185,8 +198,13 @@ fn rows(
         })?;
         let old_name = format!("a/{path}");
         let new_name = format!("b/{destination}");
-        if diff.hunks().is_empty() && before.is_some() && after.is_some() && path == destination {
+        if diff.hunks().is_empty() && before.is_some() && after.is_some() && path == destination
+            && !revealed.contains(&(path.clone(), "baseline".into()))
+            && !revealed.contains(&(destination.clone(), "proposed".into())) {
             continue;
+        }
+        if diff.hunks().is_empty() && before.is_some() && after.is_some() && path == destination {
+            contextual_path.insert(path.clone());
         }
         forge_diff::unified::write_file_header(&old_name, &new_name, &mut patch)?;
         if diff.hunks().is_empty() {
@@ -194,6 +212,14 @@ fn rows(
                 patch.extend_from_slice(b"new file mode 100644\n");
             } else if after.is_none() {
                 patch.extend_from_slice(b"deleted file mode 100644\n");
+            } else if let Some(after) = &after
+                && (revealed.contains(&(path.clone(), "baseline".into()))
+                    || revealed.contains(&(destination.clone(), "proposed".into()))) {
+                let count = after.declaration.source.len();
+                patch.extend_from_slice(format!("--- {old_name}\n+++ {new_name}\n@@ -1,{count} +1,{count} @@\n").as_bytes());
+                for row in after.declaration.text.lines() {
+                    patch.extend_from_slice(format!(" {row}\n").as_bytes());
+                }
             }
         } else {
             forge_diff::unified::write_unified(
@@ -220,7 +246,7 @@ fn rows(
             if inspection {
                 visibility.insert(
                     (path.clone(), "baseline".into()),
-                    super::calls::visibility(&path, &before, public_only)?,
+                    super::calls::visibility(&path, &before, public_only && !revealed.contains(&(path.clone(), "baseline".into())))?,
                 );
             }
             presentation.insert((path.clone(), "baseline".into()), before);
@@ -229,7 +255,7 @@ fn rows(
             if inspection {
                 visibility.insert(
                     (destination.clone(), "proposed".into()),
-                    super::calls::visibility(&destination, &after, public_only)?,
+                    super::calls::visibility(&destination, &after, public_only && !revealed.contains(&(destination.clone(), "proposed".into())))?,
                 );
             }
             presentation.insert((destination, "proposed".into()), after);
@@ -316,7 +342,10 @@ fn rows(
                     &emphasis[row_index],
                     0,
                 )?;
-                let (side, source_path, line) = if row.kind == RowKind::Removed {
+                let (side, source_path, line) = if row.kind == RowKind::Removed
+                    || (row.kind == RowKind::Context && file.old_path.as_ref() == file.new_path.as_ref()
+                        && revealed.contains(&(path.clone(), "baseline".into()))
+                        && !revealed.contains(&(path.clone(), "proposed".into()))) {
                     (
                         "baseline",
                         file.old_path.as_ref().unwrap(),
@@ -330,11 +359,16 @@ fn rows(
                     .and_then(|visibility| visibility.replacement.get(&line))
                     .map(String::as_str)
                     .unwrap_or(row.text);
-                if let Some(handle) = syntax.get(&(source_path.clone(), side.into())) {
+                let syntax_row = presentation.get(&(source_path.clone(), side.into())).and_then(|file| {
+                    let original = *file.plain_row.get(line)?;
+                    (file.declaration_row.get(&original) == Some(&line)).then_some(original)
+                });
+                if let Some(source_row) = syntax_row
+                    && let Some(handle) = syntax.get(&(source_path.clone(), side.into())) {
                     forge_diff::projection::append_syntax_row(
                         &mut metadata,
                         handle,
-                        line,
+                        source_row,
                         0,
                         row_text,
                     )?;
@@ -391,12 +425,12 @@ fn rows(
                         row_text,
                     ));
                 }
-                if let Some((owner, name)) = presentation.get(&(source_path.clone(), side.into())).and_then(|file| file.call_row.get(&line)) {
+                if let Some((owner, name, kind)) = presentation.get(&(source_path.clone(), side.into())).and_then(|file| file.call_row.get(&line)) {
                     navigation.anchor.push(PlanNavigationAnchor {
                         line: block.len() as u32,
-                        target: PlanReviewTarget::Call { path: source_path.clone(), side: side.into(), owner: owner.clone(), name: name.clone() },
-                        json_path: format!("/design/{side}_calls/{}/{}/{}", pointer(source_path), pointer(owner), pointer(name)),
-                        path: Some(source_path.clone()), label: format!("{source_path}: {owner} calls {name}"),
+                        target: PlanReviewTarget::Call { kind: *kind, path: source_path.clone(), side: side.into(), owner: owner.clone(), name: name.clone() },
+                        json_path: format!("/design/{side}_calls/{}/{}/{}", pointer(source_path), pointer(owner), if *kind == super::CallKind::Call { pointer(name) } else { format!("property/{}", pointer(name)) }),
+                        path: Some(source_path.clone()), label: format!("{source_path}: {owner}: {} {name}", kind.label()),
                     });
                 }
             }
@@ -407,6 +441,9 @@ fn rows(
             call_folds(&mut block, [file.old_path.as_ref(), file.new_path.as_ref()], &presentation, &display_row);
         }
         fold(&mut block, start, &id)?;
+        if contextual_path.contains(path) {
+            contextual_block.extend(block[start..].iter().map(|row| row.id.clone()));
+        }
     }
     if block.is_empty() {
         block.push(forge_diff::projection::header(
@@ -487,7 +524,7 @@ fn rows(
     block = overview;
     navigation.anchor.sort_by_key(|anchor| anchor.line);
     ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
-    Ok((block, navigation, hidden))
+    Ok((block, navigation, hidden, contextual_block))
 }
 
 fn declaration_folds(
@@ -500,8 +537,8 @@ fn declaration_folds(
     for (source_path, side) in [(paths[0], "baseline"), (paths[1], "proposed")] {
         let Some(source_path) = source_path else { continue };
         let Some(source) = presentation.get(&(source_path.clone(), side.into())) else { continue };
-        for declaration in DeclarationFolding::analyze(source_path, &super::calls::parse(source_path, &source.declaration.text, &[])?.0).map_err(|error| anyhow::anyhow!("{error:?}"))? {
-            let mapped = |line| source.plain_row.iter().enumerate().find(|(row, plain)| **plain == line && !source.call_row.contains_key(row) && source.declaration.text.lines().nth(*row).is_some_and(|text| text.trim() != "Calls")).and_then(|(row, _)| display_row.get(&(source_path.clone(), side.into(), row)).copied());
+        for declaration in DeclarationFolding::analyze(source_path, &source.plain).map_err(|error| anyhow::anyhow!("{error:?}"))? {
+            let mapped = |line| source.declaration_row.get(&line).and_then(|row| display_row.get(&(source_path.clone(), side.into(), *row)).copied());
             let (Some(opening), Some(closing)) = (mapped(declaration.start), mapped(declaration.end)) else { continue };
             if opening >= closing || !block[opening].text.wire_rows()[0].trim_end().ends_with('{') { continue; }
             candidates.push((opening, closing, mapped(declaration.heading).unwrap_or(opening), declaration.collapsed_suffix, declaration.closed));
@@ -529,20 +566,19 @@ fn call_folds(block: &mut [BufferBlock], paths: [Option<&String>; 2], presentati
     for (path, side) in [(paths[1], "proposed"), (paths[0], "baseline")] {
         let Some(path) = path else { continue };
         let Some(presentation) = presentation.get(&(path.clone(), side.into())) else { continue };
-        let lines = presentation.declaration.text.lines().collect::<Vec<_>>();
-        for (line, owner) in &presentation.owner_row {
+        for (line, body) in &presentation.body {
             let line = *line;
-            let last = (line + 1..lines.len()).take_while(|row| presentation.call_row.contains_key(row)).last().unwrap_or(line);
+            let last = body.end;
             let Some(opening) = display_row.get(&(path.clone(), side.into(), line)).copied() else { continue };
             let Some(closing) = display_row.get(&(path.clone(), side.into(), last)).copied() else { continue };
             if !installed.insert(opening) { continue; }
-            let heading = (0..line).rev().find_map(|row| display_row.get(&(path.clone(), side.into(), row)).copied()).unwrap_or(opening);
-            let id = FoldId(format!("plan:calls:{}:{side}:{}", super::digest(path.as_bytes()), super::digest(owner.as_bytes())));
+            let heading = display_row.get(&(path.clone(), side.into(), body.heading)).copied().unwrap_or(opening);
+            let id = FoldId(format!("plan:calls:{}:{side}:{}", super::digest(path.as_bytes()), super::digest(body.owner.as_bytes())));
             block[opening].metadata.fold.push(FoldRange {
                 id, start: TextPosition { row: 0, column: 0 },
                 end: BlockAnchor { block: block[closing].id.clone(), position: TextPosition { row: 1, column: 0 } },
                 heading_start: Some(BlockAnchor { block: block[heading].id.clone(), position: TextPosition { row: 0, column: 0 } }),
-                collapsed_suffix: Some("...".into()), closed: true, collapse_children: false, expand_children: false,
+                collapsed_suffix: Some(body.collapsed_suffix.into()), closed: true, collapse_children: false, expand_children: false,
             });
         }
     }
@@ -740,6 +776,105 @@ fn pointer(path: &str) -> String {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn synthetic_function_bodies_preserve_following_declaration_syntax() {
+        use std::sync::Arc;
+        use forge_diff::syntax::{SyntaxEngine, SyntaxLanguage, SyntaxLimits, SyntaxRequest};
+        use forge_diff::workers::{AnalysisPool, PoolLimits, WorkPriority};
+
+        let mut document = crate::plan::document::test_fixture("syntax-rows", "Syntax rows");
+        let mut design = super::super::DeclarationDesign::default();
+        let before = "pub struct ArenaPlugin;\nimpl ArenaPlugin { pub fn new(); }\n/// Registers the old arena systems.\nimpl Plugin for ArenaPlugin {}\n";
+        let after = before.replace("old", "shared");
+        design.baseline.insert("arena.rs".into(), super::super::DeclarationFile { text: before.into(), source_digest: String::new() });
+        design.proposed.insert("arena.rs".into(), after.clone());
+        let calls = vec![super::super::FunctionCalls { owner: "ArenaPlugin::new".into(), call: vec![
+            super::super::CallSite { kind: super::super::CallKind::Call, name: "ArenaConfig::validate".into(), source: None, unresolved: false },
+            super::super::CallSite { kind: super::super::CallKind::Property, name: "ArenaConfig::enabled".into(), source: None, unresolved: false },
+        ] }];
+        design.baseline_calls.insert("arena.rs".into(), calls.clone());
+        design.proposed_calls.insert("arena.rs".into(), calls);
+        document.design = Some(design);
+        let original = document.clone();
+        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2, input_bytes: 8 * 1024 * 1024 })), SyntaxLimits::default());
+        let mut syntax = HashMap::new();
+        for (side, text) in [("baseline", before), ("proposed", after.as_str())] {
+            let plain = forge_diff::syntax::DeclarationOverview::present("arena.rs", text).unwrap().text;
+            let handle = engine.analyze(SyntaxRequest {
+                source: SourceVersion::new(plain.into_bytes(), Representation::DisplayOnly).unwrap(),
+                language: SyntaxLanguage::Rust, priority: WorkPriority::Foreground, deadline: None,
+            }).await.unwrap();
+            syntax.insert(("arena.rs".into(), side.into()), handle);
+        }
+        for public_only in [false, true] {
+            let revealed = if public_only { HashSet::from([("arena.rs".into(), "baseline".into()), ("arena.rs".into(), "proposed".into())]) } else { HashSet::new() };
+            let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &syntax, public_only, None, &revealed).unwrap();
+            let mut comments = 0;
+            let mut implementations = 0;
+            let mut synthetic_rows = 0;
+            for block in blocks {
+                let text = block.text.row(0).unwrap();
+                let captures = &block.metadata.visible_decoration;
+                if text.starts_with("/// Registers") {
+                    comments += 1;
+                    assert!(captures.iter().any(|capture| capture.capture.starts_with("@comment")), "{text}: {captures:?}");
+                    assert!(captures.iter().any(|capture| capture.capture.starts_with("@comment.documentation") && capture.range.start.column == 0 && capture.range.end.column == text.len()), "{text}: {captures:?}");
+                    assert!(captures.iter().all(|capture| !capture.capture.starts_with("@keyword") && !capture.capture.starts_with("@type") && !capture.capture.starts_with("@function")), "{text}: {captures:?}");
+                }
+                if text == "impl Plugin for ArenaPlugin {}" {
+                    implementations += 1;
+                    for name in ["Plugin", "ArenaPlugin"] {
+                        assert!(captures.iter().any(|capture| capture.capture.starts_with("@type") && &text[capture.range.start.column..capture.range.end.column] == name), "{text}: {captures:?}");
+                    }
+                }
+                if matches!(text.trim(), "Calls" | "Accesses" | "ArenaConfig::validate" | "ArenaConfig::enabled") {
+                    synthetic_rows += 1;
+                    assert!(captures.iter().all(|capture| !capture.capture.ends_with(".rust")), "synthetic row received declaration syntax: {text}");
+                }
+            }
+            assert_eq!(comments, 2);
+            assert!(implementations > 0);
+            assert!(synthetic_rows >= 4);
+        }
+        assert_eq!(document, original);
+    }
+
+    #[test]
+    fn call_rows_highlight_qualified_types_methods_and_properties() {
+        let mut document = crate::plan::document::test_fixture("call-colors", "Call colors");
+        let mut design = super::super::DeclarationDesign::default();
+        design.proposed.insert("lib.rs".into(), "pub fn main();\n".into());
+        let cases = [
+            ("App::add_plugins", super::super::CallKind::Call, vec![("App", "@type"), ("add_plugins", "@function.method.call")]),
+            ("std::time::Instant::now", super::super::CallKind::Call, vec![("std", "@module"), ("time", "@module"), ("Instant", "@type"), ("now", "@function.method.call")]),
+            ("validate_policy", super::super::CallKind::Call, vec![("validate_policy", "@function.call")]),
+            ("client.send", super::super::CallKind::Call, vec![("client", "@variable"), ("send", "@function.method.call")]),
+            ("État::更新", super::super::CallKind::Call, vec![("État", "@type"), ("更新", "@function.method.call")]),
+            ("Client::count", super::super::CallKind::Property, vec![("Client", "@type"), ("count", "@variable.member")]),
+        ];
+        design.proposed_calls.insert("lib.rs".into(), vec![super::super::FunctionCalls {
+            owner: "main".into(),
+            call: cases.iter().map(|(name, kind, _)| super::super::CallSite {
+                name: (*name).into(), kind: *kind, source: None, unresolved: false,
+            }).collect(),
+        }]);
+        document.design = Some(design);
+        let original = document.clone();
+        for public_only in [false, true] {
+            let (blocks, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
+            for (name, _, expected) in &cases {
+                let row = blocks.iter().find(|block| block.text.row(0).is_some_and(|text| text.trim() == *name)).unwrap();
+                let text = row.text.row(0).unwrap();
+                let captures = row.metadata.visible_decoration.iter().map(|decoration| (
+                    &text[decoration.range.start.column..decoration.range.end.column], decoration.capture.as_str(),
+                )).collect::<Vec<_>>();
+                assert_eq!(&captures, expected, "{name}");
+                assert!(row.metadata.decoration.iter().any(|decoration| decoration.capture == "ForgeAddBg"));
+            }
+        }
+        assert_eq!(document, original);
+    }
+
     #[test]
     fn validation_evidence_stays_out_of_review_projection() {
         let mut document = crate::plan::document::test_fixture("validation", "Validation");
@@ -754,7 +889,7 @@ mod tests {
         });
         document.design = Some(design);
         for public_only in [false, true] {
-            let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None).unwrap();
+            let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
             assert!(block.iter().all(|block| !block.id.0.contains("validation")));
             let declaration = block.iter().find(|block| block.text.row(0) == Some("pub struct State;")).unwrap();
             assert!(declaration.metadata.target.iter().any(|range| target.contains_key(&range.id)));
@@ -769,7 +904,7 @@ mod tests {
         design.proposed.insert("config.rs".into(), "#[derive(Debug)]\npub enum ConfigError {\n  /// Invalid arena size.\n  ArenaSize,\n  Radius,\n}\n\npub struct State {\n  pub count: u64,\n  private: u64,\n}\n\nimpl State {\n  pub fn count(&self) -> u64;\n  fn hidden();\n}\n\npub struct Empty {\n  private: u64,\n}\n".into());
         document.design = Some(design);
         for public_only in [false, true] {
-            let (block, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None).unwrap();
+            let (block, _) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
             let index: HashMap<_, _> = block.iter().enumerate().map(|(row, block)| (block.id.clone(), row)).collect();
             let mut declarations = 0;
             for (row, owner) in block.iter().enumerate() {
@@ -833,6 +968,7 @@ mod tests {
                 &HashMap::new(),
                 public_only,
                 None,
+                &HashSet::new(),
             )
             .unwrap();
             let description = block
@@ -916,6 +1052,7 @@ mod tests {
             &HashMap::new(),
             true,
             None,
+            &HashSet::new(),
         )
         .unwrap();
         let text = block
@@ -955,6 +1092,7 @@ mod tests {
             &HashMap::new(),
             true,
             None,
+            &HashSet::new(),
         )
         .unwrap();
         assert!(
@@ -1067,6 +1205,7 @@ mod tests {
             &HashMap::new(),
             false,
             None,
+            &HashSet::new(),
         )
         .unwrap();
         assert!(block.iter().any(|block| !block.metadata.gutter.is_empty()));
@@ -1125,12 +1264,12 @@ mod tests {
         document.design = Some(design);
         let reopened: PlanDocument = serde_json::from_slice(&serde_json::to_vec(&document).unwrap()).unwrap();
         let rendered = render(&reopened).unwrap();
-        let (block, _, _) = rows(&reopened, &HashMap::new(), false, false, None).unwrap();
+        let (block, _, _, _) = rows(&reopened, &HashMap::new(), false, false, None, &HashSet::new()).unwrap();
         let directory = tempfile::tempdir().unwrap();
         let store = std::sync::Arc::new(crate::trace::TraceStore::open(directory.path()).unwrap());
         store.configure(true).unwrap();
         let trace = ReviewTrace { store: store.clone(), session_id: "review-test".into() };
-        rows(&reopened, &HashMap::new(), false, false, Some(&trace)).unwrap();
+        rows(&reopened, &HashMap::new(), false, false, Some(&trace), &HashSet::new()).unwrap();
         let recorded = std::fs::read_to_string(store.status().path).unwrap();
         assert!(recorded.contains("\"event\":\"plan.review.file_order\""));
         assert!(recorded.contains("\"count\":2"));
@@ -1143,7 +1282,7 @@ mod tests {
         let design = document.design.as_mut().unwrap();
         design.baseline.insert("0.ts".into(), super::super::DeclarationFile { text: "export type Zero = string;\n".into(), source_digest: String::new() });
         design.proposed.insert("0.ts".into(), "export type Zero = number;\n".into());
-        let (block, _, _) = rows(&document, &HashMap::new(), false, false, None).unwrap();
+        let (block, _, _, _) = rows(&document, &HashMap::new(), false, false, None, &HashSet::new()).unwrap();
         assert!(block.iter().any(|row| row.id == stable_id && row.text.row(0).unwrap().contains("c.ts")));
     }
 }

@@ -50,11 +50,11 @@ pub(crate) fn render(document: &PlanDocument, annotation: &[PlanAnnotation]) -> 
             let text = if baseline { design.baseline.get(path).map(|file| &file.text) } else { design.proposed.get(path) };
             let calls = if baseline { &design.baseline_calls } else { &design.proposed_calls };
             let line = if let Some(text) = text {
-                let presentation = super::calls::insert(path, text, calls.get(path).map(Vec::as_slice).unwrap_or_default(), false)?;
+                let presentation = super::calls::insert(path, text, calls.get(path).map(Vec::as_slice).unwrap_or_default(), false, false)?;
                 if let PlanReviewTarget::Call { owner, name, .. } = &subject.target {
                     presentation.call_row.iter().find(|(_, target)| target.0 == *owner && target.1 == *name).map(|(row, _)| *row as u32 + 1).context("reviewed call is absent from its saved snapshot")?
                 } else if line > 0 {
-                    presentation.plain_row.iter().enumerate().find(|(row, saved)| **saved == line as usize - 1 && !presentation.call_row.contains_key(row) && !presentation.owner_row.contains_key(row)).map(|(row, _)| row as u32 + 1).context("reviewed declaration is absent from its saved snapshot")?
+                    presentation.declaration_row.get(&(line as usize - 1)).map(|row| *row as u32 + 1).context("reviewed declaration is absent from its saved snapshot")?
                 } else { line }
             } else { line };
             files

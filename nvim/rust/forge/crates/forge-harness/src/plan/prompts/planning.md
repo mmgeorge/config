@@ -109,10 +109,10 @@ file ranges when their exact current text is unavailable and match that text, in
 Draft patches retain their layout until submission. Submission can reformat declarations, so read
 affected ranges before another revision unless current formatted text is already supplied in feedback.
 
-## Calls lists
+## Calls and property uses
 
-Source inspection extracts call occurrences alongside declarations in Rust, TypeScript, TSX, and Lua.
-The virtual file includes a `Calls` block immediately after each captured callable signature.
+Source inspection extracts call occurrences alongside declarations in Rust, TypeScript, TSX, and Lua. Property reads and writes also retain named receiver evidence. Render invocations under `Calls` and property accesses under `Accesses`, in that order. Each line contains a bare qualified target, with no arguments. Preserve occurrence order within each category. Parsing retains their existing interleaving in saved data. Both kinds share one ordered occurrence sequence. Rust construction and destructuring field names also count as property uses. Unknown or computed receivers remain unresolved and must not be matched to a same-named property without type evidence.
+The virtual file includes `Calls` and `Accesses` blocks immediately after each captured callable signature.
 Edit it atomically with declarations through `harness_design_apply_patch`. Include names only, without
 arguments, assignments, control flow, or other statements. Qualify methods with a receiver type only
 when source evidence identifies that type. Keep unresolved receiver names when evidence is absent.

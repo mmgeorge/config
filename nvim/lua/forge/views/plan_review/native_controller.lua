@@ -254,8 +254,7 @@ local function action(review, name)
         end)
       end)
     elseif name == "references" and type(result.references) == "table" then
-      require("forge.views.plan_review.references").open(review, result.references, captured,
-        function(id) action(review, "reveal_reference:" .. id) end)
+      require("forge.views.plan_review.references").open(review, result.references, captured)
     elseif type(result.message) == "string" then notifications.info(result.message, "ForgePlanReview")
     elseif type(result.declarations) == "table" then show_document(review, result.declarations, "Declarations", result.filetype, result.selection)
     elseif name == "schema" then show_document(review, result.schema, "Canonical plan", "json")

@@ -41,7 +41,8 @@ struct Edge {
     position: u32,
 }
 
-pub(super) fn order(design: &DeclarationDesign) -> Vec<ReviewFile> {
+/// Orders changed and explicitly included snapshots by package and declaration dependencies.
+pub(super) fn order(design: &DeclarationDesign, included: &HashSet<String>) -> Vec<ReviewFile> {
     let mut source = design.proposed.clone();
     for (path, file) in &design.baseline {
         if design.moved.contains_key(path) {
@@ -89,7 +90,7 @@ pub(super) fn order(design: &DeclarationDesign) -> Vec<ReviewFile> {
         edge.insert(path.clone(), outgoing);
     }
 
-    let changed = design.changed_paths();
+    let changed = design.changed_paths().into_iter().chain(included.iter().cloned());
     let destination = design.moved.values().collect::<HashSet<_>>();
     let mut changed_identity = HashMap::<String, ReviewFile>::new();
     for path in changed {
@@ -1250,7 +1251,7 @@ mod tests {
     }
 
     fn paths(design: &DeclarationDesign) -> Vec<String> {
-        order(design)
+        order(design, &HashSet::new())
             .into_iter()
             .map(|file| file.proposed)
             .collect()

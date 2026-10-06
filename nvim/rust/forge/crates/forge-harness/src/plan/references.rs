@@ -29,9 +29,9 @@ pub(crate) struct PlanReference {
 pub(crate) struct PlanReferenceIndex {
     pub occurrence: Vec<PlanReference>,
     pub definition: BTreeMap<(String, u32, u32), (String, usize)>,
-    pub call: BTreeMap<(String, String, String), String>,
+    pub call: BTreeMap<(String, String, String, super::CallKind), String>,
     pub structured: BTreeMap<String, String>,
-    pub unresolved: BTreeMap<(String, String, String), String>,
+    pub unresolved: BTreeMap<(String, String, String, super::CallKind), String>,
 }
 
 impl PlanReferenceIndex {
@@ -205,24 +205,22 @@ impl PlanReferenceIndex {
             }
             let callable = DeclarationCalls::extract(path, text, true)
                 .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let callable = callable
+                .iter()
+                .map(|function| (function.owner.as_str(), function))
+                .collect::<BTreeMap<_, _>>();
             for function in calls.get(path).into_iter().flatten() {
-                let position = callable
-                    .iter()
-                    .find(|declaration| declaration.owner == function.owner);
+                let position = callable.get(function.owner.as_str());
                 let Some(position) = position else { continue };
-                for name in function
-                    .call
-                    .iter()
-                    .map(|call| call.name.as_str())
-                    .collect::<BTreeSet<_>>()
-                {
-                    if function
-                        .call
-                        .iter()
-                        .any(|call| call.name == name && call.unresolved)
-                    {
+                let mut target = BTreeMap::<(&str, super::CallKind), bool>::new();
+                for reference in &function.call {
+                    *target.entry((&reference.name, reference.kind)).or_default() |=
+                        reference.unresolved;
+                }
+                for ((name, kind), unresolved) in target {
+                    if unresolved {
                         output.unresolved.insert(
-                            (path.clone(), function.owner.clone(), name.into()),
+                            (path.clone(), function.owner.clone(), name.into(), kind),
                             "This target includes an opaque local binding in the captured source."
                                 .into(),
                         );
@@ -231,13 +229,18 @@ impl PlanReferenceIndex {
                     let symbol = if path.ends_with(".lua") {
                         lua_target(path, name, &index, &lua_function)
                     } else {
-                        let resolution = resolver.callable(path, &function.owner, name);
+                        let resolution = match kind {
+                            super::CallKind::Call => resolver.callable(path, &function.owner, name),
+                            super::CallKind::Property => {
+                                resolver.property(path, &function.owner, name)
+                            }
+                        };
                         match &resolution {
                             DeclarationResolution::Invalid { reason }
                             | DeclarationResolution::Ambiguous { reason }
                             | DeclarationResolution::Unverified { reason } => {
                                 output.unresolved.insert(
-                                    (path.clone(), function.owner.clone(), name.into()),
+                                    (path.clone(), function.owner.clone(), name.into(), kind),
                                     reason.clone(),
                                 );
                             }
@@ -247,7 +250,7 @@ impl PlanReferenceIndex {
                     };
                     if let Some(symbol) = symbol {
                         output.call.insert(
-                            (path.clone(), function.owner.clone(), name.into()),
+                            (path.clone(), function.owner.clone(), name.into(), kind),
                             symbol.clone(),
                         );
                         output.push(
@@ -255,7 +258,7 @@ impl PlanReferenceIndex {
                             side,
                             &function.owner,
                             name,
-                            "call",
+                            kind.label(),
                             position.line,
                             position.column,
                             symbol,
@@ -619,6 +622,7 @@ impl PlanReferenceIndex {
                 .symbol
                 .iter()
                 .filter(|candidate| candidate.name == symbol.name
+                    && candidate.property == symbol.property
                     && same_scope(&candidate.scope, &symbol.scope))
                 .count()
                 <= 1,
@@ -642,6 +646,7 @@ impl PlanReferenceIndex {
                     .symbol
                     .iter()
                     .any(|previous| previous.name == symbol.name
+                        && previous.property == symbol.property
                         && same_scope(&previous.scope, &symbol.scope)),
                 "only symbols introduced by the plan can be renamed"
             );
@@ -674,9 +679,17 @@ impl PlanReferenceIndex {
         identity: &str,
         name: &str,
     ) -> Result<PlanDocument> {
+        let (definition_path, symbol) = self.rename_definition(document, identity)?;
+        let identifier = if symbol.name.starts_with('#') {
+            name.strip_prefix('#').ok_or_else(|| {
+                anyhow::anyhow!("private property names must retain their # prefix")
+            })?
+        } else {
+            name
+        };
         ensure!(
-            !name.is_empty()
-                && name
+            !identifier.is_empty()
+                && identifier
                     .chars()
                     .enumerate()
                     .all(|(position, character)| character == '_'
@@ -687,7 +700,6 @@ impl PlanReferenceIndex {
                         }),
             "enter one valid identifier"
         );
-        let (definition_path, symbol) = self.rename_definition(document, identity)?;
         ensure!(name != symbol.name, "new name matches the current name");
         let keyword = if definition_path.ends_with(".rs") {
             "as break const continue crate else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while async await dyn abstract become box do final macro override priv typeof unsized virtual yield try gen"
@@ -706,11 +718,9 @@ impl PlanReferenceIndex {
         let index = DeclarationIndex::extract(&definition_path, &design.proposed[&definition_path])
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         ensure!(
-            !index
-                .symbol
-                .iter()
-                .any(|candidate| candidate.name == name
-                    && same_scope(&candidate.scope, &symbol.scope))
+            !index.symbol.iter().any(|candidate| candidate.name == name
+                && (!definition_path.ends_with(".rs") || candidate.property == symbol.property)
+                && same_scope(&candidate.scope, &symbol.scope))
                 && !index.import.iter().any(|import| !import.export
                     && import.alias.as_deref() == Some(name)
                     && same_scope(&import.scope, &symbol.scope)),
@@ -741,11 +751,9 @@ impl PlanReferenceIndex {
             .entry(definition_path)
             .or_default()
             .insert((symbol.position.line, symbol.position.column));
-        for reference in self
-            .occurrence
-            .iter()
-            .filter(|reference| reference.symbol == identity && reference.kind != "call")
-        {
+        for reference in self.occurrence.iter().filter(|reference| {
+            reference.symbol == identity && !matches!(reference.kind.as_str(), "call" | "property")
+        }) {
             let text = &design.proposed[&reference.path];
             let row = text
                 .lines()
@@ -791,7 +799,12 @@ impl PlanReferenceIndex {
                     }
                     let selected = self
                         .call
-                        .get(&(path.clone(), function.owner.clone(), call.name.clone()))
+                        .get(&(
+                            path.clone(),
+                            function.owner.clone(),
+                            call.name.clone(),
+                            call.kind,
+                        ))
                         .is_some_and(|target| target == identity);
                     let separator = if path.ends_with(".rs") { "::" } else { "." };
                     let normalized = call
@@ -897,16 +910,20 @@ impl PlanReferenceIndex {
     pub(crate) fn selected(&self, anchor: &PlanNavigationAnchor, column: u32) -> Option<&str> {
         match &anchor.target {
             PlanReviewTarget::Call {
-                path, owner, name, ..
+                path,
+                owner,
+                name,
+                kind,
+                ..
             } => self
                 .call
-                .get(&(path.clone(), owner.clone(), name.clone()))
+                .get(&(path.clone(), owner.clone(), name.clone(), *kind))
                 .map(String::as_str),
             PlanReviewTarget::Declaration { path, line, .. } => self
                 .occurrence
                 .iter()
                 .filter(|reference| {
-                    reference.kind != "call"
+                    !matches!(reference.kind.as_str(), "call" | "property")
                         && reference.path == *path
                         && reference.line == *line
                         && reference.column <= column
@@ -947,6 +964,7 @@ fn lua_symbol(
     let mut scope = normalized.split('.').map(str::to_owned).collect::<Vec<_>>();
     let name = scope.pop()?;
     Some(forge_diff::syntax::DeclarationSymbol {
+        property: false,
         position: forge_diff::syntax::DeclarationPosition {
             line,
             column: column + function.owner.len() as u32 - name.len() as u32,
@@ -1015,6 +1033,252 @@ mod tests {
     use super::*;
 
     #[test]
+    fn property_reference_index_handles_large_ordered_occurrence_lists() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document = super::super::document::test_fixture("scale", "Property scale");
+        let mut design = super::super::DeclarationDesign::default();
+        let mut declaration = String::from("pub struct Client {\n");
+        for field in 0..1000 {
+            declaration.push_str(&format!("pub field_{field}: usize,\n"));
+        }
+        declaration.push_str("}\npub fn run(client: &Client);\n");
+        design.proposed.insert("lib.rs".into(), declaration);
+        let mut source = String::from("fn run(client: &Client) {\n");
+        for field in 0..1000 {
+            for _ in 0..10 {
+                source.push_str(&format!("client.field_{field};\n"));
+            }
+        }
+        source.push_str("}\n");
+        let started = std::time::Instant::now();
+        let capture = super::super::calls::extract("lib.rs", &source).unwrap();
+        let extraction = started.elapsed();
+        assert_eq!(capture[0].call.len(), 10000);
+        design.proposed_calls.insert("lib.rs".into(), capture);
+        document.design = Some(design);
+        let started = std::time::Instant::now();
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let indexing = started.elapsed();
+        assert_eq!(index.call.len(), 1000);
+        assert_eq!(
+            index
+                .occurrence
+                .iter()
+                .filter(|reference| reference.kind == "property")
+                .count(),
+            1000
+        );
+        assert!(index.unresolved.is_empty());
+        eprintln!(
+            "property scale: 10000 occurrences, 1000 unique targets, capture={extraction:?}, index={indexing:?}"
+        );
+    }
+
+    #[test]
+    fn typescript_properties_follow_aliases_and_include_methods_taken_as_values() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document =
+            super::super::document::test_fixture("properties", "Inherited properties");
+        let mut design = super::super::DeclarationDesign::default();
+        design.document.task = "Introduce a property and a callable member".into();
+        design.document.description = "Resolve their inherited and value references".into();
+        design.proposed.insert("client.ts".into(), "export interface Base { count: number; send(): void; }\nexport interface Derived extends Base {}\nexport type Alias = Derived;\nexport type Cycle = Cycle;\n".into());
+        design.proposed.insert("run.ts".into(), "import { Alias, Cycle } from './client';\nfunction run(client: Alias, cyclic: Cycle): void;\n".into());
+        design.proposed_calls.insert("run.ts".into(), super::super::calls::extract("run.ts", "function run(client: Alias, cyclic: Cycle) { client.count++; const callback = client.send; cyclic.count; }").unwrap());
+        document.design = Some(design);
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        assert!(!index.call.contains_key(&(
+            "run.ts".into(),
+            "run".into(),
+            "Cycle.count".into(),
+            super::super::CallKind::Property
+        )));
+        assert!(
+            index.unresolved[&(
+                "run.ts".into(),
+                "run".into(),
+                "Cycle.count".into(),
+                super::super::CallKind::Property
+            )]
+                .contains("cyclic")
+        );
+        let property = index
+            .call
+            .get(&(
+                "run.ts".into(),
+                "run".into(),
+                "Alias.count".into(),
+                super::super::CallKind::Property,
+            ))
+            .expect("inherited aliased property should resolve");
+        let renamed = index
+            .renamed(&document, workspace.path(), property, "total")
+            .unwrap();
+        assert!(renamed.design.as_ref().unwrap().proposed["client.ts"].contains("total: number"));
+        assert_eq!(
+            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call[0].name,
+            "Alias.total"
+        );
+        let method = index
+            .call
+            .get(&(
+                "run.ts".into(),
+                "run".into(),
+                "Alias.send".into(),
+                super::super::CallKind::Property,
+            ))
+            .expect("method value should resolve");
+        let renamed = index
+            .renamed(&document, workspace.path(), method, "dispatch")
+            .unwrap();
+        assert!(renamed.design.as_ref().unwrap().proposed["client.ts"].contains("dispatch()"));
+        assert_eq!(
+            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call[1].name,
+            "Alias.dispatch"
+        );
+    }
+
+    #[test]
+    fn property_uses_resolve_by_owner_and_rename_only_introduced_fields() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document =
+            super::super::document::test_fixture("properties", "Property references");
+        let mut design = super::super::DeclarationDesign::default();
+        design.document.task = "Add a count field".into();
+        design.document.description =
+            "Preserve the property identity across calls and accesses".into();
+        let baseline =
+            "pub struct Client { pub existing: usize }\nimpl Client { pub fn count(&self); }\n";
+        let proposed = "pub struct Client { pub existing: usize, pub count: usize }\nimpl Client { pub fn count(&self); }\npub struct Other { pub count: usize }\n";
+        design.baseline.insert(
+            "client.rs".into(),
+            super::super::DeclarationFile {
+                text: baseline.into(),
+                source_digest: "captured".into(),
+            },
+        );
+        design.proposed.insert("client.rs".into(), proposed.into());
+        let caller = "use crate::client::{Client, Other};\npub fn run(client: &mut Client, other: &Other, opaque: Unknown);\n";
+        design.proposed.insert("lib.rs".into(), caller.into());
+        design.proposed.insert(
+            "Cargo.toml".into(),
+            "[package]\nname='properties'\nversion='0.1.0'\nedition='2024'\n[lib]\npath='lib.rs'\n"
+                .into(),
+        );
+        // The module declaration gives the snapshot resolver ownership of the captured file.
+        design
+            .proposed
+            .get_mut("lib.rs")
+            .unwrap()
+            .insert_str(0, "mod client;\n");
+        let source = "use crate::client::{Client, Other}; fn run(client: &mut Client, other: &Other, opaque: Unknown) { client.count += 1; client.count(); other.count; opaque.count; client.existing; }";
+        design.proposed_calls.insert(
+            "lib.rs".into(),
+            super::super::calls::extract("lib.rs", source).unwrap(),
+        );
+        document.design = Some(design);
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let key = (
+            "lib.rs".into(),
+            "run".into(),
+            "Client::count".into(),
+            super::super::CallKind::Property,
+        );
+        let identity = index
+            .call
+            .get(&key)
+            .expect("property target should resolve");
+        let method = index
+            .call
+            .get(&(
+                "lib.rs".into(),
+                "run".into(),
+                "Client::count".into(),
+                super::super::CallKind::Call,
+            ))
+            .expect("method target should resolve");
+        assert_ne!(identity, method);
+        let anchor = PlanNavigationAnchor {
+            line: 1,
+            target: PlanReviewTarget::Call {
+                kind: super::super::CallKind::Property,
+                path: "lib.rs".into(),
+                side: "proposed".into(),
+                owner: "run".into(),
+                name: "Client::count".into(),
+            },
+            json_path: String::new(),
+            path: Some("lib.rs".into()),
+            label: String::new(),
+        };
+        assert_eq!(index.selected(&anchor, 0), Some(identity.as_str()));
+        let destination = index
+            .destination(&document, workspace.path(), identity, false)
+            .unwrap()
+            .unwrap();
+        assert!(destination.proposed);
+        assert_eq!(destination.name, "count");
+        assert_eq!(
+            index
+                .occurrence
+                .iter()
+                .filter(|reference| reference.symbol == *identity && reference.kind == "property")
+                .count(),
+            1
+        );
+        let renamed = index
+            .renamed(&document, workspace.path(), identity, "total")
+            .unwrap();
+        let design = renamed.design.as_ref().unwrap();
+        assert!(design.proposed["client.rs"].contains("pub total: usize"));
+        assert!(design.proposed["client.rs"].contains("fn count"));
+        assert!(design.proposed["client.rs"].contains("Other { pub count"));
+        let reference = &design.proposed_calls["lib.rs"][0].call;
+        assert_eq!(
+            reference
+                .iter()
+                .map(|reference| (reference.name.as_str(), reference.kind))
+                .collect::<Vec<_>>(),
+            [
+                ("Client::total", super::super::CallKind::Property),
+                ("Client::count", super::super::CallKind::Call),
+                ("Other::count", super::super::CallKind::Property),
+                ("Unknown::count", super::super::CallKind::Property),
+                ("Client::existing", super::super::CallKind::Property)
+            ]
+        );
+        assert_eq!(design.baseline, document.design.as_ref().unwrap().baseline);
+        let existing = index
+            .call
+            .get(&(
+                "lib.rs".into(),
+                "run".into(),
+                "Client::existing".into(),
+                super::super::CallKind::Property,
+            ))
+            .unwrap();
+        assert!(index.rename_definition(&document, existing).is_err());
+        assert!(!index.call.contains_key(&(
+            "lib.rs".into(),
+            "run".into(),
+            "Unknown::count".into(),
+            super::super::CallKind::Property
+        )));
+        let combined = super::super::calls::combined(
+            "lib.rs",
+            &design.proposed["lib.rs"],
+            &design.proposed_calls["lib.rs"],
+        )
+        .unwrap();
+        assert!(combined.contains("Calls\n  Client::count"));
+        assert!(combined.contains("Accesses\n  Client::total"));
+        let (_, round_trip) =
+            super::super::calls::parse("lib.rs", &combined, &design.proposed_calls["lib.rs"])
+                .unwrap();
+        assert_eq!(round_trip, design.proposed_calls["lib.rs"]);
+    }
+
+    #[test]
     fn rename_updates_cross_file_calls_in_order_without_touching_baselines() {
         let workspace = tempfile::tempdir().unwrap();
         let mut document = super::super::document::test_fixture("rename", "Rename");
@@ -1034,6 +1298,7 @@ mod tests {
                 owner: "run".into(),
                 call: vec![
                     super::super::CallSite {
+                        kind: crate::plan::CallKind::Call,
                         name: "send".into(),
                         source: None,
                         unresolved: false
@@ -1108,6 +1373,7 @@ mod tests {
             vec![super::super::FunctionCalls {
                 owner: "send".into(),
                 call: vec![super::super::CallSite {
+                    kind: crate::plan::CallKind::Call,
                     name: "send".into(),
                     source: None,
                     unresolved: false,
@@ -1154,6 +1420,7 @@ mod tests {
                 super::super::FunctionCalls {
                     owner: "run".into(),
                     call: vec![super::super::CallSite {
+                        kind: crate::plan::CallKind::Call,
                         name: "Client::send".into(),
                         source: None,
                         unresolved: false,
@@ -1212,6 +1479,7 @@ mod tests {
             vec![super::super::FunctionCalls {
                 owner: "run".into(),
                 call: vec![super::super::CallSite {
+                    kind: crate::plan::CallKind::Call,
                     name: "Client::send".into(),
                     source: None,
                     unresolved: false,
@@ -1293,6 +1561,7 @@ mod tests {
             vec![super::super::FunctionCalls {
                 owner: "run".into(),
                 call: vec![super::super::CallSite {
+                    kind: crate::plan::CallKind::Call,
                     name: "client.send".into(),
                     source: None,
                     unresolved: false,
@@ -1339,6 +1608,7 @@ mod tests {
             vec![super::super::FunctionCalls {
                 owner: "run".into(),
                 call: vec![super::super::CallSite {
+                    kind: crate::plan::CallKind::Call,
                     name: "Client::send".into(),
                     source: None,
                     unresolved: false,
@@ -1349,7 +1619,12 @@ mod tests {
         let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
         let call = index
             .call
-            .get(&("src/lib.rs".into(), "run".into(), "Client::send".into()))
+            .get(&(
+                "src/lib.rs".into(),
+                "run".into(),
+                "Client::send".into(),
+                super::super::CallKind::Call,
+            ))
             .expect("call resolves");
         assert_eq!(
             index
@@ -1401,6 +1676,7 @@ mod tests {
             vec![super::super::FunctionCalls {
                 owner: "run".into(),
                 call: vec![super::super::CallSite {
+                    kind: crate::plan::CallKind::Call,
                     name: "send".into(),
                     source: None,
                     unresolved: false,
@@ -1409,11 +1685,12 @@ mod tests {
         );
         document.design = Some(design);
         let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
-        assert!(
-            index
-                .call
-                .contains_key(&("run.ts".into(), "run".into(), "send".into()))
-        );
+        assert!(index.call.contains_key(&(
+            "run.ts".into(),
+            "run".into(),
+            "send".into(),
+            super::super::CallKind::Call
+        )));
     }
 
     #[test]
@@ -1434,6 +1711,7 @@ mod tests {
             vec![super::super::FunctionCalls {
                 owner: "run".into(),
                 call: vec![super::super::CallSite {
+                    kind: crate::plan::CallKind::Call,
                     name: "client.send".into(),
                     source: None,
                     unresolved: false,
@@ -1442,11 +1720,12 @@ mod tests {
         );
         document.design = Some(design);
         let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
-        assert!(
-            index
-                .call
-                .contains_key(&("run.lua".into(), "run".into(), "client.send".into()))
-        );
+        assert!(index.call.contains_key(&(
+            "run.lua".into(),
+            "run".into(),
+            "client.send".into(),
+            super::super::CallKind::Call
+        )));
     }
 
     #[test]
@@ -1492,6 +1771,7 @@ mod tests {
             vec![super::super::FunctionCalls {
                 owner: "run".into(),
                 call: vec![super::super::CallSite {
+                    kind: crate::plan::CallKind::Call,
                     name: "send".into(),
                     source: None,
                     unresolved: true,
@@ -1502,7 +1782,12 @@ mod tests {
         design.document.description = "Preserve opaque callback bindings".into();
         document.design = Some(design);
         let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
-        let key = ("run.ts".into(), "run".into(), "send".into());
+        let key = (
+            "run.ts".into(),
+            "run".into(),
+            "send".into(),
+            super::super::CallKind::Call,
+        );
         assert!(!index.call.contains_key(&key));
         assert!(index.unresolved.contains_key(&key));
         let identity = &index

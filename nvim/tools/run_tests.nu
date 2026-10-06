@@ -102,6 +102,7 @@ def main [
   filter: string = ""
   --timeout: duration = 30sec
   --minimal
+  --executable: path
   --list
   --worker
   --worker-spec: path
@@ -124,6 +125,12 @@ def main [
   if ($test_list | is-empty) { error make {msg: $"No Forge tests match ($filter)"} }
   let startup = if $minimal { [--headless -i NONE -u NONE --cmd "set rtp^=./nvim" -c "lua vim.loader.enable(false)"] } else {
     [--headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.loader.enable(false)"]
+  }
+  let startup = if $executable == null { $startup } else {
+    let executable_path = $executable | path expand
+    if not ($executable_path | path exists) { error make {msg: $"Test executable does not exist: ($executable_path)"} }
+    let literal = $executable_path | str replace --all '\' '/' | to json --raw
+    $startup | append [-c $"lua vim.g.forge_test_executable = ($literal)"]
   }
   mut failure_count = 0
   for entry in ($test_list | enumerate) {

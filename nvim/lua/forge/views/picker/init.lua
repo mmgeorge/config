@@ -101,13 +101,21 @@ local function close_search(instance)
   instance.search_win = nil
 end
 
+---@class ForgePickerSelectionContext
+---@field page table
+---@field option? table
+---@field query string
+---@field preview_height integer Visible host rows above the picker.
+
 ---@param instance table
----@return table
+---@return ForgePickerSelectionContext
 local function selection_context(instance)
+  local bounds = layout.host_bounds(instance.spec.host.window_list)
   return {
     page = picker_state.page(instance.state, instance.spec),
     option = picker_state.selected_option(instance.state, instance.spec),
     query = picker_state.query(instance.state, instance.spec),
+    preview_height = math.max(1, bounds.height - vim.api.nvim_win_get_height(instance.win) - 2),
   }
 end
 
@@ -117,8 +125,10 @@ local function notify_selection(instance, force)
   if not instance.spec.on_change then return end
   local context = selection_context(instance)
   local identity = context.option and tostring(context.option.id or context.option.value or context.option.label) or ""
-  if not force and instance.notified_identity == identity then return end
+  if not force and instance.notified_identity == identity
+    and instance.notified_preview_height == context.preview_height then return end
   instance.notified_identity = identity
+  instance.notified_preview_height = context.preview_height
   instance.spec.on_change(context, Picker)
 end
 
