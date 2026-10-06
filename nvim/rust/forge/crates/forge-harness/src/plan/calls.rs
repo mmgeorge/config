@@ -1,4 +1,4 @@
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 
 use anyhow::{Context, Result, ensure};
 use forge_diff::syntax::{
@@ -60,13 +60,17 @@ pub struct CallPosition {
     pub column: u32,
 }
 
-/// An ordered sequence of invocations and property accesses belonging to a named callable.
+/// Saved behavioral intent and ordered references belonging to one callable.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-pub struct FunctionCalls {
+pub struct FunctionBody {
     /// Callable identity within its saved declaration file.
     pub owner: String,
-    /// Ordered occurrences, including repeated targets.
-    pub call: Vec<CallSite>,
+    /// Intended behavior change, absent until authored through the declaration patch tool.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub change: Option<String>,
+    /// Ordered occurrences, including repeated targets. Absence means references are unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub call: Option<Vec<CallSite>>,
 }
 
 /// Maps display rows to saved declarations and call identities.
@@ -75,6 +79,7 @@ pub(crate) struct CallPresentation {
     pub plain: String,
     pub declaration: DeclarationPresentation,
     pub call_row: BTreeMap<usize, (String, String, CallKind)>,
+    pub change_row: BTreeMap<usize, (String, u32)>,
     /// Rendered body boundaries keyed by their final signature row.
     pub body: BTreeMap<usize, CallBody>,
     pub plain_row: Vec<usize>,
@@ -96,7 +101,7 @@ pub(crate) struct CallBody {
 
 /// Extract source call evidence without capturing unrelated files.
 #[cfg(test)]
-pub(crate) fn extract(path: &str, source: &str) -> Result<Vec<FunctionCalls>> {
+pub(crate) fn extract(path: &str, source: &str) -> Result<Vec<FunctionBody>> {
     Ok(from_extracted(
         DeclarationCalls::extract(path, source, false)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?,
@@ -105,12 +110,13 @@ pub(crate) fn extract(path: &str, source: &str) -> Result<Vec<FunctionCalls>> {
 
 pub(crate) fn from_extracted(
     functions: Vec<forge_diff::syntax::DeclarationCallable>,
-) -> Vec<FunctionCalls> {
+) -> Vec<FunctionBody> {
     functions
         .into_iter()
-        .map(|function| FunctionCalls {
+        .map(|function| FunctionBody {
             owner: function.owner,
-            call: function
+            change: None,
+            call: Some(function
                 .call
                 .into_iter()
                 .map(|call| CallSite {
@@ -125,18 +131,18 @@ pub(crate) fn from_extracted(
                         column: call.column,
                     }),
                 })
-                .collect(),
+                .collect()),
         })
         .collect()
 }
 
 /// Return an editable file view in declaration and stored call order.
-pub(crate) fn combined(path: &str, text: &str, calls: &[FunctionCalls]) -> Result<String> {
+pub(crate) fn combined(path: &str, text: &str, calls: &[FunctionBody]) -> Result<String> {
     Ok(insert(path, text, calls, false, false)?.declaration.text)
 }
 
-/// Render alphabetical unique targets while preserving the saved occurrence sequence.
-pub(crate) fn present(path: &str, text: &str, calls: &[FunctionCalls]) -> Result<CallPresentation> {
+/// Render function summaries and unique references while preserving saved occurrence order.
+pub(crate) fn present(path: &str, text: &str, calls: &[FunctionBody]) -> Result<CallPresentation> {
     let presentation =
         DeclarationOverview::present(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
     const SORT_FUNCTION_USES: bool = false;
@@ -155,7 +161,7 @@ pub(crate) fn present(path: &str, text: &str, calls: &[FunctionCalls]) -> Result
 pub(crate) fn insert(
     path: &str,
     text: &str,
-    calls: &[FunctionCalls],
+    calls: &[FunctionBody],
     review: bool,
     sort: bool,
 ) -> Result<CallPresentation> {
@@ -176,6 +182,7 @@ pub(crate) fn insert(
                     .collect(),
             },
             call_row: BTreeMap::new(),
+            change_row: BTreeMap::new(),
             body: BTreeMap::new(),
             plain_row: (0..text.lines().count()).collect(),
             declaration_row: (0..text.lines().count()).map(|row| (row, row)).collect(),
@@ -198,6 +205,7 @@ pub(crate) fn insert(
     let mut output = String::new();
     let mut source = Vec::new();
     let mut call_row = BTreeMap::new();
+    let mut change_row = BTreeMap::new();
     let mut body = BTreeMap::new();
     let mut declaration_row = BTreeMap::new();
     let lua = path.ends_with(".lua");
@@ -223,14 +231,25 @@ pub(crate) fn insert(
                 let opening = source.len() - 1;
                 let heading = declaration_row[&(function.line as usize - 1)];
                 let body_indent = if review { "  " } else { "" };
+                if let Some(change) = &calls.change {
+                    for (offset, summary) in std::iter::once("Change").chain(change.lines()).enumerate() {
+                        change_row.insert(source.len(), (function.owner.clone(), offset as u32));
+                        let summary_indent = if offset == 0 { "" } else { "  " };
+                        if summary.is_empty() { output.push('\n'); }
+                        else { output.push_str(&format!("{indent}{body_indent}{summary_indent}{summary}\n")); }
+                        source.push(Some(DeclarationPosition { line: function.line, column: function.column }));
+                    }
+                }
                 for kind in [CallKind::Call, CallKind::Property] {
+                    let Some(occurrences) = &calls.call else { continue };
                     let mut targets = calls
                         .call
                         .iter()
+                        .flatten()
                         .filter(|call| call.kind == kind)
                         .map(|call| call.name.as_str())
                         .collect::<Vec<_>>();
-                    if targets.is_empty() && !(kind == CallKind::Call && calls.call.is_empty()) {
+                    if targets.is_empty() && !(kind == CallKind::Call && occurrences.is_empty()) {
                         continue;
                     }
                     if review {
@@ -268,7 +287,12 @@ pub(crate) fn insert(
                             owner: function.owner.clone(),
                             heading,
                             end: source.len(),
-                            collapsed_suffix: if lua { " ... end" } else { "...}" },
+                            collapsed_suffix: match (lua, calls.change.is_some()) {
+                                (true, true) => " ... end [changed]",
+                                (false, true) => "...} [changed]",
+                                (true, false) => " ... end",
+                                (false, false) => "...}",
+                            },
                         },
                     );
                     output.push_str(&format!("{indent}{}\n", if lua { "end" } else { "}" }));
@@ -291,6 +315,7 @@ pub(crate) fn insert(
             source,
         },
         call_row,
+        change_row,
         body,
         plain_row,
         declaration_row,
@@ -325,12 +350,64 @@ pub(crate) fn visibility(
     })
 }
 
-/// Split combined patch text, retaining evidence for unchanged call occurrences.
+enum BodySection {
+    Change(String),
+    References(CallKind, Vec<(String, CallKind)>),
+}
+
+#[derive(Default)]
+struct FunctionSection {
+    change: Option<String>,
+    reference: BTreeMap<CallKind, Vec<(String, CallKind)>>,
+}
+
+fn protected_declaration_lines(path: &str, text: &str, lines: &[&str]) -> Result<std::collections::BTreeSet<usize>> {
+    let regions = DeclarationCalls::protected_regions(path, text)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    if !lines.iter().any(|line| line.trim() == "Change") {
+        return Ok(regions.into_iter().flatten().collect());
+    }
+    let mut sections = Vec::new();
+    let mut index = 0;
+    while index < lines.len() {
+        let line = lines[index];
+        if matches!(line.trim(), "Change" | "Calls" | "Accesses") {
+            let start = index;
+            let indent = line.len() - line.trim_start().len();
+            index += 1;
+            while index < lines.len() && (lines[index].trim().is_empty() || lines[index].len() - lines[index].trim_start().len() > indent) {
+                index += 1;
+            }
+            sections.push(start..index);
+        } else { index += 1; }
+    }
+    let source_regions = regions.into_iter().filter(|region| {
+        let preceding = sections.partition_point(|section| section.start < region.start);
+        !preceding.checked_sub(1).is_some_and(|index| sections[index].contains(&region.start))
+    }).collect::<Vec<_>>();
+    let mut masked = vec![false; lines.len()];
+    for section in sections {
+        let preceding = source_regions.partition_point(|region| region.start <= section.start);
+        if !preceding.checked_sub(1).is_some_and(|index| source_regions[index].contains(&section.start)) {
+            masked[section].fill(true);
+        }
+    }
+    let mut declarations = String::with_capacity(text.len());
+    for (row, line) in lines.iter().enumerate() {
+        if masked[row] { declarations.extend(std::iter::repeat_n(' ', line.len())); }
+        else { declarations.push_str(line); }
+        declarations.push('\n');
+    }
+    Ok(DeclarationCalls::protected_regions(path, &declarations)
+        .map_err(|error| anyhow::anyhow!("{error:?}"))?.into_iter().flatten().collect())
+}
+
+/// Split function summaries and references from signatures, retaining unchanged source evidence.
 pub(crate) fn parse(
     path: &str,
     text: &str,
-    previous: &[FunctionCalls],
-) -> Result<(String, Vec<FunctionCalls>)> {
+    previous: &[FunctionBody],
+) -> Result<(String, Vec<FunctionBody>)> {
     if forge_diff::syntax::ConfigurationFormat::for_path(path).is_some() {
         return Ok((
             DeclarationOverview::parse(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?,
@@ -342,8 +419,7 @@ pub(crate) fn parse(
         "combined declaration exceeds 1 MiB or contains NUL"
     );
     let lines = text.lines().collect::<Vec<_>>();
-    let protected = DeclarationCalls::protected_lines(path, text)
-        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+    let protected = protected_declaration_lines(path, text, &lines)?;
     let mut declaration = String::new();
     let mut block = Vec::new();
     let mut original_line = Vec::new();
@@ -351,7 +427,7 @@ pub(crate) fn parse(
     let mut occurrence_count = 0;
     while index < lines.len() {
         let line = lines[index];
-        if matches!(line.trim(), "Calls" | "Accesses") && !protected.contains(&index) {
+        if matches!(line.trim(), "Change" | "Calls" | "Accesses") && !protected.contains(&index) {
             let kind = if line.trim() == "Accesses" {
                 CallKind::Property
             } else {
@@ -363,6 +439,27 @@ pub(crate) fn parse(
                 .copied()
                 .context("Function uses must follow a callable declaration")?;
             index += 1;
+            if line.trim() == "Change" {
+                let start = index;
+                while index < lines.len() {
+                    let value = lines[index];
+                    if !value.trim().is_empty() && value.len() - value.trim_start().len() <= indent {
+                        break;
+                    }
+                    index += 1;
+                }
+                let mut end = index;
+                while end > start && lines[end - 1].trim().is_empty() { end -= 1; }
+                index = end;
+                let summary_indent = lines[start..end].iter().filter(|value| !value.trim().is_empty())
+                    .map(|value| value.len() - value.trim_start().len()).min()
+                    .context("Change requires an indented, nonempty summary")?;
+                let change = lines[start..end].iter().map(|value| {
+                    if value.trim().is_empty() { "" } else { &value[summary_indent..] }
+                }).collect::<Vec<_>>().join("\n");
+                block.push((original_line.len(), preceding, BodySection::Change(change)));
+                continue;
+            }
             let mut names = Vec::new();
             while index < lines.len() {
                 let value = lines[index];
@@ -386,7 +483,7 @@ pub(crate) fn parse(
                 );
                 index += 1;
             }
-            block.push((original_line.len(), preceding, kind, names));
+            block.push((original_line.len(), preceding, BodySection::References(kind, names)));
         } else {
             declaration.push_str(line);
             declaration.push('\n');
@@ -403,8 +500,7 @@ pub(crate) fn parse(
         .enumerate()
         .map(|(index, function)| (function.owner.as_str(), index))
         .collect::<BTreeMap<_, _>>();
-    let mut sections = BTreeMap::<usize, BTreeMap<CallKind, Vec<(String, CallKind)>>>::new();
-    let mut seen = BTreeSet::new();
+    let mut sections = BTreeMap::<usize, FunctionSection>::new();
     let by_line = functions
         .iter()
         .map(|function| (function.end_line as usize, function))
@@ -413,22 +509,27 @@ pub(crate) fn parse(
         .iter()
         .map(|calls| (calls.owner.as_str(), calls))
         .collect::<BTreeMap<_, _>>();
-    for (line, _, kind, names) in block {
+    for (line, _, section) in block {
         let function = by_line
             .get(&line)
-            .context("Function uses must immediately follow a callable signature")?;
-        ensure!(
-            seen.insert((function.owner.clone(), kind)),
-            "duplicate {:?} block for {}",
-            kind,
-            function.owner
-        );
-        sections.entry(line).or_default().insert(kind, names);
+            .context("Function body sections must immediately follow a callable signature")?;
+        let entry = sections.entry(line).or_default();
+        match section {
+            BodySection::Change(change) => {
+                ensure!(entry.change.is_none(), "duplicate Change block for {}", function.owner);
+                entry.change = Some(change);
+            }
+            BodySection::References(kind, names) => {
+                ensure!(!entry.reference.contains_key(&kind), "duplicate {:?} block for {}", kind, function.owner);
+                entry.reference.insert(kind, names);
+            }
+        }
     }
     let mut output = Vec::new();
     for (line, sections) in sections {
         let function = by_line[&line];
-        let mut category = sections
+        let references_available = !sections.reference.is_empty();
+        let mut category = sections.reference
             .into_iter()
             .map(|(kind, names)| (kind, std::collections::VecDeque::from(names)))
             .collect::<BTreeMap<_, _>>();
@@ -436,7 +537,7 @@ pub(crate) fn parse(
         for previous in by_owner
             .get(function.owner.as_str())
             .into_iter()
-            .flat_map(|calls| &calls.call)
+            .flat_map(|calls| calls.call.iter().flatten())
         {
             if let Some(entry) = category
                 .get_mut(&previous.kind)
@@ -453,7 +554,7 @@ pub(crate) fn parse(
         for call in by_owner
             .get(function.owner.as_str())
             .into_iter()
-            .flat_map(|calls| &calls.call)
+            .flat_map(|calls| calls.call.iter().flatten())
         {
             remaining
                 .entry((call.name.clone(), call.kind))
@@ -480,9 +581,10 @@ pub(crate) fn parse(
                 call
             })
             .collect();
-        output.push(FunctionCalls {
+        output.push(FunctionBody {
             owner: function.owner.clone(),
-            call,
+            change: sections.change,
+            call: references_available.then_some(call),
         });
     }
     output.sort_by_key(|calls| {
@@ -499,6 +601,67 @@ mod tests {
     use super::*;
 
     #[test]
+    fn change_sections_round_trip_without_inventing_references() {
+        for (path, source) in [
+            ("main.rs", "pub fn run() { send(); }\n"),
+            ("main.ts", "export function run() { send(); }\n"),
+            ("main.tsx", "export function run() { send(); }\n"),
+            ("main.lua", "function run()\n send()\nend\n"),
+        ] {
+            let declaration = DeclarationOverview::extract(path, source).unwrap();
+            let authored = format!("{}Change\n  Stop retrying authentication failures.\n\n  Record the final attempt.\n", declaration);
+            let (parsed, body) = parse(path, &authored, &[]).unwrap();
+            assert_eq!(parsed, declaration);
+            assert_eq!(body[0].change.as_deref(), Some("Stop retrying authentication failures.\n\nRecord the final attempt."));
+            assert_eq!(body[0].call, None);
+            assert_eq!(combined(path, &parsed, &body).unwrap(), authored);
+            let saved = serde_json::to_value(&body).unwrap();
+            assert!(saved[0].get("call").is_none());
+            assert_eq!(serde_json::from_value::<Vec<FunctionBody>>(saved).unwrap(), body);
+            let review = present(path, &parsed, &body).unwrap();
+            assert!(review.call_row.is_empty());
+            assert_eq!(review.change_row.len(), 4);
+            assert!(review.body.values().all(|body| body.collapsed_suffix.contains("[changed]")));
+            assert!(!review.declaration.text.contains("Calls"));
+            let mut captured = extract(path, source).unwrap();
+            captured[0].change = body[0].change.clone();
+            assert_eq!(parse(path, &combined(path, &parsed, &captured).unwrap(), &captured).unwrap().1, captured);
+        }
+    }
+
+    #[test]
+    fn change_prose_does_not_affect_later_reference_sections() {
+        for (path, source) in [("run.rs", "pub fn run();\npub fn next();\n"), ("run.ts", "export function run();\nexport function next();\n"), ("run.lua", "function run()\nfunction next()\n")] {
+            let declaration = DeclarationOverview::parse(path, source).unwrap();
+            let lines = declaration.lines().collect::<Vec<_>>();
+            for prose in ["Handle a \" token in malformed input.", "Handle a [[ token in malformed input.", "Reject /* delimiters in invalid input."] {
+                let text = format!("{}\nChange\n  {prose}\nCalls\n  send\n{}\nChange\n  Report a \" token and */ delimiter in the result.\nCalls\n  record\n", lines[0], lines[1]);
+                let (_, body) = parse(path, &text, &[]).unwrap_or_else(|error| panic!("{path}: {prose}: {error}"));
+                assert_eq!(body.len(), 2);
+                assert_eq!(body[1].call.as_ref().unwrap()[0].name, "record");
+            }
+        }
+    }
+
+    #[test]
+    fn change_sections_require_one_nonempty_summary_owned_by_a_function() {
+        for invalid in [
+            "Change\n  Explain the change.\n",
+            "pub struct Data;\nChange\n  Explain the change.\n",
+            "pub fn run();\nChange\n",
+            "pub fn run();\nChange\n  \nCalls\n",
+            "pub fn run();\nChange\n  First.\nChange\n  Second.\n",
+        ] { assert!(parse("main.rs", invalid, &[]).is_err(), "{invalid}"); }
+        let text = "/*\nChange\n  Documentation example.\n*/\npub fn run();\n";
+        assert_eq!(parse("main.rs", text, &[]).unwrap(), (text.into(), vec![]));
+        let (declaration, body) = parse("main.rs", "pub fn run();\nChange\n  Preserve ordering.\nCalls\nAccesses\n", &[]).unwrap();
+        assert_eq!(body[0].call, Some(vec![]));
+        let editable = combined("main.rs", &declaration, &body).unwrap();
+        assert!(editable.contains("Calls\n"));
+        assert_eq!(parse("main.rs", "pub fn run();\nCalls\n", &body).unwrap().1[0].change, None);
+    }
+
+    #[test]
     fn display_sorting_is_opt_in_for_both_categories_and_preserves_occurrences() {
         let path = "main.rs";
         let source = "fn run(client: Client) { z(); client.z; a(); client.a; z(); client.z; }";
@@ -510,7 +673,7 @@ mod tests {
         let sorted = insert(path, &default.plain, &calls, true, true).unwrap();
         assert_eq!(sorted.call_row.values().map(|(_, name, _)| name.as_str()).collect::<Vec<_>>(), ["a", "z", "Client::a", "Client::z"]);
         assert_eq!(calls, original);
-        assert_eq!(calls[0].call.len(), 6);
+        assert_eq!(calls[0].call.as_ref().unwrap().len(), 6);
         assert_eq!(parse(path, &combined(path, &declaration, &calls).unwrap(), &calls).unwrap().1, original);
     }
 
@@ -650,13 +813,11 @@ mod tests {
             let (_, edited_calls) = parse(path, &edited, &calls).unwrap();
             assert_eq!(
                 edited_calls[0]
-                    .call
-                    .iter()
+                    .call.iter().flatten()
                     .map(|call| call.kind)
                     .collect::<Vec<_>>(),
                 calls[0]
-                    .call
-                    .iter()
+                    .call.iter().flatten()
                     .map(|call| call.kind)
                     .collect::<Vec<_>>()
             );
@@ -680,15 +841,15 @@ mod tests {
             &[],
         )
         .unwrap();
-        assert!(calls[0].call[0].unresolved);
-        let previous = vec![FunctionCalls {
+        assert!(calls[0].call.as_ref().unwrap()[0].unresolved);
+        let previous = vec![FunctionBody { change: None,
             owner: "run".into(),
-            call: vec![CallSite {
+            call: Some(vec![CallSite {
                 kind: crate::plan::CallKind::Call,
                 name: "send".into(),
                 source: None,
                 unresolved: false,
-            }],
+            }]),
         }];
         let (_, calls) = parse(
             "run.ts",
@@ -696,6 +857,6 @@ mod tests {
             &previous,
         )
         .unwrap();
-        assert!(calls[0].call[0].unresolved);
+        assert!(calls[0].call.as_ref().unwrap()[0].unresolved);
     }
 }

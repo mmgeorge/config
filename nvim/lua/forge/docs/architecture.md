@@ -1945,6 +1945,16 @@ source digests nor project files, and it does not create an extra model edit ver
 and submitted JSON retain the same formatted declaration text, so revision patches and comment
 coordinates address the reviewed declarations. Both submission entry points share this boundary.
 
+Plan submission also validates newly added or edited comment openings. `plan/comment_lint.rs`
+rejects a first word of `Returns`, ignoring case, and directs the provider to use `Get`.
+`DeclarationOverview::comments` extracts comments through bundled grammars or the native XML parser,
+excluding string values and function metadata. Consecutive line comments form one comment, so later
+sentences and continuation lines remain valid. Normalized baseline comment counts preserve unchanged
+source comments, including file moves and formatter reflow. Only changed plan files are parsed, with
+no workspace indexing. Async validation rejects violations before dependency preparation, and the
+file-store submission boundary checks again even when reference evidence is cached. A failed lint
+reports the saved draft's coordinates, leaves it editable, and persists no submitted revision.
+
 Configuration files share the virtual patch, submission, diff, navigation, and comment boundaries.
 `ConfigurationFormat` selects JSON/JSONC, TOML, YAML, and XML by extension, including XML project
 extensions. Capture and submission preserve exact complete text, including multiline strings,
@@ -2174,8 +2184,9 @@ an invocation or property kind, target name, source position, and unresolved-bin
 The collector shares receiver inference for dot access and static string indexing and captures
 Rust construction/destructuring field names. The saved occurrence sequence preserves both kinds
 in extraction order. Invocation-only functions retain the `Calls` interface. Functions with
-properties render separate `Calls` and `Accesses` blocks, with Calls first and one bare target per row. Review sorts
-and deduplicates pairs of target name and kind, while editing retains occurrence order and evidence.
+properties render separate `Calls` and `Accesses` blocks, with Calls first and one bare target per row.
+Review deduplicates pairs of target name and kind in parsed order. An internal sorting flag defaults
+to false and changes presentation only. Editing retains occurrence order and evidence.
 Older plans omit the invocation kind, preserving their serialized bytes and reviewed digests.
 
 The declaration index identifies property definitions separately from methods. Property resolution
@@ -2186,11 +2197,21 @@ searches unrelated declarations by property name. A Rust
 field and method sharing a name retain distinct identities. Unknown receivers, dynamic indexes,
 and unavailable member declarations remain unresolved. The native review target carries the kind
 through rename selection, the reverse-reference picker, filtered context, and definition navigation.
-The review presentation places both categories inside a rendered function body. Rust and
+Each saved `FunctionBody` owns one optional plain-language `Change` summary and optional reference
+occurrences. An absent occurrence list means reference information is unavailable, while an empty
+list explicitly declares no references. The virtual declaration file accepts one indented `Change`
+section after a function signature, before `Calls` and `Accesses`, through the existing atomic patch
+tool. Summary-only patches participate in changed-file detection, saved snapshots, validation,
+execution context, and revision diffs without altering source declarations or capturing unrelated
+files. Duplicate, empty, and unattached summaries reject the complete patch. Summary text remains
+outside reference extraction and symbol rename. Function-owner renames and file moves retain the
+summary. Review targets identify the function and summary line for annotation feedback.
+
+The review presentation places the summary and both categories inside a rendered function body. Rust and
 TypeScript signatures replace their terminating semicolon with an opening brace, and Lua
 signatures retain their header with a rendered `end` boundary. The function fold starts at the
 final signature row and includes both categories and the closing delimiter. It starts collapsed,
-showing `fn signature {...}`. Explicit body spans and original declaration-row mappings preserve
+showing `fn signature {...}`, with `[changed]` when a summary exists. Explicit body spans and original declaration-row mappings preserve
 nested declaration folds, visibility, and navigation without parsing rendered body text. The
 editable tool interface and saved declarations retain their signature-only form. Reference extraction
 aggregates unresolved evidence once per occurrence and resolves each unique target/kind once per

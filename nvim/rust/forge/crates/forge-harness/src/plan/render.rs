@@ -112,6 +112,12 @@ pub enum PlanReviewTarget {
         owner: String,
         name: String,
     },
+    Change {
+        path: String,
+        side: String,
+        owner: String,
+        offset: u32,
+    },
     FileDirectory {
         path: String,
     },

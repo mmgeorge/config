@@ -213,7 +213,7 @@ impl PlanReferenceIndex {
                 let position = callable.get(function.owner.as_str());
                 let Some(position) = position else { continue };
                 let mut target = BTreeMap::<(&str, super::CallKind), bool>::new();
-                for reference in &function.call {
+                for reference in function.call.iter().flatten() {
                     *target.entry((&reference.name, reference.kind)).or_default() |=
                         reference.unresolved;
                 }
@@ -793,7 +793,7 @@ impl PlanReferenceIndex {
         resolver.bound_reference_files();
         for (path, functions) in &mut design.proposed_calls {
             for function in functions {
-                for call in &mut function.call {
+                for call in function.call.iter_mut().flatten() {
                     if call.unresolved {
                         continue;
                     }
@@ -1053,7 +1053,7 @@ mod tests {
         let started = std::time::Instant::now();
         let capture = super::super::calls::extract("lib.rs", &source).unwrap();
         let extraction = started.elapsed();
-        assert_eq!(capture[0].call.len(), 10000);
+        assert_eq!(capture[0].call.as_ref().unwrap().len(), 10000);
         design.proposed_calls.insert("lib.rs".into(), capture);
         document.design = Some(design);
         let started = std::time::Instant::now();
@@ -1116,7 +1116,7 @@ mod tests {
             .unwrap();
         assert!(renamed.design.as_ref().unwrap().proposed["client.ts"].contains("total: number"));
         assert_eq!(
-            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call[0].name,
+            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call.as_ref().unwrap()[0].name,
             "Alias.total"
         );
         let method = index
@@ -1133,7 +1133,7 @@ mod tests {
             .unwrap();
         assert!(renamed.design.as_ref().unwrap().proposed["client.ts"].contains("dispatch()"));
         assert_eq!(
-            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call[1].name,
+            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call.as_ref().unwrap()[1].name,
             "Alias.dispatch"
         );
     }
@@ -1233,7 +1233,7 @@ mod tests {
         assert!(design.proposed["client.rs"].contains("pub total: usize"));
         assert!(design.proposed["client.rs"].contains("fn count"));
         assert!(design.proposed["client.rs"].contains("Other { pub count"));
-        let reference = &design.proposed_calls["lib.rs"][0].call;
+        let reference = design.proposed_calls["lib.rs"][0].call.as_ref().unwrap();
         assert_eq!(
             reference
                 .iter()
@@ -1294,9 +1294,9 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.ts".into(),
-            vec![super::super::FunctionCalls {
+            vec![super::super::FunctionBody { change: None,
                 owner: "run".into(),
-                call: vec![
+                call: Some(vec![
                     super::super::CallSite {
                         kind: crate::plan::CallKind::Call,
                         name: "send".into(),
@@ -1304,7 +1304,7 @@ mod tests {
                         unresolved: false
                     };
                     2
-                ],
+                ]),
             }],
         );
         document.design = Some(design);
@@ -1318,14 +1318,13 @@ mod tests {
         assert!(design.proposed["run.ts"].contains("import { dispatch }"));
         assert_eq!(
             design.proposed_calls["run.ts"][0]
-                .call
-                .iter()
+                .call.iter().flatten()
                 .map(|call| call.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["dispatch", "dispatch"]
         );
         assert_eq!(
-            document.design.as_ref().unwrap().proposed_calls["run.ts"][0].call[0].name,
+            document.design.as_ref().unwrap().proposed_calls["run.ts"][0].call.as_ref().unwrap()[0].name,
             "send"
         );
         assert!(
@@ -1370,14 +1369,14 @@ mod tests {
         );
         design.proposed_calls.insert(
             "client.ts".into(),
-            vec![super::super::FunctionCalls {
+            vec![super::super::FunctionBody { change: Some("Stop retrying authentication failures in send.".into()),
                 owner: "send".into(),
-                call: vec![super::super::CallSite {
+                call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
                     name: "send".into(),
                     source: None,
                     unresolved: false,
-                }],
+                }]),
             }],
         );
         document.design = Some(design);
@@ -1393,7 +1392,9 @@ mod tests {
             .unwrap();
         let function = &renamed.design.as_ref().unwrap().proposed_calls["client.ts"][0];
         assert_eq!(function.owner, "deliver");
-        assert_eq!(function.call[0].name, "deliver");
+        assert_eq!(function.call.as_ref().unwrap()[0].name, "deliver");
+        assert_eq!(function.change.as_deref(), Some("Stop retrying authentication failures in send."));
+        assert_eq!(index.call.len(), 1);
     }
 
     #[test]
@@ -1413,18 +1414,18 @@ mod tests {
         design.proposed_calls.insert(
             "src/lib.rs".into(),
             vec![
-                super::super::FunctionCalls {
+                super::super::FunctionBody { change: None,
                     owner: "Client::send".into(),
-                    call: Vec::new(),
+                    call: Some(Vec::new()),
                 },
-                super::super::FunctionCalls {
+                super::super::FunctionBody { change: None,
                     owner: "run".into(),
-                    call: vec![super::super::CallSite {
+                    call: Some(vec![super::super::CallSite {
                         kind: crate::plan::CallKind::Call,
                         name: "Client::send".into(),
                         source: None,
                         unresolved: false,
-                    }],
+                    }]),
                 },
             ],
         );
@@ -1446,7 +1447,7 @@ mod tests {
             "Transport::send"
         );
         assert_eq!(
-            design.proposed_calls["src/lib.rs"][1].call[0].name,
+            design.proposed_calls["src/lib.rs"][1].call.as_ref().unwrap()[0].name,
             "Transport::send"
         );
     }
@@ -1476,14 +1477,14 @@ mod tests {
         design.proposed.insert("src/lib.rs".into(),"pub struct Extra;\nimpl Extra { pub fn prepare(&self); }\npub struct Client;\nimpl Client { pub fn send(&self); }\npub fn run();\n".into());
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![super::super::FunctionCalls {
+            vec![super::super::FunctionBody { change: None,
                 owner: "run".into(),
-                call: vec![super::super::CallSite {
+                call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
                     name: "Client::send".into(),
                     source: None,
                     unresolved: false,
-                }],
+                }]),
             }],
         );
         document.design = Some(design);
@@ -1558,14 +1559,14 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.lua".into(),
-            vec![super::super::FunctionCalls {
+            vec![super::super::FunctionBody { change: None,
                 owner: "run".into(),
-                call: vec![super::super::CallSite {
+                call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
                     name: "client.send".into(),
                     source: None,
                     unresolved: false,
-                }],
+                }]),
             }],
         );
         document.design = Some(design);
@@ -1585,7 +1586,7 @@ mod tests {
             .unwrap();
         assert!(renamed.design.as_ref().unwrap().proposed["client.lua"].contains("M.deliver"));
         assert_eq!(
-            renamed.design.as_ref().unwrap().proposed_calls["run.lua"][0].call[0].name,
+            renamed.design.as_ref().unwrap().proposed_calls["run.lua"][0].call.as_ref().unwrap()[0].name,
             "client.deliver"
         );
     }
@@ -1605,14 +1606,14 @@ mod tests {
         design.proposed.insert("src/lib.rs".into(), "pub struct Client;\nimpl Client {\n  pub fn send(&self);\n}\npub fn run(client: &Client);\n".into());
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![super::super::FunctionCalls {
+            vec![super::super::FunctionBody { change: None,
                 owner: "run".into(),
-                call: vec![super::super::CallSite {
+                call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
                     name: "Client::send".into(),
                     source: None,
                     unresolved: false,
-                }],
+                }]),
             }],
         );
         document.design = Some(design);
@@ -1673,14 +1674,14 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.ts".into(),
-            vec![super::super::FunctionCalls {
+            vec![super::super::FunctionBody { change: None,
                 owner: "run".into(),
-                call: vec![super::super::CallSite {
+                call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
                     name: "send".into(),
                     source: None,
                     unresolved: false,
-                }],
+                }]),
             }],
         );
         document.design = Some(design);
@@ -1708,14 +1709,14 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.lua".into(),
-            vec![super::super::FunctionCalls {
+            vec![super::super::FunctionBody { change: None,
                 owner: "run".into(),
-                call: vec![super::super::CallSite {
+                call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
                     name: "client.send".into(),
                     source: None,
                     unresolved: false,
-                }],
+                }]),
             }],
         );
         document.design = Some(design);
@@ -1768,14 +1769,14 @@ mod tests {
         );
         design.proposed_calls.insert(
             "run.ts".into(),
-            vec![super::super::FunctionCalls {
+            vec![super::super::FunctionBody { change: None,
                 owner: "run".into(),
-                call: vec![super::super::CallSite {
+                call: Some(vec![super::super::CallSite {
                     kind: crate::plan::CallKind::Call,
                     name: "send".into(),
                     source: None,
                     unresolved: true,
-                }],
+                }]),
             }],
         );
         design.document.task = "Rename the exported send API".into();
@@ -1803,7 +1804,7 @@ mod tests {
         );
         assert!(renamed.design.as_ref().unwrap().proposed["run.ts"].contains("run(send:"));
         assert_eq!(
-            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call[0].name,
+            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call.as_ref().unwrap()[0].name,
             "send"
         );
     }

@@ -49,11 +49,12 @@ pub struct DeclarationCallable {
 pub struct DeclarationCalls;
 
 impl DeclarationCalls {
-    /// Protect literal and comment rows when parsing the combined declaration interface.
-    pub fn protected_lines(
+    /// Return sorted, zero-based line ranges for literals and comments, with exclusive ends.
+    /// Region starts retain lexical ownership when callers exclude non-source sections.
+    pub fn protected_regions(
         path: &str,
         source: &str,
-    ) -> Result<std::collections::BTreeSet<usize>, SyntaxError> {
+    ) -> Result<Vec<std::ops::Range<usize>>, SyntaxError> {
         let language = DeclarationOverview::language(path)
             .ok_or_else(|| SyntaxError::Language(path.into()))?;
         let mut parser = Parser::new();
@@ -61,14 +62,14 @@ impl DeclarationCalls {
             .set_language(&language.grammar())
             .map_err(|error| SyntaxError::Query(error.to_string()))?;
         let tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
-        let mut protected = std::collections::BTreeSet::new();
+        let mut protected = Vec::new();
         let mut work = vec![(tree.root_node(), 0)];
         while let Some((node, depth)) = work.pop() {
             if depth > 128 {
                 return Err(SyntaxError::CaptureLimit);
             }
             if node.kind().contains("string") || node.kind().contains("comment") {
-                protected.extend(node.start_position().row..=node.end_position().row);
+                protected.push(node.start_position().row..node.end_position().row + 1);
             } else {
                 let mut cursor = node.walk();
                 work.extend(
@@ -77,6 +78,7 @@ impl DeclarationCalls {
                 );
             }
         }
+        protected.sort_unstable_by_key(|region| region.start);
         Ok(protected)
     }
     /// Read calls in source order, including closures but separating named functions.

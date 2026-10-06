@@ -109,7 +109,15 @@ file ranges when their exact current text is unavailable and match that text, in
 Draft patches retain their layout until submission. Submission can reformat declarations, so read
 affected ranges before another revision unless current formatted text is already supplied in feedback.
 
-## Calls and property uses
+## Function changes and references
+
+Describe each function's intended behavior change in one optional `Change` section. Edit the virtual
+declaration file through `harness_design_apply_patch`, with `Change` at the signature's indentation
+and a nonempty plain-language summary one indentation level deeper. Place it before `Calls` and
+`Accesses`. Use a single summary without categories. Include internal behavior changes even when
+the signature and reference lists remain identical. Preserve an existing summary unless the intended
+behavior changes. Removing the section withdraws that summary. Configuration documents have no
+function sections. The review includes summary-only edits and folds the summary with the function body.
 
 Source inspection extracts call occurrences alongside declarations in Rust, TypeScript, TSX, and Lua. Property reads and writes also retain named receiver evidence. Render invocations under `Calls` and property accesses under `Accesses`, in that order. Each line contains a bare qualified target, with no arguments. Preserve occurrence order within each category. Parsing retains their existing interleaving in saved data. Both kinds share one ordered occurrence sequence. Rust construction and destructuring field names also count as property uses. Unknown or computed receivers remain unresolved and must not be matched to a same-named property without type evidence.
 The virtual file includes `Calls` and `Accesses` blocks immediately after each captured callable signature.
@@ -117,8 +125,8 @@ Edit it atomically with declarations through `harness_design_apply_patch`. Inclu
 arguments, assignments, control flow, or other statements. Qualify methods with a receiver type only
 when source evidence identifies that type. Keep unresolved receiver names when evidence is absent.
 
-Keep call occurrences in extraction or authored order, including repetitions. Alphabetical sorting and
-deduplication apply only to the review presentation. Preserve unchanged Calls blocks when editing
+Keep call occurrences in extraction or authored order, including repetitions. Review deduplicates
+targets while retaining parsed order by default. Preserve unchanged Calls blocks when editing
 signatures. Update an owner's list when relationships change and include a block for a newly planned
 callable when its relationships are known. An empty block states that the callable has no calls.
 An absent block states that call information is unavailable. Do not manufacture missing information
@@ -129,6 +137,8 @@ additional indentation level:
 
 ```text
 pub fn dispatch(client: &Client);
+Change
+  Stop retrying authentication failures and record the final attempt.
 Calls
   validate_policy
   Client::send
@@ -142,6 +152,10 @@ code comment, including private declarations, types, fields, enum variants, trai
 implementation blocks, functions, methods, aliases, and module-level bindings. Preserve accurate
 existing comments and add missing ones. Imports, attributes, parameters, and configuration entries
 do not need separate declaration comments.
+
+Start newly added or edited comments with `Get` instead of `Returns`. Submission rejects comments
+whose first word is `Returns`, ignoring case. The rule applies only to the start of the complete
+comment, not later sentences or continuation lines. Unchanged captured comments remain valid.
 
 Read and follow the repository's code-comment instructions before drafting these comments.
 When the technical-writing skill is available, read its Code Comments profile and use its API

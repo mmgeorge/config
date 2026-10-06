@@ -315,6 +315,9 @@ pub(crate) fn project(
 
 pub(super) fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanReviewTarget, text: &str) {
     match target {
+        PlanReviewTarget::Change { offset, .. } => {
+            append_range(metadata, text.len() - text.trim_start().len(), text.len(), if *offset == 0 { "@keyword" } else { "@comment" });
+        }
         PlanReviewTarget::Call { name, kind, .. } => {
             let Some(start) = text.find(name) else { return };
             let member = name.rfind([':', '.', '#']).map_or(0, |column| column + 1);

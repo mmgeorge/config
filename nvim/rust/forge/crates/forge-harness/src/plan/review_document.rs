@@ -663,7 +663,7 @@ impl PlanReviewDocument {
             }
             ensure!(action == "open", "this design action is unavailable");
             let (path, side) = match &anchor.target {
-                PlanReviewTarget::Declaration { path, side, .. } | PlanReviewTarget::Call { path, side, .. } => (path, side.as_str()),
+                PlanReviewTarget::Declaration { path, side, .. } | PlanReviewTarget::Call { path, side, .. } | PlanReviewTarget::Change { path, side, .. } => (path, side.as_str()),
                 PlanReviewTarget::File { path } => (path, "proposed"),
                 _ => anyhow::bail!("select a declaration file or line"),
             };
@@ -819,7 +819,7 @@ impl PlanReviewDocument {
         if let super::PlanReviewTarget::Call { path, side, owner, name, kind } = &anchor.target {
             let design = self.source.document.design.as_ref().context("declaration design is unavailable")?;
             let calls = if side == "baseline" { &design.baseline_calls } else { &design.proposed_calls };
-            if calls.get(path).into_iter().flatten().any(|function| function.owner == *owner && function.call.iter().any(|call| call.name == *name && call.kind == *kind && call.unresolved)) {
+            if calls.get(path).into_iter().flatten().any(|function| function.owner == *owner && function.call.iter().flatten().any(|call| call.name == *name && call.kind == *kind && call.unresolved)) {
                 return Ok(crate::declaration::DeclarationResolution::Unverified { reason: "This target includes an opaque local binding in the captured source.".into() });
             }
             let baseline = side == "baseline";
@@ -2389,7 +2389,7 @@ mod tests {
         design.document.description = "Expose sender relationships for review.".into();
         design.proposed.insert("client.ts".into(), "/// Sends a request.\nexport function send(): void;\n".into());
         design.proposed.insert("run.ts".into(), "import { send } from './client';\n/// Dispatches work.\nclass Runner { private run(): void; }\n".into());
-        design.proposed_calls.insert("run.ts".into(), vec![crate::plan::FunctionCalls { owner: "Runner.run".into(), call: vec![crate::plan::CallSite { kind: crate::plan::CallKind::Call, name: "send".into(), source: None, unresolved: false }] }]);
+        design.proposed_calls.insert("run.ts".into(), vec![crate::plan::FunctionBody { change: None, owner: "Runner.run".into(), call: Some(vec![crate::plan::CallSite { kind: crate::plan::CallKind::Call, name: "send".into(), source: None, unresolved: false }]) }]);
         design.baseline.insert("run.ts".into(), crate::plan::DeclarationFile { text: design.proposed["run.ts"].clone(), source_digest: String::new() });
         design.baseline_calls.insert("run.ts".into(), design.proposed_calls["run.ts"].clone());
         canonical.design = Some(design);

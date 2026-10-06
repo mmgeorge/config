@@ -16,6 +16,15 @@ pub struct DeclarationPosition {
     pub column: u32,
 }
 
+/// Retains a source comment and its location independently of display formatting.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeclarationComment {
+    /// Start of the comment marker in the saved declaration text.
+    pub position: DeclarationPosition,
+    /// Complete comment text, including its native delimiters.
+    pub text: String,
+}
+
 /// Holds disposable formatted text and its mapping to the saved declaration document.
 pub struct DeclarationPresentation {
     /// Text formatted with the current inspection rules.
@@ -25,6 +34,52 @@ pub struct DeclarationPresentation {
 }
 
 impl DeclarationOverview {
+    /// Extract native comments without interpreting markers inside string values.
+    /// Files are limited to 1 MiB, 65,536 comments, and 128 grammar nesting levels.
+    /// Body-free signatures tolerate grammar errors. Unsupported paths yield no comments.
+    pub fn comments(path: &str, text: &str) -> Result<Vec<DeclarationComment>, SyntaxError> {
+        if text.len() > 1024 * 1024 {
+            return Err(SyntaxError::MemoryLimit);
+        }
+        if ConfigurationFormat::for_path(path) == Some(ConfigurationFormat::Xml) {
+            return xml_comments(text);
+        }
+        let Some(language) = Self::language(path) else {
+            return Ok(Vec::new());
+        };
+        let mut parser = Parser::new();
+        parser
+            .set_language(&language.grammar())
+            .map_err(|error| SyntaxError::Query(error.to_string()))?;
+        let tree = parser.parse(text, None).ok_or(SyntaxError::Cancelled)?;
+        let mut comment = Vec::new();
+        let mut pending = vec![(tree.root_node(), 0)];
+        while let Some((node, depth)) = pending.pop() {
+            if depth > 128 {
+                return Err(SyntaxError::CaptureLimit);
+            }
+            if node.kind().contains("comment") {
+                if comment.len() >= 65536 {
+                    return Err(SyntaxError::CaptureLimit);
+                }
+                comment.push(DeclarationComment {
+                    position: DeclarationPosition {
+                        line: node.start_position().row as u32 + 1,
+                        column: node.start_position().column as u32,
+                    },
+                    text: text[node.byte_range()].to_owned(),
+                });
+            } else {
+                let mut cursor = node.walk();
+                pending.extend(
+                    node.named_children(&mut cursor).map(|child| (child, depth + 1)),
+                );
+            }
+        }
+        comment.sort_unstable_by_key(|comment| (comment.position.line, comment.position.column));
+        Ok(comment)
+    }
+
     /// Locate a saved declaration token in the current inspection presentation.
     pub fn display_position(path: &str, saved: &str, source: DeclarationPosition) -> Result<DeclarationPosition, SyntaxError> {
         let presentation = Self::present(path, saved)?;
@@ -267,6 +322,37 @@ impl DeclarationOverview {
         let text = Self::project(path, &declaration_surrogate(language, overview), true)?;
         format_indentation(language, &text)
     }
+}
+
+fn xml_comments(text: &str) -> Result<Vec<DeclarationComment>, SyntaxError> {
+    let document = roxmltree::Document::parse_with_options(
+        text,
+        roxmltree::ParsingOptions {
+            allow_dtd: true,
+            nodes_limit: 1024 * 1024,
+            ..Default::default()
+        },
+    ).map_err(|error| SyntaxError::Query(error.to_string()))?;
+    let line_start = std::iter::once(0)
+        .chain(text.bytes().enumerate()
+            .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)))
+        .collect::<Vec<_>>();
+    let mut comment = Vec::new();
+    for node in document.descendants().filter(|node| node.is_comment()) {
+        if comment.len() >= 65536 {
+            return Err(SyntaxError::CaptureLimit);
+        }
+        let range = node.range();
+        let line = line_start.partition_point(|offset| *offset <= range.start) - 1;
+        comment.push(DeclarationComment {
+            position: DeclarationPosition {
+                line: line as u32 + 1,
+                column: (range.start - line_start[line]) as u32,
+            },
+            text: text[range].to_owned(),
+        });
+    }
+    Ok(comment)
 }
 
 fn formatting_tree(language: SyntaxLanguage, text: &str) -> Result<tree_sitter::Tree, SyntaxError> {
@@ -1074,6 +1160,23 @@ fn normalize(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn comments_preserve_saved_coordinates_and_exclude_literal_markers() {
+        for (path, source, line, column) in [
+            ("lib.rs", "const TEXT: &str = r#\"/// Returns text.\"#;\n  /// Get settings.\npub fn standard();\n", 2, 2),
+            ("lib.lua", "function first()\n\n--- Get settings.\nfunction standard()\n", 3, 0),
+            ("App.csproj", "<Project><![CDATA[<!-- Returns text. -->]]>é<!-- Get settings. --></Project>", 1, 45),
+        ] {
+            let comment = DeclarationOverview::comments(path, source).unwrap();
+            assert_eq!(comment.len(), 1, "{path}");
+            assert_eq!(comment[0].position, DeclarationPosition { line, column }, "{path}");
+            assert!(comment[0].text.contains("Get settings."));
+        }
+        let comment = DeclarationOverview::comments("lib.ts", "const text = `${/* Returns settings. */ value}`;\n").unwrap();
+        assert_eq!(comment.len(), 1);
+        assert_eq!(comment[0].text, "/* Returns settings. */");
+    }
 
     #[test]
     fn toml_configuration_retains_values_comments_and_multiline_string_contents() {

@@ -14,7 +14,7 @@ pub use declaration_fold::{DeclarationFold, DeclarationFolding};
 mod visibility;
 pub use configuration::ConfigurationFormat;
 pub use visibility::DeclarationVisibility;
-pub use declaration::{DeclarationOverview, DeclarationPosition, DeclarationPresentation};
+pub use declaration::{DeclarationComment, DeclarationOverview, DeclarationPosition, DeclarationPresentation};
 mod service;
 mod tree;
 

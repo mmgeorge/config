@@ -155,14 +155,29 @@ mod tests {
     use forge_diff::patch::UnifiedPatch;
 
     #[test]
+    fn change_only_revisions_compare_summaries_without_signature_edits() {
+        let mut previous = super::super::document::test_fixture("change", "Behavior change");
+        let mut design = DeclarationDesign::default();
+        design.proposed.insert("main.rs".into(), "pub fn run();\n".into());
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { owner: "run".into(), call: None, change: Some("Stop retrying authentication failures.".into()) }]);
+        previous.design = Some(design);
+        let mut current = previous.clone();
+        current.design.as_mut().unwrap().proposed_calls.get_mut("main.rs").unwrap()[0].change = Some("Limit transient retries to three attempts.".into());
+        let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
+        assert!(delta.files.contains("-  Stop retrying authentication failures."));
+        assert!(delta.files.contains("+  Limit transient retries to three attempts."));
+        assert!(!delta.files.contains("+pub fn") && !delta.files.contains("-pub fn"));
+    }
+
+    #[test]
     fn call_only_revisions_compare_saved_occurrences() {
         let mut previous = super::super::document::test_fixture("calls", "Calls");
         let mut design = DeclarationDesign::default();
         design.proposed.insert("main.rs".into(), "fn run();\n".into());
-        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionCalls { owner: "run".into(), call: vec![super::super::CallSite { kind: crate::plan::CallKind::Call, name: "before".into(), source: None, unresolved: false }] }]);
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { change: None, owner: "run".into(), call: Some(vec![super::super::CallSite { kind: crate::plan::CallKind::Call, name: "before".into(), source: None, unresolved: false }]) }]);
         previous.design = Some(design);
         let mut current = previous.clone();
-        current.design.as_mut().unwrap().proposed_calls.get_mut("main.rs").unwrap()[0].call[0].name = "after".into();
+        current.design.as_mut().unwrap().proposed_calls.get_mut("main.rs").unwrap()[0].call.as_mut().unwrap()[0].name = "after".into();
         let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
         assert!(delta.files.contains("-  before") && delta.files.contains("+  after"));
     }

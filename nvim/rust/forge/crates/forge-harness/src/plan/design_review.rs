@@ -63,7 +63,7 @@ pub(super) fn project(
         let context = contextual.contains(&row.id);
         if context { omitted += 1; }
         if let Some(anchor) = navigation.resolve_line(index as u32 + 1) {
-            if matches!(anchor.target, PlanReviewTarget::Call { .. }) {
+            if matches!(anchor.target, PlanReviewTarget::Call { .. } | PlanReviewTarget::Change { .. }) {
                 super::review_projection::append_semantic_style(&mut row.metadata, &anchor.target, row.text.row(0).unwrap_or_default());
             }
             let id = TargetId(format!("plan:declaration:{}", row.id.0));
@@ -433,6 +433,14 @@ fn rows(
                         path: Some(source_path.clone()), label: format!("{source_path}: {owner}: {} {name}", kind.label()),
                     });
                 }
+                if let Some((owner, offset)) = presentation.get(&(source_path.clone(), side.into())).and_then(|file| file.change_row.get(&line)) {
+                    navigation.anchor.push(PlanNavigationAnchor {
+                        line: block.len() as u32,
+                        target: PlanReviewTarget::Change { path: source_path.clone(), side: side.into(), owner: owner.clone(), offset: *offset },
+                        json_path: format!("/design/{side}_calls/{}/{}/change/{offset}", pointer(source_path), pointer(owner)),
+                        path: Some(source_path.clone()), label: format!("{source_path}: {owner}: Change"),
+                    });
+                }
             }
             fold(&mut block, hunk_start, &hunk_id)?;
         }
@@ -776,6 +784,30 @@ fn pointer(path: &str) -> String {
 mod tests {
     use super::*;
 
+    #[test]
+    fn change_only_edits_have_semantic_targets_and_closed_function_folds() {
+        let mut document = crate::plan::document::test_fixture("change", "Behavior change");
+        let mut design = super::super::DeclarationDesign::default();
+        let declaration = "pub fn run();\n";
+        design.baseline.insert("main.rs".into(), super::super::DeclarationFile { text: declaration.into(), source_digest: String::new() });
+        design.proposed.insert("main.rs".into(), declaration.into());
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { owner: "run".into(), call: None, change: Some("Stop retrying authentication failures.\nRecord the final attempt.".into()) }]);
+        document.design = Some(design);
+        let original = document.clone();
+        let rendered = render(&document).unwrap();
+        assert!(rendered.markdown.contains("Change") && rendered.markdown.contains("Stop retrying"));
+        assert!(!rendered.markdown.contains("Calls"));
+        for public_only in [false, true] {
+            let (blocks, targets) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
+            assert_eq!(targets.values().filter(|anchor| matches!(anchor.target, PlanReviewTarget::Change { .. })).count(), 3);
+            assert!(blocks.iter().filter(|block| block.text.row(0).unwrap().contains("pub fn run")).any(|heading| heading.metadata.fold.iter().any(|fold| fold.closed && fold.collapsed_suffix.as_ref().is_some_and(|suffix| suffix.contains("[changed]")))));
+            for block in blocks.iter().filter(|block| block.text.row(0).unwrap().contains("Stop retrying")) {
+                assert!(block.metadata.visible_decoration.iter().any(|capture| capture.capture == "@comment"));
+            }
+        }
+        assert_eq!(document, original);
+    }
+
     #[tokio::test]
     async fn synthetic_function_bodies_preserve_following_declaration_syntax() {
         use std::sync::Arc;
@@ -788,12 +820,14 @@ mod tests {
         let after = before.replace("old", "shared");
         design.baseline.insert("arena.rs".into(), super::super::DeclarationFile { text: before.into(), source_digest: String::new() });
         design.proposed.insert("arena.rs".into(), after.clone());
-        let calls = vec![super::super::FunctionCalls { owner: "ArenaPlugin::new".into(), call: vec![
+        let calls = vec![super::super::FunctionBody { change: None, owner: "ArenaPlugin::new".into(), call: Some(vec![
             super::super::CallSite { kind: super::super::CallKind::Call, name: "ArenaConfig::validate".into(), source: None, unresolved: false },
             super::super::CallSite { kind: super::super::CallKind::Property, name: "ArenaConfig::enabled".into(), source: None, unresolved: false },
-        ] }];
+        ]) }];
         design.baseline_calls.insert("arena.rs".into(), calls.clone());
-        design.proposed_calls.insert("arena.rs".into(), calls);
+        let mut proposed = calls;
+        proposed[0].change = Some("Reject invalid configuration before registration.".into());
+        design.proposed_calls.insert("arena.rs".into(), proposed);
         document.design = Some(design);
         let original = document.clone();
         let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2, input_bytes: 8 * 1024 * 1024 })), SyntaxLimits::default());
@@ -827,7 +861,7 @@ mod tests {
                         assert!(captures.iter().any(|capture| capture.capture.starts_with("@type") && &text[capture.range.start.column..capture.range.end.column] == name), "{text}: {captures:?}");
                     }
                 }
-                if matches!(text.trim(), "Calls" | "Accesses" | "ArenaConfig::validate" | "ArenaConfig::enabled") {
+                if matches!(text.trim(), "Change" | "Reject invalid configuration before registration." | "Calls" | "Accesses" | "ArenaConfig::validate" | "ArenaConfig::enabled") {
                     synthetic_rows += 1;
                     assert!(captures.iter().all(|capture| !capture.capture.ends_with(".rust")), "synthetic row received declaration syntax: {text}");
                 }
@@ -852,11 +886,12 @@ mod tests {
             ("État::更新", super::super::CallKind::Call, vec![("État", "@type"), ("更新", "@function.method.call")]),
             ("Client::count", super::super::CallKind::Property, vec![("Client", "@type"), ("count", "@variable.member")]),
         ];
-        design.proposed_calls.insert("lib.rs".into(), vec![super::super::FunctionCalls {
+        design.proposed_calls.insert("lib.rs".into(), vec![super::super::FunctionBody {
             owner: "main".into(),
-            call: cases.iter().map(|(name, kind, _)| super::super::CallSite {
+            change: None,
+            call: Some(cases.iter().map(|(name, kind, _)| super::super::CallSite {
                 name: (*name).into(), kind: *kind, source: None, unresolved: false,
-            }).collect(),
+            }).collect()),
         }]);
         document.design = Some(design);
         let original = document.clone();

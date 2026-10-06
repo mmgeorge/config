@@ -7,10 +7,11 @@ use std::path::{Path, PathBuf};
 use crate::session::{ExecutionMode, continuation::ContinuationBudget};
 
 mod audit;
+mod comment_lint;
 mod design;
 pub(crate) mod calls;
 mod references;
-pub use calls::{CallKind, CallSite, CallPosition, FunctionCalls};
+pub use calls::{CallKind, CallSite, CallPosition, FunctionBody};
 mod design_review;
 mod deviation;
 mod document;
@@ -957,6 +958,7 @@ impl PlanFileStore {
         if let Some(design) = &document.design {
             let formatted = design.formatted()?;
             formatted.check_workspace(&self.workspace)?;
+            comment_lint::validate(design)?;
             document.design = Some(formatted);
         }
         document.validate_for_submission()?;
@@ -1177,9 +1179,9 @@ mod test {
         );
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![FunctionCalls {
+            vec![FunctionBody { change: None,
                 owner: "introduced".into(),
-                call: vec![
+                call: Some(vec![
                     CallSite {
                         kind: crate::plan::CallKind::Call, name: "introduced".into(),
                         source: None,
@@ -1195,7 +1197,7 @@ mod test {
                         source: None,
                         unresolved: false,
                     },
-                ],
+                ]),
             }],
         );
         document.design = Some(design);
@@ -1228,8 +1230,7 @@ mod test {
         );
         assert_eq!(
             renamed.design.as_ref().unwrap().proposed_calls["src/lib.rs"][0]
-                .call
-                .iter()
+                .call.iter().flatten()
                 .map(|call| call.name.as_str())
                 .collect::<Vec<_>>(),
             vec!["dispatch", "existing", "dispatch"]

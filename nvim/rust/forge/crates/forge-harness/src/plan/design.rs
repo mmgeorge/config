@@ -15,7 +15,7 @@ pub struct DeclarationFile {
 
 const PLAN_DOCUMENT_PATH: &str = "plan.json";
 
-type SourceOverviewCache = std::sync::Mutex<BTreeMap<String, (DeclarationFile, Vec<super::FunctionCalls>)>>;
+type SourceOverviewCache = std::sync::Mutex<BTreeMap<String, (DeclarationFile, Vec<super::FunctionBody>)>>;
 static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sync::OnceLock::new();
 
 /// Records the requested outcome and proposed design independently of declaration files.
@@ -45,12 +45,12 @@ pub struct DeclarationDesign {
     pub baseline: BTreeMap<String, DeclarationFile>,
     pub proposed: BTreeMap<String, String>,
     pub moved: BTreeMap<String, String>,
-    /// Call occurrences captured with each source baseline, in extraction order.
+    /// Function metadata captured with each source baseline, retaining reference extraction order.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub baseline_calls: BTreeMap<String, Vec<super::FunctionCalls>>,
-    /// Authored call relationships accompanying proposed declarations.
+    pub baseline_calls: BTreeMap<String, Vec<super::FunctionBody>>,
+    /// Function changes and reference relationships accompanying proposed declarations.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub proposed_calls: BTreeMap<String, Vec<super::FunctionCalls>>,
+    pub proposed_calls: BTreeMap<String, Vec<super::FunctionBody>>,
 }
 
 fn default_line_width() -> usize {
@@ -78,6 +78,7 @@ impl DeclarationDesign {
     pub(crate) async fn validated(&self, workspace: &Path) -> Result<Self> {
         let mut design = self.formatted()?;
         design.check_workspace(workspace)?;
+        super::comment_lint::validate(self)?;
         let paths = design.proposed.keys().filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml")).cloned().collect::<Vec<_>>();
         for path in paths {
             for directory in Path::new(&path).ancestors().skip(1) {
@@ -123,7 +124,7 @@ impl DeclarationDesign {
         Ok(design)
     }
 
-    fn source(&self, workspace: &Path, path: &str) -> Result<(DeclarationFile, Vec<super::FunctionCalls>)> {
+    fn source(&self, workspace: &Path, path: &str) -> Result<(DeclarationFile, Vec<super::FunctionBody>)> {
         validate_path(path)?;
         let source = workspace_source(workspace, path)?.with_context(|| format!("declaration file does not exist: {path}"))?;
         let source_digest = super::digest(source.as_bytes());
@@ -140,7 +141,7 @@ impl DeclarationDesign {
         let calls = calls.into_iter().filter(|function| saved_owners.contains(&function.owner)).collect();
         let overview = (DeclarationFile { text, source_digest }, calls);
         let mut cache = cache.lock().map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?;
-        let bytes = cache.values().map(|(file, calls)| file.text.len() + calls.iter().map(|function| function.owner.len() + function.call.iter().map(|call| call.name.len() + 16).sum::<usize>()).sum::<usize>()).sum::<usize>();
+        let bytes = cache.values().map(|(file, calls)| file.text.len() + calls.iter().map(|function| function.owner.len() + function.call.iter().flatten().map(|call| call.name.len() + 16).sum::<usize>()).sum::<usize>()).sum::<usize>();
         if cache.len() >= 16 || bytes >= 8 * 1024 * 1024 { cache.clear(); }
         cache.insert(key, overview.clone());
         Ok(overview)
@@ -819,6 +820,34 @@ mod tests {
     }
 }
     #[test]
+    fn change_only_patch_captures_one_file_and_preserves_source_evidence() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = "pub fn run() { before(); before(); }\n";
+        std::fs::write(workspace.path().join("main.rs"), source).unwrap();
+        std::fs::write(workspace.path().join("unrelated.rs"), "invalid syntax {").unwrap();
+        let design = DeclarationDesign::default();
+        let patch = "*** Begin Patch\n*** Update File: main.rs\n@@\n pub fn run();\n+Change\n+  Stop retrying authentication failures.\n Calls\n*** End Patch";
+        let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
+        assert_eq!(changed.baseline.len(), 1);
+        assert_eq!(changed.baseline["main.rs"].text, changed.proposed["main.rs"]);
+        assert_eq!(changed.changed_paths(), vec!["main.rs".to_owned()]);
+        assert_eq!(changed.baseline_calls["main.rs"][0].call, changed.proposed_calls["main.rs"][0].call);
+        assert_eq!(changed.baseline_calls["main.rs"][0].change, None);
+        assert_eq!(changed.proposed_calls["main.rs"][0].change.as_deref(), Some("Stop retrying authentication failures."));
+        assert_eq!(std::fs::read_to_string(workspace.path().join("main.rs")).unwrap(), source);
+        assert!(changed.read(Some("main.rs"), false).unwrap()["text"].as_str().unwrap().contains("Change\n"));
+        let snapshot = serde_json::to_vec(&changed).unwrap();
+        let saved: DeclarationDesign = serde_json::from_slice(&snapshot).unwrap();
+        saved.validate().unwrap();
+        let moved = saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: main.rs\n*** Move to: moved.rs\n@@\n Change\n*** End Patch").unwrap();
+        assert_eq!(moved.proposed_calls["moved.rs"], saved.proposed_calls["main.rs"]);
+        let removed = saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: main.rs\n@@\n-Change\n-  Stop retrying authentication failures.\n Calls\n*** End Patch").unwrap();
+        assert!(removed.changed_paths().is_empty());
+        assert!(saved.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: main.rs\n@@\n Change\n-  Stop retrying authentication failures.\n Calls\n*** End Patch").is_err());
+        assert_eq!(serde_json::to_vec(&saved).unwrap(), snapshot);
+    }
+
+    #[test]
     fn lazy_call_capture_and_patch_are_atomic_and_snapshot_bound() {
         let workspace = tempfile::tempdir().unwrap();
         std::fs::write(workspace.path().join("main.rs"), "pub fn run() { before(); before(); }\n").unwrap();
@@ -829,10 +858,10 @@ mod tests {
         assert!(design.baseline.is_empty() && design.baseline_calls.is_empty());
         let patch = "*** Begin Patch\n*** Update File: main.rs\n@@\n Calls\n-  before\n+  after\n   before\n*** End Patch";
         let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
-        assert_eq!(changed.baseline_calls["main.rs"][0].call[0].name, "before");
-        assert_eq!(changed.proposed_calls["main.rs"][0].call[0].name, "after");
-        assert!(changed.proposed_calls["main.rs"][0].call[0].source.is_none());
-        assert!(changed.proposed_calls["main.rs"][0].call[1].source.is_some());
+        assert_eq!(changed.baseline_calls["main.rs"][0].call.as_ref().unwrap()[0].name, "before");
+        assert_eq!(changed.proposed_calls["main.rs"][0].call.as_ref().unwrap()[0].name, "after");
+        assert!(changed.proposed_calls["main.rs"][0].call.as_ref().unwrap()[0].source.is_none());
+        assert!(changed.proposed_calls["main.rs"][0].call.as_ref().unwrap()[1].source.is_some());
         assert_eq!(changed.baseline.len(), 1);
         assert!(design.patch(workspace.path(), &Default::default(), &patch.replace("+  after", "+  after(value)")).is_err());
         assert!(design.baseline_calls.is_empty());
