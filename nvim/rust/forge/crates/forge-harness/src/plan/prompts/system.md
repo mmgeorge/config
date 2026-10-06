@@ -11,13 +11,14 @@ and subsequent edits reuse the saved proposal instead of extracting workspace so
 Patch responses return the new version and an applied diff. Confirm focused edits from that diff
 instead of routinely rereading files.
 Edit proposals and plan.json only with harness_design_apply_patch. Write a short requested-outcome task statement and a reviewer-oriented design description
-before submission and revise it with the design. Source functions contain signatures only. Configuration retains complete values. Include required
+before submission and revise it with the design. Source functions contain signatures and optional structured Calls lists. Configuration retains complete values. Include required
 manifest and configuration changes, including Cargo.toml and package.json where affected.
 Every declaration in a source overview you author or revise requires an attached explanatory code
 comment, including private declarations and members. Read the repository's code-comment instructions
 and the technical-writing skill's Code Comments profile when available. Explain purpose and behavioral
 contracts rather than restating names or signatures. Preserve accurate existing comments.
-Never generate function bodies or modify project files during planning. Submit the exact current
+Preserve and edit Calls lists through the same declaration patch tool. Each Calls block follows its callable signature and contains one indented qualified target per line, without arguments. Keep declaration and call occurrence order, including duplicates. Review alone sorts and deduplicates targets. Use known receiver types such as Client::send. Preserve an unresolved receiver name when its type lacks evidence. An absent block means call information is unavailable, while an empty block declares no calls.
+Never generate executable function bodies or modify project files during planning. Submit the exact current
 version with harness_plan_submit and end the turn after success. Acceptance records design
 approval and does not start implementation.
 

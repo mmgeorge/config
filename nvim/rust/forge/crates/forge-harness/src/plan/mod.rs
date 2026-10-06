@@ -8,6 +8,9 @@ use crate::session::{ExecutionMode, continuation::ContinuationBudget};
 
 mod audit;
 mod design;
+pub(crate) mod calls;
+mod references;
+pub use calls::{CallSite, CallPosition, FunctionCalls};
 mod design_review;
 mod deviation;
 mod document;
@@ -876,6 +879,31 @@ impl PlanFileStore {
         Ok(result)
     }
 
+    /// Rename one introduced definition and freeze its revision using only saved plan files.
+    pub(crate) fn rename_symbol(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+        expected_version: u64,
+        identity: &str,
+        name: &str,
+    ) -> Result<(String, PlanDocument, RenderedPlan, String)> {
+        let document = self.read_working_document(session_id, plan_id)?;
+        anyhow::ensure!(
+            document.version == expected_version,
+            "plan version changed before rename"
+        );
+        let index = references::PlanReferenceIndex::planned(&document, &self.workspace)?;
+        let (_, definition) = index.rename_definition(&document, identity)?;
+        let mut renamed = index.renamed(&document, &self.workspace, identity, name)?;
+        renamed.design = Some(renamed.design.as_ref().unwrap().formatted()?);
+        renamed.validate_for_submission()?;
+        let (document, rendered, digest) =
+            self.persist_revision(session_id, plan_id, revision, renamed)?;
+        Ok((definition.name, document, rendered, digest))
+    }
+
     /// Rename one newly added entity and persist the complete canonical document.
     pub fn rename_added_entity(
         &self,
@@ -945,6 +973,16 @@ impl PlanFileStore {
             }
             design.validation.as_ref().unwrap().ensure_valid()?;
         }
+        self.persist_revision(session_id, plan_id, revision, document)
+    }
+
+    fn persist_revision(
+        &self,
+        session_id: &str,
+        plan_id: &str,
+        revision: u32,
+        document: PlanDocument,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
         let rendered = render_plan_at(&document, &self.workspace)?;
         self.write_working_document(session_id, plan_id, &document)?;
         let plan_directory = self.plan_dir(session_id, plan_id);
@@ -1115,6 +1153,125 @@ pub fn digest(content: &[u8]) -> String {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn rename_persists_from_plan_files_when_workspace_sources_are_unavailable() {
+        let temporary = tempfile::tempdir().unwrap();
+        fs::create_dir(temporary.path().join("src")).unwrap();
+        fs::write(temporary.path().join("Cargo.toml"), "invalid manifest {").unwrap();
+        fs::write(temporary.path().join("src/lib.rs"), "invalid source {").unwrap();
+        let mut document = document::test_fixture("rename", "Rename a planned definition");
+        let mut design = DeclarationDesign::default();
+        design.document.task = "Introduce a function".into();
+        design.document.description = "Keep its calls consistent".into();
+        design.baseline.insert(
+            "src/lib.rs".into(),
+            DeclarationFile {
+                text: "pub fn existing();\n".into(),
+                source_digest: "captured".into(),
+            },
+        );
+        design.proposed.insert(
+            "src/lib.rs".into(),
+            "pub fn existing();\npub fn introduced();\n".into(),
+        );
+        design.proposed_calls.insert(
+            "src/lib.rs".into(),
+            vec![FunctionCalls {
+                owner: "introduced".into(),
+                call: vec![
+                    CallSite {
+                        name: "introduced".into(),
+                        source: None,
+                        unresolved: false,
+                    },
+                    CallSite {
+                        name: "existing".into(),
+                        source: None,
+                        unresolved: false,
+                    },
+                    CallSite {
+                        name: "introduced".into(),
+                        source: None,
+                        unresolved: false,
+                    },
+                ],
+            }],
+        );
+        document.design = Some(design);
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        store
+            .persist_revision("session", "rename", 1, document.clone())
+            .unwrap();
+        let previous = fs::read(
+            store
+                .plan_dir("session", "rename")
+                .join("revisions/submitted-0001.json"),
+        )
+        .unwrap();
+        let index = references::PlanReferenceIndex::planned(&document, temporary.path()).unwrap();
+        let identity = &index.definition[&("src/lib.rs".into(), 2, 7)].0;
+        let (_, renamed, _, _) = store
+            .rename_symbol(
+                "session",
+                "rename",
+                2,
+                document.version,
+                identity,
+                "dispatch",
+            )
+            .unwrap();
+        assert_eq!(renamed.version, document.version + 1);
+        assert_eq!(
+            renamed.design.as_ref().unwrap().baseline,
+            document.design.as_ref().unwrap().baseline
+        );
+        assert_eq!(
+            renamed.design.as_ref().unwrap().proposed_calls["src/lib.rs"][0]
+                .call
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dispatch", "existing", "dispatch"]
+        );
+        assert_eq!(
+            previous,
+            fs::read(
+                store
+                    .plan_dir("session", "rename")
+                    .join("revisions/submitted-0001.json")
+            )
+            .unwrap()
+        );
+        let current = fs::read(store.plan_dir("session", "rename").join("working.json")).unwrap();
+        assert!(
+            store
+                .rename_symbol("session", "rename", 3, document.version, identity, "stale")
+                .is_err()
+        );
+        let index = references::PlanReferenceIndex::planned(&renamed, temporary.path()).unwrap();
+        let existing = &index.definition[&("src/lib.rs".into(), 1, 7)].0;
+        assert!(
+            store
+                .rename_symbol(
+                    "session",
+                    "rename",
+                    3,
+                    renamed.version,
+                    existing,
+                    "forbidden"
+                )
+                .is_err()
+        );
+        assert_eq!(
+            current,
+            fs::read(store.plan_dir("session", "rename").join("working.json")).unwrap()
+        );
+        assert_eq!(
+            fs::read_to_string(temporary.path().join("src/lib.rs")).unwrap(),
+            "invalid source {"
+        );
+    }
 
     #[test]
     fn manifest_changes_capture_patch_submit_and_remain_visible_without_source_writes() {

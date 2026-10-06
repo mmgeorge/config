@@ -189,7 +189,7 @@ function M.attach(options, callback)
     local source_lines = {}
     for _, row in ipairs(source) do
       source_lines[#source_lines + 1] = row.text
-      row.annotation_anchor = row.target ~= nil and row.target ~= vim.NIL
+      row.annotation_anchor = row.target ~= nil and row.target ~= vim.NIL and row.source_line > 0
     end
     local namespace = vim.api.nvim_create_namespace("ForgePlanDraftSource" .. options.buffer)
     local retained_folds, projection_attached
@@ -308,7 +308,7 @@ function M.attach(options, callback)
       receive({ local_draft = true }, nil) return true
     end
     if action == "delete" then comments.delete_at_cursor(options.buffer) receive({}, nil) return true end
-    if (action == "toggle_public" or action == "toggle_declaration") and vim.bo[options.buffer].modified then
+    if (action == "toggle_public" or action == "toggle_declaration" or action:find("reveal_reference:", 1, true) == 1) and vim.bo[options.buffer].modified then
       if options.notice then options.notice("Save plan annotations before changing the source projection") end
       return false
     end

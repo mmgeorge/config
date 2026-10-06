@@ -2075,6 +2075,25 @@ exclude plan metadata. Submission requires both fields to be nonempty, with at m
 Review renders the task, description, and declaration diff under `Task:`, `Description:`, and `Changes:`. All
 sections start expanded and use the shared fold-header constructor and native Tab behavior, with
 independent file and hunk folds below Changes. Section endpoints include wrapped text and comments.
+Rust, TypeScript, TSX, and Lua source capture extracts declarations and call occurrences from one
+Tree-sitter parse of the requested file. An in-memory cache keys capture results by path, source
+digest, and line width, with at most 16 entries before eviction. Inspection still rereads and checks
+the source digest, while later edits use the saved proposal. Captured baseline call lists and authored
+proposed call lists remain separate optional snapshot fields. Old snapshots without lists remain
+unavailable rather than gaining relationships from the current checkout.
+The existing read and patch tools expose a combined declaration view. A `Calls` block follows its
+callable signature and contains indented qualified names without arguments. Patches split and
+validate declarations and calls atomically. Stored lists preserve declaration order, extraction
+order, duplicates, and original source positions for unchanged occurrences. Review presentation
+alone sorts and deduplicates targets. Function signatures remain visible while their Calls bodies
+start folded. Revision deltas and feedback include call-only changes.
+Receiver normalization uses explicit parameter types, local types, constructor return declarations,
+same-file fields, and Lua parameter annotations. Missing evidence retains an unresolved receiver.
+Resolution uses declaration identities and preserves ambiguous impl targets rather than selecting
+the first same-named method.
+Call occurrences also retain opaque local binding evidence. A callback or unknown local receiver
+cannot become a reference to a same-named import. This evidence stays in the snapshot while the
+combined editable view continues to display target names alone.
 The public filter retains all headings and an explicit empty state when no public changes remain.
 Review retains both overviews in either visibility mode and maps comments separately to
 `/design/document/task` and `/design/document/description`. Behavior-only proposals carry both fields.
@@ -2150,6 +2169,33 @@ selected declaration. Rendered rows map to line and byte-column positions in imm
 including members that originally shared a line. Comments persist endpoint targets and rebuild their
 display ranges when reopened. Syntax decorations use formatted coordinates, independently of those
 saved text positions. Annotation persistence, overall feedback, historical review, and revisions remain.
+PlanReview binds `<Space>f` to semantic rename and `.` to definition navigation, including
+Calls entries. Rename reads only saved plan declarations and Calls. The immutable baseline,
+including moved files, distinguishes existing source symbols from definitions introduced by
+the proposed snapshot. Only introduced definitions admit rename. It rewrites resolved imports, signature references, qualified type
+prefixes, and Calls occurrences, then derives function owner names again without reordering
+occurrences. Existing source definitions, historical revisions, collisions, and reserved
+identifiers reject the operation. Unresolved local bindings retain their identity.
+
+The shared popup window hosts a single-line incremental rename input. Preview decorations
+replace visible proposed symbol tokens without editing the projection or canonical bytes.
+Cancel removes the decorations. Confirmation captures annotations and the review identity,
+checks the current plan version and digest, and persists one new submitted revision. Previous
+revision artifacts, source files, and baseline declarations remain immutable. Definition
+navigation uses the same snapshot identities as references and rename. Existing captured
+functions navigate to their source positions, while new functions navigate to plan definitions.
+
+PlanReview binds `or` to snapshot reverse references and `oX` to abort. Reverse references index
+saved Calls, signature types, imports, and explicit legacy task and flow entity references.
+Definitions and free prose do not count as usages. Each saved side owns a cached reference index,
+independent of alphabetical display sorting and public filtering. Resolution permits at most 64
+additional dependency files. Unresolved selections retain their resolution reason, separately from
+a resolved symbol with zero usages or an index failure.
+The shared searchable picker opens for every nonempty result set, including one result. Selection
+checks the originating document revision and cursor. A jump expands enclosing folds in the same
+plan buffer. A filtered or omitted destination receives temporary read-only snapshot context with
+Calls folds, without changing the saved design or visibility preference. Temporary context has no
+annotation source line. Historical references use the selected revision's stored relationships.
 
 Acceptance records the reviewed digest and revision and restores the session's ordinary mode. It
 creates no goal, executor, compaction request, or scheduler. The configuration picker omits the former

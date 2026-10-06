@@ -7,6 +7,8 @@ mod configuration;
 mod declaration;
 mod declaration_fold;
 mod declaration_index;
+mod declaration_calls;
+pub use declaration_calls::{DeclarationCall, DeclarationCallable, DeclarationCalls};
 pub use declaration_index::{DeclarationIndex, DeclarationIndexTiming, DeclarationImport, DeclarationModule, DeclarationReference, DeclarationSymbol, SymbolVisibility};
 pub use declaration_fold::{DeclarationFold, DeclarationFolding};
 mod visibility;

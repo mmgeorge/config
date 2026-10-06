@@ -1,0 +1,1525 @@
+use std::collections::{BTreeMap, BTreeSet};
+
+use anyhow::{Result, ensure};
+use forge_diff::syntax::{DeclarationCalls, DeclarationIndex};
+use serde::Serialize;
+
+use super::{PlanDocument, PlanNavigationAnchor, PlanReviewTarget};
+use crate::declaration::{DeclarationResolution, DeclarationResolver};
+
+/// A snapshot-bound structured usage in a declaration plan.
+#[derive(Clone, Serialize)]
+pub(crate) struct PlanReference {
+    pub id: String,
+    pub path: String,
+    pub side: String,
+    pub owner: String,
+    pub name: String,
+    pub kind: String,
+    pub line: u32,
+    pub column: u32,
+    #[serde(skip)]
+    pub symbol: String,
+    #[serde(skip)]
+    pub anchor: Option<PlanNavigationAnchor>,
+}
+
+/// Indexes reverse usages independently of sorting, folding, and visible diff context.
+#[derive(Default)]
+pub(crate) struct PlanReferenceIndex {
+    pub occurrence: Vec<PlanReference>,
+    pub definition: BTreeMap<(String, u32, u32), (String, usize)>,
+    pub call: BTreeMap<(String, String, String), String>,
+    pub structured: BTreeMap<String, String>,
+    pub unresolved: BTreeMap<(String, String, String), String>,
+}
+
+impl PlanReferenceIndex {
+    /// Resolve saved call and type references without reading uncaptured caller files.
+    pub(crate) fn build(
+        document: &PlanDocument,
+        workspace: &std::path::Path,
+        baseline: bool,
+    ) -> Result<Self> {
+        let Some(design) = &document.design else {
+            return Self::legacy(document, workspace);
+        };
+        let mut resolver = DeclarationResolver::local(workspace, design, baseline)?;
+        resolver.bound_reference_files();
+        Self::extract(document, baseline, resolver)
+    }
+
+    /// Index rename identities and uses from the saved plan declarations alone.
+    pub(crate) fn planned(document: &PlanDocument, workspace: &std::path::Path) -> Result<Self> {
+        let design = document
+            .design
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("rename requires a declaration plan"))?;
+        Self::extract(
+            document,
+            false,
+            DeclarationResolver::planned(workspace, design, false)?,
+        )
+    }
+
+    fn extract(
+        document: &PlanDocument,
+        baseline: bool,
+        mut resolver: DeclarationResolver,
+    ) -> Result<Self> {
+        let design = document.design.as_ref().unwrap();
+        let files: BTreeMap<String, String> = if baseline {
+            design
+                .baseline
+                .iter()
+                .map(|(path, file)| (path.clone(), file.text.clone()))
+                .collect()
+        } else {
+            design.proposed.clone()
+        };
+        let calls = if baseline {
+            &design.baseline_calls
+        } else {
+            &design.proposed_calls
+        };
+        let side = if baseline { "baseline" } else { "proposed" };
+        let mut output = Self::default();
+        let mut lua_function = BTreeMap::<(String, String), (u32, u32)>::new();
+        for (path, text) in files.iter().filter(|(path, _)| path.ends_with(".lua")) {
+            for function in DeclarationCalls::extract(path, text, true)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?
+            {
+                lua_function.insert(
+                    (path.clone(), function.owner.replace(':', ".")),
+                    (function.line, function.column),
+                );
+            }
+        }
+        for (path, text) in &files {
+            if forge_diff::syntax::ConfigurationFormat::for_path(path).is_some() {
+                continue;
+            }
+            let index = DeclarationIndex::extract(path, text)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            for symbol in &index.symbol {
+                if symbol.parameter && symbol.name == "Self" {
+                    continue;
+                }
+                if let Some(identity) =
+                    identity(resolver.at(path, symbol.position.line, symbol.position.column))
+                {
+                    output.definition.insert(
+                        (path.clone(), symbol.position.line, symbol.position.column),
+                        (identity, symbol.name.len()),
+                    );
+                }
+            }
+            if path.ends_with(".lua") {
+                for ((file, owner), (line, column)) in &lua_function {
+                    if file == path {
+                        output.definition.insert(
+                            (file.clone(), *line, *column),
+                            (lua_identity(file, owner), owner.len()),
+                        );
+                    }
+                }
+            }
+            for reference in &index.reference {
+                if let Some(symbol) =
+                    identity(resolver.at(path, reference.position.line, reference.position.column))
+                {
+                    output.push(
+                        path,
+                        side,
+                        &reference.scope.join("::"),
+                        &reference.path.join("::"),
+                        "type",
+                        reference.position.line,
+                        reference.position.column,
+                        symbol,
+                    );
+                }
+            }
+            for reference in &index.reference {
+                if reference.conditional {
+                    continue;
+                }
+                let row = text
+                    .lines()
+                    .nth(reference.position.line as usize - 1)
+                    .unwrap_or_default();
+                let mut offset = reference.position.column as usize;
+                for (position, part) in reference
+                    .path
+                    .iter()
+                    .enumerate()
+                    .take(reference.path.len().saturating_sub(1))
+                {
+                    let Some(found) = row.get(offset..).and_then(|tail| tail.find(part)) else {
+                        break;
+                    };
+                    offset += found;
+                    if let Some(symbol) = identity(resolver.type_target(
+                        path,
+                        &reference.scope,
+                        &reference.path[..=position],
+                    )) {
+                        output.push(
+                            path,
+                            side,
+                            &reference.scope.join("::"),
+                            part,
+                            "qualifier",
+                            reference.position.line,
+                            offset as u32,
+                            symbol,
+                        );
+                    }
+                    offset += part.len();
+                }
+            }
+            for import in &index.import {
+                if let Some(symbol) =
+                    identity(resolver.at(path, import.position.line, import.position.column))
+                        .or_else(|| {
+                            identity(resolver.callable(
+                                path,
+                                &import.scope.join("::"),
+                                import.alias.as_deref().unwrap_or_else(|| {
+                                    import.path.last().map(String::as_str).unwrap_or("")
+                                }),
+                            ))
+                        })
+                {
+                    output.push(
+                        path,
+                        side,
+                        &import.scope.join("::"),
+                        &import.path.join("::"),
+                        "import",
+                        import.position.line,
+                        import.position.column,
+                        symbol,
+                    );
+                }
+            }
+            let callable = DeclarationCalls::extract(path, text, true)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            for function in calls.get(path).into_iter().flatten() {
+                let position = callable
+                    .iter()
+                    .find(|declaration| declaration.owner == function.owner);
+                let Some(position) = position else { continue };
+                for name in function
+                    .call
+                    .iter()
+                    .map(|call| call.name.as_str())
+                    .collect::<BTreeSet<_>>()
+                {
+                    if function
+                        .call
+                        .iter()
+                        .any(|call| call.name == name && call.unresolved)
+                    {
+                        output.unresolved.insert(
+                            (path.clone(), function.owner.clone(), name.into()),
+                            "This target includes an opaque local binding in the captured source."
+                                .into(),
+                        );
+                        continue;
+                    }
+                    let symbol = if path.ends_with(".lua") {
+                        lua_target(path, name, &index, &lua_function)
+                    } else {
+                        let resolution = resolver.callable(path, &function.owner, name);
+                        match &resolution {
+                            DeclarationResolution::Invalid { reason }
+                            | DeclarationResolution::Ambiguous { reason }
+                            | DeclarationResolution::Unverified { reason } => {
+                                output.unresolved.insert(
+                                    (path.clone(), function.owner.clone(), name.into()),
+                                    reason.clone(),
+                                );
+                            }
+                            _ => (),
+                        }
+                        identity(resolution)
+                    };
+                    if let Some(symbol) = symbol {
+                        output.call.insert(
+                            (path.clone(), function.owner.clone(), name.into()),
+                            symbol.clone(),
+                        );
+                        output.push(
+                            path,
+                            side,
+                            &function.owner,
+                            name,
+                            "call",
+                            position.line,
+                            position.column,
+                            symbol,
+                        );
+                    }
+                }
+            }
+        }
+        ensure!(
+            output.occurrence.len() <= 65536,
+            "plan reference index exceeds 65536 occurrences"
+        );
+        Ok(output)
+    }
+
+    fn push(
+        &mut self,
+        path: &str,
+        side: &str,
+        owner: &str,
+        name: &str,
+        kind: &str,
+        line: u32,
+        column: u32,
+        symbol: String,
+    ) {
+        let id = super::digest(
+            format!("{side}:{path}:{owner}:{name}:{kind}:{line}:{column}").as_bytes(),
+        );
+        self.occurrence.push(PlanReference {
+            id,
+            path: path.into(),
+            side: side.into(),
+            owner: owner.into(),
+            name: name.into(),
+            kind: kind.into(),
+            line,
+            column,
+            symbol,
+            anchor: None,
+        });
+    }
+
+    fn legacy(document: &PlanDocument, workspace: &std::path::Path) -> Result<Self> {
+        let rendered = super::render_plan_at(document, workspace)?;
+        let canonical = serde_json::to_value(document)?;
+        let mut output = Self::default();
+        let mut seen = BTreeSet::new();
+        for anchor in rendered.navigation.anchor {
+            let (name, symbol, usage) = match &anchor.target {
+                PlanReviewTarget::Entity { name }
+                | PlanReviewTarget::FileTreeEntity { name, .. } => {
+                    (name.clone(), format!("planned:{name}"), false)
+                }
+                PlanReviewTarget::EntityMember { entity, member } => (
+                    format!("{entity}::{member}"),
+                    format!("planned:{entity}::{member}"),
+                    false,
+                ),
+                PlanReviewTarget::FlowStep {
+                    target_name,
+                    reference_kind,
+                    workspace_path,
+                    workspace_line,
+                    ..
+                }
+                | PlanReviewTarget::FlowEdge {
+                    target_name,
+                    reference_kind,
+                    workspace_path,
+                    workspace_line,
+                    ..
+                } => {
+                    let identity = match reference_kind {
+                        super::PlanReviewReferenceKind::PlannedEntity => {
+                            format!("planned:{target_name}")
+                        }
+                        super::PlanReviewReferenceKind::WorkspaceEntity => format!(
+                            "workspace:{}:{}:{target_name}",
+                            workspace_path.as_deref().unwrap_or_default(),
+                            workspace_line.unwrap_or_default()
+                        ),
+                        super::PlanReviewReferenceKind::ExternalEntity => {
+                            format!("external:{target_name}")
+                        }
+                    };
+                    (target_name.clone(), identity, true)
+                }
+                PlanReviewTarget::Subtask { .. } | PlanReviewTarget::Test { .. } => {
+                    let value = canonical.pointer(&anchor.json_path);
+                    let names = value
+                        .and_then(|value| {
+                            value
+                                .get("entities")
+                                .or_else(|| value.get("covers_entities"))
+                        })
+                        .and_then(serde_json::Value::as_array);
+                    for name in names
+                        .into_iter()
+                        .flatten()
+                        .filter_map(serde_json::Value::as_str)
+                    {
+                        if !seen.insert((anchor.json_path.clone(), name.to_owned())) {
+                            continue;
+                        }
+                        output.push(
+                            anchor.path.as_deref().unwrap_or("plan"),
+                            "proposed",
+                            &anchor.label,
+                            name,
+                            "task",
+                            anchor.line,
+                            0,
+                            format!("planned:{name}"),
+                        );
+                        output.occurrence.last_mut().unwrap().anchor = Some(anchor.clone());
+                    }
+                    continue;
+                }
+                _ => continue,
+            };
+            output
+                .structured
+                .insert(anchor.json_path.clone(), symbol.clone());
+            if usage && seen.insert((anchor.json_path.clone(), name.clone())) {
+                output.push(
+                    anchor.path.as_deref().unwrap_or("plan"),
+                    "proposed",
+                    &anchor.label,
+                    &name,
+                    "flow",
+                    anchor.line,
+                    0,
+                    symbol,
+                );
+                output.occurrence.last_mut().unwrap().anchor = Some(anchor);
+            }
+        }
+        Ok(output)
+    }
+
+    /// Locate a Calls definition in the selected snapshot or its unchanged source symbol.
+    pub(crate) fn destination(
+        &self,
+        document: &PlanDocument,
+        workspace: &std::path::Path,
+        identity: &str,
+        baseline: bool,
+    ) -> Result<Option<crate::declaration::DeclarationDestination>> {
+        let Some(((path, line, column), _)) = self
+            .definition
+            .iter()
+            .find(|(_, (symbol, _))| symbol == identity)
+        else {
+            return Ok(None);
+        };
+        let design = document.design.as_ref().unwrap();
+        let text = if baseline {
+            &design.baseline[path].text
+        } else {
+            &design.proposed[path]
+        };
+        let callable = DeclarationCalls::extract(path, text, true)
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let index =
+            DeclarationIndex::extract(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let symbol = index
+            .symbol
+            .iter()
+            .find(|symbol| symbol.position.line == *line && symbol.position.column == *column);
+        let function = callable
+            .iter()
+            .find(|function| function.line == *line && function.column == *column);
+        let name = symbol
+            .map(|symbol| symbol.name.clone())
+            .or_else(|| function.map(|function| function.owner.clone()))
+            .unwrap_or_default();
+        let mut destination = crate::declaration::DeclarationDestination {
+            path: workspace.join(path).to_string_lossy().into_owned(),
+            line: *line,
+            column: *column,
+            proposed: true,
+            name,
+            module_file: false,
+        };
+        if !baseline && let Some(original) = design.baseline.get(path) {
+            let previous = DeclarationIndex::extract(path, &original.text)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let existed = symbol.is_some_and(|symbol| {
+                previous.symbol.iter().any(|previous| {
+                    previous.name == symbol.name && same_scope(&previous.scope, &symbol.scope)
+                })
+            }) || function.is_some_and(|function| {
+                DeclarationCalls::extract(path, &original.text, true).is_ok_and(|previous| {
+                    previous
+                        .iter()
+                        .any(|previous| previous.owner == function.owner)
+                })
+            });
+            if existed {
+                let Some(source) = super::design::workspace_source(workspace, path)? else {
+                    return Ok(Some(destination));
+                };
+                let original = DeclarationIndex::extract(path, &source)
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                let position = symbol.and_then(|symbol| {
+                    original
+                        .symbol
+                        .iter()
+                        .find(|original| {
+                            original.name == symbol.name && original.scope == symbol.scope
+                        })
+                        .map(|symbol| symbol.position)
+                });
+                let position = position.or_else(|| {
+                    function.and_then(|function| {
+                        DeclarationCalls::extract(path, &source, false)
+                            .ok()?
+                            .into_iter()
+                            .find(|original| original.owner == function.owner)
+                            .map(|function| forge_diff::syntax::DeclarationPosition {
+                                line: function.line,
+                                column: function.column,
+                            })
+                    })
+                });
+                if let Some(position) = position {
+                    destination.line = position.line;
+                    destination.column = position.column;
+                    destination.proposed = false;
+                }
+            }
+        }
+        Ok(Some(destination))
+    }
+
+    /// Resolve an uncaptured Lua require target by reading bounded module candidates lazily.
+    pub(crate) fn lua_source_call(
+        document: &PlanDocument,
+        workspace: &std::path::Path,
+        path: &str,
+        name: &str,
+        baseline: bool,
+    ) -> Result<Option<crate::declaration::DeclarationDestination>> {
+        if !path.ends_with(".lua") {
+            return Ok(None);
+        }
+        let design = document.design.as_ref().unwrap();
+        let text = if baseline {
+            &design.baseline[path].text
+        } else {
+            &design.proposed[path]
+        };
+        let index =
+            DeclarationIndex::extract(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let normalized = name.replace(':', ".");
+        let Some((alias, member)) = normalized.split_once('.') else {
+            return Ok(None);
+        };
+        let Some(module) = index
+            .import
+            .iter()
+            .find(|import| import.alias.as_deref() == Some(alias))
+            .and_then(|import| import.source.as_deref())
+        else {
+            return Ok(None);
+        };
+        let module = module.replace('.', "/");
+        let mut candidates = BTreeSet::new();
+        for directory in std::path::Path::new(path).ancestors().skip(1).take(16) {
+            for prefix in [directory.to_path_buf(), directory.join("lua")] {
+                candidates.insert(
+                    prefix
+                        .join(format!("{module}.lua"))
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+                candidates.insert(
+                    prefix
+                        .join(format!("{module}/init.lua"))
+                        .to_string_lossy()
+                        .replace('\\', "/"),
+                );
+            }
+        }
+        let mut destination = Vec::new();
+        for path in candidates {
+            if design.proposed.contains_key(&path) || design.baseline.contains_key(&path) {
+                continue;
+            }
+            let Some(source) = super::design::workspace_source(workspace, &path)? else {
+                continue;
+            };
+            for function in DeclarationCalls::extract(&path, &source, false)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?
+            {
+                if function
+                    .owner
+                    .replace(':', ".")
+                    .split_once('.')
+                    .map_or(function.owner.as_str(), |(_, member)| member)
+                    == member
+                {
+                    destination.push(crate::declaration::DeclarationDestination {
+                        path: workspace.join(&path).to_string_lossy().into_owned(),
+                        line: function.line,
+                        column: function.column,
+                        proposed: false,
+                        name: function.owner,
+                        module_file: false,
+                    });
+                }
+            }
+        }
+        Ok(if destination.len() == 1 {
+            destination.pop()
+        } else {
+            None
+        })
+    }
+
+    /// Require a unique proposed definition that has no corresponding source declaration.
+    pub(crate) fn rename_definition(
+        &self,
+        document: &PlanDocument,
+        identity: &str,
+    ) -> Result<(String, forge_diff::syntax::DeclarationSymbol)> {
+        let design = document
+            .design
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("rename requires a declaration plan"))?;
+        let candidates = self
+            .definition
+            .iter()
+            .filter(|(_, (symbol, _))| symbol == identity)
+            .collect::<Vec<_>>();
+        let [((path, line, column), _)] = candidates.as_slice() else {
+            anyhow::bail!("select a unique symbol defined in the plan");
+        };
+        let index = DeclarationIndex::extract(path, &design.proposed[path])
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let symbol = index
+            .symbol
+            .iter()
+            .find(|symbol| symbol.position.line == *line && symbol.position.column == *column)
+            .cloned()
+            .or_else(|| {
+                path.ends_with(".lua")
+                    .then(|| lua_symbol(path, &design.proposed[path], *line, *column))
+                    .flatten()
+            })
+            .ok_or_else(|| {
+                anyhow::anyhow!("selected definition is not a renameable declaration")
+            })?;
+        ensure!(
+            !symbol.parameter && !symbol.conditional,
+            "parameter and conditional definitions cannot be renamed"
+        );
+        ensure!(
+            index
+                .symbol
+                .iter()
+                .filter(|candidate| candidate.name == symbol.name
+                    && same_scope(&candidate.scope, &symbol.scope))
+                .count()
+                <= 1,
+            "merged or overloaded definitions require a unique symbol identity before rename"
+        );
+        let original_path = design
+            .moved
+            .iter()
+            .find(|(_, destination)| *destination == path)
+            .map(|(source, _)| source)
+            .unwrap_or(path);
+        let baseline = design
+            .baseline
+            .get(original_path)
+            .map(|file| file.text.clone());
+        for text in baseline.iter() {
+            let index = DeclarationIndex::extract(original_path, text)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            ensure!(
+                !index
+                    .symbol
+                    .iter()
+                    .any(|previous| previous.name == symbol.name
+                        && same_scope(&previous.scope, &symbol.scope)),
+                "only symbols introduced by the plan can be renamed"
+            );
+            if original_path.ends_with(".lua") {
+                let functions = DeclarationCalls::extract(original_path, text, true)
+                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                ensure!(
+                    !functions
+                        .iter()
+                        .any(|function| function.owner.replace(':', ".")
+                            == symbol
+                                .scope
+                                .iter()
+                                .chain(std::iter::once(&symbol.name))
+                                .cloned()
+                                .collect::<Vec<_>>()
+                                .join(".")),
+                    "only symbols introduced by the plan can be renamed"
+                );
+            }
+        }
+        Ok(((*path).clone(), symbol))
+    }
+
+    /// Rename resolved usages atomically while preserving extraction order and immutable baselines.
+    pub(crate) fn renamed(
+        &self,
+        document: &PlanDocument,
+        workspace: &std::path::Path,
+        identity: &str,
+        name: &str,
+    ) -> Result<PlanDocument> {
+        ensure!(
+            !name.is_empty()
+                && name
+                    .chars()
+                    .enumerate()
+                    .all(|(position, character)| character == '_'
+                        || if position == 0 {
+                            character.is_alphabetic()
+                        } else {
+                            character.is_alphanumeric()
+                        }),
+            "enter one valid identifier"
+        );
+        let (definition_path, symbol) = self.rename_definition(document, identity)?;
+        ensure!(name != symbol.name, "new name matches the current name");
+        let keyword = if definition_path.ends_with(".rs") {
+            "as break const continue crate else enum extern false fn for if impl in let loop match mod move mut pub ref return self Self static struct super trait true type unsafe use where while async await dyn abstract become box do final macro override priv typeof unsized virtual yield try gen"
+        } else if definition_path.ends_with(".lua") {
+            "and break do else elseif end false for function goto if in local nil not or repeat return then true until while"
+        } else {
+            "break case catch class const continue debugger default delete do else enum export extends false finally for function if import in instanceof new null return super switch this throw true try typeof var void while with yield let static implements interface package private protected public await"
+        };
+        ensure!(
+            !keyword.split_whitespace().any(|keyword| keyword == name),
+            "reserved language keywords cannot be symbol names"
+        );
+
+        let mut output = document.clone();
+        let design = output.design.as_mut().unwrap();
+        let index = DeclarationIndex::extract(&definition_path, &design.proposed[&definition_path])
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        ensure!(
+            !index
+                .symbol
+                .iter()
+                .any(|candidate| candidate.name == name
+                    && same_scope(&candidate.scope, &symbol.scope))
+                && !index.import.iter().any(|import| !import.export
+                    && import.alias.as_deref() == Some(name)
+                    && same_scope(&import.scope, &symbol.scope)),
+            "a symbol or import with this name already exists in this scope"
+        );
+        if definition_path.ends_with(".lua") {
+            let owner = symbol
+                .scope
+                .iter()
+                .cloned()
+                .chain(std::iter::once(name.to_owned()))
+                .collect::<Vec<_>>()
+                .join(".");
+            ensure!(
+                !DeclarationCalls::extract(
+                    &definition_path,
+                    &design.proposed[&definition_path],
+                    true
+                )
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?
+                .iter()
+                .any(|function| function.owner.replace(':', ".") == owner),
+                "a symbol with this name already exists in this scope"
+            );
+        }
+        let mut edits = BTreeMap::<String, BTreeSet<(u32, u32)>>::new();
+        edits
+            .entry(definition_path)
+            .or_default()
+            .insert((symbol.position.line, symbol.position.column));
+        for reference in self
+            .occurrence
+            .iter()
+            .filter(|reference| reference.symbol == identity && reference.kind != "call")
+        {
+            let text = &design.proposed[&reference.path];
+            let row = text
+                .lines()
+                .nth(reference.line as usize - 1)
+                .unwrap_or_default();
+            let start = reference.column as usize;
+            let tail = row.get(start..).unwrap_or_default();
+            let extent = if reference.kind != "import" {
+                reference.name.len()
+            } else {
+                tail.find(|character: char| {
+                    character == ';' || character == ',' || character.is_whitespace()
+                })
+                .unwrap_or(tail.len())
+            };
+            let token = tail.get(..extent).unwrap_or(tail);
+            if let Some(offset) = token.rfind(&symbol.name) {
+                let before = &token[..offset];
+                let after = &token[offset + symbol.name.len()..];
+                if before
+                    .chars()
+                    .last()
+                    .is_none_or(|character| !character.is_alphanumeric() && character != '_')
+                    && after
+                        .chars()
+                        .next()
+                        .is_none_or(|character| !character.is_alphanumeric() && character != '_')
+                {
+                    edits
+                        .entry(reference.path.clone())
+                        .or_default()
+                        .insert((reference.line, reference.column + offset as u32));
+                }
+            }
+        }
+        let mut resolver = DeclarationResolver::planned(workspace, design, false)?;
+        resolver.bound_reference_files();
+        for (path, functions) in &mut design.proposed_calls {
+            for function in functions {
+                for call in &mut function.call {
+                    if call.unresolved {
+                        continue;
+                    }
+                    let selected = self
+                        .call
+                        .get(&(path.clone(), function.owner.clone(), call.name.clone()))
+                        .is_some_and(|target| target == identity);
+                    let separator = if path.ends_with(".rs") { "::" } else { "." };
+                    let normalized = call
+                        .name
+                        .replace(':', if separator == "." { "." } else { ":" });
+                    let parts = normalized.split(separator).collect::<Vec<_>>();
+                    let mut replacement = parts
+                        .iter()
+                        .map(|part| (*part).to_owned())
+                        .collect::<Vec<_>>();
+                    for (position, part) in parts.iter().enumerate() {
+                        if *part != symbol.name {
+                            continue;
+                        }
+                        let matches = if position + 1 == parts.len() {
+                            selected
+                        } else {
+                            super::references::identity(
+                                resolver.type_target(
+                                    path,
+                                    &function
+                                        .owner
+                                        .split(separator)
+                                        .map(str::to_owned)
+                                        .collect::<Vec<_>>(),
+                                    &parts[..=position]
+                                        .iter()
+                                        .map(|part| (*part).to_owned())
+                                        .collect::<Vec<_>>(),
+                                ),
+                            )
+                            .as_deref()
+                                == Some(identity)
+                        };
+                        if matches {
+                            replacement[position] = name.into();
+                        }
+                    }
+                    let mut offset = 0;
+                    let mut edits = Vec::new();
+                    for (replacement, original) in replacement.iter().zip(&parts) {
+                        if replacement != original {
+                            edits.push((offset, original.len(), replacement));
+                        }
+                        offset += original.len() + separator.len();
+                    }
+                    for (offset, length, replacement) in edits.into_iter().rev() {
+                        call.name
+                            .replace_range(offset..offset + length, replacement);
+                    }
+                }
+            }
+        }
+        for (path, positions) in edits {
+            let text = design.proposed.get_mut(&path).unwrap();
+            let mut offsets = vec![0];
+            for (offset, byte) in text.bytes().enumerate() {
+                if byte == b'\n' {
+                    offsets.push(offset + 1);
+                }
+            }
+            for (line, column) in positions.iter().rev() {
+                let start = offsets[*line as usize - 1] + *column as usize;
+                ensure!(
+                    text.get(start..start + symbol.name.len()) == Some(symbol.name.as_str()),
+                    "rename token changed"
+                );
+                text.replace_range(start..start + symbol.name.len(), name);
+            }
+        }
+        for (path, functions) in &mut design.proposed_calls {
+            let before = DeclarationCalls::extract(
+                path,
+                &document.design.as_ref().unwrap().proposed[path],
+                true,
+            )
+            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let after = DeclarationCalls::extract(path, &design.proposed[path], true)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            ensure!(
+                before.len() == after.len(),
+                "rename changed declaration structure"
+            );
+            for function in functions {
+                let position = before
+                    .iter()
+                    .position(|callable| callable.owner == function.owner)
+                    .ok_or_else(|| anyhow::anyhow!("call owner is unavailable"))?;
+                function.owner.clone_from(&after[position].owner);
+            }
+        }
+        design.validation = None;
+        design.validate()?;
+        output.version = output
+            .version
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("plan version overflow"))?;
+        output.validate_for_submission()?;
+        Ok(output)
+    }
+
+    /// Identify a symbol at a saved declaration position or a Calls entry.
+    pub(crate) fn selected(&self, anchor: &PlanNavigationAnchor, column: u32) -> Option<&str> {
+        match &anchor.target {
+            PlanReviewTarget::Call {
+                path, owner, name, ..
+            } => self
+                .call
+                .get(&(path.clone(), owner.clone(), name.clone()))
+                .map(String::as_str),
+            PlanReviewTarget::Declaration { path, line, .. } => self
+                .occurrence
+                .iter()
+                .filter(|reference| {
+                    reference.kind != "call"
+                        && reference.path == *path
+                        && reference.line == *line
+                        && reference.column <= column
+                        && column < reference.column + reference.name.len() as u32
+                })
+                .min_by_key(|reference| reference.name.len())
+                .map(|reference| reference.symbol.as_str())
+                .or_else(|| {
+                    self.definition
+                        .range((path.clone(), *line, 0)..=(path.clone(), *line, column))
+                        .next_back()
+                        .filter(|((_, _, start), (_, length))| column < *start + *length as u32)
+                        .map(|(_, (symbol, _))| symbol.as_str())
+                }),
+            _ => self.structured.get(&anchor.json_path).map(String::as_str),
+        }
+    }
+}
+
+fn same_scope(previous: &[String], proposed: &[String]) -> bool {
+    previous
+        .iter()
+        .filter(|scope| !scope.starts_with("@impl:"))
+        .eq(proposed.iter().filter(|scope| !scope.starts_with("@impl:")))
+}
+
+fn lua_symbol(
+    path: &str,
+    text: &str,
+    line: u32,
+    column: u32,
+) -> Option<forge_diff::syntax::DeclarationSymbol> {
+    let functions = DeclarationCalls::extract(path, text, true).ok()?;
+    let function = functions
+        .iter()
+        .find(|function| function.line == line && function.column == column)?;
+    let normalized = function.owner.replace(':', ".");
+    let mut scope = normalized.split('.').map(str::to_owned).collect::<Vec<_>>();
+    let name = scope.pop()?;
+    Some(forge_diff::syntax::DeclarationSymbol {
+        position: forge_diff::syntax::DeclarationPosition {
+            line,
+            column: column + function.owner.len() as u32 - name.len() as u32,
+        },
+        name,
+        scope,
+        visibility: forge_diff::syntax::SymbolVisibility::Public,
+        type_namespace: false,
+        value_namespace: true,
+        macro_namespace: false,
+        conditional: false,
+        global: false,
+        parameter: false,
+    })
+}
+
+fn identity(resolution: DeclarationResolution) -> Option<String> {
+    match resolution {
+        DeclarationResolution::Resolved { destination } => Some(format!(
+            "{}:{}:{}",
+            destination.path.replace('\\', "/"),
+            destination.line,
+            destination.column
+        )),
+        _ => None,
+    }
+}
+
+fn lua_identity(path: &str, owner: &str) -> String {
+    format!("lua:{path}:{owner}")
+}
+
+fn lua_target(
+    path: &str,
+    name: &str,
+    index: &DeclarationIndex,
+    functions: &BTreeMap<(String, String), (u32, u32)>,
+) -> Option<String> {
+    let name = name.replace(':', ".");
+    if functions.contains_key(&(path.into(), name.clone())) {
+        return Some(lua_identity(path, &name));
+    }
+    let (prefix, member) = name.split_once('.')?;
+    let import = index
+        .import
+        .iter()
+        .find(|import| import.alias.as_deref() == Some(prefix))?;
+    let module = import.source.as_deref()?.replace('.', "/");
+    let candidates = functions
+        .keys()
+        .filter(|(file, owner)| {
+            (file.ends_with(&format!("{module}.lua"))
+                || file.ends_with(&format!("{module}/init.lua")))
+                && owner.rsplit('.').next() == Some(member)
+        })
+        .collect::<Vec<_>>();
+    if let [(file, owner)] = candidates.as_slice() {
+        Some(lua_identity(file, owner))
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn rename_updates_cross_file_calls_in_order_without_touching_baselines() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document = super::super::document::test_fixture("rename", "Rename");
+        let mut design = super::super::DeclarationDesign::default();
+        design.document.task = "Rename the API".into();
+        design.document.description = "Keep all plan references consistent".into();
+        design
+            .proposed
+            .insert("client.ts".into(), "export function send(): void;\n".into());
+        design.proposed.insert(
+            "run.ts".into(),
+            "import { send } from './client';\nexport function run(): void;\n".into(),
+        );
+        design.proposed_calls.insert(
+            "run.ts".into(),
+            vec![super::super::FunctionCalls {
+                owner: "run".into(),
+                call: vec![
+                    super::super::CallSite {
+                        name: "send".into(),
+                        source: None,
+                        unresolved: false
+                    };
+                    2
+                ],
+            }],
+        );
+        document.design = Some(design);
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let identity = index.call.values().next().unwrap();
+        let renamed = index
+            .renamed(&document, workspace.path(), identity, "dispatch")
+            .unwrap();
+        let design = renamed.design.unwrap();
+        assert!(design.proposed["client.ts"].contains("function dispatch"));
+        assert!(design.proposed["run.ts"].contains("import { dispatch }"));
+        assert_eq!(
+            design.proposed_calls["run.ts"][0]
+                .call
+                .iter()
+                .map(|call| call.name.as_str())
+                .collect::<Vec<_>>(),
+            vec!["dispatch", "dispatch"]
+        );
+        assert_eq!(
+            document.design.as_ref().unwrap().proposed_calls["run.ts"][0].call[0].name,
+            "send"
+        );
+        assert!(
+            index
+                .renamed(&document, workspace.path(), identity, "function")
+                .is_err()
+        );
+        std::fs::write(workspace.path().join("client.ts"), "invalid source {").unwrap();
+        let snapshot = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let identity = snapshot.call.values().next().unwrap();
+        assert!(
+            snapshot
+                .renamed(&document, workspace.path(), identity, "dispatch")
+                .is_ok()
+        );
+        document.design.as_mut().unwrap().baseline.insert(
+            "client.ts".into(),
+            super::super::DeclarationFile {
+                text: "export function send(): void;\n".into(),
+                source_digest: "saved".into(),
+            },
+        );
+        assert!(
+            snapshot
+                .rename_definition(&document, identity)
+                .unwrap_err()
+                .to_string()
+                .contains("introduced")
+        );
+    }
+
+    #[test]
+    fn rename_updates_recursive_owner_and_rejects_scope_collisions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document = super::super::document::test_fixture("rename", "Rename");
+        let mut design = super::super::DeclarationDesign::default();
+        design.document.task = "Rename the API".into();
+        design.document.description = "Keep all plan references consistent".into();
+        design.proposed.insert(
+            "client.ts".into(),
+            "export function send(): void;\nexport function dispatch(): void;\n".into(),
+        );
+        design.proposed_calls.insert(
+            "client.ts".into(),
+            vec![super::super::FunctionCalls {
+                owner: "send".into(),
+                call: vec![super::super::CallSite {
+                    name: "send".into(),
+                    source: None,
+                    unresolved: false,
+                }],
+            }],
+        );
+        document.design = Some(design);
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let identity = index.call.values().next().unwrap();
+        assert!(
+            index
+                .renamed(&document, workspace.path(), identity, "dispatch")
+                .is_err()
+        );
+        let renamed = index
+            .renamed(&document, workspace.path(), identity, "deliver")
+            .unwrap();
+        let function = &renamed.design.as_ref().unwrap().proposed_calls["client.ts"][0];
+        assert_eq!(function.owner, "deliver");
+        assert_eq!(function.call[0].name, "deliver");
+    }
+
+    #[test]
+    fn rust_type_rename_updates_method_qualifiers_and_function_owners() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname='rename'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        let mut document = super::super::document::test_fixture("rename", "Rename");
+        let mut design = super::super::DeclarationDesign::default();
+        design.document.task = "Rename the owner".into();
+        design.document.description = "Keep Calls consistent".into();
+        design.proposed.insert("src/lib.rs".into(),"pub struct Client { pub endpoint: u32 }\nimpl Client {\n    pub fn send(&self);\n}\npub fn run(client: &Client);\n".into());
+        design.proposed_calls.insert(
+            "src/lib.rs".into(),
+            vec![
+                super::super::FunctionCalls {
+                    owner: "Client::send".into(),
+                    call: Vec::new(),
+                },
+                super::super::FunctionCalls {
+                    owner: "run".into(),
+                    call: vec![super::super::CallSite {
+                        name: "Client::send".into(),
+                        source: None,
+                        unresolved: false,
+                    }],
+                },
+            ],
+        );
+        document.design = Some(design);
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let identity = &index
+            .definition
+            .get(&("src/lib.rs".into(), 1, 11))
+            .unwrap()
+            .0;
+        let renamed = index
+            .renamed(&document, workspace.path(), identity, "Transport")
+            .unwrap();
+        let design = renamed.design.unwrap();
+        assert!(design.proposed["src/lib.rs"].contains("impl Transport"));
+        assert!(design.proposed["src/lib.rs"].contains("client: &Transport"));
+        assert_eq!(
+            design.proposed_calls["src/lib.rs"][0].owner,
+            "Transport::send"
+        );
+        assert_eq!(
+            design.proposed_calls["src/lib.rs"][1].call[0].name,
+            "Transport::send"
+        );
+    }
+
+    #[test]
+    fn existing_methods_remain_protected_after_impl_order_changes() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname='guard'\nversion='0.1.0'\nedition='2021'\n",
+        )
+        .unwrap();
+        let source = "pub struct Client;\nimpl Client { pub fn send(&self) {} }\n";
+        std::fs::write(workspace.path().join("src/lib.rs"), source).unwrap();
+        let mut document = super::super::document::test_fixture("guard", "Guard");
+        let mut design = super::super::DeclarationDesign::default();
+        let baseline =
+            forge_diff::syntax::DeclarationOverview::extract("src/lib.rs", source).unwrap();
+        design.baseline.insert(
+            "src/lib.rs".into(),
+            super::super::DeclarationFile {
+                text: baseline,
+                source_digest: super::super::digest(source.as_bytes()),
+            },
+        );
+        design.proposed.insert("src/lib.rs".into(),"pub struct Extra;\nimpl Extra { pub fn prepare(&self); }\npub struct Client;\nimpl Client { pub fn send(&self); }\npub fn run();\n".into());
+        design.proposed_calls.insert(
+            "src/lib.rs".into(),
+            vec![super::super::FunctionCalls {
+                owner: "run".into(),
+                call: vec![super::super::CallSite {
+                    name: "Client::send".into(),
+                    source: None,
+                    unresolved: false,
+                }],
+            }],
+        );
+        document.design = Some(design);
+        let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
+        let identity = index.call.values().next().unwrap();
+        assert!(
+            index
+                .rename_definition(&document, identity)
+                .unwrap_err()
+                .to_string()
+                .contains("introduced")
+        );
+        let destination = index
+            .destination(&document, workspace.path(), identity, false)
+            .unwrap()
+            .unwrap();
+        assert!(!destination.proposed);
+        assert_eq!(destination.line, 2);
+    }
+
+    #[test]
+    fn lua_source_calls_read_only_the_required_module() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(workspace.path().join("lua")).unwrap();
+        std::fs::write(
+            workspace.path().join("lua/client.lua"),
+            "local M = {}\nfunction M.send() return 1 end\nreturn M\n",
+        )
+        .unwrap();
+        std::fs::write(
+            workspace.path().join("lua/unrelated.lua"),
+            "invalid source {",
+        )
+        .unwrap();
+        let mut document = super::super::document::test_fixture("lua", "Lua");
+        let mut design = super::super::DeclarationDesign::default();
+        design.proposed.insert(
+            "lua/run.lua".into(),
+            "local client = require('client')\nlocal function run()\n".into(),
+        );
+        document.design = Some(design);
+        let destination = PlanReferenceIndex::lua_source_call(
+            &document,
+            workspace.path(),
+            "lua/run.lua",
+            "client.send",
+            false,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(
+            destination.path.ends_with("lua/client.lua")
+                || destination.path.ends_with("lua\\client.lua")
+        );
+        assert_eq!(destination.line, 2);
+        assert!(!destination.proposed);
+        assert_eq!(document.design.as_ref().unwrap().proposed.len(), 1);
+    }
+
+    #[test]
+    fn lua_calls_jump_to_saved_definitions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document = super::super::document::test_fixture("lua", "Lua");
+        let mut design = super::super::DeclarationDesign::default();
+        design.proposed.insert(
+            "client.lua".into(),
+            "local M\nfunction M.send()\nreturn M\n".into(),
+        );
+        design.proposed.insert(
+            "run.lua".into(),
+            "local client = require('client')\nlocal function run()\n".into(),
+        );
+        design.proposed_calls.insert(
+            "run.lua".into(),
+            vec![super::super::FunctionCalls {
+                owner: "run".into(),
+                call: vec![super::super::CallSite {
+                    name: "client.send".into(),
+                    source: None,
+                    unresolved: false,
+                }],
+            }],
+        );
+        document.design = Some(design);
+        let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
+        let identity = index.call.values().next().unwrap();
+        let destination = index
+            .destination(&document, workspace.path(), identity, false)
+            .unwrap()
+            .unwrap();
+        assert!(destination.path.ends_with("client.lua"));
+        assert_eq!(destination.line, 2);
+        assert!(destination.proposed);
+        document.design.as_mut().unwrap().document.task = "Rename Lua API".into();
+        document.design.as_mut().unwrap().document.description = "Update saved calls".into();
+        let renamed = index
+            .renamed(&document, workspace.path(), identity, "deliver")
+            .unwrap();
+        assert!(renamed.design.as_ref().unwrap().proposed["client.lua"].contains("M.deliver"));
+        assert_eq!(
+            renamed.design.as_ref().unwrap().proposed_calls["run.lua"][0].call[0].name,
+            "client.deliver"
+        );
+    }
+
+    #[test]
+    fn rust_references_use_saved_calls_and_distinguish_type_tokens() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::create_dir(workspace.path().join("src")).unwrap();
+        std::fs::write(
+            workspace.path().join("Cargo.toml"),
+            "[package]\nname = \"references\"\nversion = \"0.1.0\"\nedition = \"2021\"\n",
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("src/lib.rs"), "pub struct Client;\n").unwrap();
+        let mut document = super::super::document::test_fixture("calls", "Calls");
+        let mut design = super::super::DeclarationDesign::default();
+        design.proposed.insert("src/lib.rs".into(), "pub struct Client;\nimpl Client {\n  pub fn send(&self);\n}\npub fn run(client: &Client);\n".into());
+        design.proposed_calls.insert(
+            "src/lib.rs".into(),
+            vec![super::super::FunctionCalls {
+                owner: "run".into(),
+                call: vec![super::super::CallSite {
+                    name: "Client::send".into(),
+                    source: None,
+                    unresolved: false,
+                }],
+            }],
+        );
+        document.design = Some(design);
+        let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
+        let call = index
+            .call
+            .get(&("src/lib.rs".into(), "run".into(), "Client::send".into()))
+            .expect("call resolves");
+        assert_eq!(
+            index
+                .occurrence
+                .iter()
+                .filter(|reference| &reference.symbol == call && reference.kind == "call")
+                .count(),
+            1
+        );
+        let anchor = PlanNavigationAnchor {
+            line: 1,
+            target: PlanReviewTarget::Declaration {
+                path: "src/lib.rs".into(),
+                side: "proposed".into(),
+                line: 5,
+                column: Some(0),
+            },
+            json_path: String::new(),
+            path: None,
+            label: String::new(),
+        };
+        let function = index.selected(&anchor, 8).unwrap();
+        assert_eq!(
+            function,
+            index
+                .definition
+                .get(&("src/lib.rs".into(), 5, 7))
+                .unwrap()
+                .0
+        );
+        let parameter_type = index.selected(&anchor, 22).unwrap();
+        assert_ne!(function, parameter_type);
+    }
+
+    #[test]
+    fn typescript_cross_file_calls_resolve_import_identity() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document = super::super::document::test_fixture("calls", "Calls");
+        let mut design = super::super::DeclarationDesign::default();
+        design
+            .proposed
+            .insert("client.ts".into(), "export function send(): void;\n".into());
+        design.proposed.insert(
+            "run.ts".into(),
+            "import { send } from './client';\nexport function run(): void;\n".into(),
+        );
+        design.proposed_calls.insert(
+            "run.ts".into(),
+            vec![super::super::FunctionCalls {
+                owner: "run".into(),
+                call: vec![super::super::CallSite {
+                    name: "send".into(),
+                    source: None,
+                    unresolved: false,
+                }],
+            }],
+        );
+        document.design = Some(design);
+        let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
+        assert!(
+            index
+                .call
+                .contains_key(&("run.ts".into(), "run".into(), "send".into()))
+        );
+    }
+
+    #[test]
+    fn lua_require_calls_resolve_saved_module_functions() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document = super::super::document::test_fixture("lua", "Lua calls");
+        let mut design = super::super::DeclarationDesign::default();
+        design.proposed.insert(
+            "client.lua".into(),
+            "local M\nfunction M.send()\nreturn M\n".into(),
+        );
+        design.proposed.insert(
+            "run.lua".into(),
+            "local client = require(\"client\")\nfunction run()\n".into(),
+        );
+        design.proposed_calls.insert(
+            "run.lua".into(),
+            vec![super::super::FunctionCalls {
+                owner: "run".into(),
+                call: vec![super::super::CallSite {
+                    name: "client.send".into(),
+                    source: None,
+                    unresolved: false,
+                }],
+            }],
+        );
+        document.design = Some(design);
+        let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
+        assert!(
+            index
+                .call
+                .contains_key(&("run.lua".into(), "run".into(), "client.send".into()))
+        );
+    }
+
+    #[test]
+    fn legacy_references_include_explicit_tasks_and_flows_without_prose_matches() {
+        let workspace = tempfile::tempdir().unwrap();
+        let document = super::super::document::test_fixture("legacy", "Legacy references");
+        let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
+        assert!(
+            index
+                .occurrence
+                .iter()
+                .any(|reference| reference.kind == "flow")
+        );
+        assert!(
+            index
+                .occurrence
+                .iter()
+                .any(|reference| reference.kind == "task")
+        );
+        assert!(
+            index
+                .occurrence
+                .iter()
+                .all(|reference| reference.kind == "task" || reference.kind == "flow")
+        );
+    }
+
+    #[test]
+    fn opaque_call_evidence_blocks_name_only_reference_resolution() {
+        let workspace = tempfile::tempdir().unwrap();
+        let mut document = super::super::document::test_fixture("opaque", "Opaque calls");
+        let mut design = super::super::DeclarationDesign::default();
+        design
+            .proposed
+            .insert("client.ts".into(), "export function send(): void;\n".into());
+        design.proposed.insert(
+            "run.ts".into(),
+            "import { send } from './client';\nexport function run(send: () => void): void;\n"
+                .into(),
+        );
+        design.proposed_calls.insert(
+            "run.ts".into(),
+            vec![super::super::FunctionCalls {
+                owner: "run".into(),
+                call: vec![super::super::CallSite {
+                    name: "send".into(),
+                    source: None,
+                    unresolved: true,
+                }],
+            }],
+        );
+        design.document.task = "Rename the exported send API".into();
+        design.document.description = "Preserve opaque callback bindings".into();
+        document.design = Some(design);
+        let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
+        let key = ("run.ts".into(), "run".into(), "send".into());
+        assert!(!index.call.contains_key(&key));
+        assert!(index.unresolved.contains_key(&key));
+        let identity = &index
+            .definition
+            .get(&("client.ts".into(), 1, 16))
+            .unwrap()
+            .0;
+        let renamed = index
+            .renamed(&document, workspace.path(), identity, "dispatch")
+            .unwrap();
+        assert!(
+            renamed.design.as_ref().unwrap().proposed["run.ts"].contains("import { dispatch }")
+        );
+        assert!(renamed.design.as_ref().unwrap().proposed["run.ts"].contains("run(send:"));
+        assert_eq!(
+            renamed.design.as_ref().unwrap().proposed_calls["run.ts"][0].call[0].name,
+            "send"
+        );
+    }
+}

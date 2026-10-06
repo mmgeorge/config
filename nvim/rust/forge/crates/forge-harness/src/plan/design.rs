@@ -15,6 +15,9 @@ pub struct DeclarationFile {
 
 const PLAN_DOCUMENT_PATH: &str = "plan.json";
 
+type SourceOverviewCache = std::sync::Mutex<BTreeMap<String, (DeclarationFile, Vec<super::FunctionCalls>)>>;
+static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sync::OnceLock::new();
+
 /// Records the requested outcome and proposed design independently of declaration files.
 #[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +45,12 @@ pub struct DeclarationDesign {
     pub baseline: BTreeMap<String, DeclarationFile>,
     pub proposed: BTreeMap<String, String>,
     pub moved: BTreeMap<String, String>,
+    /// Call occurrences captured with each source baseline, in extraction order.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub baseline_calls: BTreeMap<String, Vec<super::FunctionCalls>>,
+    /// Authored call relationships accompanying proposed declarations.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub proposed_calls: BTreeMap<String, Vec<super::FunctionCalls>>,
 }
 
 fn default_line_width() -> usize {
@@ -58,6 +67,8 @@ impl Default for DeclarationDesign {
             baseline: BTreeMap::new(),
             proposed: BTreeMap::new(),
             moved: BTreeMap::new(),
+            baseline_calls: BTreeMap::new(),
+            proposed_calls: BTreeMap::new(),
         }
     }
 }
@@ -112,15 +123,27 @@ impl DeclarationDesign {
         Ok(design)
     }
 
-    fn source(&self, workspace: &Path, path: &str) -> Result<DeclarationFile> {
+    fn source(&self, workspace: &Path, path: &str) -> Result<(DeclarationFile, Vec<super::FunctionCalls>)> {
         validate_path(path)?;
         let source = workspace_source(workspace, path)?.with_context(|| format!("declaration file does not exist: {path}"))?;
-        let text = DeclarationOverview::extract(path, &source)
+        let source_digest = super::digest(source.as_bytes());
+        let key = format!("{path}:{}:{source_digest}", self.line_width);
+        let cache = SOURCE_OVERVIEW_CACHE.get_or_init(Default::default);
+        if let Some(overview) = cache.lock().map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?.get(&key).cloned() { return Ok(overview); }
+        let (text, calls) = DeclarationOverview::extract_with_calls(path, &source)
             .map_err(|error| anyhow::anyhow!("{error:?}"))
             .with_context(|| format!("extract {path}"))?;
         let text = DeclarationOverview::format_with_width(path, &text, self.line_width)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        Ok(DeclarationFile { text, source_digest: super::digest(source.as_bytes()) })
+        let calls = super::calls::from_extracted(calls);
+        let saved_owners = forge_diff::syntax::DeclarationCalls::extract(path, &text, true).map_err(|error| anyhow::anyhow!("{error:?}"))?.into_iter().map(|function| function.owner).collect::<BTreeSet<_>>();
+        let calls = calls.into_iter().filter(|function| saved_owners.contains(&function.owner)).collect();
+        let overview = (DeclarationFile { text, source_digest }, calls);
+        let mut cache = cache.lock().map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?;
+        let bytes = cache.values().map(|(file, calls)| file.text.len() + calls.iter().map(|function| function.owner.len() + function.call.iter().map(|call| call.name.len() + 16).sum::<usize>()).sum::<usize>()).sum::<usize>();
+        if cache.len() >= 16 || bytes >= 8 * 1024 * 1024 { cache.clear(); }
+        cache.insert(key, overview.clone());
+        Ok(overview)
     }
 
     /// Inspect one uncaptured workspace file without changing the saved design.
@@ -131,8 +154,9 @@ impl DeclarationDesign {
             && !self.baseline.contains_key(path)
             && !self.proposed.contains_key(path)
         {
-            let file = self.source(workspace, path)?;
-            return Ok(serde_json::json!({"path":path,"side":"workspace","text":file.text,"source_digest":file.source_digest}));
+            let (file, calls) = self.source(workspace, path)?;
+            let text = super::calls::combined(path, &file.text, &calls)?;
+            return Ok(serde_json::json!({"path":path,"side":"workspace","text":text,"source_digest":file.source_digest}));
         }
         self.read(path, baseline)
     }
@@ -173,6 +197,17 @@ impl DeclarationDesign {
             );
         }
         ensure!(bytes <= 8 * 1024 * 1024, "declaration snapshot exceeds 8 MiB");
+        for (files, baseline) in [(&self.baseline_calls, true), (&self.proposed_calls, false)] {
+            for (path, calls) in files {
+                let text = if baseline { self.baseline.get(path).map(|file| &file.text) } else { self.proposed.get(path) }
+                    .with_context(|| format!("call metadata has no declaration file: {path}"))?;
+                let combined = super::calls::combined(path, text, calls)?;
+                let (_, parsed) = super::calls::parse(path, &combined, calls)?;
+                ensure!(parsed.len() == calls.len(), "call metadata has an absent or ambiguous callable: {path}");
+                bytes += serde_json::to_vec(calls)?.len();
+            }
+        }
+        ensure!(bytes <= 8 * 1024 * 1024, "declaration and call snapshot exceeds 8 MiB");
         for (from, to) in &self.moved {
             ensure!(
                 self.baseline.contains_key(from)
@@ -216,6 +251,7 @@ impl DeclarationDesign {
             .filter(|path| {
                 self.baseline.get(path).map(|file| file.text.as_str())
                     != self.proposed.get(path).map(String::as_str)
+                    || self.baseline_calls.get(path) != self.proposed_calls.get(path)
             })
             .collect()
     }
@@ -261,9 +297,9 @@ impl DeclarationDesign {
                 self.proposed.get(path)
             }
             .with_context(|| format!("declaration file does not exist: {path}"))?;
-            Ok(
-                serde_json::json!({"path":path,"side":if baseline {"baseline"} else {"proposed"},"text":text}),
-            )
+            let calls = if baseline { self.baseline_calls.get(path) } else { self.proposed_calls.get(path) };
+            let text = super::calls::combined(path, text, calls.map(Vec::as_slice).unwrap_or_default())?;
+            Ok(serde_json::json!({"path":path,"side":if baseline {"baseline"} else {"proposed"},"text":text}))
         } else {
             Ok(
                 serde_json::json!({"paths":self.baseline.keys().chain(self.proposed.keys()).map(String::as_str).chain([PLAN_DOCUMENT_PATH]).collect::<BTreeSet<_>>(),"changed_paths":self.changed_paths()}),
@@ -311,11 +347,15 @@ impl DeclarationDesign {
                     if kind == "add" {
                         ensure!(std::fs::symlink_metadata(workspace.join(path)).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound), "{path}: Add File destination already exists or cannot be inspected");
                     } else {
-                        let file = candidate.source(workspace, path)?;
+                        let (file, calls) = candidate.source(workspace, path)?;
                         if let Some(expected) = source_digests.get(path) {
                             ensure!(*expected == file.source_digest, "{path}: workspace changed since inspection. Read the declaration file again.");
                         }
                         candidate.proposed.insert(path.into(), file.text.clone());
+                        if !calls.is_empty() {
+                            candidate.baseline_calls.insert(path.into(), calls.clone());
+                            candidate.proposed_calls.insert(path.into(), calls);
+                        }
                         candidate.baseline.insert(path.into(), file);
                     }
                 }
@@ -373,6 +413,7 @@ impl DeclarationDesign {
                         "cannot delete absent declaration file: {path}"
                     );
                     candidate.moved.retain(|_, to| to != path);
+                    candidate.proposed_calls.remove(path);
                 }
                 "add" => {
                     ensure!(
@@ -387,21 +428,22 @@ impl DeclarationDesign {
                         );
                         text.push('\n');
                     }
-                    candidate.proposed.insert(
-                        path.into(),
-                        DeclarationOverview::parse(path, &text)
-                            .map_err(|error| anyhow::anyhow!("{error:?}"))?,
-                    );
+                    let (text, calls) = super::calls::parse(path, &text, &[])?;
+                    candidate.proposed.insert(path.into(), text);
+                    if !calls.is_empty() { candidate.proposed_calls.insert(path.into(), calls); }
                 }
                 _ => {
                     let original = candidate.proposed.get(path).with_context(|| {
                         format!("cannot update absent declaration file: {path}")
                     })?;
-                    let text = patch_file(original, body)?;
-                    let text = DeclarationOverview::parse(destination, &text)
-                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                    let calls = candidate.proposed_calls.get(path).map(Vec::as_slice).unwrap_or_default();
+                    let original = super::calls::combined(path, original, calls)?;
+                    let text = patch_file(&original, body)?;
+                    let (text, calls) = super::calls::parse(destination, &text, calls)?;
                     candidate.proposed.remove(path);
+                    candidate.proposed_calls.remove(path);
                     candidate.proposed.insert(destination.into(), text);
+                    if !calls.is_empty() { candidate.proposed_calls.insert(destination.into(), calls); }
                     if destination != path {
                         let original = candidate
                             .moved
@@ -422,7 +464,7 @@ impl DeclarationDesign {
         }
         ensure!(!edited.is_empty(), "patch has no file operations");
         candidate.validate()?;
-        if candidate.proposed == self.proposed && candidate.document == self.document && candidate.moved == self.moved {
+        if candidate.proposed == self.proposed && candidate.proposed_calls == self.proposed_calls && candidate.document == self.document && candidate.moved == self.moved {
             candidate.validation = self.validation.clone();
         }
         Ok(candidate)
@@ -451,7 +493,8 @@ fn validate_path(path: &str) -> Result<()> {
     Ok(())
 }
 
-fn workspace_source(workspace: &Path, path: &str) -> Result<Option<String>> {
+/// Read one bounded workspace source after validating its path and regular-file identity.
+pub(super) fn workspace_source(workspace: &Path, path: &str) -> Result<Option<String>> {
     use std::io::Read;
     validate_relative_path(path)?;
     let target = workspace.join(path);
@@ -775,3 +818,25 @@ mod tests {
         assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Add File: ../escape.rs\n+pub struct Escaped;\n*** End Patch").is_err());
     }
 }
+    #[test]
+    fn lazy_call_capture_and_patch_are_atomic_and_snapshot_bound() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("main.rs"), "pub fn run() { before(); before(); }\n").unwrap();
+        std::fs::write(workspace.path().join("unrelated.rs"), "invalid syntax {").unwrap();
+        let design = DeclarationDesign::default();
+        let read = design.inspect(workspace.path(), Some("main.rs"), false).unwrap();
+        assert!(read["text"].as_str().unwrap().contains("Calls\n  before\n  before\n"));
+        assert!(design.baseline.is_empty() && design.baseline_calls.is_empty());
+        let patch = "*** Begin Patch\n*** Update File: main.rs\n@@\n Calls\n-  before\n+  after\n   before\n*** End Patch";
+        let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
+        assert_eq!(changed.baseline_calls["main.rs"][0].call[0].name, "before");
+        assert_eq!(changed.proposed_calls["main.rs"][0].call[0].name, "after");
+        assert!(changed.proposed_calls["main.rs"][0].call[0].source.is_none());
+        assert!(changed.proposed_calls["main.rs"][0].call[1].source.is_some());
+        assert_eq!(changed.baseline.len(), 1);
+        assert!(design.patch(workspace.path(), &Default::default(), &patch.replace("+  after", "+  after(value)")).is_err());
+        assert!(design.baseline_calls.is_empty());
+        std::fs::write(workspace.path().join("main.rs"), "pub fn run() { live(); }\n").unwrap();
+        assert!(changed.inspect(workspace.path(), Some("main.rs"), true).unwrap()["text"].as_str().unwrap().contains("before"));
+        assert!(!changed.read(Some("main.rs"), false).unwrap()["text"].as_str().unwrap().contains("live"));
+    }

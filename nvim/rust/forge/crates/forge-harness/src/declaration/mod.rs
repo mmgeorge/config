@@ -187,6 +187,8 @@ pub(crate) struct DeclarationResolver {
     source_request: BTreeMap<String, String>,
     source_acquired: bool,
     bytes: usize,
+    file_limit: Option<usize>,
+    source_enabled: bool,
     /// Correlates navigation work with the currently admitted review input.
     pub(crate) trace: Option<trace::DeclarationTrace>,
     work: ResolutionWork,
@@ -215,7 +217,7 @@ static PARSE_CACHE: OnceLock<ParseCache> = OnceLock::new();
 impl DeclarationResolver {
     /// Index snapshot declarations and discover dependency sources only when reached.
     pub(crate) fn local(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
-        let mut resolver = Self::snapshot(workspace, design, baseline)?;
+        let mut resolver = Self::snapshot(workspace, design, baseline, true)?;
         sources::project(&mut resolver)?;
         resolver.typescript_environment()?;
         if !resolver.package.is_empty() {
@@ -261,7 +263,7 @@ impl DeclarationResolver {
 
     /// Retry unavailable reached sources once through Cargo without modifying the workspace.
     pub(crate) async fn acquire(&mut self, design: &DeclarationDesign) -> Result<()> {
-        let mut acquired = Self::snapshot(&self.workspace, design, self.baseline)?;
+        let mut acquired = Self::snapshot(&self.workspace, design, self.baseline, true)?;
         acquired.trace = self.trace.clone();
         acquired.source_request = self.source_request.clone();
         acquired.source_acquired = true;
@@ -275,6 +277,14 @@ impl DeclarationResolver {
         Ok(())
     }
 
+    /// Resolve declarations exclusively from saved plan files without consulting workspace sources.
+    pub(crate) fn planned(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
+        let mut resolver = Self::snapshot(workspace, design, baseline, false)?;
+        sources::project(&mut resolver)?;
+        resolver.bound_reference_files();
+        Ok(resolver)
+    }
+
     /// Validate with cached evidence, acquiring only missing reached dependency sources.
     pub(crate) async fn validate_sources(&mut self, design: &DeclarationDesign) -> Result<DeclarationValidation> {
         let report = self.validate(design);
@@ -286,8 +296,8 @@ impl DeclarationResolver {
     }
 
     /// Create an isolated lexical snapshot before acquiring external evidence.
-    fn snapshot(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
-        let workspace = dunce::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf());
+    fn snapshot(workspace: &Path, design: &DeclarationDesign, baseline: bool, source_enabled: bool) -> Result<Self> {
+        let workspace = if source_enabled { dunce::canonicalize(workspace).unwrap_or_else(|_| workspace.to_path_buf()) } else { normalize(workspace) };
         let mut snapshot: BTreeMap<String, String> = if baseline {
             design
                 .baseline
@@ -305,7 +315,7 @@ impl DeclarationResolver {
             .collect();
         let changed = design.changed_paths().into_iter().collect();
         let source_paths = snapshot.keys().filter(|path| path.ends_with(".rs")).cloned().collect::<Vec<_>>();
-        for path in source_paths {
+        for path in source_paths.into_iter().filter(|_| source_enabled) {
             for directory in Path::new(&path).ancestors().skip(1) {
                 let manifest = directory.join("Cargo.toml").to_string_lossy().replace('\\', "/");
                 if snapshot.contains_key(&manifest) || workspace_files.contains(&manifest) {
@@ -336,6 +346,8 @@ impl DeclarationResolver {
             source_request: BTreeMap::new(),
             source_acquired: false,
             bytes: 0,
+            file_limit: None,
+            source_enabled,
             trace: None,
             work: Default::default(),
         };
@@ -386,7 +398,7 @@ impl DeclarationResolver {
                 }
             }
         }
-        std::fs::read_to_string(path).ok()
+        if self.source_enabled { std::fs::read_to_string(path).ok() } else { None }
     }
 
     fn load_file(&mut self, path: &Path, package: &str, module: &[String]) -> Result<bool> {
@@ -394,6 +406,7 @@ impl DeclarationResolver {
         if self.file.contains_key(&path) {
             return Ok(true);
         }
+        anyhow::ensure!(self.file_limit.is_none_or(|limit| self.file.len() < limit), "declaration resolution reached its 64 additional file budget");
         let stage = self.trace.as_ref().map(|trace| trace.stage("index_file", Some(self.baseline)));
         let started = Instant::now();
         let read_started = Instant::now();
@@ -450,7 +463,7 @@ impl DeclarationResolver {
                 self.changed
                     .contains(&path.to_string_lossy().replace('\\', "/"))
             });
-        let original = if !self.baseline && !proposed && path.starts_with(&self.workspace) {
+        let original = if self.source_enabled && self.file_limit.is_none() && !self.baseline && !proposed && path.starts_with(&self.workspace) {
             std::fs::read_to_string(&path)
                 .ok()
                 .and_then(|source| DeclarationIndex::extract(&path.to_string_lossy(), &source).ok())
@@ -830,6 +843,65 @@ impl DeclarationResolver {
         }
         result
     }
+    /// Limit one reference index to 64 additional dependency files.
+    pub(crate) fn bound_reference_files(&mut self) {
+        self.file_limit = Some(self.file.len() + 64);
+        for file in self.file.values_mut() {
+            if file.path.strip_prefix(&self.workspace).ok().is_some_and(|path| self.snapshot.contains_key(&path.to_string_lossy().replace('\\', "/"))) { file.original = None; }
+        }
+    }
+
+    /// Resolve a qualified type prefix in its original declaration scope.
+    pub(crate) fn type_target(
+        &mut self,
+        path: &str,
+        scope: &[String],
+        parts: &[String],
+    ) -> DeclarationResolution {
+        let absolute = normalize(&self.workspace.join(path));
+        let Some(file) = self.file.get(&absolute).cloned() else {
+            return unverified("reference has no declaration index");
+        };
+        let reference = DeclarationReference {
+            path: parts.to_vec(),
+            scope: scope.to_vec(),
+            position: forge_diff::syntax::DeclarationPosition { line: 1, column: 0 },
+            length: 0,
+            value_namespace: false,
+            macro_namespace: false,
+            conditional: false,
+        };
+        self.resolve_reference(&file, &reference, true)
+    }
+
+    /// Resolve a call target in its caller's lexical declaration scope.
+    pub(crate) fn callable(&mut self, path: &str, owner: &str, name: &str) -> DeclarationResolution {
+        let absolute = normalize(&self.workspace.join(path));
+        let Some(file) = self.file.get(&absolute).cloned() else { return unverified("caller has no declaration index"); };
+        let separator = if path.ends_with(".rs") { "::" } else { "." };
+        let name = name.split("::<").next().unwrap_or(name);
+        let reference = DeclarationReference {
+            path: name.replace(':', if path.ends_with(".rs") { ":" } else { "." }).split(separator).map(str::to_owned).collect(),
+            position: forge_diff::syntax::DeclarationPosition { line: 1, column: 0 },
+            length: name.len(), scope: owner.split(separator).map(str::to_owned).collect(),
+            value_namespace: true, macro_namespace: false, conditional: false,
+        };
+        let result = self.resolve_reference(&file, &reference, true);
+        if !path.ends_with(".rs") || matches!(result, DeclarationResolution::Resolved { .. } | DeclarationResolution::Ambiguous { .. }) || reference.path.len() < 2 { return result; }
+        let mut container = reference.clone();
+        let member = container.path.pop().unwrap();
+        container.value_namespace = false;
+        let DeclarationResolution::Resolved { destination } = self.resolve_reference(&file, &container, true) else { return result; };
+        let Some(target) = self.file.get(std::path::Path::new(&destination.path)) else { return result; };
+        let Some(owner) = target.index.symbol.iter().find(|symbol| symbol.position.line == destination.line && symbol.position.column == destination.column) else { return result; };
+        let mut scope = owner.scope.clone();
+        scope.push(owner.name.clone());
+        let candidates = target.index.symbol.iter().filter(|symbol| symbol.name == member && symbol.value_namespace && !symbol.conditional && symbol.scope.starts_with(&scope)
+            && symbol.scope.len() == scope.len() + 1 && symbol.scope.last().is_some_and(|scope| scope.contains("impl")))
+            .map(|symbol| resolved(target, symbol)).collect::<Vec<_>>();
+        combine(candidates, || result, true)
+    }
+
     fn resolve_reference(
         &mut self,
         file: &IndexedFile,

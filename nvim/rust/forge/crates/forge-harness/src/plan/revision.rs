@@ -30,10 +30,12 @@ impl DeclarationDelta {
                     .collect()
             });
         let mut baseline_paths = std::collections::BTreeSet::new();
+        let mut baseline_calls = previous.map(|design| design.proposed_calls.clone()).unwrap_or_else(|| design.baseline_calls.clone());
         if let Some(previous) = previous {
             for (path, file) in &design.baseline {
                 if !previous.baseline.contains_key(path) && !previous.proposed.contains_key(path) {
                     baseline.insert(path.clone(), file.text.clone());
+                    if let Some(calls) = design.baseline_calls.get(path) { baseline_calls.insert(path.clone(), calls.clone()); }
                     baseline_paths.insert(path.clone());
                 }
             }
@@ -66,19 +68,20 @@ impl DeclarationDelta {
                 })
                 .collect(),
             proposed: design.proposed.clone(),
+            baseline_calls,
+            proposed_calls: design.proposed_calls.clone(),
             moved,
             ..DeclarationDesign::default()
         };
         let mut patch = Vec::new();
         for file in super::review_file_layout::order(&delta) {
+            let before = delta.baseline.get(&file.baseline).map(|source| super::calls::combined(&file.baseline, &source.text, delta.baseline_calls.get(&file.baseline).map(Vec::as_slice).unwrap_or_default())).transpose()?;
+            let after = delta.proposed.get(&file.proposed).map(|text| super::calls::combined(&file.proposed, text, delta.proposed_calls.get(&file.proposed).map(Vec::as_slice).unwrap_or_default())).transpose()?;
             write_file(
                 &file.baseline,
                 &file.proposed,
-                delta
-                    .baseline
-                    .get(&file.baseline)
-                    .map(|file| file.text.as_str()),
-                delta.proposed.get(&file.proposed).map(String::as_str),
+                before.as_deref(),
+                after.as_deref(),
                 &mut patch,
             )?;
         }
@@ -150,6 +153,19 @@ fn write_file(
 mod tests {
     use super::*;
     use forge_diff::patch::UnifiedPatch;
+
+    #[test]
+    fn call_only_revisions_compare_saved_occurrences() {
+        let mut previous = super::super::document::test_fixture("calls", "Calls");
+        let mut design = DeclarationDesign::default();
+        design.proposed.insert("main.rs".into(), "fn run();\n".into());
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionCalls { owner: "run".into(), call: vec![super::super::CallSite { name: "before".into(), source: None, unresolved: false }] }]);
+        previous.design = Some(design);
+        let mut current = previous.clone();
+        current.design.as_mut().unwrap().proposed_calls.get_mut("main.rs").unwrap()[0].call[0].name = "after".into();
+        let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
+        assert!(delta.files.contains("-  before") && delta.files.contains("+  after"));
+    }
 
     #[test]
     fn newly_captured_revision_files_compare_against_source_without_restoring_deletions() {

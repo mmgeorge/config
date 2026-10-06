@@ -83,6 +83,18 @@ impl DeclarationOverview {
         Self::project(path, source, false)
     }
 
+    /// Project declarations and call evidence from one bounded source parse.
+    pub fn extract_with_calls(path: &str, source: &str) -> Result<(String, Vec<super::DeclarationCallable>), SyntaxError> {
+        if source.len() > 1024 * 1024 { return Err(SyntaxError::MemoryLimit); }
+        if ConfigurationFormat::for_path(path).is_some() { return Ok((Self::extract(path, source)?, Vec::new())); }
+        let language = Self::language(path).ok_or_else(|| SyntaxError::Language(path.into()))?;
+        let mut parser = Parser::new();
+        parser.set_language(&language.grammar()).map_err(|error| SyntaxError::Query(error.to_string()))?;
+        let tree = parser.parse(source, None).ok_or(SyntaxError::Cancelled)?;
+        if tree.root_node().has_error() { return Err(SyntaxError::Query(format!("invalid source syntax in {path}"))); }
+        Ok((Self::project_tree(source, false, language, &tree)?, super::DeclarationCalls::from_tree(source, language, &tree, false)?))
+    }
+
     fn project(path: &str, source: &str, formatted: bool) -> Result<String, SyntaxError> {
         if let Some(config) = ConfigurationFormat::for_path(path) {
             config.validate(path, source)?;
@@ -104,6 +116,11 @@ impl DeclarationOverview {
                 "invalid source syntax in {path}"
             )));
         }
+        Self::project_tree(source, formatted, language, &tree)
+    }
+
+    fn project_tree(source: &str, formatted: bool, language: SyntaxLanguage, tree: &tree_sitter::Tree) -> Result<String, SyntaxError> {
+        let grammar = language.grammar();
         let query_text = match language {
             SyntaxLanguage::Rust => include_str!("../../query/forge/rust/design.scm"),
             SyntaxLanguage::Typescript | SyntaxLanguage::Tsx => {

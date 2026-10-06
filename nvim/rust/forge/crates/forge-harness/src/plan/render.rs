@@ -104,6 +104,12 @@ pub enum PlanReviewTarget {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         column: Option<u32>,
     },
+    Call {
+        path: String,
+        side: String,
+        owner: String,
+        name: String,
+    },
     FileDirectory {
         path: String,
     },

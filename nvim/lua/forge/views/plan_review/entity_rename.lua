@@ -30,4 +30,53 @@ function M.prompt(model, buf, win, callback)
   end)
 end
 
+---@class ForgePlanRenamePreview
+---@field block string
+---@field column integer
+---@field length integer
+
+---@class ForgePlanRenameSelection
+---@field symbol string
+---@field name string
+---@field expected_version integer
+---@field preview ForgePlanRenamePreview[]
+
+--- Preview snapshot-bound rename edits and commit only an unchanged review selection.
+---@param review table
+---@param selection ForgePlanRenameSelection
+---@param captured table
+---@param commit fun(name: string)
+function M.proposed(review, selection, captured, commit)
+  local namespace = vim.api.nvim_create_namespace("ForgePlanRename")
+  local conceallevel, concealcursor = vim.wo[review.win].conceallevel, vim.wo[review.win].concealcursor
+  vim.wo[review.win].conceallevel, vim.wo[review.win].concealcursor = 2, "nvic"
+  local function clear()
+    if vim.api.nvim_buf_is_valid(review.buf) then vim.api.nvim_buf_clear_namespace(review.buf, namespace, 0, -1) end
+  end
+  popup_window.incremental_input({ title = "Rename symbol", default = selection.name, on_change = function(value)
+    clear()
+    if value == "" or value:find("[\r\n]") or not review.owner.is_current(captured) then return end
+    for _, edit in ipairs(selection.preview) do
+      local _, row = review.owner.replica.sequence:position(edit.block)
+      if row then
+        row = require("forge.buffer").physical_row(review.owner.replica, row)
+        vim.api.nvim_buf_set_extmark(review.buf, namespace, row, edit.column, {
+          end_col = edit.column + edit.length, hl_group = "Substitute",
+          conceal = "", virt_text = { { value, "Substitute" } }, virt_text_pos = "inline", priority = 250,
+        })
+      end
+    end
+  end }, function(value)
+    clear()
+    if vim.api.nvim_win_is_valid(review.win) then
+      vim.wo[review.win].conceallevel, vim.wo[review.win].concealcursor = conceallevel, concealcursor
+    end
+    if not value or value == selection.name then return end
+    if not review.owner.is_current(captured) then
+      notifications.error("Plan changed while the rename popup was open", "ForgePlanReview") return
+    end
+    commit(vim.trim(value))
+  end)
+end
+
 return M

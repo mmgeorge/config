@@ -4661,7 +4661,8 @@ Planning continuation: turn {} of {}.",
             .map(str::to_owned)
             .or_else(|| self.session.active_plan_id.clone())
             .context("no plan awaits review")?;
-        let entity_name = required_text(&params, "entity_name")?;
+        let symbol = params.get("symbol").and_then(Value::as_str);
+        let entity_name = params.get("entity_name").and_then(Value::as_str).unwrap_or_default().to_owned();
         let new_name = required_text(&params, "name")?;
         anyhow::ensure!(!new_name.trim().is_empty(), "entity name cannot be empty");
         let mut plan = self
@@ -4681,32 +4682,26 @@ Planning continuation: turn {} of {}.",
                 "plan version changed before entity rename"
             );
         }
-        let previous_name = document
-            .entity_changes
-            .iter()
-            .find(|entity| entity.name == entity_name)
-            .map(|entity| entity.name.clone())
-            .with_context(|| format!("program entity `{entity_name}` does not exist"))?;
-        anyhow::ensure!(
-            previous_name != new_name,
-            "new entity name matches current name"
-        );
-        let result = self.plan_file.rename_added_entity(
-            &self.session.id,
-            &plan.id,
-            &entity_name,
-            new_name.clone(),
-        )?;
-        plan.model_revision = plan.model_revision.saturating_add(1);
+        if let Some(expected) = params.get("digest").and_then(Value::as_str) {
+            anyhow::ensure!(plan.review_digest.as_deref() == Some(expected), "plan changed before rename");
+            anyhow::ensure!(crate::plan::digest(&serde_json::to_vec(&document)?) == expected, "working plan changed before rename");
+        }
+        let revision = plan.model_revision.saturating_add(1);
+        let (previous_name, document, rendered, digest) = if let Some(identity) = symbol {
+            anyhow::ensure!(params.get("expected_version").and_then(Value::as_u64) == Some(document.version), "rename requires the current plan version");
+            self.plan_file.rename_symbol(&self.session.id, &plan.id, revision, document.version, identity, &new_name)?
+        } else {
+            let previous = document.entity_changes.iter().find(|entity| entity.name == entity_name)
+                .map(|entity| entity.name.clone()).with_context(|| format!("program entity `{entity_name}` does not exist"))?;
+            let result = self.plan_file.rename_added_entity(&self.session.id, &plan.id, &entity_name, new_name.clone())?;
+            let (document, rendered, digest) = self.plan_file.submit_document_revision(&self.session.id, &plan.id, revision, result.version)?;
+            (previous, document, rendered, digest)
+        };
+        plan.model_revision = revision;
         plan.user_revision = plan.user_revision.saturating_add(1);
-        let (document, rendered, digest) = self.plan_file.submit_document_revision(
-            &self.session.id,
-            &plan.id,
-            plan.model_revision,
-            result.version,
-        )?;
-        plan.document_version = result.version;
-        plan.submitted_version = Some(result.version);
+        let version = document.version;
+        plan.document_version = version;
+        plan.submitted_version = Some(version);
         plan.title.clone_from(&document.title);
         plan.review_digest = Some(digest);
         plan.acceptance = None;
@@ -5243,9 +5238,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 _ => anyhow::bail!("unknown plan overview section"),
             }
         } else if baseline {
-            design.baseline.get(&path).context("declaration baseline not found")?.text.clone()
+            crate::plan::calls::present(&path, &design.baseline.get(&path).context("declaration baseline not found")?.text, design.baseline_calls.get(&path).map(Vec::as_slice).unwrap_or_default())?.declaration.text
         } else {
-            design.proposed.get(&path).context("proposed declaration not found")?.clone()
+            crate::plan::calls::present(&path, design.proposed.get(&path).context("proposed declaration not found")?, design.proposed_calls.get(&path).map(Vec::as_slice).unwrap_or_default())?.declaration.text
         };
         Ok((json!({ "text": text, "path": path, "revision": revision, "baseline": baseline }), Vec::new()))
     }

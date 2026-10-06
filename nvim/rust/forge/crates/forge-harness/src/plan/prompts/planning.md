@@ -96,7 +96,7 @@ atomic patch:
 Paths match project-relative source paths. Supported extensions are `.rs`, `.ts`, `.tsx`, `.lua`, and
 `.toml`, `.json`, `.jsonc`, `.yaml`, `.yml`, and XML configuration paths (including `.xml`,
 `.csproj`, `.fsproj`, `.vbproj`, `.props`, `.targets`, `.resx`, and `.plist`). Source overviews retain native layouts but are not compilable implementation files. Never write
-function bodies, empty or placeholder bodies, pseudocode, or executable initializers. Preserve
+executable function bodies, empty or placeholder bodies, pseudocode, or executable initializers. Preserve
 reference qualifiers, generic arguments, and complete return types. Do not infer missing types.
 
 Use two spaces per indentation level and one blank line between declarations and methods.
@@ -108,6 +108,32 @@ use one parameter per line. Literals, code examples, and indivisible types remai
 file ranges when their exact current text is unavailable and match that text, including indentation.
 Draft patches retain their layout until submission. Submission can reformat declarations, so read
 affected ranges before another revision unless current formatted text is already supplied in feedback.
+
+## Calls lists
+
+Source inspection extracts call occurrences alongside declarations in Rust, TypeScript, TSX, and Lua.
+The virtual file includes a `Calls` block immediately after each captured callable signature.
+Edit it atomically with declarations through `harness_design_apply_patch`. Include names only, without
+arguments, assignments, control flow, or other statements. Qualify methods with a receiver type only
+when source evidence identifies that type. Keep unresolved receiver names when evidence is absent.
+
+Keep call occurrences in extraction or authored order, including repetitions. Alphabetical sorting and
+deduplication apply only to the review presentation. Preserve unchanged Calls blocks when editing
+signatures. Update an owner's list when relationships change and include a block for a newly planned
+callable when its relationships are known. An empty block states that the callable has no calls.
+An absent block states that call information is unavailable. Do not manufacture missing information
+for historical plans or configuration documents.
+
+The structured list follows the signature at the same indentation level. Target names use one
+additional indentation level:
+
+```text
+pub fn dispatch(client: &Client);
+Calls
+  validate_policy
+  Client::send
+  record_metrics
+```
 
 ## Declaration comments
 

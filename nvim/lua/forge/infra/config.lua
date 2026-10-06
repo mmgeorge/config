@@ -88,6 +88,7 @@
 ---@class ForgePlanReviewKeymapConfig
 ---@field open ForgeKeymap
 ---@field jump_entity ForgeKeymap
+---@field references ForgeKeymap
 ---@field entity_info ForgeKeymap
 ---@field rename_entity ForgeKeymap
 ---@field schema ForgeKeymap
@@ -269,6 +270,7 @@ M.defaults = {
       help = "?",
     },
     plan_review = {
+      references = "or",
       visual_line_with_gutter = "W",
       toggle = "<Tab>",
       toggle_public = "<S-Tab>",
@@ -283,7 +285,7 @@ M.defaults = {
       question = "A",
       save = "<C-s>",
       request_changes = "oN",
-      abort_plan = "or",
+      abort_plan = "oX",
       close = "q",
       help = "?",
     },

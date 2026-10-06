@@ -390,7 +390,7 @@ impl HarnessService {
         let mut prompt_admission = None;
         if matches!(
             method,
-            HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges
+            HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanEntityRename
         ) {
             let params = request
                 .params

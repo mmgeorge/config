@@ -182,6 +182,38 @@ function M.input(options, callback)
   end)
 end
 
+---@class ForgeIncrementalInputOptions
+---@field title string
+---@field default string
+---@field on_change fun(value: string)
+
+--- Preview single-line input without modifying its originating document.
+---@param options ForgeIncrementalInputOptions
+---@param callback fun(value: string?)
+function M.incremental_input(options, callback)
+  local buf, win = M.open({ title = options.title, width = math.min(60, vim.o.columns - 4), height = 1,
+    filetype = "ForgeRenameInput", wrap = false })
+  vim.api.nvim_buf_set_lines(buf, 0, -1, false, { options.default })
+  vim.api.nvim_win_set_cursor(win, { 1, #options.default })
+  local finished = false
+  local function finish(value)
+    if finished then return end
+    finished = true
+    M.close(win)
+    callback(value)
+  end
+  vim.api.nvim_create_autocmd({ "TextChanged", "TextChangedI" }, { buffer = buf, callback = function()
+    if not finished then options.on_change(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "") end
+  end })
+  vim.api.nvim_create_autocmd("BufWipeout", { buffer = buf, once = true, callback = function()
+    if not finished then finished = true callback(nil) end
+  end })
+  vim.keymap.set({ "n", "i" }, "<CR>", function() finish(vim.api.nvim_buf_get_lines(buf, 0, 1, false)[1] or "") end, { buffer = buf })
+  vim.keymap.set({ "n", "i" }, "<Esc>", function() finish(nil) end, { buffer = buf })
+  vim.keymap.set({ "n", "i" }, "<C-c>", function() finish(nil) end, { buffer = buf })
+  vim.cmd("startinsert!")
+end
+
 ---@param win integer
 ---@param parent_win integer?
 ---@param width integer

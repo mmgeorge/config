@@ -12,7 +12,7 @@ use forge_diff::display::RowKind;
 use forge_diff::file_header::FileChange;
 use forge_diff::patch::UnifiedPatch;
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
-use forge_diff::syntax::{DeclarationFolding, DeclarationOverview, DeclarationPresentation, DeclarationVisibility};
+use forge_diff::syntax::{DeclarationFolding, DeclarationVisibility};
 
 use super::review_annotation::ReviewAnnotation;
 use super::review_source::ReviewTrace;
@@ -142,7 +142,7 @@ fn rows(
     let mut patch = Vec::new();
     let mut hidden = HashSet::new();
     let mut visibility = HashMap::<(String, String), DeclarationVisibility>::new();
-    let mut presentation = HashMap::<(String, String), DeclarationPresentation>::new();
+    let mut presentation = HashMap::<(String, String), super::calls::CallPresentation>::new();
     let started = Instant::now();
     let ordered_files = super::review_file_layout::order(design);
     if let Some(trace) = trace {
@@ -154,20 +154,20 @@ fn rows(
         let before = design
             .baseline
             .get(&path)
-            .map(|file| DeclarationOverview::present(&path, &file.text))
+            .map(|file| super::calls::present(&path, &file.text, design.baseline_calls.get(&path).map(Vec::as_slice).unwrap_or_default()))
             .transpose()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let after = design
             .proposed
             .get(&destination)
-            .map(|text| DeclarationOverview::present(&destination, text))
+            .map(|text| super::calls::present(&destination, text, design.proposed_calls.get(&destination).map(Vec::as_slice).unwrap_or_default()))
             .transpose()
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
         let diff = forge_diff::raw::compute_hunks(SourcePair {
             old: SourceVersion::new(
                 before
                     .as_ref()
-                    .map(|file| file.text.as_str())
+                    .map(|file| file.declaration.text.as_str())
                     .unwrap_or_default()
                     .as_bytes()
                     .to_vec(),
@@ -176,7 +176,7 @@ fn rows(
             new: SourceVersion::new(
                 after
                     .as_ref()
-                    .map(|file| file.text.as_str())
+                    .map(|file| file.declaration.text.as_str())
                     .unwrap_or_default()
                     .as_bytes()
                     .to_vec(),
@@ -210,9 +210,9 @@ fn rows(
                 },
                 before
                     .as_ref()
-                    .map(|file| file.source.len())
+                    .map(|file| file.declaration.source.len())
                     .unwrap_or(0)
-                    .max(after.as_ref().map(|file| file.source.len()).unwrap_or(0)),
+                    .max(after.as_ref().map(|file| file.declaration.source.len()).unwrap_or(0)),
                 &mut patch,
             )?;
         }
@@ -220,8 +220,7 @@ fn rows(
             if inspection {
                 visibility.insert(
                     (path.clone(), "baseline".into()),
-                    DeclarationVisibility::analyze(&path, &before.text, public_only)
-                        .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+                    super::calls::visibility(&path, &before, public_only)?,
                 );
             }
             presentation.insert((path.clone(), "baseline".into()), before);
@@ -230,8 +229,7 @@ fn rows(
             if inspection {
                 visibility.insert(
                     (destination.clone(), "proposed".into()),
-                    DeclarationVisibility::analyze(&destination, &after.text, public_only)
-                        .map_err(|error| anyhow::anyhow!("{error:?}"))?,
+                    super::calls::visibility(&destination, &after, public_only)?,
                 );
             }
             presentation.insert((destination, "proposed".into()), after);
@@ -366,7 +364,7 @@ fn rows(
                         .context("context row has no baseline file")?;
                     if let Some(position) = presentation
                         .get(&(baseline_path.clone(), "baseline".into()))
-                        .and_then(|file| row.old_line.and_then(|line| file.source.get(line)))
+                        .and_then(|file| row.old_line.and_then(|line| file.declaration.source.get(line)))
                         .copied()
                         .flatten()
                     {
@@ -381,7 +379,7 @@ fn rows(
                 }
                 let position = presentation
                     .get(&(source_path.clone(), side.into()))
-                    .and_then(|file| file.source.get(line))
+                    .and_then(|file| file.declaration.source.get(line))
                     .copied()
                     .flatten();
                 if let Some(position) = position {
@@ -393,11 +391,20 @@ fn rows(
                         row_text,
                     ));
                 }
+                if let Some((owner, name)) = presentation.get(&(source_path.clone(), side.into())).and_then(|file| file.call_row.get(&line)) {
+                    navigation.anchor.push(PlanNavigationAnchor {
+                        line: block.len() as u32,
+                        target: PlanReviewTarget::Call { path: source_path.clone(), side: side.into(), owner: owner.clone(), name: name.clone() },
+                        json_path: format!("/design/{side}_calls/{}/{}/{}", pointer(source_path), pointer(owner), pointer(name)),
+                        path: Some(source_path.clone()), label: format!("{source_path}: {owner} calls {name}"),
+                    });
+                }
             }
             fold(&mut block, hunk_start, &hunk_id)?;
         }
         if inspection {
             declaration_folds(&mut block, [file.old_path.as_ref(), file.new_path.as_ref()], &presentation, &display_row)?;
+            call_folds(&mut block, [file.old_path.as_ref(), file.new_path.as_ref()], &presentation, &display_row);
         }
         fold(&mut block, start, &id)?;
     }
@@ -486,15 +493,15 @@ fn rows(
 fn declaration_folds(
     block: &mut [BufferBlock],
     paths: [Option<&String>; 2],
-    presentation: &HashMap<(String, String), DeclarationPresentation>,
+    presentation: &HashMap<(String, String), super::calls::CallPresentation>,
     display_row: &HashMap<(String, String, usize), usize>,
 ) -> Result<()> {
     let mut candidates = Vec::new();
     for (source_path, side) in [(paths[0], "baseline"), (paths[1], "proposed")] {
         let Some(source_path) = source_path else { continue };
         let Some(source) = presentation.get(&(source_path.clone(), side.into())) else { continue };
-        for declaration in DeclarationFolding::analyze(source_path, &source.text).map_err(|error| anyhow::anyhow!("{error:?}"))? {
-            let mapped = |line| display_row.get(&(source_path.clone(), side.into(), line)).copied();
+        for declaration in DeclarationFolding::analyze(source_path, &super::calls::parse(source_path, &source.declaration.text, &[])?.0).map_err(|error| anyhow::anyhow!("{error:?}"))? {
+            let mapped = |line| source.plain_row.iter().enumerate().find(|(row, plain)| **plain == line && !source.call_row.contains_key(row) && source.declaration.text.lines().nth(*row).is_some_and(|text| text.trim() != "Calls")).and_then(|(row, _)| display_row.get(&(source_path.clone(), side.into(), row)).copied());
             let (Some(opening), Some(closing)) = (mapped(declaration.start), mapped(declaration.end)) else { continue };
             if opening >= closing || !block[opening].text.wire_rows()[0].trim_end().ends_with('{') { continue; }
             candidates.push((opening, closing, mapped(declaration.heading).unwrap_or(opening), declaration.collapsed_suffix, declaration.closed));
@@ -515,6 +522,30 @@ fn declaration_folds(
         installed.push((opening, closing));
     }
     Ok(())
+}
+
+fn call_folds(block: &mut [BufferBlock], paths: [Option<&String>; 2], presentation: &HashMap<(String, String), super::calls::CallPresentation>, display_row: &HashMap<(String, String, usize), usize>) {
+    let mut installed = HashSet::new();
+    for (path, side) in [(paths[1], "proposed"), (paths[0], "baseline")] {
+        let Some(path) = path else { continue };
+        let Some(presentation) = presentation.get(&(path.clone(), side.into())) else { continue };
+        let lines = presentation.declaration.text.lines().collect::<Vec<_>>();
+        for (line, owner) in &presentation.owner_row {
+            let line = *line;
+            let last = (line + 1..lines.len()).take_while(|row| presentation.call_row.contains_key(row)).last().unwrap_or(line);
+            let Some(opening) = display_row.get(&(path.clone(), side.into(), line)).copied() else { continue };
+            let Some(closing) = display_row.get(&(path.clone(), side.into(), last)).copied() else { continue };
+            if !installed.insert(opening) { continue; }
+            let heading = (0..line).rev().find_map(|row| display_row.get(&(path.clone(), side.into(), row)).copied()).unwrap_or(opening);
+            let id = FoldId(format!("plan:calls:{}:{side}:{}", super::digest(path.as_bytes()), super::digest(owner.as_bytes())));
+            block[opening].metadata.fold.push(FoldRange {
+                id, start: TextPosition { row: 0, column: 0 },
+                end: BlockAnchor { block: block[closing].id.clone(), position: TextPosition { row: 1, column: 0 } },
+                heading_start: Some(BlockAnchor { block: block[heading].id.clone(), position: TextPosition { row: 0, column: 0 } }),
+                collapsed_suffix: Some("...".into()), closed: true, collapse_children: false, expand_children: false,
+            });
+        }
+    }
 }
 
 fn public_blocks(

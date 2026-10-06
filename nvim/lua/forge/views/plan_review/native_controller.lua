@@ -207,10 +207,13 @@ local function refresh_winbar(review)
 end
 
 local function action(review, name)
+  if name == "rename_entity" and (review.plan.historical_revision or review.plan.state ~= "awaiting_review") then
+    notice("Only plans awaiting review can be renamed") return
+  end
   if review.plan.historical_revision and (name == "comment" or name == "question" or name == "delete") then return end
   local opening_cursor = vim.api.nvim_win_get_cursor(review.win)
   review.owner.action(name, function(result, failure, captured)
-    if name == "jump_entity" and (not review.owner.is_current(captured)
+    if (name == "rename_entity" or name == "jump_entity" or name == "references" or name:find("reveal_reference:", 1, true) == 1) and (not review.owner.is_current(captured)
         or not vim.api.nvim_win_is_valid(review.win)
         or vim.api.nvim_win_get_buf(review.win) ~= review.buf
         or not vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), opening_cursor)) then return end
@@ -237,12 +240,28 @@ local function action(review, name)
       end
     elseif name == "delete" then
       return
+    elseif name == "rename_entity" and type(result.rename) == "table" then
+      require("forge.views.plan_review.entity_rename").proposed(review, result.rename, captured, function(name)
+        if session.harness.busy then notice("A Harness request is already running") return end
+        session.harness.busy = true
+        review.owner.submit("plan.entity.rename", { symbol = result.rename.symbol, name = name,
+          expected_version = result.rename.expected_version }, function(renamed, failure)
+          session.harness.busy = false
+          if failure then notice(failure) return end
+          session.harness.active_plan = renamed.plan
+          close_review(review)
+          vim.schedule(function() M.open(renamed.plan) end)
+        end)
+      end)
+    elseif name == "references" and type(result.references) == "table" then
+      require("forge.views.plan_review.references").open(review, result.references, captured,
+        function(id) action(review, "reveal_reference:" .. id) end)
     elseif type(result.message) == "string" then notifications.info(result.message, "ForgePlanReview")
     elseif type(result.declarations) == "table" then show_document(review, result.declarations, "Declarations", result.filetype, result.selection)
     elseif name == "schema" then show_document(review, result.schema, "Canonical plan", "json")
     elseif name == "entity_info" then
       if type(result.info) == "table" then show_document(review, result.info, "Plan entity") else rustdoc(review, result, captured, false) end
-    elseif name == "jump_entity" and type(result.jump) == "table" then
+    elseif (name == "jump_entity" or name:find("reveal_reference:", 1, true) == 1) and type(result.jump) == "table" then
       effect(review, captured, { kind = "cursor", jump = true, block = result.jump.block, position = result.jump.position })
     elseif name == "open" and type(result.anchor) == "table" and type(result.anchor.target) == "table"
       and result.anchor.target.target_type == "dependency" then
@@ -284,7 +303,7 @@ local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review, function() action(review, "toggle_declaration") end) end)
   command_set.register(set, "visual_line_with_gutter", review.owner.gutter_selection.start)
-  for _, name in ipairs({ "open", "jump_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
+  for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)
   command_set.register(set, "abort_plan", function()

@@ -188,7 +188,7 @@ fn lua_imports(root: Node<'_>, source: &str, index: &mut DeclarationIndex) {
         let Some((module, rest)) = tail[1..].split_once(quote) else { continue };
         if !rest.trim_start().starts_with(')') { continue; }
         index.import.push(DeclarationImport {
-            scope: Vec::new(), path: Vec::new(), source: Some(module.into()), alias: None,
+            scope: Vec::new(), path: Vec::new(), source: Some(module.into()), alias: text[..call].split_once('=').map(|(binding, _)| binding.trim().trim_start_matches("local ").trim()).filter(|binding| !binding.is_empty() && binding.chars().all(|character| character.is_alphanumeric() || character == '_')).map(str::to_owned),
             glob: false, namespace: false, export: false, visibility: SymbolVisibility::Private,
             position: position(statement), conditional: false,
         });
