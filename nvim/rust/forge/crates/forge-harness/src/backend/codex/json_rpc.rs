@@ -171,7 +171,6 @@ pub struct CodexJsonRpc {
     planning_feedback: bool,
     plan_document: Option<PlanDocument>,
     control_runtime: Option<ControlToolRuntime>,
-    rendered_control_invocation_key_set: HashSet<String>,
     accepted_control_invocation_key_set: HashSet<String>,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
@@ -202,7 +201,6 @@ impl CodexJsonRpc {
             planning_feedback: false,
             plan_document: None,
             control_runtime: None,
-            rendered_control_invocation_key_set: HashSet::new(),
             accepted_control_invocation_key_set: HashSet::new(),
             permission_coordinator,
             event_sink,
@@ -222,7 +220,6 @@ impl CodexJsonRpc {
         self.workspace = workspace.to_owned();
         self.execution_mode = execution_mode;
         self.event_sink = event_sink;
-        self.rendered_control_invocation_key_set.clear();
         self.accepted_control_invocation_key_set.clear();
         self.control_runtime = None;
     }
@@ -333,9 +330,6 @@ impl CodexJsonRpc {
         }
         let rejects_question_resolution =
             rejects_question_resolution(self.planning_feedback, method, &message);
-        let repeats_control_invocation = self.activity_publication
-            && control_invocation_key(method, &message)
-                .is_some_and(|key| !self.rendered_control_invocation_key_set.insert(key));
         let provider_request_success =
             if message.get("id").is_some() && message.get("method").is_some() {
                 Some(self.respond_to_provider_request(&message).await?)
@@ -358,13 +352,7 @@ impl CodexJsonRpc {
                 request.source_digests = digests.clone();
             }
         }
-        let completed_control_lifecycle = repeats_control_invocation
-            && control_tool_name(method, message.get("params").unwrap_or(&Value::Null)).is_some()
-            && method.eq_ignore_ascii_case("item/completed");
-        if self.activity_publication
-            && !rejects_question_resolution
-            && (!repeats_control_invocation || completed_control_lifecycle)
-        {
+        if self.activity_publication && !rejects_question_resolution {
             normalize_event_in_workspace(
                 &message,
                 output,
@@ -861,9 +849,19 @@ fn rejects_question_resolution(planning_feedback: bool, method: &str, value: &Va
 
 fn control_invocation_key(method: &str, value: &Value) -> Option<String> {
     let params = value.get("params").unwrap_or(value);
-    let control_name = control_tool_name(method, params)?;
-    let arguments = find_control_arguments(params, control_name)?;
-    Some(format!("{control_name}:{arguments}"))
+    control_tool_name(method, params)?;
+    let call_id = pointer_string(
+        params,
+        &[
+            "/item/id",
+            "/itemId",
+            "/item_id",
+            "/toolCallId",
+            "/tool_call_id",
+            "/callId",
+        ],
+    )?;
+    Some(json!([params.get("threadId"), params.get("turnId"), call_id]).to_string())
 }
 
 /// Decode only the owning thread's native goal lifecycle notification.
@@ -1550,37 +1548,7 @@ fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
                 previous_activity.id == activity.id && previous.address == event.address
             })
         });
-        let fallback_index = exact_index.or_else(|| {
-            let meaningful_title =
-                !matches!(activity.title.as_str(), "command" | "file changes" | "tool");
-            if !meaningful_title
-                || (activity.output.is_none() && activity.status.as_deref() == Some("inProgress"))
-            {
-                return None;
-            }
-            let matching_index = output
-                .event
-                .iter()
-                .enumerate()
-                .filter_map(|(index, previous)| {
-                    let previous_activity = previous.activity.as_ref()?;
-                    (previous.address == event.address
-                        && previous_activity.kind == activity.kind
-                        && previous_activity.title == activity.title
-                        && matches!(
-                            previous_activity.status.as_deref(),
-                            Some("inProgress" | "in_progress")
-                        ))
-                    .then_some(index)
-                })
-                .collect::<Vec<_>>();
-            if matching_index.len() == 1 {
-                Some(matching_index[0])
-            } else {
-                None
-            }
-        });
-        if let Some(index) = fallback_index {
+        if let Some(index) = exact_index {
             merge_tool_activity(&mut output.event[index], event);
             return;
         }
@@ -2286,6 +2254,13 @@ mod test {
             &mut accepted_control_invocation_key_set,
             true
         ));
+        let mut next_request = request.clone();
+        next_request["params"]["itemId"] = json!("edit-2");
+        assert!(should_apply_control_request_semantics(
+            &next_request,
+            &mut accepted_control_invocation_key_set,
+            true
+        ));
     }
 
     #[tokio::test]
@@ -2492,6 +2467,79 @@ mod test {
     }
 
     #[tokio::test]
+    async fn repeated_control_calls_preserve_independent_tool_lifetimes() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        });
+        let (sink, mut stream) = crate::backend::events::channel();
+        let mut process = CodexJsonRpc::connect(
+            &endpoint,
+            &workspace,
+            ExecutionMode::Read,
+            PermissionCoordinator::transient(&workspace)?,
+            Some(sink),
+            Arc::new(TraceStore::open(fixture.path())?),
+            "session".into(),
+        ).await?;
+        let _server_socket = server.await?;
+        let mut output = BackendOutput::default();
+        let mut turn = crate::turn::Turn::new(
+            "turn".into(),
+            crate::backend::ProviderAddress {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+            },
+            0,
+        );
+        for (call_id, method, status, now_ms) in [
+            ("read-1", "item/started", "inProgress", 1000),
+            ("read-1", "item/completed", "failed", 2000),
+            ("read-2", "item/started", "inProgress", 3000),
+            ("read-2", "item/started", "inProgress", 4000),
+            ("read-2", "item/completed", "completed", 5000),
+            ("read-2", "item/completed", "completed", 6000),
+        ] {
+            process.publish_message(json!({
+                "method": method,
+                "params": {
+                    "threadId": "thread",
+                    "turnId": "turn",
+                    "item": {
+                        "id": call_id,
+                        "type": "dynamicToolCall",
+                        "tool": "harness_plan_read",
+                        "arguments": { "plan_id": "plan", "path": "plan.json" },
+                        "status": status
+                    }
+                }
+            }), &mut output).await?;
+            let event = stream.try_recv()?;
+            let activity = event.activity.expect("published tool lifecycle");
+            assert_eq!(activity.id, call_id);
+            assert_eq!(activity.status.as_deref(), Some(status));
+            turn.record_tool(&activity, now_ms)?;
+        }
+        let tool = turn.tools().collect::<Vec<_>>();
+        assert_eq!(tool.len(), 2);
+        for (call_id, started, completed) in [
+            ("read-1", 1000, 2000),
+            ("read-2", 3000, 5000),
+        ] {
+            let tool = tool.iter().find(|tool| tool.id == call_id).unwrap();
+            assert_eq!(tool.started_at_ms, Some(started));
+            assert_eq!(tool.completed_at_ms, Some(completed));
+            assert_eq!(tool.elapsed_ms(9000), Some((completed - started) as u64));
+        }
+        assert_eq!(output.event.len(), 2);
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn renders_completed_control_calls_without_reapplying_their_semantic_effect() {
         let mut output = BackendOutput::default();
         let completed = json!({
@@ -2545,6 +2593,7 @@ mod test {
         let request = json!({
             "method": "item/tool/call",
             "params": {
+                "callId": "dynamic-tool-1",
                 "name": "harness_plan_edit",
                 "arguments": arguments
             }
@@ -2782,7 +2831,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn correlates_codex_command_lifecycle_into_one_activity() {
+    async fn keeps_different_command_call_ids_separate() {
         let mut output = BackendOutput::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         normalize_event(
@@ -2835,14 +2884,17 @@ mod test {
         );
         assert_eq!(
             output.event.len(),
-            1,
-            "one command must persist as one activity"
+            2,
+            "different call IDs must remain separate even with identical commands"
         );
         let activity = output.event[0].activity.as_ref().unwrap();
         assert_eq!(activity.id, "command-1");
         assert_eq!(activity.title, "Get-Content README.md");
         assert_eq!(activity.output.as_deref(), Some("# Harness\nline two\n"));
-        assert_eq!(activity.status.as_deref(), Some("completed"));
+        assert_eq!(activity.status.as_deref(), Some("inProgress"));
+        let completed = output.event[1].activity.as_ref().unwrap();
+        assert_eq!(completed.id, "command-completed-with-different-provider-id");
+        assert_eq!(completed.status.as_deref(), Some("completed"));
         assert!(!activity.output_delta);
     }
 

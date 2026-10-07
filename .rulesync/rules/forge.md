@@ -29,6 +29,21 @@ This prevents separate debug and release dependency builds, duplicated
 compilation work, and cache churn from inconsistent build settings. Test
 executables remain distinct artifacts, but tests must reuse the release
 configuration rather than create a second profile's dependency artifacts.
+Keep `profile.release.debug = 0`, `profile.release.incremental = true`, and
+`profile.release.lto = "off"` in the workspace manifest. Keep the executable
+entry point limited to argument parsing and the non-generic library entry call.
+The library owns async host orchestration and executor shutdown.
+Do not change profile settings, compiler flags, or
+feature selection between build and test commands to pursue an isolated speedup.
+Reuse compiled dependencies and run only the affected tests. A filtered test
+still compiles its complete test target, so prefer the existing Neovim host
+fixtures when they directly cover the changed runtime behavior.
+Measure edit iteration with `--timings` after a source change. Report which
+crates compiled and distinguish that result from a no-change cache check.
+Do not promise a ten-second rebuild from an unchanged Cargo invocation.
+Changes to a library crate can recompile its consumers as well as relink the
+executable. Tests require separate test executables and may enable additional
+dependency features even when they share the release profile.
 Set `vim.g.forge_build_profile` before Forge loads only when explicitly testing a
 user-requested different profile. Cargo output belongs under
 `stdpath("cache")/rust-sidecar/forge/build`, not the crate's default `target`

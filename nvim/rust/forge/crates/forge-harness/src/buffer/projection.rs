@@ -1021,7 +1021,7 @@ impl TimelineRenderer<'_> {
             BlockId(id),
             target.clone(),
             &tool.kind,
-            &tool.status,
+            tool.elapsed_ms(self.now_ms),
             tool.failed,
             &label,
             &output.preview(self.expanded_tool.contains(&call_id)),
@@ -2839,8 +2839,24 @@ mod tests {
             task_update: None,
         };
         exchange.observe_turn(&event, 2000).unwrap();
+        for (now_ms, duration) in [(2500, "0s"), (3000, "1s"), (4500, "2s")] {
+            let entry = crate::timeline::TimelineEntry::Exchange {
+                id: exchange.id.clone(), created_at_ms: 1000, exchange: exchange.clone(),
+                agent_by_id: HashMap::new(),
+            };
+            let rendered = project_at(&entry, &WidthProfile::default(), now_ms).unwrap();
+            assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter()
+                .any(|row| row.contains(&format!("• {duration} cargo test")))));
+        }
         event.activity.as_mut().unwrap().status = Some("failed".into());
         exchange.observe_turn(&event, 5000).unwrap();
+        let entry = crate::timeline::TimelineEntry::Exchange {
+            id: exchange.id.clone(), created_at_ms: 1000, exchange: exchange.clone(),
+            agent_by_id: HashMap::new(),
+        };
+        let rendered = project_at(&entry, &WidthProfile::default(), 90_000).unwrap();
+        assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter()
+            .any(|row| row.contains("• 3s cargo test"))));
         event.kind = "turn_completed".into();
         event.activity = None;
         event.turn_boundary = Some(TurnBoundary::Finished {

@@ -115,7 +115,11 @@ impl Turn {
     }
 
     /// Merge tool progress only while its provider turn remains active.
-    pub(crate) fn record_tool(&mut self, activity: &crate::backend::ToolActivity) -> Result<()> {
+    pub(crate) fn record_tool(
+        &mut self,
+        activity: &crate::backend::ToolActivity,
+        now_ms: i64,
+    ) -> Result<()> {
         ensure!(
             self.state == TurnState::Running,
             "completed turn rejects tool events"
@@ -126,7 +130,7 @@ impl Turn {
                 id: activity.id.clone(),
             });
         }
-        self.tool.merge(activity);
+        self.tool.merge(activity, now_ms);
         Ok(())
     }
 
@@ -231,7 +235,7 @@ impl Turn {
                 ensure!(previous == outcome, "completed turn outcome cannot change");
             }
             TurnState::Running => {
-                self.tool.finish(outcome);
+                self.tool.finish(outcome, now_ms);
                 self.current_message = None;
                 self.state = TurnState::Finished { outcome };
                 self.completed_at_ms = Some(now_ms.max(self.started_at_ms));
@@ -266,6 +270,45 @@ mod tests {
     }
 
     #[test]
+    fn tool_runtime_ticks_independently_and_freezes_through_replay_and_reopening() {
+        let mut turn = Turn::new(
+            "turn".into(),
+            ProviderAddress {
+                thread_id: "thread".into(),
+                turn_id: "turn".into(),
+            },
+            1000,
+        );
+        let mut first = activity("first");
+        first.status = Some("running".into());
+        let mut second = first.clone();
+        second.id = "second".into();
+        turn.record_tool(&first, 1000).unwrap();
+        turn.record_tool(&second, 2000).unwrap();
+        turn.record_tool(&first, 3000).unwrap();
+        assert_eq!(
+            turn.tools()
+                .map(|tool| tool.elapsed_ms(3500))
+                .collect::<Vec<_>>(),
+            vec![Some(2500), Some(1500)]
+        );
+        first.status = Some("failed".into());
+        turn.record_tool(&first, 3500).unwrap();
+        turn.record_tool(&first, 6000).unwrap();
+        turn.record_tool(&activity("missing-start"), 6000).unwrap();
+        turn.finish(TurnOutcome::Interrupted, 7000).unwrap();
+        let restored: Turn = serde_json::from_value(serde_json::to_value(&turn).unwrap()).unwrap();
+        assert_eq!(
+            restored
+                .tools()
+                .map(|tool| tool.elapsed_ms(90_000))
+                .collect::<Vec<_>>(),
+            vec![Some(2500), Some(5000), None]
+        );
+        assert_eq!(restored.tools().next().unwrap().started_at_ms, Some(1000));
+    }
+
+    #[test]
     fn messages_and_tools_keep_order_across_boundaries_and_freeze_at_completion() {
         let mut turn = Turn::new(
             "local".into(),
@@ -279,7 +322,7 @@ mod tests {
             .unwrap();
         turn.record_text(MessageKind::Reasoning, "ownership")
             .unwrap();
-        turn.record_tool(&activity("tool")).unwrap();
+        turn.record_tool(&activity("tool"), 1000).unwrap();
         turn.record_text(MessageKind::Assistant, "First response")
             .unwrap();
         turn.close_message();
@@ -366,10 +409,10 @@ mod tests {
             10,
         );
         let mut tool = activity("call");
-        turn.record_tool(&tool).unwrap();
+        turn.record_tool(&tool, 1000).unwrap();
         tool.status = Some("inProgress".into());
         tool.output = Some("late output".into());
-        turn.record_tool(&tool).unwrap();
+        turn.record_tool(&tool, 1000).unwrap();
         assert_eq!(turn.tools().count(), 1);
         assert_eq!(
             turn.tools().next().unwrap().state(),
@@ -403,16 +446,16 @@ mod tests {
                 },
                 10,
             );
-            turn.record_tool(&activity("completed")).unwrap();
+            turn.record_tool(&activity("completed"), 1000).unwrap();
             let mut running = activity("running");
             running.status = Some("inProgress".into());
-            turn.record_tool(&running).unwrap();
+            turn.record_tool(&running, 1000).unwrap();
             turn.finish(outcome, 20).unwrap();
             let state: Vec<_> = turn.tools().map(|tool| tool.state()).collect();
             assert_eq!(state, [crate::turn::ToolState::Completed, expected]);
             let encoded = serde_json::to_string(&turn).unwrap();
             turn.finish(outcome, 90).unwrap();
-            assert!(turn.record_tool(&running).is_err());
+            assert!(turn.record_tool(&running, 1000).is_err());
             assert_eq!(serde_json::to_string(&turn).unwrap(), encoded);
         }
     }
@@ -443,8 +486,8 @@ mod tests {
             },
             10,
         );
-        turn.record_tool(&activity("tool")).unwrap();
-        turn.record_tool(&activity("tool")).unwrap();
+        turn.record_tool(&activity("tool"), 1000).unwrap();
+        turn.record_tool(&activity("tool"), 1000).unwrap();
         assert!(turn.attribute_tool("tool", "original-task").unwrap());
         assert!(!turn.attribute_tool("tool", "another-task").unwrap());
         assert_eq!(
@@ -454,11 +497,14 @@ mod tests {
 
         assert_eq!(turn.tools().count(), 1);
         turn.finish(TurnOutcome::Completed, 20).unwrap();
-        turn.record_usage(crate::backend::usage::TokenUsage { output: Some(128), ..Default::default() });
+        turn.record_usage(crate::backend::usage::TokenUsage {
+            output: Some(128),
+            ..Default::default()
+        });
         assert_eq!(turn.usage().unwrap().output, Some(128));
         turn.finish(TurnOutcome::Completed, 90).unwrap();
         assert_eq!(turn.completed_at_ms, Some(20));
-        assert!(turn.record_tool(&activity("late")).is_err());
+        assert!(turn.record_tool(&activity("late"), 1000).is_err());
         assert!(turn.attribute_tool("tool", "late-task").is_err());
         assert!(turn.finish(TurnOutcome::Failed, 90).is_err());
     }

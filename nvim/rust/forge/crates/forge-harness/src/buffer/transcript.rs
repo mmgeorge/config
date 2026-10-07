@@ -53,7 +53,11 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     pub fn commentary(&self, id: BlockId, source: &str) -> Result<RenderedMarkdown> {
         let source = markdown_math::normalize(source);
-        let mut rendered = MarkdownRenderer::file_link_labels(id, &source, self.profile)?;
+        let mut rendered = MarkdownRenderer::file_link_labels(
+            id,
+            source.trim_end_matches(['\r', '\n']),
+            self.profile,
+        )?;
         let block = &mut rendered.block;
         block.metadata.markdown = true;
         block.metadata.decoration.clear();
@@ -107,12 +111,13 @@ impl<'profile> TranscriptRenderer<'profile> {
         }
     }
 
+    /// Render a call's observed runtime and output without changing its saved title or output.
     pub fn tool_preview(
         &self,
         id: BlockId,
         target: TargetId,
         kind: &str,
-        _status: &str,
+        elapsed_ms: Option<u64>,
         failed: bool,
         title: &str,
         output: &ToolOutputPreview<'_>,
@@ -128,13 +133,14 @@ impl<'profile> TranscriptRenderer<'profile> {
             .flatten().filter(|_| kind == "tool_call")
             .and_then(|(name, arguments)| arguments.strip_suffix(')').map(|arguments| (name, arguments)));
         let mut row = if let Some((name, arguments)) = arguments {
-            let mut row = vec![tool_heading(self.profile, kind, name)?];
+            let mut row = vec![tool_heading(self.profile, kind, name, elapsed_ms)?];
             row.extend(tool_body_rows(self.profile, arguments, true)?);
             row
         } else if expanded {
-            self.profile.wrap_plain(&format!("  • {title}"), 4.min(self.profile.columns - 1))?
+            let duration = elapsed_ms.map(|value| format!("{}s", value / 1000)).unwrap_or_else(|| "—".into());
+            self.profile.wrap_plain(&format!("  • {duration} {title}"), 4.min(self.profile.columns - 1))?
         } else {
-            vec![tool_heading(self.profile, kind, title)?]
+            vec![tool_heading(self.profile, kind, title, elapsed_ms)?]
         };
         let title_rows = row.len();
         for (index, text) in output.row.iter().enumerate() {
@@ -209,10 +215,11 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
 }
 
 /// Formats a bounded display title without changing the retained provider call.
-fn tool_heading(profile: &WidthProfile, kind: &str, title: &str) -> Result<String> {
+fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, elapsed_ms: Option<u64>) -> Result<String> {
     let title = if kind == "command" { shell_command(title) } else { title };
     let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let full = format!("  • {normalized}");
+    let duration = elapsed_ms.map(|value| format!("{}s", value / 1000)).unwrap_or_else(|| "—".into());
+    let full = format!("  • {duration} {normalized}");
     if profile.cells(&full, 0)? <= profile.columns {
         return Ok(full);
     }
@@ -321,7 +328,10 @@ fn decorate_command(block: &mut BufferBlock, title_rows: usize) {
             continue;
         };
         let content_start = if row == 0 {
-            text.find("• ").map_or(text.len(), |column| column + "• ".len())
+            text.find("• ").and_then(|column| {
+                let start = column + "• ".len();
+                text[start..].find(' ').map(|end| start + end + 1)
+            }).unwrap_or(text.len())
         } else {
             text.len() - text.trim_start().len()
         };
@@ -357,9 +367,10 @@ fn decorate_tool_call(block: &mut BufferBlock, title_rows: usize) {
             continue;
         };
         let content_start = if row == 0 {
-            text.find("• ")
-                .map(|column| column + "• ".len())
-                .unwrap_or(text.len())
+            text.find("• ").and_then(|column| {
+                let start = column + "• ".len();
+                text[start..].find(' ').map(|end| start + end + 1)
+            }).unwrap_or(text.len())
         } else {
             text.len() - text.trim_start().len()
         };
@@ -461,12 +472,12 @@ mod test {
         let renderer = TranscriptRenderer::new(&profile)?;
         let arguments = r#"{"entity_name":"CosmosDbClient","file_path":"cosmos-db-client.ts","hops":1,"token_budget":3500}"#;
         let block = renderer.tool_preview(
-            BlockId("tool".into()), TargetId("tool".into()), "tool_call", "completed", false,
+            BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), false,
             &format!("sem.sem_context({arguments})"),
             &ToolOutputPreview { row: vec!["response"], hidden_rows: 0, total_rows: 1 }, true,
         )?;
         let rows = block.text.wire_rows();
-        assert_eq!(rows[0], "  • sem.sem_context");
+        assert_eq!(rows[0], "  • 2s sem.sem_context");
         assert!(rows[1].starts_with("    └ {\"entity_name\""));
         assert_eq!(rows.last(), Some(&"    └ response"));
         let restored = rows[1..rows.len() - 1].iter().enumerate()
@@ -485,7 +496,7 @@ mod test {
             let renderer = TranscriptRenderer::new(&profile)?;
             for expanded in [false, true] {
                 let block = renderer.tool_preview(
-                    BlockId("tool".into()), TargetId("tool".into()), "tool_call", "completed", true,
+                    BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), true,
                     "harness_plan_read", &ToolOutputPreview { row: vec![response], hidden_rows: 0, total_rows: 1 }, expanded,
                 )?;
                 let rows = block.text.wire_rows();
@@ -503,12 +514,12 @@ mod test {
     #[test]
     fn tool_titles_strip_launchers_and_close_truncated_arguments() -> Result<()> {
         let profile = WidthProfile { columns: 90, ..WidthProfile::default() };
-        assert_eq!(tool_heading(&profile, "command", r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#)?, "  • git status --short");
-        assert_eq!(tool_heading(&profile, "command", "bash -lc 'cargo test'" )?, "  • cargo test");
+        assert_eq!(tool_heading(&profile, "command", r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#, Some(2000))?, "  • 2s git status --short");
+        assert_eq!(tool_heading(&profile, "command", "bash -lc 'cargo test'", Some(2000))?, "  • 2s cargo test");
         assert_eq!(shell_command("pwsh -File build.ps1"), "pwsh -File build.ps1");
         let call = r#"sem.sem_context({"entity_name":"ServiceBusSender","file_path":"service-bus-queue.ts","fresh":true})"#;
-        let heading = tool_heading(&profile, "tool_call", call)?;
-        assert!(heading.starts_with("  • sem.sem_context({"));
+        let heading = tool_heading(&profile, "tool_call", call, Some(2000))?;
+        assert!(heading.starts_with("  • 2s sem.sem_context({"));
         assert!(heading.ends_with("…\"})"), "{heading}");
         assert!(profile.cells(&heading, 0)? <= profile.columns);
         assert!(!heading.contains('\n'));
@@ -523,7 +534,7 @@ mod test {
             BlockId("tool:1".into()),
             TargetId("expand:1".into()),
             "command",
-            "completed",
+            Some(2000),
             false,
             "cargo test --lib parser",
             &ToolOutputPreview {
@@ -536,7 +547,7 @@ mod test {
         assert_eq!(
             block.text.wire_rows(),
             vec![
-                "  • cargo test --lib parser",
+                "  • 2s cargo test --lib parser",
                 "    └ first",
                 "      second",
                 "      third",
@@ -547,7 +558,7 @@ mod test {
         assert_eq!(block.metadata.target[0].range.end.row, block.text.row_count());
         assert!(block.metadata.decoration.iter().any(|decoration| {
             decoration.capture == "ForgeHarnessCommand"
-                && decoration.range.start.column == "  • ".len()
+                && decoration.range.start.column == "  • 2s ".len()
         }));
         assert!(
             block
@@ -567,7 +578,7 @@ mod test {
             BlockId("tool:empty".into()),
             TargetId("expand:empty".into()),
             "command",
-            "completed",
+            Some(2000),
             false,
             "cargo check",
             &ToolOutputPreview {
@@ -580,7 +591,7 @@ mod test {
 
         assert_eq!(
             block.text.wire_rows(),
-            vec!["  • cargo check", "    └ no output"]
+            vec!["  • 2s cargo check", "    └ no output"]
         );
         assert!(block.metadata.decoration.iter().any(|decoration| {
             decoration.capture == "ForgeHarnessOutput" && decoration.range.start.row == 1
@@ -597,7 +608,7 @@ mod test {
             BlockId("active:tool".into()),
             TargetId("active:tool".into()),
             "tool_call",
-            "in_progress",
+            Some(2000),
             true,
             "docs_lookup(crate, Item)",
             &output.preview(false),
@@ -607,7 +618,7 @@ mod test {
         assert_eq!(
             block.text.wire_rows(),
             vec![
-                "  • docs_lookup(crate, Item)",
+                "  • 2s docs_lookup(crate, Item)",
                 "    └ one",
                 "      two",
                 "      three",
@@ -738,10 +749,10 @@ mod test {
     fn commentary_preserves_markdown_and_its_link_target() -> Result<()> {
         let rendered = TranscriptRenderer::new(&WidthProfile::default())?.commentary(
             BlockId("commentary".into()),
-            "**Review** [details](https://example.test)",
+            "**Review** [details](https://example.test)\n\nNext paragraph.\r\n\n",
         )?;
         assert!(rendered.block.metadata.markdown);
-        assert_eq!(rendered.block.text.wire_rows(), vec!["**Review** [details](https://example.test)"]);
+        assert_eq!(rendered.block.text.wire_rows(), vec!["**Review** [details](https://example.test)", "", "Next paragraph."]);
         assert_eq!(rendered.block.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "↳");
         assert_eq!(rendered.link[0].destination, "https://example.test");
         Ok(())

@@ -11381,7 +11381,7 @@ mod test {
                         diff: "child".into(),
                     }],
                 },
-            })
+            }, 1)
             .unwrap();
             turn.finish(crate::turn::TurnOutcome::Completed, 2).unwrap();
             exchange.turn.push(turn);

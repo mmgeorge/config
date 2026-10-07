@@ -13,6 +13,12 @@ startup. `:ForgeGitConfigCacheReset` clears the file. Restart Neovim afterward t
 replace gix's process-local prefix, including when switching between installations
 whose old directories still exist. Startup diagnostics record the cache state.
 
+The `forge` package builds a library and a thin executable. `src/main.rs` parses
+arguments and calls the synchronous, non-inlined `forge::run` entry point.
+`src/lib.rs` owns the host, router, runtime, and shutdown modules, keeping their
+generated async code in the library compilation unit. Both targets use the same
+release profile with incremental compilation, no debug symbols, and LTO disabled.
+
 Forge uses one Rust host for repository operations, GitHub operations, generated
 documents, analysis, and Harness sessions. Lua owns Neovim buffers, windows, editing
 callbacks, and editor effects. Public Status, branch comparisons, local previews,
@@ -2418,6 +2424,11 @@ SDK compacts automatically but exposes no manual compaction request, so its capa
 `/compact`. Compaction never creates a user interaction, and unsupported backends omit the command
 instead of receiving a synthetic summarization prompt.
 
+Codex publishes every tool lifecycle update to the owning turn. Tool records merge only by
+provider address and call ID, never by tool name or arguments. Repeating a control call with
+the same arguments creates a separate lifetime. Replayed updates retain the original start
+and completion timestamps. Accepted control effects deduplicate by provider call identity.
+
 Exchange summaries retain native input, cached input, reasoning, and inclusive output counts
 on each owning `Turn`. Codex cumulative snapshots recover call increments after the first
 report and exclude repeated notifications and synthetic context-window adjustments. Copilot
@@ -2448,8 +2459,16 @@ Tool counts use `1 tool` or `N tools`, followed by the failed count when nonzero
 Paused and completed headers place `1 request` or `N requests` before the tool count.
 Until the first admitted usage report, they show `— requests`.
 Both renderers use whole seconds, rounded cache percentages, one decimal `k` for counts of at
-least 1000, and `—` for unavailable values. Private session format 31 hides earlier sessions
+least 1000, and `—` for unavailable values. Private session format 32 hides earlier sessions
 without decoding or migrating their summaries.
+
+Each canonical `ToolCall` retains its first observed running timestamp and first terminal
+timestamp. Tool headings show `• 2s command`, updating through the existing one-second activity
+refresh. Parallel calls measure their own observed wall-clock intervals. Repeated progress never
+resets the start, and repeated completion never extends the end. Turn completion or interruption
+settles any outstanding call at that boundary. Completed timestamps survive session reopening.
+Calls first observed at completion have unavailable duration (`—`). Subsecond calls display `0s`.
+These durations measure Harness lifecycle observations rather than provider CPU execution time.
 
 `/plan` uses the same `Thinking` and `Thought` interaction summaries as every model turn. A
 question-only turn saves `PlanElicitation` under the active `AwaitingInput` plan, renders its

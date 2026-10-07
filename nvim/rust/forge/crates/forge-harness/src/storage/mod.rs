@@ -17,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 31;
+const SESSION_FORMAT_VERSION: u32 = 32;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]

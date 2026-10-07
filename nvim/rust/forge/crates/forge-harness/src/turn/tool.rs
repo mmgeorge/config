@@ -15,6 +15,10 @@ pub enum ToolState {
 /// Owns one provider tool call across progress, output, and completion events.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ToolCall {
+    /// Time at which Harness first observed this call running.
+    pub started_at_ms: Option<i64>,
+    /// First terminal observation, retained across replay and session reopening.
+    pub completed_at_ms: Option<i64>,
     #[serde(default)]
     pub task_id: Option<String>,
     pub id: String,
@@ -28,6 +32,15 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
+    /// Get observed wall-clock runtime, frozen at completion or unavailable without a start.
+    pub fn elapsed_ms(&self, now_ms: i64) -> Option<u64> {
+        let start = self.started_at_ms?;
+        let end = self
+            .completed_at_ms
+            .or_else(|| (self.state() == ToolState::Running).then_some(now_ms))?;
+        Some(end.saturating_sub(start).max(0) as u64)
+    }
+
     /// Resolve the provider status into a stable execution state.
     pub fn state(&self) -> ToolState {
         match self.status.to_ascii_lowercase().as_str() {
@@ -54,7 +67,7 @@ impl ToolStore {
     }
 
     /// Settle unfinished calls without replacing provider-reported terminal outcomes.
-    pub(crate) fn finish(&mut self, outcome: super::TurnOutcome) {
+    pub(crate) fn finish(&mut self, outcome: super::TurnOutcome, now_ms: i64) {
         let status = match outcome {
             super::TurnOutcome::Failed => "failed",
             super::TurnOutcome::Cancelled => "cancelled",
@@ -63,6 +76,7 @@ impl ToolStore {
         };
         for tool in self.item.values_mut() {
             if tool.state() == ToolState::Running {
+                tool.completed_at_ms = Some(now_ms.max(tool.started_at_ms.unwrap_or(now_ms)));
                 tool.status = status.into();
                 tool.failed = outcome == super::TurnOutcome::Failed;
             }
@@ -81,7 +95,7 @@ impl ToolStore {
         true
     }
 
-    pub(crate) fn merge(&mut self, activity: &ToolActivity) {
+    pub(crate) fn merge(&mut self, activity: &ToolActivity, now_ms: i64) {
         if !self.item.contains_key(&activity.id) {
             self.order.push(activity.id.clone());
         }
@@ -89,6 +103,8 @@ impl ToolStore {
             .item
             .entry(activity.id.clone())
             .or_insert_with(|| ToolCall {
+                started_at_ms: None,
+                completed_at_ms: None,
                 task_id: None,
                 id: activity.id.clone(),
                 kind: tool_kind(activity),
@@ -101,6 +117,9 @@ impl ToolStore {
                 failed: false,
                 change: ProviderChangeSet::default(),
             });
+        if tool.started_at_ms.is_none() && tool.state() == ToolState::Running {
+            tool.started_at_ms = Some(now_ms);
+        }
         if !activity.title.is_empty()
             && !matches!(activity.title.as_str(), "command" | "file changes" | "tool")
         {
@@ -122,6 +141,9 @@ impl ToolStore {
             tool.change.clone_from(&activity.change);
         }
         tool.failed = tool_failed(&tool.status, &tool.output);
+        if tool.state() != ToolState::Running && tool.completed_at_ms.is_none() {
+            tool.completed_at_ms = Some(now_ms.max(tool.started_at_ms.unwrap_or(now_ms)));
+        }
     }
 
     pub(crate) fn get(&self, id: &str) -> Option<&ToolCall> {

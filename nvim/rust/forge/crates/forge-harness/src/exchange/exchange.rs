@@ -217,7 +217,7 @@ impl Exchange {
                 let item_count = turn.items().len();
                 if let Some(tool) = &event.activity {
                     let known = turn.tools().any(|existing| existing.id == tool.id);
-                    turn.record_tool(tool)?;
+                    turn.record_tool(tool, now_ms)?;
                     let running = turn
                         .tools()
                         .find(|existing| existing.id == tool.id)

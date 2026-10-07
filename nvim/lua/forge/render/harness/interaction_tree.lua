@@ -238,17 +238,18 @@ end
 ---@param thought_key string Base cache key for thought.
 ---@param tool_index integer One-based index of tool within thought.
 ---@param content_width integer Maximum column width.
-local function append_tool(result, tool, thought_key, tool_index, content_width)
+---@param now_ms? number Current render timestamp in milliseconds.
+local function append_tool(result, tool, thought_key, tool_index, content_width, now_ms)
   local tool_key = ("%s:tool:%d"):format(thought_key, tool_index)
   local first = #result.lines + 1
-  local heading_line_list = tool_render.heading_lines(tool, content_width, "  ")
+  local heading_line_list = tool_render.heading_lines(tool, content_width, "  ", now_ms)
   for heading_index, heading_line in ipairs(heading_line_list) do
     result.lines[#result.lines + 1] = heading_line.text
     heading_line.line = #result.lines
     result.rows[#result.lines] = {
       kind = heading_index == 1 and "tool" or "tool_continuation",
       tool = tool,
-      foldtext = tool_render.foldtext_chunks(tool, "  ", heading_line.text),
+      foldtext = tool_render.foldtext_chunks(tool, "  ", heading_line.text, now_ms),
       expand_key = tool_key,
     }
   end
@@ -307,9 +308,10 @@ end
 ---@param result table Target render collection table.
 ---@param tool table Active tool descriptor table.
 ---@param content_width integer? Maximum column width.
-local function append_active_tool_preview(result, tool, content_width)
+---@param now_ms? number Current render timestamp in milliseconds.
+local function append_active_tool_preview(result, tool, content_width, now_ms)
   local first = #result.lines + 1
-  local heading_line_list = tool_render.heading_lines(tool, content_width, "  ")
+  local heading_line_list = tool_render.heading_lines(tool, content_width, "  ", now_ms)
   for heading_index, heading_line in ipairs(heading_line_list) do
     result.lines[#result.lines + 1] = heading_line.text
     heading_line.line = #result.lines
@@ -472,7 +474,7 @@ local function append_completed_thought(result, interaction, thought, thought_in
   end
   if result.expanded[thought_key .. ":tools"] then
     for tool_index, tool in ipairs(thought.tool or {}) do
-      append_tool(result, tool, thought_key, tool_index, options.content_width)
+      append_tool(result, tool, thought_key, tool_index, options.content_width, options.now_ms)
     end
   end
   local tree = diff_tree.build(thought.diff_text, {
@@ -512,7 +514,7 @@ local function append_active_thought(result, interaction, active, options)
     result.rows[#result.lines] = { kind = "active_tool_count", interaction = interaction }
   end
   if type(active.latest_tool) == "table" then
-    append_active_tool_preview(result, active.latest_tool, options.content_width)
+    append_active_tool_preview(result, active.latest_tool, options.content_width, options.now_ms)
   end
 end
 
@@ -700,7 +702,7 @@ local function append_interaction(result, interaction, options, agent_by_id)
             and not content.failed and (content.status == "completed" or content.status == "success")) then
         local first = #result.lines + 1
         append_tool(result, content, ("exchange:%s:turn:%s"):format(interaction.id, node.turn_id), first,
-          options.content_width)
+          options.content_width, options.now_ms)
         for line = first, #result.lines do
           result.rows[line].interaction = interaction
           result.rows[line].node_id = node.id

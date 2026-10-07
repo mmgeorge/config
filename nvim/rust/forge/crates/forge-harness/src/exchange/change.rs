@@ -226,6 +226,8 @@ mod test {
 
     fn file_tool(id: &str, status: &str, file: Vec<ProviderFileChange>) -> ToolCall {
         ToolCall {
+            started_at_ms: None,
+            completed_at_ms: None,
             task_id: None,
             id: id.into(),
             kind: "file_change".into(),
@@ -282,6 +284,8 @@ mod test {
             }],
         );
         let command = ToolCall {
+            started_at_ms: None,
+            completed_at_ms: None,
             task_id: None,
             id: "command".into(),
             kind: "command".into(),

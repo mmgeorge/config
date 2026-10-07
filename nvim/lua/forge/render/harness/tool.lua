@@ -51,15 +51,22 @@ local function command_token_list(command, expects_command)
   return token_list
 end
 
---- Returns the action verb string corresponding to tool kind and execution state.
+--- Get observed elapsed time, retaining the terminal timestamp when available.
 ---@param tool table Tool descriptor table.
----@return string verb Action verb string (`"Ran"`, `"Edited"`, `"Calling"`, or `"Called"`).
-local function tool_verb(tool)
-  local kind = tool.kind or "tool_call"
-  if kind == "command" then return "Ran" end
-  if kind == "file_change" then return "Edited" end
+---@param now_ms? number Current render timestamp in milliseconds.
+---@return string duration Whole seconds or an unavailable marker.
+local function tool_duration(tool, now_ms)
+  if type(tool.started_at_ms) ~= "number" then return "—" end
+  local finish = tool.completed_at_ms
   local status = tostring(tool.status or ""):lower()
-  return (status == "inprogress" or status == "in_progress") and "Calling" or "Called"
+  if type(finish) ~= "number" then
+    local terminal = { completed = true, complete = true, success = true, succeeded = true,
+      failed = true, error = true, denied = true, declined = true, rejected = true,
+      cancelled = true, canceled = true, interrupted = true }
+    if terminal[status] then return "—" end
+    finish = now_ms or os.time() * 1000
+  end
+  return ("%ds"):format(math.floor(math.max(0, finish - tool.started_at_ms) / 1000))
 end
 
 --- Extracts tool name and argument substrings from an MCP call signature.
@@ -75,24 +82,25 @@ end
 ---@param tool table Tool descriptor table.
 ---@param width? integer Maximum display column width.
 ---@param indent? string Leading indentation string.
+---@param now_ms? number Current render timestamp in milliseconds.
 ---@return table[] lines Array of `{ text: string, command?: string, command_offset?: integer, title_fragment?: string }` line records.
-function M.heading_lines(tool, width, indent)
+function M.heading_lines(tool, width, indent, now_ms)
   local leading = indent or ""
   if tool.kind ~= "command" then
-    local heading = M.heading(tool)
+    local heading = M.heading(tool, now_ms)
     if tool.kind ~= "tool_call" or not width or vim.fn.strdisplaywidth(leading .. heading) <= width then
       return { {
         text = leading .. heading,
         title_fragment = tool.kind == "tool_call" and (tool.title or "tool") or nil,
       } }
     end
-    local verb = tool_verb(tool)
+    local duration = tool_duration(tool, now_ms)
     local title = tool.title or "tool"
     local title_prefix = leading .. "  └ "
     local continuation_prefix = leading .. "    "
     local title_width = math.max(1, width - vim.fn.strdisplaywidth(title_prefix))
     local title_line_list = split_display_width(title, title_width)
-    local line_list = { { text = leading .. "• " .. verb } }
+    local line_list = { { text = leading .. "• " .. duration } }
     for line_index, line in ipairs(title_line_list) do
       local prefix = line_index == 1 and title_prefix or continuation_prefix
       line_list[#line_list + 1] = { text = prefix .. line, title_fragment = line }
@@ -102,10 +110,10 @@ function M.heading_lines(tool, width, indent)
 
   local command = M.display_command(tool.title or "command")
   if not width or width < 20 then
-    local text = leading .. "• Ran " .. command
+    local text = leading .. "• " .. tool_duration(tool, now_ms) .. " " .. command
     return { { text = text, command = command, command_offset = #text - #command } }
   end
-  local current = leading .. "• Ran "
+  local current = leading .. "• " .. tool_duration(tool, now_ms) .. " "
   local command_fragment = ""
   local line_list = {}
   for word in command:gmatch("%S+") do
@@ -155,12 +163,13 @@ end
 
 --- Formats a single-line summary heading string for a tool call.
 ---@param tool table Tool descriptor table.
+---@param now_ms? number Current render timestamp in milliseconds.
 ---@return string heading Formatted heading string.
-function M.heading(tool)
+function M.heading(tool, now_ms)
   local kind = tool.kind or "tool_call"
-  local verb = tool_verb(tool)
+  local duration = tool_duration(tool, now_ms)
   local title = kind == "command" and M.display_command(tool.title or "command") or (tool.title or "tool")
-  return ("• %s %s"):format(verb, title)
+  return ("• %s %s"):format(duration, title)
 end
 
 --- Applies command token highlight records for a single command line.
@@ -245,23 +254,24 @@ end
 ---@param tool table Tool descriptor table.
 ---@param indent? string Indentation prefix string.
 ---@param visible_text? string Visible fold text string.
+---@param now_ms? number Current render timestamp in milliseconds.
 ---@return table[] chunks Array of `[text, hl_group]` chunk tuples.
-function M.foldtext_chunks(tool, indent, visible_text)
+function M.foldtext_chunks(tool, indent, visible_text, now_ms)
   local prefix = (indent or "") .. "• "
   local bullet_group = M.failed(tool) and "ForgeHarnessToolFailure" or "ForgeHarnessToolSuccess"
   local kind = tool.kind or "tool_call"
-  local verb = tool_verb(tool)
+  local duration = tool_duration(tool, now_ms)
   if kind ~= "command" then
     if kind ~= "tool_call" then
       return {
         { (indent or "") .. "•", bullet_group },
-        { (" %s %s"):format(verb, tool.title or "tool"), "Normal" },
+        { (" %s %s"):format(duration, tool.title or "tool"), "Normal" },
       }
     end
     local name, arguments = mcp_title_parts(tool.title or "tool")
     local chunk_list = {
       { (indent or "") .. "•", bullet_group },
-      { " " .. verb .. " ", "Normal" },
+      { " " .. duration .. " ", "Normal" },
       { name, "ForgeHarnessMcpName" },
     }
     if arguments ~= nil then
@@ -272,7 +282,7 @@ function M.foldtext_chunks(tool, indent, visible_text)
     return chunk_list
   end
 
-  if visible_text and not visible_text:find("• Ran ", 1, true) then
+  if visible_text and not visible_text:find("• ", 1, true) then
     local command = visible_text:match("^%s*(.*)$") or visible_text
     local leading = visible_text:sub(1, #visible_text - #command)
     local chunk_list = leading ~= "" and { { leading, "Normal" } } or {}
@@ -290,7 +300,7 @@ function M.foldtext_chunks(tool, indent, visible_text)
   local command = M.display_command(tool.title or "command")
   local chunk_list = {
     { prefix:sub(1, -2), bullet_group },
-    { " " .. verb .. " ", "Normal" },
+    { " " .. duration .. " ", "Normal" },
   }
   local previous_end = 0
   for _, token in ipairs(command_token_list(command)) do
