@@ -203,6 +203,8 @@ mod tests {
         );
         design.document.description = "Revise registry declarations.".into();
         design.document.task = "Revise the registry interface.".into();
+        design.proposed.get_mut("registry.rs").unwrap().push_str("pub fn inspect(registry: &Registry);\n");
+        design.proposed_calls.insert("registry.rs".into(), crate::plan::calls::extract("registry.rs", "pub fn inspect(registry: &Registry) { registry.first; registry.second; }").unwrap());
         document.design = Some(design);
         store
             .write_working_document("session", "plan", &document)

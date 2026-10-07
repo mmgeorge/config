@@ -342,10 +342,19 @@ impl Visibility<'_> {
             return true;
         }
         let text = self.text[node.byte_range()].trim();
-        let local_owner = self
-            .returned
-            .as_ref()
-            .is_some_and(|owner| text.strip_prefix("local ") == Some(owner));
+        let mut local_owner = false;
+        if node.kind() == "variable_declaration" {
+            let mut declaration_cursor = node.walk();
+            for assignment in node.named_children(&mut declaration_cursor) {
+                let mut assignment_cursor = assignment.walk();
+                for variables in assignment.named_children(&mut assignment_cursor).filter(|child| child.kind() == "variable_list") {
+                    let mut binding_cursor = variables.walk();
+                    local_owner |= variables.named_children(&mut binding_cursor).any(|binding| {
+                        binding.kind() == "identifier" && self.returned.as_deref() == Some(&self.text[binding.byte_range()])
+                    });
+                }
+            }
+        }
         if text.starts_with("local ") && !local_owner {
             return false;
         }

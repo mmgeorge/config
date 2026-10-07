@@ -6,6 +6,7 @@ pub(crate) mod trace;
 #[cfg(test)]
 mod tests;
 mod typescript;
+pub(crate) mod exposure;
 
 use crate::plan::DeclarationDesign;
 use anyhow::{Context, Result};
@@ -215,6 +216,16 @@ type ParseCache = Mutex<BTreeMap<String, Arc<DeclarationIndex>>>;
 static PARSE_CACHE: OnceLock<ParseCache> = OnceLock::new();
 
 impl DeclarationResolver {
+    /// Reuse a snapshot's parsed declaration evidence without another source read.
+    pub(crate) fn index(&self, path: &str) -> Option<Arc<DeclarationIndex>> {
+        self.file.get(&normalize(&self.workspace.join(path))).map(|file| file.index.clone())
+    }
+
+    /// Inspect the role of one resolved target using its existing parsed evidence.
+    pub(crate) fn role(&self, resolution: &DeclarationResolution) -> Option<forge_diff::syntax::DeclarationRole> {
+        let DeclarationResolution::Resolved { destination } = resolution else { return None; };
+        self.file.get(Path::new(&destination.path))?.index.symbol.iter().find(|symbol| symbol.position.line == destination.line && symbol.position.column == destination.column).map(|symbol| symbol.role)
+    }
     /// Index snapshot declarations and discover dependency sources only when reached.
     pub(crate) fn local(workspace: &Path, design: &DeclarationDesign, baseline: bool) -> Result<Self> {
         let mut resolver = Self::snapshot(workspace, design, baseline, true)?;
@@ -871,7 +882,12 @@ impl DeclarationResolver {
             macro_namespace: false,
             conditional: false,
         };
-        self.resolve_reference(&file, &reference, true)
+        let result = self.resolve_reference(&file, &reference, true);
+        if self.role(&result) == Some(forge_diff::syntax::DeclarationRole::Module) && let DeclarationResolution::Resolved { destination } = &result {
+            let target = Path::new(&destination.path).strip_prefix(&self.workspace).ok().map(|path| path.to_string_lossy().replace('\\', "/"));
+            if let Some(target) = target { return self.at(&target, destination.line, destination.column); }
+        }
+        result
     }
 
     /// Resolve a named property through its declaring type without method-name fallback.
@@ -1020,6 +1036,14 @@ impl DeclarationResolver {
         })();
         owner_resolution.insert(key, Some(result.clone()));
         result
+    }
+
+    /// Resolve a named body value in its value namespace, then its type namespace.
+    pub(crate) fn value(&mut self, path: &str, owner: &str, name: &str) -> DeclarationResolution {
+        let result = self.callable(path, owner, name);
+        if matches!(result, DeclarationResolution::Resolved { .. } | DeclarationResolution::Ambiguous { .. }) { return result; }
+        let separator = if path.ends_with(".rs") { "::" } else { "." };
+        self.type_target(path, &owner.split(separator).map(str::to_owned).collect::<Vec<_>>(), &name.split(separator).map(str::to_owned).collect::<Vec<_>>())
     }
 
     /// Resolve a call target in its caller's lexical declaration scope.

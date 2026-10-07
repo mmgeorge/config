@@ -493,8 +493,15 @@ mod test {
         runtime.invoke(change(2,"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub struct Owner;\n+pub struct Owner { private: u64 }\n*** End Patch")).await.unwrap();
         let read = runtime.invoke(ControlToolInvocation { name:"harness_plan_read".into(),arguments:json!({"plan_id":"plan","path":"src/lib.rs"}) }).await.unwrap();
         assert!(read.message.contains("private: u64"));
-        runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(),arguments:json!({"plan_id":"plan","expected_version":3}) }).await.unwrap();
-        assert!(runtime.invoke(change(3,patch)).await.is_err());
+        let draft = runtime.plan_document().unwrap().clone();
+        let error = runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(),arguments:json!({"plan_id":"plan","expected_version":3}) }).await.unwrap_err();
+        assert!(error.to_string().contains("private"));
+        assert_eq!(runtime.plan_document(), Some(&draft));
+        let declaration = &runtime.plan_document().unwrap().design.as_ref().unwrap().proposed["src/lib.rs"];
+        let repair_patch = format!("*** Begin Patch\n*** Update File: src/lib.rs\n@@\n {}\n+\n+pub fn inspect(owner: &Owner);\n+Accesses\n+  Owner::private\n*** End Patch", declaration.lines().last().unwrap());
+        runtime.invoke(change(3, &repair_patch)).await.unwrap();
+        runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(),arguments:json!({"plan_id":"plan","expected_version":4}) }).await.unwrap();
+        assert!(runtime.invoke(change(4,patch)).await.is_err());
     }
 
 

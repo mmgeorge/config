@@ -124,6 +124,28 @@ local ok, failure = pcall(function()
     "visible input should expand the picker from its natural height")
 
   local origin_win = vim.api.nvim_get_current_win()
+  picker.open({ height_ratio = 0.3, host = { control_win = origin_win, window_list = { origin_win } },
+    page_list = { { id = "height-limit", option_list = rows } } })
+  local bounded_picker = picker._state_for_test()
+  assert_equals(vim.api.nvim_win_get_height(bounded_picker.win),
+    math.min(24, math.max(4, math.floor(vim.api.nvim_win_get_height(origin_win) * 0.3))),
+    "fractional picker height must reserve the host preview")
+  for index = 1, 39 do invoke("<Down>") end
+  assert_true(bounded_picker.frame.option_range[40] ~= nil,
+    "height-limited picker must scroll to the final result")
+  vim.api.nvim_set_current_win(origin_win)
+  vim.cmd("aboveleft split")
+  local resize_window = vim.api.nvim_get_current_win()
+  vim.api.nvim_exec_autocmds("WinResized", {})
+  vim.wait(100, function() return false end, 10)
+  assert_equals(vim.api.nvim_win_get_height(bounded_picker.win),
+    math.min(24, math.max(4, math.floor(vim.api.nvim_win_get_height(origin_win) * 0.3))),
+    "resizing the host must recompute the fractional height")
+  assert_true(bounded_picker.frame.option_range[40] ~= nil,
+    "resizing must retain the selected result in the viewport")
+  picker.close(false)
+  vim.api.nvim_win_close(resize_window, true)
+  vim.api.nvim_set_current_win(origin_win)
   vim.cmd("belowright 3split")
   local composer_win = vim.api.nvim_get_current_win()
   vim.wo[composer_win].winhighlight = "Normal:Normal"

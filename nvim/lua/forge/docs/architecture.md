@@ -2102,24 +2102,41 @@ each window, so resizing or opening a split reflows paragraphs without reproject
 changing canonical text, or moving comment anchors. The review projection must not hard-wrap these
 fields to the width captured when the review opens.
 Rust, TypeScript, TSX, and Lua source capture extracts declarations and call occurrences from one
-Tree-sitter parse of the requested file. An in-memory cache keys capture results by path, source
+Tree-sitter parse of the requested file. The shared declaration index records symbol roles,
+visibility, and recognized external entry points. Extraction records calls, callback targets,
+property accesses, construction targets, and named value uses. An in-memory cache keys capture results by path, source
 digest, and line width, with at most 16 entries before eviction. Inspection still rereads and checks
 the source digest, while later edits use the saved proposal. Captured baseline call lists and authored
 proposed call lists remain separate optional snapshot fields. Old snapshots without lists remain
 unavailable rather than gaining relationships from the current checkout.
 The existing read and patch tools expose a combined declaration view. A `Calls` block follows its
-callable signature and contains indented qualified names without arguments. Patches split and
+callable signature and contains indented qualified names without arguments. Callback targets use
+`Calls`, while properties and named values use `Accesses`. Patches split and
 validate declarations and calls atomically. Stored lists preserve declaration order, extraction
 order, duplicates, and original source positions for unchanged occurrences. Review presentation
-alone sorts and deduplicates targets. Function signatures remain visible while their Calls bodies
+alone deduplicates targets and optionally sorts them through an internal flag that defaults off.
+Function signatures remain visible while their Calls and Accesses bodies
 start folded. Revision deltas and feedback include call-only changes.
 Receiver normalization uses explicit parameter types, local types, constructor return declarations,
 same-file fields, and Lua parameter annotations. Missing evidence retains an unresolved receiver.
 Resolution uses declaration identities and preserves ambiguous impl targets rather than selecting
 the first same-named method.
-Call occurrences also retain opaque local binding evidence. A callback or unknown local receiver
-cannot become a reference to a same-named import. This evidence stays in the snapshot while the
+Call occurrences also retain opaque local binding evidence. A shadowed callback or unknown local receiver
+cannot become a reference to a same-named import. Saved declaration evidence refines imported
+callback targets after source capture, without scanning additional source files. This evidence stays in the snapshot while the
 combined editable view continues to display target names alone.
+Submission rejects newly introduced internal symbols without recorded incoming uses. The shared
+reference index compares baseline and proposed declaration identities, including moved files, and
+resolves relationships from saved plan files. Imports and self references do not establish uses.
+Calls and callback registrations establish callable uses, while signatures, construction, property
+accesses, and named values establish uses of their corresponding declarations. Existing symbols,
+recognized binary entry points, tests, trait contract items, and genuinely public APIs are exempt.
+Public API exposure follows module visibility and re-exports, so `pub(crate)` and public members
+behind private modules remain internal unless exported. Exposure reads only owning manifest and
+ancestor module metadata, with at most 256 metadata probes, 16,384 files, and the resolver's shared
+128 MiB source bound. It never searches uncaptured workspace callers. Failed submission leaves the
+working draft and submitted revision unchanged. Every submission repeats the check independently
+of cached signature validation. Editing, rendering, and reopening historical revisions do not run it.
 The public filter retains all headings and an explicit empty state when no public changes remain.
 Review retains both overviews in either visibility mode and maps comments separately to
 `/design/document/task` and `/design/document/description`. Behavior-only proposals carry both fields.
@@ -2238,7 +2255,14 @@ kind positions to preserve the saved extraction sequence, then appends additiona
 
 PlanReview binds `or` and the normal LSP-reference shortcut `of` to the plan reference picker.
 Both buffer-local aliases dispatch the same plan action and override their global mappings only
-inside PlanReview. PlanReview binds `<Space>f` to semantic rename and `.` to definition navigation, including
+inside PlanReview. The reference picker caps its height at 30 percent of the review window,
+bounded by the shared 24-row maximum and a four-row minimum for controls. It recomputes the
+cap on resize and scrolls its results while retaining headers. Reference previews retain their captured view identity across focus, tab, and
+split changes. Preview actions and cursor state belong to the originating review window. Edits,
+newer inputs, replaced views, and host replacement invalidate the capture and close the picker
+with one warning. Named reference previews use document and input authority rather than native
+cursor equality, so cursor adjustments on re-entry retain valid references. Ordinary asynchronous
+actions retain cursor equality checks. PlanReview binds `<Space>f` to semantic rename and `.` to definition navigation, including
 Calls and property-use entries. Rename reads only saved plan declarations and their structured uses. The immutable baseline,
 including moved files, distinguishes existing source symbols from definitions introduced by
 the proposed snapshot. Only introduced definitions admit rename. It rewrites resolved imports, signature references, qualified type

@@ -840,7 +840,7 @@ async fn reached_git_source_is_acquired_once_and_reused_by_validation_and_naviga
     report.ensure_valid().unwrap();
     assert!(resolver.source_acquired, "unsupported cached source did not invoke Cargo acquisition");
     let result = resolver.at("src/lib.rs", 2, 23);
-    assert!(matches!(result, DeclarationResolution::Resolved { ref destination } if destination.name == "Engine"), "{result:?}");
+    assert!(matches!(result, DeclarationResolution::Resolved { ref destination } if destination.name == "Engine"), "{result:?}; warnings: {:?}; source requests: {:?}", resolver.warning, resolver.source_request);
     let loaded = resolver.file.len();
     assert_eq!(resolver.validate_sources(&design).await.unwrap().checked, report.checked);
     assert_eq!(resolver.at("src/lib.rs", 2, 23), result);
@@ -902,7 +902,7 @@ async fn failed_acquisition_preserves_available_cached_references() {
     let report = resolver.validate_sources(&design).await.unwrap();
     assert!(report.diagnostic.iter().any(|diagnostic| diagnostic.reason.starts_with("Cargo dependency resolution is unavailable")), "{report:?}");
     let result = resolver.at("src/lib.rs", 1, 29);
-    assert!(matches!(result, DeclarationResolution::Resolved { ref destination } if destination.name == "Engine"), "{result:?}");
+    assert!(matches!(result, DeclarationResolution::Resolved { ref destination } if destination.name == "Engine"), "{result:?}; warnings: {:?}; source requests: {:?}", resolver.warning, resolver.source_request);
     assert!(!report.diagnostic.iter().any(|diagnostic| diagnostic.reference == "engine::Engine"), "available reference lost evidence after failed acquisition: {report:?}");
     let repeated = resolver.validate_sources(&design).await.unwrap();
     assert_eq!(repeated.diagnostic, report.diagnostic);

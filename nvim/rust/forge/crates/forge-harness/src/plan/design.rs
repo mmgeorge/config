@@ -79,6 +79,7 @@ impl DeclarationDesign {
         let mut design = self.formatted()?;
         design.check_workspace(workspace)?;
         super::comment_lint::validate(self)?;
+        super::usage::validate(&design, workspace)?;
         let paths = design.proposed.keys().filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml")).cloned().collect::<Vec<_>>();
         for path in paths {
             for directory in Path::new(&path).ancestors().skip(1) {
@@ -130,21 +131,31 @@ impl DeclarationDesign {
         let source_digest = super::digest(source.as_bytes());
         let key = format!("{path}:{}:{source_digest}", self.line_width);
         let cache = SOURCE_OVERVIEW_CACHE.get_or_init(Default::default);
-        if let Some(overview) = cache.lock().map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?.get(&key).cloned() { return Ok(overview); }
-        let (text, calls) = DeclarationOverview::extract_with_calls(path, &source)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))
-            .with_context(|| format!("extract {path}"))?;
-        let text = DeclarationOverview::format_with_width(path, &text, self.line_width)
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-        let calls = super::calls::from_extracted(calls);
-        let saved_owners = forge_diff::syntax::DeclarationCalls::extract(path, &text, true).map_err(|error| anyhow::anyhow!("{error:?}"))?.into_iter().map(|function| function.owner).collect::<BTreeSet<_>>();
-        let calls = calls.into_iter().filter(|function| saved_owners.contains(&function.owner)).collect();
-        let overview = (DeclarationFile { text, source_digest }, calls);
-        let mut cache = cache.lock().map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?;
-        let bytes = cache.values().map(|(file, calls)| file.text.len() + calls.iter().map(|function| function.owner.len() + function.call.iter().flatten().map(|call| call.name.len() + 16).sum::<usize>()).sum::<usize>()).sum::<usize>();
-        if cache.len() >= 16 || bytes >= 8 * 1024 * 1024 { cache.clear(); }
-        cache.insert(key, overview.clone());
-        Ok(overview)
+        let cached = cache.lock().map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?.get(&key).cloned();
+        let overview = if let Some(overview) = cached { overview } else {
+            let (text, calls) = DeclarationOverview::extract_with_calls(path, &source)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))
+                .with_context(|| format!("extract {path}"))?;
+            let text = DeclarationOverview::format_with_width(path, &text, self.line_width)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let calls = super::calls::from_extracted(calls);
+            let saved_owners = forge_diff::syntax::DeclarationCalls::extract(path, &text, true).map_err(|error| anyhow::anyhow!("{error:?}"))?.into_iter().map(|function| function.owner).collect::<BTreeSet<_>>();
+            let calls = calls.into_iter().filter(|function| saved_owners.contains(&function.owner)).collect();
+            let overview = (DeclarationFile { text, source_digest }, calls);
+            let mut cache = cache.lock().map_err(|_| anyhow::anyhow!("source overview cache lock poisoned"))?;
+            let bytes = cache.values().map(|(file, calls)| file.text.len() + calls.iter().map(|function| function.owner.len() + function.call.iter().flatten().map(|call| call.name.len() + 16).sum::<usize>()).sum::<usize>()).sum::<usize>();
+            if cache.len() >= 16 || bytes >= 8 * 1024 * 1024 { cache.clear(); }
+            cache.insert(key, overview.clone());
+            overview
+        };
+        let (file, mut calls) = overview;
+        if calls.iter().flat_map(|function| function.call.iter().flatten()).any(|reference| matches!(reference.kind, super::CallKind::Value | super::CallKind::Property)) {
+            let mut captured = self.clone();
+            captured.proposed.insert(path.into(), file.text.clone());
+            let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &captured, false)?;
+            super::calls::classify(path, &mut calls, &mut resolver);
+        }
+        Ok((file, calls))
     }
 
     /// Inspect one uncaptured workspace file without changing the saved design.
@@ -464,6 +475,12 @@ impl DeclarationDesign {
             }
         }
         ensure!(!edited.is_empty(), "patch has no file operations");
+        if candidate.proposed_calls.values().flatten().flat_map(|function| function.call.iter().flatten()).any(|reference| !reference.unresolved && matches!(reference.kind, super::CallKind::Value | super::CallKind::Property)) {
+            let mut resolver = crate::declaration::DeclarationResolver::planned(workspace, &candidate, false)?;
+            for (path, functions) in &mut candidate.proposed_calls {
+                super::calls::classify(path, functions, &mut resolver);
+            }
+        }
         candidate.validate()?;
         if candidate.proposed == self.proposed && candidate.proposed_calls == self.proposed_calls && candidate.document == self.document && candidate.moved == self.moved {
             candidate.validation = self.validation.clone();
@@ -495,7 +512,7 @@ fn validate_path(path: &str) -> Result<()> {
 }
 
 /// Read one bounded workspace source after validating its path and regular-file identity.
-pub(super) fn workspace_source(workspace: &Path, path: &str) -> Result<Option<String>> {
+pub(crate) fn workspace_source(workspace: &Path, path: &str) -> Result<Option<String>> {
     use std::io::Read;
     validate_relative_path(path)?;
     let target = workspace.join(path);
@@ -598,6 +615,20 @@ fn patch_file(original: &str, patch: &[&str]) -> Result<String> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn callback_capture_uses_saved_alias_evidence_without_scanning_other_sources() {
+        let workspace = tempfile::tempdir().unwrap();
+        std::fs::write(workspace.path().join("run.ts"), "import { worker as callback } from './api'; export function install() { register(callback); }").unwrap();
+        std::fs::write(workspace.path().join("unrelated.ts"), "invalid syntax {").unwrap();
+        let mut design = super::DeclarationDesign::default();
+        design.proposed.insert("api.ts".into(), "export function worker(): void;\n".into());
+        let (_, functions) = design.source(workspace.path(), "run.ts").unwrap();
+        let reference = functions[0].call.as_ref().unwrap().iter().find(|reference| reference.name == "callback").unwrap();
+        assert_eq!(reference.kind, crate::plan::CallKind::Callback);
+        let (_, warmed) = design.source(workspace.path(), "run.ts").unwrap();
+        assert_eq!(functions, warmed);
+        assert_eq!(design.proposed.len(), 1);
+    }
     use super::*;
 
     #[test]

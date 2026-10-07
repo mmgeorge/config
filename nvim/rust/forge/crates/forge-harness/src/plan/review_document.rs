@@ -838,7 +838,7 @@ impl PlanReviewDocument {
             let resolver = self.source.resolver.get().context("declaration resolver is unavailable")?;
             let mut resolver = resolver.lock().map_err(|_| anyhow::anyhow!("declaration resolver lock poisoned"))?;
             let resolver = if side == "baseline" { &mut resolver.1 } else { &mut resolver.0 };
-            return Ok(match kind { super::CallKind::Call => resolver.callable(path, owner, name), super::CallKind::Property => resolver.property(path, owner, name) });
+            return Ok(match kind { super::CallKind::Call | super::CallKind::Callback => resolver.callable(path, owner, name), super::CallKind::Property => resolver.property(path, owner, name), super::CallKind::Value => resolver.value(path, owner, name) });
         }
         let super::PlanReviewTarget::Declaration {
             path,
@@ -1300,6 +1300,8 @@ mod tests {
         design.document.task = "Expose configuration.".into();
         design.document.description = "Reject invalid configuration.".into();
         design.proposed.insert("src/lib.rs".into(), "#[derive(Debug)]\n/// Rejects invalid dimensions.\npub enum ConfigError {\n  /// Invalid arena.\n  ArenaSize,\n}\n\n/// Stores configuration.\npub struct Config {\n  /// Internal limit.\n  limit: u32,\n  /// Public count.\n  pub count: u32,\n}\n".into());
+        design.proposed.get_mut("src/lib.rs").unwrap().push_str("pub fn inspect(config: &Config);\n");
+        design.proposed_calls.insert("src/lib.rs".into(), crate::plan::calls::extract("src/lib.rs", "pub fn inspect(config: &Config) { config.limit; }").unwrap());
         canonical.design = Some(design);
         store.write_working_document("session", "plan", &canonical).unwrap();
         let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
@@ -1931,6 +1933,9 @@ mod tests {
         );
         design.proposed.insert("src/controls.rs".into(), "use bevy::prelude::*;\n\n/// Holds normalized movement intent.\n#[derive(Resource, Default)]\npub(crate) struct MovementInput {\n  /// Direction limited to unit length.\n  pub(crate) direction: Vec2,\n}\n\n/// Samples keyboard movement.\npub(crate) fn movement_input(\n  keys: Res<ButtonInput<KeyCode>>,\n  mut movement: ResMut<MovementInput>,\n);\n".into());
         design.proposed.insert("src/arena.rs".into(), "use bevy::prelude::*;\nuse crate::controls::MovementInput;\n\n/// Advances the player from sampled input.\npub(crate) fn move_player(\n  movement: Res<MovementInput>,\n);\n".into());
+        design.proposed.get_mut("src/lib.rs").unwrap().push_str("pub fn install();\n");
+        design.proposed_calls.insert("src/lib.rs".into(), crate::plan::calls::extract("src/lib.rs", "pub fn install() { crate::controls::movement_input(); crate::arena::move_player(); }").unwrap());
+        design.proposed_calls.insert("src/controls.rs".into(), crate::plan::calls::extract("src/controls.rs", "fn movement_input(movement: &mut MovementInput) { movement.direction; }").unwrap());
         canonical.design = Some(design);
         file.write_working_document("session", "plan", &canonical)
             .unwrap();
@@ -2285,6 +2290,8 @@ mod tests {
         design.proposed.insert("client.ts".into(), "/// Tracks requests.\nexport interface Client {\n  /// Current request count.\n  count: number;\n}\n".into());
         design.proposed.insert("run.ts".into(), "import { Client } from './client';\n/// Updates request count.\nfunction run(client: Client): void;\n".into());
         design.proposed_calls.insert("run.ts".into(), crate::plan::calls::extract("run.ts", "import { Client } from './client'; function run(client: Client) { client.count++; client.count; }").unwrap());
+        design.proposed.get_mut("run.ts").unwrap().push_str("export function install(): void;\n");
+        design.proposed_calls.get_mut("run.ts").unwrap().extend(crate::plan::calls::extract("run.ts", "export function install() { run(); }").unwrap());
         canonical.design = Some(design);
         store
             .write_working_document("session", "plan", &canonical)

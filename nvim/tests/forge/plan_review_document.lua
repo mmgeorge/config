@@ -64,6 +64,44 @@ local success, failure = xpcall(function()
   local action = requests[#requests]
   assert(action.params.input.target == "plan:source:1")
   assert(owner.is_current(action.params.input))
+  local original_window = owner.current_view().window
+  vim.api.nvim_exec_autocmds("FocusLost", {})
+  vim.cmd("tabnew")
+  assert(owner.is_current(action.params.input), "switching tabs invalidated the captured plan view")
+  vim.cmd("tabclose")
+  vim.cmd("vsplit")
+  owner.refresh_views()
+  assert(owner.current_view().id ~= action.params.input.view)
+  assert(owner.is_current(action.params.input), "another plan split invalidated the captured view")
+  local captured_window
+  owner.action("open", function() end, original_window)
+  captured_window = requests[#requests].params.input
+  assert(captured_window.view == action.params.input.view, "explicit reference action used the focused split")
+  assert(not owner.is_current(action.params.input), "a newer action retained the older input sequence")
+  action = requests[#requests]
+  vim.cmd("close")
+  vim.api.nvim_exec_autocmds("FocusGained", {})
+  assert(owner.is_current(action.params.input), "focus return invalidated the captured view")
+  vim.api.nvim_win_set_cursor(original_window, { 1, 1 })
+  assert(not owner.is_current(action.params.input), "cursor-bound action survived a cursor change")
+  assert(owner.is_current(action.params.input, false), "reference snapshot depended on the native cursor column")
+  vim.api.nvim_win_set_cursor(original_window, { 1, 0 })
+  assert(not owner.is_current(vim.tbl_extend("force", action.params.input, { document = "other" })))
+  assert(not owner.is_current(vim.tbl_extend("force", action.params.input, { view = "other" })))
+  local preview_result
+  owner.action("reveal_reference:usage", function(result) preview_result = result end, original_window)
+  local preview = requests[#requests]
+  vim.api.nvim_win_set_cursor(original_window, { 1, 1 })
+  preview.callback({ jump = { block = "plan:source", position = { row = 0, column = 0 } } })
+  assert(preview_result and preview_result.jump, "cursor adjustment cancelled a named reference response")
+  preview_result = nil
+  owner.action("reveal_reference:usage", function(result) preview_result = result end, original_window)
+  preview = requests[#requests]
+  require("forge.input").capture(owner.replica, owner.current_view(original_window), "open")
+  preview.callback({ jump = { block = "plan:source", position = { row = 0, column = 0 } } })
+  assert(preview_result and preview_result.cancelled, "superseded preview did not settle its cancellation")
+  owner.action("open", function(value) selected = value end, original_window)
+  action = requests[#requests]
   vim.bo[native_buffer].modifiable = true
   vim.api.nvim_buf_set_text(native_buffer, 0, 0, 0, 0, { "new " })
   assert(not owner.is_current(action.params.input), "follow-up effect retained authority after newer physical typing")

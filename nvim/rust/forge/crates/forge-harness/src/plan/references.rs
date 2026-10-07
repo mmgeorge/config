@@ -27,6 +27,10 @@ pub(crate) struct PlanReference {
 /// Indexes reverse usages independently of sorting, folding, and visible diff context.
 #[derive(Default)]
 pub(crate) struct PlanReferenceIndex {
+    pub declaration: BTreeMap<String, std::sync::Arc<DeclarationIndex>>,
+    pub introduced: BTreeSet<(String, u32, u32)>,
+    pub module_source: BTreeMap<(String, u32, u32), std::path::PathBuf>,
+    baseline_digest: BTreeMap<String, String>,
     pub occurrence: Vec<PlanReference>,
     pub definition: BTreeMap<(String, u32, u32), (String, usize)>,
     pub call: BTreeMap<(String, String, String, super::CallKind), String>,
@@ -46,7 +50,7 @@ impl PlanReferenceIndex {
         };
         let mut resolver = DeclarationResolver::local(workspace, design, baseline)?;
         resolver.bound_reference_files();
-        Self::extract(document, baseline, resolver)
+        Self::extract(design, baseline, resolver)
     }
 
     /// Index rename identities and uses from the saved plan declarations alone.
@@ -56,18 +60,22 @@ impl PlanReferenceIndex {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("rename requires a declaration plan"))?;
         Self::extract(
-            document,
+            design,
             false,
             DeclarationResolver::planned(workspace, design, false)?,
         )
     }
 
+    /// Index proposed usages and introduced identities without consulting uncaptured callers.
+    pub(crate) fn design(design: &super::DeclarationDesign, workspace: &std::path::Path) -> Result<Self> {
+        Self::extract(design, false, DeclarationResolver::planned(workspace, design, false)?)
+    }
+
     fn extract(
-        document: &PlanDocument,
+        design: &super::DeclarationDesign,
         baseline: bool,
         mut resolver: DeclarationResolver,
     ) -> Result<Self> {
-        let design = document.design.as_ref().unwrap();
         let files: BTreeMap<String, String> = if baseline {
             design
                 .baseline
@@ -85,28 +93,44 @@ impl PlanReferenceIndex {
         let side = if baseline { "baseline" } else { "proposed" };
         let mut output = Self::default();
         let mut lua_function = BTreeMap::<(String, String), (u32, u32)>::new();
+        let mut lua_index = BTreeMap::new();
         for (path, text) in files.iter().filter(|(path, _)| path.ends_with(".lua")) {
-            for function in DeclarationCalls::extract(path, text, true)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?
-            {
-                lua_function.insert(
-                    (path.clone(), function.owner.replace(':', ".")),
-                    (function.line, function.column),
-                );
+            let index = std::sync::Arc::new(DeclarationIndex::extract(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?);
+            for symbol in &index.symbol {
+                lua_function.insert((path.clone(), symbol.scope.iter().chain(std::iter::once(&symbol.name)).cloned().collect::<Vec<_>>().join(".")), (symbol.position.line, symbol.position.column));
             }
+            lua_index.insert(path.clone(), index);
+
         }
         for (path, text) in &files {
             if forge_diff::syntax::ConfigurationFormat::for_path(path).is_some() {
                 continue;
             }
-            let index = DeclarationIndex::extract(path, text)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let index = match resolver.index(path) {
+                Some(index) => index,
+                None => match lua_index.get(path) { Some(index) => index.clone(), None => std::sync::Arc::new(DeclarationIndex::extract(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?) },
+            };
+            if !baseline {
+                let origin = design.moved.iter().find(|(_, destination)| *destination == path).map(|(source, _)| source).unwrap_or(path);
+                let previous = design.baseline.get(origin).map(|file| DeclarationIndex::extract(origin, &file.text)).transpose().map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                let existing = previous.iter().flat_map(|index| &index.symbol).map(symbol_key).collect::<BTreeSet<_>>();
+                if let Some(file) = design.baseline.get(origin) { output.baseline_digest.insert(origin.clone(), super::digest(file.text.as_bytes())); }
+                for symbol in &index.symbol {
+                    if !symbol.parameter && !existing.contains(&symbol_key(symbol)) {
+                        output.introduced.insert((path.clone(), symbol.position.line, symbol.position.column));
+                    }
+                }
+            }
             for symbol in &index.symbol {
                 if symbol.parameter && symbol.name == "Self" {
                     continue;
                 }
-                if let Some(identity) =
-                    identity(resolver.at(path, symbol.position.line, symbol.position.column))
+                if let Some(identity) = if path.ends_with(".lua") { Some(lua_identity(path, &symbol.scope.iter().chain(std::iter::once(&symbol.name)).cloned().collect::<Vec<_>>().join("."))) } else {
+                    let resolution = resolver.at(path, symbol.position.line, symbol.position.column);
+                    if let DeclarationResolution::Resolved { destination } = &resolution && destination.module_file {
+                        output.module_source.insert((path.clone(), symbol.position.line, symbol.position.column), destination.path.clone().into());
+                    }
+                    identity(resolution) }
                 {
                     output.definition.insert(
                         (path.clone(), symbol.position.line, symbol.position.column),
@@ -114,26 +138,16 @@ impl PlanReferenceIndex {
                     );
                 }
             }
-            if path.ends_with(".lua") {
-                for ((file, owner), (line, column)) in &lua_function {
-                    if file == path {
-                        output.definition.insert(
-                            (file.clone(), *line, *column),
-                            (lua_identity(file, owner), owner.len()),
-                        );
-                    }
-                }
-            }
             for reference in &index.reference {
-                if let Some(symbol) =
-                    identity(resolver.at(path, reference.position.line, reference.position.column))
+                if let Some(symbol) = if path.ends_with(".lua") { lua_target(path, &reference.path.join("."), &index, &lua_function) } else {
+                    identity(resolver.at(path, reference.position.line, reference.position.column)) }
                 {
                     output.push(
                         path,
                         side,
                         &reference.scope.join("::"),
                         &reference.path.join("::"),
-                        "type",
+                        if index.symbol.iter().any(|symbol| symbol.parameter && symbol.name == "Self" && symbol.position == reference.position) { "owner" } else { "type" },
                         reference.position.line,
                         reference.position.column,
                         symbol,
@@ -226,11 +240,20 @@ impl PlanReferenceIndex {
                         );
                         continue;
                     }
+                    let separator = if path.ends_with(".rs") { "::" } else { "." };
+                    let parts = name.split(separator).map(str::to_owned).collect::<Vec<_>>();
+                    for prefix in 1..parts.len() {
+                        let target = if path.ends_with(".lua") { lua_target(path, &parts[..prefix].join(separator), &index, &lua_function) } else { identity(resolver.type_target(path, &function.owner.split(separator).map(str::to_owned).collect::<Vec<_>>(), &parts[..prefix])) };
+                        if let Some(symbol) = target {
+                            output.push(path, side, &function.owner, &parts[..prefix].join(separator), "body_qualifier", position.line, position.column, symbol);
+                        }
+                    }
                     let symbol = if path.ends_with(".lua") {
                         lua_target(path, name, &index, &lua_function)
                     } else {
                         let resolution = match kind {
-                            super::CallKind::Call => resolver.callable(path, &function.owner, name),
+                            super::CallKind::Call | super::CallKind::Callback => resolver.callable(path, &function.owner, name),
+                            super::CallKind::Value => resolver.value(path, &function.owner, name),
                             super::CallKind::Property => {
                                 resolver.property(path, &function.owner, name)
                             }
@@ -266,6 +289,7 @@ impl PlanReferenceIndex {
                     }
                 }
             }
+            output.declaration.insert(path.clone(), index);
         }
         ensure!(
             output.occurrence.len() <= 65536,
@@ -598,8 +622,7 @@ impl PlanReferenceIndex {
         let [((path, line, column), _)] = candidates.as_slice() else {
             anyhow::bail!("select a unique symbol defined in the plan");
         };
-        let index = DeclarationIndex::extract(path, &design.proposed[path])
-            .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+        let index = self.declaration.get(path).ok_or_else(|| anyhow::anyhow!("selected declaration index is unavailable"))?;
         let symbol = index
             .symbol
             .iter()
@@ -628,45 +651,11 @@ impl PlanReferenceIndex {
                 <= 1,
             "merged or overloaded definitions require a unique symbol identity before rename"
         );
-        let original_path = design
-            .moved
-            .iter()
-            .find(|(_, destination)| *destination == path)
-            .map(|(source, _)| source)
-            .unwrap_or(path);
-        let baseline = design
-            .baseline
-            .get(original_path)
-            .map(|file| file.text.clone());
-        for text in baseline.iter() {
-            let index = DeclarationIndex::extract(original_path, text)
-                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-            ensure!(
-                !index
-                    .symbol
-                    .iter()
-                    .any(|previous| previous.name == symbol.name
-                        && previous.property == symbol.property
-                        && same_scope(&previous.scope, &symbol.scope)),
-                "only symbols introduced by the plan can be renamed"
-            );
-            if original_path.ends_with(".lua") {
-                let functions = DeclarationCalls::extract(original_path, text, true)
-                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                ensure!(
-                    !functions
-                        .iter()
-                        .any(|function| function.owner.replace(':', ".")
-                            == symbol
-                                .scope
-                                .iter()
-                                .chain(std::iter::once(&symbol.name))
-                                .cloned()
-                                .collect::<Vec<_>>()
-                                .join(".")),
-                    "only symbols introduced by the plan can be renamed"
-                );
-            }
+        ensure!(self.introduced.contains(&((*path).clone(), *line, *column)), "only symbols introduced by the plan can be renamed");
+        let origin = design.moved.iter().find(|(_, destination)| *destination == path).map(|(source, _)| source).unwrap_or(path);
+        if let Some(file) = design.baseline.get(origin) && self.baseline_digest.get(origin) != Some(&super::digest(file.text.as_bytes())) {
+            let previous = DeclarationIndex::extract(origin, &file.text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            ensure!(!previous.symbol.iter().any(|previous| symbol_key(previous) == symbol_key(&symbol)), "only symbols introduced by the plan can be renamed");
         }
         Ok(((*path).clone(), symbol))
     }
@@ -675,7 +664,6 @@ impl PlanReferenceIndex {
     pub(crate) fn renamed(
         &self,
         document: &PlanDocument,
-        workspace: &std::path::Path,
         identity: &str,
         name: &str,
     ) -> Result<PlanDocument> {
@@ -752,7 +740,7 @@ impl PlanReferenceIndex {
             .or_default()
             .insert((symbol.position.line, symbol.position.column));
         for reference in self.occurrence.iter().filter(|reference| {
-            reference.symbol == identity && !matches!(reference.kind.as_str(), "call" | "property")
+            reference.symbol == identity && !matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "body_qualifier")
         }) {
             let text = &design.proposed[&reference.path];
             let row = text
@@ -789,8 +777,8 @@ impl PlanReferenceIndex {
                 }
             }
         }
-        let mut resolver = DeclarationResolver::planned(workspace, design, false)?;
-        resolver.bound_reference_files();
+        let qualifier = self.occurrence.iter().filter(|reference| reference.kind == "body_qualifier")
+            .map(|reference| ((reference.path.as_str(), reference.owner.as_str(), reference.name.as_str()), reference.symbol.as_str())).collect::<BTreeMap<_, _>>();
         for (path, functions) in &mut design.proposed_calls {
             for function in functions {
                 for call in function.call.iter_mut().flatten() {
@@ -822,22 +810,7 @@ impl PlanReferenceIndex {
                         let matches = if position + 1 == parts.len() {
                             selected
                         } else {
-                            super::references::identity(
-                                resolver.type_target(
-                                    path,
-                                    &function
-                                        .owner
-                                        .split(separator)
-                                        .map(str::to_owned)
-                                        .collect::<Vec<_>>(),
-                                    &parts[..=position]
-                                        .iter()
-                                        .map(|part| (*part).to_owned())
-                                        .collect::<Vec<_>>(),
-                                ),
-                            )
-                            .as_deref()
-                                == Some(identity)
+                            qualifier.get(&(path.as_str(), function.owner.as_str(), parts[..=position].join(separator).as_str())).copied() == Some(identity)
                         };
                         if matches {
                             replacement[position] = name.into();
@@ -923,7 +896,7 @@ impl PlanReferenceIndex {
                 .occurrence
                 .iter()
                 .filter(|reference| {
-                    !matches!(reference.kind.as_str(), "call" | "property")
+                    !matches!(reference.kind.as_str(), "call" | "property" | "callback" | "value" | "body_qualifier")
                         && reference.path == *path
                         && reference.line == *line
                         && reference.column <= column
@@ -950,6 +923,10 @@ fn same_scope(previous: &[String], proposed: &[String]) -> bool {
         .eq(proposed.iter().filter(|scope| !scope.starts_with("@impl:")))
 }
 
+fn symbol_key(symbol: &forge_diff::syntax::DeclarationSymbol) -> (String, forge_diff::syntax::DeclarationRole, Vec<String>) {
+    (symbol.name.clone(), symbol.role, symbol.scope.iter().filter(|scope| !scope.starts_with("@impl:")).cloned().collect())
+}
+
 fn lua_symbol(
     path: &str,
     text: &str,
@@ -964,6 +941,8 @@ fn lua_symbol(
     let mut scope = normalized.split('.').map(str::to_owned).collect::<Vec<_>>();
     let name = scope.pop()?;
     Some(forge_diff::syntax::DeclarationSymbol {
+        role: forge_diff::syntax::DeclarationRole::Callable,
+        external_entry: false,
         property: false,
         position: forge_diff::syntax::DeclarationPosition {
             line,
@@ -1112,7 +1091,7 @@ mod tests {
             ))
             .expect("inherited aliased property should resolve");
         let renamed = index
-            .renamed(&document, workspace.path(), property, "total")
+            .renamed(&document, property, "total")
             .unwrap();
         assert!(renamed.design.as_ref().unwrap().proposed["client.ts"].contains("total: number"));
         assert_eq!(
@@ -1129,7 +1108,7 @@ mod tests {
             ))
             .expect("method value should resolve");
         let renamed = index
-            .renamed(&document, workspace.path(), method, "dispatch")
+            .renamed(&document, method, "dispatch")
             .unwrap();
         assert!(renamed.design.as_ref().unwrap().proposed["client.ts"].contains("dispatch()"));
         assert_eq!(
@@ -1227,7 +1206,7 @@ mod tests {
             1
         );
         let renamed = index
-            .renamed(&document, workspace.path(), identity, "total")
+            .renamed(&document, identity, "total")
             .unwrap();
         let design = renamed.design.as_ref().unwrap();
         assert!(design.proposed["client.rs"].contains("pub total: usize"));
@@ -1311,7 +1290,7 @@ mod tests {
         let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
         let identity = index.call.values().next().unwrap();
         let renamed = index
-            .renamed(&document, workspace.path(), identity, "dispatch")
+            .renamed(&document, identity, "dispatch")
             .unwrap();
         let design = renamed.design.unwrap();
         assert!(design.proposed["client.ts"].contains("function dispatch"));
@@ -1329,7 +1308,7 @@ mod tests {
         );
         assert!(
             index
-                .renamed(&document, workspace.path(), identity, "function")
+                .renamed(&document, identity, "function")
                 .is_err()
         );
         std::fs::write(workspace.path().join("client.ts"), "invalid source {").unwrap();
@@ -1337,7 +1316,7 @@ mod tests {
         let identity = snapshot.call.values().next().unwrap();
         assert!(
             snapshot
-                .renamed(&document, workspace.path(), identity, "dispatch")
+                .renamed(&document, identity, "dispatch")
                 .is_ok()
         );
         document.design.as_mut().unwrap().baseline.insert(
@@ -1384,11 +1363,11 @@ mod tests {
         let identity = index.call.values().next().unwrap();
         assert!(
             index
-                .renamed(&document, workspace.path(), identity, "dispatch")
+                .renamed(&document, identity, "dispatch")
                 .is_err()
         );
         let renamed = index
-            .renamed(&document, workspace.path(), identity, "deliver")
+            .renamed(&document, identity, "deliver")
             .unwrap();
         let function = &renamed.design.as_ref().unwrap().proposed_calls["client.ts"][0];
         assert_eq!(function.owner, "deliver");
@@ -1437,7 +1416,7 @@ mod tests {
             .unwrap()
             .0;
         let renamed = index
-            .renamed(&document, workspace.path(), identity, "Transport")
+            .renamed(&document, identity, "Transport")
             .unwrap();
         let design = renamed.design.unwrap();
         assert!(design.proposed["src/lib.rs"].contains("impl Transport"));
@@ -1582,7 +1561,7 @@ mod tests {
         document.design.as_mut().unwrap().document.task = "Rename Lua API".into();
         document.design.as_mut().unwrap().document.description = "Update saved calls".into();
         let renamed = index
-            .renamed(&document, workspace.path(), identity, "deliver")
+            .renamed(&document, identity, "deliver")
             .unwrap();
         assert!(renamed.design.as_ref().unwrap().proposed["client.lua"].contains("M.deliver"));
         assert_eq!(
@@ -1730,6 +1709,28 @@ mod tests {
     }
 
     #[test]
+    fn lua_module_rename_updates_declaration_owners_and_body_qualifiers() {
+        let workspace = tempfile::tempdir().unwrap();
+        let source = "local M = {}\nfunction M.run() M.other() end\nfunction M.other() end\nreturn M\n";
+        let mut document = super::super::document::test_fixture("module", "Rename module");
+        let mut design = super::super::DeclarationDesign::default();
+        design.proposed.insert("api.lua".into(), forge_diff::syntax::DeclarationOverview::extract("api.lua", source).unwrap());
+        design.proposed_calls.insert("api.lua".into(), super::super::calls::extract("api.lua", source).unwrap());
+        design.document.task = "Rename the module".into();
+        design.document.description = "Preserve module definitions and calls".into();
+        document.design = Some(design);
+        let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
+        let symbol = index.declaration["api.lua"].symbol.iter().find(|symbol| symbol.name == "M").unwrap();
+        let identity = &index.definition[&("api.lua".into(), symbol.position.line, symbol.position.column)].0;
+        let renamed = index.renamed(&document, identity, "Module").unwrap();
+        let design = renamed.design.unwrap();
+        assert!(design.proposed["api.lua"].contains("function Module.run"));
+        assert!(design.proposed["api.lua"].contains("return Module"));
+        assert_eq!(design.proposed_calls["api.lua"][0].owner, "Module.run");
+        assert_eq!(design.proposed_calls["api.lua"][0].call.as_ref().unwrap()[0].name, "Module.other");
+    }
+
+    #[test]
     fn legacy_references_include_explicit_tasks_and_flows_without_prose_matches() {
         let workspace = tempfile::tempdir().unwrap();
         let document = super::super::document::test_fixture("legacy", "Legacy references");
@@ -1797,7 +1798,7 @@ mod tests {
             .unwrap()
             .0;
         let renamed = index
-            .renamed(&document, workspace.path(), identity, "dispatch")
+            .renamed(&document, identity, "dispatch")
             .unwrap();
         assert!(
             renamed.design.as_ref().unwrap().proposed["run.ts"].contains("import { dispatch }")

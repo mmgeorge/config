@@ -23,15 +23,22 @@ function M.attach(options, callback)
     end)
   end
   function owner.attached() return alive() and owner.ready == true end
-  function owner.current_view()
-    local window = vim.api.nvim_get_current_win()
-    return owner.views[window] or owner.views[vim.fn.win_findbuf(options.buffer)[1]]
+  function owner.current_view(window)
+    if window then return owner.views[window] end
+    local current_window = vim.api.nvim_get_current_win()
+    return owner.views[current_window] or owner.views[vim.fn.win_findbuf(options.buffer)[1]]
   end
-  function owner.is_current(captured)
-    local view = owner.current_view()
+  function owner.is_current(captured, cursor_bound)
+    local view
+    for _, candidate in pairs(owner.views) do
+      if captured and candidate.id == captured.view then view = candidate break end
+    end
     return captured and alive() and view and captured.revision == owner.replica.revision
+      and captured.document == owner.document and view.active
+      and vim.api.nvim_win_is_valid(view.window) and vim.api.nvim_win_get_buf(view.window) == options.buffer
       and view.changedtick == vim.api.nvim_buf_get_changedtick(options.buffer)
-      and view.sequence == captured.sequence and vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), view.cursor)
+      and view.sequence == captured.sequence
+      and (cursor_bound == false or vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), view.cursor))
   end
   function owner.sync_editability()
     if not owner.ready or not owner.comment_state then return end
@@ -300,7 +307,7 @@ function M.attach(options, callback)
       if not owner.views[window] then open_view(window) end
     end
   end
-  function owner.action(action, receive)
+  function owner.action(action, receive, window)
     if not owner.attached() then return false end
     if action == "comment" or action == "question" then
       comments.add_at_cursor(options.buffer, false, { kind = action == "question" and "question" or nil,
@@ -312,7 +319,9 @@ function M.attach(options, callback)
       if options.notice then options.notice("Save plan annotations before changing the source projection") end
       return false
     end
-    local captured, failure = input.capture(owner.replica, owner.current_view(), action)
+    local view = owner.current_view(window)
+    if not view then receive(nil, "Plan review window is no longer available") return false end
+    local captured, failure = input.capture(owner.replica, view, action)
     if not captured then receive(nil, failure) return false end
     local viewport
     if action == "toggle_declaration" then
@@ -320,11 +329,15 @@ function M.attach(options, callback)
       local collapse = node and node.entry.metadata.collapse and node.entry.metadata.collapse[1]
       if collapse then
         viewport = require("forge.buffer_view").capture_viewport(owner.replica,
-          owner.current_view().window, collapse.opening)
+          view.window, collapse.opening)
       end
     end
     request({ operation = "plan_action", input = captured }, function(result, error)
-      if not owner.is_current(captured) then return end
+      local reference_preview = action:find("reveal_reference:", 1, true) == 1
+      if not owner.is_current(captured, not reference_preview) then
+        if reference_preview then receive({ cancelled = true }, nil, captured) end
+        return
+      end
       if not error and result.patch and result.patch ~= vim.NIL then
         comments.detach(options.buffer, false)
         owner.replica.locate, owner.replica.physical_row = nil, nil
@@ -333,7 +346,6 @@ function M.attach(options, callback)
         if applied.kind ~= "Applied" then receive(nil, applied.kind, captured) return end
         attach_projection(result)
         captured = vim.tbl_extend("force", captured, { revision = owner.replica.revision })
-        local view = owner.current_view()
         if view and view.id == captured.view then
           view.cursor = vim.api.nvim_win_get_cursor(view.window)
           view.changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)

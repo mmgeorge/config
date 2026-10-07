@@ -12,9 +12,10 @@ local executable = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "
 assert(vim.uv.fs_copyfile(vim.g.forge_test_executable or require("forge.builder").binary_path(), executable))
 local original_stdpath, original_notify = vim.fn.stdpath, vim.notify
 vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
-local errors = {}
+local errors, warnings = {}, {}
 vim.notify = function(message, level)
   if level == vim.log.levels.ERROR then errors[#errors + 1] = tostring(message) end
+  if level == vim.log.levels.WARN then warnings[#warnings + 1] = tostring(message) end
 end
 package.loaded["forge.builder"] = { ensure = function(callback)
   vim.schedule(function() callback({ ok = true, path = executable }) end)
@@ -185,11 +186,26 @@ local success, failure = xpcall(function()
   vim.api.nvim_feedkeys("or", "mtx", false)
   await(function() return picker.is_open() end, "reference picker did not open")
   local active = picker._state_for_test()
+  assert(active.spec.height_ratio == 0.3, "plan references did not set their host height limit")
+  assert(vim.api.nvim_win_get_height(active.win) <= math.max(4, math.floor(vim.api.nvim_win_get_height(review.win) * 0.3)),
+    "plan references exceeded thirty percent of the review height")
   assert(active.spec.page_list[1].search, "reference picker is not searchable")
   assert(#active.spec.page_list[1].option_list == 2, "calls did not retain both distinct caller results")
   assert(active.spec.page_list[1].option_list[1].value.owner == "run")
   await(function() return #vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 1 end, "initial call preview is absent")
   local first_preview = vim.api.nvim_win_get_cursor(review.win)
+  local warning_count = #warnings
+  vim.api.nvim_exec_autocmds("FocusLost", {})
+  vim.cmd("tabnew")
+  vim.api.nvim_exec_autocmds("WinResized", {})
+  vim.wait(100, function() return false end, 10)
+  vim.cmd("tabclose")
+  vim.api.nvim_set_current_win(active.win)
+  vim.api.nvim_exec_autocmds("FocusGained", {})
+  vim.api.nvim_exec_autocmds("WinResized", {})
+  vim.wait(100, function() return false end, 10)
+  assert(#warnings == warning_count, "focus and tab changes invalidated unchanged plan references: " .. table.concat(warnings, "\n"))
+  assert(picker.is_open(), "focus change closed the reference picker")
   local first_option = active.frame.lines[active.frame.option_range[1].first]
   local second_option = active.frame.lines[active.frame.option_range[2].first]
   assert(first_option:find("run", 1, true) == second_option:find("update", 1, true), "caller columns are not aligned")
@@ -250,13 +266,20 @@ local success, failure = xpcall(function()
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(review.win), cursor), "cancel did not restore the originating cursor")
   assert(#vim.fn.getjumplist()[1] == 0, "cancelled reference previews added jumps")
   review.command_set.action_by_id.references.run({})
-  await(function() return picker.is_open() end, "call reference picker did not reopen")
+  await(function() return picker.is_open()
+    and #vim.api.nvim_buf_get_extmarks(review.buf, preview_namespace, 0, -1, {}) == 1 end, "call reference picker did not reopen")
   active = picker._state_for_test()
   vim.api.nvim_win_set_cursor(review.win, { leaf_row, leaf_column })
+  require("forge.input").capture(review.owner.replica, review.owner.current_view(review.win), "open")
+  warning_count = #warnings
   select = vim.api.nvim_buf_call(active.buf, function() return vim.fn.maparg("<CR>", "n", false, true) end)
   select.callback()
   vim.wait(100, function() return false end, 10)
   assert(vim.api.nvim_win_get_cursor(review.win)[1] == leaf_row, "stale picker selection changed the review cursor")
+  assert(not picker.is_open() and #warnings == warning_count + 1, "stale references did not close with exactly one warning")
+  vim.api.nvim_exec_autocmds("WinResized", {})
+  vim.wait(50, function() return false end, 10)
+  assert(#warnings == warning_count + 1, "closed reference picker repeated its stale warning")
   assert(vim.deep_equal(vim.fn.readfile(artifact, "b"), canonical), "reference navigation modified the plan")
   assert(vim.deep_equal(vim.fn.readfile(workspace .. "/src/change.rs"), source), "planning modified implementation source")
   local function select_new_definition()

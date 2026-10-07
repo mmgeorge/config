@@ -49,22 +49,23 @@ function M.open(review, references, captured)
       if offset > 0 then vim.cmd("normal! " .. offset .. "\5") end
       vim.wo[review.win].scrolloff = scrolloff
     end)
+    review.owner.current_view(review.win).cursor = vim.api.nvim_win_get_cursor(review.win)
   end
   local function restore()
-    if not review.owner.is_current(captured) or not vim.api.nvim_win_is_valid(review.win) then return end
+    if not review.owner.is_current(captured, false) or not vim.api.nvim_win_is_valid(review.win) then return end
     local _, row = review.owner.replica.sequence:position(origin_block)
     if not row then return end
     origin.lnum = require("forge.buffer").physical_row(review.owner.replica, row) + origin_position.row + 1
     origin.col = origin_position.column
     vim.api.nvim_win_call(review.win, function() vim.fn.winrestview(origin) end)
-    review.owner.current_view().cursor = vim.api.nvim_win_get_cursor(review.win)
+    review.owner.current_view(review.win).cursor = vim.api.nvim_win_get_cursor(review.win)
   end
   local function finish()
     local destination = vim.api.nvim_win_get_cursor(review.win)
     restore()
     vim.api.nvim_win_call(review.win, function() vim.cmd("normal! m'") end)
     vim.api.nvim_win_set_cursor(review.win, destination)
-    review.owner.current_view().cursor = destination
+    review.owner.current_view(review.win).cursor = destination
     closed = true
     clear()
     picker.close(false)
@@ -75,11 +76,12 @@ function M.open(review, references, captured)
   local preview
   ---@param reference ForgePlanReference
   preview = function(reference)
+    if closed then return end
     pending = reference
     if busy then clear() return end
-    if not review.owner.is_current(captured) then
+    if not review.owner.is_current(captured, false) then
       notifications.warn("Plan references changed while the picker was open", "ForgePlanReview")
-      if confirming then picker.close(true) end
+      picker.close(true)
       return
     end
     if displayed == reference.id then
@@ -96,12 +98,16 @@ function M.open(review, references, captured)
       end
       captured = input
       if closed then restore() return end
-      if not review.owner.is_current(captured) then return end
+      if not review.owner.is_current(captured, false) then
+        notifications.warn("Plan references changed while the picker was open", "ForgePlanReview")
+        picker.close(true)
+        return
+      end
       if not pending or pending.id ~= reference.id then
         if pending then preview(pending) end
         return
       end
-      local view = review.owner.current_view()
+      local view = review.owner.current_view(review.win)
       local applied = require("forge.effects").apply(review.owner.replica, view, {
         id = "plan:reference:" .. captured.sequence, kind = "cursor", jump = false,
         document = captured.document, revision = captured.revision, view = captured.view,
@@ -115,12 +121,13 @@ function M.open(review, references, captured)
         line_hl_group = "Visual", priority = 250,
       })
       if confirming then finish() end
-    end)
+    end, review.win)
     if not started then busy = false confirming = false end
   end
   picker.open({
     id = "plan_references",
     title = "Plan references",
+    height_ratio = 0.3,
     host = { control_win = review.win, window_list = { review.win } },
     page_list = { { id = "references", title = "References", option_list = options,
       column_headers = { "Location", "Caller", "Kind", "Symbol" },

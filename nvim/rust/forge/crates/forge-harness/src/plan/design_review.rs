@@ -427,7 +427,7 @@ fn rows(
                     navigation.anchor.push(PlanNavigationAnchor {
                         line: block.len() as u32,
                         target: PlanReviewTarget::Call { kind: *kind, path: source_path.clone(), side: side.into(), owner: owner.clone(), name: name.clone() },
-                        json_path: format!("/design/{side}_calls/{}/{}/{}", pointer(source_path), pointer(owner), if *kind == super::CallKind::Call { pointer(name) } else { format!("property/{}", pointer(name)) }),
+                        json_path: format!("/design/{side}_calls/{}/{}/{}", pointer(source_path), pointer(owner), if *kind == super::CallKind::Call { pointer(name) } else { format!("{}/{}", kind.label(), pointer(name)) }),
                         path: Some(source_path.clone()), label: format!("{source_path}: {owner}: {} {name}", kind.label()),
                     });
                 }

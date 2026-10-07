@@ -663,19 +663,21 @@ mod tests {
     async fn inspection_uses_shared_repository_and_diff_without_status_publication() {
         let directory = tempfile::tempdir().unwrap();
         let workspace = directory.path().to_path_buf();
-        let mut command = std::process::Command::new("git");
-        command.args(["init", "--quiet"]).current_dir(&workspace);
-        let output = forge_git::command::write_command(
-            &mut command,
-            forge_git::command::CommandLimits {
-                stdout_bytes: 4 * 1024,
-                stderr_bytes: 4 * 1024,
-                timeout: std::time::Duration::from_secs(5),
-            },
-            &[],
-            || Ok(()),
-        )
-        .unwrap();
+        let initialization_workspace = workspace.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            let mut command = std::process::Command::new("git");
+            command.args(["init", "--quiet"]).current_dir(initialization_workspace);
+            forge_git::command::write_command(
+                &mut command,
+                forge_git::command::CommandLimits {
+                    stdout_bytes: 4 * 1024,
+                    stderr_bytes: 4 * 1024,
+                    timeout: std::time::Duration::from_secs(5),
+                },
+                &[],
+                || Ok(()),
+            )
+        }).await.unwrap().unwrap();
         assert!(output.status.success());
         std::fs::write(workspace.join("example.txt"), "literal **content**\n").unwrap();
         let (repository, diff) = services();

@@ -9,7 +9,7 @@ mod declaration_fold;
 mod declaration_index;
 mod declaration_calls;
 pub use declaration_calls::{DeclarationCall, DeclarationCallKind, DeclarationCallable, DeclarationCalls};
-pub use declaration_index::{DeclarationIndex, DeclarationIndexTiming, DeclarationImport, DeclarationModule, DeclarationMemberOwner, DeclarationReference, DeclarationSymbol, SymbolVisibility};
+pub use declaration_index::{DeclarationIndex, DeclarationIndexTiming, DeclarationImport, DeclarationModule, DeclarationMemberOwner, DeclarationReference, DeclarationRole, DeclarationSymbol, SymbolVisibility};
 pub use declaration_fold::{DeclarationFold, DeclarationFolding};
 mod visibility;
 pub use configuration::ConfigurationFormat;

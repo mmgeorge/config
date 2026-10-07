@@ -339,8 +339,9 @@ pub(super) fn append_semantic_style(metadata: &mut BlockMetadata, target: &PlanR
             }
             append_range(metadata, start + member, start + name.len(), match kind {
                 super::CallKind::Property => "@variable.member",
-                super::CallKind::Call if member > 0 => "@function.method.call",
-                super::CallKind::Call => "@function.call",
+                super::CallKind::Value => "@variable",
+                super::CallKind::Call | super::CallKind::Callback if member > 0 => "@function.method.call",
+                super::CallKind::Call | super::CallKind::Callback => "@function.call",
             });
         }
         PlanReviewTarget::Task { title } => {

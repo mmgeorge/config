@@ -11,6 +11,10 @@ pub enum DeclarationCallKind {
     Call,
     /// Reads, writes, or takes a reference to a named property.
     Property,
+    /// Takes a callable as a value instead of invoking it directly.
+    Callback,
+    /// Reads a named value or constructs a named type.
+    Value,
 }
 
 /// A source call occurrence, retaining lexical order and receiver evidence.
@@ -123,6 +127,7 @@ impl DeclarationCalls {
         collect(tree.root_node(), source, language, &[], &mut callable, 0)?;
         let mut return_type = HashMap::new();
         collect_returns(tree.root_node(), source, language, &[], &mut return_type, 0)?;
+        let callable_name = callable.iter().map(|function| function.owner.clone()).collect::<std::collections::HashSet<_>>();
         if !declarations {
             let position = callable
                 .iter()
@@ -135,6 +140,7 @@ impl DeclarationCalls {
                 language,
                 &[],
                 &return_type,
+                &callable_name,
                 &position,
                 &mut callable,
                 0,
@@ -392,6 +398,7 @@ fn populate(
     language: SyntaxLanguage,
     scope: &[String],
     returns: &HashMap<String, Option<String>>,
+    callable: &std::collections::HashSet<String>,
     position: &HashMap<(u32, u32), usize>,
     output: &mut [DeclarationCallable],
     depth: usize,
@@ -433,6 +440,7 @@ fn populate(
                     source,
                     language,
                     returns,
+                    callable,
                     &mut binding,
                     &mut item.call,
                     0,
@@ -451,6 +459,7 @@ fn populate(
             language,
             &nested,
             returns,
+            callable,
             position,
             output,
             depth + 1,
@@ -712,6 +721,7 @@ fn calls(
     source: &str,
     language: SyntaxLanguage,
     returns: &HashMap<String, Option<String>>,
+    callable: &std::collections::HashSet<String>,
     binding: &mut HashMap<String, Option<String>>,
     output: &mut Vec<DeclarationCall>,
     depth: usize,
@@ -832,18 +842,36 @@ fn calls(
             | "bracket_index_expression"
     ) && !invocation_target(node)
     {
+        let name = call_name(node, source, returns, binding);
         output.push(DeclarationCall {
-            kind: DeclarationCallKind::Property,
-            name: call_name(node, source, returns, binding),
+            kind: if callable.contains(&name) { DeclarationCallKind::Callback } else { DeclarationCallKind::Property },
+            name,
             unresolved: member_access(node, source).is_none()
                 || shadowed_target(node, source, returns, binding),
             line: node.start_position().row as u32 + 1,
             column: node.start_position().column as u32,
         });
     }
+    if matches!(node.kind(), "identifier" | "scoped_identifier" | "type_identifier" | "scoped_type_identifier")
+        && !invocation_target(node)
+        && !binding.contains_key(contents(node, source))
+        && !node.parent().is_some_and(|parent| {
+            matches!(parent.kind(), "scoped_identifier" | "scoped_type_identifier" | "field_expression" | "member_expression" | "dot_index_expression" | "method_index_expression" | "subscript_expression" | "bracket_index_expression" | "parameters" | "parameter" | "closure_parameters" | "variable_list" | "type_annotation" | "type_arguments")
+                || matches!(parent.kind(), "let_declaration" | "variable_declarator") && parent.child_by_field_name("pattern").or_else(|| parent.child_by_field_name("name")).is_some_and(|name| name.id() == node.id())
+        })
+    {
+        let name = contents(node, source).to_owned();
+        let callback = callable.contains(&name);
+        output.push(DeclarationCall {
+            kind: if callback { DeclarationCallKind::Callback } else { DeclarationCallKind::Value },
+            unresolved: false, name,
+            line: node.start_position().row as u32 + 1,
+            column: node.start_position().column as u32,
+        });
+    }
     let mut cursor = node.walk();
     for child in node.named_children(&mut cursor) {
-        calls(child, source, language, returns, binding, output, depth + 1)?;
+        calls(child, source, language, returns, callable, binding, output, depth + 1)?;
     }
     if let Some((name, value)) = pending_binding {
         binding.insert(name, value);
@@ -977,6 +1005,19 @@ mod tests {
                 .collect::<Vec<_>>(),
             ["Client::send", "z", "a", "z"]
         );
+    }
+
+    #[test]
+    fn callbacks_and_named_values_preserve_extraction_order_and_shadowing() {
+        let source = "const LIMIT: u32 = 3; fn worker() {} fn install() { register(worker); consume(LIMIT); worker(); } fn shadowed(worker: fn()) { register(worker); }";
+        let functions = DeclarationCalls::extract("lib.rs", source, false).unwrap();
+        let install = functions.iter().find(|function| function.owner == "install").unwrap();
+        assert_eq!(install.call.iter().map(|call| (call.name.as_str(), call.kind)).collect::<Vec<_>>(), [
+            ("register", DeclarationCallKind::Call), ("worker", DeclarationCallKind::Callback),
+            ("consume", DeclarationCallKind::Call), ("LIMIT", DeclarationCallKind::Value), ("worker", DeclarationCallKind::Call),
+        ]);
+        let shadowed = functions.iter().find(|function| function.owner == "shadowed").unwrap();
+        assert!(!shadowed.call.iter().any(|call| call.name == "worker" && !call.unresolved));
     }
 
     #[test]

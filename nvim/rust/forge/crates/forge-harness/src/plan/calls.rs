@@ -18,9 +18,20 @@ pub enum CallKind {
     Call,
     /// Reads, writes, or takes a reference to a named property.
     Property,
+    /// Takes a callable as a value, including callback registration.
+    Callback,
+    /// Reads a named value or constructs a named type.
+    Value,
 }
 
 impl CallKind {
+    /// Group semantic references into the two editable body sections.
+    pub(crate) fn category(self) -> Self {
+        match self {
+            Self::Call | Self::Callback => Self::Call,
+            Self::Property | Self::Value => Self::Property,
+        }
+    }
     /// Preserve canonical bytes for older invocation-only plan snapshots.
     pub(crate) fn is_call(&self) -> bool {
         *self == Self::Call
@@ -31,6 +42,8 @@ impl CallKind {
         match self {
             Self::Call => "call",
             Self::Property => "property",
+            Self::Callback => "callback",
+            Self::Value => "value",
         }
     }
 }
@@ -123,6 +136,8 @@ pub(crate) fn from_extracted(
                     kind: match call.kind {
                         forge_diff::syntax::DeclarationCallKind::Call => CallKind::Call,
                         forge_diff::syntax::DeclarationCallKind::Property => CallKind::Property,
+                        forge_diff::syntax::DeclarationCallKind::Callback => CallKind::Callback,
+                        forge_diff::syntax::DeclarationCallKind::Value => CallKind::Value,
                     },
                     name: call.name,
                     unresolved: call.unresolved,
@@ -134,6 +149,26 @@ pub(crate) fn from_extracted(
                 .collect()),
         })
         .collect()
+}
+
+/// Refine non-invoking references using captured declaration identities without source discovery.
+pub(crate) fn classify(path: &str, functions: &mut [FunctionBody], resolver: &mut crate::declaration::DeclarationResolver) {
+    let mut classification = BTreeMap::new();
+    for function in functions {
+        for reference in function.call.iter_mut().flatten() {
+            if reference.unresolved || !matches!(reference.kind, CallKind::Value | CallKind::Property) { continue; }
+            let key = (function.owner.clone(), reference.name.clone(), reference.kind);
+            let kind = classification.entry(key).or_insert_with(|| {
+                let target = resolver.value(path, &function.owner, &reference.name);
+                match resolver.role(&target) {
+                    Some(forge_diff::syntax::DeclarationRole::Callable) => CallKind::Callback,
+                    Some(forge_diff::syntax::DeclarationRole::Value | forge_diff::syntax::DeclarationRole::Type | forge_diff::syntax::DeclarationRole::Module) => CallKind::Value,
+                    _ => reference.kind,
+                }
+            });
+            reference.kind = *kind;
+        }
+    }
 }
 
 /// Return an editable file view in declaration and stored call order.
@@ -246,15 +281,15 @@ pub(crate) fn insert(
                         .call
                         .iter()
                         .flatten()
-                        .filter(|call| call.kind == kind)
-                        .map(|call| call.name.as_str())
+                        .filter(|call| call.kind.category() == kind)
+                        .map(|call| (call.name.as_str(), call.kind))
                         .collect::<Vec<_>>();
                     if targets.is_empty() && !(kind == CallKind::Call && occurrences.is_empty()) {
                         continue;
                     }
                     if review {
                         let mut seen = std::collections::HashSet::with_capacity(targets.len());
-                        targets.retain(|name| seen.insert(*name));
+                        targets.retain(|(name, _)| seen.insert(*name));
                         if sort {
                             targets.sort_unstable();
                         }
@@ -262,16 +297,17 @@ pub(crate) fn insert(
                     let heading = match kind {
                         CallKind::Call => "Calls",
                         CallKind::Property => "Accesses",
+                        _ => unreachable!(),
                     };
                     output.push_str(&format!("{indent}{body_indent}{heading}\n"));
                     source.push(Some(DeclarationPosition {
                         line: function.line,
                         column: function.column,
                     }));
-                    for name in targets {
+                    for (name, semantic_kind) in targets {
                         call_row.insert(
                             source.len(),
-                            (function.owner.clone(), name.to_owned(), kind),
+                            (function.owner.clone(), name.to_owned(), semantic_kind),
                         );
                         output.push_str(&format!("{indent}{body_indent}  {name}\n"));
                         source.push(Some(DeclarationPosition {
@@ -540,7 +576,7 @@ pub(crate) fn parse(
             .flat_map(|calls| calls.call.iter().flatten())
         {
             if let Some(entry) = category
-                .get_mut(&previous.kind)
+                .get_mut(&previous.kind.category())
                 .and_then(std::collections::VecDeque::pop_front)
             {
                 names.push(entry);
@@ -557,7 +593,7 @@ pub(crate) fn parse(
             .flat_map(|calls| calls.call.iter().flatten())
         {
             remaining
-                .entry((call.name.clone(), call.kind))
+                .entry((call.name.clone(), call.kind.category()))
                 .or_default()
                 .push_back(call.clone());
         }

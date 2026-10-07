@@ -676,6 +676,12 @@ pub(super) fn declaration_surrogate(language: SyntaxLanguage, overview: &str) ->
                     format!("{line}\n")
                 }
             } else if language == SyntaxLanguage::Lua
+                && text.starts_with("local ")
+                && !text.contains('=')
+                && text[6..].chars().all(|character| character.is_alphanumeric() || character == '_')
+            {
+                format!("{line} = nil\n")
+            } else if language == SyntaxLanguage::Lua
                 && !text.is_empty()
                 && text
                     .chars()

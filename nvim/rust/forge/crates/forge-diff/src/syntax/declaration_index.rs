@@ -14,9 +14,24 @@ pub enum SymbolVisibility {
     Public,
 }
 
+/// The declaration contract used to classify structured incoming references.
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub enum DeclarationRole {
+    Callable,
+    Type,
+    Property,
+    Value,
+    Module,
+    Variant,
+    Binding,
+}
+
 /// A named declaration with its lexical scope and exact source position.
 #[derive(Clone, Debug)]
 pub struct DeclarationSymbol {
+    pub role: DeclarationRole,
+    /// A test or trait contract whose invoker need not appear in source declarations.
+    pub external_entry: bool,
     /// Distinguishes named fields and properties from callable and type declarations.
     pub property: bool,
     pub name: String,
@@ -144,7 +159,14 @@ impl DeclarationIndex {
             ..Self::default()
         };
         if language == SyntaxLanguage::Lua {
+            let surrogate;
+            let source = if tree.root_node().has_error() {
+                surrogate = super::declaration::declaration_surrogate(language, source);
+                tree = parser.parse(&surrogate, None).ok_or(SyntaxError::Cancelled)?;
+                surrogate.as_str()
+            } else { source };
             lua_imports(tree.root_node(), source, &mut index);
+            lua_symbols(tree.root_node(), source, &mut index, &[], 0)?;
             return Ok((index, DeclarationIndexTiming { parse, extract: started.elapsed() }));
         }
         index.external_module = children(tree.root_node())
@@ -209,6 +231,118 @@ fn lua_imports(root: Node<'_>, source: &str, index: &mut DeclarationIndex) {
     }
 }
 
+fn lua_symbols(root: Node<'_>, source: &str, index: &mut DeclarationIndex, scope: &[String], depth: usize) -> Result<(), SyntaxError> {
+    let mut local = std::collections::HashSet::new();
+    let mut exported = std::collections::HashSet::new();
+    for statement in children(root) {
+        if statement.kind() == "return_statement" {
+            if let Some(value) = children(statement).into_iter().find(|child| child.kind() == "expression_list") {
+                for name in children(value).into_iter().filter(|child| child.kind() == "identifier") {
+                    exported.insert(contents(name, source).to_owned());
+                }
+            }
+        }
+        if statement.kind() == "variable_declaration" {
+            for assignment in children(statement) {
+                if let Some(variables) = children(assignment).into_iter().find(|child| child.kind() == "variable_list") {
+                    for name in children(variables).into_iter().filter(|child| child.kind() == "identifier") {
+                        local.insert(contents(name, source).to_owned());
+                    }
+                }
+            }
+        }
+    }
+    lua_symbol_walk(root, source, index, scope, &local, &exported, depth)
+}
+
+fn lua_symbol_walk(node: Node<'_>, source: &str, index: &mut DeclarationIndex, scope: &[String], local: &std::collections::HashSet<String>, exported: &std::collections::HashSet<String>, depth: usize) -> Result<(), SyntaxError> {
+    if depth > 128 || index.symbol.len() > 65536 { return Err(SyntaxError::CaptureLimit); }
+    if node.kind() == "function_declaration" {
+        if let Some(name) = node.child_by_field_name("name") {
+            let parts = contents(name, source).replace(':', ".").split('.').map(str::to_owned).collect::<Vec<_>>();
+            let Some(member) = parts.last() else { return Ok(()); };
+            let mut owner = scope.to_vec();
+            owner.extend(parts[..parts.len() - 1].iter().cloned());
+            if parts.len() > 1 {
+                let path = parts[..parts.len() - 1].to_vec();
+                index.reference.push(DeclarationReference {
+                    length: path.join(".").len(), path, position: position(name), scope: scope.to_vec(),
+                    value_namespace: true, macro_namespace: false, conditional: false,
+                });
+            }
+            let private = contents(node, source).trim_start().starts_with("local ")
+                || parts.first().is_some_and(|root| local.contains(root) && !exported.contains(root));
+            index.symbol.push(DeclarationSymbol {
+                role: DeclarationRole::Callable, external_entry: false, property: false,
+                name: member.clone(), scope: owner, position: DeclarationPosition { line: position(name).line, column: position(name).column + contents(name, source).len() as u32 - member.len() as u32 },
+                visibility: if private { SymbolVisibility::Private } else { SymbolVisibility::Public },
+                type_namespace: false, value_namespace: true, macro_namespace: false,
+                conditional: false, global: !private, parameter: false,
+            });
+        }
+        return Ok(());
+    }
+    if node.kind() == "return_statement" {
+        for expression in children(node).into_iter().filter(|child| child.kind() == "expression_list").flat_map(children).filter(|child| child.kind() == "identifier") {
+            index.reference.push(DeclarationReference {
+                path: vec![contents(expression, source).into()], position: position(expression), length: contents(expression, source).len(), scope: scope.to_vec(),
+                value_namespace: true, macro_namespace: false, conditional: false,
+            });
+        }
+        return Ok(());
+    }
+    if node.kind() == "variable_list" && node.parent().is_some_and(|parent| parent.kind() == "assignment_statement") {
+        for name in children(node).into_iter().filter(|child| matches!(child.kind(), "identifier" | "dot_index_expression")) {
+            let name_text = contents(name, source);
+            if index.import.iter().any(|import| import.alias.as_deref() == Some(name_text)) { continue; }
+            let mut parts = name_text.split('.').map(str::to_owned).collect::<Vec<_>>();
+            let member = parts.pop().unwrap();
+            let root = parts.first().map(String::as_str).unwrap_or(&member);
+            let public = !local.contains(root) || exported.contains(root);
+            index.symbol.push(DeclarationSymbol {
+                role: if parts.is_empty() { DeclarationRole::Value } else { DeclarationRole::Property }, external_entry: false, property: !parts.is_empty(),
+                name: member.clone(), scope: scope.iter().cloned().chain(parts).collect(), position: DeclarationPosition { line: position(name).line, column: position(name).column + name_text.len() as u32 - member.len() as u32 },
+                visibility: if public { SymbolVisibility::Public } else { SymbolVisibility::Private },
+                type_namespace: false, value_namespace: true, macro_namespace: false,
+                conditional: false, global: public, parameter: false,
+            });
+        }
+        return Ok(());
+    }
+    for child in children(node) {
+        lua_symbol_walk(child, source, index, scope, local, exported, depth + 1)?;
+    }
+    Ok(())
+}
+
+fn declaration_role(kind: &str) -> DeclarationRole {
+    match kind {
+        "function_item" | "function_signature_item" | "function_declaration" | "function_signature" | "method_definition" | "method_signature" => DeclarationRole::Callable,
+        "field_declaration" | "public_field_definition" | "property_signature" => DeclarationRole::Property,
+        "struct_item" | "enum_item" | "trait_item" | "type_item" | "class_declaration" | "abstract_class_declaration" | "interface_declaration" | "type_alias_declaration" | "enum_declaration" | "associated_type" => DeclarationRole::Type,
+        "mod_item" | "internal_module" | "module" => DeclarationRole::Module,
+        "enum_variant" => DeclarationRole::Variant,
+        "type_parameter" | "constrained_type_parameter" | "optional_type_parameter" | "mapped_type_clause" => DeclarationRole::Binding,
+        _ => DeclarationRole::Value,
+    }
+}
+
+fn declaration_entry(node: Node<'_>, attributes: &str) -> bool {
+    let normalized = attributes.chars().filter(|character| !character.is_whitespace()).collect::<String>();
+    if normalized.split("#[").skip(1).any(|attribute| {
+        let name = attribute.split(['(', ']']).next().unwrap_or_default();
+        matches!(name, "test" | "bench" | "proc_macro" | "proc_macro_attribute" | "proc_macro_derive") || name.ends_with("::test")
+    }) { return true; }
+    let mut parent = node.parent();
+    while let Some(owner) = parent {
+        if matches!(owner.kind(), "trait_item" | "interface_declaration") { return true; }
+        if owner.kind() == "impl_item" { return owner.child_by_field_name("trait").is_some(); }
+        if matches!(owner.kind(), "function_item" | "method_definition") { return false; }
+        parent = owner.parent();
+    }
+    false
+}
+
 fn children(node: Node<'_>) -> Vec<Node<'_>> {
     let mut cursor = node.walk();
     node.named_children(&mut cursor).collect()
@@ -241,6 +375,13 @@ fn quoted_attribute(text: &str, name: &str) -> Option<String> {
 
 fn visibility(node: Node<'_>, source: &str, exported: bool, rust: bool) -> SymbolVisibility {
     if !rust {
+        if matches!(node.kind(), "method_definition" | "method_signature" | "public_field_definition" | "property_signature") {
+            return if children(node).iter().any(|child| {
+                child.kind() == "accessibility_modifier" && matches!(contents(*child, source), "private" | "protected")
+            }) || node.child_by_field_name("name").is_some_and(|name| name.kind() == "private_property_identifier") {
+                SymbolVisibility::Private
+            } else { SymbolVisibility::Public };
+        }
         return if exported {
             SymbolVisibility::Public
         } else {
@@ -551,7 +692,18 @@ fn walk(
             | "optional_type_parameter"
             | "variable_declarator"
             | "mapped_type_clause"
+            | "enum_variant"
     );
+    if !rust && node.parent().is_some_and(|parent| parent.kind() == "enum_body") && matches!(kind, "property_identifier" | "string" | "enum_assignment") {
+        let name = node.child_by_field_name("name").unwrap_or(node);
+        index.symbol.push(DeclarationSymbol {
+            role: DeclarationRole::Variant, external_entry: false, property: true,
+            name: contents(name, source).trim_matches(['\'', '"']).into(), scope: scope.to_vec(), position: position(name),
+            visibility: SymbolVisibility::Public, type_namespace: false, value_namespace: true, macro_namespace: false,
+            conditional, global: false, parameter: false,
+        });
+        return Ok(());
+    }
     let mut nested = scope.to_vec();
     let mut name_node = None;
     if declaration {
@@ -587,11 +739,13 @@ fn walk(
                         | "associated_type"
                 ) || parameter;
                 index.symbol.push(DeclarationSymbol {
+                    role: if kind == "variable_declarator" && node.child_by_field_name("value").is_some_and(|value| matches!(value.kind(), "arrow_function" | "function_expression")) { DeclarationRole::Callable } else { declaration_role(kind) },
+                    external_entry: declaration_entry(node, attributes),
                     property: matches!(kind, "field_declaration" | "public_field_definition" | "property_signature"),
                     name: name_text.clone(),
                     scope: scope.to_vec(),
                     position: position(name),
-                    visibility: visibility(node, source, exported, rust),
+                    visibility: if kind == "enum_variant" { SymbolVisibility::Public } else { visibility(node, source, exported, rust) },
                     type_namespace: type_namespace && !public_macro,
                     macro_namespace: public_macro || kind == "mod_item",
                     value_namespace: !matches!(
@@ -616,6 +770,7 @@ fn walk(
                         | "class_declaration"
                         | "abstract_class_declaration"
                         | "interface_declaration"
+                        | "enum_declaration"
                         | "function_declaration"
                         | "function_signature"
                         | "internal_module"
@@ -627,6 +782,7 @@ fn walk(
                         | "field_declaration"
                         | "public_field_definition"
                         | "variable_declarator"
+                        | "enum_variant"
                 ) {
                     nested.push(name_text);
                 }
@@ -645,6 +801,8 @@ fn walk(
             .find(|child| child.kind() == "type_identifier")
         {
             index.symbol.push(DeclarationSymbol {
+                role: DeclarationRole::Binding,
+                external_entry: false,
                     property: false,
                 name: contents(name, source).into(),
                 scope: scope.to_vec(),
@@ -702,6 +860,8 @@ fn walk(
             nested.push(owner_text);
             nested.push(synthetic_scope(ordinal, "impl"));
             index.symbol.push(DeclarationSymbol {
+                role: DeclarationRole::Binding,
+                external_entry: false,
                     property: false,
                 name: "Self".into(),
                 scope: nested.clone(),
@@ -718,6 +878,8 @@ fn walk(
     }
     if kind == "trait_item" {
         index.symbol.push(DeclarationSymbol {
+            role: DeclarationRole::Binding,
+            external_entry: false,
                     property: false,
             name: "Self".into(),
             scope: nested.clone(),
@@ -903,6 +1065,8 @@ fn rust_attribute(node: Node<'_>, source: &str, scope: &[String], conditional: b
         "proc_macro_derive" => {
             if let Some(name) = children(*arguments).into_iter().find(|child| child.kind() == "identifier") {
                 index.symbol.push(DeclarationSymbol {
+                    role: DeclarationRole::Value,
+                    external_entry: true,
                     property: false,
                     name: contents(name, source).into(), scope: scope.to_vec(), position: position(name),
                     visibility: SymbolVisibility::Public, type_namespace: false, value_namespace: false,
@@ -1184,6 +1348,17 @@ mod tests {
                 .iter()
                 .any(|reference| reference.path == ["Entry"])
         );
+    }
+
+    #[test]
+    fn indexes_typescript_variants_and_callable_bindings() {
+        let index = DeclarationIndex::extract("api.ts", "export enum State { Ready, Active = 1 } const worker = () => {}; export function install() { register(worker); }").unwrap();
+        for name in ["Ready", "Active"] {
+            let symbol = index.symbol.iter().find(|symbol| symbol.name == name).unwrap();
+            assert_eq!(symbol.role, DeclarationRole::Variant);
+            assert_eq!(symbol.scope, ["State"]);
+        }
+        assert_eq!(index.symbol.iter().find(|symbol| symbol.name == "worker").unwrap().role, DeclarationRole::Callable);
     }
 
     #[test]

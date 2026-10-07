@@ -8,6 +8,8 @@ use crate::session::{ExecutionMode, continuation::ContinuationBudget};
 
 mod audit;
 mod comment_lint;
+mod usage;
+pub(crate) use design::workspace_source;
 mod design;
 pub(crate) mod calls;
 mod references;
@@ -897,7 +899,7 @@ impl PlanFileStore {
         );
         let index = references::PlanReferenceIndex::planned(&document, &self.workspace)?;
         let (_, definition) = index.rename_definition(&document, identity)?;
-        let mut renamed = index.renamed(&document, &self.workspace, identity, name)?;
+        let mut renamed = index.renamed(&document, identity, name)?;
         renamed.design = Some(renamed.design.as_ref().unwrap().formatted()?);
         renamed.validate_for_submission()?;
         let (document, rendered, digest) =
@@ -959,6 +961,7 @@ impl PlanFileStore {
             let formatted = design.formatted()?;
             formatted.check_workspace(&self.workspace)?;
             comment_lint::validate(design)?;
+            usage::validate(&formatted, &self.workspace)?;
             document.design = Some(formatted);
         }
         document.validate_for_submission()?;

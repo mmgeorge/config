@@ -20,7 +20,7 @@ compact = "/// Registry keeps the published handles and exposes the shared decla
 if bevy_navigation then compact = "use bevy::prelude::*;\n" .. compact end
 vim.fn.writefile({ '{"declaration_line_width":60}' }, workspace .. "/.forge.json")
 vim.fn.writefile(vim.split(compact, "\n", { plain = true }), workspace .. "/src/change.rs")
-vim.fn.writefile({ "/// Exposes movement declarations.", "mod change;", "/// Consumes movement declarations.", "mod input_consumer;" }, workspace .. "/src/lib.rs")
+vim.fn.writefile({ "/// Exposes movement declarations.", "pub mod change;", "/// Consumes movement declarations.", "mod input_consumer;" }, workspace .. "/src/lib.rs")
 vim.fn.writefile({ "use engine::*;", "use crate::change::MovementInput;", "/// Uses sampled movement intent.",
   "pub(crate) fn move_player(movement: Res<MovementInput>);", "/// Owns remote review state.", "pub(crate) struct RemoteState;" }, workspace .. "/src/input_consumer.rs")
 local engine = vim.fn.tempname()

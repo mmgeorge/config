@@ -19,6 +19,20 @@ local function valid_window(win)
   return win and vim.api.nvim_win_is_valid(win)
 end
 
+---@param spec { height_ratio?: number }
+---@param content_height integer
+---@param host_height integer
+---@return integer
+local function window_height(spec, content_height, host_height)
+  local available = math.max(4, host_height - 2)
+  if spec.height_ratio ~= nil then
+    assert(type(spec.height_ratio) == "number" and spec.height_ratio > 0 and spec.height_ratio <= 1,
+      "picker height ratio must be greater than zero and at most one")
+    available = math.min(available, math.max(4, math.floor(host_height * spec.height_ratio)))
+  end
+  return math.min(content_height, config.options.picker.max_height, available)
+end
+
 local function title_chunks(instance, width)
   local page = picker_state.page(instance.state, instance.spec)
   local title = page.title or instance.spec.title or "Select"
@@ -159,7 +173,7 @@ local function render_view(instance)
     end
   end
   frame.input_height = page.input_height or config.options.picker.input_height
-  local height = math.min(#frame.lines, config.options.picker.max_height, math.max(4, bounds.height - 2))
+  local height = window_height(instance.spec, #frame.lines, bounds.height)
   local border_footer
   if #frame.lines > height then
     border_footer = vim.trim(table.remove(frame.lines, frame.footer_line))
@@ -524,7 +538,7 @@ function Picker.open(spec)
   local initial_page = picker_state.page(state, spec)
   local initial_frame = layout.build(initial_page, picker_state.selected_index(state, spec), width,
     { search_visible = not initial_page.search or not initial_page.search.start_in_normal })
-  local height = math.min(#initial_frame.lines, config.options.picker.max_height, math.max(4, bounds.height - 2))
+  local height = window_height(spec, #initial_frame.lines, bounds.height)
   local instance = {
     spec = spec,
     state = state,
