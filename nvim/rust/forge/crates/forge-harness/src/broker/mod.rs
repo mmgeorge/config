@@ -2009,6 +2009,9 @@ impl HarnessBroker {
 
     async fn submit_prompt_inner(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let text = required_text(&params, "text")?;
+        if text.trim() == "/plan" {
+            return self.select_harness_mode(json!({ "mode": "plan" }));
+        }
         if text == "/read" {
             return self.select_execution_mode(json!({ "mode": "read" }));
         }
@@ -2045,7 +2048,6 @@ impl HarnessBroker {
             !failed_plan_active,
             "plan generation stopped; run /plan retry or /plan cancel"
         );
-        anyhow::ensure!(text != "/plan", "usage: /plan <prompt>");
         anyhow::ensure!(text != "/replan", "select a plan and revision with the /replan picker");
         let explicit_plan_request = text.strip_prefix("/plan ");
         let active_plan_controls = self

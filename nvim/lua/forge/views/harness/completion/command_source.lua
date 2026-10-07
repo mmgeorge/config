@@ -24,7 +24,7 @@ local command_list = {
   { label = "/bg", detail = "List and terminate background terminals" },
   { label = "/agent", detail = "Switch between Main and child-agent timelines", capability = "agent_observe" },
   { label = "/spawn", detail = "Spawn a child agent", capability = "agent_catalog" },
-  { label = "/plan", detail = "Create a reviewed plan" },
+  { label = "/plan", detail = "Enter Plan mode, or create a reviewed plan with a prompt" },
   { label = "/replan", detail = "Start planning from a saved plan revision" },
   { label = "/plan cancel", detail = "Cancel the active plan" },
   { label = "/sessions", detail = "Search, preview, resume, or delete a Harness session" },

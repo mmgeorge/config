@@ -1526,7 +1526,7 @@ function M.submit()
     end)
     return
   end
-  if vim.tbl_contains({ "/read", "/write", "/full", "/yolo" }, text) then
+  if vim.tbl_contains({ "/read", "/write", "/full", "/yolo", "/plan" }, text) then
     set_composer_text(state.composer_buf, "")
     M.set_mode(text:sub(2))
     return
@@ -1812,7 +1812,7 @@ function M.queue_submit()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
-  if text == "/config" or text == "/log" or text:match("^/log%s") then M.submit() return end
+  if text == "/plan" or text == "/config" or text == "/log" or text:match("^/log%s") then M.submit() return end
   if text == "/bg" or text == "/recap" or text == "/mcp" or text == "/replan" or text == "/plan cancel" or text == "/fast" or text:match("^/fast%s") then M.submit() return end
   if text == "/model" then
     M.select_model(function(next_config)

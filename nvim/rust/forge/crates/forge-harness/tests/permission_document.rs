@@ -129,13 +129,21 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
             params: json!({ "text": "/write" }),
         })
         .await;
-    broker
-        .dispatch(Request {
-            id: 12,
-            method: "session.mode".into(),
-            params: json!({ "mode": "plan" }),
-        })
-        .await;
+    for command in ["/plan", "  /plan \n", "/plan"] {
+        let changed = broker
+            .dispatch(Request {
+                id: 12,
+                method: "prompt.submit".into(),
+                params: json!({ "text": command }),
+            })
+            .await;
+        assert!(changed.response.error().is_none());
+        let snapshot = broker.snapshot().unwrap();
+        assert_eq!(snapshot.session.mode, HarnessMode::Plan);
+        assert_eq!(snapshot.session.execution_mode, ExecutionMode::Write);
+        assert!(snapshot.active_plan.is_none());
+        assert!(snapshot.exchange.is_empty());
+    }
     let planned = broker
         .dispatch(Request {
             id: 13,
@@ -149,6 +157,18 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         ExecutionMode::Write
     );
     assert_eq!(broker.snapshot().unwrap().session.mode, HarnessMode::Plan);
+    let before = broker.snapshot().unwrap();
+    let retained = broker
+        .dispatch(Request {
+            id: 15,
+            method: "prompt.submit".into(),
+            params: json!({ "text": "/plan" }),
+        })
+        .await;
+    assert!(retained.response.error().is_none());
+    let after = broker.snapshot().unwrap();
+    assert_eq!(after.active_plan.unwrap().id, before.active_plan.unwrap().id);
+    assert_eq!(after.exchange.len(), before.exchange.len());
     let accepted = broker
         .dispatch(Request {
             id: 14,

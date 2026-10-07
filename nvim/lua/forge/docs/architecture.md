@@ -2291,7 +2291,10 @@ one resumable SDK `Session`. The SDK owns CLI startup and authentication when th
 stays empty. An explicit command remains available for development and pinned installations.
 The backend subscribes before every send, forwards deltas immediately, and lets
 `CopilotEventDecoder` normalize messages, reasoning, tool lifecycle, usage, tasks, and subagent
-events into the same broker model as Codex. `/plan` does not select a provider-native plan mode.
+events into the same broker model as Codex. Bare `/plan` uses the existing session mode transition
+without creating a plan or sending a model request. `/plan <request>` starts planning immediately,
+and an ordinary prompt in Plan mode starts planning when no active plan controls own the input.
+`/plan` does not select a provider-native plan mode.
 Harness sends the same structured planning contract through both backends without changing the
 session's retained Read, Write, Full, or YOLO authorization. `plan/prompts/planning.md` owns the
 JSON authoring procedure, field contracts, independence checks, and complete edit example.
