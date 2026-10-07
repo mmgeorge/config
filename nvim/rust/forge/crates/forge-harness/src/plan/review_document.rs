@@ -404,6 +404,7 @@ impl PlanReviewStore {
 
 pub(crate) struct PlanReviewDocument {
     reference: Mutex<HashMap<bool, super::references::PlanReferenceIndex>>,
+    reference_context: Mutex<HashMap<bool, super::reference_context::ReferenceContext>>,
     focused_annotation: Option<String>,
     annotation_revision: HashMap<
         String,
@@ -586,7 +587,13 @@ impl PlanReviewDocument {
         };
         let occurrences = index.occurrence.iter().filter(|reference| reference.symbol == symbol).collect::<Vec<_>>();
         if occurrences.is_empty() { return Ok(serde_json::json!({"message":"No references in this plan snapshot."})); }
-        Ok(serde_json::json!({"references":occurrences,"revision":self.document.revision()}))
+        let mut context = self.reference_context.lock().map_err(|_| anyhow::anyhow!("plan reference context cache lock poisoned"))?;
+        if !context.contains_key(&baseline) {
+            context.insert(baseline, super::reference_context::ReferenceContext::build(&self.source, baseline)?);
+        }
+        let context = context.get(&baseline).unwrap();
+        let entries = occurrences.into_iter().map(|reference| context.entry(reference)).collect::<Result<Vec<_>>>()?;
+        Ok(serde_json::json!({"references":entries,"revision":self.document.revision()}))
     }
 
     fn reveal_reference(&mut self, id: &str) -> Result<serde_json::Value> {
@@ -1086,6 +1093,7 @@ impl PlanReviewDocument {
         view_width.open(view.clone(), width.clone())?;
         Ok(Self {
             reference: Default::default(),
+            reference_context: Default::default(),
             focused_annotation,
             annotation_revision: HashMap::new(),
             id,
@@ -2413,6 +2421,14 @@ mod tests {
         let row = block.text.row(0).unwrap();
         let references = document.references(&anchor, row, row.find("send").unwrap()).unwrap();
         let call = references["references"].as_array().unwrap().iter().find(|reference| reference["kind"] == "call").unwrap();
+        assert_eq!(call["text"].as_str().unwrap().trim(), "send");
+        assert!(call["text_highlight"].as_array().unwrap().iter().any(|capture| capture["capture"] == "@function.call"));
+        let baseline_context = super::super::reference_context::ReferenceContext::build(&document.source, true).unwrap();
+        let mut baseline_call = document.reference.lock().unwrap().get(&false).unwrap().occurrence.iter().find(|reference| reference.kind == "call").unwrap().clone();
+        baseline_call.side = "baseline".into();
+        let baseline_entry = serde_json::to_value(baseline_context.entry(&baseline_call).unwrap()).unwrap();
+        assert_eq!(baseline_entry["text"].as_str().unwrap().trim(), "send");
+        assert_eq!(baseline_entry["side"], "baseline");
         let result = document.reveal_reference(call["id"].as_str().unwrap()).unwrap();
         let jump: forge_buffer::block::BlockAnchor = serde_json::from_value(result["jump"].clone()).unwrap();
         assert_eq!(document.document.block(&jump.block).unwrap().text.row(0).unwrap().trim(), "send");

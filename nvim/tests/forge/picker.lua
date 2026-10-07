@@ -24,6 +24,89 @@ local ok, failure = pcall(function()
   local picker_input = require("forge.views.picker.input")
   local picker_state = require("forge.views.picker.state")
   local picker = require("forge.views.picker")
+  local styled_rows = {}
+  for index = 1, 20 do
+    styled_rows[index] = { label = "method " .. index, columns = { "foo.rs", "Client::send" },
+      column_segments = { { { "foo.rs", "ForgeFileName" } },
+        { { "Client", "@type" }, { "::" }, { "send", "@function" } } } }
+  end
+  local styled_page = { column_headers = { "Location", "Caller" }, option_list = styled_rows,
+    highlight_selected_line = true, highlight_selected_text = false }
+  local styled_frame = layout.build(styled_page, 20, 100)
+  assert_equals(styled_frame.lines[1]:find("Location", 1, true), 3, "unkeyed columns must align with the title inset")
+  assert_equals(styled_frame.lines[2]:find("foo.rs", 1, true), 3, "unkeyed values must align with their headings")
+  assert_equals(styled_frame.footer_line, styled_frame.body_end + 1, "footer must not add an empty result row")
+  styled_frame = layout.viewport(styled_frame, 8)
+  local styled_buf = vim.api.nvim_create_buf(false, true)
+  require("forge.views.picker.render").apply(styled_buf, styled_frame)
+  local styled_mark = {}
+  local selected_line_count = 0
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(styled_buf, -1, 0, -1, { details = true })) do
+    local capture = mark[4].hl_group
+    if mark[4].line_hl_group then
+      selected_line_count = selected_line_count + 1
+      assert_equals(mark[4].line_hl_group, "ForgePickerSelectedLine")
+      assert_equals(mark[2], styled_frame.primary_range[20].first - 1,
+        "selection background must follow the projected selected row")
+      assert_equals(mark[3], 0, "selection must include the leading gutter")
+      assert_equals(mark[4].end_row, nil, "line background must not extend into the next row")
+    end
+    assert_true(capture ~= "ForgePickerKey", "unkeyed rows must not highlight a synthetic hotkey")
+    assert_true(capture ~= "ForgePickerSelected", "background selection must not recolor the selected text")
+    if capture and mark[2] == styled_frame.primary_range[20].first - 1 then
+      styled_mark[capture] = styled_frame.lines[mark[2] + 1]:sub(mark[3] + 1, mark[4].end_col)
+    end
+  end
+  assert_equals(styled_mark.ForgeFileName, "foo.rs", "filename style must survive scrolling on selected rows")
+  assert_equals(selected_line_count, 1, "only the selected row may receive a full-line background")
+  assert_true(vim.api.nvim_get_hl(0, { name = "ForgePickerSelectedLine", link = false }).bg ~= nil,
+    "selected line highlight must supply a background")
+  assert_equals(styled_mark["@type"], "Client", "caller type style must survive viewport remapping")
+  assert_equals(styled_mark["@function"], "send", "caller method style must cover only its identifier")
+  styled_page.highlight_selected_line, styled_page.highlight_selected_text = nil, nil
+  local default_frame = layout.viewport(layout.build(styled_page, 19, 100), 8)
+  require("forge.views.picker.render").apply(styled_buf, default_frame)
+  local selected_text_count = 0
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(styled_buf, -1, 0, -1, { details = true })) do
+    assert_equals(mark[4].line_hl_group, nil, "default selection must clear any prior line background")
+    if mark[4].hl_group == "ForgePickerSelected" then
+      selected_text_count = selected_text_count + 1
+      assert_equals(mark[2], default_frame.primary_range[19].first - 1, "default text highlight must follow selection")
+    end
+  end
+  assert_equals(selected_text_count, 1, "text selection must remain enabled by default")
+  vim.api.nvim_buf_delete(styled_buf, { force = true })
+  local keyed_frame = layout.build({ option_list = { { key = "a", label = "One" }, { label = "Two" } } }, 1, 100)
+  assert_equals(keyed_frame.lines[1]:find("One", 1, true), keyed_frame.lines[2]:find("Two", 1, true),
+    "mixed keyed rows must retain aligned values")
+  assert_equals(keyed_frame.primary_range[1].key_end, 3)
+  assert_equals(keyed_frame.primary_range[2].key_end, nil)
+  local clipped_frame = layout.build({ option_list = { { label = "unicode", columns = { "界界界界界界界界界界Client" },
+    column_segments = { { { "界界界界界界界界界界", "@type" }, { "Client", "@function" } } } } } }, 1, 24)
+  local clipped_span = clipped_frame.primary_range[1].spans
+  assert_equals(#clipped_span, 1, "truncated identifiers must not retain hidden highlight spans")
+  assert_true(clipped_span[1].last < #clipped_frame.lines[1], "truncation ellipsis must not inherit identifier styling")
+  local text_page = { column_headers = { "Location", "Caller", "Text" }, flexible_column = 3,
+    option_list = { { label = "code", columns = { "src/arena.rs:30", "RoundPlugin::new", "pub fn new(config: ArenaConfig) -> Self {" },
+      column_spans = { [3] = { { first = 0, last = 3, group = "@keyword", priority = 100 },
+        { first = 0, last = 3, group = "@keyword.modifier", priority = 120 },
+        { first = 11, last = 29, group = "@type", priority = 100 } } } } } }
+  local text_frame = layout.build(text_page, 1, 58)
+  assert_true(text_frame.lines[2]:find("src/arena.rs:30", 1, true) ~= nil and text_frame.lines[2]:find("RoundPlugin::new", 1, true) ~= nil,
+    "long code must clip before its location and caller")
+  assert_true(text_frame.lines[2]:find("…", 1, true) ~= nil, "long text did not clip its end")
+  local text_buf = vim.api.nvim_create_buf(false, true)
+  require("forge.views.picker.render").apply(text_buf, text_frame)
+  local priority_by_capture = {}
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(text_buf, -1, 0, -1, { details = true })) do
+    if mark[4].hl_group and mark[4].hl_group:find("@keyword", 1, true) then priority_by_capture[mark[4].hl_group] = mark[4].priority end
+  end
+  assert_true(priority_by_capture["@keyword.modifier"] > priority_by_capture["@keyword"],
+    "overlapping text captures lost their query priorities")
+  local widened = layout.build(text_page, 1, 140)
+  assert_true(widened.lines[2]:find(text_page.option_list[1].columns[3], 1, true) ~= nil,
+    "resizing did not restore the full source line")
+  vim.api.nvim_buf_delete(text_buf, { force = true })
   local rows = {}
   for index = 1, 40 do rows[index] = { label = "Session " .. index, detail = "codex" } end
   local scrolling_page = { subtitle = "Search current repository. Open in current tab.",
@@ -357,6 +440,7 @@ local ok, failure = pcall(function()
       title = "Harness sessions",
       subtitle = "Search sessions.",
       option_list = search_options,
+      show_item_counter = true,
       search = { choice_keys = { "n", "e", "a", "i", "l", "u", "o", "y" } },
     } },
     action_list = {
@@ -383,6 +467,8 @@ local ok, failure = pcall(function()
   vim.api.nvim_buf_set_lines(active.search_buf, 0, -1, false, { "gma" })
   vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active.search_buf })
   assert_equals(#picker_state.page(active.state, active.spec).option_list, 1, "fuzzy search should filter by session name")
+  assert_true(active.frame.lines[active.frame.footer_line]:match("1 of 1$"),
+    "counter must use the filtered result count")
   assert_equals(picker_state.selected_option(active.state, active.spec).label, "Gamma migration",
     "fuzzy search should retain the matching session")
   invoke("<C-j>", "i")
@@ -412,22 +498,38 @@ local ok, failure = pcall(function()
   local overflow_spec = {
     owner = "overflow",
     host = { window_list = { origin_win, composer_win }, control_win = composer_win },
-    page_list = { { id = "overflow", option_list = long_options, footer = "Enter insert  q close" } },
+    page_list = { { id = "overflow", option_list = long_options, footer = "Enter insert  q close", show_item_counter = true } },
   }
   picker.open(overflow_spec)
   active = picker._state_for_test()
   assert_true(vim.api.nvim_win_get_config(active.win).footer[1][1]:find("Enter insert", 1, true),
     "overflowing picker lost its visible controls")
   assert_equals(active.frame.footer_line, nil, "overflowing picker duplicated its footer in scrollable content")
+  assert_true(vim.api.nvim_win_get_config(active.win).footer[1][1]:match("1 of 50%s*$"),
+    "overflowing picker did not show its first selected item")
+  assert_equals(vim.fn.strdisplaywidth(vim.api.nvim_win_get_config(active.win).footer[1][1]),
+    vim.api.nvim_win_get_width(active.win) - 2, "border counter must align at the right inset")
   invoke("<Up>")
   assert_equals(picker_state.selected_index(active.state, active.spec), 50)
+  assert_true(vim.api.nvim_win_get_config(active.win).footer[1][1]:match("50 of 50%s*$"),
+    "counter did not follow selection outside the initial viewport")
   assert_true(vim.api.nvim_win_get_config(active.win).footer[1][1]:find("q close", 1, true))
   overflow_spec.page_list[1].option_list = { { label = "Only option" } }
   picker.update(overflow_spec)
   active = picker._state_for_test()
   assert_true(active.frame.footer_line ~= nil, "short picker did not restore its inline footer")
+  assert_true(active.frame.lines[active.frame.footer_line]:match("1 of 1$"), "inline counter retained the old total")
+  assert_equals(vim.fn.strdisplaywidth(active.frame.lines[active.frame.footer_line]),
+    vim.api.nvim_win_get_width(active.win) - 2, "inline counter must align at the right inset")
   assert_true(not vim.inspect(vim.api.nvim_win_get_config(active.win).footer):find("Enter insert", 1, true),
     "short picker retained a stale border footer")
+  overflow_spec.page_list[1].option_list = {}
+  picker.update(overflow_spec)
+  assert_true(active.frame.lines[active.frame.footer_line]:match("0 of 0$"), "empty counter must not invent a selection")
+  overflow_spec.page_list[1].show_item_counter = nil
+  picker.update(overflow_spec)
+  assert_true(not active.frame.lines[active.frame.footer_line]:find("of 0", 1, true),
+    "item counter must remain opt-in")
   picker.close(false)
 
   require("forge.views.harness.model_picker").open({

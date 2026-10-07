@@ -144,6 +144,8 @@ local success, failure = xpcall(function()
   vim.api.nvim_feedkeys("of", "mtx", false)
   await(function() return picker.is_open() end, "property reference picker did not open")
   local property_picker = picker._state_for_test()
+  assert(property_picker.spec.page_list[1].option_list[1].columns[3] == "Client::count",
+    "property text did not use the unfolded Accesses row")
   assert(#property_picker.spec.page_list[1].option_list == 1, "duplicate accesses produced duplicate caller results")
   assert(property_picker.spec.page_list[1].option_list[1].value.kind == "property")
   local preview_namespace = vim.api.nvim_create_namespace("forge.plan.references.preview")
@@ -209,7 +211,19 @@ local success, failure = xpcall(function()
   local first_option = active.frame.lines[active.frame.option_range[1].first]
   local second_option = active.frame.lines[active.frame.option_range[2].first]
   assert(first_option:find("run", 1, true) == second_option:find("update", 1, true), "caller columns are not aligned")
-  assert(first_option:find("call", 1, true) == second_option:find("call", 1, true), "kind columns are not aligned")
+  assert(first_option:find("leaf", 1, true) == second_option:find("leaf", 1, true), "symbol columns are not aligned")
+  assert(vim.deep_equal(active.spec.page_list[1].column_headers, { "Location", "Caller", "Text" }), "reference picker did not replace its symbol column with text")
+  assert(active.spec.page_list[1].option_list[1].columns[3] == "leaf", "call context did not use the unfolded Calls row")
+  assert(first_option:find("src/change.rs", 1, true) == 3, "unkeyed reference location is not aligned with the title")
+  assert(active.frame.lines[active.frame.footer_line - 1] ~= "", "reference picker retained an empty footer row")
+  local caller_highlight, filename_highlight, text_highlight = false, false, false
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(active.buf, -1, 0, -1, { details = true })) do
+    local text = active.frame.lines[mark[2] + 1]:sub(mark[3] + 1, mark[4].end_col)
+    if mark[4].hl_group == "@function" and text == "run" then caller_highlight = true end
+    if mark[4].hl_group == "ForgeFileName" and text == "change.rs" then filename_highlight = true end
+    if mark[4].hl_group == "@function.call" and text == "leaf" then text_highlight = true end
+  end
+  assert(caller_highlight and filename_highlight and text_highlight, "references did not render semantic caller, filename, and text styles")
   local next_reference = vim.api.nvim_buf_call(active.buf, function() return vim.fn.maparg("<Down>", "n", false, true) end)
   next_reference.callback()
   await(function() return vim.api.nvim_win_get_cursor(review.win)[1] ~= first_preview[1]
@@ -282,6 +296,22 @@ local success, failure = xpcall(function()
   assert(#warnings == warning_count + 1, "closed reference picker repeated its stale warning")
   assert(vim.deep_equal(vim.fn.readfile(artifact, "b"), canonical), "reference navigation modified the plan")
   assert(vim.deep_equal(vim.fn.readfile(workspace .. "/src/change.rs"), source), "planning modified implementation source")
+  for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    if row:find("pub struct Client", 1, true) then
+      vim.api.nvim_win_set_cursor(review.win, { index, row:find("Client", 1, true) - 1 })
+      break
+    end
+  end
+  review.command_set.action_by_id.references.run({})
+  await(function() return picker.is_open() end, "type reference picker did not open")
+  local type_option
+  for _, option in ipairs(picker._state_for_test().spec.page_list[1].option_list) do
+    if option.columns[3]:find("pub fn update", 1, true) then type_option = option break end
+  end
+  assert(type_option, "type references did not include their complete declaration line")
+  assert(vim.tbl_contains(vim.tbl_map(function(span) return span.group end, type_option.column_spans[3]), "@type.rust"),
+    "declaration reference text did not reuse Rust syntax captures")
+  picker.close(true)
   local function select_new_definition()
     vim.api.nvim_set_current_win(review.win)
     for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do

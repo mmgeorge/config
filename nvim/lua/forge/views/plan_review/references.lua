@@ -3,13 +3,21 @@ local picker = require("forge.views.picker")
 local notifications = require("forge.infra.notifications")
 local preview_namespace = vim.api.nvim_create_namespace("forge.plan.references.preview")
 
+---@class ForgePlanReferenceHighlight
+---@field range table<string, { row: integer, column: integer }>
+---@field capture string
+---@field priority integer
+
 ---@class ForgePlanReference
 ---@field id string
 ---@field path string
 ---@field owner string
+---@field owner_capture (string|userdata)[]
 ---@field name string
 ---@field kind string
 ---@field line integer
+---@field text string
+---@field text_highlight ForgePlanReferenceHighlight[]
 
 --- Open snapshot-bound plan usages through the shared searchable picker.
 ---@param review table
@@ -18,13 +26,43 @@ local preview_namespace = vim.api.nvim_create_namespace("forge.plan.references.p
 function M.open(review, references, captured)
   local options = {}
   for _, reference in ipairs(references) do
+    local caller_segments = {}
+    local caller_parts = {}
+    local caller = reference.owner ~= "" and reference.owner or reference.name
+    for index, part in ipairs(vim.split(caller, "::", { plain = true })) do
+      if not part:match("^@impl:%d+$") then
+        if #caller_parts > 0 then caller_segments[#caller_segments + 1] = { "::", "@punctuation.delimiter" } end
+        caller_parts[#caller_parts + 1] = part
+        local capture = reference.owner_capture and reference.owner_capture[index]
+        caller_segments[#caller_segments + 1] = { part, type(capture) == "string" and capture or nil }
+      end
+    end
+    caller = table.concat(caller_parts, "::")
+    local filename = reference.path:match("[^/\\]+$") or reference.path
+    local directory = reference.path:sub(1, #reference.path - #filename)
+    local location = ("%s:%d"):format(reference.path, reference.line)
+    local text = reference.text:gsub("^%s+", "")
+    local leading_bytes = #reference.text - #text
+    local text_spans = {}
+    for _, highlight in ipairs(reference.text_highlight) do
+      local first = math.max(0, highlight.range.start.column - leading_bytes)
+      local last = highlight.range["end"].column - leading_bytes
+      if first < last then
+        text_spans[#text_spans + 1] = {
+          first = first, last = last, group = highlight.capture, priority = highlight.priority,
+        }
+      end
+    end
     options[#options + 1] = {
       id = reference.id,
       value = reference,
-      columns = { ("%s:%d"):format(reference.path, reference.line),
-        reference.owner ~= "" and reference.owner or reference.name, reference.kind, reference.name },
-      label = ("%s:%d  %s  [%s]  %s"):format(reference.path, reference.line,
-        reference.owner ~= "" and reference.owner or reference.name, reference.kind, reference.name),
+      columns = { location, caller, text },
+      column_segments = {
+        { { directory, "ForgeDirName" }, { filename, "ForgeFileName" }, { ":" .. reference.line, "ForgePickerHint" } },
+        caller_segments,
+      },
+      column_spans = { [3] = text_spans },
+      label = ("%s  %s  %s"):format(location, caller, text),
     }
   end
   local origin = vim.api.nvim_win_call(review.win, vim.fn.winsaveview)
@@ -130,8 +168,9 @@ function M.open(review, references, captured)
     height_ratio = 0.3,
     host = { control_win = review.win, window_list = { review.win } },
     page_list = { { id = "references", title = "References", option_list = options,
-      column_headers = { "Location", "Caller", "Kind", "Symbol" },
-      selection_mode = "single", search = { start_in_normal = true } } },
+      column_headers = { "Location", "Caller", "Text" }, flexible_column = 3,
+      highlight_selected_line = true, highlight_selected_text = false,
+      selection_mode = "single", show_item_counter = true, search = { start_in_normal = true } } },
     on_change = function(context)
       preview_height = context.preview_height
       if context.option then preview(context.option.value) else pending, displayed = nil, nil clear() end

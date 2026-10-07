@@ -687,6 +687,11 @@ type. The standalone diff, file-revision, and preview buffers are separate.
 | Picker input | `ForgePickerInput` | — | `views/picker/input.lua` | Multiline feedback, Other answers, Ask prompts, custom models, and agent tasks |
 | Plan review | `markdown` | — | `/plan <request>` | Physical editable plan, line annotations, accept or request changes |
 
+Harness prompt windows use native `winfixheight` so closing another horizontal pane or
+equalizing the layout leaves prompt height unchanged. Timeline windows explicitly clear
+`winfixheight`, including when opened from a prompt window, and receive the available height.
+Draft and queue changes still resize the prompt within its configured minimum and maximum.
+
 **Why one filetype for four views.** Folding, keymaps, highlight groups, and the
 hint-bar winbar are all keyed on the `ForgeStatus` filetype. Sharing it means the status,
 PR, PR-review, and branch-diff buffers reuse the entire status rendering and interaction
@@ -2257,7 +2262,27 @@ PlanReview binds `or` and the normal LSP-reference shortcut `of` to the plan ref
 Both buffer-local aliases dispatch the same plan action and override their global mappings only
 inside PlanReview. The reference picker caps its height at 30 percent of the review window,
 bounded by the shared 24-row maximum and a four-row minimum for controls. It recomputes the
-cap on resize and scrolls its results while retaining headers. Reference previews retain their captured view identity across focus, tab, and
+cap on resize and scrolls its results while retaining headers. Its Location, Caller, and Text
+columns omit usage-kind labels. The reference index supplies caller captures from declaration
+roles, including field owners and imported targets, without additional source reads. Caller
+display hides synthetic impl scope components while reference identities retain them.
+The shared picker removes hotkey padding when no option has a key and places controls directly
+after content. Ordered column segments retain byte-accurate highlights through truncation,
+viewport projection, and resizing. Filenames use `ForgeFileName` and callers use syntax captures.
+`ReferenceContext` lazily projects an unfolded saved side using the review's cached syntax handles,
+then retains complete lines and capture priorities for reference lookups. The context includes
+unchanged files and private declarations without changing the review's public filter or source.
+The Text column uses these lines, remains searchable, and clips at the right edge before the
+location and caller columns shrink. Resizing restores text from the complete cached line.
+References enable the shared picker's optional `show_item_counter` page flag. The footer shows
+the selected position and filtered total as `1 of N`, right aligned in both inline and border
+footers. Empty results show `0 of 0`. Other picker pages leave the flag disabled.
+Picker pages opt into `highlight_selected_line` to apply a background-only, single-row selection
+decoration across the full window width, including the leading gutter, column gaps, and trailing
+space. This flag defaults to off. `highlight_selected_text` defaults to on and controls selection
+foreground styling independently. References enable the line background and disable text styling,
+so syntax captures and unstyled text keep the same foreground colors when selected.
+Reference previews retain their captured view identity across focus, tab, and
 split changes. Preview actions and cursor state belong to the originating review window. Edits,
 newer inputs, replaced views, and host replacement invalidate the capture and close the picker
 with one warning. Named reference previews use document and input authority rather than native

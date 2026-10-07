@@ -13,6 +13,7 @@ pub(crate) use design::workspace_source;
 mod design;
 pub(crate) mod calls;
 mod references;
+mod reference_context;
 pub use calls::{CallKind, CallSite, CallPosition, FunctionBody};
 mod design_review;
 mod deviation;

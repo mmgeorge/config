@@ -18,14 +18,26 @@ function PickerRender.apply(buf, frame)
     end
   end
   for index, range in pairs(frame.primary_range or frame.option_range) do
-    local group = index == frame.selected_index and "ForgePickerSelected"
+    local group = index == frame.selected_index and frame.highlight_selected_text ~= false and "ForgePickerSelected"
       or frame.chosen_index_set and frame.chosen_index_set[index] and "ForgePickerChosen"
       or "ForgePickerOption"
     for line = range.first, range.last do
-      vim.api.nvim_buf_add_highlight(buf, namespace, group, line - 1, 0, -1)
+      vim.api.nvim_buf_set_extmark(buf, namespace, line - 1, 0, {
+        end_row = line, end_col = 0, hl_group = group, priority = 100,
+      })
+      if index == frame.selected_index and frame.highlight_selected_line then
+        vim.api.nvim_buf_set_extmark(buf, namespace, line - 1, 0, {
+          line_hl_group = "ForgePickerSelectedLine", priority = 500,
+        })
+      end
     end
-    if index ~= frame.selected_index then
-      vim.api.nvim_buf_add_highlight(buf, namespace, "ForgePickerKey", range.first - 1, 2, 3)
+    if (index ~= frame.selected_index or frame.highlight_selected_text == false) and range.key_end then
+      vim.api.nvim_buf_add_highlight(buf, namespace, "ForgePickerKey", range.first - 1, 2, range.key_end)
+    end
+    for _, span in ipairs(range.spans or {}) do
+      vim.api.nvim_buf_set_extmark(buf, namespace, range.first - 1, span.first, {
+        end_col = span.last, hl_group = span.group, priority = math.min(65535, 200 + (span.priority or 0)),
+      })
     end
     local highlight = frame.option_highlight_by_index and frame.option_highlight_by_index[index]
     if highlight then

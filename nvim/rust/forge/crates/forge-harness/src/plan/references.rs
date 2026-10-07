@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use anyhow::{Result, ensure};
-use forge_diff::syntax::{DeclarationCalls, DeclarationIndex};
+use forge_diff::syntax::{DeclarationCalls, DeclarationIndex, DeclarationRole};
 use serde::Serialize;
 
 use super::{PlanDocument, PlanNavigationAnchor, PlanReviewTarget};
@@ -14,6 +14,7 @@ pub(crate) struct PlanReference {
     pub path: String,
     pub side: String,
     pub owner: String,
+    pub owner_capture: Vec<Option<&'static str>>,
     pub name: String,
     pub kind: String,
     pub line: u32,
@@ -295,6 +296,42 @@ impl PlanReferenceIndex {
             output.occurrence.len() <= 65536,
             "plan reference index exceeds 65536 occurrences"
         );
+        let mut capture_by_path = BTreeMap::new();
+        let mut capture_by_identity = BTreeMap::new();
+        for (path, index) in &output.declaration {
+            let mut capture_by_owner = BTreeMap::new();
+            for symbol in &index.symbol {
+                if symbol.parameter { continue; }
+                let capture = match symbol.role {
+                    DeclarationRole::Callable => "@function",
+                    DeclarationRole::Type => "@type",
+                    DeclarationRole::Property => "@variable.member",
+                    DeclarationRole::Module => "@module",
+                    DeclarationRole::Value | DeclarationRole::Variant => "@constant",
+                    DeclarationRole::Binding => "@variable",
+                };
+                capture_by_owner.insert(symbol.scope.iter().chain(std::iter::once(&symbol.name)).cloned().collect::<Vec<_>>().join("::"), capture);
+                if let Some((identity, _)) = output.definition.get(&(path.clone(), symbol.position.line, symbol.position.column)) {
+                    capture_by_identity.insert(identity.as_str(), capture);
+                }
+            }
+            capture_by_path.insert(path.as_str(), capture_by_owner);
+        }
+        for reference in &mut output.occurrence {
+            let owner = if reference.owner.is_empty() { &reference.name } else { &reference.owner };
+            let mut prefix = String::new();
+            let parts = owner.split("::").collect::<Vec<_>>();
+            for (position, part) in parts.iter().enumerate() {
+                if !prefix.is_empty() { prefix.push_str("::"); }
+                prefix.push_str(part);
+                let capture = if reference.owner.is_empty() && position + 1 == parts.len() {
+                    capture_by_identity.get(reference.symbol.as_str()).copied()
+                } else {
+                    capture_by_path.get(reference.path.as_str()).and_then(|capture| capture.get(&prefix)).copied()
+                };
+                reference.owner_capture.push(capture);
+            }
+        }
         Ok(output)
     }
 
@@ -317,6 +354,7 @@ impl PlanReferenceIndex {
             path: path.into(),
             side: side.into(),
             owner: owner.into(),
+            owner_capture: Vec::new(),
             name: name.into(),
             kind: kind.into(),
             line,
@@ -1582,7 +1620,7 @@ mod tests {
         std::fs::write(workspace.path().join("src/lib.rs"), "pub struct Client;\n").unwrap();
         let mut document = super::super::document::test_fixture("calls", "Calls");
         let mut design = super::super::DeclarationDesign::default();
-        design.proposed.insert("src/lib.rs".into(), "pub struct Client;\nimpl Client {\n  pub fn send(&self);\n}\npub fn run(client: &Client);\n".into());
+        design.proposed.insert("src/lib.rs".into(), "pub struct Client;\nimpl Client {\n  pub fn send(&self, other: &Client);\n}\npub fn run(client: &Client);\npub struct Settings { pub client: Client }\n".into());
         design.proposed_calls.insert(
             "src/lib.rs".into(),
             vec![super::super::FunctionBody { change: None,
@@ -1597,6 +1635,10 @@ mod tests {
         );
         document.design = Some(design);
         let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
+        let method_reference = index.occurrence.iter().find(|reference| reference.owner.ends_with("::send") && reference.kind == "type").unwrap();
+        assert_eq!(method_reference.owner_capture, vec![Some("@type"), None, Some("@function")]);
+        let property_reference = index.occurrence.iter().find(|reference| reference.owner == "Settings::client").unwrap();
+        assert_eq!(property_reference.owner_capture, vec![Some("@type"), Some("@variable.member")]);
         let call = index
             .call
             .get(&(

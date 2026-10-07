@@ -64,6 +64,7 @@ end
 
 ---@param win integer
 function M.configure_transcript_window(win)
+  vim.wo[win].winfixheight = false
   vim.wo[win].wrap = true
   vim.wo[win].linebreak = true
   vim.wo[win].breakindent = true
@@ -100,6 +101,7 @@ function M.open(timeline_key)
   vim.api.nvim_buf_set_lines(composer_buf, 0, -1, false, { "" })
   vim.wo[composer_win].wrap = true
   vim.wo[composer_win].linebreak = true
+  vim.wo[composer_win].winfixheight = true
   input_gutter.apply(composer_win)
   keep_composer_normal_on_entry(composer_buf)
   return transcript_buf, transcript_win, composer_buf, composer_win, tabpage
