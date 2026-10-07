@@ -49,7 +49,7 @@ local tool_render = require("forge.render.harness.tool")
 ---@return string|table text Fold display string or chunk array.
 function M.foldtext(line)
   local text = line or vim.fn.getline(vim.v.foldstart)
-  if text:match("^▸ Thought for ") then return { { text, "ForgeHarnessThought" } } end
+  if text:match("^▸ Thought %d+s ") then return { { text, "ForgeHarnessThought" } } end
   local fold_start = tonumber(vim.v.foldstart)
   local state = require("forge.session").harness
   local row = fold_start and state.render_rows and state.render_rows[fold_start] or nil
@@ -62,11 +62,42 @@ end
 
 --- Formats a numeric token count as an abbreviated string.
 ---@param value number? Numeric token count.
----@return string? formatted Formatted token count string, or nil.
+---@return string formatted Formatted token count or unavailable marker.
 local function format_token_count(value)
-  if type(value) ~= "number" then return nil end
+  if type(value) ~= "number" then return "—" end
   if value >= 1000 then return ("%.1fk"):format(value / 1000) end
   return tostring(value)
+end
+
+--- Formats reported usage across owned turns, preserving unavailable categories.
+---@param interaction table Exchange descriptor table.
+---@param response_ms number? Elapsed milliseconds outside tracked waits, when available.
+---@return string summary Input, cache percentage, reasoning, output, and effective throughput.
+local function format_exchange_usage(interaction, response_ms)
+  local totals = {}
+  for _, field in ipairs({ "input", "cached_input", "reasoning", "output" }) do
+    local total = 0
+    local available = #(interaction.turn or {}) > 0
+    for _, turn in ipairs(interaction.turn or {}) do
+      local value = type(turn.usage) == "table" and turn.usage[field] or nil
+      if type(value) ~= "number" then available = false else total = total + value end
+    end
+    if available then totals[field] = total end
+  end
+  local cached = "—"
+  if totals.input and totals.input > 0 and totals.cached_input and totals.cached_input <= totals.input then
+    cached = ("%d%%"):format(math.floor(totals.cached_input / totals.input * 100 + 0.5))
+  end
+  local output
+  if totals.output and totals.reasoning and totals.output >= totals.reasoning then
+    output = totals.output - totals.reasoning
+  end
+  local throughput = "—"
+  if totals.output and response_ms and response_ms > 0 then
+    throughput = ("~%.0f"):format(math.floor(totals.output * 1000 / response_ms + 0.5))
+  end
+  return ("%s I (%s) → %s R / %s O (%s tps)"):format(
+    format_token_count(totals.input), cached, format_token_count(totals.reasoning), format_token_count(output), throughput)
 end
 
 --- Formats a concise summary of tool execution counts and failure metrics.
@@ -513,8 +544,12 @@ end
 ---@param interaction table Exchange descriptor table.
 ---@param options table Render options table.
 local function append_exchange_summary(result, interaction, options)
-  local complete = interaction.state ~= "running" and interaction.state ~= "finalizing"
+  local complete = interaction.completed_at_ms ~= nil and interaction.completed_at_ms ~= vim.NIL
+    or interaction.state ~= "running" and interaction.state ~= "finalizing" and interaction.state ~= "queued"
+  local paused = interaction.state == "running" and not complete
+    and type(interaction.execution_started_at_ms) ~= "number"
   local tool_count, failed_count, agent_count = 0, 0, 0
+  local agent_seen = {}
   for _, turn in ipairs(interaction.turn or {}) do
     for _, tool_id in ipairs((turn.tool and turn.tool.order) or {}) do
       local tool = turn.tool.item and turn.tool.item[tool_id]
@@ -525,32 +560,60 @@ local function append_exchange_summary(result, interaction, options)
     end
   end
   for _, node in ipairs(interaction.node_list or {}) do
-    if node.kind == "agent_reference" then agent_count = agent_count + 1 end
+    if node.kind == "agent_reference" and not agent_seen[node.agent.child_agent_id] then
+      agent_seen[node.agent.child_agent_id] = true
+      agent_count = agent_count + 1
+    end
   end
   local duration_ms = interaction.duration_ms or 0
-  if interaction.state == "running" and interaction.execution_started_at_ms and options.now_ms then
+  if interaction.state == "running" and type(interaction.execution_started_at_ms) == "number" and options.now_ms then
     duration_ms = duration_ms + math.max(0, options.now_ms - interaction.execution_started_at_ms)
   end
   local duration = math.floor(duration_ms / 1000)
+  local metrics = interaction.metrics or {}
+  local response = "—"
+  local response_ms
+  if metrics.timing_complete then
+    local blocked = metrics.blocked_duration_ms or 0
+    if type(metrics.blocked_started_ms) == "number" then
+      blocked = blocked + math.max(0, duration_ms - metrics.blocked_started_ms)
+    end
+    response_ms = math.max(0, duration_ms - blocked)
+    response = ("%ds"):format(math.floor(response_ms / 1000))
+  end
   local verb = complete and "Thought" or "Thinking"
   if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
-    verb = complete and "Planned" or "Planning"
+    verb = (interaction.awaiting_input or paused) and "Planning paused" or complete and "Planned" or "Planning"
   elseif interaction.kind == "plan_execution" then
-    verb = complete and "Executed plan" or "Executing plan"
-  elseif interaction.state == "cancelled" then
-    verb = "Cancelled"
+    verb = complete and "Executed plan" or paused and "Plan execution paused" or "Executing plan"
+  elseif paused then
+    verb = "Paused"
   end
+  local outcome = { cancelled = "Cancelled", finalizing = "Finalizing", interrupted = "Interrupted", failed = "Failed" }
+  verb = outcome[interaction.state] or verb
+  local history = { rolled_back = "Rolled back · ", superseded = "Superseded · " }
   local key = ("exchange:%s"):format(interaction.id or interaction.ordinal)
   local expanded = not complete or result.expanded[key] == true
-  local summary = ("%s %s for %ds"):format(expanded and "▾" or "▸", verb, duration)
-  local token_text = complete and format_token_count(interaction.token_count) or nil
-  if token_text then summary = summary .. ", " .. token_text .. " tokens" end
+  local summary = ("%s %s%s %ds (%s)"):format(expanded and "▾" or "▸",
+    history[interaction.disposition] or "", verb, duration, response)
+  if complete or interaction.awaiting_input or paused then
+    summary = summary .. ", " .. format_exchange_usage(interaction, response_ms)
+    local count = metrics.request_count
+    if type(count) == "number" and count > 0 then
+      summary = summary .. (", %d %s"):format(count, count == 1 and "request" or "requests")
+    else
+      summary = summary .. ", — requests"
+    end
+  end
   if tool_count > 0 then
-    summary = summary .. (", %d %s called"):format(tool_count, tool_count == 1 and "tool" or "tools")
+    summary = summary .. (", %d %s"):format(tool_count, tool_count == 1 and "tool" or "tools")
     if failed_count > 0 then summary = summary .. (" (%d failed)"):format(failed_count) end
   end
   if agent_count > 0 then
     summary = summary .. (", %d %s spawned"):format(agent_count, agent_count == 1 and "agent" or "agents")
+  end
+  if type(interaction.finalization_error) == "string" then
+    summary = summary .. " — " .. interaction.finalization_error:gsub("[\r\n]", " ")
   end
   local line = #result.lines + 1
   result.lines[line] = summary
@@ -772,7 +835,7 @@ end
 
 --- Builds the complete harness timeline render tree with lines, highlights, extmarks, and row mappings.
 ---@param interactions table[] Array of interaction or lifecycle event records.
----@param options? { working_seconds?: integer, cwd?: string, on_diff_update?: function, expanded?: table<string, boolean>, timeline_status?: table } Render configuration options.
+---@param options? { working_seconds?: integer, now_ms?: integer, cwd?: string, on_diff_update?: function, expanded?: table<string, boolean>, timeline_status?: table } Render configuration options.
 ---@return table tree Rendered tree model structure.
 function M.build(interactions, options)
   options = options or {}

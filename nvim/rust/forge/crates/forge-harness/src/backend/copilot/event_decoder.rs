@@ -145,13 +145,34 @@ impl CopilotEventDecoder {
                     .await;
                 }
             }
-            "assistant.usage" if output.metrics.token_count.is_none() => {
-                output.metrics.token_count = Some(
-                    ["inputTokens", "outputTokens", "reasoningTokens"]
-                        .iter()
-                        .filter_map(|field| unsigned_field(&provider_event.data, &[*field]))
-                        .sum(),
-                );
+            "assistant.usage" => {
+                use crate::backend::usage::{TokenUsage, UsageUpdate};
+                let update = UsageUpdate {
+                    id: string_field(&provider_event.data, &["apiCallId"])
+                        .unwrap_or_else(|| provider_event.id.clone()),
+                    usage: TokenUsage {
+                        input: unsigned_field(&provider_event.data, &["inputTokens"]),
+                        cached_input: unsigned_field(&provider_event.data, &["cacheReadTokens"]),
+                        reasoning: unsigned_field(&provider_event.data, &["reasoningTokens"]),
+                        output: unsigned_field(&provider_event.data, &["outputTokens"]),
+                    },
+                    cumulative: None,
+                    cumulative_total: None,
+                };
+                let mut event = BackendEvent {
+                    address: None,
+                    turn_boundary: None,
+                    kind: "usage".into(),
+                    text: None,
+                    data: serde_json::to_value(provider_event)
+                        .expect("provider event is JSON serializable"),
+                    activity: None,
+                    summary: None,
+                    task_update: None,
+                };
+                address_event(&mut event, output);
+                event.data = serde_json::to_value(update).expect("usage update is JSON serializable");
+                publish(event, output, event_sink).await;
             }
             "subagent.started" | "subagent.completed" | "subagent.failed" => {
                 publish(
@@ -273,11 +294,7 @@ impl CopilotEventDecoder {
     }
 }
 
-async fn publish(
-    mut event: BackendEvent,
-    output: &mut BackendOutput,
-    event_sink: Option<&BackendEventSink>,
-) {
+fn address_event(event: &mut BackendEvent, output: &BackendOutput) {
     if event.address.is_none() {
         let thread_id = event
             .data
@@ -305,6 +322,14 @@ async fn publish(
                 turn_id.map(|turn_id| crate::backend::ProviderAddress { thread_id, turn_id });
         }
     }
+}
+
+async fn publish(
+    mut event: BackendEvent,
+    output: &mut BackendOutput,
+    event_sink: Option<&BackendEventSink>,
+) {
+    address_event(&mut event, output);
     if let Some(activity) = event.activity.as_ref()
         && let Some(previous) = output.event.iter_mut().find(|previous| {
             previous.activity.as_ref().is_some_and(|existing| {
@@ -563,6 +588,54 @@ mod test {
     }
 
     #[tokio::test]
+    async fn reports_every_model_call_and_addresses_late_child_usage() {
+        let decoder = CopilotEventDecoder;
+        let mut output = BackendOutput {
+            backend_session_id: Some("parent".into()),
+            ..BackendOutput::default()
+        };
+        decoder
+            .decode(
+                &event("assistant.turn_start", json!({"turnId":"parent-turn"})),
+                &mut output,
+                None,
+            )
+            .await;
+        let mut child = event("assistant.turn_start", json!({"turnId":"child-turn"}));
+        child.agent_id = Some("child".into());
+        decoder.decode(&child, &mut output, None).await;
+        for id in ["call-one", "call-two"] {
+            let usage = event(
+                "assistant.usage",
+                json!({
+                    "apiCallId":id, "inputTokens":1000, "cacheReadTokens":900,
+                    "reasoningTokens":200, "outputTokens":280,
+                }),
+            );
+            decoder.decode(&usage, &mut output, None).await;
+        }
+        child.event_type = "assistant.turn_end".into();
+        decoder.decode(&child, &mut output, None).await;
+        child.event_type = "assistant.usage".into();
+        child.data = json!({"apiCallId":"child-call", "inputTokens":10,"outputTokens":20});
+        decoder.decode(&child, &mut output, None).await;
+        let usage = output
+            .event
+            .iter()
+            .filter(|event| event.kind == "usage")
+            .collect::<Vec<_>>();
+        assert_eq!(usage.len(), 3);
+        assert_eq!(usage[0].address.as_ref().unwrap().turn_id, "parent-turn");
+        assert_eq!(usage[1].data["id"], "call-two");
+        assert_eq!(usage[2].address.as_ref().unwrap().thread_id, "child");
+        assert_eq!(usage[2].address.as_ref().unwrap().turn_id, "child-turn");
+        assert!(usage[2].data["usage"]["reasoning"].is_null());
+        let native: crate::backend::usage::UsageUpdate =
+            serde_json::from_value(usage[0].data.clone()).unwrap();
+        assert_eq!(native.usage.non_reasoning_output(), Some(80));
+    }
+
+    #[tokio::test]
     async fn retains_tool_identity_across_turns_and_ignores_late_background_output() {
         let decoder = CopilotEventDecoder;
         let mut output = BackendOutput {
@@ -678,7 +751,7 @@ mod test {
                 None,
             )
             .await;
-        assert_eq!(output.metrics.token_count, None);
+        assert!(!output.event.iter().any(|event| event.kind == "usage"));
         assert!(matches!(
             output.event[0].turn_boundary,
             Some(crate::backend::TurnBoundary::Started)

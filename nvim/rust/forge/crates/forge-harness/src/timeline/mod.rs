@@ -398,7 +398,7 @@ mod test {
             elicitation: None,
             duration_ms: 1,
             execution_started_at_ms: None,
-            token_count: None,
+            metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
         }

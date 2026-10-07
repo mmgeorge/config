@@ -316,15 +316,43 @@ impl CodexBackend {
         thread_id: &str,
         workspace: &str,
     ) -> Result<()> {
-        process
-            .request(
-                "thread/resume",
-                json!({ "threadId": thread_id, "cwd": workspace }),
-                output,
-            )
-            .await
-            .context("load Codex thread for background terminal request")?;
-        Ok(())
+        let mut retries_remaining = 4;
+        loop {
+            let id = process
+                .send_request(
+                    "thread/resume",
+                    json!({ "threadId": thread_id, "cwd": workspace }),
+                )
+                .await
+                .context("load Codex thread for background terminal request")?;
+            let (message, result) = loop {
+                let message = process
+                    .read_message(output)
+                    .await
+                    .context("load Codex thread for background terminal request")?;
+                if let Some(result) = CodexJsonRpc::request_result(&message, id, "thread/resume") {
+                    break (message, result);
+                }
+            };
+            let empty_rollout = message.pointer("/error/code").and_then(Value::as_i64)
+                == Some(-32603)
+                && message
+                    .pointer("/error/message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| {
+                        message.starts_with("failed to read thread:")
+                            && message.contains("failed to read session metadata")
+                            && message.contains(&format!("{thread_id}.jsonl"))
+                            && message.ends_with(" is empty")
+                    });
+            if !empty_rollout || retries_remaining == 0 {
+                return result
+                    .map(|_| ())
+                    .context("load Codex thread for background terminal request");
+            }
+            retries_remaining -= 1;
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+        }
     }
 
     async fn skill_catalog(
@@ -1615,6 +1643,58 @@ mod test {
 
     #[tokio::test]
     async fn loads_a_thread_before_using_a_secondary_terminal_connection() -> Result<()> {
+        terminal_thread_resume_fixture(vec![json!({
+            "result": { "thread": { "id": "provider-thread" } }
+        })])
+        .await
+    }
+
+    #[tokio::test]
+    async fn terminal_thread_resume_recovers_empty_rollout_and_preserves_errors() -> Result<()> {
+        let empty_rollout = json!({
+            "error": {
+                "code": -32603,
+                "message": "failed to read thread: thread-store internal error: failed to read session metadata /sessions/rollout-provider-thread.jsonl: rollout at /sessions/rollout-provider-thread.jsonl is empty"
+            }
+        });
+        let success = json!({ "result": { "thread": { "id": "provider-thread" } } });
+        let mut recovering = vec![empty_rollout.clone(); 4];
+        recovering.push(success);
+        terminal_thread_resume_fixture(recovering).await?;
+
+        let failure = terminal_thread_resume_fixture(vec![empty_rollout.clone(); 5])
+            .await
+            .unwrap_err();
+        assert!(format!("{failure:#}").contains("rollout-provider-thread.jsonl is empty"));
+
+        for response in [
+            json!({ "error": { "code": -32603, "message": "permission denied" } }),
+            json!({ "error": { "code": -32603, "message": "thread not found" } }),
+            json!({ "error": {
+                "code": -32602,
+                "message": empty_rollout["error"]["message"]
+            } }),
+            json!({ "error": {
+                "code": -32603,
+                "message": "failed to read thread: failed to read session metadata /sessions/rollout-other-thread.jsonl: rollout at /sessions/rollout-other-thread.jsonl is empty"
+            } }),
+        ] {
+            let expected = response["error"].to_string();
+            let failure = terminal_thread_resume_fixture(vec![response])
+                .await
+                .unwrap_err();
+            assert!(format!("{failure:#}").contains(&expected));
+        }
+        let failure = terminal_thread_resume_fixture(Vec::new())
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{failure:#}").contains("load Codex thread for background terminal request")
+        );
+        Ok(())
+    }
+
+    async fn terminal_thread_resume_fixture(response: Vec<Value>) -> Result<()> {
         use futures_util::{SinkExt, StreamExt};
 
         let fixture = tempfile::tempdir()?;
@@ -1627,23 +1707,21 @@ mod test {
         let server = tokio::spawn(async move {
             let (stream, _) = listener.accept().await.unwrap();
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-            let request: Value =
-                serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+            for mut response in response {
+                let request: Value =
+                    serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
+                        .unwrap();
+                assert_eq!(request["method"], "thread/resume");
+                assert_eq!(request["params"]["threadId"], "provider-thread");
+                assert_eq!(request["params"]["cwd"], expected_workspace);
+                response["id"] = request["id"].clone();
+                socket
+                    .send(tokio_tungstenite::tungstenite::Message::Text(
+                        response.to_string().into(),
+                    ))
+                    .await
                     .unwrap();
-            assert_eq!(request["method"], "thread/resume");
-            assert_eq!(request["params"]["threadId"], "provider-thread");
-            assert_eq!(request["params"]["cwd"], expected_workspace);
-            socket
-                .send(tokio_tungstenite::tungstenite::Message::Text(
-                    json!({
-                        "id": request["id"],
-                        "result": { "thread": { "id": "provider-thread" } }
-                    })
-                    .to_string()
-                    .into(),
-                ))
-                .await
-                .unwrap();
+            }
         });
         let mut process = CodexJsonRpc::connect(
             &endpoint,
@@ -1655,15 +1733,15 @@ mod test {
             "session".into(),
         )
         .await?;
-        CodexBackend::load_terminal_thread(
+        let result = CodexBackend::load_terminal_thread(
             &mut process,
             &mut BackendOutput::default(),
             "provider-thread",
             &workspace,
         )
-        .await?;
+        .await;
         tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
-        Ok(())
+        result
     }
 
     #[tokio::test]

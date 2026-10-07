@@ -1332,6 +1332,14 @@ fn truncate_to_cells(width: &WidthProfile, text: &str, max_cells: usize) -> Resu
     Ok(truncated)
 }
 
+fn token_display(tokens: Option<u64>) -> String {
+    match tokens {
+        Some(tokens) if tokens >= 1000 => format!("{:.1}k", tokens as f64 / 1000.0),
+        Some(tokens) => tokens.to_string(),
+        None => "—".into(),
+    }
+}
+
 fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     let complete = interaction.completed_at_ms.is_some();
     let paused = interaction.state == ExchangeState::Running
@@ -1339,42 +1347,67 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
         && interaction.execution_started_at_ms.is_none();
     let duration = interaction.elapsed(now_ms) / 1000;
     let activity = if interaction.state == ExchangeState::Cancelled {
-        "Cancelled after"
+        "Cancelled"
     } else if interaction.state == ExchangeState::Finalizing {
-        "Finalizing after"
+        "Finalizing"
     } else if interaction.state == ExchangeState::Interrupted {
-        "Interrupted after"
+        "Interrupted"
     } else if interaction.state == ExchangeState::Failed {
-        "Failed after"
+        "Failed"
     } else {
         match interaction.kind {
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
                 if interaction.awaiting_input || paused =>
             {
-                "Planning paused after"
+                "Planning paused"
             }
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if complete => "Planned for",
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => "Planning for",
-            ExchangeKind::PlanExecution if complete => "Executed plan for",
-            ExchangeKind::PlanExecution if paused => "Plan execution paused after",
-            ExchangeKind::PlanExecution => "Executing plan for",
-            ExchangeKind::Chat if complete => "Thought for",
-            ExchangeKind::Chat if paused => "Paused after",
-            ExchangeKind::Chat => "Thinking for",
+            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if complete => "Planned",
+            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => "Planning",
+            ExchangeKind::PlanExecution if complete => "Executed plan",
+            ExchangeKind::PlanExecution if paused => "Plan execution paused",
+            ExchangeKind::PlanExecution => "Executing plan",
+            ExchangeKind::Chat if complete => "Thought",
+            ExchangeKind::Chat if paused => "Paused",
+            ExchangeKind::Chat => "Thinking",
         }
     };
     let mut summary = format!(
         "▸ {}{activity} {duration}s",
         history_prefix(interaction.disposition)
     );
+    let response_ms = interaction.metrics.response_ms(interaction.elapsed(now_ms));
+    let response = response_ms
+        .map(|duration| format!("{}s", duration / 1000))
+        .unwrap_or_else(|| "—".into());
+    summary.push_str(&format!(" ({response})"));
     if complete || interaction.awaiting_input || paused {
-        if let Some(tokens) = interaction.token_count {
-            let display = if tokens >= 1000 {
-                format!("{:.1}k", tokens as f64 / 1000.0)
-            } else {
-                tokens.to_string()
-            };
-            summary.push_str(&format!(", {display} tokens"));
+        let usage = interaction.usage();
+        let cached = usage
+            .cached_percent()
+            .map(|percent| format!("{percent}%"))
+            .unwrap_or_else(|| "—".into());
+        let throughput = usage
+            .output
+            .zip(response_ms)
+            .filter(|(_, duration)| *duration > 0)
+            .map(|(tokens, duration)| {
+                format!("~{:.0}", (tokens as f64 * 1000.0 / duration as f64).round())
+            })
+            .unwrap_or_else(|| "—".into());
+        summary.push_str(&format!(
+            ", {} I ({cached}) → {} R / {} O ({throughput} tps)",
+            token_display(usage.input),
+            token_display(usage.reasoning),
+            token_display(usage.non_reasoning_output())
+        ));
+        let count = interaction.metrics.request_count;
+        if count > 0 {
+            summary.push_str(&format!(
+                ", {count} {}",
+                if count == 1 { "request" } else { "requests" }
+            ));
+        } else {
+            summary.push_str(", — requests");
         }
     }
     let spawned = interaction
@@ -1399,7 +1432,7 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
         .count();
     if count > 0 {
         summary.push_str(&format!(
-            ", {count} {} called",
+            ", {count} {}",
             if count == 1 { "tool" } else { "tools" }
         ));
         if failed > 0 {
@@ -2691,7 +2724,7 @@ mod tests {
                 exchange.finish(state, 4000).unwrap();
                 assert_eq!(
                     super::exchange_activity_summary(&exchange, 90_000),
-                    format!("▸ {label} after 3s")
+                    format!("▸ {label} 3s (3s), — I (—) → — R / — O (— tps), — requests")
                 );
             }
         }
@@ -2700,13 +2733,13 @@ mod tests {
     #[test]
     fn paused_exchange_activity_summary_freezes_until_execution_resumes() {
         for (kind, paused, running) in [
-            ("chat", "Paused after", "Thinking for"),
-            ("plan_draft", "Planning paused after", "Planning for"),
-            ("plan_revision", "Planning paused after", "Planning for"),
+            ("chat", "Paused", "Thinking"),
+            ("plan_draft", "Planning paused", "Planning"),
+            ("plan_revision", "Planning paused", "Planning"),
             (
                 "plan_execution",
-                "Plan execution paused after",
-                "Executing plan for",
+                "Plan execution paused",
+                "Executing plan",
             ),
         ] {
             let mut exchange: Exchange = serde_json::from_value(json!({
@@ -2720,13 +2753,13 @@ mod tests {
             for now in [4000, 90_000] {
                 assert_eq!(
                     super::exchange_activity_summary(&exchange, now),
-                    format!("▸ {paused} 3s")
+                    format!("▸ {paused} 3s (3s), — I (—) → — R / — O (— tps), — requests")
                 );
             }
             exchange.resume(90_000).unwrap();
             assert_eq!(
                 super::exchange_activity_summary(&exchange, 92_000),
-                format!("▸ {running} 5s")
+                format!("▸ {running} 5s (5s)")
             );
         }
     }
@@ -2762,11 +2795,103 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 summary.text.wire_rows().join(""),
-                format!("▸ {marker} · Failed after 3s")
+                format!("▸ {marker} · Failed 3s (3s), — I (—) → — R / — O (— tps), — requests")
             );
             assert_eq!(exchange.state, ExchangeState::Failed);
             assert_eq!(exchange.elapsed(90_000), 3000);
         }
+    }
+
+    #[test]
+    fn compact_summary_counts_native_usage_and_total_time_including_tools() {
+        use crate::backend::usage::{TokenUsage, UsageUpdate};
+        use crate::backend::{
+            BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind, TurnBoundary,
+        };
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Work", "kind":"chat", "state":"running", "created_at_ms":1000,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))
+        .unwrap();
+        exchange.resume(1000).unwrap();
+        let address = ProviderAddress {
+            thread_id: "parent".into(),
+            turn_id: "turn".into(),
+        };
+        exchange.start_turn(address.clone(), 1000).unwrap();
+        let mut event = BackendEvent {
+            address: Some(address),
+            turn_boundary: None,
+            kind: "tool".into(),
+            text: None,
+            data: json!({}),
+            activity: Some(ToolActivity {
+                id: "tool".into(),
+                kind: ToolActivityKind::ToolCall,
+                title: "cargo test".into(),
+                output: None,
+                status: Some("running".into()),
+                change: Default::default(),
+                output_delta: false,
+            }),
+            summary: None,
+            task_update: None,
+        };
+        exchange.observe_turn(&event, 2000).unwrap();
+        event.activity.as_mut().unwrap().status = Some("failed".into());
+        exchange.observe_turn(&event, 5000).unwrap();
+        event.kind = "turn_completed".into();
+        event.activity = None;
+        event.turn_boundary = Some(TurnBoundary::Finished {
+            outcome: crate::turn::TurnOutcome::Completed,
+        });
+        exchange.observe_turn(&event, 7000).unwrap();
+        exchange
+            .finish(crate::exchange::ExchangeState::Complete, 7000)
+            .unwrap();
+        event.kind = "usage".into();
+        event.turn_boundary = None;
+        event.data = serde_json::to_value(UsageUpdate {
+            id: "call".into(),
+            usage: TokenUsage {
+                input: Some(76000),
+                cached_input: Some(68400),
+                reasoning: Some(3000),
+                output: Some(4200),
+            },
+            cumulative: None,
+            cumulative_total: None,
+        })
+        .unwrap();
+        exchange.observe_turn(&event, 8000).unwrap();
+        exchange.observe_turn(&event, 9000).unwrap();
+        assert_eq!(
+            super::exchange_activity_summary(&exchange, 90_000),
+            "▸ Thought 6s (3s), 76.0k I (90%) → 3.0k R / 1.2k O (~1400 tps), 1 request, 1 tool (1 failed)"
+        );
+        event.address.as_mut().unwrap().thread_id = "unowned-child".into();
+        assert!(!exchange.observe_turn(&event, 90_000).unwrap());
+        assert_eq!(exchange.usage().input, Some(76000));
+        for (duration_ms, response, throughput) in [
+            (6500, "3s", "~1200"),
+            (3500, "0s", "~8400"),
+            (3000, "0s", "—"),
+        ] {
+            exchange.duration_ms = duration_ms;
+            assert_eq!(
+                super::exchange_activity_summary(&exchange, 90_000),
+                format!(
+                    "▸ Thought {}s ({response}), 76.0k I (90%) → 3.0k R / 1.2k O ({throughput} tps), 1 request, 1 tool (1 failed)",
+                    duration_ms / 1000
+                )
+            );
+        }
+        exchange.metrics.timing_complete = false;
+        assert_eq!(
+            super::exchange_activity_summary(&exchange, 90_000),
+            "▸ Thought 3s (—), 76.0k I (90%) → 3.0k R / 1.2k O (— tps), 1 request, 1 tool (1 failed)"
+        );
     }
 
     #[test]
@@ -2781,14 +2906,38 @@ mod tests {
         interaction.resume(1000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 4200),
-            "▸ Planning for 3s"
+            "▸ Planning 3s (3s)"
         );
         interaction.pause(5500);
-        interaction.token_count = Some(1280);
+        interaction
+            .start_turn(
+                crate::backend::ProviderAddress {
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                },
+                1000,
+            )
+            .unwrap();
+        interaction
+            .turn
+            .last_mut()
+            .unwrap()
+            .record_usage(crate::backend::usage::TokenUsage {
+                input: Some(1000),
+                cached_input: Some(900),
+                reasoning: Some(200),
+                output: Some(280),
+            });
+        interaction
+            .turn
+            .last_mut()
+            .unwrap()
+            .finish(crate::turn::TurnOutcome::Completed, 5500)
+            .unwrap();
         interaction.awaiting_input = true;
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "▸ Planning paused after 4s, 1.3k tokens"
+            "▸ Planning paused 4s (4s), 1.0k I (90%) → 200 R / 80 O (~62 tps), — requests"
         );
         interaction.kind = ExchangeKind::Chat;
         interaction
@@ -2796,7 +2945,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "▸ Thought for 4s, 1.3k tokens"
+            "▸ Thought 4s (4s), 1.0k I (90%) → 200 R / 80 O (~62 tps), — requests"
         );
     }
 }

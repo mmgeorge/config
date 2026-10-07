@@ -1004,10 +1004,25 @@ async fn normalize_event_in_workspace(
     if let Some(native_compact) = available_compact_update(&params) {
         output.metrics.native_compact_update = Some(native_compact);
     }
-    if let Some(token_count) = turn_token_count(&params) {
-        output.metrics.token_count = Some(token_count);
-    }
     if usage_event {
+        if address.is_some()
+            && let Some(update) = usage_update(&params)
+        {
+            let event = BackendEvent {
+                address: address.clone(),
+                turn_boundary: None,
+                kind: "usage".into(),
+                text: None,
+                data: serde_json::to_value(update).expect("usage update is JSON serializable"),
+                activity: None,
+                summary: None,
+                task_update: None,
+            };
+            if let Some(event_sink) = event_sink {
+                let _ = event_sink.send_wait(event.clone()).await;
+            }
+            append_output_event(output, event);
+        }
         if let Some(context_usage) = context_usage(&params) {
             output.metrics.context_usage = Some(context_usage.clone());
             let event = BackendEvent {
@@ -1373,39 +1388,42 @@ fn available_compact_update(params: &Value) -> Option<bool> {
     }))
 }
 
-fn turn_token_count(params: &Value) -> Option<u64> {
-    for pointer in [
-        "/tokenUsage/last/totalTokens",
-        "/tokenUsage/last/total_tokens",
-        "/turn/tokenUsage/totalTokens",
-        "/turn/tokenUsage/total_tokens",
-        "/usage/totalTokens",
-        "/usage/total_tokens",
-        "/update/used",
-        "/used",
-    ] {
-        if let Some(token_count) = params.pointer(pointer).and_then(Value::as_u64) {
-            return Some(token_count);
+fn usage_update(params: &Value) -> Option<crate::backend::usage::UsageUpdate> {
+    use crate::backend::usage::{TokenUsage, UsageUpdate};
+    fn pointer_u64(value: &Value, paths: &[&str]) -> Option<u64> {
+        paths
+            .iter()
+            .find_map(|path| value.pointer(path).and_then(Value::as_u64))
+    }
+    fn counts(value: &Value) -> TokenUsage {
+        TokenUsage {
+            input: pointer_u64(value, &["/inputTokens", "/input_tokens"]),
+            cached_input: pointer_u64(value, &["/cachedInputTokens", "/cached_input_tokens"]),
+            reasoning: pointer_u64(
+                value,
+                &["/reasoningOutputTokens", "/reasoning_output_tokens"],
+            ),
+            output: pointer_u64(value, &["/outputTokens", "/output_tokens"]),
         }
     }
-    let last_usage = params
-        .pointer("/tokenUsage/last")
-        .or_else(|| params.pointer("/turn/tokenUsage"))
-        .or_else(|| params.get("usage"))?;
-    let token_count = [
-        "inputTokens",
-        "input_tokens",
-        "cachedInputTokens",
-        "cached_input_tokens",
-        "outputTokens",
-        "output_tokens",
-        "reasoningOutputTokens",
-        "reasoning_output_tokens",
-    ]
-    .into_iter()
-    .filter_map(|field| last_usage.get(field).and_then(Value::as_u64))
-    .sum::<u64>();
-    (token_count > 0).then_some(token_count)
+    let token_usage = params
+        .get("tokenUsage")
+        .or_else(|| params.get("token_usage"))?;
+    let last = token_usage.get("last")?;
+    let usage = counts(last);
+    if usage.input.is_none() && usage.output.is_none() {
+        return None;
+    }
+    let total = token_usage.get("total")?;
+    let cumulative = counts(total);
+    let cumulative_total = pointer_u64(total, &["/totalTokens", "/total_tokens"]);
+    let id = serde_json::to_string(&(cumulative_total, &cumulative)).ok()?;
+    Some(UsageUpdate {
+        id,
+        usage,
+        cumulative: Some(cumulative),
+        cumulative_total,
+    })
 }
 
 fn is_tool_lifecycle_event(method_lower: &str, encoded: &str) -> bool {
@@ -2683,6 +2701,37 @@ mod test {
     }
 
     #[tokio::test]
+    async fn usage_retains_native_categories_and_streams_addressed_snapshots() {
+        let mut output = BackendOutput::default();
+        let (sink, mut stream) = crate::backend::events::channel();
+        normalize_event(&json!({"method":"thread/tokenUsage/updated", "params":{
+            "threadId":"parent", "turnId":"turn", "tokenUsage":{
+                "last":{"inputTokens":76000,"cachedInputTokens":68400,"outputTokens":4200,"reasoningOutputTokens":3000,"totalTokens":80200},
+                "total":{"inputTokens":176000,"cachedInputTokens":148400,"outputTokens":14200,"reasoningOutputTokens":9000,"totalTokens":190200},
+                "modelContextWindow":258400
+            }
+        }}), &mut output, Some(&sink)).await;
+        let event = output
+            .event
+            .iter()
+            .find(|event| event.kind == "usage")
+            .unwrap();
+        assert_eq!(event.address.as_ref().unwrap().turn_id, "turn");
+        let native: crate::backend::usage::UsageUpdate =
+            serde_json::from_value(event.data.clone()).unwrap();
+        assert_eq!(native.usage.cached_percent(), Some(90));
+        assert_eq!(native.usage.non_reasoning_output(), Some(1200));
+        assert_eq!(native.cumulative.unwrap().input, Some(176000));
+        assert_eq!(stream.try_recv().unwrap().kind, "usage");
+        assert!(
+            output
+                .event
+                .iter()
+                .any(|event| event.kind == "context_usage")
+        );
+    }
+
+    #[tokio::test]
     async fn coalesces_message_deltas_without_treating_prose_as_control_tools() {
         let mut output = BackendOutput::default();
         normalize_event(
@@ -3207,7 +3256,7 @@ mod test {
         )
         .await;
 
-        assert_eq!(output.metrics.token_count, Some(2700));
+        assert!(!output.event.iter().any(|event| event.kind == "usage"));
         assert_eq!(
             output.metrics.context_usage,
             Some(ContextUsage {

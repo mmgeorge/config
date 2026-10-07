@@ -1540,6 +1540,35 @@ impl HarnessBroker {
         else {
             return Ok(false);
         };
+        if backend_event.kind == "usage"
+            && !self.child_exchange_runtime_by_agent.contains_key(&run_id)
+        {
+            if let Some(address) = backend_event.address.as_ref()
+                && let Some(mut exchange) = self
+                    .store
+                    .list_agent_exchange(&run_id)?
+                    .into_iter()
+                    .find(|exchange| exchange.turn.iter().any(|turn| turn.provider() == address))
+            {
+                exchange.observe_turn(backend_event, self.clock.now_ms())?;
+                self.store.save_exchange(&exchange)?;
+                self.emit_live(
+                    BackendEvent {
+                        address: None,
+                        turn_boundary: None,
+                        kind: "agent_timeline_updated".into(),
+                        text: None,
+                        data: json!({"run_id": run_id, "interaction": exchange, "active": null}),
+                        activity: None,
+                        summary: None,
+                        task_update: None,
+                    },
+                    event,
+                )
+                .await?;
+            }
+            return Ok(true);
+        }
         let parent_agent_id = self
             .agent_registry
             .execution(&run_id)
@@ -1657,8 +1686,6 @@ impl HarnessBroker {
                     crate::turn::TurnOutcome::Interrupted => ExchangeState::Interrupted,
                 };
                 runtime.exchange.finish(state, now_ms)?;
-                runtime.exchange.duration_ms =
-                    now_ms.saturating_sub(runtime.exchange.created_at_ms) as u64;
                 self.store.save_exchange(&runtime.exchange)?;
             }
             self.agent_registry.execution_mut(&run_id).active_turn_id = None;
@@ -3335,10 +3362,7 @@ Planning continuation: turn {} of {}.",
             "model.completed",
             serde_json::to_value(&output)?,
         );
-        let token_count = output.metrics.token_count;
         interaction.pause(self.clock.now_ms());
-        interaction.token_count = token_count.or(interaction.token_count);
-        interaction.record_latest_turn_usage(token_count);
         self.capability = output.capability.clone();
         self.session.native_fork = output.capability.native_fork;
         self.session.native_compact = output.capability.native_compact;
@@ -4098,11 +4122,11 @@ Planning continuation: turn {} of {}.",
                     .iter()
                     .any(|turn| turn.provider() == address)
                 {
-                    interaction
+                    &mut *interaction
                 } else {
-                    &self
+                    &mut self
                         .child_exchange_runtime_by_agent
-                        .values()
+                        .values_mut()
                         .find(|child| {
                             child
                                 .exchange
@@ -4114,7 +4138,7 @@ Planning continuation: turn {} of {}.",
                         .exchange
                 }
             } else {
-                interaction
+                &mut *interaction
             };
             let turn = owner.turn.iter().find(|turn| {
                 turn.state() == crate::turn::TurnState::Running
@@ -4133,7 +4157,29 @@ Planning continuation: turn {} of {}.",
                 &owner.id,
                 turn.map(|turn| turn.id()),
             )?;
+            owner.observe_blocker(format!("approval:{id}"), true, self.clock.now_ms());
+            self.store.save_exchange(owner)?;
             backend_event.data = serde_json::to_value(approval)?;
+            self.emit_live(backend_event, event).await?;
+            return Ok(());
+        }
+        if matches!(
+            backend_event.kind.as_str(),
+            "approval_resolved" | "approval_cancelled"
+        ) {
+            let approval: ApprovalRequestView = serde_json::from_value(backend_event.data.clone())?;
+            let now_ms = self.clock.now_ms();
+            if approval.exchange_id.as_deref() == Some(interaction.id.as_str()) {
+                interaction.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
+                self.store.save_exchange(interaction)?;
+            } else if let Some(owner) = self
+                .child_exchange_runtime_by_agent
+                .values_mut()
+                .find(|owner| approval.exchange_id.as_deref() == Some(owner.exchange.id.as_str()))
+            {
+                owner.exchange.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
+                self.store.save_exchange(&owner.exchange)?;
+            }
             self.emit_live(backend_event, event).await?;
             return Ok(());
         }
@@ -4146,6 +4192,7 @@ Planning continuation: turn {} of {}.",
             let now_ms = self.clock.now_ms();
             match boundary {
                 "wait_started" => {
+                    interaction.observe_blocker("agent_wait".into(), true, now_ms);
                     interaction.close_running_messages();
                     runtime.active_wait = Some(ActiveWait {
                         exchange_id: interaction.id.clone(),
@@ -4168,7 +4215,11 @@ Planning continuation: turn {} of {}.",
                             as usize;
                     }
                 }
-                "wait_ended" => runtime.active_wait = None,
+                "wait_ended" => {
+                    interaction.observe_blocker("agent_wait".into(), false, now_ms);
+                    runtime.active_wait = None;
+                    self.store.save_exchange(interaction)?;
+                }
                 _ => return Ok(()),
             }
             self.emit_active_wait(interaction, runtime, event).await?;
@@ -4294,6 +4345,7 @@ Planning continuation: turn {} of {}.",
         if backend_event.kind == "steering_input" {
             runtime.retraction_eligible = false;
             let now_ms = self.clock.now_ms();
+            interaction.observe_blocker("agent_wait".into(), false, now_ms);
             runtime.active_wait = None;
             interaction.append_input(
                 crate::exchange::InputIntent::Steering,
@@ -4585,7 +4637,7 @@ Planning continuation: turn {} of {}.",
                 elicitation: None,
                 duration_ms: 0,
                 execution_started_at_ms: Some(now_ms),
-                token_count: None,
+                metrics: crate::exchange::ExchangeMetrics::default(),
                 comment: Vec::new(),
                 task: None,
             },
@@ -6959,7 +7011,7 @@ mod test {
             elicitation: None,
             duration_ms: 1,
             execution_started_at_ms: None,
-            token_count: None,
+            metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
         }
@@ -8895,6 +8947,114 @@ mod test {
             )
             .unwrap(),
             settled_json
+        );
+    }
+
+    #[tokio::test]
+    async fn late_child_usage_updates_only_its_settled_owner_and_deduplicates_replay() {
+        use crate::backend::ProviderAddress;
+        use crate::backend::usage::{TokenUsage, UsageUpdate};
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let mut child = Agent::pending(&broker.session.id, "explorer", "inspect", 1);
+        child.provider_thread_id = Some("child-thread".into());
+        broker.store.save_agent_run(&child).unwrap();
+        broker.agent_registry.insert(child.clone());
+        let address = ProviderAddress {
+            thread_id: "child-thread".into(),
+            turn_id: "child-turn".into(),
+        };
+        let mut child_exchange =
+            completed_interaction("child-exchange", &broker.session.id, Vec::new());
+        child_exchange.agent_id = child.id.clone();
+        child_exchange.state = ExchangeState::Running;
+        child_exchange.completed_at_ms = None;
+        child_exchange.resume(1000).unwrap();
+        child_exchange.start_turn(address.clone(), 1000).unwrap();
+        child_exchange.turn[0]
+            .finish(crate::turn::TurnOutcome::Completed, 2000)
+            .unwrap();
+        child_exchange
+            .finish(ExchangeState::Complete, 2000)
+            .unwrap();
+        broker.store.save_exchange(&child_exchange).unwrap();
+        let mut parent = completed_interaction("parent", &broker.session.id, Vec::new());
+        let parent_before = serde_json::to_value(&parent).unwrap();
+        let event = BackendEvent {
+            address: Some(address),
+            turn_boundary: None,
+            kind: "usage".into(),
+            text: None,
+            data: serde_json::to_value(UsageUpdate {
+                id: "call".into(),
+                usage: TokenUsage {
+                    input: Some(1000),
+                    cached_input: Some(900),
+                    reasoning: Some(100),
+                    output: Some(200),
+                },
+                cumulative: None,
+                cumulative_total: None,
+            })
+            .unwrap(),
+            activity: None,
+            summary: None,
+            task_update: None,
+        };
+        let mut emitted = Vec::new();
+        for _ in 0..2 {
+            assert!(
+                broker
+                    .route_agent_backend_event(Some(&mut parent), &event, &mut emitted)
+                    .await
+                    .unwrap()
+            );
+        }
+        assert_eq!(serde_json::to_value(parent).unwrap(), parent_before);
+        let stored = broker
+            .store
+            .list_agent_exchange(&child.id)
+            .unwrap()
+            .pop()
+            .unwrap();
+        assert_eq!(stored.usage().input, Some(1000));
+        assert_eq!(stored.state, ExchangeState::Complete);
+        assert_eq!(stored.duration_ms, child_exchange.duration_ms);
+        assert_eq!(stored.completed_at_ms, child_exchange.completed_at_ms);
+        assert!(
+            !broker
+                .child_exchange_runtime_by_agent
+                .contains_key(&child.id)
+        );
+        drop(broker);
+        let store = SqliteStore::open(data.path()).unwrap();
+        let mut reloaded = store.list_agent_exchange(&child.id).unwrap().pop().unwrap();
+        let retained = serde_json::to_value(&stored).unwrap();
+        assert_eq!(serde_json::to_value(&reloaded).unwrap(), retained);
+        reloaded.observe_turn(&event, 90_000).unwrap();
+        assert_eq!(serde_json::to_value(&reloaded).unwrap(), retained);
+        let rendered = crate::buffer::projection::project(
+            &TimelineEntry::Exchange {
+                id: reloaded.id.clone(),
+                created_at_ms: reloaded.created_at_ms,
+                exchange: reloaded,
+                agent_by_id: std::collections::HashMap::new(),
+            },
+            &forge_buffer::width::WidthProfile::default(),
+            false,
+            &std::collections::HashSet::new(),
+        )
+        .unwrap();
+        let summary = rendered
+            .entry
+            .block
+            .iter()
+            .find(|block| block.id.0 == "child-exchange:summary")
+            .unwrap();
+        assert_eq!(
+            summary.text.wire_rows().join(""),
+            "▸ Thought 1s (1s), 1.0k I (90%) → 100 R / 100 O (~200 tps), 1 request"
         );
     }
 

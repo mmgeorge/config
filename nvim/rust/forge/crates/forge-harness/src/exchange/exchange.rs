@@ -66,7 +66,8 @@ pub struct Exchange {
     #[serde(default)]
     pub execution_started_at_ms: Option<i64>,
     #[serde(default)]
-    pub token_count: Option<u64>,
+    /// Retains usage identities and observed tool, approval, and delegated wait occupancy.
+    pub metrics: ExchangeMetrics,
     #[serde(default)]
     pub comment: Vec<ExchangeComment>,
     #[serde(default)]
@@ -113,7 +114,7 @@ impl Exchange {
             elicitation: None,
             duration_ms: 0,
             execution_started_at_ms: None,
-            token_count: None,
+            metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
         }
@@ -148,6 +149,7 @@ impl Exchange {
             "only an open exchange can finalize"
         );
         self.pause(now_ms);
+        self.metrics.settle(self.elapsed(now_ms));
         self.awaiting_input = false;
         self.state = ExchangeState::Finalizing;
         self.finalization_outcome = Some(outcome);
@@ -169,20 +171,44 @@ impl Exchange {
             );
             return Ok(true);
         };
+        if event.kind == "usage" {
+            let Some(index) = self.turn.iter().position(|turn| turn.provider() == address) else {
+                return Ok(false);
+            };
+            let update = serde_json::from_value(event.data.clone())?;
+            if let Some(usage) = self
+                .metrics
+                .usage(&address.thread_id, &address.turn_id, update)
+            {
+                self.turn[index].record_usage(usage);
+            }
+            return Ok(true);
+        }
         match event.turn_boundary {
             Some(TurnBoundary::Started) => {
                 self.start_turn(address.clone(), now_ms)?;
             }
             Some(TurnBoundary::Finished { outcome }) => {
-                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
-                else {
+                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address) else {
                     return Ok(false);
                 };
                 turn.finish(outcome, now_ms)?;
+                let prefix = format!("tool:{}:{}:", address.thread_id, address.turn_id);
+                let elapsed = self.elapsed(now_ms);
+                for id in self
+                    .turn
+                    .iter()
+                    .find(|turn| turn.provider() == address)
+                    .into_iter()
+                    .flat_map(|turn| turn.tools())
+                    .map(|tool| format!("{prefix}{}", tool.id))
+                    .collect::<Vec<_>>()
+                {
+                    self.metrics.block(id, false, elapsed);
+                }
             }
             None => {
-                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
-                else {
+                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address) else {
                     return Ok(false);
                 };
                 if turn.state() != TurnState::Running {
@@ -190,7 +216,21 @@ impl Exchange {
                 }
                 let item_count = turn.items().len();
                 if let Some(tool) = &event.activity {
+                    let known = turn.tools().any(|existing| existing.id == tool.id);
                     turn.record_tool(tool)?;
+                    let running = turn
+                        .tools()
+                        .find(|existing| existing.id == tool.id)
+                        .is_some_and(|tool| tool.state() == crate::turn::ToolState::Running);
+                    if !known && !running {
+                        self.metrics.timing_complete = false;
+                    }
+                    let id = format!("tool:{}:{}:{}", address.thread_id, address.turn_id, tool.id);
+                    let elapsed = self.duration_ms.saturating_add(
+                        self.execution_started_at_ms
+                            .map_or(0, |started| now_ms.saturating_sub(started).max(0) as u64),
+                    );
+                    self.metrics.block(id, running, elapsed);
                 }
                 if let Some(text) = event.text.as_deref() {
                     let kind = match event.kind.as_str() {
@@ -214,8 +254,9 @@ impl Exchange {
                 let turn_id = turn.id().to_owned();
                 for item in turn.items()[item_count..].to_vec() {
                     let item_id = match &item {
-                        crate::turn::TurnItem::Message { id }
-                        | crate::turn::TurnItem::Tool { id } => id,
+                        crate::turn::TurnItem::Message { id } | crate::turn::TurnItem::Tool { id } => {
+                            id
+                        }
                     };
                     self.node_list.push(ExchangeNode::TurnContent {
                         id: format!("{turn_id}:content:{item_id}"),
@@ -301,6 +342,7 @@ impl Exchange {
             }
         }
         self.pause(now_ms);
+        self.metrics.settle(self.elapsed(now_ms));
         Ok(())
     }
 
@@ -313,6 +355,11 @@ impl Exchange {
             0
         };
         self.duration_ms.saturating_add(active)
+    }
+
+    /// Account for non-model activity without excluding it from total execution time.
+    pub(crate) fn observe_blocker(&mut self, id: String, running: bool, now_ms: i64) {
+        self.metrics.block(id, running, self.elapsed(now_ms));
     }
 
     /// Freeze the active interval before waiting for user input or finalization.
@@ -370,6 +417,7 @@ impl Exchange {
             }
         }
         self.pause(now_ms);
+        self.metrics.settle(self.elapsed(now_ms));
         self.state = outcome;
         self.completed_at_ms = Some(now_ms);
         self.awaiting_input = false;
@@ -489,11 +537,17 @@ impl Exchange {
         Ok(())
     }
 
-    /// Attribute provider usage to the most recently admitted turn.
-    pub fn record_latest_turn_usage(&mut self, token_count: Option<u64>) {
-        if let Some(turn) = self.turn.last_mut() {
-            turn.set_token_count(token_count);
+    /// Sum usage across owned turns, retaining unavailable categories.
+    pub fn usage(&self) -> crate::backend::usage::TokenUsage {
+        let mut turn = self.turn.iter();
+        let Some(first) = turn.next() else {
+            return Default::default();
+        };
+        let mut usage = first.usage().cloned().unwrap_or_default();
+        for turn in turn {
+            usage.accumulate(&turn.usage().cloned().unwrap_or_default());
         }
+        usage
     }
 
     /// End the current streamed message at a provider wait or input boundary.
@@ -595,10 +649,59 @@ mod test {
             elicitation: None,
             duration_ms: 0,
             execution_started_at_ms: None,
-            token_count: None,
+            metrics: ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
         }
+    }
+
+    #[test]
+    fn tool_timing_excludes_user_input_pauses_and_rejects_missing_start_evidence() {
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        let mut exchange = interaction();
+        exchange.resume(1000).unwrap();
+        let address = ProviderAddress {
+            thread_id: "parent".into(),
+            turn_id: "one".into(),
+        };
+        exchange.start_turn(address.clone(), 1000).unwrap();
+        let mut event = BackendEvent {
+            address: Some(address),
+            turn_boundary: None,
+            kind: "tool".into(),
+            text: None,
+            data: serde_json::json!({}),
+            activity: Some(ToolActivity {
+                id: "call".into(),
+                kind: ToolActivityKind::ToolCall,
+                title: "command".into(),
+                output: None,
+                status: Some("running".into()),
+                change: Default::default(),
+                output_delta: false,
+            }),
+            summary: None,
+            task_update: None,
+        };
+        exchange.observe_turn(&event, 2000).unwrap();
+        exchange.pause(3000);
+        assert_eq!(exchange.elapsed(90000), 2000);
+        assert_eq!(
+            exchange.metrics.response_ms(exchange.elapsed(90000)),
+            Some(1000)
+        );
+        exchange.resume(90000).unwrap();
+        event.activity.as_mut().unwrap().status = Some("completed".into());
+        exchange.observe_turn(&event, 92000).unwrap();
+        assert_eq!(exchange.elapsed(93000), 5000);
+        assert_eq!(exchange.metrics.response_ms(5000), Some(2000));
+        event.activity.as_mut().unwrap().status = Some("running".into());
+        exchange.observe_turn(&event, 93000).unwrap();
+        assert_eq!(exchange.metrics.response_ms(6000), Some(3000));
+        event.activity.as_mut().unwrap().id = "missing-start".into();
+        event.activity.as_mut().unwrap().status = Some("completed".into());
+        exchange.observe_turn(&event, 94000).unwrap();
+        assert_eq!(exchange.metrics.response_ms(6000), None);
     }
 
     #[test]

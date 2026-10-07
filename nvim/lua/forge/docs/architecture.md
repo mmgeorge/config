@@ -2418,6 +2418,39 @@ SDK compacts automatically but exposes no manual compaction request, so its capa
 `/compact`. Compaction never creates a user interaction, and unsupported backends omit the command
 instead of receiving a synthetic summarization prompt.
 
+Exchange summaries retain native input, cached input, reasoning, and inclusive output counts
+on each owning `Turn`. Codex cumulative snapshots recover call increments after the first
+report and exclude repeated notifications and synthetic context-window adjustments. Copilot
+reports every `assistant.usage` call with its native call identity. Rust persists report identities
+and cumulative cursors inside `ExchangeMetrics`, so streamed events and terminal replay count
+each report once. Parent and child exchanges keep separate usage. A late child report updates
+its settled owning exchange without reopening execution. Missing categories remain unavailable.
+`ExchangeMetrics.request_count` counts admitted model-usage reports once. Codex uses distinct
+cumulative updates and Copilot uses native call identities. Duplicate refreshes, replay, and
+synthetic context adjustments do not increment the count. A cumulative jump can recover token
+totals without recovering how many reports were missed. Requests without usage reports, including
+failed attempts and calls still in progress, remain outside this observed completion count.
+
+Completed and paused headers show `Thought 6s (3s), 76.0k I (90%) → 3.0k R / 1.2k O (~1400 tps)`
+before tool and agent counts. Input includes cached tokens. The percentage divides summed cached
+input by summed input, and output subtracts reasoning from inclusive generated tokens. Active
+headers show the two durations without the token breakdown. The outer duration includes tools,
+approval waits, and delegated waits within active execution. Explicit user-input pauses and
+checkpoint finalization freeze that duration. The parenthetical subtracts the union of observed
+tool, approval, and delegated-wait intervals, including overlapping activity only once. It includes
+prompt processing, reasoning, output generation, and transport latency. It does not measure
+reasoning duration or time to first token. Missing tool-start evidence makes it unavailable.
+Effective throughput divides inclusive generated tokens (reasoning plus output) by the unrounded
+parenthetical duration in milliseconds, then rounds to whole tokens per second with a `~` prefix.
+Missing generated-token counts or unavailable or zero duration produce `— tps`. Inclusive output
+can supply throughput even when its reasoning split is unavailable. Paused values are provisional.
+Tool counts use `1 tool` or `N tools`, followed by the failed count when nonzero.
+Paused and completed headers place `1 request` or `N requests` before the tool count.
+Until the first admitted usage report, they show `— requests`.
+Both renderers use whole seconds, rounded cache percentages, one decimal `k` for counts of at
+least 1000, and `—` for unavailable values. Private session format 31 hides earlier sessions
+without decoding or migrating their summaries.
+
 `/plan` uses the same `Thinking` and `Thought` interaction summaries as every model turn. A
 question-only turn saves `PlanElicitation` under the active `AwaitingInput` plan, renders its
 choices in the timeline, and opens the shared picker across the bottom of the complete Harness
@@ -2510,6 +2543,13 @@ execution. That path uses clarification input boundaries when available, but old
 without item timestamps cannot recover every historical intra-turn position exactly. Cancellation pauses the execution without closing its active task. `/goal resume`
 reuses that task, the effective canonical plan, and an interruption-specific prompt that preserves
 completed workspace work.
+
+Codex background-terminal requests resume their owning thread on an independent connection.
+A newly created thread can become visible before its rollout metadata is written. For the
+specific `-32603` empty-rollout response naming that thread, the backend retries resume at
+500 ms intervals, up to four retries and two seconds of added delay. Exhausted retries preserve
+the provider error for the terminal observer to report. Other provider and transport failures
+propagate immediately. Recovery never substitutes an empty terminal inventory for a failure.
 
 Harness defaults to the direct Codex app-server backend. Set `harness.backend = "copilot"` to use
 the native Copilot SDK. An empty `harness.backends.copilot.command` delegates CLI discovery and

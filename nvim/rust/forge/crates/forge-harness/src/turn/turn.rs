@@ -40,7 +40,7 @@ pub struct Turn {
     started_at_ms: i64,
     completed_at_ms: Option<i64>,
     #[serde(default)]
-    token_count: Option<u64>,
+    usage: Option<crate::backend::usage::TokenUsage>,
     tool: ToolStore,
     message: Vec<Message>,
     item: Vec<TurnItem>,
@@ -56,7 +56,7 @@ impl Turn {
             state: TurnState::Running,
             started_at_ms: now_ms,
             completed_at_ms: None,
-            token_count: None,
+            usage: None,
             tool: ToolStore::default(),
             message: Vec::new(),
             item: Vec::new(),
@@ -80,8 +80,8 @@ impl Turn {
     }
 
     /// Return usage attributed to this provider execution.
-    pub fn token_count(&self) -> Option<u64> {
-        self.token_count
+    pub fn usage(&self) -> Option<&crate::backend::usage::TokenUsage> {
+        self.usage.as_ref()
     }
 
     /// Return the frozen provider execution duration after completion.
@@ -101,9 +101,11 @@ impl Turn {
     }
 
     /// Attach terminal usage without reopening the settled execution.
-    pub(crate) fn set_token_count(&mut self, token_count: Option<u64>) {
-        if token_count.is_some() {
-            self.token_count = token_count;
+    pub(crate) fn record_usage(&mut self, usage: crate::backend::usage::TokenUsage) {
+        if let Some(current) = &mut self.usage {
+            current.accumulate(&usage);
+        } else {
+            self.usage = Some(usage);
         }
     }
 
@@ -452,8 +454,8 @@ mod tests {
 
         assert_eq!(turn.tools().count(), 1);
         turn.finish(TurnOutcome::Completed, 20).unwrap();
-        turn.set_token_count(Some(128));
-        assert_eq!(turn.token_count(), Some(128));
+        turn.record_usage(crate::backend::usage::TokenUsage { output: Some(128), ..Default::default() });
+        assert_eq!(turn.usage().unwrap().output, Some(128));
         turn.finish(TurnOutcome::Completed, 90).unwrap();
         assert_eq!(turn.completed_at_ms, Some(20));
         assert!(turn.record_tool(&activity("late")).is_err());

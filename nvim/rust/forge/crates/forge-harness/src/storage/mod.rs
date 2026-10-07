@@ -17,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 29;
+const SESSION_FORMAT_VERSION: u32 = 31;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -1022,7 +1022,7 @@ mod test {
             elicitation: None,
             duration_ms: 20,
             execution_started_at_ms: Some(30),
-            token_count: None,
+            metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
         };
@@ -1103,7 +1103,7 @@ mod test {
             elicitation: None,
             duration_ms: 1,
             execution_started_at_ms: None,
-            token_count: None,
+            metrics: crate::exchange::ExchangeMetrics::default(),
             comment: Vec::new(),
             task: None,
         };

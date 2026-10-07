@@ -15,7 +15,7 @@ local function turn_content(id, text, duration_ms)
       state = { kind = "finished", outcome = "completed" },
       started_at_ms = 0,
       completed_at_ms = duration_ms,
-      token_count = 100,
+      usage = { input = 100, cached_input = 0, reasoning = 0, output = 0 },
       tool = { order = {}, item = {} },
       message = { { id = message_id, kind = "assistant", delivery = "commentary", text = text } },
       item = { { kind = "message", id = message_id } },

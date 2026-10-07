@@ -9,6 +9,7 @@ mod steering;
 pub(crate) mod text_generation;
 pub use text_generation::TextGeneration;
 pub mod terminal;
+pub mod usage;
 pub use catalog::{
     BackendCatalogRequest, BackendInput, CatalogCapability, CatalogMutation, McpDefinition,
     McpStatus, McpToolDefinition, SkillDefinition,
@@ -224,7 +225,7 @@ pub enum TaskStatus {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct TurnSummary {
     pub duration_ms: u64,
-    pub token_count: Option<u64>,
+    pub usage: Option<usage::TokenUsage>,
 }
 
 /// Represents one provider tool invocation across its streamed lifecycle.
@@ -335,7 +336,6 @@ pub struct BackendForkRequest {
 /// Tracks provider-reported metrics while one backend turn streams.
 #[derive(Clone, Debug, Default)]
 pub struct TurnMetrics {
-    pub token_count: Option<u64>,
     pub context_usage: Option<ContextUsage>,
     pub native_compact_update: Option<bool>,
 }
