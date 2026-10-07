@@ -1,6 +1,8 @@
 vim.loader.enable(false)
 local picker = require("forge.views.picker")
 local original_open = picker.open
+local references = require("forge.views.plan_review.references")
+local original_show_caller = references.show_caller
 local specification
 picker.open = function(value) specification = value end
 local reference = {
@@ -13,7 +15,19 @@ local reference = {
       capture = "@comment", priority = 100 } },
 }
 local success, failure = xpcall(function()
-  require("forge.views.plan_review.references").open({ win = vim.api.nvim_get_current_win() }, {
+  assert(references.show_caller == false, "Caller must be disabled by default")
+  references.open({ win = vim.api.nvim_get_current_win() }, { reference }, { position = { row = 0, column = 0 } })
+  local default_page = specification.page_list[1]
+  local default_method = default_page.option_list[1]
+  assert(vim.deep_equal(default_page.column_headers, { "Location", "Text" }))
+  assert(default_page.flexible_column == 2 and #default_method.columns == 2)
+  assert(default_method.columns[2] == reference.text:sub(3))
+  assert(default_method.column_segments[2] == nil and not default_method.label:find("RoundPlugin", 1, true))
+  assert(vim.deep_equal(default_method.column_spans[2], {
+    { first = 0, last = 3, group = "@keyword.rust", priority = 100 },
+  }), "disabled Caller must preserve Text syntax offsets")
+  references.show_caller = true
+  references.open({ win = vim.api.nvim_get_current_win() }, {
     reference,
     { id = "field", path = "src/arena.rs", line = 24, owner = "ArenaPlugin::config",
       owner_capture = { "@type", "@variable.member" }, name = "ArenaConfig", kind = "type",
@@ -49,5 +63,6 @@ local success, failure = xpcall(function()
   }))
 end, debug.traceback)
 picker.open = original_open
+references.show_caller = original_show_caller
 assert(success, failure)
 print("plan_references: passed")

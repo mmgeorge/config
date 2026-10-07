@@ -211,7 +211,7 @@ impl PlanReferenceIndex {
                         side,
                         &import.scope.join("::"),
                         &import.path.join("::"),
-                        "import",
+                        if path.ends_with(".rs") && import.export { "export" } else { "import" },
                         import.position.line,
                         import.position.column,
                         symbol,
@@ -787,7 +787,7 @@ impl PlanReferenceIndex {
                 .unwrap_or_default();
             let start = reference.column as usize;
             let tail = row.get(start..).unwrap_or_default();
-            let extent = if reference.kind != "import" {
+            let extent = if !matches!(reference.kind.as_str(), "import" | "export") {
                 reference.name.len()
             } else {
                 tail.find(|character: char| {

@@ -585,7 +585,9 @@ impl PlanReviewDocument {
             }
             return Ok(serde_json::json!({"message":"The selected symbol has no resolved plan identity."}));
         };
-        let occurrences = index.occurrence.iter().filter(|reference| reference.symbol == symbol).collect::<Vec<_>>();
+        let occurrences = index.occurrence.iter().filter(|reference| {
+            reference.symbol == symbol && !(reference.kind == "import" && reference.path.ends_with(".rs"))
+        }).collect::<Vec<_>>();
         if occurrences.is_empty() { return Ok(serde_json::json!({"message":"No references in this plan snapshot."})); }
         let mut context = self.reference_context.lock().map_err(|_| anyhow::anyhow!("plan reference context cache lock poisoned"))?;
         if !context.contains_key(&baseline) {
@@ -2392,6 +2394,43 @@ mod tests {
             serde_json::to_vec(&document.source.document).unwrap(),
             saved
         );
+    }
+
+    #[test]
+    fn references_hide_plain_rust_imports_without_losing_exports_or_rename_uses() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Import visibility");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.task = "Define shared record declarations.".into();
+        design.document.description = "Expose records through public exports.".into();
+        design.proposed.insert("Cargo.toml".into(), "[package]\nname = 'records'\nversion = '0.1.0'\nedition = '2021'\n".into());
+        design.proposed.insert("src/lib.rs".into(), "pub mod model;\npub mod consumer;\npub use crate::model::Record;\npub(crate) use crate::model::Record as CrateRecord;\n".into());
+        design.proposed.insert("src/model.rs".into(), "/// Holds a shared record.\npub struct Record {}\n".into());
+        design.proposed.insert("src/consumer.rs".into(), "use crate::model::{\n    Record as LocalRecord,\n};\nimpl LocalRecord {}\n".into());
+        canonical.design = Some(design);
+        store.write_working_document("session", "plan", &canonical).unwrap();
+        let (_, _, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let source = store.capture_review_source("session", "plan", 1, &checksum).unwrap();
+        let mut document = PlanReviewDocument::new(DocumentId("imports".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
+        let block = document.snapshot().block.into_iter().find(|block| block.text.row(0).is_some_and(|row| row.contains("pub struct Record"))).unwrap();
+        let anchor = block.metadata.target.iter().filter_map(|target| document.target.get(&target.id)).find(|anchor| matches!(&anchor.target, super::super::PlanReviewTarget::Declaration { .. })).unwrap().clone();
+        let row = block.text.row(0).unwrap();
+        let result = document.references(&anchor, row, row.find("Record").unwrap()).unwrap();
+        let references = result["references"].as_array().unwrap();
+        assert!(references.iter().all(|reference| reference["kind"] != "import"));
+        assert_eq!(references.iter().filter(|reference| reference["kind"] == "export").count(), 2);
+        assert!(references.iter().any(|reference| reference["text"].as_str().unwrap().starts_with("pub use ")));
+        assert!(references.iter().any(|reference| reference["text"].as_str().unwrap().starts_with("pub(crate) use ")));
+        let index = document.reference.lock().unwrap();
+        let index = index.get(&false).unwrap();
+        assert!(index.occurrence.iter().any(|reference| reference.kind == "import" && reference.path == "src/consumer.rs"));
+        let identity = &index.definition.get(&("src/model.rs".into(), 2, 11)).unwrap().0;
+        let renamed = index.renamed(&document.source.document, identity, "Entry").unwrap();
+        let renamed = renamed.design.unwrap();
+        assert!(renamed.proposed["src/consumer.rs"].contains("Entry as LocalRecord"));
+        assert!(renamed.proposed["src/lib.rs"].contains("pub use crate::model::Entry;"));
+        assert!(renamed.proposed["src/lib.rs"].contains("pub(crate) use crate::model::Entry as CrateRecord;"));
     }
 
     #[test]

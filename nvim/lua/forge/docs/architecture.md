@@ -2264,8 +2264,11 @@ PlanReview binds `or` and the normal LSP-reference shortcut `of` to the plan ref
 Both buffer-local aliases dispatch the same plan action and override their global mappings only
 inside PlanReview. The reference picker caps its height at 30 percent of the review window,
 bounded by the shared 24-row maximum and a four-row minimum for controls. It recomputes the
-cap on resize and scrolls its results while retaining headers. Its Location, Caller, and Text
-columns omit usage-kind labels. The reference index supplies caller captures from declaration
+cap on resize and scrolls its results while retaining headers. Its Location and Text columns
+omit usage-kind labels. The internal `forge.views.plan_review.references.show_caller` flag
+adds the Caller column when enabled and defaults to false. Plain Rust `use` imports are excluded from picker results.
+`pub use` and restricted-visibility exports remain visible, and the complete index retains
+imports for rename and resolution. The reference index supplies caller captures from declaration
 roles, including field owners and imported targets, without additional source reads. Caller
 display hides synthetic impl scope components while reference identities retain them.
 The shared picker removes hotkey padding when no option has a key and places controls directly

@@ -1,4 +1,6 @@
 local M = {}
+---@type boolean
+M.show_caller = false
 local picker = require("forge.views.picker")
 local notifications = require("forge.infra.notifications")
 local preview_namespace = vim.api.nvim_create_namespace("forge.plan.references.preview")
@@ -24,12 +26,14 @@ local preview_namespace = vim.api.nvim_create_namespace("forge.plan.references.p
 ---@param references ForgePlanReference[]
 ---@param captured table
 function M.open(review, references, captured)
+  local show_caller = M.show_caller
+  local text_column = show_caller and 3 or 2
   local options = {}
   for _, reference in ipairs(references) do
     local caller_segments = {}
     local caller_parts = {}
     local caller = reference.owner ~= "" and reference.owner or reference.name
-    for index, part in ipairs(vim.split(caller, "::", { plain = true })) do
+    for index, part in ipairs(show_caller and vim.split(caller, "::", { plain = true }) or {}) do
       if not part:match("^@impl:%d+$") then
         if #caller_parts > 0 then caller_segments[#caller_segments + 1] = { "::", "@punctuation.delimiter" } end
         caller_parts[#caller_parts + 1] = part
@@ -56,13 +60,14 @@ function M.open(review, references, captured)
     options[#options + 1] = {
       id = reference.id,
       value = reference,
-      columns = { location, caller, text },
+      columns = show_caller and { location, caller, text } or { location, text },
       column_segments = {
         { { directory, "ForgeDirName" }, { filename, "ForgeFileName" }, { ":" .. reference.line, "ForgePickerHint" } },
-        caller_segments,
+        show_caller and caller_segments or nil,
       },
-      column_spans = { [3] = text_spans },
-      label = ("%s  %s  %s"):format(location, caller, text),
+      column_spans = { [text_column] = text_spans },
+      label = show_caller and ("%s  %s  %s"):format(location, caller, text)
+        or ("%s  %s"):format(location, text),
     }
   end
   local origin = vim.api.nvim_win_call(review.win, vim.fn.winsaveview)
@@ -168,7 +173,8 @@ function M.open(review, references, captured)
     height_ratio = 0.3,
     host = { control_win = review.win, window_list = { review.win } },
     page_list = { { id = "references", title = "References", option_list = options,
-      column_headers = { "Location", "Caller", "Text" }, flexible_column = 3,
+      column_headers = show_caller and { "Location", "Caller", "Text" } or { "Location", "Text" },
+      flexible_column = text_column,
       highlight_selected_line = true, highlight_selected_text = false,
       selection_mode = "single", show_item_counter = true, search = { start_in_normal = true } } },
     on_change = function(context)
