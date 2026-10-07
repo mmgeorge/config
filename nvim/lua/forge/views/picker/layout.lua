@@ -125,7 +125,7 @@ function PickerLayout.build(page, selected_index, width, options)
   end
   if page.column_headers then
     lines[#lines + 1] = column_row(page.column_headers, string.rep(" ", prefix_width)).text
-    section_line[#section_line + 1] = #lines
+    content_range[#content_range + 1] = { first = #lines, last = #lines, group = "ForgePickerHint" }
   end
   local header_height = #lines
   local previous_section = nil

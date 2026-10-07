@@ -32,8 +32,10 @@ Source highlights apply inline-code and heading backgrounds independently from s
 Heading overlays add one display cell of trailing padding at the source line endpoint.
 The viewport provider reveals the original source on the cursor or selection rows according
 to the window's conceal policy. Overlays preserve source coordinates and rebase with edits.
-The Neovim replica applies those ranges. PlanReview uses absolute line numbers, the global
-status column, and Markdown conceal level 3, restoring the inherited settings when released.
+The Neovim replica applies those ranges. PlanReview hides editor line numbers and the status
+column and uses Markdown conceal level 3, restoring the inherited settings when released.
+Source-line numbers remain in declaration diff gutters. Draft comments preserve their owning
+view's column settings instead of changing editor line-number options.
 Wrapped source lines retain the invoking window's continuation indentation and indentation
 options. The input view owns those settings through window re-entry and restores them on release.
 The statusline resolves the source type from physical native-buffer paths without changing

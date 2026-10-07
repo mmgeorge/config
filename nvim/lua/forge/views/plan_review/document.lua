@@ -240,7 +240,7 @@ function M.attach(options, callback)
     expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice })
   local function open_view(window)
     local columns = require("forge.window_presentation").capture(window)
-    columns.number, columns.relativenumber, columns.statuscolumn = true, false, ""
+    columns.number, columns.relativenumber, columns.statuscolumn = false, false, ""
     local view = input.open(owner.replica, window, { columns = columns, virtualedit = "", conceal = { level = 3, cursor = "" },
       wrapping = { indent = columns.breakindent, options = columns.breakindentopt } })
     owner.views[window] = view

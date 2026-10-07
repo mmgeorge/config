@@ -26,9 +26,11 @@ local ok, failure = pcall(function()
   local win = vim.api.nvim_get_current_win()
   vim.api.nvim_win_set_buf(win, buf)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, source_lines)
+  vim.wo[win].number = false
+  vim.wo[win].relativenumber = false
 
   comment_view.attach(buf, win, source_lines, annotation_list)
-  assert_true(vim.wo[win].number, "PlanReview windows should show absolute line numbers")
+  assert_true(not vim.wo[win].number, "draft comments must preserve the view's hidden line numbers")
   assert_true(not vim.wo[win].relativenumber, "PlanReview windows should not show relative line numbers")
   vim.api.nvim_win_set_cursor(win, { 2, 0 })
   comment_view.add_at_cursor(buf)

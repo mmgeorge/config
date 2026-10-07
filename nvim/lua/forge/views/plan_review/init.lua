@@ -98,9 +98,9 @@ end
 ---@param win integer
 local function configure_review_window(win)
   if not vim.api.nvim_win_is_valid(win) then return end
-  vim.wo[win].number = true
+  vim.wo[win].number = false
   vim.wo[win].relativenumber = false
-  vim.wo[win].statuscolumn = vim.go.statuscolumn
+  vim.wo[win].statuscolumn = ""
 end
 
 ---@param buf integer

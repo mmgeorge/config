@@ -91,7 +91,8 @@ local ok, failure = xpcall(function()
   vim.wo.statuscolumn = "%s"
   vim.api.nvim_win_set_buf(0, alternate)
   vim.api.nvim_win_set_buf(0, native_buffer)
-  assert(vim.wo.number and vim.wo.statuscolumn == "", "reopening the draft inherited a status column without line numbers")
+  assert(not vim.wo.number and not vim.wo.relativenumber and vim.wo.statuscolumn == "",
+    "reopening the draft restored editor line numbers")
   assert(comments.capture(native_buffer)[1].source.body == "typing after submit", "hide and reopen lost the draft")
   owner.submit("plan.request_changes", { comment = "reentrant completion" }, function(result, error_message)
     assert(result and not error_message, error_message)

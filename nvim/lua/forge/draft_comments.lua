@@ -693,10 +693,6 @@ end
 ---@return ForgeDraftCommentState
 function M.attach(buf, win, source_lines, annotation_list, opts)
   opts = opts or {}
-  if win > 0 and vim.api.nvim_win_is_valid(win) and vim.api.nvim_win_get_buf(win) == buf then
-    vim.wo[win].number = true
-    vim.wo[win].relativenumber = false
-  end
   local previous = state_by_buf[buf]
   if previous then
     pcall(vim.api.nvim_del_augroup_by_id, previous.group)

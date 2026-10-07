@@ -44,8 +44,8 @@ local success, failure = xpcall(function()
       if mark[4].virt_text and mark[4].virt_text[1][1] == " 1 + " then gutter_count = gutter_count + 1 end
   end
   assert(gutter_count == 1, "plan comment projection duplicated the snapshot gutter")
-  assert(vim.wo.number and not vim.wo.relativenumber and vim.wo.signcolumn == "yes"
-    and vim.wo.statuscolumn == vim.go.statuscolumn, "plan review did not restore absolute source columns")
+  assert(not vim.wo.number and not vim.wo.relativenumber and vim.wo.signcolumn == "yes"
+    and vim.wo.statuscolumn == "", "plan review did not hide editor line numbers")
   assert(vim.wo.conceallevel == 3 and vim.wo.concealcursor == "", "plan review did not apply Markdown concealment")
   assert(vim.wo.breakindent and vim.wo.breakindentopt == "shift:0", "plan review lost source continuation indentation")
   local alternate = vim.api.nvim_create_buf(false, true)
