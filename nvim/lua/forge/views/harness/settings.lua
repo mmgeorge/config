@@ -193,14 +193,20 @@ function M.open(state, host)
           column_headers = { "Setting", "Value", "Description" },
           option_list = {
             { id = "logging", label = "Logging", columns = { "Logging", picker_field.render(status.enabled and "On" or "Off", true), "Save session log" } },
+            { id = "provider", label = "Provider", columns = { "Provider", cli or "Unknown",
+              require("forge.views.harness").backend_switch_available() and "Choose a new chat or resume a session" or "Finish pending work to switch" } },
           },
-          footer = "←→/Enter change  q close",
+          footer = "←→ change setting  Enter change/select provider  q close",
         } },
         action_list = {
           { id = "previous-value", key = "<Left>", callback = toggle },
           { id = "next-value", key = "<Right>", callback = toggle },
         },
         on_confirm = function(result)
+          if result.option.id == "provider" then
+            require("forge.views.harness.controller").select_backend()
+            return false
+          end
           toggle({ option = result.option })
           return false
         end,

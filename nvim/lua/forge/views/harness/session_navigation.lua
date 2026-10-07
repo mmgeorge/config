@@ -99,12 +99,32 @@ function M.activate(result, options)
   local existing = state_by_session_id[next_session.id]
   local source_state = session.harness
   local state = options.state
-  if existing and valid_view(existing) and existing ~= state then state = existing end
+  local reusable_buffer = existing and existing.transcript_buf and existing.composer_buf
+    and vim.api.nvim_buf_is_valid(existing.transcript_buf) and vim.api.nvim_buf_is_valid(existing.composer_buf)
+  if existing and existing ~= state and (valid_view(existing)
+    or (reusable_buffer and state and options.open_mode == "current" and valid_view(state))) then
+    if state and options.open_mode == "current" and valid_view(state) then
+      local previous_tab = existing.timeline_tab
+      require("forge.views.harness.workspace").release(existing)
+      require("forge.views.harness.workspace").release(state)
+      vim.api.nvim_win_set_buf(state.transcript_win, existing.transcript_buf)
+      vim.api.nvim_win_set_buf(state.composer_win, existing.composer_buf)
+      existing.transcript_win, existing.composer_win, existing.timeline_tab =
+        state.transcript_win, state.composer_win, state.timeline_tab
+      state.transcript_win, state.composer_win, state.timeline_tab = nil, nil, nil
+      vim.api.nvim_set_current_tabpage(existing.timeline_tab)
+      if previous_tab and previous_tab ~= existing.timeline_tab and vim.api.nvim_tabpage_is_valid(previous_tab) then
+        vim.cmd("tabclose " .. vim.api.nvim_tabpage_get_number(previous_tab))
+      end
+    end
+    state = existing
+  end
   if not state then
     state = options.open_mode == "current" and source_state or create_view("session-pending-" .. next_session.id)
   end
   attach_activation(state)
   register(state, next_session.id)
+  state.ready = source_state.ready
   activate_state(state)
   controller().activate_snapshot(result)
   controller().attach()
@@ -118,7 +138,7 @@ function M.activate(result, options)
     and vim.api.nvim_tabpage_is_valid(source_state.timeline_tab)
   then
     require("forge.views.harness.workspace").release(source_state)
-    vim.api.nvim_tabpage_close(source_state.timeline_tab, false)
+    vim.cmd("tabclose " .. vim.api.nvim_tabpage_get_number(source_state.timeline_tab))
   end
 end
 

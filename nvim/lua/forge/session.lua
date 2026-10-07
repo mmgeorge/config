@@ -65,6 +65,9 @@ M.empty_diff_rows = {}
 ---@field client table?
 ---@field ready boolean
 ---@field busy boolean
+---@field switching_backend? boolean
+---@field state_sync_pending? boolean
+---@field aborting_plan? boolean
 ---@field cancel_requested boolean
 ---@field session table?
 ---@field capability table
@@ -109,7 +112,6 @@ M.empty_diff_rows = {}
 ---@field rename_revision integer?
 ---@field rename_status string?
 ---@field pending_config_validate boolean?
----@field pending_backend string?
 ---@field pending_mode string?
 ---@field mode_restart_requested boolean?
 ---@field plan_question_open boolean?

@@ -540,6 +540,17 @@ impl HarnessBroker {
             || request.lease_conflict_action.as_deref() == Some("new");
         let mut session = match request.session_id.as_deref().filter(|_| !force_new_session) {
             Some(session_id) => {
+                let selected = store
+                    .load_session(session_id)?
+                    .context("session not found")?;
+                anyhow::ensure!(
+                    selected.workspace == workspace,
+                    "session uses a different workspace"
+                );
+                anyhow::ensure!(
+                    selected.backend == request.backend.kind,
+                    "session uses a different configured backend"
+                );
                 store.acquire_session_lease(session_id, &request.client_id, now_ms)?
             }
             None => {
@@ -9314,6 +9325,54 @@ mod test {
         assert_eq!(first.session.name, "first");
         assert_eq!(second.session.name, "second");
         assert_eq!(second.store.list_session(None).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn explicit_session_initialization_validates_before_leasing_and_resumes_exact_id() {
+        let workspace = repository();
+        let other_workspace = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut request = InitializeRequest {
+            data_root: data.path().to_string_lossy().into_owned(),
+            permission_file: None,
+            workspace: workspace.path().to_string_lossy().into_owned(),
+            client_id: "source-client".into(),
+            backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+            model: "mock-model".into(),
+            effort: "low".into(),
+            session_id: None,
+            new_session_name: Some("source".into()),
+            goal_max_turns: 20,
+            lease_conflict_action: None,
+        };
+        let mut source = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(100))).unwrap();
+        source.release_lease().unwrap();
+        request.client_id = "destination-client".into();
+        request.new_session_name = Some(String::new());
+        let newest = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(110))).unwrap();
+        assert_ne!(source.session.id, newest.session.id);
+        request.new_session_name = None;
+        request.session_id = Some(source.session.id.clone());
+
+        let mut incompatible = request.clone();
+        incompatible.workspace = other_workspace.path().to_string_lossy().into_owned();
+        let failure = HarnessBroker::initialize_with_clock(incompatible, Box::new(FixedClock(120))).err().unwrap();
+        assert!(failure.to_string().contains("different workspace"));
+        assert!(source.store.load_session(&source.session.id).unwrap().unwrap().lease_owner.is_none());
+
+        let mut stored = source.store.load_session(&source.session.id).unwrap().unwrap();
+        stored.backend = "copilot".into();
+        source.store.save_session(&stored).unwrap();
+        let failure = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(130))).err().unwrap();
+        assert!(failure.to_string().contains("different configured backend"));
+        assert!(source.store.load_session(&source.session.id).unwrap().unwrap().lease_owner.is_none());
+        stored.backend = "mock".into();
+        source.store.save_session(&stored).unwrap();
+
+        let resumed = HarnessBroker::initialize_with_clock(request, Box::new(FixedClock(140))).unwrap();
+        assert_eq!(resumed.session.id, source.session.id);
+        assert_eq!(resumed.session.name, "source");
+        assert_eq!(resumed.store.list_session(None).unwrap().len(), 2);
     }
 
     #[tokio::test]

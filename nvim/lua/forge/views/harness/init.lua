@@ -20,10 +20,11 @@ local function resolve_backend_preference()
   )
 end
 
-local function apply_snapshot(state, result)
+local function apply_snapshot(state, result, open_mode)
   session_navigation.activate(result, {
     state = state,
     interaction_mode = "reconcile",
+    open_mode = open_mode,
   })
 end
 
@@ -43,6 +44,7 @@ end
 local function finish_start(state, result, start_error, error_detail, callback)
   local conflict = error_detail and error_detail.code == "session_lease_conflict" and error_detail.data or nil
   if conflict then
+    local confirmed = false
     local option_list = M.lease_conflict_options(conflict)
     for _, option in ipairs(option_list) do option.detail = option.desc end
     picker.open({
@@ -61,10 +63,16 @@ local function finish_start(state, result, start_error, error_detail, callback)
         },
       },
       on_confirm = function(result)
+        confirmed = true
         local action = result.option.value
         client.resolve_lease_conflict(action, conflict, function(next_result, next_error, next_detail)
           finish_start(state, next_result, next_error, next_detail, callback)
         end)
+      end,
+      on_close = function()
+        if not confirmed and callback and callback.on_error then
+          callback.on_error("Session selection cancelled")
+        end
       end,
     })
     return
@@ -78,8 +86,8 @@ local function finish_start(state, result, start_error, error_detail, callback)
     end
     return
   end
+  apply_snapshot(state, result, callback and callback.open_mode)
   if callback and callback.on_ready then callback.on_ready(result) end
-  apply_snapshot(state, result)
 end
 
 function M.open()
@@ -102,29 +110,53 @@ function M.open()
   vim.api.nvim_set_current_win(state.composer_win)
 end
 
+---@return boolean
+function M.backend_switch_available()
+  local state = session.harness
+  return state.session ~= nil and not state.busy and not state.switching_backend
+    and not state.configuring and not state.state_sync_pending
+    and not state.configuration_debounce and not state.aborting_plan
+    and not (state.status and state.status.kind == "finalizing")
+    and not state.pending_config and not state.pending_mode
+    and #(state.queue or {}) == 0 and #(state.pending_steer or {}) == 0
+end
+
+---@class ForgeHarnessBackendDestination
+---@field kind "new"|"resume"
+---@field session_id? string
+
 ---@param backend string
-function M.switch_backend(backend)
+---@param destination ForgeHarnessBackendDestination
+function M.switch_backend(backend, destination)
   local state = session.harness
   local backend_config = config.options.harness.backends[backend]
   if not backend_config or backend_config.selectable == false then
     notifications.error("Unknown Harness backend: " .. tostring(backend), "Harness backend")
     return
   end
-  if state.busy then
-    notifications.warn("Cancel or finish the active turn before switching backends", "Harness backend")
+  if not M.backend_switch_available() then
+    notifications.warn("Finish or cancel pending work before switching providers", "Harness backend")
     return
   end
-  local previous_backend = config.options.harness.backend
+  if not destination or (destination.kind ~= "new" and destination.kind ~= "resume")
+    or (destination.kind == "resume" and not destination.session_id) then
+    notifications.error("Select a new chat or a session to resume", "Harness backend")
+    return
+  end
+  local previous_backend = state.session.backend
+  local previous_session_id = state.session.id
   if backend == previous_backend then return end
-  state.queue = {}
-  state.pending_steer = {}
-  state.pending_config = nil
-  state.pending_mode = nil
+  local initialize_options = destination.kind == "new" and { new_session_name = "" }
+    or { session_id = destination.session_id }
+  state.switching_backend = true
   client.stop(nil, function()
     config.options.harness.backend = backend
     client.start_harness(function(result, start_error, error_detail)
       finish_start(state, result, start_error, error_detail, {
+        open_mode = "current",
         on_ready = function()
+          state.switching_backend = false
+          controller.render()
           local saved, save_error = backend_preference.save(backend)
           if not saved then
             notifications.error(save_error or "Failed to save backend preference", "Harness backend")
@@ -135,12 +167,13 @@ function M.switch_backend(backend)
           config.options.harness.backend = previous_backend
           client.stop(nil, function()
             client.start_harness(function(previous_result, previous_error, previous_detail)
+              state.switching_backend = false
               finish_start(state, previous_result, previous_error, previous_detail)
-            end)
+            end, { session_id = previous_session_id })
           end)
         end,
       })
-    end)
+    end, initialize_options)
   end)
 end
 

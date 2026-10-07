@@ -507,6 +507,7 @@ local function send_harness_initialize(callback, initialize_options)
     effort = harness_config.effort,
     goal_max_turns = harness_config.goal_max_turns,
     lease_conflict_action = initialize_options and initialize_options.lease_conflict_action or nil,
+    session_id = initialize_options and initialize_options.session_id or nil,
     new_session_name = initialize_options and initialize_options.new_session_name or nil,
   }
   M.request_host("harness.initialize", params, initialized)
@@ -796,7 +797,8 @@ function M.resolve_lease_conflict(action, conflict, callback)
     else callback(nil, "Unknown Harness lease recovery action") end
     return
   end
-  local initialize_options = action ~= "retry" and { lease_conflict_action = "new" } or nil
+  local initialize_options = action ~= "retry" and { lease_conflict_action = "new" }
+    or { session_id = conflict.session_id }
   M.start_harness(function(result, start_error, error_detail)
     if start_error or action ~= "fork" then callback(result, start_error, error_detail) return end
     M.request("session.fork", { session_id = conflict.session_id }, callback)

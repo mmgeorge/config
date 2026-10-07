@@ -343,6 +343,7 @@ end
 
 function M.render()
   local state = harness_state()
+  if state.switching_backend then M.refresh_winbar() return end
   if not (state.transcript_buf and vim.api.nvim_buf_is_valid(state.transcript_buf)
       and state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)) then return end
   if not (state.session and state.session.id) then
@@ -364,11 +365,16 @@ function M.render()
     state.transcript_win = vim.fn.win_findbuf(state.transcript_buf)[1]
     if not state.transcript_win then return end
   end
+  local opening_session_id, opening_generation = state.session.id, client.host_generation()
+  local function owns_presentation()
+    return not state.switching_backend and state.session and state.session.id == opening_session_id
+      and client.host_generation() == opening_generation
+  end
   state.presentation = require("forge.views.harness.presentation").open({
     session_id = state.session.id, transcript_buffer = state.transcript_buf, composer_buffer = state.composer_buf,
     transcript_window = state.transcript_win,
     is_alive = function() return vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf) end,
-    notice = function(message) notifications.error(message, "ForgeHarness") end,
+    notice = function(message) if owns_presentation() then notifications.error(message, "ForgeHarness") end end,
     on_update = function()
       if state.presentation and vim.api.nvim_win_is_valid(state.transcript_win) then
         state.presentation.transcript.recap = state.recap
@@ -379,6 +385,7 @@ function M.render()
       if render_observer_for_test then render_observer_for_test(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), { native = true }) end
     end,
   }, function(opened, failure)
+    if not owns_presentation() then return end
     if failure then notifications.error(failure, "ForgeHarness") return end
     if state.selected_agent_run_id then opened.select_agent(state.selected_agent_run_id) end
     opened.sync()
@@ -1015,15 +1022,9 @@ end
 function M.drain()
   local state = harness_state()
   if state.aborting_plan then return end
-  if state.busy or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
+  if state.busy or state.switching_backend or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
   if #(state.pending_steer or {}) > 0 then return end
   if state.status and state.status.kind == "finalizing" then return end
-  if state.pending_backend then
-    local pending_backend = state.pending_backend
-    state.pending_backend = nil
-    require("forge.views.harness").switch_backend(pending_backend)
-    return
-  end
   if state.pending_mode then
     local pending_mode = state.pending_mode
     state.pending_mode = nil
@@ -1475,6 +1476,7 @@ end
 
 function M.submit()
   local state = harness_state()
+  if state.switching_backend then return end
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
@@ -1806,6 +1808,7 @@ end
 ---Queue a follow-up independently of active waits and the selected child timeline.
 function M.queue_submit()
   local state = harness_state()
+  if state.switching_backend then return end
   local text = composer_text(state.composer_buf)
   if text == "" then return end
   if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
@@ -2031,6 +2034,15 @@ end
 
 function M.select_backend()
   local state = harness_state()
+  local harness = require("forge.views.harness")
+  if not harness.backend_switch_available() then
+    notifications.warn("Finish or cancel pending work before switching providers", "Harness backend")
+    return
+  end
+  local source_session_id = state.session.id
+  local function current_source()
+    return session.harness == state and state.session and state.session.id == source_session_id
+  end
   local current = state.session and state.session.backend or config.options.harness.backend
   local option_list = {}
   for backend, backend_config in pairs(config.options.harness.backends) do
@@ -2046,14 +2058,28 @@ function M.select_backend()
   table.sort(option_list, function(left, right) return left.label < right.label end)
   open_choice_picker(state, "Select Harness", nil, option_list,
     function(backend)
-      if backend == current then return end
-      if state.busy then
-        state.pending_backend = backend
-        M.refresh_winbar()
-        notifications.info("Harness backend will switch after the active turn", "Harness backend")
-        return
+      if backend == current or not current_source() then return end
+      local function destination_picker()
+        if not current_source() then return end
+        open_choice_picker(state, "Select Chat", config.options.harness.backends[backend].label, {
+          { id = "new", label = "New chat", value = "new" },
+          { id = "resume", label = "Resume session…", value = "resume" },
+        }, function(destination)
+          if not current_source() then return end
+          if destination == "new" then
+            harness.switch_backend(backend, { kind = "new" })
+          else
+            require("forge.views.harness.session_picker").open(picker_host(state), {
+              backend = backend,
+              on_select = function(entry)
+                if current_source() then harness.switch_backend(backend, { kind = "resume", session_id = entry.id }) end
+              end,
+              on_cancel = destination_picker,
+            })
+          end
+        end)
       end
-      require("forge.views.harness").switch_backend(backend)
+      destination_picker()
     end)
 end
 
@@ -2335,6 +2361,7 @@ function M.attach()
   prompt_history.attach(state.composer_buf)
   if state.unsubscribe then state.unsubscribe() end
   state.unsubscribe = client.subscribe(function(event, payload, event_session_id)
+    if state.switching_backend then return end
     if state.session and event_session_id and state.session.id ~= event_session_id then return end
     local active_state = session.harness
     session.activate_harness(state)

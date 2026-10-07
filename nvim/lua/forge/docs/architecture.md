@@ -1645,7 +1645,7 @@ as timestamped events with indented JSON payloads in a reusable read-only tab. `
 the view, and editor focus, buffer entry, and idle events refresh it when the file changes.
 `/log clear` empties only the current session file and removes its three rotated segments.
 It leaves the global trace, other session logs, and logging preference unchanged.
-The Configuration picker displays the provider CLI as read-only context.
+The Configuration picker displays the provider CLI and exposes an explicit provider-switch action.
 
 The Codex `CodexTurnCoordinator` treats one user request as an exchange that may outlive
 its first parent app-server turn. A `turn/start` acknowledgement admits its returned turn before
@@ -1854,12 +1854,24 @@ when older sessions become invisible. `:ForgeHarness` therefore resumes current 
 while `/clear` remains the explicit boundary for creating a new session. Resumed sessions retain
 their persisted execution mode. New and forked sessions establish a fresh Read boundary.
 
-`/backend` opens the shared Harness picker over user-selectable backend descriptors. Confirmation
-stops the generic broker, restarts it with the selected launch descriptor, and resumes the latest
-same-repository session owned by that backend. Neovim stores the last successful selection in
+The Provider row in `/config` and `/backend` open the same shared picker over selectable providers.
+Selecting another provider requires an explicit New chat or Resume session destination. The resume
+picker searches and previews only that provider's sessions in the current workspace. Switching is
+unavailable during active turns, queued prompts or steering, pending configuration, and another switch.
+Cancellation before startup preserves the active chat. Confirmation stops the host and initializes the
+selected provider directly into a fresh session or the exact selected session, displayed in the current
+tab. Rust validates the selected workspace and provider before acquiring its lease. Sessions retain
+their own conversations, plans, goals, and settings without a cross-provider fork or context transfer.
+An already-open destination moves its existing buffers into the current tab, preserving its unsent
+draft and closing its previous tab. Switching back reuses retained session buffers without creating
+duplicate buffer identities. Presentation callbacks reject obsolete session and host generations,
+and shutdown events cannot start state reconciliation while a provider switch owns the host.
+Neovim stores the last successful selection in
 `stdpath("data")/forge/harness/backend.json` before the next editor launch. An explicit
 `setup({ harness = { backend = ... } })` remains authoritative, and failed switches restore the
-previous backend rather than persisting a broken default.
+exact previous session and backend rather than persisting a broken default. Cancelling lease-conflict
+recovery also restores that source session. Ordinary Harness startup still resumes the latest
+same-workspace session for its configured provider.
 
 Declaration design records use schema 6. Older plan records are excluded from storage reads,
 and older document schemas fail validation. Planning no longer authors entities, flows, stages,

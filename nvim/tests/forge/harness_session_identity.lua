@@ -24,6 +24,25 @@ local succeeded, failure = xpcall(function()
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, true)[1] == "Unsent draft")
   assert(session.harness_by_id[durable_id] == state)
   assert(vim.api.nvim_get_current_buf() == state.composer_buf)
+  local source_pending = navigation.begin_new("Switch source")
+  local source = source_pending.state
+  navigation.complete_pending(source_pending, { session = { id = "source-identity-fixture" } })
+  local source_tab = source.timeline_tab
+  local previous_target_tab = state.timeline_tab
+  local tab_count = #vim.api.nvim_list_tabpages()
+  navigation.activate({ session = { id = durable_id } }, { state = source, open_mode = "current" })
+  assert(session.harness == state and state.timeline_tab == source_tab)
+  assert(vim.api.nvim_get_current_tabpage() == source_tab and not vim.api.nvim_tabpage_is_valid(previous_target_tab))
+  assert(#vim.api.nvim_list_tabpages() == tab_count - 1)
+  assert(vim.api.nvim_win_get_buf(state.composer_win) == state.composer_buf)
+  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, true)[1] == "Unsent draft")
+  assert(source.timeline_tab == nil and source.composer_win == nil)
+  navigation.activate({ session = { id = "source-identity-fixture" } }, { state = state, open_mode = "current" })
+  assert(session.harness == source and source.timeline_tab == source_tab)
+  assert(vim.api.nvim_get_current_tabpage() == source_tab)
+  navigation.activate({ session = { id = durable_id } }, { state = source, open_mode = "current" })
+  assert(session.harness == state and state.timeline_tab == source_tab)
+  assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, true)[1] == "Unsent draft")
 end, debug.traceback)
 package.loaded["forge.views.harness.controller"] = original_controller
 if not succeeded then
