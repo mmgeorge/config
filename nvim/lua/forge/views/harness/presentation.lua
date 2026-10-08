@@ -45,12 +45,12 @@ function M.open(options, callback)
       dispatch_next()
       if not accepted then notice(tostring(callback_error)) end
     end
-    if owner.host_generation ~= client.host_generation() then
+    if owner.host_generation ~= client.host_generation() or not client.host_accepting() then
       receive(current.params.operation == "close" and {} or nil, current.params.operation ~= "close" and "Harness host generation changed" or nil)
     else client.request_for(options.session_id, "harness.document", current.params, receive) end
   end
   local function request(params, done)
-    if owner.host_generation ~= client.host_generation() then
+    if owner.host_generation ~= client.host_generation() or not client.host_accepting() then
       done(params.operation == "close" and {} or nil, params.operation ~= "close" and "Harness host generation changed" or nil)
       return
     end
@@ -365,10 +365,10 @@ function M.open(options, callback)
     owner.follow_tail()
     client.request_for(options.session_id, "prompt.submit", {
       text = text, submission = { document = identity, token = submission.token },
-    }, function(result, failure)
+    }, function(result, failure, error_detail)
       if owner.closed or owner.host_generation ~= client.host_generation() or owner.submission ~= submission then return end
       owner.submission = nil
-      callback(result, failure)
+      callback(result, failure, error_detail)
     end)
   end
 

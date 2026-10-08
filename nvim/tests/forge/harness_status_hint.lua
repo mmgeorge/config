@@ -83,6 +83,16 @@ for _, mode in ipairs({ "read", "write", "full", "yolo", "plan" }) do
   assert(colored[1][4].sign_hl_group == capture, "spinner differs from Working text")
 end
 state.session = original_session
+transcript.execution_notice = "Host stopped. Reopen Harness to reconnect."
+hint.render(transcript, command_set, 120)
+local stopped = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
+assert(#stopped == 1 and not stopped[1][4].sign_text, "stopped host retained a spinner or interrupt hint")
+assert(stopped[1][4].virt_text[1][1]:find("Host stopped", 1, true))
+vim.wait(150, function() return false end, 25)
+assert(vim.deep_equal(stopped, vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })),
+  "stopped host retained its animation timer")
+transcript.execution_notice = nil
+hint.render(transcript, command_set, 120)
 assert(vim.wait(500, function()
   local _, current = working_marks()
   return current[1][4].sign_text ~= first

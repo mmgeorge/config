@@ -83,6 +83,11 @@ local ok, failure = xpcall(function()
   assert(vim.api.nvim_buf_get_lines(composer, 0, -1, false)[1] == "typed after acceptance")
   submission.callback(nil, "turn_retracted")
 
+  local cancellation
+  owner.submit(function(_, _, detail) cancellation = detail end)
+  submission = requests[#requests]
+  submission.callback(nil, "interrupted", { code = "turn_cancelled" })
+  assert(cancellation and cancellation.code == "turn_cancelled", "composer dropped structured cancellation")
   owner.submit(function() end)
   submission = requests[#requests]
   submission.callback(nil, "admission failed")

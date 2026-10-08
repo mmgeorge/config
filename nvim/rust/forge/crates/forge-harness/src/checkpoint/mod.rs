@@ -400,7 +400,9 @@ impl GitCheckpoint {
             }
             file.push(CheckpointFile {
                 path: relative,
-                object_id: objects.put_file(&path)?,
+                object_id: objects
+                    .put_file(&path)
+                    .with_context(|| format!("capture checkpoint source {}", path.display()))?,
             });
         }
         check()?;
@@ -1165,6 +1167,32 @@ mod test {
         git(temporary.path(), &["add", "."]);
         git(temporary.path(), &["commit", "-qm", "seed"]);
         temporary
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn locked_checkpoint_source_reports_path_and_can_be_retried() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let store = SqliteStore::open(data.path()).unwrap();
+        let snapshot = GitCheckpoint::new(repository.path());
+        let path = repository.path().join("tracked.txt");
+        let locked = fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(&path)
+            .unwrap();
+        let error = snapshot
+            .capture_native(&store.objects, "session", 1, || Ok(()))
+            .unwrap_err();
+        assert!(format!("{error:#}").contains(&format!("capture checkpoint source {}", path.display())));
+        drop(locked);
+        let checkpoint = snapshot
+            .capture_native(&store.objects, "session", 2, || Ok(()))
+            .unwrap();
+        assert!(checkpoint.file.iter().any(|file| file.path == "tracked.txt"));
     }
 
     #[tokio::test]

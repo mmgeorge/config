@@ -23,6 +23,8 @@ type TaskOutcome = std::result::Result<(Id, Result<()>), JoinError>;
 
 #[derive(Deserialize)]
 pub(crate) struct RoutedRequestEnvelope {
+    #[serde(skip)]
+    pub(crate) harness_admission: Option<tokio::sync::OwnedSemaphorePermit>,
     #[serde(default)]
     pub(crate) session_id: Option<String>,
     #[serde(flatten)]
@@ -310,7 +312,7 @@ impl ConnectionHost {
                 connection.input_open = false;
                 return Ok(None);
             };
-            let envelope = match serde_json::from_slice::<RoutedRequestEnvelope>(&line) {
+            let mut envelope = match serde_json::from_slice::<RoutedRequestEnvelope>(&line) {
                 Ok(envelope) => envelope,
                 Err(error) => {
                     sink.send(Message::Response(Response::failure(
@@ -354,7 +356,7 @@ impl ConnectionHost {
                     continue;
                 }
             };
-            let method = match self.router.prepare(&envelope).await {
+            let method = match self.router.prepare(&mut envelope).await {
                 Ok(method) => method,
                 Err(error) => {
                     sink.send(Message::Response(Response::failure(

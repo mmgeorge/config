@@ -56,6 +56,23 @@ function M.render(transcript, commands, width)
   local row = vim.api.nvim_buf_line_count(target_buffer) - 1
   local location = buffer.locate(transcript, row, 0)
   local working = location and location.target and location.target:match(":working$")
+  if transcript.execution_notice then
+    M.clear(target_buffer)
+    local text = transcript.execution_notice:gsub("%s+", " ")
+    if working then
+      local rendered = vim.fn.strcharpart(text, 0, math.max(1, width - 1))
+      rendered = rendered .. string.rep(" ", math.max(0, width - vim.fn.strdisplaywidth(rendered)))
+      vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
+        id = 1, virt_text = { { rendered, "ForgeHarnessToolFailure" } },
+        virt_text_win_col = 0, priority = 200,
+      })
+    else
+      vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
+        id = 1, virt_lines = { { { text, "ForgeHarnessToolFailure" } } },
+      })
+    end
+    return
+  end
   local question = location and location.target and location.target:match(":question$")
   local inventory = transcript.background_terminals
   local terminal_count = inventory and inventory.supported and #(inventory.terminal or {}) or 0

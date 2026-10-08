@@ -1632,6 +1632,19 @@ request, plan and goal associations, and initial checkpoint. Cancellation retain
 while cleanup awaits terminal evidence. A 30-second cleanup failure remains retryable, with the
 Exchange finalizing and new request admission blocked. The terminal checkpoint and Exchange outcome
 commit together. Rollback changes history disposition while preserving execution outcomes.
+Checkpoint capture errors include the source path and retain the finalizing exchange. Ctrl-C
+retries finalization even when no provider request is active. Goal resume retries finalization
+before activating the goal, so a failed retry leaves the goal paused and admits no new work.
+Execution admission retains one permit per session from request preparation through response
+delivery. A second execution cannot reset the first request's cancellation state. Cleanup owns
+a separate control permit that blocks new execution admission until cleanup returns. Status
+reads and approval responses remain available. Ctrl-C during a mode restart suppresses its
+automatic resumption and waits for the existing cleanup acknowledgement and execution result.
+It then cancels the settled exchange and pauses its goal durably, preventing a reconnect from
+resuming work that the user stopped. Repeated idle cancellation leaves terminal history intact.
+The shared provider instructions require a missing repository-root `.gitignore` to be created
+before implementation changes or builds, with project-specific generated-output rules. Planning
+records this requirement without writing workspace files.
 
 Stable tool identities merge start, output, and completion events into one canonical tool record.
 Codex `mcpToolCall` items follow that same path. `CodexJsonRpc` converts their app-server
@@ -1698,12 +1711,30 @@ history while preserving the quick-regret workflow for a genuinely output-free t
 
 `turn.restart` uses that same out-of-band lane for an execution-mode change. Shift-Tab records the
 target mode in the Harness winbar, interrupts the active provider turn, persists the mode after
-the cancellation settles, then resumes the cancelled interaction on the retained provider
+both cancellation completion and restart acknowledgement arrive, then resumes the cancelled interaction on the retained provider
 conversation. The interrupted turn remains durable and the resumed provider work appends another
 `Turn` to the same `Exchange`, so one user action keeps one checkpoint and one rollback boundary.
 Codex exposes the submitted app-server thread for resumption, while Copilot exposes its retained
 SDK session. A restart failure preserves the partial transcript, keeps the selected execution mode,
 and notifies the user instead of silently replaying the original prompt.
+
+All execution callbacks share mode-restart completion handling, including plan acceptance,
+planning clarification, goal continuation, compaction, child-agent requests, and resumed turns.
+The selected child timeline does not defer a session-wide mode change. A newer mode selection
+replaces the pending target while cancellation or mode application completes. The restart marker
+clears before resumed work begins, so another mode selection can interrupt that work immediately.
+Cleanup or mode-application failure stops the sequence and reports the error without resuming.
+Interrupted exchanges without an active provider turn project a paused footer even while their
+retained exchange remains resumable. Host exit broadcasts a local stop event before failing pending
+requests. The controller clears transient busy, cancellation, and restart ownership, stops timers,
+and overlays a reconnect error on the retained transcript. Partial output and queued prompts remain
+available. Passive refreshes and failure callbacks cannot start a replacement host or resume work.
+Reopening Harness explicitly reconnects the presentation.
+
+Session events above the 512 KiB frame limit use session-scoped, transfer-identified parts and a
+completion record. Lua validates and assembles the complete event before delivering it to any
+subscriber. Event transfers share the two-transfer, 16 MiB-per-transfer bound with response transfers.
+Oversized-event rejection leaves the output connection available to report the request failure.
 
 `turn.steer` uses the same out-of-band broker lane without creating another interaction. Ctrl-q
 clears HarnessInput only after admitting the text into a pending steering record, then the backend
@@ -2674,7 +2705,7 @@ from reappearing through a later state snapshot.
 Read, Write, Full, and YOLO form the fixed execution-mode set. New and forked sessions start in Read,
 while resumed sessions retain their persisted mode. Plan creation, review, acceptance, rejection,
 and cancellation never change it. `Shift-Tab` cycles the four modes through
-`session.execution_mode` while idle. During an active main turn it requests `turn.restart`, then
+`session.execution_mode` while idle. During any active execution it requests `turn.restart`, then
 persists the selected mode and resumes the cancelled interaction under that new security boundary.
 `:ForgePermissions` uses an `acwrite` JSON buffer, so invalid documents never replace the compiled policy.
 Non-Git modes that permit writes retain the checkpoint warning and confirmation path.

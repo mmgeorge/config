@@ -1163,7 +1163,7 @@ impl HarnessBroker {
                 self.release_lease()?;
                 Ok((json!({ "shutdown": true }), Vec::new()))
             }
-            HarnessMethod::TurnCancel => self.retry_finalization().await,
+            HarnessMethod::TurnCancel => self.cancel_settled_execution().await,
             HarnessMethod::TurnRestart
             | HarnessMethod::TurnSteer
             | HarnessMethod::ApprovalResolve
@@ -3900,6 +3900,8 @@ Planning continuation: turn {} of {}.",
             tokio::pin!(prompt);
             loop {
                 tokio::select! {
+                    biased;
+                    () = cancellation.cancelled() => break Err(anyhow::Error::new(TurnCancelled)),
                     control = execution_receiver.recv() => {
                         if let Some(control) = control {
                             while let Ok(backend_event) = backend_event_stream.try_recv() {
@@ -3961,7 +3963,6 @@ Planning continuation: turn {} of {}.",
                     }
                     error = crate::backend::events::failed(delivery_sink.as_ref()) => break Err(error.into()),
                     result = &mut prompt => break result,
-                    () = cancellation.cancelled() => break Err(anyhow::Error::new(TurnCancelled)),
                 }
             }
         };
@@ -4007,6 +4008,26 @@ Planning continuation: turn {} of {}.",
     }
 
     /// Retry finalization without submitting provider input or replaying tool execution.
+    async fn cancel_settled_execution(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
+        let mut event = Vec::new();
+        if self.current_goal()?.is_some_and(|goal| goal.state == GoalState::Active) {
+            let (_, goal_event) = self.pause_goal().await?;
+            event.extend(goal_event);
+        }
+        if let Some(mut exchange) = self.store.list_exchange(&self.session.id)?
+            .into_iter().find(|exchange| exchange.state == ExchangeState::Running)
+        {
+            anyhow::ensure!(exchange.execution_started_at_ms.is_none()
+                && exchange.turn.iter().all(|turn| turn.state() != crate::turn::TurnState::Running),
+                "execution must settle before idle cancellation");
+            exchange.begin_finalization(ExchangeState::Cancelled, self.clock.now_ms())?;
+            self.store.save_exchange(&exchange)?;
+        }
+        let (result, finalization_event) = self.retry_finalization().await?;
+        event.extend(finalization_event);
+        Ok((result, event))
+    }
+
     async fn retry_finalization(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let Some(mut exchange) = self
             .store
@@ -5512,6 +5533,15 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             ),
             "goal cannot resume from its current state"
         );
+        let (_, mut finalization_event) = self
+            .retry_finalization()
+            .await
+            .context("finish previous exchange before resuming goal")?;
+        if self.turn_cancellation.requested.load(Ordering::Acquire)
+            || !matches!(*self.turn_cancellation.cleanup.borrow(), ExecutionCleanup::Idle)
+        {
+            return Err(anyhow::Error::new(TurnCancelled));
+        }
         goal.resume(self.clock.now_ms());
         self.store.save_goal(&goal)?;
         self.sync_plan_execution(&goal)?;
@@ -5553,7 +5583,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         {
             Ok((result, mut event)) => {
                 event.insert(0, self.event("goal_changed", serde_json::to_value(goal)?)?);
-                Ok((result, event))
+                finalization_event.extend(event);
+                Ok((result, finalization_event))
             }
             Err(error) => {
                 if error.downcast_ref::<TurnCancelled>().is_some()
@@ -7259,6 +7290,73 @@ mod test {
     }
 
     #[tokio::test]
+    async fn cancelling_paused_restart_persists_goal_and_exchange_stop() {
+        let repository = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.create_goal("Complete implementation".into(), false).unwrap();
+        let mut exchange = completed_interaction("paused-restart", &broker.session.id, Vec::new());
+        exchange.state = ExchangeState::Running;
+        exchange.completed_at_ms = None;
+        broker.store.save_exchange(&exchange).unwrap();
+        broker.cancel_settled_execution().await.unwrap();
+        assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
+        let stopped = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(stopped[0].state, ExchangeState::Cancelled);
+        broker.cancel_settled_execution().await.unwrap();
+        assert_eq!(broker.store.list_exchange(&broker.session.id).unwrap().len(), 1);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn goal_resume_retries_locked_checkpoint_before_admitting_work() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let mut goal = broker.create_goal("Finish implementation".into(), false).unwrap();
+        goal.state = GoalState::Paused;
+        broker.store.save_goal(&goal).unwrap();
+        let before = GitCheckpoint::new(repository.path())
+            .capture(&broker.store.objects, &broker.repositories, &broker.session.id, 1)
+            .await
+            .unwrap();
+        let mut exchange = completed_interaction("locked-checkpoint", &broker.session.id, Vec::new());
+        exchange.state = ExchangeState::Finalizing;
+        exchange.completed_at_ms = None;
+        exchange.finalization_outcome = Some(ExchangeState::Cancelled);
+        exchange.checkpoint_before = Some(before.id.clone());
+        broker.store.save_checkpoint_exchange(&before, &exchange).unwrap();
+        let locked = std::fs::OpenOptions::new()
+            .read(true)
+            .share_mode(0)
+            .open(repository.path().join("seed.txt"))
+            .unwrap();
+        let error = broker.resume_goal().await.unwrap_err();
+        assert!(format!("{error:#}").contains("seed.txt"));
+        assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
+        let stored = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(stored.len(), 1);
+        assert_eq!(stored[0].state, ExchangeState::Finalizing);
+        assert!(stored[0].finalization_error.is_some());
+        drop(locked);
+
+        broker.turn_cancellation.request(false);
+        assert!(broker.resume_goal().await.unwrap_err().downcast_ref::<TurnCancelled>().is_some());
+        assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
+        assert_eq!(broker.store.list_exchange(&broker.session.id).unwrap().len(), 1);
+        broker.turn_cancellation.arm(false);
+        let (_, event) = broker.resume_goal().await.unwrap();
+        assert_eq!(event[0].event, "goal_changed");
+        let stored = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(stored.len(), 2);
+        assert_eq!(stored[0].state, ExchangeState::Cancelled);
+        assert!(stored[0].finalization_error.is_none());
+        assert!(stored[0].checkpoint_after.is_some());
+    }
+
+    #[tokio::test]
     async fn cleanup_failure_retains_provider_delivery_until_retry_settles_execution() {
         let repository = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -7761,6 +7859,14 @@ mod test {
         let patch = if let Some(previous) = design.proposed.get(path) {
             format!("*** Begin Patch\n*** Update File: {path}\n@@\n{}{}*** End Patch",previous.lines().map(|line| format!("-{line}\n")).collect::<String>(),text.lines().map(|line| format!("+{line}\n")).collect::<String>())
         } else { format!("*** Begin Patch\n*** Add File: {path}\n{}*** End Patch",text.lines().map(|line| format!("+{line}\n")).collect::<String>()) };
+        let previous_metadata = serde_json::to_string_pretty(&design.document).unwrap()
+            .lines().map(|line| format!("-{line}\n")).collect::<String>();
+        let mut metadata = design.document.clone();
+        metadata.task = "Implement the migration strategy.".into();
+        metadata.description = overview.into();
+        let proposed_metadata = serde_json::to_string_pretty(&metadata).unwrap()
+            .lines().map(|line| format!("+{line}\n")).collect::<String>();
+        let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{previous_metadata}{proposed_metadata}*** End Patch"));
         let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Migration plan".into()),source_digests:Default::default() };
         let changed = document.patch_design(Path::new(&request.workspace), change.clone()).unwrap();
         output.design_patch.push(change);

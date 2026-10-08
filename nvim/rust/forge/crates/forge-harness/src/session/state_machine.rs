@@ -20,6 +20,7 @@ pub enum WorkflowActivity {
 pub enum SessionPhase {
     #[default]
     Idle,
+    Paused,
     Finalizing {
         exchange_id: String,
         error: Option<String>,
@@ -60,8 +61,9 @@ impl SessionPhase {
         active_wait: Option<&ActiveWait>,
         exchange: Option<&Exchange>,
     ) -> Self {
-        let executing = exchange.is_some_and(|exchange| exchange.state == ExchangeState::Running
-            && exchange.execution_started_at_ms.is_some());
+        let executing = exchange.is_some_and(|exchange| {
+            exchange.state == ExchangeState::Running && exchange.execution_started_at_ms.is_some()
+        });
         if let Some(exchange) =
             exchange.filter(|exchange| exchange.state == ExchangeState::Finalizing)
         {
@@ -76,8 +78,8 @@ impl SessionPhase {
                 turn_count: plan.generation.budget.turn_count,
             };
         }
-        if let Some(plan) =
-            active_plan.filter(|plan| !executing && (plan.acceptance.is_some() || plan.elicitation.is_some()))
+        if let Some(plan) = active_plan
+            .filter(|plan| !executing && (plan.acceptance.is_some() || plan.elicitation.is_some()))
         {
             return Self::AwaitingInput {
                 owner: if plan.acceptance.is_some() {
@@ -100,11 +102,28 @@ impl SessionPhase {
                 exchange_id: Some(exchange.id.clone()),
             };
         }
-        if let Some(plan) = active_plan.filter(|plan| !executing && plan.state == PlanState::AwaitingReview) {
+        if let Some(plan) =
+            active_plan.filter(|plan| !executing && plan.state == PlanState::AwaitingReview)
+        {
             return Self::AwaitingPlanReview {
                 plan_id: plan.id.clone(),
                 revision: plan.model_revision,
             };
+        }
+        if exchange.is_some_and(|exchange| {
+            exchange.state == ExchangeState::Running
+                && exchange.execution_started_at_ms.is_none()
+                && exchange.turn.last().is_some_and(|turn| {
+                    matches!(
+                        turn.state(),
+                        crate::turn::TurnState::Finished {
+                            outcome: crate::turn::TurnOutcome::Interrupted
+                                | crate::turn::TurnOutcome::Cancelled
+                        }
+                    )
+                })
+        }) {
+            return Self::Paused;
         }
         let working = exchange
             .filter(|exchange| exchange.state == ExchangeState::Running)
@@ -228,26 +247,50 @@ mod test {
     fn question_wait_yields_to_execution_and_returns_after_the_reply() {
         for planning in [false, true] {
             let elicitation = crate::plan::PlanElicitation::new(
-                crate::plan::PlanQuestionSet::freeform("Which scope?".into()).normalize().unwrap());
+                crate::plan::PlanQuestionSet::freeform("Which scope?".into())
+                    .normalize()
+                    .unwrap(),
+            );
             let mut plan = plan(PlanState::AwaitingInput);
             let mut exchange = exchange();
-            if planning { plan.elicitation = Some(elicitation); }
-            else { exchange.elicitation = Some(elicitation); }
+            if planning {
+                plan.elicitation = Some(elicitation);
+            } else {
+                exchange.elicitation = Some(elicitation);
+            }
             let active_plan = planning.then_some(&plan);
             exchange.awaiting_input = true;
             exchange.pause(50);
-            assert!(matches!(SessionPhase::resolve(active_plan,None,Some(&exchange)),SessionPhase::AwaitingInput {..}));
+            assert!(matches!(
+                SessionPhase::resolve(active_plan, None, Some(&exchange)),
+                SessionPhase::AwaitingInput { .. }
+            ));
             exchange.resume(60).unwrap();
-            assert!(matches!(SessionPhase::resolve(active_plan,None,Some(&exchange)),SessionPhase::Working {started_at_ms:60,..}));
+            assert!(matches!(
+                SessionPhase::resolve(active_plan, None, Some(&exchange)),
+                SessionPhase::Working {
+                    started_at_ms: 60,
+                    ..
+                }
+            ));
             exchange.pause(70);
-            assert!(matches!(SessionPhase::resolve(active_plan,None,Some(&exchange)),SessionPhase::AwaitingInput {..}));
+            assert!(matches!(
+                SessionPhase::resolve(active_plan, None, Some(&exchange)),
+                SessionPhase::AwaitingInput { .. }
+            ));
         }
         let plan = plan(PlanState::AwaitingReview);
         let mut unrelated = exchange();
         unrelated.kind = ExchangeKind::Chat;
-        assert!(matches!(SessionPhase::resolve(Some(&plan),None,Some(&unrelated)),SessionPhase::Working {..}));
-        unrelated.finish(ExchangeState::Complete,70).unwrap();
-        assert!(matches!(SessionPhase::resolve(Some(&plan),None,Some(&unrelated)),SessionPhase::AwaitingPlanReview {..}));
+        assert!(matches!(
+            SessionPhase::resolve(Some(&plan), None, Some(&unrelated)),
+            SessionPhase::Working { .. }
+        ));
+        unrelated.finish(ExchangeState::Complete, 70).unwrap();
+        assert!(matches!(
+            SessionPhase::resolve(Some(&plan), None, Some(&unrelated)),
+            SessionPhase::AwaitingPlanReview { .. }
+        ));
     }
 
     #[test]
@@ -332,6 +375,30 @@ mod test {
                 started_at_ms: 42,
                 ..
             }
+        ));
+    }
+
+    #[test]
+    fn interrupted_restart_remains_paused_until_execution_resumes() {
+        let mut exchange = exchange();
+        exchange
+            .start_turn(
+                crate::backend::ProviderAddress {
+                    thread_id: "thread".into(),
+                    turn_id: "turn".into(),
+                },
+                42,
+            )
+            .unwrap();
+        exchange.pause_for_restart(100).unwrap();
+        assert_eq!(
+            SessionPhase::resolve(None, None, Some(&exchange)),
+            SessionPhase::Paused
+        );
+        exchange.resume(120).unwrap();
+        assert!(matches!(
+            SessionPhase::resolve(None, None, Some(&exchange)),
+            SessionPhase::Working { .. }
         ));
     }
 }

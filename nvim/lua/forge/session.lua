@@ -114,6 +114,9 @@ M.empty_diff_rows = {}
 ---@field pending_config_validate boolean?
 ---@field pending_mode string?
 ---@field mode_restart_requested boolean?
+---@field mode_restart {accepted: boolean, finished: boolean, applying: boolean, cancelled?: boolean, stopping?: boolean}?
+---@field host_error string?
+---@field execution_notice string?
 ---@field plan_question_open boolean?
 ---@field presented_question_key string?
 ---@field timeline_status_timer any?

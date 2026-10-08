@@ -220,6 +220,7 @@ impl TimelineRenderer<'_> {
             TimelineEntry::Status { id, status, .. } => {
                 let text = match status {
                     SessionPhase::Idle => String::new(),
+                    SessionPhase::Paused => "Paused".into(),
                     SessionPhase::Finalizing { error, .. } => error.as_ref().map_or_else(
                         || "Finalizing".into(),
                         |error| format!("Finalization failed: {error}"),

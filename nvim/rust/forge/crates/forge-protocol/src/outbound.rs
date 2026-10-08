@@ -1,9 +1,12 @@
 //! Output admission bounds encoded storage before serialization starts.
 
 use std::io::{self, Write};
-use std::sync::{Arc, Mutex};
+use std::sync::{
+    Arc, Mutex,
+    atomic::{AtomicU64, Ordering},
+};
 
-use crate::message::{Message, RequestEvent, Response};
+use crate::message::{Message, RequestEvent, Response, SessionEvent};
 use serde::Serialize;
 use serde_json::json;
 use tokio::sync::{mpsc, watch};
@@ -26,6 +29,7 @@ pub struct MessageSender {
     failure: watch::Sender<Option<String>>,
     capacity: watch::Sender<()>,
     transfer: Arc<tokio::sync::Semaphore>,
+    event_sequence: Arc<AtomicU64>,
 }
 
 pub struct MessageReceiver {
@@ -58,6 +62,7 @@ pub fn channel() -> (MessageSender, MessageReceiver) {
             failure,
             capacity,
             transfer: Arc::new(tokio::sync::Semaphore::new(2)),
+            event_sequence: Arc::new(AtomicU64::new(0)),
         },
         MessageReceiver {
             receiver,
@@ -77,6 +82,36 @@ pub fn encode(message: &impl Serialize, limit: usize) -> io::Result<Vec<u8>> {
 }
 
 impl MessageSender {
+    /// Transfers a session event atomically through bounded frames without discarding its payload.
+    pub async fn send_event(&self, event: SessionEvent) -> io::Result<()> {
+        let message = Message::Event(event.clone());
+        if encode(&message, MAX_FRAME_BYTES).is_ok() {
+            return self.send_wait(message).await;
+        }
+        let _permit = self.begin_transfer()?;
+        let transfer = crate::transfer::JsonTransfer::new(&message)?;
+        let transfer_id = self
+            .event_sequence
+            .fetch_add(1, Ordering::Relaxed)
+            .to_string();
+        let completion =
+            json!({"part_count":transfer.part_count(), "total_bytes":transfer.total_bytes()});
+        for part in transfer {
+            self.send_wait(Message::Event(SessionEvent {
+                session_id: event.session_id.clone(),
+                event: "event.part".into(),
+                payload: json!({"transfer_id":transfer_id, "part":part}),
+            }))
+            .await?;
+        }
+        self.send_wait(Message::Event(SessionEvent {
+            session_id: event.session_id,
+            event: "event.complete".into(),
+            payload: json!({"transfer_id":transfer_id, "part":completion}),
+        }))
+        .await
+    }
+
     /// Transfer a complete response without exceeding individual frame limits.
     pub async fn send_response(&self, response: Response) -> io::Result<()> {
         let request_id = response.id;
@@ -441,6 +476,73 @@ mod tests {
             assert_eq!(frame.bytes(), format!("{sequence}\n").as_bytes());
         }
         assert_eq!(sender.budget.lock().unwrap().bytes, 0);
+    }
+
+    #[tokio::test]
+    async fn large_session_event_preserves_payload_and_output_connection() {
+        let (sender, mut receiver) = channel();
+        let event = SessionEvent {
+            session_id: "session".into(),
+            event: "exchange_updated".into(),
+            payload: json!({"text": "\"\\\n\u{03bb}".repeat(MAX_FRAME_BYTES)}),
+        };
+        let expected = serde_json::to_value(&event).unwrap();
+        let producer = async {
+            sender.send_event(event).await.unwrap();
+            sender
+                .send_response(Response::success(12, json!({"ok":true})).unwrap())
+                .await
+                .unwrap();
+        };
+        let consumer = async {
+            let mut encoded = String::new();
+            let mut sequence = 0;
+            loop {
+                let frame = receiver.recv().await.unwrap().unwrap();
+                assert!(frame.bytes().len() <= MAX_FRAME_BYTES);
+                let message: serde_json::Value = serde_json::from_slice(frame.bytes()).unwrap();
+                match message["event"].as_str() {
+                    Some("event.part") => {
+                        let part = &message["payload"]["part"];
+                        assert_eq!(part["sequence"], sequence);
+                        sequence += 1;
+                        encoded.push_str(part["payload"].as_str().unwrap());
+                    }
+                    Some("event.complete") => {
+                        assert_eq!(message["payload"]["part"]["part_count"], sequence);
+                        assert_eq!(
+                            serde_json::from_str::<serde_json::Value>(&encoded).unwrap(),
+                            expected
+                        );
+                    }
+                    _ => {
+                        assert_eq!(message["id"], 12);
+                        break;
+                    }
+                }
+            }
+        };
+        tokio::join!(producer, consumer);
+    }
+
+    #[tokio::test]
+    async fn rejected_session_event_does_not_poison_output() {
+        let (sender, mut receiver) = channel();
+        assert!(
+            sender
+                .send_event(SessionEvent {
+                    session_id: "session".into(),
+                    event: "exchange_updated".into(),
+                    payload: json!("x".repeat(crate::MAX_SNAPSHOT_BYTES)),
+                })
+                .await
+                .is_err()
+        );
+        sender
+            .send_response(Response::success(12, json!({"ok":true})).unwrap())
+            .await
+            .unwrap();
+        assert!(receiver.recv().await.unwrap().is_some());
     }
 
     #[tokio::test]

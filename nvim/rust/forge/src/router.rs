@@ -504,10 +504,10 @@ impl HostRouter {
         }
     }
 
-    pub(crate) async fn prepare(&self, envelope: &RoutedRequestEnvelope) -> Result<RoutedMethod> {
+    pub(crate) async fn prepare(&self, envelope: &mut RoutedRequestEnvelope) -> Result<RoutedMethod> {
         let method = decode_method(&envelope.request.method)?;
         if let RoutedMethod::Harness(harness_method) = method {
-            self.host
+            envelope.harness_admission = self.host
                 .harness
                 .prepare(envelope.session_id.as_deref(), harness_method)
                 .await?;
@@ -540,6 +540,7 @@ impl HostRouter {
                 }
             })
         });
+        let _harness_admission = envelope.harness_admission;
         let request = envelope.request;
         match method {
             RoutedMethod::StatusNavigate => {

@@ -16,6 +16,7 @@ end
 ---@param result table
 function HarnessSnapshot.apply(state, result)
   result = presentation_value(result)
+  if state.host_error then state.host_error, state.execution_notice = nil, nil end
   local previous_session_id = state.session and state.session.id or nil
   local previous_context_usage = state.session and state.session.context_usage or nil
   state.session = result.session

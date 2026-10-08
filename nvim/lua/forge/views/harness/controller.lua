@@ -27,6 +27,7 @@ local render_observer_for_test = nil
 local begin_request
 local submit_immediate
 local configure_now
+local finish_execution
 local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
 local queue_only_commands = { ["/plan"] = true }
 
@@ -260,7 +261,9 @@ local function status_text()
   local effort = selected_setting(state, "effort")
   if state.pending_config and state.pending_config.model then model = state.pending_config.model .. "*" end
   if effort ~= (active_session.effort or config.options.harness.effort) then effort = effort .. "*" end
-  local busy = state.cancel_requested and " • cancelling"
+  local busy = state.host_error and " • host stopped"
+    or state.execution_notice and " • stopped"
+    or state.cancel_requested and " • cancelling"
     or state.mode_restart_requested and " • restarting"
     or state.busy and ""
     or (#state.queue > 0 and (" • queued " .. #state.queue) or "")
@@ -343,6 +346,14 @@ end
 
 function M.render()
   local state = harness_state()
+  if state.presentation and state.presentation.transcript then
+    state.presentation.transcript.execution_notice = state.execution_notice
+    if state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
+      require("forge.views.harness.status_hint").render(state.presentation.transcript,
+        M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
+    end
+  end
+  if state.host_error then M.refresh_winbar() return end
   if state.switching_backend then M.refresh_winbar() return end
   if not (state.transcript_buf and vim.api.nvim_buf_is_valid(state.transcript_buf)
       and state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)) then return end
@@ -379,6 +390,7 @@ function M.render()
       if state.presentation and vim.api.nvim_win_is_valid(state.transcript_win) then
         state.presentation.transcript.recap = state.recap
         state.presentation.transcript.rename_status = state.rename_status
+        state.presentation.transcript.execution_notice = state.execution_notice
         require("forge.views.harness.status_hint").render(state.presentation.transcript,
           M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
       end
@@ -415,6 +427,7 @@ local function set_busy(busy)
   local state = harness_state()
   state.busy = busy
   if busy then
+    state.execution_notice = nil
     if state.working_started_ns then return end
     state.working_started_ns = vim.uv.hrtime()
     state.working_timer = vim.uv.new_timer()
@@ -467,6 +480,7 @@ end
 ---@param callback? fun(result: table)
 local function synchronize_state(callback)
   local synchronized_state = harness_state()
+  if synchronized_state.host_error then M.render() return end
   if callback then
     synchronized_state.state_sync_callback = synchronized_state.state_sync_callback or {}
     table.insert(synchronized_state.state_sync_callback, callback)
@@ -540,6 +554,21 @@ end
 
 local function on_event(event, payload)
   local state = harness_state()
+  if event == "host_stopped" then
+    state.host_error = payload.message
+    state.execution_notice = payload.message .. ". Reopen Harness to reconnect."
+    state.mode_restart, state.pending_mode, state.mcp_restart = nil, nil, nil
+    state.mode_restart_requested, state.cancel_requested = false, false
+    state.state_sync_pending, state.state_sync_again, state.state_sync_callback = nil, nil, nil
+    state.configuring, state.configuration_debounce = false, false
+    state.approval, state.active_wait = {}, nil
+    state.ready = false
+    if state.presentation and state.presentation.terminals then state.presentation.terminals.close() end
+    set_busy(false)
+    M.refresh_winbar()
+    return
+  end
+  if state.host_error then return end
   if event == "timeline_patch" then
     local applied, patch_error = timeline_cache.apply(state, payload)
     if not applied then
@@ -779,8 +808,8 @@ function M.present_plan_question(force)
       state.plan_question_open = false
       prompt_history.record(params.text)
       set_busy(true)
-      client.request("question.ask", params, function(_, request_error)
-        set_busy(false)
+      client.request("question.ask", params, function(_, request_error, error_detail)
+        if finish_execution(request_error, error_detail) then return end
         question_presentation.reset(state)
         if request_error then
           notifications.error(request_error, "Planning clarification")
@@ -793,8 +822,8 @@ function M.present_plan_question(force)
     continue = function()
       state.plan_question_open = false
       set_busy(true)
-      client.request("question.continue", {}, function(_, request_error)
-        set_busy(false)
+      client.request("question.continue", {}, function(_, request_error, error_detail)
+        if finish_execution(request_error, error_detail) then return end
         if request_error then
           notifications.error(request_error, "Planning continuation")
           synchronize_state()
@@ -837,28 +866,60 @@ function M.reopen_question()
   M.present_plan_question(true)
 end
 
----@param mode string
-local function resume_mode_restart(mode)
+local function clear_mode_restart(state)
+  state.mode_restart = nil
+  state.mode_restart_requested = false
+  state.pending_mode = nil
+end
+
+local function cancel_mode_restart(state, restart)
+  if restart.stopping then return end
+  restart.stopping = true
+  client.request("turn.cancel", {}, function(_, request_error)
+    if state.mode_restart ~= restart or state.host_error then return end
+    clear_mode_restart(state)
+    state.execution_notice = request_error and ("Stopped: " .. request_error) or "Paused"
+    set_busy(false)
+    if request_error then notifications.error(request_error, "Harness cancel") end
+    synchronize_state()
+  end)
+end
+
+local function resume_mode_restart()
   local state = harness_state()
+  local restart = state.mode_restart
+  if not (restart and restart.accepted and restart.finished) or restart.applying then return end
+  if restart.cancelled then
+    cancel_mode_restart(state, restart)
+    return
+  end
+  restart.applying = true
+  local mode = state.pending_mode
   local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
   set_busy(true)
   client.request("session.execution_mode", { mode = mode }, function(session_result, mode_error)
+    if state.mode_restart ~= restart or restart.stopping then return end
     if mode_error then
-      state.mode_restart_requested = false
-      state.pending_mode = nil
+      clear_mode_restart(state)
+      state.execution_notice = "Stopped: execution mode change failed: " .. mode_error
       set_busy(false)
       report_configuration_error("Could not change execution mode after interruption: " .. mode_error)
       synchronize_state()
       return
     end
     state.session = session_result or state.session
+    if state.pending_mode ~= mode then
+      restart.applying = false
+      resume_mode_restart()
+      return
+    end
+    clear_mode_restart(state)
+    M.refresh_winbar()
     client.request("exchange.resume", {
       text = "Continue the active task from the interrupted turn. Execution mode is now " .. label
         .. ". Preserve completed work and do not repeat finished actions.",
-    }, function(result, resume_error)
-      state.mode_restart_requested = false
-      state.pending_mode = nil
-      set_busy(false)
+    }, function(result, resume_error, error_detail)
+      if finish_execution(resume_error, error_detail) then return end
       if resume_error then
         notifications.error("Harness could not resume after changing to " .. label .. ": " .. resume_error, "ForgeHarness")
         synchronize_state()
@@ -868,10 +929,38 @@ local function resume_mode_restart(mode)
         state.session = result.session or (result.id and result) or state.session
         state.capability = result.capability or state.capability
       end
-      synchronize_state()
-      vim.schedule(M.drain)
+      synchronize_state(M.drain)
     end)
   end)
+end
+
+---@param request_error string?
+---@param error_detail {code: string}?
+---@return boolean
+finish_execution = function(request_error, error_detail)
+  local state = harness_state()
+  if state.host_error then set_busy(false) return true end
+  local restart = state.mode_restart
+  if restart then
+    restart.finished = true
+    if not request_error or (error_detail and error_detail.code == "turn_cancelled") then
+      resume_mode_restart()
+      return true
+    end
+    clear_mode_restart(state)
+  end
+  if request_error and error_detail and error_detail.code == "turn_cancelled" and not state.mcp_restart then
+    state.execution_notice = "Paused"
+    set_busy(false)
+    synchronize_state()
+    return true
+  end
+  if request_error and not (error_detail and error_detail.code == "turn_retracted") then
+    state.execution_notice = error_detail and error_detail.code == "turn_cancelled" and "Paused"
+      or ("Stopped: " .. request_error)
+  end
+  set_busy(false)
+  return false
 end
 
 local function clear_mcp_restart(state)
@@ -889,9 +978,9 @@ local function maybe_resume_mcp_restart()
   client.request("exchange.resume", {
     text = "Continue the active task from the interrupted turn. " .. change_summary
       .. " Preserve completed work and do not repeat finished actions.",
-  }, function(result, resume_error)
+  }, function(result, resume_error, error_detail)
     clear_mcp_restart(state)
-    set_busy(false)
+    if finish_execution(resume_error, error_detail) then return end
     if resume_error then
       notifications.error("Harness could not resume after changing MCP state: " .. resume_error, "Harness MCP")
       synchronize_state()
@@ -921,7 +1010,7 @@ begin_request = function(text, from_composer)
   local method = "prompt.submit"
   local params = { text = text }
   local function receive(result, request_error, error_detail)
-    set_busy(false)
+    if finish_execution(request_error, error_detail) then return end
     state.cancel_requested = false
     if request_error then
       if error_detail and error_detail.code == "turn_retracted" then
@@ -934,10 +1023,6 @@ begin_request = function(text, from_composer)
         if state.mcp_restart then
           state.mcp_restart.turn_cancelled = true
           maybe_resume_mcp_restart()
-          return
-        end
-        if state.mode_restart_requested and state.pending_mode then
-          resume_mode_restart(state.pending_mode)
           return
         end
         synchronize_state(M.drain)
@@ -960,18 +1045,49 @@ end
 
 function M.cancel_turn()
   local state = harness_state()
+  if not state.busy and not state.host_error and state.status
+      and (state.status.kind == "finalizing" or state.status.kind == "paused") then
+    if state.cancel_requested then return end
+    state.cancel_requested = true
+    client.request("turn.cancel", {}, function(_, request_error)
+      if state.host_error then return end
+      state.cancel_requested = false
+      if request_error then
+        state.execution_notice = "Finalization failed: " .. request_error
+        notifications.error(request_error, "Harness finalization")
+      else
+        state.execution_notice = "Paused"
+      end
+      M.render()
+      synchronize_state()
+    end)
+    return
+  end
   if not state.busy then
-    notifications.warn("No Harness turn is running", "ForgeHarness")
+    state.execution_notice = state.execution_notice or "Paused"
+    M.render()
+    if not state.host_error then synchronize_state() end
     return
   end
   if state.cancel_requested then return end
+  if state.mode_restart then
+    local restart = state.mode_restart
+    restart.cancelled = true
+    state.cancel_requested = true
+    if restart.applying then
+      cancel_mode_restart(state, restart)
+    else
+      resume_mode_restart()
+      M.refresh_winbar()
+    end
+    return
+  end
   local target = selected_agent_target(state)
   if state.selected_agent_run_id and not target then
     notifications.warn("The selected child has no active turn to cancel", "ForgeHarness")
     return
   end
-  state.mode_restart_requested = false
-  state.pending_mode = nil
+  clear_mode_restart(state)
   state.cancel_requested = true
   M.refresh_winbar()
   local restore_prompt = state.capability.native_turn_rollback == true
@@ -979,6 +1095,7 @@ function M.cancel_turn()
     and #(state.pending_steer or {}) == 0
     and composer_text(state.composer_buf) == ""
   client.request("turn.cancel", { restore_prompt_if_no_output = restore_prompt, target = target }, function(result, request_error)
+    if state.host_error then return end
     if request_error then
       state.cancel_requested = false
       notifications.error(request_error, "Harness cancel")
@@ -1004,8 +1121,8 @@ function M.compact()
   end
   set_busy(true)
   M.refresh_winbar()
-  client.request("session.compact", {}, function(result, request_error)
-    set_busy(false)
+  client.request("session.compact", {}, function(result, request_error, error_detail)
+    if finish_execution(request_error, error_detail) then return end
     if request_error then
       notifications.error(request_error, "Harness compact")
       M.refresh_winbar()
@@ -1022,6 +1139,7 @@ end
 
 function M.drain()
   local state = harness_state()
+  if state.host_error or state.execution_notice then return end
   if state.aborting_plan then return end
   if state.busy or state.switching_backend or state.state_sync_pending or state.configuring or state.configuration_debounce then return end
   if #(state.pending_steer or {}) > 0 then return end
@@ -1068,8 +1186,8 @@ function M.drain()
   if state.goal and state.goal.state == "active" then
     set_busy(true)
     M.refresh_winbar()
-    client.request("goal.continue", {}, function(result, request_error)
-      set_busy(false)
+    client.request("goal.continue", {}, function(result, request_error, error_detail)
+      if finish_execution(request_error, error_detail) then return end
       if request_error then
         notifications.error(request_error, "Harness Goal")
         synchronize_state()
@@ -1217,7 +1335,7 @@ function M.abort_plan()
       if state.plan_review and state.plan_review.command_set then
         state.plan_review.command_set.action_by_id.close.run({})
       end
-      state.pending_mode, state.mode_restart_requested = nil, false
+      clear_mode_restart(state)
       state.active_plan, state.active_elicitation = nil, nil
       synchronize_state(M.drain)
     end)
@@ -1406,8 +1524,8 @@ function M.spawn_agent(definition, task)
   end
   if state.presentation then state.presentation.follow_tail() end
   set_busy(true)
-  client.request("agent.start", { definition = definition, task = task }, function(_, request_error)
-    set_busy(false)
+  client.request("agent.start", { definition = definition, task = task }, function(_, request_error, error_detail)
+    if finish_execution(request_error, error_detail) then return end
     if request_error then notifications.error(request_error, "Harness agent") end
     synchronize_state(M.drain)
   end)
@@ -1476,6 +1594,8 @@ function M.open_background_picker()
 end
 
 function M.submit()
+  if harness_state().host_error then notifications.error(harness_state().execution_notice, "ForgeHarness") return end
+  harness_state().execution_notice = nil
   local state = harness_state()
   if state.switching_backend then return end
   local text = composer_text(state.composer_buf)
@@ -1808,6 +1928,8 @@ end
 
 ---Queue a follow-up independently of active waits and the selected child timeline.
 function M.queue_submit()
+  if harness_state().host_error then notifications.error(harness_state().execution_notice, "ForgeHarness") return end
+  harness_state().execution_notice = nil
   local state = harness_state()
   if state.switching_backend then return end
   local text = composer_text(state.composer_buf)
@@ -2098,6 +2220,7 @@ end
 ---@param mode string
 function M.set_mode(mode)
   local state = harness_state()
+  if state.host_error then notifications.error(state.execution_notice, "ForgeHarness") return end
   mode = mode:lower()
   local function apply_mode()
     if mode == "plan" then
@@ -2116,26 +2239,35 @@ function M.set_mode(mode)
       return
     end
     if state.busy then
-      if state.mode_restart_requested then
-        return
-      end
-      if selected_agent_run(state) then
-        state.pending_mode = mode
+      state.pending_mode = mode
+      if state.mode_restart then
+        if state.mode_restart.stopping then
+          state.pending_mode = nil
+          notifications.warn("Cancellation is finishing. Change mode after it settles.", "ForgeHarness")
+          return
+        end
+        state.mode_restart.cancelled = false
+        state.cancel_requested = false
         M.refresh_winbar()
         return
       end
-      state.pending_mode = mode
+      local restart = { accepted = false, finished = false, applying = false }
+      state.mode_restart = restart
       state.mode_restart_requested = true
       M.refresh_winbar()
       client.request("turn.restart", { mode = mode }, function(result, request_error)
+        if state.mode_restart ~= restart then return end
         if request_error or not (result and result.restart_requested) then
-          state.mode_restart_requested = false
-          state.pending_mode = nil
+          clear_mode_restart(state)
+          if restart.finished then set_busy(false) synchronize_state() end
           report_configuration_error(
             "Failed to restart Harness in " .. mode .. " mode: " .. (request_error or "request rejected")
           )
           M.refresh_winbar()
+          return
         end
+        restart.accepted = true
+        resume_mode_restart()
       end)
       return
     end
@@ -2351,6 +2483,7 @@ end
 
 function M.attach()
   local state = harness_state()
+  if client.host_accepting() then state.host_error, state.execution_notice = nil, nil end
   state.command_set = M.command_set()
   M.attach_transcript(state.transcript_buf)
   local composer_command_set = M.command_set()

@@ -27,6 +27,13 @@ Never generate executable function bodies or modify project files during plannin
 version with harness_plan_submit and end the turn after success. Submission requests review.
 Explicit acceptance starts semantic execution under the approved goal and phase instructions.
 
+Before making code changes during implementation, check for a repository-root .gitignore.
+If it is absent, create it first with ignore rules for the project's build outputs, dependency
+caches, and temporary files. For Rust projects, include /target/. Do this before running builds
+or dependency installation, even when global Git ignore rules exist. Preserve existing ignore
+rules and do not ignore source files or required lockfiles. During planning, record this setup
+requirement without creating or modifying workspace files.
+
 Use Markdown for user-facing responses, language-tagged code fences, and inline code for
 identifiers and commands. Keep tool arguments in their advertised schema.
 

@@ -11,7 +11,7 @@ use forge_git::store::RepositoryStore;
 use forge_protocol::message::{Message, Request, Response, SessionEvent};
 use forge_protocol::outbound::MessageSender;
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, MutexGuard, Notify, RwLock, RwLockReadGuard};
+use tokio::sync::{Mutex, MutexGuard, Notify, OwnedSemaphorePermit, RwLock, RwLockReadGuard, Semaphore};
 use tokio::task::JoinSet;
 
 use crate::broker::{
@@ -349,18 +349,24 @@ impl HarnessService {
     }
 
     /// Arm provider work in input order before concurrent dispatch can admit a later cancellation.
-    pub async fn prepare(&self, session_id: Option<&str>, method: HarnessMethod) -> Result<()> {
+    /// Keep the permit until dispatch and response delivery finish. Overlapping execution and
+    /// pending cleanup reject admission without resetting the current cancellation state.
+    pub async fn prepare(&self, session_id: Option<&str>, method: HarnessMethod) -> Result<Option<OwnedSemaphorePermit>> {
         let _activity = self.admit().await?;
         if method.requires_provider_fork() {
             let registry = self.registry().await?;
             let session_id = session_id.unwrap_or(&registry.initial_session_id);
-            registry
-                .resolve(session_id)
-                .await?
-                .cancellation
-                .arm(method == HarnessMethod::PromptSubmit);
+            let controller = registry.resolve(session_id).await?;
+            let _control = Arc::clone(&controller.control_admission)
+                .try_acquire_owned()
+                .context("Harness cleanup is still running")?;
+            let execution = Arc::clone(&controller.execution_admission)
+                .try_acquire_owned()
+                .context("a Harness execution request is already running")?;
+            controller.cancellation.arm(method == HarnessMethod::PromptSubmit);
+            return Ok(Some(execution));
         }
-        Ok(())
+        Ok(None)
     }
 
     /// Route a validated session operation without holding the initialization mutex during work.
@@ -577,6 +583,8 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    execution_admission: Arc<Semaphore>,
+    control_admission: Arc<Semaphore>,
     plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
     broker: Mutex<HarnessBroker>,
     presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
@@ -606,6 +614,8 @@ impl SessionController {
     fn new(broker: HarnessBroker) -> Arc<Self> {
         let catalog_request = broker.backend_catalog_request();
         Arc::new(Self {
+            execution_admission: Arc::new(Semaphore::new(1)),
+            control_admission: Arc::new(Semaphore::new(1)),
             plan_review: Arc::clone(&broker.plan_review),
             presentation: broker.presentation(),
             cancellation: broker.turn_cancellation(),
@@ -821,11 +831,11 @@ async fn route_request(
                 )
             };
             message_sink_for_event
-                .send_wait(Message::Event(SessionEvent {
+                .send_event(SessionEvent {
                     session_id: routed_session_id.clone(),
                     event: event_name,
                     payload,
-                }))
+                })
                 .await?;
         }
         Ok::<(), anyhow::Error>(())
@@ -849,7 +859,7 @@ async fn route_request(
         registry.resolve(child_session_id).await?;
     }
     for event in result.event {
-        message_sink.send_wait(Message::Event(event)).await?;
+        message_sink.send_event(event).await?;
     }
     if shutdown {
         message_sink.send_terminal(Message::Response(result.response))?;
@@ -965,7 +975,9 @@ async fn route_session_fork(
             .complete_provider_fork(result);
         match completion {
             Ok(event) => {
-                let _ = message_sink.send(Message::Event(event));
+                if let Err(error) = message_sink.send_event(event).await {
+                    readiness = Err(format!("deliver provider fork outcome: {error:#}"));
+                }
             }
             Err(error) => {
                 readiness = Err(format!("persist provider fork outcome: {error:#}"));
@@ -1031,6 +1043,13 @@ async fn route_control_request(
     method: HarnessMethod,
     message_sink: &MessageSender,
 ) -> Result<bool> {
+    let _control = if matches!(method, HarnessMethod::TurnCancel | HarnessMethod::TurnRestart | HarnessMethod::BackendMcpSetEnabled) {
+        Some(Arc::clone(&controller.control_admission)
+            .try_acquire_owned()
+            .context("Harness cleanup is already running")?)
+    } else {
+        None
+    };
     let catalog_request = controller.catalog_request.read().await.clone();
     let response = match method {
         HarnessMethod::TurnCancel => {
@@ -1046,7 +1065,7 @@ async fn route_control_request(
                     controller.cancellation.request(restore_prompt);
                     let result = broker.dispatch(request.clone()).await;
                     for event in result.event {
-                        message_sink.send(Message::Event(event))?;
+                        message_sink.send_event(event).await?;
                     }
                     message_sink.send_control(Message::Response(result.response))?;
                     return Ok(true);
@@ -1420,6 +1439,26 @@ mod tests {
             backend.request.lock().await[0],
             ("parent-session".into(), correction.into())
         );
+    }
+
+    #[tokio::test]
+    async fn execution_admission_excludes_overlapping_work_and_pending_cleanup() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        assert!(service.open_session(1, initialize(&fixture, "mock")).await.unwrap().result().is_some());
+        let execution = service.prepare(None, HarnessMethod::PromptSubmit).await.unwrap().unwrap();
+        assert!(service.prepare(None, HarnessMethod::GoalResume).await.is_err());
+        assert!(service.prepare(None, HarnessMethod::TurnCancel).await.unwrap().is_none());
+        assert!(service.prepare(None, HarnessMethod::StateGet).await.unwrap().is_none());
+        let registry = service.registry().await.unwrap();
+        let controller = registry.resolve(&registry.initial_session_id).await.unwrap();
+        let cleanup = Arc::clone(&controller.control_admission).try_acquire_owned().unwrap();
+        drop(execution);
+        assert!(service.prepare(None, HarnessMethod::ExchangeResume).await.is_err());
+        drop(cleanup);
+        let resumed = service.prepare(None, HarnessMethod::ExchangeResume).await.unwrap().unwrap();
+        drop(resumed);
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
     #[tokio::test]

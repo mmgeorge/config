@@ -196,10 +196,16 @@ end
 ---@return string? failure
 local function receive_result(client, message)
   local document = message.document
-  local request_id = document and ("document:" .. document) or message.request_id
-  local part = message.payload
+  local session_id = message.session_id
+  local envelope = message.payload
+  if session_id and (type(envelope) ~= "table" or type(envelope.transfer_id) ~= "string") then
+    return nil, "invalid event transfer identity"
+  end
+  local request_id = session_id and ("event:" .. session_id .. ":" .. envelope.transfer_id)
+    or document and ("document:" .. document) or message.request_id
+  local part = session_id and envelope.part or envelope
   local transfer = client.transfer[request_id]
-  if message.event == "result.part" or message.event == "document.part" then
+  if message.event == "result.part" or message.event == "document.part" or message.event == "event.part" then
     if not json_transfer.valid(part) then return nil, "invalid result part" end
     for key in pairs(part) do
       if key ~= "sequence" and key ~= "part_count" and key ~= "total_bytes" and key ~= "payload" then
@@ -244,6 +250,15 @@ local function receive_result(client, message)
   if document then
     if not decoded or type(response) ~= "table" or response.document ~= document or response.event ~= "status.update" or type(response.payload) ~= "table" then
       return nil, "invalid assembled document update"
+    end
+    return response, nil
+  end
+  if session_id then
+    if not decoded or type(response) ~= "table" or response.session_id ~= session_id
+      or type(response.event) ~= "string" or response.event == "event.part" or response.event == "event.complete"
+      or response.payload == nil then return nil, "invalid assembled session event" end
+    for key in pairs(response) do
+      if key ~= "session_id" and key ~= "event" and key ~= "payload" then return nil, "unexpected assembled event field" end
     end
     return response, nil
   end
@@ -322,6 +337,12 @@ end
 ---@param message table
 local function dispatch_message(message, timing)
   local client = state()
+  if message.event == "event.part" or message.event == "event.complete" then
+    local assembled, failure = receive_result(client, message)
+    if failure then error("Forge event transfer failed: " .. failure) end
+    if not assembled then return end
+    message = assembled
+  end
   if message.document ~= nil then
     if message.event == "document.part" or message.event == "document.complete" then
       local assembled, failure = receive_result(client, message)
@@ -589,8 +610,13 @@ local function spawn(binary, callback, launch_token, lease)
     current.harness_ready = false
     current.snapshot = nil
     current.starting = false
-    current.draining = false
+    current.draining = true
     session.harness.ready = false
+    local stop_reason = current.stop_reason or ("Forge host stopped (exit " .. tostring(result.code) .. ")")
+    for _, subscriber in pairs(current.subscriber) do
+      local ok, failure = pcall(subscriber, "host_stopped", { message = stop_reason })
+      if not ok then notifications.error("Harness stop handler failed: " .. tostring(failure), "ForgeHarness") end
+    end
     if result.code ~= 0 then
       local message = vim.trim(current.stderr)
       notifications.error("Harness broker exited " .. tostring(result.code) .. (message ~= "" and (": " .. message) or ""), "ForgeHarness")
@@ -604,6 +630,7 @@ local function spawn(binary, callback, launch_token, lease)
         code = "outcome_unknown", request_id = id, method = pending.method,
       })
     end
+    current.draining = false
     current.stop_reason = nil
     local stopped = current.stop_callback or {}
     current.stop_callback = {}
