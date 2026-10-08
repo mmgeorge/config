@@ -1,3 +1,4 @@
+mod execution;
 mod fork;
 mod new_session;
 mod replanning;
@@ -26,12 +27,11 @@ use crate::goal::{ContinuationDecision, GoalRecord, GoalState};
 use crate::permissions::store::PermissionStore;
 use crate::plan::state_machine::{PlanEvent, PlanStateMachine};
 use crate::plan::{
-    ArtifactSummary, PlanAcceptance, PlanCallable, PlanDeviation,
-    PlanDeviationDisposition, PlanDeviationKind, PlanDocument, PlanElicitation,
+    ArtifactSummary, PlanAcceptance, PlanCallable, PlanDocument, PlanElicitation,
     PlanExecutionLifecycleEvent, PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState,
     PlanFileStore, PlanLifecycleKind, PlanLifecycleRecord, PlanPrompt, PlanQuestionAnswer,
-    PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord, PlanResolutionKind,
-    PlanState, ScopeDeviationReview, digest as plan_digest, execution_prompt,
+    PlanQuestionResponse, PlanQuestionSet, PlanQuestionWithdrawal, PlanRecord,
+    PlanState, ScopeDeviationReview, digest as plan_digest,
 };
 use crate::protocol::HarnessMethod;
 use crate::rustdoc::{RustdocResolver, RustdocResolverConfig, validate_plan_rust_api};
@@ -589,6 +589,7 @@ impl HarnessBroker {
                                 .map_or(request.effort, |value| value.effort.clone()),
                             plan_executor: preference.as_ref().map_or_else(Default::default, |value| value.plan_executor.clone()),
                             plan_compact: preference.as_ref().is_some_and(|value| value.plan_compact),
+                            plan_auto_approve_revisions: preference.as_ref().is_none_or(|value| value.plan_auto_approve_revisions),
                             context_window: None,
                             fast_mode: preference.as_ref().is_some_and(|value| value.fast_mode),
                             execution_mode: ExecutionMode::Read,
@@ -738,11 +739,12 @@ impl HarnessBroker {
                 })
                 .unwrap_or_default(),
             has_active_elicitation: plan.as_ref().is_some_and(|plan| plan.elicitation.is_some()),
-            has_active_execution: mode == PromptMode::ExecutePlan,
+            has_active_execution: self.store.list_plan_execution(&self.session.id).ok()?.iter().any(|execution| Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref() && !matches!(execution.state, PlanExecutionState::Complete | PlanExecutionState::Cancelled)),
             has_active_goal: self.session.goal_id.is_some(),
             workspace_root: Some(PathBuf::from(&self.session.workspace)),
             rustdoc: Some(Arc::clone(&self.rustdoc)),
             repository: None,
+            execution: None,
         })
     }
 
@@ -819,11 +821,12 @@ impl HarnessBroker {
                 .cloned()
         });
         let active_wait = self.active_wait_projection.clone();
-        let status = crate::session::state_machine::SessionPhase::resolve(
+        let mut status = crate::session::state_machine::SessionPhase::resolve(
             active_plan.as_ref(),
             active_wait.as_ref(),
             interaction.last(),
         );
+        if let Some(execution) = goal_execution.as_ref() { Self::execution_status(&mut status, execution); }
         self.record_plan_trace(
             "status_projected",
             json!({ "session_id": self.session.id, "status": status }),
@@ -920,12 +923,14 @@ impl HarnessBroker {
             plan.review_digest.as_deref() == Some(expected_digest),
             "plan review digest changed"
         );
-        self.plan_file.capture_review_source(
+        let mut source = self.plan_file.capture_review_source(
             &self.session.id,
             &plan.id,
-            plan.model_revision,
+            if plan.state == PlanState::Accepted { plan.accepted_revision.unwrap_or(plan.model_revision) } else { plan.model_revision },
             expected_digest,
-        )
+        )?;
+        source.execution_review = self.execution_review(plan_id)?;
+        Ok(source)
     }
 
     /// Route one client request through the owning feature boundary.
@@ -1124,7 +1129,7 @@ impl HarnessBroker {
             HarnessMethod::PlanDeclaration => self.read_plan_declaration(params),
             HarnessMethod::PlanList => self.list_replanning_choices(),
             HarnessMethod::PlanScopeDeviationReview => self.select_scope_deviation_review(params),
-            HarnessMethod::PlanDeviationResolve => self.resolve_plan_deviation(params).await,
+            HarnessMethod::PlanDeviationResolve => anyhow::bail!("task-based deviations are no longer supported"),
             HarnessMethod::QuestionAnswer => self.answer_question(params),
             HarnessMethod::QuestionSkip => self.skip_question(params),
             HarnessMethod::QuestionAsk => self.ask_question(params).await,
@@ -3119,6 +3124,7 @@ Planning continuation: turn {} of {}.",
             }
             if let Some(execution_id) = interaction.execution_id.as_deref() {
                 if let Some(mut execution) = self.store.load_plan_execution(execution_id)? {
+                    if execution.baseline_checkpoint.is_none() { execution.baseline_checkpoint = interaction.checkpoint_before.clone(); }
                     for record in &mut execution.lifecycle {
                         if admission.as_ref().is_some_and(|admission| admission.plan_event_id.is_some()) {
                             record.anchor = Some(crate::plan::ExchangeAnchor::capture(&interaction));
@@ -3678,8 +3684,12 @@ Planning continuation: turn {} of {}.",
             interaction.elicitation = owner.elicitation;
             interaction.awaiting_input = owner.awaiting_input;
         }
-        let execution_paused =
-            self.apply_plan_execution_control(&mut output, &mut event, &interaction)?;
+        let execution_paused = interaction.awaiting_input;
+        if mode == PromptMode::ExecutePlan {
+            output.evidence.structured_complete = false;
+            output.evidence.tool_called = false;
+            output.evidence.workspace_changed = self.observe_plan_progress(&interaction)?;
+        }
         self.session.updated_at_ms = self.clock.now_ms();
         self.save_session()?;
         let continuing = if execution_paused {
@@ -3858,7 +3868,7 @@ Planning continuation: turn {} of {}.",
 
     async fn prompt_with_timeline(
         &mut self,
-        request: BackendRequest,
+        mut request: BackendRequest,
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
     ) -> Result<crate::backend::BackendOutput> {
@@ -3870,6 +3880,15 @@ Planning continuation: turn {} of {}.",
         let cancellation = Arc::clone(&self.turn_cancellation);
         let mut cleanup = cancellation.cleanup.subscribe();
         let (backend_event_sink, mut backend_event_stream) = crate::backend::events::channel();
+        let (execution_sender, mut execution_receiver) = tokio::sync::mpsc::channel::<crate::plan::execution::ExecutionControl>(1);
+        let execution = self.store.list_plan_execution(&self.session.id)?.into_iter()
+            .find(|execution| Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref() && execution.state == PlanExecutionState::Active);
+        if request.mode == PromptMode::ExecutePlan && let (Some(context), Some(execution)) = (&mut request.control_context, execution.as_ref()) {
+            context.execution = Some(crate::plan::execution::ExecutionControlSender { execution_id: execution.id.clone(), generation: execution.generation, sender: execution_sender.clone() });
+        }
+        let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(5));
+        scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        scan_interval.tick().await;
         let mut stream_open = true;
         let delivery_sink = self.event_sink.clone();
         let outcome = {
@@ -3881,6 +3900,35 @@ Planning continuation: turn {} of {}.",
             tokio::pin!(prompt);
             loop {
                 tokio::select! {
+                    control = execution_receiver.recv() => {
+                        if let Some(control) = control {
+                            while let Ok(backend_event) = backend_event_stream.try_recv() {
+                                self.process_backend_event(&mut runtime, interaction, backend_event, event).await?;
+                            }
+                            let result = self.handle_execution_control(&control.execution_id, control.generation, control.operation, interaction).await;
+                            let committed = result.is_ok();
+                            let _ = control.response.send(result);
+                            if committed {
+                                let patch = self.reconcile_timeline()?;
+                                self.emit_timeline_patch(patch, event).await?;
+                            }
+                        }
+                    }
+                    _ = scan_interval.tick(), if execution.is_some() => {
+                        if let Some(execution) = &execution {
+                            match self.scan_execution(&execution.id).await {
+                                Ok(progress) => {
+                                    let patch = self.reconcile_live_interaction(Some(interaction), None)?;
+                                    self.emit_timeline_patch(patch, event).await?;
+                                    self.emit_backend_event(BackendEvent {
+                                    address: None, turn_boundary: None, kind: "plan_execution_progress".into(), text: None,
+                                    data: progress, activity: None, summary: None, task_update: None,
+                                }, event).await?;
+                                },
+                                Err(error) => self.trace.record(&self.session.id, "plan.progress_failed", json!({"error":format!("{error:#}")})),
+                            }
+                        }
+                    }
                     changed = cleanup.changed() => {
                         if changed.is_ok() {
                             let state = cleanup.borrow_and_update().clone();
@@ -4561,11 +4609,15 @@ Planning continuation: turn {} of {}.",
     ) -> Result<TimelinePatch> {
         let active_plan = self.session.active_plan_id.as_deref()
             .map(|id| self.store.load_plan(id)).transpose()?.flatten();
-        let status = crate::session::state_machine::SessionPhase::resolve(
+        let mut status = crate::session::state_machine::SessionPhase::resolve(
             active_plan.as_ref(),
             self.active_wait_projection.as_ref(),
             interaction,
         );
+        if let Some(execution_id) = interaction.and_then(|exchange| exchange.execution_id.as_deref())
+            && let Some(execution) = self.store.load_plan_execution(execution_id)? {
+            Self::execution_status(&mut status, &execution);
+        }
         self.presentation
             .lock()
             .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
@@ -4657,7 +4709,7 @@ Planning continuation: turn {} of {}.",
             .load_plan(&plan_id)?
             .context("active plan record is missing")?;
         anyhow::ensure!(
-            plan.state == PlanState::AwaitingReview,
+            matches!(plan.state, PlanState::AwaitingReview | PlanState::Accepted),
             "plan does not await review"
         );
         let review_digest = plan
@@ -4676,12 +4728,35 @@ Planning continuation: turn {} of {}.",
             plan.model_revision,
             &review_digest,
         )?;
+        if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.plan_id == plan.id) {
+            anyhow::ensure!(execution.pending_revision_reason.is_some(), "execution already exists. Use /goal resume to continue it");
+            let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
+            plan.accepted_revision = Some(plan.model_revision);
+            plan.accepted_digest = plan.review_digest.clone();
+            plan.user_revision += 1;
+            plan.state = PlanState::Accepted;
+            execution.revision = plan.model_revision;
+            execution.generation += 1;
+            execution.revision_history.push(crate::plan::execution::ExecutionRevision {
+                revision: execution.revision, reason: execution.pending_revision_reason.take().unwrap(), approval: "user".into(), recorded_at_ms: self.clock.now_ms(),
+            });
+            execution.progress = Default::default();
+            let resume = execution.review_paused;
+            execution.review_paused = false;
+            if resume { execution.state = PlanExecutionState::Active; goal.resume(self.clock.now_ms()); }
+            execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
+                PlanExecutionLifecycleEvent::Phase { title: "Plan revision accepted".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
+            self.store.save_execution_transition(&execution, &goal, Some(&plan))?;
+            let mut events = vec![self.event("plan_accepted", json!({"plan":plan,"execution":execution}))?];
+            if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
+            return Ok((serde_json::to_value(self.snapshot()?)?, events));
+        }
         if reviewed.document.design.is_some() {
             reviewed.document.design.as_ref().unwrap().check_workspace(Path::new(&self.session.workspace))?;
             if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
                 anyhow::ensure!(expected == reviewed.saved_digest, "saved design changed after review");
             }
-            return self.accept_declaration_design(plan);
+
         }
         let mut acceptance =
             PlanAcceptance::new(review_digest, &self.capability.execution_mode_list)?;
@@ -4820,29 +4895,7 @@ Planning continuation: turn {} of {}.",
         .await
     }
 
-    fn accept_declaration_design(&mut self, mut plan:PlanRecord) -> Result<(Value,Vec<SessionEvent>)> {
-        plan.user_revision += 1;
-        plan.accepted_digest = plan.review_digest.clone();
-        plan.accepted_revision = Some(plan.model_revision);
-        plan.acceptance = None;
-        PlanStateMachine::apply(&mut plan,PlanEvent::Accepted,self.clock.now_ms())?;
-        self.store.save_plan(&plan)?;
-        let lifecycle = PlanLifecycleRecord {
-            title:plan.title.clone(),anchor:Some(self.plan_exchange_anchor(&plan.id)?),id:Uuid::new_v4().to_string(),session_id:self.session.id.clone(),plan_id:plan.id.clone(),kind:PlanLifecycleKind::Accepted,model_revision:plan.model_revision,user_revision:plan.user_revision,overall_comment:None,annotation:Vec::new(),question:None,answer:None,created_at_ms:self.clock.now_ms(),
-        };
-        self.store.save_plan_lifecycle(&lifecycle)?;
-        self.session.active_plan_id = Some(plan.id.clone());
-        self.session.mode = HarnessMode::from(self.session.execution_mode);
-        self.save_session()?;
-        let snapshot = self.snapshot()?;
-        Ok((serde_json::to_value(snapshot)?,vec![self.event("plan_accepted",json!({"plan":plan,"lifecycle":lifecycle}))?]))
-    }
-
     async fn accept_plan(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        if let Some(id) = params.get("plan_id").and_then(Value::as_str).or(self.session.active_plan_id.as_deref()) {
-            let document = self.plan_file.read_working_document(&self.session.id,id)?;
-            if document.design.is_some() { return self.begin_plan_acceptance(params); }
-        }
         anyhow::ensure!(
             !self
                 .store
@@ -4875,7 +4928,7 @@ Planning continuation: turn {} of {}.",
             .load_plan(&plan_id)?
             .context("active plan record is missing")?;
         anyhow::ensure!(
-            plan.state == PlanState::AwaitingReview,
+            matches!(plan.state, PlanState::AwaitingReview | PlanState::Accepted),
             "plan does not await review"
         );
         let digest = plan
@@ -4896,6 +4949,9 @@ Planning continuation: turn {} of {}.",
         )?;
         let accepted_document = reviewed.document;
         let accepted_render = reviewed.rendered;
+        anyhow::ensure!(accepted_document.design.is_some(), "execution requires a semantic plan");
+        anyhow::ensure!(!self.store.list_plan_execution(&self.session.id)?.iter().any(|execution| execution.plan_id == plan.id), "execution already exists. Use /goal resume to continue it");
+        accepted_document.design.as_ref().unwrap().check_workspace(Path::new(&self.session.workspace))?;
         if let Some(expected) = params.get("saved_source_digest").and_then(Value::as_str) {
             anyhow::ensure!(
                 expected == reviewed.saved_digest,
@@ -4919,7 +4975,7 @@ Planning continuation: turn {} of {}.",
         plan.accepted_digest = Some(digest);
         plan.accepted_revision = Some(plan.model_revision);
         plan.acceptance = None;
-        PlanStateMachine::apply(&mut plan, PlanEvent::Accepted, self.clock.now_ms())?;
+        if plan.state != PlanState::Accepted { PlanStateMachine::apply(&mut plan, PlanEvent::Accepted, self.clock.now_ms())?; }
         self.store.save_plan(&plan)?;
         self.session.active_plan_id = Some(plan.id.clone());
         let objective = format!("Complete accepted plan: {}", plan.title);
@@ -4952,40 +5008,21 @@ Planning continuation: turn {} of {}.",
         self.session.mode = HarnessMode::from(self.session.execution_mode);
         self.save_session()?;
         let execution_created_at_ms = self.clock.now_ms();
-        let mut scheduler = crate::plan::PlanScheduler::activate(&accepted_document);
-        let active_task = scheduler.next_task(&accepted_document, execution_created_at_ms);
         let mut execution_record = PlanExecutionRecord {
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
-            plan_id: plan.id.clone(),
-            goal_id: goal.id.clone(),
-            state: PlanExecutionState::Active,
-            planning_backend_session_id,
+            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(),
+            plan_id: plan.id.clone(), goal_id: goal.id.clone(), baseline_checkpoint: None, state: PlanExecutionState::Active,
+            phase: crate::plan::PlanPhase::Implement, original_revision: plan.model_revision,
+            revision: plan.model_revision, generation: 0, planning_backend_session_id,
             execution_backend_session_id: self.session.backend_session_id.clone(),
-            scheduler,
-            lifecycle: Vec::new(),
-            created_at_ms: execution_created_at_ms,
-            completed_at_ms: None,
+            lifecycle: Vec::new(), findings: Vec::new(), progress: Default::default(),
+            verification: Vec::new(), revision_history: Vec::new(), pending_revision_reason: None,
+            review_paused: false, observed_source: Default::default(), observed_generation: 0,
+            observed_check: Default::default(), created_at_ms: execution_created_at_ms, completed_at_ms: None,
         };
-        if let Some(active_task) = active_task {
-            let task_path = execution_record
-                .scheduler
-                .task
-                .iter()
-                .find(|task| task.state == crate::plan::PlanTaskState::Active)
-                .map(|task| task.task_path.clone())
-                .context("activated task path is missing")?;
-            execution_record.append_lifecycle(
-                lifecycle.anchor.clone().context("plan acceptance has no owning exchange")?,
-                execution_created_at_ms,
-                PlanExecutionLifecycleEvent::TaskStarted {
-                    task_path,
-                    ordinal: 1,
-                    total: accepted_document.tasks().count(),
-                    title: active_task.title.clone(),
-                },
-            );
-        }
+        execution_record.progress = crate::plan::execution::SemanticProgress::scan(accepted_document.design.as_ref().unwrap(), Path::new(&self.session.workspace))?;
+        execution_record.observed_source = execution_record.progress.source_digest.clone();
+        execution_record.append_lifecycle(lifecycle.anchor.clone().context("plan acceptance has no owning exchange")?, execution_created_at_ms,
+            PlanExecutionLifecycleEvent::Phase { title: "Execution started".into(), phase: execution_record.phase, revision: execution_record.revision, state: execution_record.state });
         self.store.save_plan_execution(&execution_record)?;
         let mut pre_execution_event = compact_event;
         self.emit_live(
@@ -5010,12 +5047,7 @@ Planning continuation: turn {} of {}.",
             &mut pre_execution_event,
         )
         .await?;
-        let execution_prompt = execution_prompt(
-            PlanExecutionPromptKind::Start,
-            &execution_record.id,
-            active_task,
-            &accepted_document,
-        )?;
+        let execution_prompt = format!("{}\nAccepted semantic design:\n{}", execution_record.instructions(), accepted_document.model_json()?);
         let mut admission = ExchangeAdmission::execution(
             format!("Accept plan: {}", plan.request), plan.id.clone(),
             execution_record.id.clone(), goal.id.clone());
@@ -5031,6 +5063,12 @@ Planning continuation: turn {} of {}.",
         self.store.save_plan_execution(&execution_record)?;
         let (result, mut event) = match execution {
             Ok(result) => result,
+            Err(error) if error.downcast_ref::<TurnCancelled>().is_some()
+                && !self.turn_cancellation.restart.load(Ordering::Acquire) => {
+                (serde_json::to_value(self.snapshot()?)?, vec![
+                    self.event("goal_changed", serde_json::to_value(self.active_goal()?)?)?,
+                ])
+            }
             Err(error) => {
                 if error.downcast_ref::<TurnCancelled>().is_some()
                     && self.turn_cancellation.restart.load(Ordering::Acquire)
@@ -5070,7 +5108,7 @@ Planning continuation: turn {} of {}.",
         };
         event.splice(0..0, pre_execution_event);
         if execution_succeeded {
-            event.insert(0, self.event("goal_changed", serde_json::to_value(goal)?)?);
+            event.insert(0, self.event("goal_changed", serde_json::to_value(self.active_goal()?)?)?);
         }
         event.insert(
             0,
@@ -5138,6 +5176,24 @@ Planning continuation: turn {} of {}.",
                 .is_none_or(|comment| comment.len() <= 65536),
             "overall plan review comment exceeds 64 KiB"
         );
+        if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter()
+            .find(|execution| execution.plan_id == plan.id && execution.pending_revision_reason.is_some()) {
+            let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
+            let feedback = crate::plan::render_review_feedback(&document, &annotation)?;
+            execution.findings.push(format!("Revise the pending design using this review feedback: {}\n{}", overall_comment.as_deref().unwrap_or_default(), feedback));
+            execution.pending_revision_reason = None;
+            plan.state = PlanState::Revising;
+            let resume = execution.review_paused;
+            execution.review_paused = false;
+            if resume { execution.state = PlanExecutionState::Active; goal.resume(self.clock.now_ms()); }
+            execution.generation += 1;
+            execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
+                PlanExecutionLifecycleEvent::Phase { title: "Plan revision changes requested".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
+            self.store.save_execution_transition(&execution, &goal, Some(&plan))?;
+            let mut events = vec![self.event("plan_changes_requested", json!({"plan":plan,"execution":execution}))?];
+            if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
+            return Ok((serde_json::to_value(self.snapshot()?)?, events));
+        }
         let document_json = document.model_json()?;
         let instruction = PlanPrompt::revision(
             &document_json,
@@ -5198,6 +5254,30 @@ Planning continuation: turn {} of {}.",
             .store
             .load_plan(&plan_id)?
             .context("active plan record is missing")?;
+        if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter()
+            .find(|execution| execution.plan_id == plan.id && execution.pending_revision_reason.is_some()) {
+            let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
+            let accepted = self.plan_file.restore_revision(&self.session.id, &plan.id, execution.revision)?;
+            plan.state = PlanState::Accepted;
+            plan.document_version = accepted.version;
+            plan.title = accepted.title;
+            plan.review_digest = plan.accepted_digest.clone();
+            execution.revision_history.push(crate::plan::execution::ExecutionRevision {
+                revision: plan.model_revision, reason: execution.pending_revision_reason.take().unwrap(),
+                approval: "rejected".into(), recorded_at_ms: self.clock.now_ms(),
+            });
+            execution.findings.push("The user rejected the proposed revision. Match the current accepted design.".into());
+            let resume = execution.review_paused;
+            execution.review_paused = false;
+            if resume { execution.state = PlanExecutionState::Active; goal.resume(self.clock.now_ms()); }
+            execution.generation += 1;
+            execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
+                PlanExecutionLifecycleEvent::Phase { title: "Plan revision rejected".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
+            self.store.save_execution_transition(&execution, &goal, Some(&plan))?;
+            let mut events = vec![self.event("plan_revision_rejected", json!({"plan":plan,"execution":execution}))?];
+            if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
+            return Ok((serde_json::to_value(self.snapshot()?)?, events));
+        }
         PlanStateMachine::apply(&mut plan, PlanEvent::Cancelled, self.clock.now_ms())?;
         plan.acceptance = None;
         self.store.save_plan(&plan)?;
@@ -5284,7 +5364,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let plan = self.store.load_plan(plan_id)?.context("plan artifact not found")?;
         anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
         anyhow::ensure!(revision > 0 && revision <= plan.model_revision, "plan revision is unavailable");
-        self.plan_file.capture_revision_source(&self.session.id, &plan.id, revision)
+        let mut source = self.plan_file.capture_revision_source(&self.session.id, &plan.id, revision)?;
+        source.execution_review = self.execution_review(plan_id)?;
+        Ok(source)
     }
 
     fn read_plan_declaration(&self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
@@ -5300,6 +5382,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             match path.as_str() {
                 "Task" => design.document.task.clone(),
                 "Description" => design.document.description.clone(),
+                "Validation/Automated" => design.document.validation.automated.clone(),
+                "Validation/Manual" => design.document.validation.manual.clone(),
                 _ => anyhow::bail!("unknown plan overview section"),
             }
         } else if baseline {
@@ -5326,7 +5410,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         );
         if let Some(revision) = params.get("revision").filter(|value| !value.is_null()) {
             let revision: u32 = serde_json::from_value(revision.clone())?;
-            if revision != plan.model_revision || plan.state != PlanState::AwaitingReview {
+            let stranded = plan.state == PlanState::Accepted && !self.store.list_plan_execution(&self.session.id)?.iter().any(|execution| execution.plan_id == plan.id);
+            if revision != plan.model_revision || (plan.state != PlanState::AwaitingReview && !stranded) {
                 let source = self.capture_plan_revision(&plan.id, revision)?;
                 let mut historical = serde_json::to_value(&plan)?;
                 historical["title"] = serde_json::json!(source.document.title);
@@ -5394,6 +5479,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
 
     async fn pause_goal(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut goal = self.active_goal()?;
+        if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.goal_id == goal.id) {
+            execution.review_paused = false;
+            self.store.save_plan_execution(&execution)?;
+        }
         if goal.state == GoalState::Paused {
             return Ok((serde_json::to_value(&goal)?,
                 vec![self.event("goal_changed", serde_json::to_value(goal)?)?]));
@@ -5412,6 +5501,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
 
     async fn resume_goal(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut goal = self.active_goal()?;
+        if let Some(execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.goal_id == goal.id) {
+            anyhow::ensure!(execution.pending_revision_reason.is_none(), "review the pending plan revision before resuming execution");
+        }
         anyhow::ensure!(
             matches!(
                 goal.state,
@@ -5523,66 +5615,24 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                     format!("Continue working toward this goal: {}", goal.objective)
                 }
             });
-        self.run_interaction(prompt, mode, None)
-            .await
-    }
-
-    fn plan_goal_prompt(
-        &self,
-        goal: &GoalRecord,
-        kind: PlanExecutionPromptKind,
-    ) -> Result<Option<String>> {
-        let Some(execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.goal_id == goal.id)
-        else {
-            return Ok(None);
+        let admission = if mode == PromptMode::ExecutePlan
+            && self.store.list_exchange(&self.session.id)?.last()
+                .is_some_and(|exchange| exchange.state == ExchangeState::Complete)
+        {
+            self.store.list_plan_execution(&self.session.id)?.into_iter()
+                .find(|execution| execution.goal_id == goal.id)
+                .map(|execution| ExchangeAdmission::execution(
+                    "Continue plan after review".into(), execution.plan_id,
+                    execution.id, goal.id.clone()))
+        } else {
+            None
         };
-        let plan = self
-            .store
-            .load_plan(&execution.plan_id)?
-            .context("accepted plan record is missing")?;
-        let accepted_revision = plan
-            .accepted_revision
-            .context("accepted plan revision is missing")?;
-        let accepted = self.plan_file.read_submitted_document(
-            &self.session.id,
-            &plan.id,
-            accepted_revision,
-        )?;
-        let deviation_list = self
-            .store
-            .list_plan_deviation(&self.session.id)?
-            .into_iter()
-            .filter(|deviation| deviation.execution_id == execution.id)
-            .collect::<Vec<_>>();
-        let effective = crate::plan::build_effective_plan(&accepted, &deviation_list)?;
-        let active_task_index = execution
-            .scheduler
-            .task
-            .iter()
-            .enumerate()
-            .find(|(_, task)| task.state == crate::plan::PlanTaskState::Active)
-            .map(|(task_index, _)| task_index);
-        let active_task = active_task_index.and_then(|task_index| {
-            effective
-                .document
-                .task_by_id(&execution.scheduler.task[task_index].task_id)
-                .map(|(_, task)| task)
-        });
-        Ok(Some(execution_prompt(
-            kind,
-            &execution.id,
-            active_task,
-            &effective.document,
-        )?))
+        self.run_interaction(prompt, mode, admission).await
     }
 
     fn apply_goal_evidence(
         &mut self,
-        evidence: crate::goal::TurnEvidence,
+        mut evidence: crate::goal::TurnEvidence,
         event: &mut Vec<SessionEvent>,
     ) -> Result<bool> {
         let Some(goal_id) = self.session.goal_id.clone() else {
@@ -5592,6 +5642,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .store
             .load_goal(&goal_id)?
             .context("active goal record is missing")?;
+        if self.store.list_plan_execution(&self.session.id)?.iter().any(|execution| execution.goal_id == goal.id) {
+            evidence.structured_complete = false;
+        }
         let continuing = match goal.observe(evidence, self.clock.now_ms()) {
             ContinuationDecision::Continue | ContinuationDecision::RetryNoProgress => {
                 event.push(self.event("goal_continue_requested", serde_json::to_value(&goal)?)?);
@@ -5608,431 +5661,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         };
         self.store.save_goal(&goal)?;
         self.sync_plan_execution(&goal)?;
-        let resolved_execution = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.goal_id == goal.id);
-        let resolution_list = self.store.list_plan_resolution(&self.session.id)?;
-        if let Some(resolution) = resolved_execution.and_then(|execution| {
-            resolution_list
-                .into_iter()
-                .rev()
-                .find(|resolution| resolution.execution_id == execution.id
-                    && Some(resolution.resolved_at_ms) == execution.completed_at_ms)
-        }) {
-            let deviations = self
-                .store
-                .list_plan_deviation(&self.session.id)?
-                .into_iter()
-                .filter(|deviation| deviation.execution_id == resolution.execution_id)
-                .collect::<Vec<_>>();
-            let audit = self
-                .store
-                .list_plan_audit(&self.session.id)?
-                .into_iter()
-                .find(|audit| audit.id == resolution.audit_id);
-            event.push(self.event(
-                "plan_resolution",
-                json!({ "resolution": resolution, "deviations": deviations, "audit": audit }),
-            )?);
-        }
         Ok(continuing)
     }
 
-    fn apply_plan_execution_control(
-        &mut self,
-        output: &mut crate::backend::BackendOutput,
-        event: &mut Vec<SessionEvent>,
-        exchange: &Exchange,
-    ) -> Result<bool> {
-        if output.plan_deviation.is_empty() && output.plan_task_report.is_empty() {
-            return Ok(false);
-        }
-        let mut execution = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .rev()
-            .find(|execution| execution.state == PlanExecutionState::Active)
-            .context("plan execution control requires an active execution")?;
-        let plan = self
-            .store
-            .load_plan(&execution.plan_id)?
-            .context("accepted plan record is missing")?;
-        let accepted_revision = plan
-            .accepted_revision
-            .context("accepted plan revision is missing")?;
-        let accepted = self.plan_file.read_submitted_document(
-            &self.session.id,
-            &plan.id,
-            accepted_revision,
-        )?;
-        let mut deviation_list = self.store.list_plan_deviation(&self.session.id)?;
-        deviation_list.retain(|deviation| deviation.execution_id == execution.id);
-        let effective_before_deviation =
-            crate::plan::build_effective_plan(&accepted, &deviation_list)?;
-        let mut pause_for_review = false;
-        for request in std::mem::take(&mut output.plan_deviation) {
-            anyhow::ensure!(
-                request.plan_id == plan.id,
-                "deviation plan id does not match execution"
-            );
-            let effective_value = serde_json::to_value(&effective_before_deviation.document)?;
-            for pointer in [
-                request.task_path.as_deref(),
-                request.subtask_path.as_deref(),
-            ]
-            .into_iter()
-            .flatten()
-            {
-                anyhow::ensure!(
-                    effective_value.pointer(pointer).is_some(),
-                    "deviation references a path outside the effective plan"
-                );
-            }
-            let disposition = match request.kind {
-                PlanDeviationKind::Informational => PlanDeviationDisposition::Recorded,
-                PlanDeviationKind::Scope
-                    if self.scope_deviation_review == ScopeDeviationReview::Auto =>
-                {
-                    PlanDeviationDisposition::AutoApproved
-                }
-                PlanDeviationKind::Scope => {
-                    pause_for_review = true;
-                    PlanDeviationDisposition::Pending
-                }
-            };
-            let deviation_created_at_ms = self.clock.now_ms();
-            let deviation = PlanDeviation {
-                id: Uuid::new_v4().to_string(),
-                plan_id: plan.id.clone(),
-                execution_id: execution.id.clone(),
-                kind: request.kind,
-                disposition,
-                summary: request.summary,
-                reason: request.reason,
-                task_path: request.task_path,
-                subtask_path: request.subtask_path,
-                affected_paths: request.affected_paths,
-                proposed_changes: request.proposed_changes,
-                created_at_ms: deviation_created_at_ms,
-                resolved_at_ms: (disposition != PlanDeviationDisposition::Pending)
-                    .then(|| self.clock.now_ms()),
-            };
-            deviation.validate()?;
-            let mut candidate_deviations = deviation_list.clone();
-            let mut candidate = deviation.clone();
-            if candidate.disposition == PlanDeviationDisposition::Pending {
-                candidate.disposition = PlanDeviationDisposition::UserApproved;
-            }
-            candidate_deviations.push(candidate);
-            let proposed = crate::plan::build_effective_plan(&accepted, &candidate_deviations)?;
-            let mut candidate_scheduler = execution.scheduler.clone();
-            candidate_scheduler.reconcile(&proposed.document)?;
-            if disposition == PlanDeviationDisposition::AutoApproved {
-                execution.scheduler = candidate_scheduler;
-                self.store.save_plan_transition(&deviation, &execution)?;
-            } else {
-                self.store
-                    .save_plan_deviation(&self.session.id, &deviation)?;
-            }
-            event.push(self.event(
-                if disposition == PlanDeviationDisposition::Pending {
-                    "plan_deviation_review"
-                } else {
-                    "plan_deviation_recorded"
-                },
-                serde_json::to_value(&deviation)?,
-            )?);
-            execution.append_lifecycle(
-                crate::plan::ExchangeAnchor::capture(exchange),
-                deviation_created_at_ms,
-                PlanExecutionLifecycleEvent::DeviationRecorded {
-                    deviation_id: deviation.id.clone(),
-                    summary: deviation.summary.clone(),
-                },
-            );
-            deviation_list.push(deviation);
-        }
-        let effective = crate::plan::build_effective_plan(&accepted, &deviation_list)?;
-        execution.scheduler.reconcile(&effective.document)?;
-        if pause_for_review {
-            anyhow::ensure!(
-                output.plan_task_report.is_empty(),
-                "task cannot finish while a scope deviation awaits review"
-            );
-            let mut goal = self.active_goal()?;
-            goal.state = GoalState::Paused;
-            goal.updated_at_ms = self.clock.now_ms();
-            self.store.save_goal(&goal)?;
-            execution.state = PlanExecutionState::Paused;
-            self.store.save_plan_execution(&execution)?;
-            event.push(self.event("goal_changed", serde_json::to_value(goal)?)?);
-            return Ok(true);
-        }
-        for report in std::mem::take(&mut output.plan_task_report) {
-            anyhow::ensure!(
-                report.execution_id == execution.id,
-                "task report execution id does not match active execution"
-            );
-            let task_index = execution
-                .scheduler
-                .task
-                .iter()
-                .position(|task| task.task_path == report.task_path)
-                .context("scheduled task not found")?;
-            let task = effective
-                .document
-                .task_by_id(&report.task_id)
-                .map(|(_, task)| task)
-                .context("canonical task not found")?;
-            let task_path = report.task_path.clone();
-            let task_title = task.title.clone();
-            let report_state = report.state;
-            let transition_at_ms = self.clock.now_ms();
-            let prior_exchanges = self.store.list_exchange(&self.session.id)?;
-            let elapsed_ms = execution.task_duration_ms(&task_path,
-                prior_exchanges.iter().filter(|prior| prior.id != exchange.id)
-                    .chain(std::iter::once(exchange)), transition_at_ms);
-            let next_task =
-                execution
-                    .scheduler
-                    .apply_report(&effective.document, report, transition_at_ms)?;
-            if report_state == crate::plan::PlanTaskState::Complete {
-                execution.append_lifecycle(
-                    crate::plan::ExchangeAnchor::capture(exchange),
-                    transition_at_ms,
-                    PlanExecutionLifecycleEvent::TaskCompleted {
-                        task_path,
-                        ordinal: task_index + 1,
-                        total: execution.scheduler.task.len(),
-                        title: task_title,
-                        elapsed_ms,
-                    },
-                );
-            }
-            if let Some(next_task) = next_task {
-                let next_index = execution
-                    .scheduler
-                    .task
-                    .iter()
-                    .position(|task| task.state == crate::plan::PlanTaskState::Active)
-                    .context("activated task not found")?;
-                let next_task_path = execution.scheduler.task[next_index].task_path.clone();
-                execution.append_lifecycle(
-                    crate::plan::ExchangeAnchor::capture(exchange),
-                    transition_at_ms,
-                    PlanExecutionLifecycleEvent::TaskStarted {
-                        task_path: next_task_path,
-                        ordinal: next_index + 1,
-                        total: execution.scheduler.task.len(),
-                        title: next_task.title.clone(),
-                    },
-                );
-            }
-            event.push(self.event(
-                "plan_task_updated",
-                json!({ "execution": &execution, "scheduler": &execution.scheduler }),
-            )?);
-        }
-        if output.evidence.structured_complete {
-            anyhow::ensure!(
-                execution.scheduler.is_complete(),
-                "plan cannot complete before every scheduled task completes"
-            );
-        }
-        if execution
-            .scheduler
-            .task
-            .iter()
-            .any(|task| task.state == crate::plan::PlanTaskState::Blocked)
-        {
-            output.evidence.structured_blocked = true;
-        }
-        self.store.save_plan_execution(&execution)?;
-        Ok(false)
-    }
-
-    async fn resolve_plan_deviation(
-        &mut self,
-        params: Value,
-    ) -> Result<(Value, Vec<SessionEvent>)> {
-        let deviation_id = required_text(&params, "deviation_id")?;
-        let approved = params
-            .get("approved")
-            .and_then(Value::as_bool)
-            .context("approved is required")?;
-        let mut deviation = self
-            .store
-            .list_plan_deviation(&self.session.id)?
-            .into_iter()
-            .find(|deviation| deviation.id == deviation_id)
-            .context("plan deviation not found")?;
-        anyhow::ensure!(
-            deviation.disposition == PlanDeviationDisposition::Pending,
-            "plan deviation does not await review"
-        );
-        deviation.disposition = if approved {
-            PlanDeviationDisposition::UserApproved
-        } else {
-            PlanDeviationDisposition::Rejected
-        };
-        deviation.resolved_at_ms = Some(self.clock.now_ms());
-        if approved {
-            let mut execution = self
-                .store
-                .load_plan_execution(&deviation.execution_id)?
-                .context("execution is unavailable")?;
-            let plan = self
-                .store
-                .load_plan(&deviation.plan_id)?
-                .context("plan is unavailable")?;
-            let accepted = self.plan_file.read_submitted_document(
-                &self.session.id,
-                &plan.id,
-                plan.accepted_revision
-                    .context("accepted revision is missing")?,
-            )?;
-            let mut deviations = self.store.list_plan_deviation(&self.session.id)?;
-            deviations.retain(|entry| entry.execution_id == execution.id);
-            for entry in &mut deviations {
-                if entry.id == deviation.id {
-                    *entry = deviation.clone();
-                }
-            }
-            let effective = crate::plan::build_effective_plan(&accepted, &deviations)?;
-            execution.scheduler.reconcile(&effective.document)?;
-            self.store.save_plan_transition(&deviation, &execution)?;
-        }
-        if !approved {
-            self.store
-                .save_plan_deviation(&self.session.id, &deviation)?;
-        }
-        let mut event =
-            vec![self.event("plan_deviation_resolved", serde_json::to_value(&deviation)?)?];
-        if approved {
-            let (result, mut resume_event) = self.resume_goal().await?;
-            event.append(&mut resume_event);
-            Ok((result, event))
-        } else {
-            let mut goal = self.active_goal()?;
-            goal.state = GoalState::Blocked;
-            goal.updated_at_ms = self.clock.now_ms();
-            self.store.save_goal(&goal)?;
-            self.sync_plan_execution(&goal)?;
-            event.push(self.event("goal_changed", serde_json::to_value(&goal)?)?);
-            Ok((serde_json::to_value(goal)?, event))
-        }
-    }
-
-    fn sync_plan_execution(&mut self, goal: &GoalRecord) -> Result<()> {
-        let Some(mut execution) = self
-            .store
-            .list_plan_execution(&self.session.id)?
-            .into_iter()
-            .find(|execution| execution.goal_id == goal.id)
-        else {
-            return Ok(());
-        };
-        if goal.state == GoalState::Active && execution.state != PlanExecutionState::Active {
-            execution.scheduler.resume_blocked_task();
-        }
-        execution.state = match goal.state {
-            GoalState::Active => PlanExecutionState::Active,
-            GoalState::Paused | GoalState::UsageLimited | GoalState::BudgetLimited => PlanExecutionState::Paused,
-            GoalState::Cleared => PlanExecutionState::Cancelled,
-            GoalState::Complete => PlanExecutionState::Complete,
-            GoalState::Blocked => PlanExecutionState::Blocked,
-            GoalState::Stalled => PlanExecutionState::Stalled,
-        };
-        if matches!(
-            execution.state,
-            PlanExecutionState::Complete
-                | PlanExecutionState::Blocked
-                | PlanExecutionState::Stalled
-                | PlanExecutionState::Cancelled
-        ) {
-            execution.completed_at_ms.get_or_insert(goal.updated_at_ms);
-        } else {
-            execution.completed_at_ms = None;
-        }
-        self.store.save_plan_execution(&execution)?;
-        let resolution_kind = match execution.state {
-            PlanExecutionState::Complete => Some(PlanResolutionKind::Completed),
-            PlanExecutionState::Blocked | PlanExecutionState::Stalled => {
-                Some(PlanResolutionKind::Blocked)
-            }
-            PlanExecutionState::Cancelled => Some(PlanResolutionKind::Cancelled),
-            PlanExecutionState::Active | PlanExecutionState::Paused => None,
-        };
-        if let Some(kind) = resolution_kind {
-            self.finalize_plan_resolution(&execution, kind)?;
-        }
-        Ok(())
-    }
-
-    fn finalize_plan_resolution(
-        &mut self,
-        execution: &PlanExecutionRecord,
-        kind: PlanResolutionKind,
-    ) -> Result<()> {
-        let now_ms = execution.completed_at_ms.context("plan resolution requires a settled execution")?;
-        if self
-            .store
-            .list_plan_resolution(&self.session.id)?
-            .iter()
-            .any(|resolution| resolution.execution_id == execution.id
-                && resolution.kind == kind && resolution.resolved_at_ms == now_ms)
-        {
-            return Ok(());
-        }
-        let plan = self
-            .store
-            .load_plan(&execution.plan_id)?
-            .context("resolved plan record is missing")?;
-        let accepted_revision = plan
-            .accepted_revision
-            .context("resolved plan accepted revision is missing")?;
-        let accepted = self.plan_file.read_submitted_document(
-            &self.session.id,
-            &plan.id,
-            accepted_revision,
-        )?;
-        let deviation_list = self
-            .store
-            .list_plan_deviation(&self.session.id)?
-            .into_iter()
-            .filter(|deviation| deviation.execution_id == execution.id)
-            .collect::<Vec<_>>();
-        let effective = crate::plan::build_effective_plan(&accepted, &deviation_list)?;
-        let audit = crate::plan::build_plan_audit(
-            Uuid::new_v4().to_string(),
-            execution.id.clone(),
-            &effective.document,
-            &execution.scheduler,
-            &deviation_list,
-            now_ms,
-        );
-        self.store.save_plan_audit(&self.session.id, &audit)?;
-        let mut resolution = crate::plan::build_plan_resolution(
-            Uuid::new_v4().to_string(),
-            self.session.id.clone(),
-            accepted_revision,
-            kind,
-            crate::plan::PlanResolutionEvidence {
-                scheduler: &execution.scheduler,
-                deviation_list: &deviation_list,
-                audit: &audit,
-            },
-            now_ms,
-        )?;
-        resolution.anchor = Some(crate::plan::ExchangeAnchor::capture(
-            &self.store.list_exchange(&self.session.id)?.into_iter().rev()
-                .find(|exchange| exchange.execution_id.as_deref() == Some(&execution.id))
-                .context("plan resolution has no owning exchange")?));
-        self.store.save_plan_resolution(&resolution)
-    }
 
     fn active_goal(&self) -> Result<GoalRecord> {
         let goal_id = self.session.goal_id.as_deref().context("no active goal")?;
@@ -6519,6 +6150,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         self.session.plan_executor = plan_executor;
         self.session.plan_compact = plan_compact;
+        if let Some(enabled) = params.get("plan_auto_approve_revisions").and_then(Value::as_bool) { self.session.plan_auto_approve_revisions = enabled; }
         self.save_session()?;
         let update_model_preference = requested_model.is_some()
             || requested_effort.is_some()
@@ -6827,6 +6459,7 @@ fn preference_for_session(
         fast_mode: session.fast_mode,
         plan_executor: session.plan_executor.clone(),
         plan_compact: session.plan_compact,
+        plan_auto_approve_revisions: session.plan_auto_approve_revisions,
     }
 }
 
@@ -6908,7 +6541,7 @@ mod test {
     use super::*;
 
     #[tokio::test]
-    async fn declaration_design_reviews_revises_and_accepts_without_execution() {
+    async fn declaration_design_acceptance_executes_verifies_resolves_and_completes() {
         let repository = repository();
         std::fs::write(repository.path().join("lib.rs"),"pub struct Existing;\n").unwrap();
         let data = tempfile::tempdir().unwrap();
@@ -6932,7 +6565,8 @@ mod test {
         let source = broker.capture_plan_review(&revised.id,revised.review_digest.as_deref().unwrap()).unwrap();
         assert!(source.rendered.markdown.contains("reviewed_change"));
         let overview = &source.document.design.as_ref().unwrap().document;
-        for (path, expected) in [("Task", &overview.task), ("Description", &overview.description)] {
+        for (path, expected) in [("Task", &overview.task), ("Description", &overview.description),
+            ("Validation/Automated", &overview.validation.automated), ("Validation/Manual", &overview.validation.manual)] {
             let (snapshot, _) = broker.read_plan_declaration(json!({"plan_id":revised.id,
                 "revision":2,"document":true,"path":path})).unwrap();
             assert_eq!(snapshot["text"].as_str().unwrap(), expected);
@@ -6947,11 +6581,251 @@ mod test {
         assert_eq!(broker.snapshot().unwrap().active_plan.as_ref().unwrap().state,PlanState::AwaitingReview);
         let result = broker.dispatch(Request { id:3,method:"plan.acceptance.begin".into(),params:json!({"plan_id":revised.id,"digest":revised.review_digest}) }).await;
         assert!(result.response.error().is_none(),"{:?}",result.response.error());
-        assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().state,PlanState::Accepted);
-        assert!(broker.session.goal_id.is_none());
-        assert!(broker.store.list_plan_execution(&broker.session.id).unwrap().is_empty());
+        assert!(broker.snapshot().unwrap().active_plan.unwrap().acceptance.is_some());
+        broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: 2 });
+        let result = broker.dispatch(Request { id:4, method:"plan.accept".into(), params:json!({"plan_id":revised.id,"digest":revised.review_digest,"execution_mode":"write"}) }).await;
+        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        let snapshot = broker.snapshot().unwrap();
+        assert_eq!(snapshot.active_plan.unwrap().state, PlanState::Accepted);
+        assert_eq!(snapshot.goal_execution.as_ref().unwrap().phase, crate::plan::PlanPhase::Verify);
+        let execution_id = snapshot.goal_execution.unwrap().id;
+        broker.pause_goal().await.unwrap();
+        assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Verify);
+        let mut resumed = InitializeRequest {
+            data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
+            workspace:repository.path().to_string_lossy().into_owned(), client_id:"design-test".into(),
+            backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:Some(broker.session.id.clone()), new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
+        };
+        drop(broker);
+        let mut broker = HarnessBroker::initialize_with_clock(resumed.clone(), Box::new(FixedClock(300))).unwrap();
+        assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
+        broker.backend = Arc::new(SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize::new(1), revision:2 });
+        broker.resume_goal().await.unwrap();
+        assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Resolve);
+        resumed.session_id = Some(broker.session.id.clone());
+        drop(broker);
+        let mut broker = HarnessBroker::initialize_with_clock(resumed, Box::new(FixedClock(400))).unwrap();
+        let recovered = broker.snapshot().unwrap().goal_execution.unwrap();
+        assert_eq!(recovered.phase, crate::plan::PlanPhase::Resolve);
+        assert_eq!(recovered.state, PlanExecutionState::Paused);
+        assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
+        broker.backend = Arc::new(SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize::new(2), revision:2 });
+        broker.resume_goal().await.unwrap();
+        for expected in [crate::plan::PlanPhase::Verify] {
+            let result = broker.dispatch(Request { id:5, method:"goal.continue".into(), params:json!({}) }).await;
+            assert!(result.response.error().is_none(), "{:?}", result.response.error());
+            assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, expected);
+        }
+        let snapshot = broker.snapshot().unwrap();
+        assert_eq!(snapshot.goal.unwrap().state, GoalState::Complete);
+        let execution = snapshot.goal_execution.unwrap();
+        assert_eq!(execution.id, execution_id);
+        assert_eq!(execution.state, PlanExecutionState::Complete);
+        assert_eq!(execution.verification.len(), 2);
+        assert!(execution.baseline_checkpoint.is_some());
         assert_eq!(std::fs::read_to_string(repository.path().join("lib.rs")).unwrap(),"pub struct Existing;\n");
-        assert!(!repository.path().join("src/change.rs").exists());
+        assert!(timeline_text(&broker.snapshot().unwrap()).contains("Execution completed"));
+        let review = broker.capture_plan_review(&revised.id, revised.review_digest.as_deref().unwrap()).unwrap();
+        assert!(review.execution_review.unwrap().contains("Verification assessments"));
+    }
+
+    struct NoProgressExecutionBackend;
+
+    #[async_trait::async_trait]
+    impl Backend for NoProgressExecutionBackend {
+        async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+            let context = request.control_context.unwrap();
+            let plan_id = context.plan_document.as_ref().unwrap().plan_id.clone();
+            let mut runtime = crate::control_tools::ControlToolRuntime::new(context);
+            runtime.invoke(crate::control_tools::ControlToolInvocation { name:"harness_plan_read".into(), arguments:json!({"plan_id":plan_id}) }).await?;
+            assert!(runtime.invoke(crate::control_tools::ControlToolInvocation { name:"harness_goal_complete".into(), arguments:json!({"summary":"premature"}) }).await.is_err());
+            Ok(crate::backend::BackendOutput { evidence:crate::goal::TurnEvidence { tool_called:true, structured_complete:true, ..Default::default() }, ..Default::default() })
+        }
+        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
+    }
+
+    #[tokio::test]
+    async fn semantic_execution_stalls_after_two_read_only_turns_and_resumes_the_same_phase() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = HarnessBroker::initialize_with_clock(InitializeRequest {
+            data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
+            workspace:repository.path().to_string_lossy().into_owned(), client_id:"guard-test".into(),
+            backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:None, new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
+        }, Box::new(FixedClock(100))).unwrap();
+        broker.submit_prompt(json!({"text":"/plan add a reusable API"})).await.unwrap();
+        let plan = broker.snapshot().unwrap().active_plan.unwrap();
+        broker.backend = Arc::new(NoProgressExecutionBackend);
+        let (_, first) = broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})).await.unwrap();
+        assert!(first.iter().any(|event| event.event == "goal_continue_requested"));
+        let (_, second) = broker.continue_goal().await.unwrap();
+        assert!(!second.iter().any(|event| event.event == "goal_continue_requested"));
+        let stalled = broker.snapshot().unwrap().goal_execution.unwrap();
+        assert_eq!(stalled.state, PlanExecutionState::Stalled);
+        assert_eq!(stalled.phase, crate::plan::PlanPhase::Implement);
+        assert!(stalled.completed_at_ms.is_none());
+        assert_eq!(broker.snapshot().unwrap().goal.unwrap().continuation.turn_count, 2);
+        broker.resume_goal().await.unwrap();
+        let resumed = broker.snapshot().unwrap().goal_execution.unwrap();
+        assert_eq!(resumed.id, stalled.id);
+        assert_eq!(resumed.state, PlanExecutionState::Active);
+        assert_eq!(resumed.phase, stalled.phase);
+        assert_eq!(broker.snapshot().unwrap().goal.unwrap().continuation.turn_count, 1);
+    }
+
+    struct RevisionExecutionBackend;
+
+    #[async_trait::async_trait]
+    impl Backend for RevisionExecutionBackend {
+        async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+            use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
+            let context = request.control_context.context("missing execution context")?;
+            let document = context.plan_document.as_ref().unwrap();
+            let plan_id = document.plan_id.clone();
+            let version = document.version;
+            let description = &document.design.as_ref().unwrap().document.description;
+            let before = serde_json::to_string(description)?;
+            let after = serde_json::to_string(&format!("{description} Preserve score reset behavior."))?;
+            std::fs::write(Path::new(&request.workspace).join("added.rs"), "pub fn extra() {}\n")?;
+            let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": {before}\n+  \"description\": {after}\n*** Update File: added.rs\n@@\n-pub fn extra();\n+pub fn extra() -> u32;\n*** End Patch");
+            let mut runtime = ControlToolRuntime::new(context);
+            runtime.invoke(ControlToolInvocation { name:"harness_design_apply_patch".into(), arguments:json!({"plan_id":plan_id,"expected_version":version,"patch":patch}) }).await?;
+            let result = runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(), arguments:json!({"plan_id":plan_id,"expected_version":version+1,"reason":"Verification needs an explicit score reset requirement"}) }).await?;
+            assert!(result.message.contains("transitioned"));
+            Ok(crate::backend::BackendOutput { backend_session_id:Some("revision-execution".into()), ..Default::default() })
+        }
+        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
+    }
+
+    #[tokio::test]
+    async fn execution_revisions_preserve_the_original_and_respect_review_and_user_pause() {
+        for decision in ["automatic", "accept", "recovered_accept", "paused_accept", "reject", "changes"] {
+            let repository = repository();
+            let data = tempfile::tempdir().unwrap();
+            let initialize = InitializeRequest {
+                data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
+                workspace:repository.path().to_string_lossy().into_owned(), client_id:"revision-test".into(),
+                backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:None, new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
+            };
+            let mut broker = HarnessBroker::initialize_with_clock(initialize, Box::new(FixedClock(100))).unwrap();
+            let planned = broker.dispatch(Request { id:1, method:"prompt.submit".into(), params:json!({"text":"/plan add a reusable API"}) }).await;
+            assert!(planned.response.error().is_none(), "{:?}", planned.response.error());
+            let plan = broker.snapshot().unwrap().active_plan.unwrap();
+            let original = broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 1).unwrap();
+            broker.session.plan_auto_approve_revisions = decision == "automatic";
+            broker.backend = Arc::new(RevisionExecutionBackend);
+            let accepted = broker.dispatch(Request { id:2, method:"plan.accept".into(), params:json!({"plan_id":plan.id,"digest":plan.review_digest,"execution_mode":"write"}) }).await;
+            assert!(accepted.response.error().is_none(), "{decision}: {:?}", accepted.response.error());
+            let execution = broker.snapshot().unwrap().goal_execution.unwrap();
+            assert_eq!(execution.original_revision, 1);
+            assert_eq!(execution.phase, crate::plan::PlanPhase::Implement);
+            let execution_id = execution.id.clone();
+            if decision == "automatic" {
+                assert_eq!(execution.revision, 2);
+                assert_eq!(execution.state, PlanExecutionState::Active);
+                assert_eq!(execution.revision_history[0].approval, "automatic");
+            } else {
+                assert_eq!(execution.revision, 1);
+                assert_eq!(execution.state, PlanExecutionState::Paused);
+                assert!(broker.resume_goal().await.unwrap_err().to_string().contains("review the pending"));
+                if decision == "recovered_accept" {
+                    let mut previous = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
+                    broker.capture_final_checkpoint(&mut previous, ExchangeState::Complete).await.unwrap();
+                    broker.exchange_runtime = None;
+                }
+                if decision == "paused_accept" { broker.pause_goal().await.unwrap(); }
+                let events = if decision == "reject" { broker.cancel_plan().unwrap().1 }
+                    else if decision == "changes" { broker.request_plan_changes(json!({"comment":"Retain the approved scope"})).await.unwrap().1 }
+                    else { broker.begin_plan_acceptance(json!({"plan_id":plan.id})).unwrap().1 };
+                let updated = broker.snapshot().unwrap().goal_execution.unwrap();
+                assert_eq!(updated.id, execution_id);
+                assert_eq!(updated.phase, execution.phase);
+                assert_eq!(updated.revision, if matches!(decision, "reject" | "changes") { 1 } else { 2 });
+                assert!(updated.pending_revision_reason.is_none());
+                assert_eq!(events.iter().any(|event| event.event == "goal_continue_requested"), decision != "paused_accept");
+                assert_eq!(updated.state, if decision == "paused_accept" { PlanExecutionState::Paused } else { PlanExecutionState::Active });
+                if decision == "reject" {
+                    let restored = broker.store.load_plan(&plan.id).unwrap().unwrap();
+                    let source = broker.capture_plan_review(&plan.id, restored.review_digest.as_deref().unwrap()).unwrap();
+                    assert_eq!(source.document, original);
+                    assert_eq!(updated.revision_history[0].approval, "rejected");
+                }
+                if decision == "changes" { assert_eq!(broker.snapshot().unwrap().active_plan.unwrap().state, PlanState::Revising); }
+                if decision != "paused_accept" {
+                    let previous = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
+                    broker.backend = Arc::new(NoProgressExecutionBackend);
+                    broker.continue_goal().await.unwrap();
+                    let continued = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
+                    assert_eq!(continued.id == previous.id, decision != "recovered_accept");
+                    assert_eq!(continued.execution_id.as_deref(), Some(execution_id.as_str()));
+                    assert_eq!(continued.kind, ExchangeKind::PlanExecution);
+                }
+            }
+            assert_eq!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 1).unwrap(), original);
+            let revised = broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 2).unwrap().design.unwrap();
+            assert!(revised.document.description.contains("score reset"));
+            assert!(revised.proposed.contains_key("added.rs"));
+            assert!(!revised.baseline.contains_key("added.rs"), "implemented additions must not become the original baseline");
+            assert!(broker.execution_review(&plan.id).unwrap().unwrap().contains("Original approved revision: 1"));
+        }
+    }
+
+    struct SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize, revision: u32 }
+
+    #[async_trait::async_trait]
+    impl Backend for SemanticExecutionBackend {
+        async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+            use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
+            let turn = self.turn.fetch_add(1, Ordering::SeqCst);
+            let context = request.control_context.clone().context("missing control context")?;
+            let document = context.plan_document.clone().unwrap();
+            let mut runtime = ControlToolRuntime::new(context);
+            let phase = match turn { 0 => "implement", 2 => "resolve", _ => "verify" };
+            let mut arguments = json!({"phase":phase,"revision":self.revision,"summary":"Checked planned behavior"});
+            if turn == 0 {
+                let mismatch = runtime.invoke(ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments:arguments.clone() }).await.unwrap_err();
+                assert!(mismatch.to_string().contains("Semantic comparison failed"), "{mismatch:#}");
+                for (path, overview) in &document.design.as_ref().unwrap().proposed {
+                    let path = Path::new(&request.workspace).join(path);
+                    std::fs::create_dir_all(path.parent().unwrap())?;
+                    std::fs::write(path, overview.replace("();", "() {}"))?;
+                }
+                std::fs::write(Path::new(&request.workspace).join("unexpected.rs"), "fn unexpected() {}")?;
+                let outside = runtime.invoke(ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments:arguments.clone() }).await.unwrap_err();
+                assert!(outside.to_string().contains("outside the accepted plan"), "{outside:#}");
+                std::fs::remove_file(Path::new(&request.workspace).join("unexpected.rs"))?;
+            } else if phase == "verify" {
+                let id = format!("check-{turn}");
+                sink.as_ref().unwrap().send_wait(BackendEvent { address:None, turn_boundary:None, kind:"tool".into(), text:None, data:Value::Null,
+                    activity:Some(crate::backend::ToolActivity { id:id.clone(), kind:crate::backend::ToolActivityKind::Command, title:"cargo test".into(), output:Some(if turn == 1 { "round reset failed" } else { "all checks passed" }.into()), status:Some("completed".into()), change:Default::default(), output_delta:false }), summary:None, task_update:None }).await?;
+                arguments["verification"] = json!({"outcome":if turn == 1 { "failed" } else { "passed" },"evidence":[id],"findings":if turn == 1 { vec!["Round reset retains score"] } else { Vec::<&str>::new() }});
+            }
+            if phase == "verify" {
+                let read = runtime.invoke(ControlToolInvocation {
+                    name: "harness_plan_read".into(), arguments: json!({"plan_id":document.plan_id}),
+                }).await.unwrap();
+                let inspection: Value = serde_json::from_str(&read.message).unwrap();
+                let available = inspection["execution"]["verification_evidence"].as_array().unwrap();
+                let reference = available.iter().find(|evidence| evidence["id"] == format!("check-{turn}")).unwrap();
+                assert_eq!(reference["title"], "cargo test");
+                assert_eq!(inspection["execution"]["phase"], "verify");
+                let mut invalid = arguments.clone();
+                invalid["verification"]["evidence"] = json!(["unobserved-check"]);
+                assert!(runtime.invoke(ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments:invalid }).await.unwrap_err().to_string().contains("not a completed tool result"));
+                if turn == 3 {
+                    let mut reused = arguments.clone();
+                    reused["verification"]["evidence"] = json!(["check-1"]);
+                    assert!(runtime.invoke(ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments:reused }).await.unwrap_err().to_string().contains("reused verification evidence"));
+                }
+            }
+            let invocation = ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments };
+            let first = runtime.invoke(invocation.clone()).await?;
+            let repeated = runtime.invoke(invocation).await?;
+            assert_eq!(first.message, repeated.message);
+            assert!(runtime.invoke(ControlToolInvocation { name:"harness_goal_complete".into(), arguments:json!({"summary":"premature"}) }).await.is_err());
+            Ok(crate::backend::BackendOutput { backend_session_id:Some("semantic-execution".into()), ..Default::default() })
+        }
+        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
     }
 
     /// Render persisted timeline state through the native document projection.
@@ -8501,6 +8375,7 @@ mod test {
             effort: "low".into(),
             plan_executor: Default::default(),
             plan_compact: false,
+            plan_auto_approve_revisions: true,
             context_window: None,
             fast_mode: false,
             execution_mode: ExecutionMode::Read,
@@ -8536,6 +8411,7 @@ mod test {
                 fast_mode: false,
                 plan_executor: Default::default(),
                 plan_compact: false,
+                plan_auto_approve_revisions: true,
             }),
         );
         assert_eq!(preference.model_setting.len(), 2);

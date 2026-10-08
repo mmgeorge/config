@@ -29,6 +29,8 @@ local function interaction(session_id, prompt)
     ordinal = 1,
     prompt = prompt,
     state = "complete",
+    attributed_diff_text = vim.NIL,
+    checkpoint_diff_text = vim.NIL,
     created_at_ms = 1,
     completed_at_ms = 2,
     duration_ms = 1,

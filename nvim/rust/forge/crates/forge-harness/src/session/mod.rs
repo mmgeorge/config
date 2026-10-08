@@ -178,6 +178,8 @@ pub struct HarnessSession {
     pub plan_executor: PlanExecutor,
     #[serde(default)]
     pub plan_compact: bool,
+    #[serde(default = "auto_approve_revisions")]
+    pub plan_auto_approve_revisions: bool,
     #[serde(default)]
     pub context_window: Option<String>,
     #[serde(default)]
@@ -213,6 +215,8 @@ pub struct HarnessPreference {
     pub plan_executor: PlanExecutor,
     #[serde(default)]
     pub plan_compact: bool,
+    #[serde(default = "auto_approve_revisions")]
+    pub plan_auto_approve_revisions: bool,
 }
 
 /// Selects the model used after a plan is accepted.
@@ -289,3 +293,5 @@ mod context_usage_test {
         assert_eq!(usage.remaining_percent, 22);
     }
 }
+
+fn auto_approve_revisions() -> bool { true }

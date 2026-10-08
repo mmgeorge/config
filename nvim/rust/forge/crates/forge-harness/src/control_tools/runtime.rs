@@ -1,7 +1,7 @@
 use super::{ControlToolInvocation, apply_invocation};
 use crate::backend::{BackendOutput, PromptMode};
 use crate::plan::{
-    PlanDocument, PlanState, apply_plan_edit, render_plan, validate_workspace_references,
+    PlanDocument, PlanState, render_plan, validate_workspace_references,
 };
 use crate::rustdoc::{RustdocResolver, validate_plan_rust_api};
 use anyhow::{Context, Result};
@@ -23,6 +23,7 @@ pub struct ControlTurnContext {
     pub workspace_root: Option<PathBuf>,
     pub rustdoc: Option<Arc<RustdocResolver>>,
     pub repository: Option<Arc<super::repository::RepositoryToolScope>>,
+    pub execution: Option<crate::plan::execution::ExecutionControlSender>,
 }
 
 impl std::fmt::Debug for ControlTurnContext {
@@ -62,6 +63,7 @@ impl ControlTurnContext {
             workspace_root: None,
             rustdoc: None,
             repository: None,
+            execution: None,
         }
     }
 }
@@ -71,6 +73,7 @@ pub struct ControlToolRuntime {
     context: ControlTurnContext,
     plan_document: Option<PlanDocument>,
     terminal: bool,
+    completion: Option<(String, String)>,
     inspected: BTreeMap<String, String>,
     patch_source_digests: BTreeMap<u64, BTreeMap<String, String>>,
 }
@@ -89,12 +92,13 @@ impl ControlToolRuntime {
             plan_document: context.plan_document.clone(),
             context,
             terminal: false,
+            completion: None,
             inspected: BTreeMap::new(),
             patch_source_digests: BTreeMap::new(),
         }
     }
 
-    /// Validate and stage one control invocation without persisting broker state.
+    /// Validate a control invocation and await broker persistence for execution controls.
     pub async fn invoke(&mut self, invocation: ControlToolInvocation) -> Result<ControlToolResult> {
         let mut output = BackendOutput::default();
         apply_invocation(&invocation, &mut output)?;
@@ -107,11 +111,24 @@ impl ControlToolRuntime {
         mut invocation: ControlToolInvocation,
         mut output: BackendOutput,
     ) -> Result<ControlToolResult> {
+        let identity = serde_json::to_string(&invocation)?;
+        if let Some((completed, message)) = &self.completion && completed == &identity {
+            return Ok(ControlToolResult { invocation: None, message: message.clone() });
+        }
         anyhow::ensure!(
             !self.terminal,
             "this provider turn already reached a terminal control action"
         );
         match invocation.name.as_str() {
+            "harness_plan_phase_done" => {
+                let execution = self.context.execution.as_ref().context("phase completion requires an active execution")?;
+                let request = serde_json::from_value(invocation.arguments.clone())?;
+                let response = execution.send(crate::plan::execution::ExecutionOperation::Phase(request)).await?;
+                self.terminal = true;
+                let message = serde_json::to_string(&response)?;
+                self.completion = Some((identity, message.clone()));
+                Ok(ControlToolResult { invocation: None, message })
+            }
             "harness_design_apply_patch" => {
                 self.require_readable_plan()?;
                 anyhow::ensure!(!self.context.has_active_elicitation, "resolve pending Harness questions before editing the design");
@@ -140,6 +157,16 @@ impl ControlToolRuntime {
                 } else if confirmation.is_empty() {
                     confirmation.push_str("No declaration changes.\n");
                 }
+                if let Some(execution) = &self.context.execution {
+                    if updated.version == document.version {
+                        return Ok(ControlToolResult { invocation: None, message: self.plan_version_message("Design unchanged") });
+                    }
+                    let saved = execution.send(crate::plan::execution::ExecutionOperation::Draft(updated.clone())).await?;
+                    let updated: PlanDocument = serde_json::from_value(saved["document"].clone())?;
+                    self.context.plan_state = Some(PlanState::Revising);
+                    self.plan_document = Some(updated);
+                    return Ok(ControlToolResult { invocation: None, message: format!("{}\n{confirmation}", self.plan_version_message("Execution revision draft saved")) });
+                }
                 self.plan_document = Some(updated);
                 if self.context.plan_state == Some(PlanState::AwaitingReview) { self.context.plan_state = Some(PlanState::Revising); }
                 Ok(ControlToolResult { invocation:Some(invocation), message:format!("{}\n{confirmation}", self.plan_version_message("Declaration patch accepted")) })
@@ -155,30 +182,6 @@ impl ControlToolRuntime {
                 Ok(ControlToolResult {
                     invocation: None,
                     message,
-                })
-            }
-            "harness_plan_edit" => {
-                self.require_readable_plan()?;
-                anyhow::ensure!(!self.context.has_active_elicitation,
-                    "resolve the pending Harness questions before editing the plan");
-                let request = output
-                    .plan_edit
-                    .pop()
-                    .context("plan edit did not produce an edit request")?;
-                let document = self
-                    .plan_document
-                    .as_ref()
-                    .context("plan edit has no active canonical document")?;
-                self.plan_document = Some(apply_plan_edit(document, request)?.document);
-                if self.context.plan_state == Some(PlanState::AwaitingReview) {
-                    self.context.plan_state = Some(PlanState::Revising);
-                }
-                Ok(ControlToolResult {
-                    invocation: Some(invocation),
-                    message: format!(
-                        "{} Submission validation has not run.",
-                        self.plan_version_message("Plan edit accepted")
-                    ),
                 })
             }
             "harness_plan_read" => {
@@ -200,6 +203,14 @@ impl ControlToolRuntime {
                         }
                         message
                     } else { document.model_json()? };
+                if invocation.arguments.get("path").and_then(serde_json::Value::as_str).is_none()
+                    && let Some(execution) = &self.context.execution
+                {
+                    let state = execution.send(crate::plan::execution::ExecutionOperation::Inspect).await?;
+                    let mut value: serde_json::Value = serde_json::from_str(&message)?;
+                    value["execution"] = state;
+                    return Ok(ControlToolResult { invocation: None, message: serde_json::to_string(&value)? });
+                }
                 Ok(ControlToolResult { invocation: Some(invocation), message })
             }
             "harness_plan_submit" => {
@@ -223,9 +234,18 @@ impl ControlToolRuntime {
                 document.validate_for_submission()?;
                 if let Some(design) = &document.design {
                     let workspace = self.context.workspace_root.as_deref().context("design submission has no workspace root")?;
-                    let design = design.validated(workspace).await?;
+                    let design = if self.context.execution.is_some() { design.validated_revision(workspace).await? } else { design.validated(workspace).await? };
                     let mut submitted = document.clone();
                     submitted.design = Some(design);
+                    if let Some(execution) = &self.context.execution {
+                        let reason = invocation.arguments.get("reason").and_then(serde_json::Value::as_str).filter(|reason| !reason.trim().is_empty()).context("execution revision requires a reason")?;
+                        let response = execution.send(crate::plan::execution::ExecutionOperation::Submit { document: submitted.clone(), reason: reason.into() }).await?;
+                        self.plan_document = Some(submitted);
+                        self.terminal = true;
+                        let message = serde_json::to_string(&response)?;
+                        self.completion = Some((identity, message.clone()));
+                        return Ok(ControlToolResult { invocation: None, message });
+                    }
                     self.plan_document = Some(submitted);
                     self.terminal = true;
                     return Ok(ControlToolResult { invocation:Some(invocation), message:self.plan_version_message("Declaration design submitted for review") });
@@ -308,22 +328,13 @@ impl ControlToolRuntime {
                     message: "Question resolution accepted".into(),
                 })
             }
-            "harness_plan_deviation" | "harness_plan_task_report" => {
-                anyhow::ensure!(
-                    self.context.mode == PromptMode::ExecutePlan
-                        && self.context.has_active_execution,
-                    "plan execution controls require an active accepted-plan task"
-                );
-                Ok(ControlToolResult {
-                    invocation: Some(invocation),
-                    message: "Execution control accepted".into(),
-                })
-            }
             "harness_goal_complete" | "harness_goal_blocked" | "harness_goal_status" => {
                 anyhow::ensure!(
                     self.context.has_active_goal,
                     "goal control requires an active nonterminal goal"
                 );
+                anyhow::ensure!(invocation.name != "harness_goal_complete" || !self.context.has_active_execution,
+                    "plan execution completes only through harness_plan_phase_done in Verify");
                 if invocation.name != "harness_goal_status" {
                     self.terminal = true;
                 }
@@ -335,6 +346,9 @@ impl ControlToolRuntime {
             name => anyhow::bail!("unknown Harness control tool: {name}"),
         }
     }
+
+    /// Indicates that the current provider turn must stop after delivering its execution result.
+    pub(crate) fn execution_finished(&self) -> bool { self.completion.is_some() }
 
     /// Return the staged canonical document after accepted plan edits.
     pub fn plan_document(&self) -> Option<&PlanDocument> {
@@ -356,6 +370,7 @@ impl ControlToolRuntime {
     }
 
     fn require_readable_plan(&self) -> Result<()> {
+        if self.context.mode == PromptMode::ExecutePlan && self.context.execution.is_some() { return Ok(()); }
         anyhow::ensure!(
             matches!(self.context.mode, PromptMode::Plan | PromptMode::PlanDiscussion),
             "plan controls require Harness Plan mode"
@@ -455,6 +470,7 @@ mod test {
             has_active_goal: false,
             workspace_root: Some(tempfile::tempdir().unwrap().keep()),
             repository: None,
+            execution: None,
             rustdoc: Some(Arc::new(
                 RustdocResolver::new(crate::rustdoc::RustdocResolverConfig {
                     crates_io_base: "http://127.0.0.1:9".into(),

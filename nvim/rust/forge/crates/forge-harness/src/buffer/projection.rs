@@ -480,30 +480,7 @@ impl TimelineRenderer<'_> {
             }
             PlanEventContent::Execution { event: lifecycle } => {
                 let label = match lifecycle {
-                    PlanExecutionLifecycleEvent::TaskStarted {
-                        task_path,
-                        ordinal,
-                        total,
-                        title,
-                        ..
-                    } => format!(
-                        "Task {} ({ordinal}/{total}): {title}",
-                        crate::plan::PlanDocument::label_for_path(task_path).unwrap_or_default()
-                    ),
-                    PlanExecutionLifecycleEvent::TaskCompleted {
-                        task_path,
-                        ordinal,
-                        total,
-                        title,
-                        elapsed_ms,
-                        ..
-                    } => format!(
-                        "Completed {} ({ordinal}/{total}): {title} · {elapsed_ms} ms",
-                        crate::plan::PlanDocument::label_for_path(task_path).unwrap_or_default()
-                    ),
-                    PlanExecutionLifecycleEvent::DeviationRecorded { summary, .. } => {
-                        format!("Deviation: {summary}")
-                    }
+                    PlanExecutionLifecycleEvent::Phase { title, revision, .. } => format!("{title} · revision {revision}"),
                 };
                 self.literal(&event.id, &label, None)?;
             }

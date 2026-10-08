@@ -321,11 +321,7 @@ impl CodexJsonRpc {
             .get("method")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        if !self.activity_publication && method.starts_with("item/") && message.get("id").is_some()
-        {
-            self.write_message(&json!({"jsonrpc":"2.0", "id":message["id"],
-                "error":{"code":-32000,"message":"No Harness turn owns this provider request"}}))
-                .await?;
+        if !self.activity_publication && message.get("id").is_some() && !method.is_empty() {
             return Ok(message);
         }
         let rejects_question_resolution =
@@ -530,6 +526,12 @@ impl CodexJsonRpc {
             }
         }
         write_result?;
+        if response_success && matches!(control_tool_name(message.get("method").and_then(Value::as_str).unwrap_or_default(), message.get("params").unwrap_or(message)), Some("harness_plan_phase_done" | "harness_plan_submit")) && self.control_runtime.as_ref().is_some_and(|runtime| runtime.execution_finished()) {
+            let params = message.get("params").unwrap_or(message);
+            if let (Some(thread), Some(turn)) = (params.get("threadId").and_then(Value::as_str), params.get("turnId").and_then(Value::as_str)) {
+                self.send_request("turn/interrupt", json!({"threadId":thread,"turnId":turn})).await?;
+            }
+        }
         Ok(response_success)
     }
 
@@ -699,13 +701,13 @@ impl CodexJsonRpc {
     ) -> Result<Option<String>> {
         if let Some(runtime) = self.control_runtime.as_mut() {
             let result = runtime.invoke_decoded(invocation.clone(), output).await?;
-            if result.invocation.is_none() {
-                return Ok(Some(result.message));
-            }
             self.plan_document = runtime.plan_document().cloned();
             return Ok(Some(result.message));
         }
         match invocation.name.as_str() {
+            "harness_plan_phase_done" => {
+                anyhow::bail!("phase completion requires an active execution control context");
+            }
             "harness_plan_edit" => {
                 anyhow::bail!("obsolete plan edit tool. Use harness_design_apply_patch");
             }
@@ -1458,8 +1460,7 @@ fn control_tool_name<'value>(method: &str, value: &'value Value) -> Option<&'val
                 "harness_plan_edit"
                     | "harness_plan_read"
                     | "harness_plan_submit"
-                    | "harness_plan_deviation"
-                    | "harness_plan_task_report"
+                    | "harness_plan_phase_done"
                     | "harness_question_ask"
                     | "harness_question_answer"
                     | "harness_question_withdraw"
@@ -2024,6 +2025,50 @@ fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+
+    #[tokio::test]
+    async fn passive_catalog_connection_does_not_answer_broadcast_controls() -> anyhow::Result<()> {
+        use super::*;
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let request: Value = serde_json::from_str(
+                socket.next().await.unwrap().unwrap().to_text().unwrap(),
+            ).unwrap();
+            assert_eq!(request["method"], "thread/backgroundTerminals/list");
+            socket.send(Message::Text(json!({
+                "id": 90, "method": "item/tool/call",
+                "params": {"threadId":"thread", "turnId":"turn", "callId":"phase",
+                    "tool":"harness_plan_phase_done",
+                    "arguments":{"phase":"implement","revision":1,"summary":"Implemented"}}
+            }).to_string().into())).await.unwrap();
+            socket.send(Message::Text(json!({
+                "id": request["id"], "result":{"terminals":[]}
+            }).to_string().into())).await.unwrap();
+            assert!(tokio::time::timeout(Duration::from_millis(100), socket.next()).await.is_err(),
+                "a catalog connection must leave broadcast controls to the turn owner");
+        });
+        let mut process = CodexJsonRpc::connect(
+            &endpoint, &workspace, ExecutionMode::Read,
+            PermissionCoordinator::transient(&workspace)?, None,
+            Arc::new(TraceStore::open(fixture.path())?), "session".into(),
+        ).await?;
+        process.set_activity_publication(false);
+        let mut output = BackendOutput::default();
+        process.request("thread/backgroundTerminals/list", json!({"threadId":"thread"}), &mut output).await?;
+        tokio::time::timeout(Duration::from_secs(2), server).await??;
+        let failure = process.execute_control_invocation(&ControlToolInvocation {
+            name: "harness_plan_phase_done".into(),
+            arguments: json!({"phase":"implement","revision":1,"summary":"Implemented"}),
+        }, BackendOutput::default()).await.unwrap_err();
+        assert!(failure.to_string().contains("active execution control context"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn native_goal_state_ignores_child_and_unknown_notifications() {
         use crate::goal::GoalState;

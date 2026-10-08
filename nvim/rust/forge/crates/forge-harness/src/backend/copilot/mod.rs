@@ -562,6 +562,8 @@ impl Backend for CopilotBackend {
             .send(MessageOptions::new(prompt))
             .await
             .context("send Copilot prompt")?;
+        let mut execution_control_call = std::collections::HashSet::new();
+        let mut execution_turn_stopped = false;
         loop {
             tokio::select! {
                 provider_event = subscription.recv() => {
@@ -596,6 +598,22 @@ impl Backend for CopilotBackend {
                     let terminal_error = provider_event.event_type == "session.error"
                         && !provider_event.is_transient_error();
                     decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
+                    if request.mode == PromptMode::ExecutePlan && !execution_turn_stopped {
+                        let call_id = provider_event.data.get("toolCallId").and_then(Value::as_str);
+                        if provider_event.event_type == "tool.execution_start"
+                            && matches!(provider_event.data.get("toolName").and_then(Value::as_str), Some("harness_plan_phase_done" | "harness_plan_submit"))
+                            && let Some(call_id) = call_id {
+                            execution_control_call.insert(call_id.to_owned());
+                        }
+                        if provider_event.event_type == "tool.execution_complete"
+                            && call_id.is_some_and(|call_id| execution_control_call.remove(call_id))
+                            && provider_event.data.pointer("/result/content").and_then(Value::as_str)
+                                .and_then(|content| serde_json::from_str::<Value>(content).ok())
+                                .is_some_and(|result| result["result"] == "transitioned") {
+                            session.abort().await.context("finish Copilot execution phase")?;
+                            execution_turn_stopped = true;
+                        }
+                    }
                     if terminal_error {
                         let detail = provider_event
                             .data
@@ -1234,6 +1252,7 @@ impl ControlToolRouter {
             (active_sender, admission, runtime)
         };
         let result = runtime.invoke(invocation.clone()).await;
+        let execution_finished = runtime.execution_finished();
         let failure_json = result
             .as_ref()
             .err()
@@ -1262,9 +1281,11 @@ impl ControlToolRouter {
                 );
             }
         };
-        let Some(invocation) = result.invocation else {
+        let Some(accepted) = result.invocation else {
+            if execution_finished { admission.send(invocation); }
             return Ok(result.message);
         };
+        let invocation = accepted;
         admission.send(invocation);
         Ok(result.message)
     }

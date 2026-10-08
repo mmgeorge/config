@@ -89,6 +89,8 @@ impl DeclarationDelta {
         for (section, before, after) in [
             ("Task", previous.map(|design| design.document.task.as_str()), design.document.task.as_str()),
             ("Description", previous.map(|design| design.document.description.as_str()), design.document.description.as_str()),
+            ("Validation/Automated", previous.map(|design| design.document.validation.automated.as_str()), design.document.validation.automated.as_str()),
+            ("Validation/Manual", previous.map(|design| design.document.validation.manual.as_str()), design.document.validation.manual.as_str()),
         ] {
             write_file(section, section, before, Some(after), &mut document)?;
         }

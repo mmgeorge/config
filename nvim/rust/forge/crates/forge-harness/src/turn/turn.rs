@@ -91,15 +91,6 @@ impl Turn {
         })
     }
 
-    /// Measure provider execution inside a bounded task interval.
-    pub(crate) fn duration_between(&self, start_ms: i64, end_ms: i64) -> i64 {
-        self.completed_at_ms
-            .unwrap_or(end_ms)
-            .min(end_ms)
-            .saturating_sub(self.started_at_ms.max(start_ms))
-            .max(0)
-    }
-
     /// Attach terminal usage without reopening the settled execution.
     pub(crate) fn record_usage(&mut self, usage: crate::backend::usage::TokenUsage) {
         if let Some(current) = &mut self.usage {

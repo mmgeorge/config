@@ -118,7 +118,7 @@ function M.review_item_list(elicitation)
     item_list[#item_list + 1] = {
       question = question.question or question.header or "Planning question",
       answer = answer_text,
-      additional_input = additional_input ~= "" and additional_input or nil,
+      additional_input = type(additional_input) == "string" and additional_input ~= "" and additional_input or nil,
     }
   end
   return item_list

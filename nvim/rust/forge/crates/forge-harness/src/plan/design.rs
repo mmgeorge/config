@@ -25,8 +25,20 @@ pub struct DesignDocument {
     /// States the requested outcome and scope without prescribing implementation steps.
     #[serde(default)]
     pub task: String,
+    /// Records the checks required to verify the accepted implementation.
+    pub validation: DesignValidation,
     /// Describes the intended behavioral change and its design.
     pub description: String,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Stores validation requirements separately from semantic validation results.
+pub struct DesignValidation {
+    /// Contains one executable command per nonblank line, without Markdown wrappers.
+    pub automated: String,
+    /// Contains a Markdown list of observable checks to perform manually.
+    pub manual: String,
 }
 
 /// Owns baseline declarations and the agent's proposed file contents.
@@ -76,8 +88,13 @@ impl Default for DeclarationDesign {
 impl DeclarationDesign {
     /// Format and validate one submission using the shared lazy source resolver.
     pub(crate) async fn validated(&self, workspace: &Path) -> Result<Self> {
+        self.check_workspace(workspace)?;
+        self.validated_revision(workspace).await
+    }
+
+    /// Validate a new target without replacing the immutable pre-execution baseline.
+    pub(crate) async fn validated_revision(&self, workspace: &Path) -> Result<Self> {
         let mut design = self.formatted()?;
-        design.check_workspace(workspace)?;
         super::comment_lint::validate(self)?;
         super::usage::validate(&design, workspace)?;
         let paths = design.proposed.keys().filter(|path| path.ends_with(".rs") || path.ends_with("Cargo.toml")).cloned().collect::<Vec<_>>();
@@ -125,7 +142,7 @@ impl DeclarationDesign {
         Ok(design)
     }
 
-    fn source(&self, workspace: &Path, path: &str) -> Result<(DeclarationFile, Vec<super::FunctionBody>)> {
+    pub(crate) fn source(&self, workspace: &Path, path: &str) -> Result<(DeclarationFile, Vec<super::FunctionBody>)> {
         validate_path(path)?;
         let source = workspace_source(workspace, path)?.with_context(|| format!("declaration file does not exist: {path}"))?;
         let source_digest = super::digest(source.as_bytes());
@@ -179,7 +196,12 @@ impl DeclarationDesign {
             (40..=240).contains(&self.line_width),
             "declaration line width must be between 40 and 240"
         );
-        for (name, text) in [("task", &self.document.task), ("description", &self.document.description)] {
+        for (name, text) in [
+            ("task", &self.document.task),
+            ("description", &self.document.description),
+            ("validation.automated", &self.document.validation.automated),
+            ("validation.manual", &self.document.validation.manual),
+        ] {
             ensure!(text.len() <= 16 * 1024, "plan {name} exceeds 16 KiB");
             ensure!(!text.contains('\0'), "plan {name} contains a NUL byte");
         }
@@ -414,7 +436,7 @@ impl DeclarationDesign {
                 let original = format!("{}\n", serde_json::to_string_pretty(&candidate.document)?);
                 let text = patch_file(&original, body)?;
                 candidate.document = serde_json::from_str(&text)
-                    .context("plan.json must contain only string task and description fields")?;
+                    .context("plan.json requires task and description strings and a validation object with automated and manual strings")?;
                 continue;
             }
             match kind {
@@ -766,6 +788,63 @@ mod tests {
         assert!(document.validate_for_submission().is_err());
         let oversized = changed.patch(workspace.path(), &Default::default(), &format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"Add cancellable requests.\"\n+  \"description\": \"{}\"\n*** End Patch", "x".repeat(16 * 1024 + 1)));
         assert!(oversized.is_err());
+    }
+
+    #[test]
+    fn validation_requirements_survive_submission_and_revision_without_running_commands() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+        let mut design = DeclarationDesign::default();
+        design.document.task = "Verify score resets.".into();
+        design.document.description = "Reset score when a new round starts.".into();
+        let patch = r#"*** Begin Patch
+*** Update File: plan.json
+@@
+-    "automated": "",
+-    "manual": ""
++    "automated": "echo test > should-not-exist.txt\nnvim --headless -l tests/score.lua",
++    "manual": "- Start a new round and confirm the score is zero.\n- Confirm `Score` remains visible after resize."
+*** End Patch"#;
+        let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
+        let mut document = crate::plan::document::test_fixture("validation", "Score validation");
+        document.design = Some(changed.clone());
+        store.write_working_document("session", "validation", &document).unwrap();
+        let (_, rendered, _) = store.submit_document_revision("session", "validation", 1, 1).unwrap();
+        let original = store.read_submitted_document("session", "validation", 1).unwrap();
+        assert_eq!(original.design.as_ref().unwrap().document, changed.document);
+        assert!(rendered.markdown.contains("Validation:\n  Automated:\n    echo test > should-not-exist.txt\n    nvim --headless -l tests/score.lua"));
+        assert!(rendered.markdown.contains("  Manual:\n  - Start a new round"));
+        assert!(!workspace.path().join("should-not-exist.txt").exists());
+        let serialized = changed.read(Some("plan.json"), false).unwrap();
+        let metadata: serde_json::Value = serde_json::from_str(serialized["text"].as_str().unwrap()).unwrap();
+        assert_eq!(metadata["validation"]["automated"], changed.document.validation.automated);
+
+        let revised = changed.patch(workspace.path(), &Default::default(), r#"*** Begin Patch
+*** Update File: plan.json
+@@
+-    "automated": "echo test > should-not-exist.txt\nnvim --headless -l tests/score.lua",
++    "automated": "nvim --headless -l tests/score.lua",
+@@
+-    "manual": "- Start a new round and confirm the score is zero.\n- Confirm `Score` remains visible after resize."
++    "manual": ""
+*** End Patch"#).unwrap();
+        document.version += 1;
+        document.design = Some(revised);
+        store.write_working_document("session", "validation", &document).unwrap();
+        store.submit_document_revision("session", "validation", 2, document.version).unwrap();
+        let current = store.read_submitted_document("session", "validation", 2).unwrap();
+        let delta = crate::plan::revision::DeclarationDelta::between(Some(&original), &current).unwrap();
+        assert!(delta.files.is_empty());
+        assert!(delta.document.contains("a/Validation/Automated b/Validation/Automated"));
+        assert!(delta.document.contains("-echo test > should-not-exist.txt"));
+        assert!(delta.document.contains("-- Start a new round and confirm the score is zero."));
+        assert_eq!(store.read_submitted_document("session", "validation", 1).unwrap(), original);
+
+        for invalid in ["\\u0000".to_owned(), "x".repeat(16 * 1024 + 1)] {
+            let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-    \"automated\": \"\",\n+    \"automated\": \"{invalid}\",\n*** Add File: unwanted.rs\n+pub struct Unwanted;\n*** End Patch");
+            assert!(design.patch(workspace.path(), &Default::default(), &patch).is_err());
+            assert!(design.document.validation.automated.is_empty() && design.proposed.is_empty());
+        }
     }
 
     #[test]

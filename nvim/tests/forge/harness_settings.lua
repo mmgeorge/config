@@ -25,6 +25,7 @@ client.request_for = function(session_id, method, params, callback)
   if method == "session.configure" then
     if params.plan_executor_enabled ~= nil then configured_session.plan_executor.enabled = params.plan_executor_enabled end
     if params.plan_compact ~= nil then configured_session.plan_compact = params.plan_compact end
+    if params.plan_auto_approve_revisions ~= nil then configured_session.plan_auto_approve_revisions = params.plan_auto_approve_revisions end
     if params.plan_executor_model then configured_session.plan_executor.model = params.plan_executor_model end
     if params.plan_executor_effort then configured_session.plan_executor.effort = params.plan_executor_effort end
     callback(vim.deepcopy(configured_session))
@@ -44,12 +45,18 @@ local success, failure = xpcall(function()
   assert(not text:find("Plan Executor", 1, true) and not text:find("Plan Compact", 1, true), text)
   assert(text:find("Description", 1, true), text)
   assert(not text:find("[←", 1, true), text)
+  assert(text:find("Auto-approve plan revisions", 1, true), text)
   vim.fn.maparg("<Right>", "n", false, true).callback()
-  assert(enabled and require("forge.infra.perf").enabled("harness"))
+  assert(configured_session.plan_auto_approve_revisions == false)
   vim.fn.maparg("<Left>", "n", false, true).callback()
+  assert(configured_session.plan_auto_approve_revisions == true)
+  local logging = instance.spec.page_list[1].option_list[2]
+  instance.spec.action_list[1].callback({ option = logging })
+  assert(enabled and require("forge.infra.perf").enabled("harness"))
+  instance.spec.action_list[1].callback({ option = logging })
   assert(not enabled and not require("forge.infra.perf").enabled("harness"))
-  assert(#instance.spec.page_list[1].option_list == 2)
-  local provider = instance.spec.page_list[1].option_list[2]
+  assert(#instance.spec.page_list[1].option_list == 3)
+  local provider = instance.spec.page_list[1].option_list[3]
   assert(provider.id == "provider" and provider.columns[2] == "Codex CLI")
   instance.spec.action_list[1].callback({ option = provider })
   assert(not enabled and picker.is_open("harness-config"), "Left opened the provider picker")

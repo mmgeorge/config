@@ -17,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 32;
+const SESSION_FORMAT_VERSION: u32 = 34;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -403,6 +403,25 @@ impl SqliteStore {
             "SELECT payload FROM exchange_comment WHERE interaction_id=?1 ORDER BY rowid",
             [exchange_id],
         )
+    }
+
+    /// Commit execution state, its goal, and an optional accepted revision together.
+    pub fn save_execution_transition(&mut self, execution: &PlanExecutionRecord, goal: &GoalRecord, plan: Option<&PlanRecord>) -> Result<()> {
+        let mut execution_payload = serde_json::to_value(execution)?;
+        execution_payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+        let mut rows = vec![("plan_execution_record", execution.id.as_str(), execution_payload),
+            ("goal_record", goal.id.as_str(), serde_json::to_value(goal)?)];
+        if let Some(plan) = plan {
+            let mut payload = serde_json::to_value(plan)?;
+            payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+            rows.push(("plan_record", plan.id.as_str(), payload));
+        }
+        let transaction = self.connection.transaction()?;
+        for (table, id, payload) in rows {
+            transaction.execute(&format!("INSERT INTO {table}(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload"), params![id,execution.session_id,encode(&payload)?])?;
+        }
+        transaction.commit()?;
+        Ok(())
     }
 
     /// Commit an approved scope change and its reconciled scheduler together.
@@ -941,6 +960,7 @@ mod test {
             effort: "medium".into(),
             plan_executor: Default::default(),
             plan_compact: false,
+            plan_auto_approve_revisions: true,
             context_window: None,
             fast_mode: false,
             execution_mode: crate::session::ExecutionMode::Read,
@@ -1235,6 +1255,7 @@ mod test {
             fast_mode: true,
             plan_executor: Default::default(),
             plan_compact: false,
+            plan_auto_approve_revisions: true,
         };
         store
             .save_preference("D:/work", "codex", &preference)

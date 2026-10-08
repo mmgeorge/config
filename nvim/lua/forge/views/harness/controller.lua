@@ -650,12 +650,13 @@ local function on_event(event, payload)
     synchronize_state()
   elseif event == "goal_changed" or event == "goal_continue_requested" then
     state.goal = payload.state ~= "cleared" and payload or nil
-    if state.goal_execution then
+    if event == "goal_continue_requested" then
+      synchronize_state(M.drain)
+    elseif state.goal_execution then
       synchronize_state()
     else
       M.refresh_winbar()
     end
-    if event == "goal_continue_requested" then vim.schedule(M.drain) end
   elseif event == "context_compacted" then
     synchronize_state()
   elseif event == "session_fork_ready" or event == "session_fork_failed" then

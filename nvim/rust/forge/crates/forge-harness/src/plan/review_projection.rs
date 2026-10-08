@@ -23,7 +23,20 @@ pub(crate) fn project(
     if source.document.design.is_some() {
         let started = Instant::now();
         let result = super::design_review::project(&source.document,width,annotation,revision,focused,&source.declaration_syntax,source.public_only,source.trace.as_ref(),&source.revealed)
-            .and_then(|(block, mut target)| {
+            .and_then(|(mut block, mut target)| {
+                if let Some(review) = &source.execution_review {
+                    let (heading, body) = review.split_once('\n').unwrap_or((review, ""));
+                    let mut heading = MarkdownRenderer::source(BlockId("plan:execution:heading".into()), heading, width)?.block;
+                    let report = MarkdownRenderer::source(BlockId("plan:execution:report".into()), body, width)?.block;
+                    heading.metadata.fold.push(FoldRange {
+                        collapsed_suffix: Some(" …".into()), heading_start: None,
+                        collapse_children: false, expand_children: false,
+                        id: FoldId("plan:execution:report".into()), start: TextPosition { row: 0, column: 0 },
+                        end: BlockAnchor { block: report.id.clone(), position: TextPosition { row: report.text.row_count(), column: 0 } }, closed: true,
+                    });
+                    block.push(heading);
+                    block.push(report);
+                }
                 let block = forge_buffer::collapse::project(block, &source.collapse)?;
                 let visible: std::collections::HashSet<_> = block.iter().flat_map(|block| &block.metadata.target).map(|target| &target.id).collect();
                 target.retain(|id, _| visible.contains(id));

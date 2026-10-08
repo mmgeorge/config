@@ -37,6 +37,8 @@ pub(crate) mod review_document;
 mod review_projection;
 pub(crate) mod review_source;
 mod scheduler;
+pub(crate) mod execution;
+pub use execution::{PlanExecutionState, PlanExecutionRecord, PlanExecutionLifecycleEvent, PlanExecutionLifecycleRecord, PlanPhase};
 pub mod state_machine;
 mod validation;
 
@@ -56,7 +58,7 @@ pub use edit::{
     apply_plan_mutation,
 };
 pub use graph::{PlanGraph, ResolvedPlanEntity};
-pub use prompt::{PlanExecutionPromptKind, PlanPrompt, execution_prompt};
+pub use prompt::{PlanExecutionPromptKind, PlanPrompt};
 pub use render::{
     PlanNavigationAnchor, PlanNavigationIndex, PlanReviewReferenceKind, PlanReviewTarget,
     PlanSection, RenderedPlan, render_plan, render_plan_at, render_plan_delta,
@@ -662,120 +664,6 @@ fn default_allow_freeform() -> bool {
     true
 }
 
-/// Defines terminal and nonterminal states for one accepted plan execution.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum PlanExecutionState {
-    Active,
-    Complete,
-    Paused,
-    Stalled,
-    Blocked,
-    Cancelled,
-}
-
-/// Defines one scheduler-owned event in an accepted plan execution.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum PlanExecutionLifecycleEvent {
-    TaskStarted {
-        task_path: String,
-        ordinal: usize,
-        total: usize,
-        title: String,
-    },
-    TaskCompleted {
-        task_path: String,
-        ordinal: usize,
-        total: usize,
-        title: String,
-        elapsed_ms: i64,
-    },
-    DeviationRecorded {
-        deviation_id: String,
-        summary: String,
-    },
-}
-
-/// Tracks one causally ordered scheduler event for timeline projection.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanExecutionLifecycleRecord {
-    #[serde(default)]
-    pub anchor: Option<ExchangeAnchor>,
-    pub sequence: u64,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub after_exchange_id: Option<String>,
-    pub occurred_at_ms: i64,
-    #[serde(flatten)]
-    pub event: PlanExecutionLifecycleEvent,
-}
-
-/// Tracks one accepted plan through its guarded execution goal.
-#[derive(Clone, Debug, Deserialize, Serialize)]
-pub struct PlanExecutionRecord {
-    pub id: String,
-    pub session_id: String,
-    pub plan_id: String,
-    pub goal_id: String,
-    pub state: PlanExecutionState,
-    #[serde(default)]
-    pub planning_backend_session_id: Option<String>,
-    #[serde(default)]
-    pub execution_backend_session_id: Option<String>,
-    #[serde(default)]
-    pub scheduler: PlanScheduler,
-    #[serde(default)]
-    pub lifecycle: Vec<PlanExecutionLifecycleRecord>,
-    pub created_at_ms: i64,
-    pub completed_at_ms: Option<i64>,
-}
-
-impl PlanExecutionRecord {
-    /// Sum owning provider execution within a task, excluding gaps between turns.
-    pub(crate) fn task_duration_ms<'a>(
-        &self,
-        task_path: &str,
-        exchanges: impl Iterator<Item = &'a crate::exchange::Exchange>,
-        end_ms: i64,
-    ) -> i64 {
-        let Some(start_ms) = self
-            .scheduler
-            .task
-            .iter()
-            .find(|task| task.task_path == task_path)
-            .and_then(|task| task.started_at_ms)
-        else {
-            return 0;
-        };
-        exchanges
-            .filter(|exchange| exchange.execution_id.as_deref() == Some(self.id.as_str()))
-            .flat_map(|exchange| &exchange.turn)
-            .fold(0i64, |duration, turn| {
-                duration.saturating_add(turn.duration_between(start_ms, end_ms))
-            })
-    }
-
-    /// Append one durable scheduler event at its causal exchange position.
-    pub fn append_lifecycle(
-        &mut self,
-        anchor: ExchangeAnchor,
-        occurred_at_ms: i64,
-        event: PlanExecutionLifecycleEvent,
-    ) {
-        let sequence = self
-            .lifecycle
-            .last()
-            .map_or(1, |record| record.sequence.saturating_add(1));
-        self.lifecycle.push(PlanExecutionLifecycleRecord {
-            anchor: Some(anchor),
-            sequence,
-            after_exchange_id: None,
-            occurred_at_ms,
-            event,
-        });
-    }
-}
-
 /// Describes one plan artifact for the Harness picker and winbar.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ArtifactSummary {
@@ -841,6 +729,18 @@ impl PlanFileStore {
     }
 
     /// Write the structurally valid working draft without rendering it.
+    /// Restore the accepted working view without overwriting any submitted revision.
+    pub(crate) fn restore_revision(&self, session_id: &str, plan_id: &str, revision: u32) -> Result<PlanDocument> {
+        let document = self.read_submitted_document(session_id, plan_id, revision)?;
+        let directory = self.plan_dir(session_id, plan_id);
+        for extension in ["md", "index.json"] {
+            let source = directory.join("revisions").join(format!("submitted-{revision:04}.{extension}"));
+            write_bytes_atomically(&directory.join(format!("working.{extension}")), &fs::read(source)?)?;
+        }
+        self.write_working_document(session_id, plan_id, &document)?;
+        Ok(document)
+    }
+
     /// Preserve incomplete construction until submission validates the whole plan.
     pub fn write_working_document(
         &self,
@@ -979,6 +879,19 @@ impl PlanFileStore {
             }
             design.validation.as_ref().unwrap().ensure_valid()?;
         }
+        self.persist_revision(session_id, plan_id, revision, document)
+    }
+
+    /// Freeze a validated execution revision without requiring unchanged original sources.
+    pub(crate) fn submit_execution_revision(&self, session_id: &str, plan_id: &str, revision: u32, mut document: PlanDocument) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let current = self.read_working_document(session_id, plan_id)?;
+        anyhow::ensure!(current.version == document.version && document.plan_id == plan_id, "execution revision changed before submission");
+        let design = document.design.as_ref().context("execution revision requires semantic design")?.formatted()?;
+        comment_lint::validate(&design)?;
+        usage::validate(&design, &self.workspace)?;
+        design.validation.as_ref().context("execution revision has no validation evidence")?.ensure_valid()?;
+        document.design = Some(design);
+        document.validate_for_submission()?;
         self.persist_revision(session_id, plan_id, revision, document)
     }
 

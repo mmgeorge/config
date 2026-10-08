@@ -364,8 +364,7 @@ mod test {
         agent::{Agent, AgentState},
         exchange::{Exchange, ExchangeKind, ExchangeState},
         plan::{
-            PlanExecutionLifecycleEvent, PlanExecutionLifecycleRecord, PlanExecutionRecord,
-            PlanExecutionState, PlanFileStore, PlanScheduler,
+            PlanFileStore,
         },
     };
 
@@ -619,71 +618,6 @@ mod test {
         }
     }
 
-    #[test]
-    fn projects_task_duration_from_provider_intervals_without_waiting() {
-        let document = crate::plan::test_fixture("plan", "Overview");
-        let mut scheduler = PlanScheduler::activate(&document);
-        scheduler.next_task(&document, 20).unwrap();
-        let execution = PlanExecutionRecord {
-            id: "execution".into(),
-            session_id: "session".into(),
-            plan_id: "plan".into(),
-            goal_id: "goal".into(),
-            state: PlanExecutionState::Complete,
-            planning_backend_session_id: None,
-            execution_backend_session_id: None,
-            scheduler,
-            lifecycle: vec![PlanExecutionLifecycleRecord {
-                    anchor: None,
-                sequence: 1,
-                after_exchange_id: Some("second".into()),
-                occurred_at_ms: 120,
-                event: PlanExecutionLifecycleEvent::TaskCompleted {
-                    task_path: "/stages/0/tasks/0".into(),
-                    ordinal: 1,
-                    total: 1,
-                    title: "Task".into(),
-                    elapsed_ms: 100,
-                },
-            }],
-            created_at_ms: 20,
-            completed_at_ms: Some(120),
-        };
-        let mut exchanges = Vec::new();
-        for (id, owner, start, end) in [
-            ("first", "execution", 10, 30),
-            ("second", "execution", 100, 130),
-            ("unrelated", "other", 20, 120),
-        ] {
-            let mut exchange = interaction(id);
-            exchange.execution_id = Some(owner.into());
-            let mut turn = crate::turn::Turn::new(
-                id.into(),
-                crate::backend::ProviderAddress {
-                    thread_id: "thread".into(),
-                    turn_id: id.into(),
-                },
-                start,
-            );
-            turn.finish(crate::turn::TurnOutcome::Completed, end)
-                .unwrap();
-            exchange.turn.push(turn);
-            exchanges.push(exchange);
-        }
-        assert_eq!(
-            execution.task_duration_ms("/stages/0/tasks/0", exchanges.iter(), 120),
-            30
-        );
-        assert_eq!(
-            execution.task_duration_ms("/stages/0/tasks/0", exchanges.iter(), 5),
-            0
-        );
-        super::planning::attach(&mut exchanges, &[], Vec::new(), vec![execution], Vec::new(), &[], &[]);
-        assert!(exchanges.iter().flat_map(|exchange| &exchange.node_list).any(|node| matches!(node,
-            crate::exchange::ExchangeNode::PlanEvent { event }
-            if matches!(&event.content, crate::plan::PlanEventContent::Execution {
-                event: PlanExecutionLifecycleEvent::TaskCompleted { elapsed_ms: 30, .. }
-            }))));
-    }
+
 
 }

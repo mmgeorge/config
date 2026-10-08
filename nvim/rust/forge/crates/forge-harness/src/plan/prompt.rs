@@ -1,5 +1,3 @@
-use super::document::{PlanDocument, PlanSubtask, PlanTask};
-use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 /// Builds the Harness-owned planning and revision contracts.
@@ -13,52 +11,6 @@ pub enum PlanExecutionPromptKind {
     Start,
     Continue,
     ResumeAfterInterruption,
-}
-
-/// Build one scheduler-aware accepted-plan execution prompt.
-pub fn execution_prompt(
-    kind: PlanExecutionPromptKind,
-    execution_id: &str,
-    active_task: Option<&PlanTask>,
-    document: &PlanDocument,
-) -> Result<String> {
-    let boundary = match kind {
-        PlanExecutionPromptKind::Start => "Begin accepted-plan execution.",
-        PlanExecutionPromptKind::Continue => "Continue accepted-plan execution.",
-        PlanExecutionPromptKind::ResumeAfterInterruption => {
-            "Resume accepted-plan execution after an interruption. Preserve completed workspace changes and evidence. Do not repeat finished actions. Continue the same active task."
-        }
-    };
-    let active_entity_name = active_task
-        .into_iter()
-        .flat_map(|task| &task.files)
-        .flat_map(|file| &file.subtasks)
-        .flat_map(PlanSubtask::owned_entities)
-        .collect::<std::collections::HashSet<_>>();
-    let active_entity_change = document
-        .entity_changes
-        .iter()
-        .filter(|entity| active_entity_name.contains(&entity.name))
-        .collect::<Vec<_>>();
-    let active_work = serde_json::json!({
-        "task_id": active_task.map(|task| &task.id),
-        "plan_version": document.version,
-        "label": active_task.and_then(|task| document.task_label(&task.id)),
-        "task_path": active_task.and_then(|task| document.task_by_id(&task.id).map(|(path, _)| path)),
-        "stage": active_task.and_then(|task| document.stages.iter().find(|stage| stage.tasks.iter().any(|child| child.id == task.id))).map(|stage| serde_json::json!({"id": stage.id, "title": stage.title})),
-        "task": active_task,
-        "entity_changes": active_entity_change,
-    });
-    let recovery = if active_task.is_some() {
-        " The active task remains unfinished in Harness's persisted scheduler. If its workspace work and tests already finished, reuse that evidence and submit a fresh harness_plan_task_report for this task. A previous tool acknowledgment or final answer does not replace the persisted task state."
-    } else {
-        ""
-    };
-    Ok(format!(
-        "{boundary} Execution ID: {execution_id}.{recovery} Complete the active whole task before calling harness_plan_task_report with the active task_id, current plan_version, and detailed subtask, entity, path, and test evidence. A stage completes only when all its lettered tasks have persisted completion. Execute only the selected task even when its siblings are independent. Address tasks, subtasks, entities, and tests by their JSON pointer paths in this exact plan version. Call harness_plan_deviation before departing from accepted intent. Call harness_goal_complete only after the scheduler has no incomplete tasks.\n\nActive task:\n```json\n{}\n```\n\nEffective declaration design:\n```json\n{}\n```",
-        serde_json::to_string_pretty(&active_work)?,
-        serde_json::to_string_pretty(document)?,
-    ))
 }
 
 impl PlanPrompt {
@@ -187,7 +139,7 @@ User follow-up:
 
 #[cfg(test)]
 mod test {
-    use super::{PLANNING_CONTRACT, PlanExecutionPromptKind, PlanPrompt, execution_prompt};
+    use super::{PLANNING_CONTRACT, PlanPrompt};
 
     #[test]
     fn planning_modes_include_the_same_complete_contract_and_current_context() {
@@ -275,33 +227,4 @@ mod test {
         assert!(prompt.contains("harness_question_answer"));
     }
 
-    #[test]
-    fn execution_prompt_reanchors_start_and_resume_to_the_active_task() {
-        let document = super::super::document::test_fixture("plan", "Overview");
-        let task = &document.stages[0].tasks[0];
-        let start = execution_prompt(
-            PlanExecutionPromptKind::Start,
-            "execution",
-            Some(task),
-            &document,
-        )
-        .unwrap();
-        assert!(start.contains("Begin accepted-plan execution"));
-        assert!(start.contains(&task.title));
-
-        let resumed = execution_prompt(
-            PlanExecutionPromptKind::ResumeAfterInterruption,
-            "execution",
-            Some(task),
-            &document,
-        )
-        .unwrap();
-        assert!(resumed.contains("Preserve completed workspace changes"));
-        assert!(resumed.contains("Do not repeat finished actions"));
-        assert!(resumed.contains("Continue the same active task"));
-        assert!(resumed.contains("unfinished in Harness's persisted scheduler"));
-        assert!(resumed.contains("reuse that evidence and submit a fresh harness_plan_task_report"));
-        let settled = execution_prompt(PlanExecutionPromptKind::Continue, "execution", None, &document).unwrap();
-        assert!(!settled.contains("unfinished in Harness's persisted scheduler"));
-    }
 }

@@ -1,7 +1,6 @@
 use crate::backend::{BackendOutput, PlanSubmitRequest};
 use crate::plan::{
-    PlanDeviationRequest, PlanEditRequest, PlanQuestionAnswer, PlanQuestionSet,
-    PlanQuestionWithdrawal, PlanTaskReport,
+    PlanQuestionAnswer, PlanQuestionSet, PlanQuestionWithdrawal,
 };
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
@@ -67,12 +66,12 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "harness_design_apply_patch",
-                description: "Atomically edit proposed declaration overview files, complete JSON/JSONC, TOML, YAML, and XML manifests/configuration, and the virtual plan.json containing task and description. Use the familiar *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax. Paths are project-relative virtual overview paths. Read affected lines with harness_plan_read when their exact current text or version is unavailable. Never copy the read response's line-number prefixes into the patch. Source functions contain signatures only, never bodies. Configuration retains complete values, including required Cargo.toml and package.json changes. Returns the new design version and a compact applied diff, capped at 16 KiB. Use that confirmation instead of rereading unchanged files. Nonempty plan.json task and description fields are required before submission. Task states the requested outcome. Description explains the proposed design for a reviewer. plan.json already exists and accepts Update File only. New plans start without captured files. The first successful Update, Delete, or Move captures that source baseline. Add requires an absent workspace destination. Optional source_digests maps inspected paths to source hashes for stale-read checks across turns. Optional title names the design.",
+                description: "Atomically edit proposed declaration overview files, complete JSON/JSONC, TOML, YAML, and XML manifests/configuration, and the virtual plan.json containing task, description, and validation. validation.automated is a newline-separated command string, one command per nonblank line without Markdown. validation.manual is a Markdown list of manual checks, one item per line. Both strings can be empty when no checks apply. Use the familiar *** Begin Patch / Add File / Update File / Delete File / Move to / @@ syntax. Paths are project-relative virtual overview paths. Read affected lines with harness_plan_read when their exact current text or version is unavailable. Never copy the read response's line-number prefixes into the patch. Source functions contain signatures only, never bodies. Configuration retains complete values, including required Cargo.toml and package.json changes. Returns the new design version and a compact applied diff, capped at 16 KiB. Use that confirmation instead of rereading unchanged files. Nonempty plan.json task and description fields are required before submission. Task states the requested outcome. Description explains the proposed design for a reviewer. plan.json already exists and accepts Update File only. New plans start without captured files. The first successful Update, Delete, or Move captures that source baseline. Add requires an absent workspace destination. Optional source_digests maps inspected paths to source hashes for stale-read checks across turns. Optional title names the design.",
                 input_schema: strict_object_input_schema(vec![("plan_id",string_schema()),("expected_version",json!({"type":"integer","minimum":1})),("patch",string_schema()),("title",string_schema()),("source_digests",json!({"type":"object","additionalProperties":{"type":"string"}}))], &["plan_id","expected_version","patch"]),
             },
             ControlToolDefinition {
                 name: "harness_plan_read",
-                description: "List captured/proposed declaration and configuration paths and plan.json, or read one file as plain text with 1-based line numbers and the active version. Optional start_line and end_line select an inclusive range and require path. Omitted bounds select the beginning or end of the file. Line-number prefixes are presentation only, omit them from patches. plan.json contains task and description and has no baseline. Omit path for the inventory. Set baseline true to inspect immutable current-code declarations or complete configuration. For an uncaptured path, extracts only that workspace file and returns its source digest without saving a baseline or changing the version. Read existing files before editing them. Does not return implementation bodies.",
+                description: "List captured/proposed declaration and configuration paths and plan.json, or read one file as plain text with 1-based line numbers and the active version. Optional start_line and end_line select an inclusive range and require path. Omitted bounds select the beginning or end of the file. Line-number prefixes are presentation only, omit them from patches. plan.json contains task, description, and validation requirements (automated commands and manual checks) and has no baseline. Omit path for the inventory. Set baseline true to inspect immutable current-code declarations or complete configuration. For an uncaptured path, extracts only that workspace file and returns its source digest without saving a baseline or changing the version. Read existing files before editing them. Does not return implementation bodies.",
                 input_schema: strict_object_input_schema(
                     vec![("plan_id", string_schema()),("path",string_schema()),("baseline",json!({"type":"boolean"})),("start_line",json!({"type":"integer","minimum":1})),("end_line",json!({"type":"integer","minimum":1}))],
                     &["plan_id"],
@@ -80,10 +79,11 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "harness_plan_submit",
-                description: "Format and submit the exact canonical declaration design for user review. Automatically validate Rust and TypeScript imports and signature references against the proposed declarations and available sources. Proven invalid references return actionable errors and remain editable. Unavailable or unsupported evidence remains in saved diagnostics and permits submission. Success returns acceptance and the current version without a warning dump. No implementation build or second model review runs.",
+                description: "Format and submit the exact canonical declaration design for user review. Automatically validate Rust and TypeScript imports and signature references against the proposed declarations and available sources. Proven invalid references return actionable errors and remain editable. Unavailable or unsupported evidence remains in saved diagnostics and permits submission. Success returns acceptance and the current version without a warning dump. No implementation build or second model review runs. During execution, reason is required and explains the necessary deviation. Forge accepts the new revision automatically unless the user disabled Auto-approve plan revisions in /config. End the turn after successful execution revision submission.",
                 input_schema: strict_object_input_schema(
                     vec![
                         ("plan_id", string_schema()),
+                        ("reason", string_schema()),
                         (
                             "expected_version",
                             json!({ "type": "integer", "minimum": 1 }),
@@ -91,6 +91,21 @@ impl ControlToolRegistry {
                     ],
                     &["plan_id", "expected_version"],
                 ),
+            },
+            ControlToolDefinition {
+                name: "harness_plan_phase_done",
+                description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. Forge validates the expected phase and revision, runs semantic gates, commits the transition, and returns the next instructions. End the turn after success. Semantic mismatches return errors: prefer correcting the implementation, or submit a justified revision. Verify requires an agent assessment and exact completed tool-call IDs in verification.evidence. After running checks, call harness_plan_read with only plan_id to obtain execution.verification_evidence IDs and output previews. Passed cannot bypass semantic conformance. Failed enters Resolve. Blocked preserves Verify.",
+                input_schema: strict_object_input_schema(vec![
+                    ("phase", json!({"type":"string","enum":["implement","verify","resolve"]})),
+                    ("revision", json!({"type":"integer","minimum":1})),
+                    ("summary", string_schema()),
+                    ("verification", strict_object_input_schema(vec![
+                        ("outcome", json!({"type":"string","enum":["passed","failed","blocked"]})),
+                        ("evidence", json!({"type":"array","description":"Exact completed tool-call IDs from harness_plan_read execution.verification_evidence", "items":{"type":"string"}})),
+                        ("findings", json!({"type":"array","items":{"type":"string"}})),
+                        ("reason", string_schema()), ("reuse_reason", string_schema())
+                    ], &["outcome"]))
+                ], &["phase","revision","summary"]),
             },
             ControlToolDefinition {
                 name: "harness_question_ask",
@@ -169,12 +184,6 @@ pub fn apply_invocation(
             output.design_patch.push(decode_arguments::<crate::plan::DesignPatchRequest>(invocation)?);
             output.structured_plan = true;
         }
-        "harness_plan_edit" => {
-            output
-                .plan_edit
-                .push(decode_arguments::<PlanEditRequest>(invocation)?);
-            output.structured_plan = true;
-        }
         "harness_plan_read" => {
             output.plan_read = invocation
                 .arguments
@@ -185,18 +194,6 @@ pub fn apply_invocation(
         }
         "harness_plan_submit" => {
             output.plan_submit = Some(decode_arguments::<PlanSubmitRequest>(invocation)?);
-            output.structured_plan = true;
-        }
-        "harness_plan_deviation" => {
-            output
-                .plan_deviation
-                .push(decode_arguments::<PlanDeviationRequest>(invocation)?);
-            output.structured_plan = true;
-        }
-        "harness_plan_task_report" => {
-            output
-                .plan_task_report
-                .push(decode_arguments::<PlanTaskReport>(invocation)?);
             output.structured_plan = true;
         }
         "harness_question_ask" => {
@@ -210,6 +207,7 @@ pub fn apply_invocation(
             output.question_withdrawal =
                 Some(decode_arguments::<PlanQuestionWithdrawal>(invocation)?);
         }
+        "harness_plan_phase_done" => {},
         "harness_goal_complete" => output.evidence.structured_complete = true,
         "harness_goal_blocked" => output.evidence.structured_blocked = true,
         "harness_goal_status" => output.evidence.tool_called = true,

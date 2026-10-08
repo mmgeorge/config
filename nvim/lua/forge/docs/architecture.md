@@ -1550,7 +1550,7 @@ press the commit key
 
 **Design and review through Harness**
 
-Planning captures an immutable declaration baseline. Approval records the reviewed design and does not start implementation.
+Planning captures an immutable declaration baseline. Approval records the reviewed design, creates its execution goal, and starts the Implement phase.
 
 ```
 :ForgeHarness -> multiline composer -> /plan <request>
@@ -1562,7 +1562,8 @@ Planning captures an immutable declaration baseline. Approval records the review
   -> PlanReview displays the shared native file and hunk diff
        -> Enter opens a declaration snapshot and C adds a line comment
        -> oN sends inline comments and overall feedback for revision
-       -> oY approves the exact saved design without creating an execution goal
+       -> oY approves the saved design and selects execution authorization
+       -> Implement -> Verify -> completion, or Verify -> Resolve -> Verify
 ```
 
 **Persist goals without hiding user prompts**
@@ -2096,7 +2097,13 @@ baseline and proposed positions, with proposed positions owning ordinary row act
 folds start open. PlanReview, ForgeStatus hunks, and Harness changes use the shared
 header-fold constructor. A closed file shows only its file header, and a closed hunk
 shows only its hunk header. PlanReview toggles headers through the shared Lua fold engine.
-The declaration design also owns a virtual `plan.json` with model-authored `task` and `description`.
+The declaration design also owns a virtual `plan.json` with model-authored `task`, `description`,
+and `validation`. Validation contains `automated` and `manual` strings. Each nonblank Automated
+line is a separate command, executed in listed order from the project workspace through normal
+agent tools and permissions. Manual contains a Markdown list of actions and expected results.
+Either field can be empty when no checks of that kind apply. Verify instructions require results
+for these checks and a blocked outcome when a required check cannot be performed. Saved requirements
+remain separate from semantic validation diagnostics and recorded verification results.
 Task states the requested outcome and scope. Description explains the proposed design for a reviewer,
 including responsibility boundaries and important lifecycle behavior, rather than inventorying changes.
 Planning prompts require an attached explanatory comment on every declaration in authored or revised
@@ -2106,8 +2113,10 @@ ownership, domain meaning, and behavioral contracts without implementation bodie
 attributes, parameters, and configuration entries do not require individual declaration comments.
 The read tool lists it alongside declaration paths. The patch tool edits these fields and
 declaration files atomically at one optimistic version, while source baselines and workspace checks
-exclude plan metadata. Submission requires both fields to be nonempty, with at most 16 KiB per field.
-Review renders the task, description, and declaration diff under `Task:`, `Description:`, and `Changes:`. All
+exclude plan metadata. Submission requires Task and Description to be nonempty. Each metadata string
+has a 16 KiB limit. Review renders `Task:`, `Description:`, `Validation:`, and `Changes:`. Validation
+contains independently foldable `Automated:` and `Manual:` subsections. Automated preserves literal
+command text and Manual supports Markdown list styling. All
 sections start expanded and use the shared fold-header constructor and native Tab behavior, with
 independent file and hunk folds below Changes. Section endpoints include wrapped text and comments.
 Task and Description retain their complete saved source rows. Neovim owns soft word wrapping in
@@ -2335,10 +2344,77 @@ use the selected revision's stored relationships. Unchanged referenced files par
 existing dependency order and render as context hunks. Their rows have no canonical annotation
 source line, and including them preserves the saved source positions of changed files.
 
-Acceptance records the reviewed digest and revision and restores the session's ordinary mode. It
-creates no goal, executor, compaction request, or scheduler. The configuration picker omits the former
-Plan Executor and Plan Compact controls. Dependency navigation, implementation scheduling, and
-parallel execution remain outside this MVP.
+Acceptance records the reviewed digest and starts one Harness-owned execution goal. The accepted
+semantic design describes the complete target. Forge does not divide it into execution tasks or
+steps. The agent selects its implementation order. Parallel execution is not enabled.
+
+`plan::execution` owns phase validation and semantic comparison. `broker::execution` owns workspace
+observations, evidence admission, revision decisions, persistence, and continuation. The execution
+record retains the original approved revision, current accepted revision, phase, suspension state,
+verification assessments, revision reasons, source hashes, and lifecycle positions. Submitted
+revision files remain immutable. Session format 33 replaces the legacy task execution records.
+Older session formats are excluded from the current session catalog.
+
+Semantic comparison preserves target multiplicity and order within the editable Calls and Accesses
+groups. It does not impose cross-group source interleaving or finer reference kinds that the
+editable design cannot express.
+
+`harness_plan_phase_done` takes `phase`, `revision`, and `summary`. In Verify it also takes a
+`verification` object with `outcome`, `evidence`, `findings`, and optional `reason` and `reuse_reason`.
+Evidence references must identify completed or failed tool calls in this execution. Forge validates
+those references. The agent assesses whether build, test, or manual verification established the
+requested behavior. Forge does not interpret arbitrary command output as a universal test protocol.
+During execution, `harness_plan_read` without a file path also returns current phase, semantic
+progress, and the newest 32 completed tool results with exact evidence IDs, titles, and bounded
+output previews. This read does not advance the state machine. The agent uses these IDs when
+submitting its verification assessment.
+
+| Current phase | Completion request | Committed result |
+| --- | --- | --- |
+| Implement | The fresh semantic comparison passes. | Forge enters Verify. |
+| Implement or Resolve | The comparison finds missing, different, or unverified targets. | Forge returns an error and preserves the phase. |
+| Resolve | The fresh semantic comparison passes. | Forge returns to Verify. |
+| Verify | The agent reports passed with evidence and no findings, and the semantic comparison passes. | Forge completes the execution and goal together. |
+| Verify | The agent reports failed with findings, or reports passed while semantic differences remain. | Forge enters Resolve and retains the findings. |
+| Verify | The agent reports blocked with a reason. | Forge blocks execution and preserves Verify for explicit resume. |
+
+Comparison checks fresh declaration projections, supported configuration contents, planned call
+relationships, deletions, and supported source changes outside the approved file set. It compares
+against the execution's initial repository checkpoint, so preexisting workspace edits do not become
+execution deviations. Workspaces without a repository checkpoint retain an explicit warning that workspace-wide deviation
+detection is unavailable. Unsupported analysis remains explicit. Semantic conformance does not prove
+behavioral correctness. After Resolve, the agent selects affected checks to rerun and supplies a
+reason when it reuses previous verification evidence.
+
+Successful phase and revision controls return the committed phase, state, revision, generation,
+findings, and next instructions. Provider adapters end that turn after delivering the response.
+Forge then continues from persisted state. Generation checks reject stale requests. Repeated
+successful calls within the same control runtime return the original result without advancing again.
+The broker commits execution, goal, and plan metadata in one SQLite transaction. The active plan's
+completion cannot be bypassed through `harness_goal_complete`.
+
+Semantic mismatches instruct the agent to correct implementation first. Necessary design changes
+use the existing `harness_design_apply_patch` and `harness_plan_submit` tools. Submission requires a
+reason during execution. `/config` exposes **Auto-approve plan revisions**, enabled by default.
+Disabling it pauses for the existing PlanReview. Approval changes the target, rejection restores the
+last accepted design, and requested changes retain the pending draft for revision. A separate user
+pause prevents review decisions from restarting execution. The original approved revision remains
+available alongside the current accepted revision and their complete diff.
+When recovery has finalized the exchange that requested review, continuation creates a new
+execution exchange linked to the same plan and goal. It never reopens a completed exchange.
+
+Forge scans planned files at five-second intervals while a provider turn runs. It places phase and
+matched, missing, different, and unverified counts in the existing Working status row. PlanReview
+contains a folded execution report with file findings, verification references, revision decisions,
+and the original-to-current comparison. The timeline retains compact lifecycle events, normal tool
+calls, and native snapshot diffs. Completion records the original-to-implemented revision diff.
+
+An ordinary end of a provider turn does not complete a phase. Forge continues the same phase and
+counts source changes, accepted transitions, and distinct verification command results as progress.
+Reads and repeated identical checks do not reset the guard. Two consecutive turns without progress
+or the configured total-turn limit stop automatic continuation. The default limit is twenty turns.
+Interrupt, pause, and detached-host recovery retain the phase and existing source changes.
+`/goal resume` explicitly resumes the same execution and resets its continuation budget.
 
 Repository-independent prompt history stays ordered newest first and pruned transactionally to
 100 entries. Every broker snapshot carries that shared list, while
@@ -2428,6 +2504,10 @@ Codex publishes every tool lifecycle update to the owning turn. Tool records mer
 provider address and call ID, never by tool name or arguments. Repeating a control call with
 the same arguments creates a separate lifetime. Replayed updates retain the original start
 and completion timestamps. Accepted control effects deduplicate by provider call identity.
+Catalog and background-terminal connections observe shared app-server broadcasts without
+answering provider requests. Only the connection owning the active turn responds to controls
+and approvals. An observer must not reject a broadcast, because its response can win the race
+against the owning connection. Phase completion without an execution control context fails.
 
 Exchange summaries retain native input, cached input, reasoning, and inclusive output counts
 on each owning `Turn`. Codex cumulative snapshots recover call increments after the first
@@ -2546,8 +2626,7 @@ cancels pending acceptance and restores plan-review status. Rust attaches one co
 replacement plan. Acceptance prevents an accepted write plan from inheriting Read authorization and
 blocking its first file change. It then emits
 `Plan accepted` inside the admitted execution exchange and creates the guarded
-`Complete accepted plan: <title>` goal. `PlanScheduler` timestamps each whole-task activation
-and successful report. Plan lifecycle, task transitions, deviations, and execution resolutions
+`Complete accepted plan: <title>` goal. Phase transitions, revision decisions, and suspension events
 retain an `ExchangeAnchor` containing the owning exchange ID and a boundary in its append-only
 source node sequence. `TimelineProjector` inserts their content as `ExchangeNode::PlanEvent`
 inside that exchange. The timeline has no separate plan lifecycle, execution, or resolution
@@ -2559,9 +2638,9 @@ the user input row. Review feedback retains annotations before revision executio
 failed revisions. Direct review renames remain visible as exchange-owned revision events.
 Records saved before anchors existed use a compatibility path scoped to the matching plan or
 execution. That path uses clarification input boundaries when available, but old provider content
-without item timestamps cannot recover every historical intra-turn position exactly. Cancellation pauses the execution without closing its active task. `/goal resume`
-reuses that task, the effective canonical plan, and an interruption-specific prompt that preserves
-completed workspace work.
+without item timestamps cannot recover every historical intra-turn position exactly. Cancellation
+pauses execution without changing its phase. `/goal resume` uses the effective canonical design,
+retained findings, and phase instructions while preserving completed workspace work.
 
 Codex background-terminal requests resume their owning thread on an independent connection.
 A newly created thread can become visible before its rollout metadata is written. For the
@@ -2902,7 +2981,7 @@ Timeline file headings request recursive expansion through the shared fold
 metadata. Opening a file reveals all of its hunks. Opening a change summary
 retains collapsed file headings, and individual hunks remain independently foldable.
 The transcript renders these deltas through the shared change tree, independently
-of the Task and Description delta. Overview revisions compare the plain prose
+of the Task, Description, and Validation delta. Metadata revisions compare the plain text
 of each section, omit unchanged sections, and retain paragraph breaks. Their
 navigation opens that section's immutable text rather than internal JSON.
 PlanReview continues to compare source with
@@ -3182,10 +3261,9 @@ without an additional wire object.
 
 Plan mutation uses a `ResourceSchema` descriptor for collection identity, semantic keys, renaming,
 and preparation. The descriptor keeps each resource's naming and identity rules together while
-the mutation algorithm still validates and applies the same ordered edits. Plan resolution accepts
-`PlanResolutionEvidence`, which borrows the scheduler, deviations, and audit used to derive the
-terminal summaries. Existing completion and pending-deviation checks remain in the resolution
-builder.
+the mutation algorithm still validates and applies the same ordered edits. Semantic execution
+accepts phase completion through its broker-owned control channel. Completion requires a fresh
+semantic comparison and a verification assessment with retained tool evidence.
 
 Wrapped plan lines accept their first-line and continuation prefixes as a pair. Entity rendering
 derives the entity from its document index instead of accepting a second independently supplied

@@ -285,10 +285,11 @@ impl CodexBackend {
     ) -> Result<(CodexJsonRpc, BackendOutput)> {
         let backend_request = Self::catalog_backend_request(request);
         let mut output = BackendOutput::default();
-        let process = self
+        let mut process = self
             .connect(&backend_request, &mut output, None)
             .await?
             .process;
+        process.set_activity_publication(false);
         Ok((process, output))
     }
 

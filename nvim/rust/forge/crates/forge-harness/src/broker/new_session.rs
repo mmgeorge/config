@@ -46,6 +46,7 @@ pub fn prepare_new_session(
         effort: preference.as_ref().map_or_else(|| source.effort.clone(), |value| value.effort.clone()),
         plan_executor: preference.as_ref().map_or(source.plan_executor, |value| value.plan_executor.clone()),
         plan_compact: preference.as_ref().map_or(source.plan_compact, |value| value.plan_compact),
+        plan_auto_approve_revisions: preference.as_ref().map_or(source.plan_auto_approve_revisions, |value| value.plan_auto_approve_revisions),
         context_window: preference.as_ref().and_then(|value| value.model_setting.get(&value.model))
             .and_then(|setting| setting.context_window.clone()).or(source.context_window),
         fast_mode: source.fast_mode,

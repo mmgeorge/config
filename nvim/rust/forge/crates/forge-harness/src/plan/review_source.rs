@@ -7,6 +7,7 @@ use std::path::Path;
 const SOURCE_CAPACITY: u64 = 8 * 1024 * 1024;
 
 pub(crate) struct PlanReviewSource {
+    pub execution_review: Option<String>,
     pub trace: Option<ReviewTrace>,
     pub resolver: std::sync::Arc<tokio::sync::OnceCell<std::sync::Mutex<(crate::declaration::DeclarationResolver, crate::declaration::DeclarationResolver)>>>,
     pub resolver_sources: std::sync::Arc<tokio::sync::OnceCell<()>>,
@@ -78,6 +79,7 @@ impl PlanFileStore {
         };
         Ok(PlanReviewSource {
             trace: None,
+            execution_review: None,
             resolver: Default::default(),
             resolver_sources: Default::default(),
             public_only: true,
@@ -147,6 +149,7 @@ impl PlanFileStore {
         };
         Ok(PlanReviewSource {
             trace: None,
+            execution_review: None,
             resolver: Default::default(),
             resolver_sources: Default::default(),
             public_only: true,

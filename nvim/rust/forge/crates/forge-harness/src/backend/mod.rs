@@ -704,7 +704,11 @@ impl Backend for MockBackend {
                     }
                 }
                 let metadata = serde_json::to_string_pretty(&design.document)?.lines().map(|line| format!("-{line}\n")).collect::<String>();
-                let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{metadata}+{{\n+  \"task\": \"Revise the registry interface.\",\n+  \"description\": \"Revise the registry interface while preserving its ownership boundary.\"\n+}}\n*** End Patch"));
+                let mut revised_metadata = design.document.clone();
+                revised_metadata.task = "Revise the registry interface.".into();
+                revised_metadata.description = "Revise the registry interface while preserving its ownership boundary.".into();
+                let added = serde_json::to_string_pretty(&revised_metadata)?.lines().map(|line| format!("+{line}\n")).collect::<String>();
+                let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{metadata}{added}*** End Patch"));
                 let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Design the requested change".into()),source_digests };
                 let proposed = document.patch_design(std::path::Path::new(&request.workspace), change.clone())?;
                 return Ok(BackendOutput {

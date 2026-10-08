@@ -41,6 +41,7 @@ end
 ---@param options? { indent?: integer, key_prefix?: string, interaction?: table, cwd?: string, on_update?: function, expanded?: table<string, boolean> } Rendering options table.
 ---@return ForgeRenderedTree tree Rendered tree data structure.
 function M.build(diff_text, options)
+  if diff_text == vim.NIL then diff_text = nil end
   options = options or {}
   local indent = options.indent or 0
   local expanded = options.expanded

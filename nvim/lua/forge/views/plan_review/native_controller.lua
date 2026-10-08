@@ -333,7 +333,11 @@ function M.open(plan)
   local recovery
   if previous and previous.plan.id == plan.id and previous.plan.review_digest == plan.review_digest
     and previous.plan.historical_revision == plan.historical_revision and vim.api.nvim_buf_is_valid(previous.buf) then
-    if previous.owner.generation == client.host_generation() and not previous.owner.closed and previous.owner.attached() then
+    local refresh_execution = plan.state == "accepted" and not vim.bo[previous.buf].modified
+    if refresh_execution and previous.owner.generation == client.host_generation() and previous.owner.attached() then
+      if not close_review(previous) then return end
+    end
+    if not refresh_execution and previous.owner.generation == client.host_generation() and not previous.owner.closed and previous.owner.attached() then
       local window = vim.fn.win_findbuf(previous.buf)[1]
       if window then vim.api.nvim_set_current_win(window) else vim.cmd("tabnew") vim.api.nvim_win_set_buf(0, previous.buf) end
       previous.win = vim.api.nvim_get_current_win()

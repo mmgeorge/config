@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use crate::exchange::{Exchange, ExchangeNode, InputIntent};
 use crate::plan::{
     ExchangeAnchor, ExchangePlanEvent, PlanAudit, PlanDeviation, PlanEventContent,
-    PlanExecutionLifecycleEvent, PlanExecutionRecord, PlanLifecycleKind, PlanLifecycleRecord,
+    PlanExecutionRecord, PlanLifecycleKind, PlanLifecycleRecord,
     PlanRecord, PlanResolutionRecord,
 };
 
@@ -53,16 +53,7 @@ pub(super) fn attach(
         }
     }
     for execution in executions {
-        for mut record in execution.lifecycle.clone() {
-            if let PlanExecutionLifecycleEvent::TaskCompleted {
-                task_path,
-                elapsed_ms,
-                ..
-            } = &mut record.event
-            {
-                *elapsed_ms =
-                    execution.task_duration_ms(task_path, exchanges.iter(), record.occurred_at_ms);
-            }
+        for record in execution.lifecycle.clone() {
             let anchor = record
                 .anchor
                 .or_else(|| {
@@ -466,7 +457,7 @@ mod tests {
     }
 
     #[test]
-    fn task_transitions_and_resolution_keep_their_position_before_later_input() {
+    fn execution_phases_keep_their_position_before_later_input() {
         let mut source = exchange();
         source
             .append_input(InputIntent::Steering, "Task one".into(), 2)
@@ -477,13 +468,16 @@ mod tests {
             .unwrap();
         let execution: PlanExecutionRecord = serde_json::from_value(json!({
             "id":"execution", "session_id":"session", "plan_id":"plan", "goal_id":"goal",
-            "state":"active", "created_at_ms":1, "lifecycle":[
+            "state":"active", "phase":"verify", "original_revision":1, "revision":1, "generation":2,
+            "baseline_checkpoint":null, "findings":[], "progress":{"matched":[],"missing":[],"different":[],"unverified":[],"warning":[],"source_digest":{}},
+            "verification":[], "revision_history":[], "pending_revision_reason":null, "review_paused":false,
+            "observed_source":{}, "observed_generation":0, "observed_check":[], "created_at_ms":1, "lifecycle":[
                 {"anchor":anchor, "sequence":1,"after_exchange_id":"exchange","occurred_at_ms":10,
-                 "kind":"task_completed","task_path":"/stages/0/tasks/0","ordinal":1,"total":2,"title":"First","elapsed_ms":0},
+                 "kind":"phase","phase":"verify","revision":1,"state":"active","title":"Ready for verification"},
                 {"anchor":anchor, "sequence":2,"after_exchange_id":"exchange","occurred_at_ms":10,
-                 "kind":"task_started","task_path":"/stages/0/tasks/1","ordinal":2,"total":2,"title":"Second"},
+                 "kind":"phase","phase":"resolve","revision":1,"state":"active","title":"Resolving verification findings"},
                 {"anchor":anchor, "sequence":3,"after_exchange_id":"exchange","occurred_at_ms":10,
-                 "kind":"deviation_recorded","deviation_id":"deviation","summary":"Scope decision"}
+                 "kind":"phase","phase":"verify","revision":1,"state":"complete","title":"Execution completed"}
             ]
         })).unwrap();
         let resolution: PlanResolutionRecord = serde_json::from_value(json!({

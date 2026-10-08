@@ -3,7 +3,7 @@
 Design the final interfaces and ownership structures required by the user's request.
 Harness starts with an empty declaration design and captures each existing file's immutable
 baseline on its first successful edit. Edit virtual
-overview files, complete configuration files, and the virtual plan.json task and description, then submit them for mandatory review. Do not implement the design or
+overview files, complete configuration files, and the virtual plan.json task, description, and validation requirements, then submit them for mandatory review. Do not implement the design or
 modify project files.
 
 ## Procedure
@@ -23,7 +23,7 @@ modify project files.
 4. Design complete declaration files and required configuration changes. Preserve unchanged declarations, private members, complete
    types, generics, visibility, documentation, and associations. Add only useful requested work.
    Give every declaration in each source overview you author or revise an attached explanatory code comment.
-   Write the task overview and reviewer-oriented design overview in the separate virtual `plan.json`.
+   Write the task overview, reviewer-oriented design overview, and validation requirements in the separate virtual `plan.json`.
    Do not author JSON entities, flows, tasks, stages, prerequisites, or execution reports.
 5. Edit with `harness_design_apply_patch`, supplying `plan_id`, `expected_version`, and `patch`.
    An optional `title` names the design. Multiple files and chunks can change atomically. Use the
@@ -38,7 +38,8 @@ modify project files.
 
 ## Task and change overview
 
-Harness creates a virtual `plan.json` with exactly two string fields, `task` and `description`, initially empty.
+Harness creates a virtual `plan.json` with `task` and `description` strings and a `validation`
+object containing `automated` and `manual` strings. All strings start empty.
 Read and update it through the same tools as declaration files. It is plan metadata, never a
 project file or declaration overview. Do not add fields, move it, or delete it.
 
@@ -71,12 +72,16 @@ separates the requested outcome from the proposed mechanism:
 ```json
 {
   "task": "Support asynchronous texture replacement with observable progress and cancellation while keeping textures used by submitted frames valid.",
+  "validation": {
+    "automated": "cargo check\ncargo test",
+    "manual": "- Cancel a pending replacement and confirm the current texture remains visible.\n- Replace a texture while frames are in flight and confirm rendering remains valid."
+  },
   "description": "The proposal gives callers a `TextureRequest` for each pending replacement so they can observe loading and cancel it before publication. `TextureStreaming` coordinates decoding and upload, while `TextureRegistry` owns the published texture version.\n\n`TextureRegistry` publishes replacements at frame boundaries after upload completes. It retains previous allocations until their final GPU use completes, so a replacement cannot invalidate a texture still used by a submitted frame."
 }
 ```
 
 Use the actual saved text when updating it. Read it when that text is not already available.
-Task, description, and declaration edits can share one
+Task, description, validation, and declaration edits can share one
 atomic patch:
 
 ```text
@@ -90,6 +95,22 @@ atomic patch:
 +  "description": "`TextureStreaming` returns observable request handles and supports cancellation."
 *** End Patch
 ```
+
+## Validation requirements
+
+Record the checks needed to verify the final implementation in `validation`.
+Write `automated` as newline-separated executable commands, one command per nonblank line.
+Use exact commands supported by the inspected project, in the order they should run from the
+project workspace. Include a directory change in a command when it needs another working directory.
+Do not add bullets, numbering, Markdown fences, prose, or multiline shell scripts to this field.
+Encode line breaks as `\n` inside the JSON string.
+
+Write `manual` as a Markdown list, one observable check per line. State the action and expected
+result. Identify checks that require a person or unavailable hardware. These are requirements,
+not completed results. Leave either string empty when no checks of that kind apply.
+Keep both fields consistent with the design and revise them when review changes the scope.
+Planning records commands without running implementation validation. During execution, Verify
+runs the automated commands and performs or reports blockers for the manual checks before completion.
 
 ## Overview syntax
 

@@ -50,7 +50,8 @@ pub(super) fn project(
     let mut source_end = HashMap::new();
     let mut omitted = 0;
     for (index, mut row) in source.into_iter().enumerate() {
-        if row.id.0.starts_with("plan:description:") || row.id.0.starts_with("plan:task:") {
+        if row.id.0.starts_with("plan:description:") || row.id.0.starts_with("plan:task:")
+            || row.id.0.starts_with("plan:validation/manual:") {
             row = forge_buffer::markdown::MarkdownRenderer::source(
                 row.id.clone(),
                 &row.text.wire_rows().join("\n"),
@@ -473,21 +474,41 @@ fn rows(
     }
     let mut overview = Vec::new();
     let mut section_anchor = Vec::new();
+    let mut validation_start = None;
     for (name, title, text, section, label) in [
         ("task", "Task", design.document.task.as_str(), super::PlanSection::Task, "Requested task"),
         ("description", "Description", design.document.description.as_str(), super::PlanSection::Overview, "Change description"),
+        ("validation/automated", "Automated", design.document.validation.automated.as_str(), super::PlanSection::AutomatedValidation, "Automated validation commands"),
+        ("validation/manual", "Manual", design.document.validation.manual.as_str(), super::PlanSection::ManualValidation, "Manual validation checks"),
     ] {
+        if name == "validation/automated" {
+            validation_start = Some(overview.len());
+            overview.push(forge_diff::projection::header(
+                BlockId("plan:section:validation".into()),
+                vec![TextChunk { text: "Validation:".into(), capture: "ForgeStatusHeader".into() }], 0,
+            )?);
+            section_anchor.push(PlanNavigationAnchor {
+                line: overview.len() as u32,
+                target: PlanReviewTarget::Section { section: super::PlanSection::Validation },
+                json_path: "/design/document/validation".into(), path: None, label: "Validation requirements".into(),
+            });
+        }
         let start = overview.len();
         let fold_id = format!("plan:section:{name}");
+        let nested = name.starts_with("validation/");
+        let heading_indent = if nested { "  " } else { "" };
+        let text_indent = if name == "validation/manual" { "  " } else if nested { "    " } else { "" };
         overview.push(forge_diff::projection::header(
             BlockId(fold_id.clone()),
-            vec![TextChunk { text: format!("{title}:"), capture: "ForgeStatusHeader".into() }], 0,
+            vec![TextChunk { text: format!("{heading_indent}{title}:"), capture: "ForgeStatusHeader".into() }], 0,
         )?);
-        let text = if text.trim().is_empty() { if name == "task" { "No task overview." } else { "No description." } } else { text };
+        let text = if text.trim().is_empty() {
+            match name { "task" => "No task overview.", "description" => "No description.", _ => "None specified." }
+        } else { text };
         for (index, line) in text.lines().enumerate() {
             overview.push(BufferBlock {
                 id: BlockId(format!("plan:{name}:{index}")),
-                text: BufferText::from_rows([line])?, metadata: BlockMetadata::default(),
+                text: BufferText::from_rows([format!("{text_indent}{line}")])?, metadata: BlockMetadata::default(),
             });
         }
         fold(&mut overview, start, &fold_id)?;
@@ -501,6 +522,9 @@ fn rows(
             id: BlockId(format!("plan:section:{name}:separator")),
             text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
         });
+    }
+    if let Some(start) = validation_start {
+        fold(&mut overview, start, "plan:section:validation")?;
     }
     let changes_start = overview.len();
     overview.push(forge_diff::projection::header(
@@ -913,6 +937,8 @@ mod tests {
         let mut document = crate::plan::document::test_fixture("validation", "Validation");
         let mut design = super::super::DeclarationDesign::default();
         design.proposed.insert("lib.rs".into(), "pub struct State;\n".into());
+        design.document.validation.automated = "cargo test -- --test-threads=1\nprintf '# *literal*'".into();
+        design.document.validation.manual = "- Resize and confirm `State` remains visible.".into();
         design.validation = Some(crate::declaration::DeclarationValidation {
             diagnostic: vec![crate::declaration::DeclarationDiagnostic {
                 path: "plan".into(), line: 1, column: 0, reference: String::new(), error: false,
@@ -923,7 +949,12 @@ mod tests {
         document.design = Some(design);
         for public_only in [false, true] {
             let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
-            assert!(block.iter().all(|block| !block.id.0.contains("validation")));
+            assert!(block.iter().flat_map(|block| block.text.wire_rows()).all(|line| !line.contains("Cargo source resolution failed") && !line.contains("dependency source is unavailable")));
+            let command = block.iter().find(|block| block.id.0 == "plan:validation/automated:1").unwrap();
+            assert_eq!(command.text.row(0), Some("    printf '# *literal*'"));
+            assert!(target.values().any(|anchor| anchor.json_path == "/design/document/validation/automated"));
+            assert!(target.values().any(|anchor| anchor.json_path == "/design/document/validation/manual"));
+            forge_buffer::document::BufferDocument::new(forge_buffer::identity::DocumentId("validation".into()), block.clone()).unwrap();
             let declaration = block.iter().find(|block| block.text.row(0) == Some("pub struct State;")).unwrap();
             assert!(declaration.metadata.target.iter().any(|range| target.contains_key(&range.id)));
         }
@@ -1250,18 +1281,21 @@ mod tests {
             .iter()
             .filter(|block| !block.metadata.fold.is_empty())
             .collect();
-        assert_eq!(folded_header.len(), 5);
+        assert_eq!(folded_header.len(), 8);
         assert_eq!(folded_header[0].text.row(0), Some("Task:"));
         assert_eq!(folded_header[1].text.row(0), Some("Description:"));
-        assert_eq!(folded_header[2].text.row(0), Some("Changes:"));
+        assert_eq!(folded_header[2].text.row(0), Some("Validation:"));
+        assert_eq!(folded_header[3].text.row(0), Some("  Automated:"));
+        assert_eq!(folded_header[4].text.row(0), Some("  Manual:"));
+        assert_eq!(folded_header[5].text.row(0), Some("Changes:"));
         assert!(
-            folded_header[3]
+            folded_header[6]
                 .text
                 .row(0)
                 .unwrap()
                 .starts_with("Modified src/lib.rs")
         );
-        assert!(folded_header[4].text.row(0).unwrap().starts_with("@@"));
+        assert!(folded_header[7].text.row(0).unwrap().starts_with("@@"));
         for header in folded_header {
             let fold = &header.metadata.fold[0];
             assert!(fold.heading_start.is_none());
