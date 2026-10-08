@@ -370,6 +370,7 @@ mod test {
 
     fn interaction(id: &str) -> Exchange {
         Exchange {
+            lifecycle: None,
             finalization_error: None,
             finalization_outcome: None,
             agent_id: "primary".into(),

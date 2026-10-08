@@ -1146,6 +1146,7 @@ mod test {
         store.save_session(&session("session", "D:/work")).unwrap();
         store.save_agent_run(&Agent::primary("session", 0)).unwrap();
         let mut exchange = Exchange {
+            lifecycle: None,
             finalization_error: None,
             finalization_outcome: None,
             agent_id: "session:agent:primary".into(),
@@ -1227,6 +1228,7 @@ mod test {
         store.save_agent_run(&first).unwrap();
         store.save_agent_run(&second).unwrap();
         let mut interaction = Exchange {
+            lifecycle: None,
             finalization_error: None,
             finalization_outcome: None,
             agent_id: "session:agent:primary".into(),

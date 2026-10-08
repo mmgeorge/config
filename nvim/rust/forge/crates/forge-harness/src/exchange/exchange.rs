@@ -30,6 +30,9 @@ pub struct Exchange {
     pub ordinal: u64,
     pub prompt: String,
     #[serde(default)]
+    /// Lifecycle event that admitted this exchange instead of a user message.
+    pub lifecycle: Option<String>,
+    #[serde(default)]
     pub kind: ExchangeKind,
     #[serde(default)]
     /// Interaction mode retained independently of later session mode changes.
@@ -92,6 +95,7 @@ impl Exchange {
             agent_id: delegation.child_agent_id.clone(),
             ordinal,
             prompt: delegation.task.clone(),
+            lifecycle: None,
             kind: ExchangeKind::Chat,
             mode: None,
             plan_id: None,
@@ -623,6 +627,7 @@ mod test {
 
     fn interaction() -> Exchange {
         Exchange {
+            lifecycle: None,
             finalization_error: None,
             finalization_outcome: None,
             agent_id: "primary".into(),

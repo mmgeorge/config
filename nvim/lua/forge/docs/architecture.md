@@ -5349,6 +5349,9 @@ The Plan permission defaults to Keep current. Both preferences live in `/config`
 Explicit resume restores saved permission. Selecting Read pauses Execute and Goal tasks.
 Interrupting retains the selected task. The next ordinary message resumes a paused Plan,
 Execute, or Goal task with its saved context and the message as additional instructions.
+Control-triggered resumption records a lifecycle title on its exchange instead of a user
+prompt. The title identifies the task and any permission or configuration change. Backend
+continuation instructions remain separate, including the native goal activation command.
 Clearing, switching, or completing the task ends that message association. A resumed plan
 awaiting review still requires explicit acceptance before execution.
 Changing permission while paused does not restart execution. Model changes during execution

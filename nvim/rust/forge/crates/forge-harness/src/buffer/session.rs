@@ -1378,6 +1378,7 @@ mod tests {
             turn_id: identity.into(),
         };
         let mut interaction = Exchange {
+            lifecycle: None,
             finalization_error: None,
             finalization_outcome: None,
             agent_id: "primary".into(),

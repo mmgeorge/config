@@ -630,7 +630,9 @@ end
 ---@param agent_by_id? table<string, table> Lookup map of child agent runs by identifier.
 local function append_interaction(result, interaction, options, agent_by_id)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
-  if not interaction.hide_prompt and interaction.kind ~= "plan_execution" then
+  if type(interaction.lifecycle) == "string" then
+    append_wrapped(result, interaction.lifecycle, "  ", "  ", "Comment", options.content_width)
+  elseif not interaction.hide_prompt and interaction.kind ~= "plan_execution" then
     local prompt_line = #result.lines + 1
     append_wrapped(result, interaction.prompt, "▸ ", "  ", "ForgeHarnessPrompt", options.content_width)
     result.prompt_lines[#result.prompt_lines + 1] = prompt_line

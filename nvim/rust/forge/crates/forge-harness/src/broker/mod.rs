@@ -376,6 +376,7 @@ impl std::fmt::Display for TurnRetracted {
 impl std::error::Error for TurnRetracted {}
 
 struct ExchangeAdmission {
+    lifecycle: Option<String>,
     plan_event_id: Option<String>,
     prompt: String,
     kind: ExchangeKind,
@@ -395,6 +396,7 @@ struct PromptControlSnapshot {
 impl ExchangeAdmission {
     fn chat(prompt: String) -> Self {
         Self {
+            lifecycle: None,
             plan_event_id: None,
             prompt,
             kind: ExchangeKind::Chat,
@@ -407,6 +409,7 @@ impl ExchangeAdmission {
 
     fn agent(prompt: String, agent_run_id: String) -> Self {
         Self {
+            lifecycle: None,
             plan_event_id: None,
             prompt,
             kind: ExchangeKind::Chat,
@@ -419,6 +422,7 @@ impl ExchangeAdmission {
 
     fn plan(prompt: String, plan_id: Option<String>, revision: bool) -> Self {
         Self {
+            lifecycle: None,
             plan_event_id: None,
             prompt,
             kind: if revision {
@@ -435,6 +439,7 @@ impl ExchangeAdmission {
 
     fn execution(prompt: String, plan_id: String, execution_id: String, goal_id: String) -> Self {
         Self {
+            lifecycle: None,
             plan_event_id: None,
             prompt,
             kind: ExchangeKind::PlanExecution,
@@ -447,6 +452,7 @@ impl ExchangeAdmission {
 
     fn goal(prompt: String, goal_id: String) -> Self {
         Self {
+            lifecycle: None,
             plan_event_id: None,
             prompt,
             kind: ExchangeKind::Chat,
@@ -1170,7 +1176,7 @@ impl HarnessBroker {
             HarnessMethod::QuestionContinue => self.continue_question().await,
             HarnessMethod::GoalSet => self.set_goal(params).await,
             HarnessMethod::GoalPause => self.pause_goal().await,
-            HarnessMethod::GoalResume => self.resume_goal(None).await,
+            HarnessMethod::GoalResume => self.resume_goal(None, None).await,
             HarnessMethod::GoalClear => self.clear_goal().await,
             HarnessMethod::GoalContinue => self.continue_goal().await,
             HarnessMethod::ExchangeList => Ok((
@@ -1543,7 +1549,14 @@ impl HarnessBroker {
                     }
                     self.store.save_task(&task)?;
                     self.save_session()?;
-                    if resume { return Box::pin(self.transition_task(json!({"action":"resume","task_id":task.id}))).await; }
+                    if resume {
+                        let reason = match command.as_str() {
+                            "permission" => format!("Permission changed to {}", permission.label()),
+                            "configure" => "Model settings changed".into(),
+                            _ => "Context compacted".into(),
+                        };
+                        return Box::pin(self.transition_task(json!({"action":"resume","task_id":task.id,"reason":reason}))).await;
+                    }
                 } else if resume {
                     let previous = self.store.list_exchange(&self.session.id)?.pop().context("interrupted exchange is missing")?;
                     let prompt = format!("Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions. Original request: {}", previous.prompt);
@@ -1574,6 +1587,13 @@ impl HarnessBroker {
                 task.begin(self.clock.now_ms())?;
                 task.operation_id = self.active_operation_id.clone();
                 self.store.save_task(&task)?;
+                let resumed = match task.kind {
+                    TaskKind::Plan => "Planning resumed".to_owned(),
+                    TaskKind::Execute => format!("Execution resumed · {}", task.phase),
+                    TaskKind::Goal => "Goal resumed".to_owned(),
+                };
+                let lifecycle = action.get("reason").and_then(Value::as_str)
+                    .map(|reason| format!("{reason} · {resumed}")).unwrap_or(resumed);
                 if task.kind == TaskKind::Plan {
                     let plan_id = task.plan_id.clone().context("planning task has no plan")?;
                     let mut plan = self.store.load_plan(&plan_id)?.context("task plan is missing")?;
@@ -1591,10 +1611,12 @@ impl HarnessBroker {
                         return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
                     }
                     let document = self.plan_file.read_working_document(&self.session.id, &plan_id)?;
+                    let mut admission = ExchangeAdmission::plan(message.clone().unwrap_or_default(), Some(plan_id), plan.model_revision > 0);
+                    if message.is_none() { admission.lifecycle = Some(lifecycle); }
                     self.run_planning_interaction(PlanPrompt::with_active_document(
                         message.clone().unwrap_or_else(|| "Resume this planning task. Reassess the saved design against the current repository before continuing.".into()), &document.model_json()?),
-                        Some(ExchangeAdmission::plan(message.unwrap_or_else(|| "Resume planning task".into()), Some(plan_id), false))).await
-                } else { self.resume_goal(message).await }
+                        Some(admission)).await
+                } else { self.resume_goal(message, Some(lifecycle)).await }
             }
             "plan" | "goal" => {
                 let text = required_text(&action, "text")?;
@@ -2358,7 +2380,7 @@ impl HarnessBroker {
         }
         match text.as_str() {
             "/goal pause" => return self.pause_goal().await,
-            "/goal resume" => return self.resume_goal(None).await,
+            "/goal resume" => return self.resume_goal(None, None).await,
             "/goal clear" => return self.clear_goal().await,
             _ => {}
         }
@@ -3317,6 +3339,7 @@ Planning continuation: turn {} of {}.",
             .await?;
         interaction.mode = Some(self.session.execution_mode);
         if new_interaction && let Some(admission) = admission.as_ref() {
+            interaction.lifecycle.clone_from(&admission.lifecycle);
             interaction.kind = admission.kind;
             interaction.plan_id.clone_from(&admission.plan_id);
             interaction.execution_id.clone_from(&admission.execution_id);
@@ -4920,6 +4943,7 @@ Planning continuation: turn {} of {}.",
         }
         Ok((
             Exchange {
+                lifecycle: None,
                 finalization_error: None,
                 finalization_outcome: None,
                 agent_id: self.session.primary_agent_id.clone(),
@@ -5788,7 +5812,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         ))
     }
 
-    async fn resume_goal(&mut self, message: Option<String>) -> Result<(Value, Vec<SessionEvent>)> {
+    async fn resume_goal(&mut self, message: Option<String>, lifecycle: Option<String>) -> Result<(Value, Vec<SessionEvent>)> {
         let mut goal = self.active_goal()?;
         if let Some(execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.goal_id == goal.id) {
             anyhow::ensure!(execution.pending_revision_reason.is_none(), "review the pending plan revision before resuming execution");
@@ -5835,8 +5859,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             prompt.push_str("\n\nAdditional user instructions:\n");
             prompt.push_str(text);
         }
-        let visible_prompt = message.unwrap_or_else(|| "/goal resume".into());
-        let admission = self
+        let control_resume = message.is_none();
+        let visible_prompt = message.unwrap_or_default();
+        let mut admission = self
             .store
             .list_plan_execution(&self.session.id)?
             .into_iter()
@@ -5850,6 +5875,11 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 )
             })
             .unwrap_or_else(|| ExchangeAdmission::goal(visible_prompt, goal.id.clone()));
+        if control_resume {
+            admission.lifecycle = Some(lifecycle.unwrap_or_else(|| if mode == PromptMode::ExecutePlan {
+                "Execution resumed".into()
+            } else { "Goal resumed".into() }));
+        }
         match self
             .run_interaction(prompt, mode, Some(admission))
             .await
@@ -6991,7 +7021,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(resumed.clone(), Box::new(FixedClock(300))).unwrap();
         assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
         broker.backend = Arc::new(SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize::new(1), revision:2 });
-        broker.resume_goal(None).await.unwrap();
+        broker.resume_goal(None, None).await.unwrap();
         assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Resolve);
         resumed.session_id = Some(broker.session.id.clone());
         drop(broker);
@@ -7001,7 +7031,7 @@ mod test {
         assert_eq!(recovered.state, PlanExecutionState::Paused);
         assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
         broker.backend = Arc::new(SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize::new(2), revision:2 });
-        broker.resume_goal(None).await.unwrap();
+        broker.resume_goal(None, None).await.unwrap();
         for expected in [crate::plan::PlanPhase::Verify] {
             let result = broker.dispatch(Request { id:5, method:"goal.continue".into(), params:json!({}) }).await;
             assert!(result.response.error().is_none(), "{:?}", result.response.error());
@@ -7056,7 +7086,7 @@ mod test {
         assert_eq!(stalled.phase, crate::plan::PlanPhase::Implement);
         assert!(stalled.completed_at_ms.is_none());
         assert_eq!(broker.snapshot().unwrap().goal.unwrap().continuation.turn_count, 2);
-        broker.resume_goal(None).await.unwrap();
+        broker.resume_goal(None, None).await.unwrap();
         let resumed = broker.snapshot().unwrap().goal_execution.unwrap();
         assert_eq!(resumed.id, stalled.id);
         assert_eq!(resumed.state, PlanExecutionState::Active);
@@ -7118,7 +7148,7 @@ mod test {
             } else {
                 assert_eq!(execution.revision, 1);
                 assert_eq!(execution.state, PlanExecutionState::Paused);
-                assert!(broker.resume_goal(None).await.unwrap_err().to_string().contains("review the pending"));
+                assert!(broker.resume_goal(None, None).await.unwrap_err().to_string().contains("review the pending"));
                 if decision == "recovered_accept" {
                     let mut previous = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
                     broker.capture_final_checkpoint(&mut previous, ExchangeState::Complete).await.unwrap();
@@ -7249,6 +7279,7 @@ mod test {
 
     fn completed_interaction(id: &str, session_id: &str, node_list: Vec<ExchangeNode>) -> Exchange {
         Exchange {
+            lifecycle: None,
             mode: None,
             finalization_error: None,
             finalization_outcome: None,
@@ -7693,7 +7724,7 @@ mod test {
             .share_mode(0)
             .open(repository.path().join("seed.txt"))
             .unwrap();
-        let error = broker.resume_goal(None).await.unwrap_err();
+        let error = broker.resume_goal(None, None).await.unwrap_err();
         assert!(format!("{error:#}").contains("seed.txt"));
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
@@ -7703,11 +7734,11 @@ mod test {
         drop(locked);
 
         broker.turn_cancellation.request(false);
-        assert!(broker.resume_goal(None).await.unwrap_err().downcast_ref::<TurnCancelled>().is_some());
+        assert!(broker.resume_goal(None, None).await.unwrap_err().downcast_ref::<TurnCancelled>().is_some());
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         assert_eq!(broker.store.list_exchange(&broker.session.id).unwrap().len(), 1);
         broker.turn_cancellation.arm(false);
-        let (_, event) = broker.resume_goal(None).await.unwrap();
+        let (_, event) = broker.resume_goal(None, None).await.unwrap();
         assert_eq!(event[0].event, "goal_changed");
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(stored.len(), 2);
@@ -11293,7 +11324,7 @@ mod test {
                 reopened.backend = Arc::new(NativeSettlementBackend {
                     inner: reopened.backend.clone(), state: GoalState::Complete,
                 });
-                reopened.resume_goal(None).await.unwrap();
+                reopened.resume_goal(None, None).await.unwrap();
                 assert_eq!(reopened.active_goal().unwrap().state, GoalState::Complete);
             }
         }

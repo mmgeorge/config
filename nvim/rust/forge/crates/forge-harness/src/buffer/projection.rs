@@ -566,12 +566,15 @@ impl TimelineRenderer<'_> {
         if depth == 0 && self.leading_separator {
             self.literal(&format!("{}:separator", interaction.id), "", None)?;
         }
-        let prompt = TranscriptRenderer::new(&self.content_width())?.prompt(
-            BlockId(format!("{}:prompt", interaction.id)),
-            &interaction.prompt,
-        )?;
-        self.prompt.push(prompt.id.clone());
-        self.push(prompt)?;
+        if let Some(lifecycle) = &interaction.lifecycle {
+            self.literal(&format!("{}:lifecycle", interaction.id), lifecycle, None)?;
+        } else {
+            let prompt = TranscriptRenderer::new(&self.content_width())?.prompt(
+                BlockId(format!("{}:prompt", interaction.id)), &interaction.prompt,
+            )?;
+            self.prompt.push(prompt.id.clone());
+            self.push(prompt)?;
+        }
         let summary = exchange_activity_summary(interaction, self.now_ms);
         let mut heading = TranscriptRenderer::new(&self.content_width())?.literal(
             BlockId(format!("{}:summary", interaction.id)),
@@ -2619,6 +2622,29 @@ mod tests {
         assert!(matches!(projected.action.get(&target.id),
             Some(super::TranscriptAction::Plan { plan_id, .. }) if plan_id == "pending-plan"));
         assert!(block.metadata.fold.is_empty());
+    }
+
+    #[test]
+    fn lifecycle_resumption_does_not_render_as_user_input() {
+        let interaction: Exchange = serde_json::from_value(json!({
+            "id":"interaction", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"", "lifecycle":"Execution resumed · implement",
+            "kind":"plan_execution", "state":"running", "created_at_ms":1000,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        })).unwrap();
+        let projected = project_at(
+            &TimelineEntry::Exchange {
+                id: "interaction".into(),
+                created_at_ms: 1_000,
+                exchange: interaction,
+                agent_by_id: HashMap::new(),
+            },
+            &WidthProfile::default(),
+            1_000,
+        ).unwrap();
+        assert_eq!(projected.entry.block[0].id.0, "interaction:lifecycle");
+        assert!(projected.entry.block[0].text.wire_rows().join("\n").contains("Execution resumed · implement"));
+        assert!(!projected.entry.block.iter().any(|block| block.id.0 == "interaction:prompt"));
     }
 
     #[test]
