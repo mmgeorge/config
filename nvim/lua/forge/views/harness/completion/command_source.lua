@@ -351,7 +351,11 @@ function CommandSource:get_completions(_, callback)
     return
   end
   if command_start then
+    local parent_command = prefix:match("^%s*(/%S+)%s+")
     for _, command in ipairs(command_list) do
+      if parent_command and command.label:sub(1, #parent_command + 1) ~= parent_command .. " " then
+        goto continue
+      end
       local capability = session.harness.capability or {}
       if command.capability == "agent_observe"
         and not (capability.agent and capability.agent.observe)

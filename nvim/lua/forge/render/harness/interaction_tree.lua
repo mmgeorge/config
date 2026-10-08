@@ -71,14 +71,15 @@ end
 
 --- Formats reported usage across owned turns, preserving unavailable categories.
 ---@param interaction table Exchange descriptor table.
----@param response_ms number? Elapsed milliseconds outside tracked waits, when available.
+---@param metrics table Captured throughput operands and timing validity.
 ---@return string summary Input, cache percentage, reasoning, output, and effective throughput.
-local function format_exchange_usage(interaction, response_ms)
+local function format_exchange_usage(interaction, metrics)
   local totals = {}
+  local reported = vim.tbl_filter(function(turn) return type(turn.usage) == "table" end, interaction.turn or {})
   for _, field in ipairs({ "input", "cached_input", "reasoning", "output" }) do
     local total = 0
-    local available = #(interaction.turn or {}) > 0
-    for _, turn in ipairs(interaction.turn or {}) do
+    local available = #reported > 0
+    for _, turn in ipairs(reported) do
       local value = type(turn.usage) == "table" and turn.usage[field] or nil
       if type(value) ~= "number" then available = false else total = total + value end
     end
@@ -93,11 +94,12 @@ local function format_exchange_usage(interaction, response_ms)
     output = totals.output - totals.reasoning
   end
   local throughput = "—"
-  if totals.output and response_ms and response_ms > 0 then
-    throughput = ("~%.0f"):format(math.floor(totals.output * 1000 / response_ms + 0.5))
+  if metrics.timing_complete and type(metrics.reported_output_tokens) == "number"
+    and type(metrics.reported_response_ms) == "number" and metrics.reported_response_ms > 0 then
+    throughput = ("~%.0f"):format(math.floor(metrics.reported_output_tokens * 1000 / metrics.reported_response_ms + 0.5))
   end
-  return ("%s I (%s) → %s R / %s O (%s tps)"):format(
-    format_token_count(totals.input), cached, format_token_count(totals.reasoning), format_token_count(output), throughput)
+  return ("%s tok/s │ I %s (%s) · R %s · O %s"):format(
+    throughput, format_token_count(totals.input), cached, format_token_count(totals.reasoning), format_token_count(output))
 end
 
 --- Formats a concise summary of tool execution counts and failure metrics.
@@ -573,15 +575,13 @@ local function append_exchange_summary(result, interaction, options)
   end
   local duration = math.floor(duration_ms / 1000)
   local metrics = interaction.metrics or {}
-  local response = "—"
-  local response_ms
+  local tools = "—s"
   if metrics.timing_complete then
-    local blocked = metrics.blocked_duration_ms or 0
-    if type(metrics.blocked_started_ms) == "number" then
-      blocked = blocked + math.max(0, duration_ms - metrics.blocked_started_ms)
+    local elapsed = metrics.tool_duration_ms or 0
+    if type(metrics.tool_started_ms) == "number" then
+      elapsed = elapsed + math.max(0, duration_ms - metrics.tool_started_ms)
     end
-    response_ms = math.max(0, duration_ms - blocked)
-    response = ("%ds"):format(math.floor(response_ms / 1000))
+    tools = ("%ds"):format(math.floor(elapsed / 1000))
   end
   local verb = complete and "Thought" or "Thinking"
   if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
@@ -596,21 +596,11 @@ local function append_exchange_summary(result, interaction, options)
   local history = { rolled_back = "Rolled back · ", superseded = "Superseded · " }
   local key = ("exchange:%s"):format(interaction.id or interaction.ordinal)
   local expanded = not complete or result.expanded[key] == true
-  local summary = ("%s %s%s %ds (%s)"):format(expanded and "▾" or "▸",
-    history[interaction.disposition] or "", verb, duration, response)
-  if complete or interaction.awaiting_input or paused then
-    summary = summary .. ", " .. format_exchange_usage(interaction, response_ms)
-    local count = metrics.request_count
-    if type(count) == "number" and count > 0 then
-      summary = summary .. (", %d %s"):format(count, count == 1 and "request" or "requests")
-    else
-      summary = summary .. ", — requests"
-    end
-  end
-  if tool_count > 0 then
-    summary = summary .. (", %d %s"):format(tool_count, tool_count == 1 and "tool" or "tools")
-    if failed_count > 0 then summary = summary .. (" (%d failed)"):format(failed_count) end
-  end
+  local summary = ("%s %s%s %ds (%s tools) │ %s │ %d req · %d %s"):format(
+    expanded and "▾" or "▸", history[interaction.disposition] or "", verb, duration, tools,
+    format_exchange_usage(interaction, metrics), metrics.request_count or 0,
+    tool_count, tool_count == 1 and "tool" or "tools")
+  if failed_count > 0 then summary = summary .. (" (%d failed)"):format(failed_count) end
   if agent_count > 0 then
     summary = summary .. (", %d %s spawned"):format(agent_count, agent_count == 1 and "agent" or "agents")
   end

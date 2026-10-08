@@ -181,6 +181,7 @@ impl Exchange {
                 .usage(&address.thread_id, &address.turn_id, update)
             {
                 self.turn[index].record_usage(usage);
+                self.metrics.record_throughput(self.usage().output, self.elapsed(now_ms));
             }
             return Ok(true);
         }
@@ -539,13 +540,13 @@ impl Exchange {
 
     /// Sum usage across owned turns, retaining unavailable categories.
     pub fn usage(&self) -> crate::backend::usage::TokenUsage {
-        let mut turn = self.turn.iter();
+        let mut turn = self.turn.iter().filter_map(|turn| turn.usage());
         let Some(first) = turn.next() else {
             return Default::default();
         };
-        let mut usage = first.usage().cloned().unwrap_or_default();
+        let mut usage = first.clone();
         for turn in turn {
-            usage.accumulate(&turn.usage().cloned().unwrap_or_default());
+            usage.accumulate(turn);
         }
         usage
     }

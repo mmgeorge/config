@@ -2554,25 +2554,28 @@ synthetic context adjustments do not increment the count. A cumulative jump can 
 totals without recovering how many reports were missed. Requests without usage reports, including
 failed attempts and calls still in progress, remain outside this observed completion count.
 
-Completed and paused headers show `Thought 6s (3s), 76.0k I (90%) → 3.0k R / 1.2k O (~1400 tps)`
-before tool and agent counts. Input includes cached tokens. The percentage divides summed cached
-input by summed input, and output subtracts reasoning from inclusive generated tokens. Active
-headers show the two durations without the token breakdown. The outer duration includes tools,
-approval waits, and delegated waits within active execution. Explicit user-input pauses and
-checkpoint finalization freeze that duration. The parenthetical subtracts the union of observed
-tool, approval, and delegated-wait intervals, including overlapping activity only once. It includes
-prompt processing, reasoning, output generation, and transport latency. It does not measure
-reasoning duration or time to first token. Missing tool-start evidence makes it unavailable.
-Effective throughput divides inclusive generated tokens (reasoning plus output) by the unrounded
-parenthetical duration in milliseconds, then rounds to whole tokens per second with a `~` prefix.
-Missing generated-token counts or unavailable or zero duration produce `— tps`. Inclusive output
-can supply throughput even when its reasoning split is unavailable. Paused values are provisional.
-Tool counts use `1 tool` or `N tools`, followed by the failed count when nonzero.
-Paused and completed headers place `1 request` or `N requests` before the tool count.
-Until the first admitted usage report, they show `— requests`.
-Both renderers use whole seconds, rounded cache percentages, one decimal `k` for counts of at
-least 1000, and `—` for unavailable values. Private session format 32 hides earlier sessions
-without decoding or migrating their summaries.
+Running, paused, and completed headers share the layout
+`Planning 120s (12s tools) │ ~65 tok/s │ I 820.0k (94%) · R 2.8k · O 4.2k │ 8 req · 21 tools`.
+The outer duration includes tools, approvals, and delegated waits within active execution and
+freezes across explicit pauses. The parenthetical counts tool-only wall time, taking the union
+of overlapping calls and capping outstanding intervals at interruption or completion.
+
+Each distinct admitted usage report refreshes cumulative input, cache percentage, reasoning,
+non-reasoning output, and request count immediately. Turns that have not reported usage do not
+erase previously reported totals. Missing categories within reported usage remain unavailable.
+Input includes cached tokens and cache percentage divides cumulative cached input by cumulative
+input. Inclusive generated tokens include reasoning and tool arguments.
+
+The same report captures cumulative generated tokens and active elapsed time minus the union
+of tool, approval, and delegated waits. Their quotient supplies approximate effective throughput,
+rounded to whole tokens per second. Both operands stay fixed until the next report, so ongoing
+requests cannot lower the displayed rate before reporting their tokens. Provider and transport
+overhead remain in this estimate. Missing timing or zero duration displays `— tok/s`.
+Elapsed and active tool time tick independently. Missing tool starts display `—s tools`.
+Headers show `0 req` before any usage report and retain tool-failure and spawned-agent suffixes.
+Both renderers retain compact token formatting and show `—` for unavailable categories.
+Private session format 36 hides earlier sessions without migration.
+
 
 Each canonical `ToolCall` retains its first observed running timestamp and first terminal
 timestamp. Tool headings show `• 2s command`, updating through the existing one-second activity
@@ -5325,6 +5328,10 @@ Commit detail reads resolve one immutable full commit identity to its first pare
 ## Harness task ownership and recovery
 
 The broker owns task transitions. Neovim presents task history and submits durable intents.
+Command completion keeps subcommands within their typed parent command. Opening `/task new`
+retains the conversation and current execution until a replacement task is submitted.
+Session listing and resumption compare existing workspace paths after filesystem resolution,
+so alternate separators do not hide a session from its worktree.
 `TaskRecord` identifies a conversation-scoped Plan, Execute, or Goal workflow, its saved
 permission, phase, lifecycle status, generation, and attempt identity. Plan and goal records
 retain their workflow-specific evidence. `current_task_id` selects the task independently of

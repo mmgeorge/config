@@ -74,6 +74,13 @@ local success, failure = xpcall(function()
   assert(task.current(state).status == "blocked" and task.current(state).phase == "implement",
     "read-only mock execution did not stop at its no-progress boundary: " .. vim.inspect(task.current(state)))
   assert(state.session.execution_mode == "write", "execute did not apply configured write permission")
+  local tab_count, conversation = #vim.api.nvim_list_tabpages(), state.session.id
+  vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/task new" })
+  controller.submit()
+  assert(require("forge.views.picker").is_open("harness-task"), "new task did not open the task picker")
+  assert(#vim.api.nvim_list_tabpages() == tab_count and state.session.id == conversation, "new task changed the conversation")
+  assert(task.current(state).id == executing_id, "opening new task picker detached execution")
+  require("forge.views.picker").close(true)
   controller.task_transition({ action = "pause" })
   wait_settled()
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "continue implementation using the accepted plan" })

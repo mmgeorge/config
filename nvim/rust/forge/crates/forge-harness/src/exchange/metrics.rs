@@ -16,6 +16,15 @@ pub struct ExchangeMetrics {
     pub blocked_started_ms: Option<u64>,
     /// Whether all observed tool completions had a corresponding start.
     pub timing_complete: bool,
+    /// Tool-only wall time, counting concurrent calls once.
+    pub tool_duration_ms: u64,
+    /// Active elapsed coordinate at which tool occupancy began.
+    pub tool_started_ms: Option<u64>,
+    /// Generated tokens captured at the latest admitted usage report.
+    pub reported_output_tokens: Option<u64>,
+    /// Response-time estimate captured with the latest admitted usage report.
+    pub reported_response_ms: Option<u64>,
+    tool: BTreeSet<String>,
     blocker: BTreeSet<String>,
     sample: BTreeSet<String>,
     cursor: HashMap<String, UsageCursor>,
@@ -30,6 +39,15 @@ struct UsageCursor {
 impl ExchangeMetrics {
     /// Record one identified activity transition in the exchange's active elapsed coordinate.
     pub(crate) fn block(&mut self, id: String, running: bool, elapsed_ms: u64) {
+        if id.starts_with("tool:") {
+            if running {
+                if self.tool.insert(id.clone()) && self.tool_started_ms.is_none() {
+                    self.tool_started_ms = Some(elapsed_ms);
+                }
+            } else if self.tool.remove(&id) && self.tool.is_empty() {
+                self.close_tools(elapsed_ms);
+            }
+        }
         if running {
             if self.blocker.insert(id) && self.blocked_started_ms.is_none() {
                 self.blocked_started_ms = Some(elapsed_ms);
@@ -43,6 +61,27 @@ impl ExchangeMetrics {
     pub(crate) fn settle(&mut self, elapsed_ms: u64) {
         self.close(elapsed_ms);
         self.blocker.clear();
+        self.close_tools(elapsed_ms);
+        self.tool.clear();
+    }
+
+    /// Returns tool occupancy including currently running calls, when timing is complete.
+    pub fn tool_ms(&self, elapsed_ms: u64) -> Option<u64> {
+        self.timing_complete.then(|| self.tool_duration_ms.saturating_add(
+            self.tool_started_ms.map_or(0, |started| elapsed_ms.saturating_sub(started)),
+        ))
+    }
+
+    /// Captures both operands together so throughput stays fixed between usage reports.
+    pub(crate) fn record_throughput(&mut self, output: Option<u64>, elapsed_ms: u64) {
+        self.reported_output_tokens = output;
+        self.reported_response_ms = self.response_ms(elapsed_ms);
+    }
+
+    fn close_tools(&mut self, elapsed_ms: u64) {
+        if let Some(started) = self.tool_started_ms.take() {
+            self.tool_duration_ms = self.tool_duration_ms.saturating_add(elapsed_ms.saturating_sub(started));
+        }
     }
 
     /// Return active time outside observed tool, approval, and delegated wait intervals.
@@ -122,6 +161,11 @@ impl Default for ExchangeMetrics {
             blocked_duration_ms: 0,
             blocked_started_ms: None,
             timing_complete: true,
+            tool_duration_ms: 0,
+            tool_started_ms: None,
+            reported_output_tokens: None,
+            reported_response_ms: None,
+            tool: BTreeSet::new(),
             blocker: BTreeSet::new(),
             sample: BTreeSet::new(),
             cursor: HashMap::new(),
@@ -249,5 +293,32 @@ mod test {
         assert_eq!(metrics.response_ms(7000), Some(2000));
         metrics.timing_complete = false;
         assert_eq!(metrics.response_ms(7000), None);
+    }
+
+    #[test]
+    fn tool_occupancy_excludes_other_waits_and_throughput_freezes_between_reports() {
+        let mut metrics = ExchangeMetrics::default();
+        metrics.block("tool:first".into(), true, 1000);
+        metrics.block("approval".into(), true, 1500);
+        metrics.block("tool:second".into(), true, 2000);
+        metrics.block("tool:first".into(), false, 3000);
+        assert_eq!(metrics.tool_ms(3500), Some(2500));
+        metrics.block("tool:second".into(), false, 4000);
+        metrics.block("approval".into(), false, 5000);
+        assert_eq!(metrics.tool_ms(6000), Some(3000));
+        metrics.record_throughput(Some(100), 6000);
+        metrics = serde_json::from_value(serde_json::to_value(metrics).unwrap()).unwrap();
+        assert_eq!(metrics.reported_response_ms, Some(2000));
+        assert_eq!(metrics.response_ms(9000), Some(5000));
+        assert_eq!(metrics.reported_response_ms, Some(2000));
+        metrics.block("tool:interrupted".into(), true, 9000);
+        metrics.settle(10000);
+        assert_eq!(metrics.tool_ms(12000), Some(4000));
+        metrics.record_throughput(Some(200), 10000);
+        assert_eq!(metrics.reported_response_ms, Some(5000));
+        metrics.timing_complete = false;
+        assert_eq!(metrics.tool_ms(12000), None);
+        metrics.record_throughput(Some(200), 12000);
+        assert_eq!(metrics.reported_response_ms, None);
     }
 }

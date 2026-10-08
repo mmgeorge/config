@@ -39,7 +39,7 @@ local success, failure = xpcall(function()
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "", "durable native admission did not clear composer")
   local summary_found = false
   for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
-    if line:match("Thought %d+s %(%d+s%), — I %(—%) → — R / — O %(— tps%), — requests") then summary_found = true end
+    if line:match("Thought %d+s %(%d+s tools%) │ — tok/s │ I — %(—%) · R — · O — │ 0 req") then summary_found = true end
   end
   assert(summary_found, "fresh host did not render the current metrics header")
   local log_status

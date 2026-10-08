@@ -53,9 +53,15 @@ end
 
 ---@param instance table
 ---@param entry table
+local function same_workspace(left, right)
+  if left == right then return true end
+  local resolved = left and vim.uv.fs_realpath(left)
+  return resolved ~= nil and right ~= nil and resolved == vim.uv.fs_realpath(right)
+end
+
 local function resume_session(instance, entry)
   local current_session = session.harness.session or {}
-  if entry.workspace ~= current_session.workspace then
+  if not same_workspace(entry.workspace, current_session.workspace) then
     notifications.warn("Cross-worktree sessions are history-only. Open Harness from that worktree to resume.", "ForgeSessions")
     return
   end
@@ -174,7 +180,7 @@ load_session_list = function(instance)
       return
     end
     instance.entry_list = vim.tbl_filter(function(entry)
-      return not instance.backend or (entry.backend == instance.backend and entry.workspace == instance.workspace)
+      return not instance.backend or (entry.backend == instance.backend and same_workspace(entry.workspace, instance.workspace))
     end, result or {})
     if picker.is_open("sessions") then
       picker.update(build_spec(instance))

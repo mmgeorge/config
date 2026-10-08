@@ -551,7 +551,7 @@ impl HarnessBroker {
                     .load_session(session_id)?
                     .context("session not found")?;
                 anyhow::ensure!(
-                    selected.workspace == workspace,
+                    crate::workspace::same(&selected.workspace, &workspace),
                     "session uses a different workspace"
                 );
                 anyhow::ensure!(
@@ -6250,7 +6250,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .load_session(&session_id)?
             .context("session not found")?;
         anyhow::ensure!(
-            session.workspace == self.session.workspace,
+            crate::workspace::same(&session.workspace, &self.session.workspace),
             "cross-worktree resume requires native fork"
         );
         anyhow::ensure!(
@@ -9873,6 +9873,7 @@ mod test {
         assert!(failure.to_string().contains("different configured backend"));
         assert!(source.store.load_session(&source.session.id).unwrap().unwrap().lease_owner.is_none());
         stored.backend = "mock".into();
+        stored.workspace = format!("{}//./", stored.workspace);
         source.store.save_session(&stored).unwrap();
 
         let resumed = HarnessBroker::initialize_with_clock(request, Box::new(FixedClock(140))).unwrap();

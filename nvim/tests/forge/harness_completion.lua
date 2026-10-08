@@ -68,6 +68,11 @@ local ok, failure = xpcall(function()
   item(complete(commands, "/"), "/model")
   item(complete(commands, "/b"), "/bg")
   item(complete(commands, "/rec"), "/recap")
+  local task_items = complete(commands, "/task new")
+  item(task_items, "/task new")
+  for _, entry in ipairs(task_items) do
+    assert(entry.label:match("^/task "), "task completion offered an unrelated command: " .. entry.label)
+  end
   item(complete(commands, "/mode "), "write")
   session.harness.agent = { run = { { id = "child", definition = "explorer", state = "ready" } }, exchange = {} }
   session.harness.timeline = { { kind = "agent_lifecycle", run = session.harness.agent.run[1],

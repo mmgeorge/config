@@ -17,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 35;
+const SESSION_FORMAT_VERSION: u32 = 36;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -971,16 +971,13 @@ impl SessionStore for SqliteStore {
     }
 
     fn list_session(&self, workspace: Option<&str>) -> Result<Vec<HarnessSession>> {
-        match workspace {
-            Some(path) => self.list_current_session(
-                "SELECT payload FROM session_record WHERE workspace=?1 ORDER BY updated_at_ms DESC",
-                [path],
-            ),
-            None => self.list_current_session(
-                "SELECT payload FROM session_record ORDER BY updated_at_ms DESC",
-                [],
-            ),
+        let mut sessions = self.list_current_session(
+            "SELECT payload FROM session_record ORDER BY updated_at_ms DESC", [],
+        )?;
+        if let Some(path) = workspace {
+            sessions.retain(|session| crate::workspace::same(&session.workspace, path));
         }
+        Ok(sessions)
     }
 
     fn delete_session(&mut self, session_id: &str) -> Result<()> {
@@ -1116,6 +1113,10 @@ mod test {
         }
         assert_eq!(store.list_session(Some("D:/one")).unwrap().len(), 1);
         assert_eq!(store.list_session(None).unwrap().len(), 2);
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().to_string_lossy();
+        store.save_session(&session("alternate", &format!("{path}//./"))).unwrap();
+        assert_eq!(store.list_session(Some(&path)).unwrap()[0].id, "alternate");
     }
 
     #[test]
