@@ -14,6 +14,7 @@ package.loaded["forge.views.harness.controller"] = {
   activate_snapshot = function() end,
   render = function() end,
   present_plan_question = function() end,
+  task_transition = function(action) assert(action.action == "execute" and action.plan_id == "plan") end,
 }
 require("forge.infra.popup_window").input = function(_, callback) callback("") end
 harness.session = { id = "session" }

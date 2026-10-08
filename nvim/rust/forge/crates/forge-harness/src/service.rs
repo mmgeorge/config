@@ -369,6 +369,17 @@ impl HarnessService {
         Ok(None)
     }
 
+    /// Persist transition ordering on the host input lane before concurrent execution begins.
+    pub async fn prepare_task(&self, session_id: Option<&str>, request: &Request) -> Result<()> {
+        let _activity = self.admit().await?;
+        let registry = self.registry().await?;
+        let session_id = session_id.unwrap_or(&registry.initial_session_id);
+        let controller = registry.resolve(session_id).await?;
+        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        admit_task_intent(&controller, session_id, request, &mut store)?;
+        Ok(())
+    }
+
     /// Route a validated session operation without holding the initialization mutex during work.
     ///
     /// The host must call `prepare` in input order before dispatching provider-bound operations.
@@ -799,6 +810,21 @@ async fn route_request(
         return route_new_session(registry, session_id, request, message_sink).await;
     }
     let controller = registry.resolve(&session_id).await?;
+    if method == HarnessMethod::Health {
+        message_sink.send_control_wait(Message::Response(Response::success(request.id,
+            json!({"session_id":session_id,"responsive":true}))?)).await?;
+        return Ok(());
+    }
+    if method == HarnessMethod::TaskOperation {
+        let id = request.params.get("operation_id").and_then(Value::as_str).context("operation_id is required")?;
+        let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        message_sink.send_control_wait(Message::Response(Response::success(request.id,
+            store.load_task_operation(&session_id, id)?.map(|operation| operation.view()))?)).await?;
+        return Ok(());
+    }
+    if method == HarnessMethod::TaskTransition {
+        return route_task_transition(registry, controller, session_id, request, message_sink).await;
+    }
     if method.requires_provider_fork() {
         registry
             .await_provider_fork(&session_id, &controller)
@@ -841,13 +867,29 @@ async fn route_request(
         Ok::<(), anyhow::Error>(())
     });
     let shutdown = method == HarnessMethod::Shutdown;
-    let result = broker.dispatch_stream(request, event_sink).await;
+    let continuation_store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+    let continuation_owner = continuation_store.latest_task_operation(&session_id)?.map(|operation| operation.id);
+    let mut result = broker.dispatch_stream(request, event_sink).await;
+    event_forwarder.await??;
+    let mut continuing = result.response.error().is_none()
+        && result.event.iter().any(|event| event.event == "goal_continue_requested");
+    for event in result.event.drain(..) { message_sink.send_event(event).await?; }
+    while continuing {
+        if continuation_store.latest_task_operation(&session_id)?.map(|operation| operation.id) != continuation_owner { break; }
+        match dispatch_task_attempt(&mut broker, &session_id,
+            Request { id: 0, method: "goal.continue".into(), params: json!({}) }, message_sink).await {
+            Ok(next) => continuing = next,
+            Err(error) => {
+                result.response = Response::failure(result.response.id, "continuation_failed", format!("{error:#}"));
+                break;
+            }
+        }
+    }
     let catalog_request = broker.backend_catalog_request();
     drop(broker);
     *controller.catalog_request.write().await = catalog_request;
     let _ = heartbeat_stop.send(());
     let _ = heartbeat.await;
-    event_forwarder.await??;
 
     if let Some(child_session_id) = result
         .response
@@ -867,6 +909,175 @@ async fn route_request(
         message_sink.send_response(result.response).await?;
     }
     Ok(())
+}
+
+fn admit_task_intent(controller: &SessionController, session_id: &str, request: &Request,
+    store: &mut SqliteStore) -> Result<crate::task::TaskOperation> {
+    let id = request.params.get("operation_id").and_then(Value::as_str)
+        .filter(|id| !id.is_empty() && id.len() <= 128).context("task transition requires operation_id")?.to_owned();
+    if let Some(previous) = store.load_task_operation(session_id, &id)? {
+        ensure!(previous.action == request.params, "operation ID was reused for a different action");
+        return Ok(previous);
+    }
+    let action = request.params.get("action").and_then(Value::as_str).context("task action is required")?;
+    ensure!(["plan", "execute", "goal", "fork", "attach_plan", "resume", "pause", "clear", "permission", "configure", "compact"].contains(&action), "unknown task action");
+    if action == "permission" {
+        let permission: crate::session::PermissionMode = serde_json::from_value(request.params.get("mode").cloned().context("permission is required")?)?;
+        ensure!(controller.backend.descriptor().capability.execution_mode_list.contains(&permission), "permission is unavailable for this backend");
+    }
+    if matches!(action, "plan" | "goal") {
+        ensure!(request.params.get("text").and_then(Value::as_str).is_some_and(|text| !text.trim().is_empty()), "task objective is required");
+    }
+    let selected = crate::session::SessionStore::load_session(store, session_id)?.context("session is missing")?.current_task_id;
+    let task = store.list_task(&session_id)?.into_iter().find(|task| Some(&task.id) == selected.as_ref());
+    let prior = store.latest_task_operation(&session_id)?;
+    let pending = prior.as_ref().filter(|operation| matches!(operation.state.as_str(), "admitted" | "accepted" | "stopping" | "running"));
+    if matches!(action, "permission" | "configure" | "compact")
+        && let Some(pending) = pending.filter(|operation| matches!(operation.action["action"].as_str(), Some("plan" | "execute" | "goal" | "fork" | "attach_plan" | "resume"))) {
+        ensure!(task.as_ref().is_some_and(|task| task.operation_id.as_deref() == Some(&pending.id)),
+            "Task selection is still being admitted. Retry this setting after it starts, or pause the pending task");
+    }
+    let running_intent = pending.or_else(|| prior.as_ref().filter(|operation| !operation.resume_after_transition))
+        .map(|operation| operation.resume_after_transition).unwrap_or_else(||
+        task.as_ref().is_some_and(|task| task.status == crate::task::TaskStatus::Running)
+            || (task.is_none() && controller.execution_admission.available_permits() == 0));
+    let resume_after_transition = if matches!(action, "pause" | "clear") { false }
+        else if action == "permission" && request.params["mode"] == "read"
+            && task.as_ref().is_some_and(|task| task.kind != crate::task::TaskKind::Plan) { false }
+        else if matches!(action, "plan" | "execute" | "goal" | "fork" | "attach_plan" | "resume") { true }
+        else { running_intent };
+    let operation = crate::task::TaskOperation {
+        id, session_id: session_id.to_owned(), action: request.params.clone(), state: "admitted".into(), error: None,
+        created_at_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64,
+        resume_after_transition,
+    };
+    store.admit_task_operation(&operation)?;
+    Ok(operation)
+}
+
+async fn route_task_transition(
+    registry: Arc<SessionControllerRegistry>,
+    controller: Arc<SessionController>,
+    session_id: String,
+    request: Request,
+    sink: &MessageSender,
+) -> Result<()> {
+    let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+    let mut operation = admit_task_intent(&controller, &session_id, &request, &mut store)?;
+    let admitted = store.claim_task_operation(&session_id, &operation.id)?;
+    if !admitted {
+        sink.send_control_wait(Message::Response(Response::success(request.id,
+            store.load_task_operation(&session_id, &operation.id)?.map(|operation| operation.view()))?)).await?;
+        return Ok(());
+    }
+    operation.state = "accepted".into();
+    sink.send_control_wait(Message::Response(Response::success(request.id, json!({"id":operation.id,"state":operation.state}))?)).await?;
+    let result = execute_task_transition(&registry, &controller, &mut operation, &mut store, sink).await;
+    match result {
+        Ok(()) => if operation.state != "superseded" { operation.state = "completed".into(); },
+        Err(error) => { operation.state = "failed".into(); operation.error = Some(format!("{error:#}")); }
+    }
+    if let Err(error) = store.save_task_operation(&operation) {
+        operation.state = "outcome_unknown".into();
+        operation.error = Some(format!("Task outcome could not be persisted: {error:#}. Effects may have occurred"));
+    }
+    sink.send_control_wait(Message::Event(SessionEvent { session_id, event: "task_operation".into(), payload: operation.view() })).await?;
+    Ok(())
+}
+
+async fn execute_task_transition(
+    registry: &SessionControllerRegistry,
+    controller: &SessionController,
+    operation: &mut crate::task::TaskOperation,
+    store: &mut SqliteStore,
+    sink: &MessageSender,
+) -> Result<()> {
+    let task_list = store.list_task(&operation.session_id)?;
+    let session = crate::session::SessionStore::load_session(store, &operation.session_id)?.context("session is missing")?;
+    let current_task = task_list.iter().find(|task| Some(&task.id) == session.current_task_id.as_ref());
+    if operation.action["action"] == "resume" && current_task.is_some_and(|task|
+        task.status == crate::task::TaskStatus::Running && operation.action.get("task_id").and_then(Value::as_str).is_none_or(|id| id == task.id)) {
+        return Ok(());
+    }
+    let mut action = operation.action.clone();
+    if matches!(action["action"].as_str(), Some("permission" | "configure" | "compact")) {
+        action["resume"] = json!(operation.resume_after_transition);
+    }
+    let control = tokio::time::timeout(Duration::from_secs(10), Arc::clone(&controller.control_admission).acquire_owned())
+        .await.context("task transition is waiting for previous cleanup. Execution state is unknown")??;
+    if store.latest_task_operation(&operation.session_id)?.is_none_or(|latest| latest.id != operation.id) {
+        operation.state = "superseded".into();
+        return Ok(());
+    }
+    operation.state = "stopping".into();
+    store.save_task_operation(operation)?;
+    if controller.broker.try_lock().is_err() {
+        controller.cancellation.begin_cleanup(false, false)?;
+        controller.permission.cancel_all(None).await?;
+        if let Err(error) = controller.backend.cleanup_execution(&operation.session_id).await {
+            controller.cancellation.fail_cleanup(&error);
+            return Err(error.context("collect current task before transition"));
+        }
+        controller.cancellation.request(false);
+    }
+    // The old request retains this permit through finalization and output delivery.
+    let execution = tokio::time::timeout(Duration::from_secs(10), Arc::clone(&controller.execution_admission).acquire_owned())
+        .await.context("previous execution did not finish finalization within 10s. Inspect task state before resuming")??;
+    if store.latest_task_operation(&operation.session_id)?.is_none_or(|latest| latest.id != operation.id) {
+        operation.state = "superseded".into();
+        return Ok(());
+    }
+    controller.cancellation.arm(false);
+    drop(control);
+    operation.state = "running".into();
+    store.save_task_operation(operation)?;
+    sink.send_event(SessionEvent {
+        session_id: operation.session_id.clone(), event: "task_operation".into(),
+        payload: json!({"id": operation.id, "state": "running"}),
+    }).await?;
+    let mut broker = controller.broker.lock().await;
+    let (root, session_id, client_id) = broker.lease_identity();
+    let (stop, stopped) = tokio::sync::oneshot::channel();
+    let heartbeat = tokio::spawn(run_lease_heartbeat(root, session_id, client_id, stopped));
+    let mut request = Request { id: 0, method: "task.transition".into(), params: action };
+    let outcome = loop {
+        let result = dispatch_task_attempt(&mut broker, &operation.session_id, request, sink).await;
+        match result {
+            Err(error) => break Err(error),
+            Ok(continuing) => {
+                if !continuing || store.latest_task_operation(&operation.session_id)?.is_none_or(|latest| latest.id != operation.id) { break Ok(()); }
+                request = Request { id: 0, method: "goal.continue".into(), params: json!({}) };
+            }
+        }
+    };
+    *controller.catalog_request.write().await = broker.backend_catalog_request();
+    drop(broker);
+    let _ = stop.send(());
+    heartbeat.await?;
+    outcome?;
+    drop(execution);
+    let _ = registry;
+    Ok(())
+}
+
+async fn dispatch_task_attempt(broker: &mut HarnessBroker, session_id: &str, request: Request, sink: &MessageSender) -> Result<bool> {
+    let (event_sink, mut event_stream) = crate::backend::events::channel();
+    let output = sink.clone();
+    let routed_session = session_id.to_owned();
+    let forwarder = tokio::spawn(async move {
+        while let Some(event) = event_stream.recv().await? {
+            let (name, payload) = if event.kind == "timeline_patch" { ("timeline_patch", event.data) }
+                else { ("backend_event", serde_json::to_value(event)?) };
+            output.send_event(SessionEvent { session_id: routed_session.clone(), event: name.into(), payload }).await?;
+        }
+        Ok::<(), anyhow::Error>(())
+    });
+    let result = broker.dispatch_stream(request, event_sink).await;
+    forwarder.await??;
+    let continuing = result.event.iter().any(|event| event.event == "goal_continue_requested");
+    for event in result.event { sink.send_event(event).await?; }
+    if let Some(failure) = result.response.error() { anyhow::bail!("{}", failure.message); }
+    Ok(continuing)
 }
 
 async fn route_new_session(
@@ -1185,6 +1396,7 @@ async fn route_control_request(
             Some(Response::success(request.id, server_list)?)
         }
         HarnessMethod::BackendMcpSetEnabled => {
+            ensure!(controller.broker.try_lock().is_ok(), "Pause the current task before changing MCP configuration");
             let name = request
                 .params
                 .get("name")
@@ -1331,6 +1543,38 @@ async fn run_lease_heartbeat(
 mod tests {
     use super::*;
     use forge_diff::cache::CacheLimits;
+
+    #[tokio::test]
+    async fn task_stop_intent_and_health_remain_available_while_the_broker_is_owned() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await.unwrap();
+        let controller = registry.resolve(&session_id).await.unwrap();
+        let broker = controller.broker.lock().await;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        let stopping = service.dispatch(Some(session_id.clone()), Request { id: 2, method: "task.transition".into(), params: json!({"operation_id":"stop-once","action":"pause"}) }, &sink);
+        tokio::pin!(stopping);
+        tokio::select! {
+            result = &mut stopping => panic!("stop completed before the old owner settled: {result:?}"),
+            frame = output.recv() => {
+                let frame = frame.unwrap().unwrap();
+                let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+                assert_eq!(value["result"]["state"], "accepted");
+            }
+        }
+        tokio::time::timeout(Duration::from_secs(1), service.dispatch(Some(session_id.clone()), Request { id: 3, method: "health.get".into(), params: json!({}) }, &sink)).await.unwrap().unwrap();
+        let frame = output.recv().await.unwrap().unwrap();
+        let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+        assert_eq!(value["result"]["responsive"], true);
+        drop(frame);
+        drop(broker);
+        tokio::time::timeout(Duration::from_secs(2), &mut stopping).await.unwrap().unwrap();
+        let store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path()).unwrap();
+        assert_eq!(store.load_task_operation(&session_id,"stop-once").unwrap().unwrap().state, "completed");
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
 
     struct SteeringBackend {
         mode: crate::agent::AgentControlMode,

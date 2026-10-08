@@ -28,4 +28,14 @@ response.active_elicitation = { elicitation = { id = "new", response = vim.NIL }
 snapshot.apply(state, response)
 assert(state.goal.state == "paused" and state.goal.completed_at_ms == nil)
 assert(state.active_elicitation.elicitation.id == "new" and state.active_elicitation.elicitation.response == nil)
+response.runtime_epoch, response.snapshot_revision = "first-runtime", 5
+snapshot.apply(state, response)
+local stale = vim.deepcopy(response)
+stale.snapshot_revision, stale.session.name = 4, "stale"
+assert(snapshot.apply(state, stale) == false and state.session.name ~= "stale")
+state.task_operation, state.busy = { id = "old-operation" }, true
+response.runtime_epoch, response.snapshot_revision = "restarted-runtime", 1
+response.task_operation = { state = "outcome_unknown", error = "Interrupted before confirmation" }
+assert(snapshot.apply(state, response))
+assert(not state.busy and not state.task_operation and state.execution_notice == "Interrupted before confirmation")
 print("harness_snapshot: passed")

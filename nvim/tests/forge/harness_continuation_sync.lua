@@ -68,7 +68,7 @@ local success, failure = xpcall(function()
   assert(snapshot_requests == 2, "coalesced invalidation did not request a fresh snapshot")
   assert(goal_requests == 0, "goal advanced using the consumed acceptance snapshot")
   state_reply(snapshot(goal))
-  assert(goal_requests == 1 and state.busy, "goal did not advance after acceptance synchronization")
+  assert(goal_requests == 0 and not state.busy, "snapshot dispatched a duplicate host-owned continuation")
   assert(vim.api.nvim_get_current_win() == focused_window, "continuation changed keyboard focus")
 
   state.busy, state.goal = false, nil
@@ -80,7 +80,7 @@ local success, failure = xpcall(function()
   assert(submitted == nil, "queue drained using an outdated clarification snapshot")
   state_reply(snapshot())
   assert(submitted == "queued after clarification", "clarification completion stranded queued input")
-  assert(goal_requests == 1, "snapshot completion duplicated goal continuation")
+  assert(goal_requests == 0, "snapshot completion duplicated goal continuation")
   state.busy, submitted = false, nil
   state.capability.agent = { catalog = true }
   local followed = false

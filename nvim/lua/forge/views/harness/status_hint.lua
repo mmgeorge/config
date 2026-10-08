@@ -85,7 +85,7 @@ function M.render(transcript, commands, width)
   end
   if working then
     local session = require("forge.session").harness.session or {}
-    local capture = require("forge.infra.highlights").harness_mode(session.mode or session.execution_mode)
+    local capture = require("forge.infra.highlights").harness_mode(session.execution_mode)
     local text = vim.api.nvim_buf_get_lines(target_buffer, row, row + 1, false)[1]
     local function draw()
       if not vim.api.nvim_buf_is_valid(target_buffer) then M.clear(target_buffer) return end

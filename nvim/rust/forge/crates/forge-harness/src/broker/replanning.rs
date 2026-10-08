@@ -9,22 +9,23 @@ struct PlanChoice {
     revision_count: u32,
     implemented: bool,
     state: PlanState,
+    digest: Option<String>,
+    task: Option<crate::task::TaskRecord>,
 }
 
 impl HarnessBroker {
     /// List submitted plans in the current workspace with durable completion evidence.
     pub(super) fn list_replanning_choices(&self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut choices = Vec::new();
-        for session in self.store.list_session(Some(&self.session.workspace))? {
+        for session in [&self.session] {
             let execution = self.store.list_plan_execution(&session.id)?;
             for plan in self.store.list_plan(&session.id)? {
-                if plan.model_revision == 0 {
-                    continue;
-                }
                 choices.push(PlanChoice {
                     implemented: execution.iter().any(|record| {
                         record.plan_id == plan.id && record.state == PlanExecutionState::Complete
                     }),
+                    task: self.store.list_task(&session.id)?.into_iter().find(|task| task.plan_id.as_deref() == Some(&plan.id)),
+                    digest: plan.review_digest.clone(),
                     id: plan.id,
                     created_at_ms: plan.created_at_ms,
                     title: plan.title,
@@ -91,24 +92,9 @@ impl HarnessBroker {
             document.title = request.lines().next().unwrap_or("Declaration design").chars().take(100).collect();
             document.overview = request.clone();
         }
-        if let Some(active) = self
-            .session
-            .active_plan_id
-            .as_deref()
-            .map(|id| self.store.load_plan(id))
-            .transpose()?
-            .flatten()
-            && matches!(
-                active.state,
-                PlanState::Generating
-                    | PlanState::Revising
-                    | PlanState::AwaitingInput
-                    | PlanState::AwaitingReview
-                    | PlanState::Failed
-            )
-        {
-            let (_, mut cancelled) = self.cancel_plan()?;
-            leading_event.append(&mut cancelled);
+        self.pause_task(false).await?;
+        if let Some(permission) = self.session.plan_permission {
+            self.select_execution_mode(json!({"mode":permission}))?;
         }
         let now_ms = self.clock.now_ms();
         let plan_id = document.plan_id.clone();
@@ -137,10 +123,13 @@ impl HarnessBroker {
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
         };
-        self.store.save_plan(&plan)?;
-        self.session.mode = HarnessMode::Plan;
+        let mut task = crate::task::TaskRecord::new(self.session.id.clone(), plan.title.clone(), crate::task::TaskKind::Plan, self.session.execution_mode, now_ms);
+        task.plan_id = Some(plan.id.clone());
+        task.operation_id = self.active_operation_id.clone();
+        task.begin(now_ms)?;
+        self.session.current_task_id = Some(task.id.clone());
         self.session.active_plan_id = Some(plan_id.clone());
-        self.save_session()?;
+        self.store.select_task(&self.session, Some(&task), None, Some(&plan), &self.client_id)?;
         if let Some(goal) = self.current_goal()?
             && goal.state == GoalState::Active
         {

@@ -20,7 +20,7 @@ pub use steering::SteerTarget;
 use crate::agent::AgentCapability;
 use crate::goal::TurnEvidence;
 use crate::plan::{PlanQuestionAnswer, PlanQuestionSet, PlanQuestionWithdrawal};
-use crate::session::{ContextUsage, ExecutionMode};
+use crate::session::{ContextUsage, PermissionMode};
 use anyhow::Result;
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
@@ -71,7 +71,7 @@ pub struct BackendCapability {
     pub fast_mode: bool,
     pub permission_control: bool,
     #[serde(default)]
-    pub execution_mode_list: Vec<ExecutionMode>,
+    pub execution_mode_list: Vec<PermissionMode>,
     pub agent: AgentCapability,
     #[serde(default)]
     pub catalog: CatalogCapability,
@@ -109,7 +109,7 @@ pub struct BackendRequest {
     pub effort: String,
     pub context_window: Option<String>,
     pub fast_mode: bool,
-    pub execution_mode: ExecutionMode,
+    pub execution_mode: PermissionMode,
     pub backend_session_id: Option<String>,
     #[serde(skip, default)]
     pub control_context: Option<crate::control_tools::ControlTurnContext>,
@@ -536,7 +536,7 @@ pub trait Backend: Send + Sync {
 
     /// Interrupt the parent and descendants for one session and await terminal evidence.
     async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
-        Ok(())
+        anyhow::bail!("backend cannot confirm execution cleanup")
     }
 
     /// Stop the active provider transport after its prompt future is cancelled.
@@ -646,6 +646,9 @@ impl MockBackend {
 
 #[async_trait]
 impl Backend for MockBackend {
+    async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+        Ok(())
+    }
     async fn generate_text(&self, _request: BackendCatalogRequest, purpose: TextGeneration, _model: &str, _history: &str) -> Result<String> {
         if let Some(delay) = self.delay { tokio::time::sleep(delay).await; }
         purpose.validate(match purpose {
@@ -1100,10 +1103,10 @@ fn mock_capability() -> BackendCapability {
         fast_mode: true,
         permission_control: true,
         execution_mode_list: vec![
-            ExecutionMode::Read,
-            ExecutionMode::Write,
-            ExecutionMode::Full,
-            ExecutionMode::Yolo,
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Full,
+            PermissionMode::Yolo,
         ],
         agent: AgentCapability::default(),
         catalog: CatalogCapability::default(),
@@ -1120,7 +1123,7 @@ mod test {
         assert!(!prompt.contains("harness_plan_edit"));
     }
     use super::{Backend, BackendRequest, MockBackend, PromptMode};
-    use crate::session::ExecutionMode;
+    use crate::session::PermissionMode;
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -1148,7 +1151,7 @@ mod test {
                         effort: "low".into(),
                         context_window: None,
                         fast_mode: false,
-                        execution_mode: ExecutionMode::Read,
+                        execution_mode: PermissionMode::Read,
                         backend_session_id: None,
                         control_context: None,
                     },

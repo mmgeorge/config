@@ -25,6 +25,7 @@ struct Budget {
 #[derive(Clone)]
 pub struct MessageSender {
     sender: mpsc::Sender<EncodedFrame>,
+    control_sender: mpsc::Sender<EncodedFrame>,
     budget: Arc<Mutex<Budget>>,
     failure: watch::Sender<Option<String>>,
     capacity: watch::Sender<()>,
@@ -34,6 +35,7 @@ pub struct MessageSender {
 
 pub struct MessageReceiver {
     receiver: mpsc::Receiver<EncodedFrame>,
+    control_receiver: mpsc::Receiver<EncodedFrame>,
     failure: watch::Receiver<Option<String>>,
 }
 
@@ -53,11 +55,13 @@ struct LimitedWriter {
 
 pub fn channel() -> (MessageSender, MessageReceiver) {
     let (sender, receiver) = mpsc::channel(MAX_PENDING_FRAMES);
+    let (control_sender, control_receiver) = mpsc::channel(RESERVED_CONTROL_RECORDS);
     let (failure, failed) = watch::channel(None);
     let (capacity, _) = watch::channel(());
     (
         MessageSender {
             sender,
+            control_sender,
             budget: Arc::new(Mutex::new(Budget::default())),
             failure,
             capacity,
@@ -66,6 +70,7 @@ pub fn channel() -> (MessageSender, MessageReceiver) {
         },
         MessageReceiver {
             receiver,
+            control_receiver,
             failure: failed,
         },
     )
@@ -201,6 +206,23 @@ impl MessageSender {
         self.admit(message, true, false)
     }
 
+    /// Waits for reserved control capacity without treating congestion as transport failure.
+    pub async fn send_control_wait(&self, message: impl Serialize) -> io::Result<()> {
+        let mut capacity = self.capacity.subscribe();
+        loop {
+            match self.try_admit(&message, true, false) {
+                Ok(()) => return Ok(()),
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {},
+                Err(error) => return Err(error),
+            }
+            tokio::select! {
+                _ = capacity.changed() => {},
+                error = self.failed() => return Err(error),
+                _ = self.control_sender.closed() => return Err(io::Error::new(io::ErrorKind::BrokenPipe, "control output closed")),
+            }
+        }
+    }
+
     pub fn send_terminal(&self, message: impl Serialize) -> io::Result<()> {
         self.admit(message, false, true)
     }
@@ -255,6 +277,7 @@ impl MessageSender {
                 MAX_QUEUED_BYTES - RESERVED_CONTROL_RECORDS * MAX_CONTROL_BYTES
             };
             if budget.frames == MAX_PENDING_FRAMES
+                || (control && budget.frames - budget.normal == RESERVED_CONTROL_RECORDS)
                 || (!control && budget.normal == MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS)
                 || budget.bytes + limit > byte_limit
             {
@@ -281,8 +304,8 @@ impl MessageSender {
             budget.bytes -= limit - frame.bytes.len();
             frame.reservation = frame.bytes.len();
         }
-        self.sender
-            .try_send(frame)
+        let sender = if control { &self.control_sender } else { &self.sender };
+        sender.try_send(frame)
             .map_err(|error| io::Error::new(io::ErrorKind::BrokenPipe, error.to_string()))
     }
 }
@@ -297,6 +320,7 @@ impl MessageReceiver {
 
     pub fn try_recv(&mut self) -> io::Result<EncodedFrame> {
         self.check()?;
+        if let Ok(frame) = self.control_receiver.try_recv() { return Ok(frame); }
         self.receiver.try_recv().map_err(|error| {
             let kind = match error {
                 mpsc::error::TryRecvError::Empty => io::ErrorKind::WouldBlock,
@@ -310,8 +334,13 @@ impl MessageReceiver {
         if let Some(failure) = self.failure.borrow().clone() {
             return Err(io::Error::new(io::ErrorKind::BrokenPipe, failure));
         }
+        if let Ok(frame) = self.control_receiver.try_recv() { return Ok(Some(frame)); }
         tokio::select! {
             biased;
+            frame = self.control_receiver.recv() => match frame {
+                Some(frame) => Ok(Some(frame)),
+                None => Ok(self.receiver.recv().await),
+            },
             changed = self.failure.changed() => {
                 if changed.is_ok() {
                     return Err(io::Error::new(io::ErrorKind::BrokenPipe,
@@ -463,7 +492,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn reserved_control_capacity_preserves_fifo_order() {
+    async fn reserved_control_capacity_precedes_bulk_output_without_reordering_each_lane() {
         let (sender, mut receiver) = channel();
         for sequence in 0..MAX_PENDING_FRAMES - RESERVED_CONTROL_RECORDS {
             sender.send(sequence).unwrap();
@@ -471,7 +500,7 @@ mod tests {
         for sequence in 0..RESERVED_CONTROL_RECORDS {
             sender.send_control(sequence + 96).unwrap();
         }
-        for sequence in 0..MAX_PENDING_FRAMES {
+        for sequence in (96..MAX_PENDING_FRAMES).chain(0..96) {
             let frame = receiver.recv().await.unwrap().unwrap();
             assert_eq!(frame.bytes(), format!("{sequence}\n").as_bytes());
         }

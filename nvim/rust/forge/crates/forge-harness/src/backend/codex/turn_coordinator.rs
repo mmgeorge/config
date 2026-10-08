@@ -805,7 +805,7 @@ mod test {
         use crate::backend::{BackendInput, PromptMode};
         use crate::backend::steering::SteeringLane;
         use crate::backend::approval::PermissionCoordinator;
-        use crate::session::ExecutionMode;
+        use crate::session::PermissionMode;
         use crate::trace::TraceStore;
         use futures_util::{SinkExt, StreamExt};
         use std::sync::Arc;
@@ -836,13 +836,13 @@ mod test {
             }
             let _ = socket.next().await;
         });
-        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, ExecutionMode::Read,
+        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
             permission, None, trace, "session".into()).await?;
         let request = BackendRequest {
             harness_session_id: "session".into(), workspace,
             input: BackendInput::from_text("plan out a new one"), mode: PromptMode::Chat,
             model: "gpt-5.6-terra".into(), effort: "medium".into(), context_window: None,
-            fast_mode: false, execution_mode: ExecutionMode::Read,
+            fast_mode: false, execution_mode: PermissionMode::Read,
             backend_session_id: Some("parent".into()), control_context: None,
         };
         let lane = SteeringLane::default();
@@ -865,7 +865,7 @@ mod test {
     async fn parent_restart_retains_child_progress_and_early_completion() -> Result<()> {
         use crate::backend::approval::PermissionCoordinator;
         use crate::backend::{BackendInput, PromptMode};
-        use crate::session::ExecutionMode;
+        use crate::session::PermissionMode;
         use crate::trace::TraceStore;
         use futures_util::{SinkExt, StreamExt};
         use std::sync::Arc;
@@ -893,11 +893,11 @@ mod test {
             }
             let _ = socket.next().await;
         });
-        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, ExecutionMode::Read, permission, None, trace, "session".into()).await?;
+        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read, permission, None, trace, "session".into()).await?;
         let request = BackendRequest {
             harness_session_id: "session".into(), workspace, input: BackendInput::from_text("parent"),
             mode: PromptMode::Chat, model: "gpt-5.6-terra".into(), effort: "medium".into(),
-            context_window: None, fast_mode: false, execution_mode: ExecutionMode::Read,
+            context_window: None, fast_mode: false, execution_mode: PermissionMode::Read,
             backend_session_id: Some("parent".into()), control_context: None,
         };
         let lane = crate::backend::steering::SteeringLane::default();
@@ -926,7 +926,7 @@ mod test {
         use crate::backend::approval::PermissionCoordinator;
         use crate::backend::steering::SteeringLane;
         use crate::backend::{BackendInput, PromptMode};
-        use crate::session::ExecutionMode;
+        use crate::session::PermissionMode;
         use crate::trace::TraceStore;
         use futures_util::{SinkExt, StreamExt};
         use std::sync::Arc;
@@ -1011,7 +1011,7 @@ mod test {
             let mut process = CodexJsonRpc::connect(
                 &endpoint,
                 &workspace,
-                ExecutionMode::Read,
+                PermissionMode::Read,
                 permission,
                 None,
                 trace,
@@ -1027,7 +1027,7 @@ mod test {
                 effort: "medium".into(),
                 context_window: None,
                 fast_mode: false,
-                execution_mode: ExecutionMode::Read,
+                execution_mode: PermissionMode::Read,
                 backend_session_id: Some("parent".into()),
                 control_context: None,
             };

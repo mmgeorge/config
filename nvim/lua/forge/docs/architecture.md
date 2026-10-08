@@ -2445,7 +2445,7 @@ counts source changes, accepted transitions, and distinct verification command r
 Reads and repeated identical checks do not reset the guard. Two consecutive turns without progress
 or the configured total-turn limit stop automatic continuation. The default limit is twenty turns.
 Interrupt, pause, and detached-host recovery retain the phase and existing source changes.
-`/goal resume` explicitly resumes the same execution and resets its continuation budget.
+`/task resume` explicitly resumes the selected execution and resets its continuation budget.
 
 Repository-independent prompt history stays ordered newest first and pruned transactionally to
 100 entries. Every broker snapshot carries that shared list, while
@@ -2458,12 +2458,13 @@ one resumable SDK `Session`. The SDK owns CLI startup and authentication when th
 stays empty. An explicit command remains available for development and pinned installations.
 The backend subscribes before every send, forwards deltas immediately, and lets
 `CopilotEventDecoder` normalize messages, reasoning, tool lifecycle, usage, tasks, and subagent
-events into the same broker model as Codex. Bare `/plan` uses the existing session mode transition
-without creating a plan or sending a model request. `/plan <request>` starts planning immediately,
-and an ordinary prompt in Plan mode starts planning when no active plan controls own the input.
-`/plan` does not select a provider-native plan mode.
-Harness sends the same structured planning contract through both backends without changing the
-session's retained Read, Write, Full, or YOLO authorization. `plan/prompts/planning.md` owns the
+events into the same broker model as Codex. Bare `/plan` opens the current conversation's
+plans without a model request. `/plan <request>` creates a planning task. Ordinary text
+never creates a planning task implicitly. `/mode` and the direct Read, Write, Full, and YOLO
+commands select permissions independently of Plan, Execute, and Goal workflows.
+`/plan` does not select a provider-native plan mode. Both backends receive the same planning
+contract. The configured Plan permission defaults to retaining the conversation's permission.
+`plan/prompts/planning.md` owns the
 JSON authoring procedure, field contracts, independence checks, and complete edit example.
 `PlanPrompt` embeds that file with `include_str!` for draft, feedback, and revision requests.
 The example passes the real edit, submission-validation, and rendering paths in tests. Harness
@@ -2493,7 +2494,7 @@ A separate accepted-request identity set keeps successful provider request repla
 without allowing rejected requests to reserve that identity.
 The question tool also works during ordinary chat, goal, and execution turns. Those questions
 persist on their owning `Exchange`, while planning questions remain on `PlanRecord`.
-After submission, a normal prompt in Plan mode creates a plan-associated discussion exchange.
+After submission, a normal prompt associated with the selected waiting Plan task creates a plan discussion exchange.
 `PromptMode::PlanDiscussion` supplies the canonical document and instructions to answer questions
 without editing or resubmitting. Discussion questions remain on that exchange, and clarification
 and answer continuations retain its planning context. Reading leaves `AwaitingReview` unchanged.
@@ -5319,3 +5320,62 @@ Lua obtains mode, viewed state, and submission outcomes only through `review.beg
 Commit detail reads resolve one immutable full commit identity to its first parent and subject through `GithubReviewRemote`. Expansion compares that parent SHA to the selected commit SHA. A commit with no parents produces an explicit root-commit unavailable state because no comparison base exists.
 
 `forge-review::commit_diff::CommitDiffStore` owns expanded commit rows separately from pull-request file state. Each record uses the full commit SHA and repository-relative path as its key, retains the subject target across expansion, and admits at most 64 records and 16 MiB. Failed admission preserves every existing record. Path-only pull-request `RetainedFile` entries never satisfy or replace a commit-scoped lookup.
+
+
+## Harness task ownership and recovery
+
+The broker owns task transitions. Neovim presents task history and submits durable intents.
+`TaskRecord` identifies a conversation-scoped Plan, Execute, or Goal workflow, its saved
+permission, phase, lifecycle status, generation, and attempt identity. Plan and goal records
+retain their workflow-specific evidence. `current_task_id` selects the task independently of
+the conversation permission. Clearing a task retains its history and artifacts.
+
+`/task` lists the current task first and previous tasks by activity. `/task new` offers the
+three workflow kinds. `/task resume`, `/task pause`, and `/task clear` operate on the selected
+task. `/execute` selects a submitted plan and `/execute last` selects the most recently
+submitted plan in this conversation. Selection accepts the exact revision and transitions its
+Plan task into Execute. Terminal executions require an explicit fork. Forking a plan uses its
+latest saved design and reassesses the current repository without copying execution evidence.
+
+The default writable permission is Write and applies to new Goal tasks and accepted plans.
+The Plan permission defaults to Keep current. Both preferences live in `/config`.
+Explicit resume restores saved permission. Selecting Read pauses Execute and Goal tasks.
+Interrupting retains the selected task. The next ordinary message resumes a paused Plan,
+Execute, or Goal task with its saved context and the message as additional instructions.
+Clearing, switching, or completing the task ends that message association. A resumed plan
+awaiting review still requires explicit acceptance before execution.
+Changing permission while paused does not restart execution. Model changes during execution
+use the same stop-and-resume coordinator. MCP configuration changes require a paused task.
+
+`task.transition` persists an operation ID on the ordered host input lane before concurrent
+dispatch or acknowledgement. A compare-and-set claim permits one execution of each intent.
+Pending pause or clear intent takes precedence over stale Running records when settings change.
+Settings received before a new task acquires its identity reject visibly without displacing
+that task. The coordinator
+closes conflicting execution admission, collects the previous provider attempt, finishes
+checkpoint finalization, and applies the latest intent. Superseded intents cannot start a
+provider attempt. Ctrl-C submits a pause intent. Backend goal continuation stays inside the
+service-owned execution lifetime rather than relying on Lua to submit the next turn.
+`task.operation` queries the original ID after uncertain acknowledgement and never replays it.
+
+SQLite uses WAL and FULL synchronization. Acceptance commits the task, goal, execution,
+accepted revision, and acceptance event together. Session ownership includes an operating-system
+file lock, so an expired timestamp cannot admit a second live runtime. Restart recovery retains
+committed phase and completion evidence, suspends unfinished attempts, and marks unsettled
+operations outcome-unknown. No recovered task starts a provider automatically.
+
+Health requests use reserved admission and output scheduling independently of the broker
+execution lock. The UI sends at most one outstanding health request per conversation. Ten
+seconds without a response shows connection uncertainty. Thirty seconds without provider
+activity shows an explicit wait without failing or repeating work. Bulk output remains bounded,
+and control frames receive priority between complete output frames.
+
+Snapshots are scoped to their originating conversation, host generation, runtime epoch, and
+monotonic snapshot revision. An older snapshot cannot replace newer task state. A new runtime
+clears obsolete UI operation ownership while retaining an uncertain durable operation outcome.
+Task status responses omit the original prompt and bound error text to 4096 characters.
+Transition admission and finalization waits stop after ten seconds with a visible diagnostic.
+Failed state
+refreshes remain visible and retry after one, two, and four seconds. `/task refresh` requests a
+new authoritative snapshot. Failure, disconnect, and unknown operation outcomes suppress
+automatic queue draining. Queued input retains task identity and is not retargeted by a switch.

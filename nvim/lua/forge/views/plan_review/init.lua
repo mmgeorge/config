@@ -166,7 +166,7 @@ local function accept(plan, review)
     end
     local controller = require("forge.views.harness.controller")
     controller.render()
-    vim.schedule(function() controller.present_plan_question(true) end)
+    controller.task_transition({ action = "execute", plan_id = plan.id, digest = plan.review_digest })
   end)
 end
 

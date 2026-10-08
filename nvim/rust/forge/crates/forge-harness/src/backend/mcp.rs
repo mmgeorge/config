@@ -151,7 +151,7 @@ mod test {
         BackendCatalogRequest {
             harness_session_id: "test".into(),
             workspace: ".".into(),
-            execution_mode: crate::session::ExecutionMode::Read,
+            execution_mode: crate::session::PermissionMode::Read,
             backend_session_id: None,
         }
     }

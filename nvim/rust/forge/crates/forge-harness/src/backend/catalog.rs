@@ -1,4 +1,4 @@
-use crate::session::ExecutionMode;
+use crate::session::PermissionMode;
 use serde::{Deserialize, Serialize};
 
 /// Describes provider-owned catalogs and their active-turn mutation behavior.
@@ -14,7 +14,7 @@ pub struct CatalogCapability {
 pub struct BackendCatalogRequest {
     pub harness_session_id: String,
     pub workspace: String,
-    pub execution_mode: ExecutionMode,
+    pub execution_mode: PermissionMode,
     pub backend_session_id: Option<String>,
 }
 

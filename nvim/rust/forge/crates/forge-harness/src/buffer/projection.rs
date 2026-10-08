@@ -595,7 +595,7 @@ impl TimelineRenderer<'_> {
                 format!(
                     "ForgeHarness{}",
                     match mode {
-                        crate::session::HarnessMode::Yolo => "Yolo",
+                        crate::session::PermissionMode::Yolo => "Yolo",
                         mode => mode.label(),
                     }
                 )
@@ -1499,13 +1499,12 @@ mod tests {
     }
 
     #[test]
-    fn activity_summary_uses_retained_mode_and_recognizes_legacy_planning() {
+    fn activity_summary_uses_permission_and_separate_planning_kind() {
         for (mode, capture) in [
             ("read", "ForgeHarnessRead"),
             ("write", "ForgeHarnessWrite"),
             ("full", "ForgeHarnessFull"),
             ("yolo", "ForgeHarnessYolo"),
-            ("plan", "ForgeHarnessPlan"),
         ] {
             for completed in [false, true] {
                 let exchange: Exchange = serde_json::from_value(json!({

@@ -7,7 +7,7 @@ use crate::backend::{
     McpStatus, McpToolDefinition, PromptMode, SkillDefinition,
 };
 use crate::control_tools::ControlToolRegistry;
-use crate::session::ExecutionMode;
+use crate::session::PermissionMode;
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
@@ -72,10 +72,10 @@ fn capability() -> BackendCapability {
         fast_mode: true,
         permission_control: true,
         execution_mode_list: vec![
-            ExecutionMode::Read,
-            ExecutionMode::Write,
-            ExecutionMode::Full,
-            ExecutionMode::Yolo,
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Full,
+            PermissionMode::Yolo,
         ],
         agent: crate::agent::AgentCapability::codex(),
         catalog: CatalogCapability {
@@ -124,7 +124,7 @@ impl CodexBackend {
         );
         Ok(Self {
             runtime: CodexRuntime::new(
-                CodexSecurity::new(ExecutionMode::Read).launch_command(&command),
+                CodexSecurity::new(PermissionMode::Read).launch_command(&command),
             ),
             default_model: Mutex::new(None),
             steering_by_session: Mutex::new(HashMap::new()),
@@ -1119,8 +1119,10 @@ impl Backend for CodexBackend {
                 .with_context(|| format!("skill ${name} omitted its provider path"))?;
             input.push(json!({ "type": "skill", "name": name, "path": path }));
         }
-        let native_resume =
-            request.mode == PromptMode::GoalContinuation && request_text.trim() == "/goal resume";
+        let native_resume = request.mode == PromptMode::GoalContinuation
+            && request_text.lines().next() == Some("/goal resume");
+        let resume_message = native_resume.then(|| request_text.split_once("\n\nAdditional user instructions:\n")
+            .map(|(_, text)| text.to_owned())).flatten();
         let admission = if native_resume {
             self.resume_native_goal_turn(process, &mut output, &request, &thread_id)
                 .await?
@@ -1157,7 +1159,7 @@ impl Backend for CodexBackend {
                 .and_then(Value::as_str)
                 .context("Codex turn/start response omitted turn id")?
                 .to_owned();
-            let completed = turn_coordinator::CodexTurnCoordinator::new(
+            let coordinator = turn_coordinator::CodexTurnCoordinator::new(
                 self,
                 process,
                 &mut output,
@@ -1165,13 +1167,18 @@ impl Backend for CodexBackend {
                 coordinator_event_sink.clone(),
                 &request,
                 &thread_id,
-            )
-            .run(
+            );
+            let completion = coordinator.run(
                 current_turn_id.clone(),
                 provider_turn_started,
                 observed_message_list,
-            )
-            .await?;
+            );
+            let completed = if let Some(text) = resume_message {
+                let lane = self.steering_lane(&request.harness_session_id).await;
+                let (completed, delivered) = tokio::join!(completion, lane.steer(text));
+                delivered.context("deliver instructions to resumed native goal")?;
+                completed?
+            } else { completion.await? };
             let status = completed
                 .pointer("/turn/status")
                 .or_else(|| completed.get("status"))
@@ -1190,6 +1197,7 @@ impl Backend for CodexBackend {
                     .unwrap_or(current_turn_id),
             )
         } else {
+            anyhow::ensure!(resume_message.is_none(), "native goal settled before receiving the resume message");
             None
         };
         self.active_turn_by_session.lock().await.insert(
@@ -1727,7 +1735,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            ExecutionMode::Read,
+            PermissionMode::Read,
             permission,
             None,
             trace,
@@ -1758,7 +1766,7 @@ mod test {
                     .to_string_lossy()
                     .into_owned(),
                 backend_session_id: None,
-                execution_mode: ExecutionMode::Read,
+                execution_mode: PermissionMode::Read,
             }),
         )
         .await;
@@ -1801,7 +1809,7 @@ mod test {
             effort: "medium".into(),
             context_window: None,
             fast_mode: false,
-            execution_mode: ExecutionMode::Read,
+            execution_mode: PermissionMode::Read,
             backend_session_id: Some("source-thread".into()),
             control_context: None,
         };
@@ -2023,7 +2031,7 @@ mod test {
             let process = CodexJsonRpc::connect(
                 &endpoint,
                 &workspace,
-                ExecutionMode::Read,
+                PermissionMode::Read,
                 permission,
                 None,
                 trace,
@@ -2049,7 +2057,7 @@ mod test {
                         effort: "medium".into(),
                         context_window: None,
                         fast_mode: false,
-                        execution_mode: ExecutionMode::Read,
+                        execution_mode: PermissionMode::Read,
                         backend_session_id: Some("parent".into()),
                         control_context: None,
                     },
@@ -2100,8 +2108,8 @@ mod test {
     #[tokio::test]
     async fn native_resume_adopts_auto_started_turn_without_explicit_start() -> Result<()> {
         use futures_util::{SinkExt, StreamExt};
-        for (before_ack, starts_turn) in
-            [(true, true), (false, true), (true, false), (false, false)]
+        for (before_ack, starts_turn, with_message) in
+            [(true, true, false), (false, true, false), (true, false, false), (false, false, false), (false, true, true)]
         {
             let fixture = tempfile::tempdir()?;
             let workspace = fixture.path().to_string_lossy().into_owned();
@@ -2163,6 +2171,7 @@ mod test {
                         json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"resumed","status":"completed"}}}),
                     ]);
                 }
+                let deferred = if with_message { messages.split_off(messages.len() - 2) } else { Vec::new() };
                 messages.push(json!({"method":"thread/goal/updated","params":{"threadId":"parent","goal":{"status":"usageLimited"}}}));
                 if before_ack {
                     messages.push(acknowledgement);
@@ -2175,6 +2184,16 @@ mod test {
                         .await
                         .unwrap();
                 }
+                if with_message {
+                    let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                    assert_eq!(request["method"], "turn/steer");
+                    assert_eq!(request["params"]["expectedTurnId"], "resumed");
+                    assert_eq!(request["params"]["input"][0]["text"], "Keep the original objective and add tests");
+                    socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":{"turnId":"resumed"}}).to_string().into())).await.unwrap();
+                    for message in deferred {
+                        socket.send(tokio_tungstenite::tungstenite::Message::Text(message.to_string().into())).await.unwrap();
+                    }
+                }
                 if let Some(Ok(message)) = socket.next().await {
                     assert!(
                         !message.is_text(),
@@ -2185,7 +2204,7 @@ mod test {
             let process = CodexJsonRpc::connect(
                 &endpoint,
                 &workspace,
-                ExecutionMode::Read,
+                PermissionMode::Read,
                 permission,
                 None,
                 trace,
@@ -2205,13 +2224,13 @@ mod test {
                     BackendRequest {
                         harness_session_id: "session".into(),
                         workspace,
-                        input: BackendInput::from_text("/goal resume"),
+                        input: BackendInput::from_text(if with_message { "/goal resume\n\nAdditional user instructions:\nKeep the original objective and add tests" } else { "/goal resume" }),
                         mode: PromptMode::GoalContinuation,
                         model: "gpt-5.6-terra".into(),
                         effort: "medium".into(),
                         context_window: None,
                         fast_mode: false,
-                        execution_mode: ExecutionMode::Read,
+                        execution_mode: PermissionMode::Read,
                         backend_session_id: Some("parent".into()),
                         control_context: None,
                     },

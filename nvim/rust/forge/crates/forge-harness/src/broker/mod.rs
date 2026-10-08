@@ -36,7 +36,7 @@ use crate::plan::{
 use crate::protocol::HarnessMethod;
 use crate::rustdoc::{RustdocResolver, RustdocResolverConfig, validate_plan_rust_api};
 use crate::session::{
-    ContextUsage, ExecutionMode, HarnessMode, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
+    ContextUsage, PermissionMode, HarnessPreference, HarnessSession, ModelSetting, PlanExecutor,
     ProviderForkState, SessionStore,
 };
 use crate::storage::SqliteStore;
@@ -54,7 +54,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{
     Arc, RwLock,
-    atomic::{AtomicBool, Ordering},
+    atomic::{AtomicBool, AtomicU64, Ordering},
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 use tokio::sync::Notify;
@@ -103,7 +103,11 @@ pub struct InitializeRequest {
 /// Represents the complete client-visible state for one active session.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
+    pub runtime_epoch: String,
+    pub snapshot_revision: u64,
+    pub task_operation: Option<Value>,
     pub session: HarnessSession,
+    pub task: Vec<crate::task::TaskRecord>,
     pub exchange: Vec<Exchange>,
     pub capability: BackendCapability,
     pub no_checkpoint: bool,
@@ -456,6 +460,9 @@ impl ExchangeAdmission {
 
 /// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
 pub struct HarnessBroker {
+    active_operation_id: Option<String>,
+    runtime_epoch: String,
+    snapshot_revision: AtomicU64,
     repositories: Arc<forge_git::store::RepositoryStore>,
     diff: Arc<forge_diff::engine::DiffEngine>,
     store: SqliteStore,
@@ -592,8 +599,8 @@ impl HarnessBroker {
                             plan_auto_approve_revisions: preference.as_ref().is_none_or(|value| value.plan_auto_approve_revisions),
                             context_window: None,
                             fast_mode: preference.as_ref().is_some_and(|value| value.fast_mode),
-                            execution_mode: ExecutionMode::Read,
-                            mode: HarnessMode::Read,
+                            execution_mode: PermissionMode::Read,
+                            current_task_id: None, default_write_permission: preference.as_ref().map_or(PermissionMode::Write, |value| value.default_write_permission), plan_permission: preference.as_ref().and_then(|value| value.plan_permission),
                             created_at_ms: now_ms,
                             updated_at_ms: now_ms,
                             active_plan_id: None,
@@ -623,6 +630,7 @@ impl HarnessBroker {
             session.resolved_model = Some(session.model.clone());
         }
         session.updated_at_ms = now_ms;
+        store.lock_session(&session.id)?;
         store.save_session(&session)?;
         if store
             .list_agent_run(&session.id)?
@@ -643,11 +651,20 @@ impl HarnessBroker {
         capability.native_fork = session.native_fork || capability.native_fork;
         capability.native_compact = session.native_compact || capability.native_compact;
         store.interrupt_detached_execution(&session.id)?;
+        session = store.load_session(&session.id)?.context("session disappeared during recovery")?;
+        if store.list_task(&session.id)?.iter().any(|task| Some(&task.id) == session.current_task_id.as_ref()
+            && task.kind == crate::task::TaskKind::Plan && task.status == crate::task::TaskStatus::Paused) {
+            session.active_plan_id = None;
+            store.save_owned_session(&session, &request.client_id)?;
+        }
         let agent_registry = load_agent_registry(&store, &session.id)?;
         let presentation = Arc::new(std::sync::Mutex::new(SessionPresentation::new(
             session.id.clone(),
         )));
         let broker = Self {
+            active_operation_id: None,
+            runtime_epoch: Uuid::new_v4().to_string(),
+            snapshot_revision: AtomicU64::new(0),
             repositories: Arc::clone(&runtime.repositories),
             diff: Arc::clone(&runtime.diff),
             store,
@@ -868,7 +885,11 @@ impl HarnessBroker {
             })
             .collect();
         Ok(BrokerSnapshot {
+            runtime_epoch: self.runtime_epoch.clone(),
+            snapshot_revision: self.snapshot_revision.fetch_add(1, Ordering::Relaxed) + 1,
+            task_operation: self.store.latest_task_operation(&self.session.id)?.map(|operation| operation.view()),
             session: self.session.clone(),
+            task: self.store.list_task(&self.session.id)?,
             exchange: interaction,
             capability: self.capability.clone(),
             no_checkpoint: matches!(self.workspace_kind, WorkspaceKind::Untracked(_)),
@@ -959,7 +980,17 @@ impl HarnessBroker {
             "request_received",
             json!({ "request_id": id, "method": request.method }),
         );
-        let outcome = self.dispatch_inner(method, request.params).await;
+        if method == HarnessMethod::TaskTransition {
+            self.active_operation_id = request.params.get("operation_id").and_then(Value::as_str).map(str::to_owned);
+        } else if method != HarnessMethod::GoalContinue {
+            self.active_operation_id = None;
+        }
+        let mut outcome = self.dispatch_inner(method, request.params).await;
+        if !matches!(method, HarnessMethod::StateGet | HarnessMethod::TaskList | HarnessMethod::PlanList) {
+            if let Err(error) = self.settle_task(outcome.as_ref().err().map(|error| format!("{error:#}"))) {
+                outcome = Err(error.context("persist task outcome"));
+            }
+        }
         match outcome {
             Ok((value, mut event)) => {
                 self.active_wait_projection = None;
@@ -1086,6 +1117,9 @@ impl HarnessBroker {
             self.refresh_lease()?;
         }
         match method {
+            HarnessMethod::TaskList => Ok((serde_json::to_value(self.store.list_task(&self.session.id)?)?, Vec::new())),
+            HarnessMethod::TaskTransition => self.transition_task(params).await,
+            HarnessMethod::TaskOperation | HarnessMethod::Health => anyhow::bail!("control requires the service coordinator"),
             HarnessMethod::StateGet => Ok((serde_json::to_value(self.snapshot()?)?, Vec::new())),
             HarnessMethod::TraceStatus => {
                 Ok((serde_json::to_value(self.trace.status())?, Vec::new()))
@@ -1108,8 +1142,8 @@ impl HarnessBroker {
             HarnessMethod::AgentStart => self.start_agent(params).await,
             HarnessMethod::PermissionsOpen => self.open_permission_document(),
             HarnessMethod::PermissionsSave => self.save_permission_document(params),
-            HarnessMethod::SessionExecutionMode => self.select_execution_mode(params),
-            HarnessMethod::SessionMode => self.select_harness_mode(params),
+            HarnessMethod::SessionPermissionMode => self.select_execution_mode(params),
+            HarnessMethod::SessionMode => self.select_execution_mode(params),
             HarnessMethod::ExchangeResume => self.resume_exchange(params).await,
             HarnessMethod::PromptSubmit => self.submit_prompt(params).await,
             HarnessMethod::HistoryRecord => self.record_prompt_history(params),
@@ -1136,7 +1170,7 @@ impl HarnessBroker {
             HarnessMethod::QuestionContinue => self.continue_question().await,
             HarnessMethod::GoalSet => self.set_goal(params).await,
             HarnessMethod::GoalPause => self.pause_goal().await,
-            HarnessMethod::GoalResume => self.resume_goal().await,
+            HarnessMethod::GoalResume => self.resume_goal(None).await,
             HarnessMethod::GoalClear => self.clear_goal().await,
             HarnessMethod::GoalContinue => self.continue_goal().await,
             HarnessMethod::ExchangeList => Ok((
@@ -1391,8 +1425,247 @@ impl HarnessBroker {
         self.open_permission_document()
     }
 
+    fn current_task(&self) -> Result<Option<crate::task::TaskRecord>> {
+        Ok(self.store.list_task(&self.session.id)?.into_iter()
+            .find(|task| Some(&task.id) == self.session.current_task_id.as_ref()))
+    }
+
+    fn current_task_is_plan(&self) -> Result<bool> {
+        Ok(self.current_task()?.is_some_and(|task| task.kind == crate::task::TaskKind::Plan
+            && matches!(task.status, crate::task::TaskStatus::Running | crate::task::TaskStatus::Waiting)))
+    }
+
+    async fn pause_task(&mut self, clear: bool) -> Result<(Value, Vec<SessionEvent>)> {
+        use crate::task::TaskStatus;
+        self.retry_finalization().await?;
+        let mut events = Vec::new();
+        let mut task = self.current_task()?;
+        if let Some(task) = task.as_mut() {
+            if !task.status.terminal() {
+                if self.current_goal()?.is_some_and(|goal| goal.state == GoalState::Active) {
+                    events.extend(self.pause_goal().await?.1);
+                }
+                task.status = if clear { TaskStatus::Cancelled } else { TaskStatus::Paused };
+                task.generation += 1;
+                task.reason = Some(if clear { "Cleared by user" } else { "Paused by user" }.into());
+                task.updated_at_ms = self.clock.now_ms();
+
+            }
+        }
+        self.session.active_plan_id = None;
+        self.session.goal_id = None;
+        if clear { self.session.current_task_id = None; }
+        self.store.select_task(&self.session, task.as_ref(), None, None, &self.client_id)?;
+        Ok((serde_json::to_value(self.snapshot()?)?, events))
+    }
+
+    #[cfg(test)]
+    fn create_task(&mut self, kind: crate::task::TaskKind, title: String, plan_id: Option<String>, goal_id: Option<String>) -> Result<()> {
+        let mut task = crate::task::TaskRecord::new(self.session.id.clone(), title, kind, self.session.execution_mode, self.clock.now_ms());
+        task.plan_id = plan_id;
+        task.goal_id = goal_id;
+        task.begin(self.clock.now_ms())?;
+        self.session.current_task_id = Some(task.id.clone());
+        self.store.select_task(&self.session, Some(&task), None, None, &self.client_id)
+    }
+
+    fn settle_task(&mut self, failure: Option<String>) -> Result<()> {
+        use crate::task::{TaskKind, TaskStatus};
+        let Some(mut task) = self.current_task()? else { return Ok(()) };
+        if task.status.terminal() || task.status == TaskStatus::Paused { return Ok(()) }
+        task.permission = self.session.execution_mode;
+        if task.permission.permits_workspace_write() { task.last_write_permission = task.permission; }
+        if let Some(message) = failure {
+            task.status = if self.turn_cancellation.requested.load(Ordering::Acquire) { TaskStatus::Paused } else { TaskStatus::Failed };
+            task.reason = Some(message);
+        } else if task.kind == TaskKind::Plan {
+            if let Some(plan) = task.plan_id.as_deref().map(|id| self.store.load_plan(id)).transpose()?.flatten() {
+                task.title = plan.title;
+                task.status = match plan.state {
+                    PlanState::AwaitingInput | PlanState::AwaitingReview => TaskStatus::Waiting,
+                    PlanState::Failed => TaskStatus::Failed,
+                    PlanState::Cancelled => TaskStatus::Cancelled,
+                    _ => TaskStatus::Running,
+                };
+                task.phase = if plan.state == PlanState::AwaitingReview { "review" } else { "draft" }.into();
+            }
+        } else if let Some(goal) = task.goal_id.as_deref().map(|id| self.store.load_goal(id)).transpose()?.flatten() {
+            task.status = match goal.state {
+                GoalState::Active => TaskStatus::Running,
+                GoalState::Complete => TaskStatus::Completed,
+                GoalState::Cleared => TaskStatus::Cancelled,
+                GoalState::Paused => TaskStatus::Paused,
+                _ => TaskStatus::Blocked,
+            };
+            task.reason = match goal.state {
+                GoalState::Blocked => Some("Provider reported that the task is blocked".into()),
+                GoalState::Stalled => Some("Execution stopped because no observable progress was recorded".into()),
+                GoalState::UsageLimited => Some("Provider usage limit reached".into()),
+                GoalState::BudgetLimited => Some("Task budget limit reached".into()),
+                _ => None,
+            };
+            if let Some(execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|entry| entry.goal_id == goal.id) {
+                task.phase = format!("{:?}", execution.phase).to_lowercase();
+                if execution.pending_revision_reason.is_some() { task.status = TaskStatus::Waiting; }
+            }
+        }
+        task.updated_at_ms = self.clock.now_ms();
+        self.store.save_task(&task)
+    }
+
+    /// Applies a transition only after the service has collected the previous owner.
+    pub(crate) async fn transition_task(&mut self, action: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        use crate::task::{TaskKind, TaskStatus};
+        let command = required_text(&action, "action")?;
+        match command.as_str() {
+            "pause" | "clear" => self.pause_task(command == "clear").await,
+            "permission" | "configure" | "compact" => {
+                let permission: PermissionMode = if command == "permission" {
+                    serde_json::from_value(action.get("mode").cloned().context("permission is required")?)?
+                } else { self.session.execution_mode };
+                let task = self.current_task()?;
+                let waiting = task.as_ref().is_some_and(|task| task.status == TaskStatus::Waiting);
+                let resume = action.get("resume").and_then(Value::as_bool).unwrap_or(false)
+                    && task.as_ref().is_none_or(|task| task.kind == TaskKind::Plan || permission.permits_workspace_write());
+                self.pause_task(false).await?;
+                match command.as_str() {
+                    "configure" => { self.configure_session(action.get("config").cloned().context("configuration is required")?).await?; },
+                    "compact" => { self.compact_session().await?; },
+                    _ => { self.select_execution_mode(json!({"mode":permission}))?; },
+                }
+                if let Some(mut task) = self.current_task()? {
+                    task.permission = permission;
+                    if permission.permits_workspace_write() { task.last_write_permission = permission; }
+                    if waiting {
+                        task.status = TaskStatus::Waiting;
+                        self.session.active_plan_id = task.plan_id.clone();
+                        self.session.goal_id = task.goal_id.clone();
+                    }
+                    self.store.save_task(&task)?;
+                    self.save_session()?;
+                    if resume { return Box::pin(self.transition_task(json!({"action":"resume","task_id":task.id}))).await; }
+                } else if resume {
+                    let previous = self.store.list_exchange(&self.session.id)?.pop().context("interrupted exchange is missing")?;
+                    let prompt = format!("Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions. Original request: {}", previous.prompt);
+                    return self.run_interaction(prompt, PromptMode::Chat, Some(ExchangeAdmission::chat("Continue interrupted request".into()))).await;
+                }
+                Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()))
+            }
+            "resume" => {
+                let message = action.get("text").and_then(Value::as_str).map(str::to_owned);
+                let task_list = self.store.list_task(&self.session.id)?;
+                let task_id = action.get("task_id").and_then(Value::as_str).map(str::to_owned)
+                    .or_else(|| self.session.current_task_id.clone());
+                let mut task = if action.get("task_id").and_then(Value::as_str).is_some() {
+                    task_list.iter().find(|task| Some(&task.id) == task_id.as_ref()).cloned()
+                } else {
+                    task_list.iter().find(|task| Some(&task.id) == task_id.as_ref() && !task.status.terminal()).cloned()
+                        .or_else(|| task_list.into_iter().find(|task| !task.status.terminal()))
+                }.context("no resumable task matches this selection")?;
+                anyhow::ensure!(!task.status.terminal(), "task is terminal. Fork its plan or create a new task");
+                if let Some(expected) = action.get("generation").and_then(Value::as_u64) {
+                    anyhow::ensure!(task.generation == expected, "task changed after selection. Refresh the task picker");
+                }
+                self.pause_task(false).await?;
+                self.session.current_task_id = Some(task.id.clone());
+                self.session.active_plan_id = task.plan_id.clone();
+                self.session.goal_id = task.goal_id.clone();
+                self.select_execution_mode(json!({"mode": if task.kind == TaskKind::Plan { task.permission } else { task.last_write_permission }}))?;
+                task.begin(self.clock.now_ms())?;
+                task.operation_id = self.active_operation_id.clone();
+                self.store.save_task(&task)?;
+                if task.kind == TaskKind::Plan {
+                    let plan_id = task.plan_id.clone().context("planning task has no plan")?;
+                    let mut plan = self.store.load_plan(&plan_id)?.context("task plan is missing")?;
+                    if plan.state == PlanState::Failed {
+                        plan.generation.reset();
+                        PlanStateMachine::apply(&mut plan, PlanEvent::RetryRequested, self.clock.now_ms())?;
+                        self.store.save_plan(&plan)?;
+                    }
+                    if plan.state == PlanState::AwaitingReview || plan.state == PlanState::AwaitingInput {
+                        task.status = TaskStatus::Waiting;
+                        self.store.save_task(&task)?;
+                        if let Some(text) = message {
+                            return Box::pin(self.submit_prompt_inner(json!({"text":text}))).await;
+                        }
+                        return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
+                    }
+                    let document = self.plan_file.read_working_document(&self.session.id, &plan_id)?;
+                    self.run_planning_interaction(PlanPrompt::with_active_document(
+                        message.clone().unwrap_or_else(|| "Resume this planning task. Reassess the saved design against the current repository before continuing.".into()), &document.model_json()?),
+                        Some(ExchangeAdmission::plan(message.unwrap_or_else(|| "Resume planning task".into()), Some(plan_id), false))).await
+                } else { self.resume_goal(message).await }
+            }
+            "plan" | "goal" => {
+                let text = required_text(&action, "text")?;
+                self.pause_task(false).await?;
+                if command == "plan" { self.submit_prompt_inner(json!({"text":format!("/plan {text}")})).await }
+                else { self.set_goal(json!({"objective":text})).await }
+            }
+            "execute" => {
+                let plans = self.store.list_plan(&self.session.id)?;
+                let selected = action.get("plan_id").and_then(Value::as_str).unwrap_or("last");
+                let plan = if selected == "last" {
+                    self.store.list_plan_lifecycle(&self.session.id)?.into_iter().rev()
+                        .filter(|event| matches!(event.kind, PlanLifecycleKind::Created | PlanLifecycleKind::RevisionCreated))
+                        .find_map(|event| plans.iter().find(|plan| plan.id == event.plan_id && plan.model_revision > 0).cloned())
+                }
+                    else { plans.into_iter().find(|plan| plan.id == selected) }.context("no submitted plan matches this selection")?;
+                if let Some(task) = self.store.list_task(&self.session.id)?.into_iter().find(|task| task.plan_id.as_deref() == Some(&plan.id) && task.kind == TaskKind::Execute) {
+                    anyhow::ensure!(!task.status.terminal(), "this plan has finished. Fork it to create a new execution");
+                    return Box::pin(self.transition_task(json!({"action":"resume","task_id":task.id}))).await;
+                }
+                anyhow::ensure!(plan.state == PlanState::AwaitingReview, "selected plan is not submitted for review");
+                let digest = plan.review_digest.clone().context("submitted plan has no digest")?;
+                if let Some(expected) = action.get("digest").and_then(Value::as_str) { anyhow::ensure!(expected == digest, "plan changed after selection"); }
+                self.pause_task(false).await?;
+                self.session.active_plan_id = Some(plan.id.clone());
+                self.session.current_task_id = None;
+                if let Some(task) = self.store.list_task(&self.session.id)?.into_iter().find(|task| task.plan_id.as_deref() == Some(&plan.id)) {
+                    self.session.current_task_id = Some(task.id);
+                }
+                self.save_session()?;
+                let saved_source = action.get("saved_source_digest").cloned().or_else(|| plan.acceptance.as_ref()
+                    .and_then(|acceptance| acceptance.saved_source_digest.as_ref()).map(|digest| json!(digest)));
+                self.accept_plan(json!({"plan_id":plan.id,"digest":digest,"execution_mode":self.session.default_write_permission,"saved_source_digest":saved_source})).await
+            }
+            "attach_plan" => {
+                let plan_id = required_text(&action, "plan_id")?;
+                let plan = self.store.load_plan(&plan_id)?.context("selected plan is missing")?;
+                anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another conversation");
+                anyhow::ensure!(plan.accepted_revision.is_none(), "accepted plan requires its execution task. Fork the plan to start again");
+                anyhow::ensure!(!self.store.list_task(&self.session.id)?.iter().any(|task| task.plan_id.as_deref() == Some(&plan_id)), "plan already has a task. Refresh the picker");
+                self.pause_task(false).await?;
+                let permission = self.session.plan_permission.unwrap_or(self.session.execution_mode);
+                let mut task = crate::task::TaskRecord::new(self.session.id.clone(), plan.title, TaskKind::Plan, permission, self.clock.now_ms());
+                task.plan_id = Some(plan_id);
+                self.session.current_task_id = Some(task.id.clone());
+                self.store.select_task(&self.session, Some(&task), None, None, &self.client_id)?;
+                Box::pin(self.transition_task(json!({"action":"resume","task_id":task.id}))).await
+            }
+            "fork" => {
+                let plan_id = required_text(&action,"plan_id")?;
+                let source = self.store.load_plan(&plan_id)?.context("source plan is missing")?;
+                anyhow::ensure!(source.session_id == self.session.id, "source plan belongs to another conversation");
+                let mut document = self.plan_file.read_working_document(&self.session.id, &plan_id)?;
+                self.pause_task(false).await?;
+                document.plan_id = Uuid::new_v4().to_string();
+                document.version = 1;
+                let request = format!("Fork {}. Assess this saved design against the current repository and create a new plan. Original objective: {}", source.title, source.request);
+                document.prompt = request.clone();
+                if let Some(design) = document.design.as_mut() {
+                    let fresh = crate::plan::DeclarationDesign::open(Path::new(&self.session.workspace))?;
+                    design.baseline = fresh.baseline;
+                    design.baseline_calls = fresh.baseline_calls;
+                }
+                self.start_plan(request.clone(), request, document).await
+            }
+            _ => anyhow::bail!("unknown task action"),
+        }
+    }
+
     fn select_execution_mode(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let mode = serde_json::from_value::<ExecutionMode>(
+        let mode = serde_json::from_value::<PermissionMode>(
             params.get("mode").cloned().context("mode is required")?,
         )?;
         anyhow::ensure!(
@@ -1401,33 +1674,13 @@ impl HarnessBroker {
             mode.label()
         );
         self.session.execution_mode = mode;
-        self.session.mode = mode.into();
+
         self.save_session()?;
         let session = serde_json::to_value(&self.session)?;
         Ok((
             session.clone(),
             vec![self.event("execution_mode_changed", session)?],
         ))
-    }
-
-    fn select_harness_mode(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let mode = serde_json::from_value::<HarnessMode>(
-            params.get("mode").cloned().context("mode is required")?,
-        )?;
-        if let Some(execution_mode) = mode.execution_mode() {
-            anyhow::ensure!(
-                self.capability
-                    .execution_mode_list
-                    .contains(&execution_mode),
-                "execution mode {} is unavailable for this backend",
-                execution_mode.label()
-            );
-            self.session.execution_mode = execution_mode;
-        }
-        self.session.mode = mode;
-        self.save_session()?;
-        let session = serde_json::to_value(&self.session)?;
-        Ok((session.clone(), vec![self.event("mode_changed", session)?]))
     }
 
     fn select_scope_deviation_review(
@@ -2042,7 +2295,7 @@ impl HarnessBroker {
     async fn submit_prompt_inner(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let text = required_text(&params, "text")?;
         if text.trim() == "/plan" {
-            return self.select_harness_mode(json!({ "mode": "plan" }));
+            return self.list_replanning_choices();
         }
         if text == "/read" {
             return self.select_execution_mode(json!({ "mode": "read" }));
@@ -2082,28 +2335,7 @@ impl HarnessBroker {
         );
         anyhow::ensure!(text != "/replan", "select a plan and revision with the /replan picker");
         let explicit_plan_request = text.strip_prefix("/plan ");
-        let active_plan_controls = self
-            .session
-            .active_plan_id
-            .as_deref()
-            .map(|plan_id| self.store.load_plan(plan_id))
-            .transpose()?
-            .flatten()
-            .is_some_and(|plan| {
-                matches!(
-                    plan.state,
-                    PlanState::Generating
-                        | PlanState::Revising
-                        | PlanState::AwaitingInput
-                        | PlanState::AwaitingReview
-                )
-            });
-        let plan_request = explicit_plan_request.or_else(|| {
-            (self.session.mode == HarnessMode::Plan
-                && !active_plan_controls
-                && !text.starts_with('/'))
-            .then_some(text.as_str())
-        });
+        let plan_request = explicit_plan_request;
         if let Some(request) = plan_request {
             anyhow::ensure!(!request.trim().is_empty(), "usage: /plan <prompt>");
             let plan_id = Uuid::new_v4().to_string();
@@ -2126,12 +2358,19 @@ impl HarnessBroker {
         }
         match text.as_str() {
             "/goal pause" => return self.pause_goal().await,
-            "/goal resume" => return self.resume_goal().await,
+            "/goal resume" => return self.resume_goal(None).await,
             "/goal clear" => return self.clear_goal().await,
             _ => {}
         }
         if let Some(objective) = text.strip_prefix("/goal ") {
             return self.set_goal(json!({ "objective": objective })).await;
+        }
+        if let Some(task) = self.current_task()?
+            && task.status == crate::task::TaskStatus::Paused
+        {
+            return Box::pin(self.transition_task(json!({
+                "action":"resume", "task_id":task.id, "text":text,
+            }))).await;
         }
         if let Some(plan) = self
             .session
@@ -2178,7 +2417,7 @@ impl HarnessBroker {
             .map(|plan_id| self.store.load_plan(plan_id))
             .transpose()?
             .flatten();
-        if self.session.mode == HarnessMode::Plan
+        if self.current_task_is_plan()?
             && let Some(plan) = active_plan.as_ref().filter(|plan| plan.state == PlanState::AwaitingReview)
         {
             let mut admission = ExchangeAdmission::chat(text.clone());
@@ -2209,7 +2448,7 @@ impl HarnessBroker {
             }
             BackendInput::Text { .. } => BackendInput::from_text(prompt.clone()),
         };
-        let prompt_mode = if self.session.mode == HarnessMode::Plan
+        let prompt_mode = if self.current_task_is_plan()?
             && active_plan.as_ref().is_some_and(|plan| {
                 matches!(plan.state, PlanState::Generating | PlanState::Revising)
             }) {
@@ -2733,7 +2972,7 @@ impl HarnessBroker {
             .run_interaction(
                 PlanPrompt::question_follow_up(&elicitation_json, &text),
                 if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some()
-                    && interaction.mode == Some(HarnessMode::Plan) {
+                    && interaction.plan_id.is_some() {
                     PromptMode::PlanDiscussion
                 } else { PromptMode::Chat },
                 None,
@@ -2858,7 +3097,7 @@ impl HarnessBroker {
             "The user answered the pending Harness questions. Continue the original request using these responses.\n\n{feedback}"
         );
         let (value, mut event) = if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some()
-            && interaction.mode == Some(HarnessMode::Plan) {
+            && interaction.plan_id.is_some() {
             self.run_planning_interaction(prompt, None).await?
         } else {
             self.run_interaction(prompt, PromptMode::Chat, None).await?
@@ -2933,9 +3172,7 @@ impl HarnessBroker {
             let (value, mut event) = match result {
                 Ok(result) => result,
                 Err(error) => {
-                    if error.downcast_ref::<TurnCancelled>().is_some()
-                        && self.turn_cancellation.restart.load(Ordering::Acquire)
-                    {
+                    if error.downcast_ref::<TurnCancelled>().is_some() {
                         return Err(error);
                     }
                     let mut plan = self
@@ -3078,7 +3315,7 @@ Planning continuation: turn {} of {}.",
         let (mut interaction, new_interaction) = self
             .interaction_for_turn(admitted_prompt, admission.is_some(), now_ms)
             .await?;
-        interaction.mode = Some(self.session.mode);
+        interaction.mode = Some(self.session.execution_mode);
         if new_interaction && let Some(admission) = admission.as_ref() {
             interaction.kind = admission.kind;
             interaction.plan_id.clone_from(&admission.plan_id);
@@ -3166,7 +3403,7 @@ Planning continuation: turn {} of {}.",
             .into_iter().rev().find(|execution| goal.as_ref().is_some_and(|goal| goal.id == execution.goal_id));
         self.emit_backend_event(BackendEvent {
             address: None, turn_boundary: None, kind: "execution_state".into(), text: None,
-            data: json!({"session":self.session,"goal":goal,"goal_execution":goal_execution}),
+            data: json!({"session":self.session,"task":self.store.list_task(&self.session.id)?,"goal":goal,"goal_execution":goal_execution}),
             activity: None, summary: None, task_update: None,
         }, &mut event).await?;
 
@@ -4691,7 +4928,7 @@ Planning continuation: turn {} of {}.",
                 ordinal: self.store.next_exchange_ordinal(&self.session.id)?,
                 prompt: text.to_owned(),
                 kind: ExchangeKind::Chat,
-                mode: Some(self.session.mode),
+                mode: Some(self.session.execution_mode),
                 plan_id: None,
                 execution_id: None,
                 goal_id: None,
@@ -4925,7 +5162,7 @@ Planning continuation: turn {} of {}.",
                 .any(|execution| execution.state == PlanExecutionState::Active),
             "another plan execution is already active"
         );
-        let execution_mode = serde_json::from_value::<ExecutionMode>(
+        let execution_mode = serde_json::from_value::<PermissionMode>(
             params
                 .get("execution_mode")
                 .cloned()
@@ -4997,10 +5234,17 @@ Planning continuation: turn {} of {}.",
         plan.accepted_revision = Some(plan.model_revision);
         plan.acceptance = None;
         if plan.state != PlanState::Accepted { PlanStateMachine::apply(&mut plan, PlanEvent::Accepted, self.clock.now_ms())?; }
-        self.store.save_plan(&plan)?;
+
         self.session.active_plan_id = Some(plan.id.clone());
         let objective = format!("Complete accepted plan: {}", plan.title);
-        let goal = self.create_goal(objective, false)?;
+        let now_ms = self.clock.now_ms();
+        let goal = GoalRecord {
+            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), objective,
+            state: GoalState::Active,
+            continuation: crate::session::continuation::ContinuationBudget::new(self.goal_max_turns, 2),
+            native: false, created_at_ms: now_ms, updated_at_ms: now_ms,
+        };
+        self.session.goal_id = Some(goal.id.clone());
         let lifecycle = PlanLifecycleRecord {
             title: plan.title.clone(),
             anchor: Some(self.plan_exchange_anchor(&plan.id)?),
@@ -5016,7 +5260,7 @@ Planning continuation: turn {} of {}.",
             answer: None,
             created_at_ms: self.clock.now_ms(),
         };
-        self.store.save_plan_lifecycle(&lifecycle)?;
+
         let planning_backend_session_id = self.session.backend_session_id.clone();
         if self.session.plan_executor.enabled {
             let executor = &self.session.plan_executor;
@@ -5026,8 +5270,17 @@ Planning continuation: turn {} of {}.",
             self.session.context_window = None;
         }
         self.session.execution_mode = execution_mode;
-        self.session.mode = HarnessMode::from(self.session.execution_mode);
-        self.save_session()?;
+        let mut task = self.current_task()?.filter(|task| task.plan_id.as_deref() == Some(plan.id.as_str()))
+            .unwrap_or_else(|| crate::task::TaskRecord::new(self.session.id.clone(), plan.title.clone(), crate::task::TaskKind::Execute, execution_mode, now_ms));
+        task.kind = crate::task::TaskKind::Execute;
+        task.operation_id = self.active_operation_id.clone();
+        task.phase = "implement".into();
+        task.plan_id = Some(plan.id.clone());
+        task.goal_id = Some(goal.id.clone());
+        task.permission = execution_mode;
+        task.last_write_permission = execution_mode;
+        task.begin(now_ms)?;
+        self.session.current_task_id = Some(task.id.clone());
         let execution_created_at_ms = self.clock.now_ms();
         let mut execution_record = PlanExecutionRecord {
             id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(),
@@ -5044,7 +5297,7 @@ Planning continuation: turn {} of {}.",
         execution_record.observed_source = execution_record.progress.source_digest.clone();
         execution_record.append_lifecycle(lifecycle.anchor.clone().context("plan acceptance has no owning exchange")?, execution_created_at_ms,
             PlanExecutionLifecycleEvent::Phase { title: "Execution started".into(), phase: execution_record.phase, revision: execution_record.revision, state: execution_record.state });
-        self.store.save_plan_execution(&execution_record)?;
+        self.store.accept_task(&self.session, &task, &goal, &plan, &execution_record, &lifecycle, &self.client_id)?;
         let mut pre_execution_event = compact_event;
         self.emit_live(
             BackendEvent {
@@ -5226,7 +5479,7 @@ Planning continuation: turn {} of {}.",
         plan.generation.reset();
         self.store.save_plan(&plan)?;
         self.session.active_plan_id = Some(plan.id.clone());
-        self.session.mode = HarnessMode::Plan;
+
         self.save_session()?;
         let lifecycle = PlanLifecycleRecord {
             title: plan.title.clone(),
@@ -5327,7 +5580,7 @@ Planning continuation: turn {} of {}.",
             }
         }
         self.session.active_plan_id = None;
-        self.session.mode = self.session.execution_mode.into();
+
         self.save_session()?;
         Ok((
             serde_json::to_value(&plan)?,
@@ -5454,8 +5707,22 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
 
     async fn set_goal(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let objective = required_text(&params, "objective")?;
-        self.pause_current_goal().await?;
-        let goal = self.create_goal(objective.clone(), self.capability.native_goal)?;
+        self.pause_task(false).await?;
+        self.select_execution_mode(json!({"mode":self.session.default_write_permission}))?;
+        let now_ms = self.clock.now_ms();
+        let goal = GoalRecord {
+            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), objective: objective.clone(),
+            state: GoalState::Active,
+            continuation: crate::session::continuation::ContinuationBudget::new(self.goal_max_turns, 2),
+            native: self.capability.native_goal, created_at_ms: now_ms, updated_at_ms: now_ms,
+        };
+        let mut task = crate::task::TaskRecord::new(self.session.id.clone(), objective.clone(), crate::task::TaskKind::Goal, self.session.execution_mode, now_ms);
+        task.operation_id = self.active_operation_id.clone();
+        task.goal_id = Some(goal.id.clone());
+        task.begin(now_ms)?;
+        self.session.goal_id = Some(goal.id.clone());
+        self.session.current_task_id = Some(task.id.clone());
+        self.store.select_task(&self.session, Some(&task), Some(&goal), None, &self.client_id)?;
         let prompt = if goal.native {
             format!("/goal {objective}")
         } else {
@@ -5477,6 +5744,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         Ok((result, event))
     }
 
+    #[cfg(test)]
     fn create_goal(&mut self, objective: String, native: bool) -> Result<GoalRecord> {
         let now_ms = self.clock.now_ms();
         let goal = GoalRecord {
@@ -5520,7 +5788,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         ))
     }
 
-    async fn resume_goal(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
+    async fn resume_goal(&mut self, message: Option<String>) -> Result<(Value, Vec<SessionEvent>)> {
         let mut goal = self.active_goal()?;
         if let Some(execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.goal_id == goal.id) {
             anyhow::ensure!(execution.pending_revision_reason.is_none(), "review the pending plan revision before resuming execution");
@@ -5552,7 +5820,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         } else {
             PromptMode::GoalContinuation
         };
-        let prompt = plan_prompt
+        let mut prompt = plan_prompt
             .unwrap_or_else(|| {
                 if goal.native {
                     "/goal resume".to_owned()
@@ -5563,6 +5831,11 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                     )
                 }
             });
+        if let Some(text) = message.as_deref() {
+            prompt.push_str("\n\nAdditional user instructions:\n");
+            prompt.push_str(text);
+        }
+        let visible_prompt = message.unwrap_or_else(|| "/goal resume".into());
         let admission = self
             .store
             .list_plan_execution(&self.session.id)?
@@ -5570,13 +5843,13 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .find(|execution| execution.goal_id == goal.id)
             .map(|execution| {
                 ExchangeAdmission::execution(
-                    "/goal resume".into(),
+                    visible_prompt.clone(),
                     execution.plan_id,
                     execution.id,
                     goal.id.clone(),
                 )
             })
-            .unwrap_or_else(|| ExchangeAdmission::goal("/goal resume".into(), goal.id.clone()));
+            .unwrap_or_else(|| ExchangeAdmission::goal(visible_prompt, goal.id.clone()));
         match self
             .run_interaction(prompt, mode, Some(admission))
             .await
@@ -6059,6 +6332,14 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn configure_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        if let Some(value) = params.get("default_write_permission") {
+            let permission: PermissionMode = serde_json::from_value(value.clone())?;
+            anyhow::ensure!(permission.permits_workspace_write(), "default write permission must be Write, Full, or YOLO");
+            self.session.default_write_permission = permission;
+        }
+        if let Some(value) = params.get("plan_permission") {
+            self.session.plan_permission = serde_json::from_value(value.clone())?;
+        }
         if params.get("fast_mode").and_then(Value::as_bool).is_some() {
             anyhow::ensure!(
                 self.capability.native_goal,
@@ -6284,7 +6565,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             effort: self.session.effort.clone(),
             context_window: self.session.context_window.clone(),
             fast_mode: self.session.fast_mode,
-            execution_mode: if matches!(mode,PromptMode::Plan | PromptMode::PlanDiscussion | PromptMode::PlanQuestion) { ExecutionMode::Read } else { self.session.execution_mode },
+            execution_mode: if matches!(mode,PromptMode::Plan | PromptMode::PlanDiscussion | PromptMode::PlanQuestion) { PermissionMode::Read } else { self.session.execution_mode },
             backend_session_id: self.session.backend_session_id.clone(),
             control_context: self.control_turn_context(mode),
         }
@@ -6484,6 +6765,8 @@ fn preference_for_session(
         },
     );
     HarnessPreference {
+        default_write_permission: session.default_write_permission,
+        plan_permission: session.plan_permission,
         model: session.model.clone(),
         effort: session.effort.clone(),
         model_setting,
@@ -6569,6 +6852,83 @@ fn default_goal_max_turns() -> u32 {
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn task_switch_retains_paused_history_and_clear_does_not_destroy_it() {
+        use crate::task::{TaskKind, TaskStatus};
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.create_task(TaskKind::Plan, "First".into(), None, None).unwrap();
+        let first = broker.session.current_task_id.clone().unwrap();
+        broker.pause_task(false).await.unwrap();
+        broker.create_task(TaskKind::Plan, "Second".into(), None, None).unwrap();
+        let second = broker.session.current_task_id.clone().unwrap();
+        broker.pause_task(true).await.unwrap();
+        let tasks = broker.store.list_task(&broker.session.id).unwrap();
+        assert_eq!(tasks.len(), 2);
+        assert_eq!(tasks.iter().find(|task| task.id == first).unwrap().status, TaskStatus::Paused);
+        assert_eq!(tasks.iter().find(|task| task.id == second).unwrap().status, TaskStatus::Cancelled);
+        assert!(broker.session.current_task_id.is_none());
+        assert!(broker.transition_task(json!({"action":"resume","task_id":second})).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn task_permission_change_while_paused_cannot_restart_the_provider() {
+        use crate::task::{TaskKind, TaskStatus};
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let goal = broker.create_goal("Persist goal".into(), false).unwrap();
+        broker.create_task(TaskKind::Goal, goal.objective.clone(), None, Some(goal.id)).unwrap();
+        broker.pause_task(false).await.unwrap();
+        broker.transition_task(json!({"action":"permission","mode":"full"})).await.unwrap();
+        let task = broker.current_task().unwrap().unwrap();
+        assert_eq!(task.status, TaskStatus::Paused);
+        assert_eq!(task.permission, PermissionMode::Full);
+        assert_eq!(task.last_write_permission, PermissionMode::Full);
+        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn restart_recovers_clear_without_replaying_or_deleting_task_history() {
+        use crate::task::{TaskKind, TaskStatus, TaskOperation};
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.create_task(TaskKind::Plan, "Interrupted".into(), None, None).unwrap();
+        let operation = TaskOperation {
+            id: "clear-before-shutdown".into(), session_id: broker.session.id.clone(),
+            action: json!({"action":"clear"}), state: "accepted".into(), error: None,
+            created_at_ms: 1, resume_after_transition: false,
+        };
+        broker.store.admit_task_operation(&operation).unwrap();
+        broker.store.interrupt_detached_execution(&broker.session.id).unwrap();
+        let session = broker.store.load_session(&broker.session.id).unwrap().unwrap();
+        assert!(session.current_task_id.is_none());
+        assert_eq!(broker.store.list_task(&session.id).unwrap()[0].status, TaskStatus::Cancelled);
+        assert!(broker.store.list_exchange(&session.id).unwrap().is_empty());
+        assert_eq!(broker.store.load_task_operation(&session.id, &operation.id).unwrap().unwrap().state, "outcome_unknown");
+    }
+
+    #[test]
+    fn task_operations_deduplicate_and_survive_runtime_recovery_without_replay() {
+        use crate::task::{TaskKind, TaskStatus, TaskOperation};
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.create_task(TaskKind::Plan, "Interrupted".into(), None, None).unwrap();
+        let mut operation = TaskOperation { id: "original".into(), session_id: broker.session.id.clone(), action: json!({"action":"plan","text":"Original"}), state: "running".into(), error: None, created_at_ms: 1, resume_after_transition: false };
+        assert!(broker.store.admit_task_operation(&operation).unwrap());
+        assert!(!broker.store.admit_task_operation(&operation).unwrap());
+        operation.action["text"] = json!("Changed");
+        assert!(broker.store.admit_task_operation(&operation).is_err());
+        broker.store.interrupt_detached_execution(&broker.session.id).unwrap();
+        assert_eq!(broker.current_task().unwrap().unwrap().status, TaskStatus::Paused);
+        assert_eq!(broker.store.load_task_operation(&broker.session.id, "original").unwrap().unwrap().state, "outcome_unknown");
+        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+    }
+
+
     use super::*;
 
     #[tokio::test]
@@ -6631,7 +6991,7 @@ mod test {
         let mut broker = HarnessBroker::initialize_with_clock(resumed.clone(), Box::new(FixedClock(300))).unwrap();
         assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
         broker.backend = Arc::new(SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize::new(1), revision:2 });
-        broker.resume_goal().await.unwrap();
+        broker.resume_goal(None).await.unwrap();
         assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Resolve);
         resumed.session_id = Some(broker.session.id.clone());
         drop(broker);
@@ -6641,7 +7001,7 @@ mod test {
         assert_eq!(recovered.state, PlanExecutionState::Paused);
         assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
         broker.backend = Arc::new(SemanticExecutionBackend { turn: std::sync::atomic::AtomicUsize::new(2), revision:2 });
-        broker.resume_goal().await.unwrap();
+        broker.resume_goal(None).await.unwrap();
         for expected in [crate::plan::PlanPhase::Verify] {
             let result = broker.dispatch(Request { id:5, method:"goal.continue".into(), params:json!({}) }).await;
             assert!(result.response.error().is_none(), "{:?}", result.response.error());
@@ -6696,7 +7056,7 @@ mod test {
         assert_eq!(stalled.phase, crate::plan::PlanPhase::Implement);
         assert!(stalled.completed_at_ms.is_none());
         assert_eq!(broker.snapshot().unwrap().goal.unwrap().continuation.turn_count, 2);
-        broker.resume_goal().await.unwrap();
+        broker.resume_goal(None).await.unwrap();
         let resumed = broker.snapshot().unwrap().goal_execution.unwrap();
         assert_eq!(resumed.id, stalled.id);
         assert_eq!(resumed.state, PlanExecutionState::Active);
@@ -6758,7 +7118,7 @@ mod test {
             } else {
                 assert_eq!(execution.revision, 1);
                 assert_eq!(execution.state, PlanExecutionState::Paused);
-                assert!(broker.resume_goal().await.unwrap_err().to_string().contains("review the pending"));
+                assert!(broker.resume_goal(None).await.unwrap_err().to_string().contains("review the pending"));
                 if decision == "recovered_accept" {
                     let mut previous = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
                     broker.capture_final_checkpoint(&mut previous, ExchangeState::Complete).await.unwrap();
@@ -7333,7 +7693,7 @@ mod test {
             .share_mode(0)
             .open(repository.path().join("seed.txt"))
             .unwrap();
-        let error = broker.resume_goal().await.unwrap_err();
+        let error = broker.resume_goal(None).await.unwrap_err();
         assert!(format!("{error:#}").contains("seed.txt"));
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
@@ -7343,11 +7703,11 @@ mod test {
         drop(locked);
 
         broker.turn_cancellation.request(false);
-        assert!(broker.resume_goal().await.unwrap_err().downcast_ref::<TurnCancelled>().is_some());
+        assert!(broker.resume_goal(None).await.unwrap_err().downcast_ref::<TurnCancelled>().is_some());
         assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
         assert_eq!(broker.store.list_exchange(&broker.session.id).unwrap().len(), 1);
         broker.turn_cancellation.arm(false);
-        let (_, event) = broker.resume_goal().await.unwrap();
+        let (_, event) = broker.resume_goal(None).await.unwrap();
         assert_eq!(event[0].event, "goal_changed");
         let stored = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(stored.len(), 2);
@@ -7725,7 +8085,7 @@ mod test {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime, apply_invocation};
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
             assert_eq!(request.mode, if turn == 4 { PromptMode::Plan } else { PromptMode::PlanDiscussion });
-            assert_eq!(request.execution_mode, ExecutionMode::Read);
+            assert_eq!(request.execution_mode, PermissionMode::Read);
             if turn < 4 {
                 assert!(request.input.text().contains("Answer questions without editing or resubmitting"));
             }
@@ -8029,7 +8389,7 @@ mod test {
             let turn = self.turn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let mut output = crate::backend::BackendOutput {
                 backend_session_id: Some("retry-plan".into()),
-                capability: BackendCapability::default(),
+                capability: BackendCapability { execution_mode_list: vec![PermissionMode::Read], ..Default::default() },
                 runtime: crate::backend::BackendRuntime {
                     provider: "Retry plan test".into(),
                     model: Some(request.model.clone()),
@@ -8484,8 +8844,8 @@ mod test {
             plan_auto_approve_revisions: true,
             context_window: None,
             fast_mode: false,
-            execution_mode: ExecutionMode::Read,
-            mode: HarnessMode::Read,
+            execution_mode: PermissionMode::Read,
+            current_task_id: None, default_write_permission: PermissionMode::Write, plan_permission: None,
             created_at_ms: 0,
             updated_at_ms: 0,
             active_plan_id: None,
@@ -8511,6 +8871,8 @@ mod test {
         let preference = preference_for_session(
             &session,
             Some(HarnessPreference {
+                default_write_permission: PermissionMode::Write,
+                plan_permission: None,
                 model: "other-model".into(),
                 effort: "high".into(),
                 model_setting,
@@ -9839,7 +10201,7 @@ mod test {
         assert_eq!(restarted.session.model, "gpt-5.6");
         assert_eq!(restarted.session.effort, "low");
         assert!(restarted.session.fast_mode);
-        assert_eq!(restarted.session.execution_mode, ExecutionMode::Full);
+        assert_eq!(restarted.session.execution_mode, PermissionMode::Full);
         assert!(
             !restarted
                 .snapshot()
@@ -9910,7 +10272,7 @@ mod test {
             })
             .await;
         assert!(invalid_mode.response.error().is_some());
-        assert_eq!(broker.session.execution_mode, ExecutionMode::Read);
+        assert_eq!(broker.session.execution_mode, PermissionMode::Read);
     }
 
     #[tokio::test]
@@ -10396,6 +10758,18 @@ mod test {
         assert_eq!(submitted.id, plan_id);
         assert_eq!(submitted.state, PlanState::AwaitingReview);
         assert_eq!(submitted.generation.budget.turn_count, 1);
+        let mut interrupted = submitted;
+        PlanStateMachine::apply(&mut interrupted, PlanEvent::TransitionFailed, broker.clock.now_ms()).unwrap();
+        broker.store.save_plan(&interrupted).unwrap();
+        broker.pause_task(false).await.unwrap();
+        let resumed = broker.dispatch(Request {
+            id: 4, method: "prompt.submit".into(), params: json!({"text":"continue the existing design"}),
+        }).await;
+        assert!(resumed.response.error().is_none(), "{:?}", resumed.response.error());
+        let recovered = broker.snapshot().unwrap().active_plan.unwrap();
+        assert_eq!(recovered.id, plan_id);
+        assert_eq!(recovered.state, PlanState::AwaitingReview);
+        assert_eq!(recovered.generation.budget.turn_count, 1);
     }
 
     #[tokio::test]
@@ -10404,7 +10778,7 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), structured);
-            broker.session.execution_mode = ExecutionMode::Full;
+            broker.session.execution_mode = PermissionMode::Full;
             let planned = broker.dispatch(Request { id:1, method:"prompt.submit".into(),
                 params:json!({"text":"/plan migrate"}) }).await;
             assert!(planned.response.error().is_none());
@@ -10414,7 +10788,7 @@ mod test {
             assert!(cancelled.response.error().is_none());
             let snapshot = broker.snapshot().unwrap();
             assert!(snapshot.active_plan.is_none());
-            assert_eq!(broker.session.mode, HarnessMode::Full);
+            assert_eq!(broker.session.execution_mode, PermissionMode::Full);
             assert!(snapshot.active_elicitation.is_none());
             assert!(!snapshot.timeline.iter().any(|entry| matches!(entry, TimelineEntry::Status { .. })));
             assert!(broker.store.list_exchange(&broker.session.id).unwrap().iter()
@@ -10918,7 +11292,7 @@ mod test {
                 reopened.backend = Arc::new(NativeSettlementBackend {
                     inner: reopened.backend.clone(), state: GoalState::Complete,
                 });
-                reopened.resume_goal().await.unwrap();
+                reopened.resume_goal(None).await.unwrap();
                 assert_eq!(reopened.active_goal().unwrap().state, GoalState::Complete);
             }
         }

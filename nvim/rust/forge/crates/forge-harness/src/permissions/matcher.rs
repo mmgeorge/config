@@ -3,7 +3,7 @@ use super::document::{
     CATEGORY_BASH, CATEGORY_EDIT, CATEGORY_ELEVATE, CATEGORY_MCP, CATEGORY_READ, CATEGORY_TOOL,
     CATEGORY_WEBFETCH, PermissionDecision, PermissionDocument,
 };
-use crate::session::ExecutionMode;
+use crate::session::PermissionMode;
 use serde::{Deserialize, Serialize};
 use std::path::{Component, Path, PathBuf};
 
@@ -207,23 +207,23 @@ impl CompiledPermissionDocument {
 
     fn ceiling_decision(
         &self,
-        mode: ExecutionMode,
+        mode: PermissionMode,
         target: &PermissionTarget,
     ) -> PermissionDecision {
-        if mode == ExecutionMode::Yolo {
+        if mode == PermissionMode::Yolo {
             return PermissionDecision::Allow;
         }
         match target {
             PermissionTarget::Write { path } => match mode {
-                ExecutionMode::Read => PermissionDecision::Deny,
-                ExecutionMode::Write => normalized_path(Path::new(path))
+                PermissionMode::Read => PermissionDecision::Deny,
+                PermissionMode::Write => normalized_path(Path::new(path))
                     .filter(|path| path_starts_with(path, &self.workspace))
                     .map_or(PermissionDecision::Deny, |_| PermissionDecision::Allow),
-                ExecutionMode::Full | ExecutionMode::Yolo => PermissionDecision::Allow,
+                PermissionMode::Full | PermissionMode::Yolo => PermissionDecision::Allow,
             },
             PermissionTarget::Elevate { .. } => match mode {
-                ExecutionMode::Read | ExecutionMode::Write => PermissionDecision::Deny,
-                ExecutionMode::Full | ExecutionMode::Yolo => PermissionDecision::Allow,
+                PermissionMode::Read | PermissionMode::Write => PermissionDecision::Deny,
+                PermissionMode::Full | PermissionMode::Yolo => PermissionDecision::Allow,
             },
             _ => PermissionDecision::Allow,
         }
@@ -231,7 +231,7 @@ impl CompiledPermissionDocument {
 
     pub fn evaluate(
         &self,
-        mode: ExecutionMode,
+        mode: PermissionMode,
         request: &PermissionRequest,
     ) -> PermissionEvaluation {
         let mut result_list = Vec::new();
@@ -241,7 +241,7 @@ impl CompiledPermissionDocument {
                 result_list.push((PermissionDecision::Deny, None));
                 continue;
             }
-            if mode == ExecutionMode::Yolo {
+            if mode == PermissionMode::Yolo {
                 result_list.push((PermissionDecision::Allow, None));
                 continue;
             }
@@ -302,7 +302,7 @@ mod test {
             }],
         };
         assert_eq!(
-            permission.evaluate(ExecutionMode::Read, &allowed).decision,
+            permission.evaluate(PermissionMode::Read, &allowed).decision,
             PermissionDecision::Allow
         );
         let denied = PermissionRequest {
@@ -312,7 +312,7 @@ mod test {
             ..allowed
         };
         assert_eq!(
-            permission.evaluate(ExecutionMode::Read, &denied).decision,
+            permission.evaluate(PermissionMode::Read, &denied).decision,
             PermissionDecision::Deny
         );
     }
@@ -334,13 +334,13 @@ mod test {
         ] {
             let permission = compiled(&format!(r#"{{"permission":{{"bash":{{"*":"{rule}"}}}}}}"#));
             assert_eq!(
-                permission.evaluate(ExecutionMode::Read, &request).decision,
+                permission.evaluate(PermissionMode::Read, &request).decision,
                 expected
             );
         }
         assert_eq!(
             compiled(r#"{"permission":{"bash":{"git":"allow"}}}"#)
-                .evaluate(ExecutionMode::Read, &request)
+                .evaluate(PermissionMode::Read, &request)
                 .decision,
             PermissionDecision::Ask
         );
@@ -369,7 +369,7 @@ mod test {
                 command: command.into(),
             }];
             assert_eq!(
-                permission.evaluate(ExecutionMode::Read, &request).decision,
+                permission.evaluate(PermissionMode::Read, &request).decision,
                 expected,
                 "command: {command}"
             );
@@ -379,7 +379,7 @@ mod test {
         }];
         assert_eq!(
             compiled(r#"{"permission":{"bash":{"*":"allow","git status":"deny"}}}"#)
-                .evaluate(ExecutionMode::Read, &request)
+                .evaluate(PermissionMode::Read, &request)
                 .decision,
             PermissionDecision::Deny
         );
@@ -398,13 +398,13 @@ mod test {
         };
         assert_eq!(
             permission
-                .evaluate(ExecutionMode::Read, &workspace_write)
+                .evaluate(PermissionMode::Read, &workspace_write)
                 .decision,
             PermissionDecision::Deny
         );
         assert_eq!(
             permission
-                .evaluate(ExecutionMode::Write, &workspace_write)
+                .evaluate(PermissionMode::Write, &workspace_write)
                 .decision,
             PermissionDecision::Allow
         );
@@ -415,11 +415,11 @@ mod test {
             ..workspace_write
         };
         assert_eq!(
-            permission.evaluate(ExecutionMode::Write, &outside).decision,
+            permission.evaluate(PermissionMode::Write, &outside).decision,
             PermissionDecision::Deny
         );
         assert_eq!(
-            permission.evaluate(ExecutionMode::Full, &outside).decision,
+            permission.evaluate(PermissionMode::Full, &outside).decision,
             PermissionDecision::Allow
         );
     }

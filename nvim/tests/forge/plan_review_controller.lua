@@ -9,9 +9,10 @@ local state = require("forge.session").harness
 state.session = { id = "plan-session" }
 state.transcript_win = vim.api.nvim_get_current_win()
 local original_controller = package.loaded["forge.views.harness.controller"]
-local activated
+local activated, execution
 package.loaded["forge.views.harness.controller"] = { refresh_winbar = function() end, render = function() end,
-  activate_snapshot = function(value) activated = value end, present_plan_question = function() end }
+  activate_snapshot = function(value) activated = value end, present_plan_question = function() end,
+  task_transition = function(action) execution = action end }
 local path = vim.fn.tempname() .. ".md"
 vim.fn.writefile({ "# Physical plan" }, path)
 local pending
@@ -146,6 +147,7 @@ local success, failure = xpcall(function()
   assert(state.plan_review == review and not review.owner.closed, "approval closed before its capture completed")
   pending.callback({ session = { id = "plan-session" } })
   assert(activated and state.plan_review == nil and not state.busy)
+  assert(execution.action == "execute" and execution.plan_id == "plan" and execution.digest == "canonical")
   assert(vim.api.nvim_get_current_win() == state.transcript_win, "approval did not return to Harness")
   assert(vim.api.nvim_buf_is_valid(review.buf), "closing PlanReview deleted its physical buffer")
   assert(vim.deep_equal(vim.fn.readfile(path), { "# Physical plan" }))

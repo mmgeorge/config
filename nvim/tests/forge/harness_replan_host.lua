@@ -51,7 +51,7 @@ local success, failure = xpcall(function()
     end
     return not state.busy and discussion and discussion.state == "complete"
   end, "discussion did not finish")
-  assert(state.session.mode == "plan", "discussion left Plan mode")
+  assert(require("forge.views.harness.task").current(state).kind == "plan", "discussion lost its planning task")
   assert(state.active_plan.id == source.id and state.active_plan.model_revision == source.model_revision,
     "discussion changed the submitted plan")
   assert(discussion.plan_id == source.id and discussion.kind == "chat",
@@ -75,22 +75,25 @@ local success, failure = xpcall(function()
   vim.api.nvim_set_current_win(state.transcript_win)
   invoke("or")
   await(function() return not state.aborting_plan and not state.state_sync_pending
-    and not state.active_plan and state.session.mode == "read" end, "abort did not exit Plan mode")
+    and not state.active_plan and not state.session.current_task_id end, "abort did not clear the planning task")
   assert(not state.active_elicitation, "abort retained input status")
   await(function()
     return not table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
       :find("Awaiting plan review", 1, true)
   end, "abort retained the rendered review status")
-  submit("/replan")
+  submit("/plan")
   await(function() return picker.is_open() end, "replan picker missing")
   local choice = picker._state_for_test().spec.page_list[1].option_list[1]
-  assert(choice.id == source.id and choice.detail:find("2/2", 1, true))
-  invoke("<Left>")
-  assert(picker._state_for_test().spec.page_list[1].option_list[1].detail:find("1/2", 1, true))
+  assert(choice.value.id == source.id and choice.detail:find("cancelled", 1, true))
   invoke("<CR>")
+  local actions = picker._state_for_test().spec
+  local fork = vim.iter(actions.page_list[1].option_list):find(function(option) return option.label == "Fork plan" end)
+  assert(fork)
+  picker.close(false)
+  actions.on_confirm({ option = fork })
   await(function() return not state.busy and state.active_plan and state.active_plan.id ~= source.id
     and state.active_plan.model_revision == 1 end, "replan did not create a new planning exchange")
-  assert(state.session.mode == "plan")
+  assert(require("forge.views.harness.task").current(state).kind == "plan")
   assert(vim.deep_equal(vim.fn.readfile(revision_path, "b"), original), "replan modified the source revision")
   controller.abort_plan()
   await(function() return not state.aborting_plan and not state.active_plan end, "replanned plan did not abort")

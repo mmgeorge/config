@@ -17,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 34;
+const SESSION_FORMAT_VERSION: u32 = 35;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -29,10 +29,121 @@ struct SessionEnvelope {
 /// Owns SQLite metadata and content-addressed objects for the Harness broker.
 pub struct SqliteStore {
     connection: Connection,
+    session_lock: std::collections::HashMap<String, fs::File>,
+    data_root: std::path::PathBuf,
     pub objects: objects::ObjectStore,
 }
 
 impl SqliteStore {
+    /// Holds an operating-system lock so lease expiry cannot admit a second live runtime.
+    pub(crate) fn lock_session(&mut self, session_id: &str) -> Result<()> {
+        if self.session_lock.contains_key(session_id) { return Ok(()); }
+        let directory = self.data_root.join("session-owner");
+        fs::create_dir_all(&directory)?;
+        let path = directory.join(format!("{}.lock", crate::plan::digest(session_id.as_bytes())));
+        let owner = fs::OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&path)?;
+        match owner.try_lock() {
+            Ok(()) => {},
+            Err(fs::TryLockError::WouldBlock) => return Err(crate::session::SessionLeaseConflict {
+                session_id: session_id.to_owned(), native_fork: self.load_session(session_id)?.is_some_and(|session| session.native_fork),
+            }.into()),
+            Err(error) => return Err(anyhow::anyhow!("acquire session runtime ownership: {error}")),
+        }
+        self.session_lock.insert(session_id.to_owned(), owner);
+        Ok(())
+    }
+    /// Loads workflow history for a single conversation.
+    pub fn list_task(&self, session_id: &str) -> Result<Vec<crate::task::TaskRecord>> {
+        self.list_payload("SELECT payload FROM task_record WHERE session_id=?1 ORDER BY json_extract(payload,'$.updated_at_ms') DESC, rowid DESC", [session_id])
+    }
+
+    /// Persists a workflow checkpoint without changing the selected conversation.
+    pub fn save_task(&mut self, task: &crate::task::TaskRecord) -> Result<()> {
+        self.save_scoped_payload("task_record", &task.id, &task.session_id, task)
+    }
+
+    /// Commits task selection and its lifecycle checkpoint under the session lease.
+    pub fn select_task(&mut self, session: &HarnessSession, task: Option<&crate::task::TaskRecord>, goal: Option<&GoalRecord>, plan: Option<&PlanRecord>, client_id: &str) -> Result<()> {
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let payload: String = transaction.query_row("SELECT payload FROM session_record WHERE id=?1", [&session.id], |row| row.get(0))?;
+        let owner = decode_current_session(&payload)?.context("session format changed")?;
+        anyhow::ensure!(owner.lease_owner.as_deref() == Some(client_id), "task selection lost session ownership");
+        if let Some(task) = task {
+            anyhow::ensure!(task.session_id == session.id, "task belongs to another conversation");
+            transaction.execute("INSERT INTO task_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![task.id, session.id, encode(task)?])?;
+        }
+        if let Some(goal) = goal {
+            anyhow::ensure!(goal.session_id == session.id, "goal belongs to another conversation");
+            transaction.execute("INSERT INTO goal_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![goal.id, session.id, encode(goal)?])?;
+        }
+        if let Some(plan) = plan {
+            anyhow::ensure!(plan.session_id == session.id, "plan belongs to another conversation");
+            let mut payload = serde_json::to_value(plan)?;
+            payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
+            transaction.execute("INSERT INTO plan_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload", params![plan.id, session.id, encode(&payload)?])?;
+        }
+        transaction.execute("UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1", params![session.id,encode_session(session)?,session.updated_at_ms])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Publishes acceptance and every execution owner in one commit before provider dispatch.
+    pub fn accept_task(&mut self, session: &HarnessSession, task: &crate::task::TaskRecord,
+        goal: &GoalRecord, plan: &PlanRecord, execution: &PlanExecutionRecord,
+        lifecycle: &PlanLifecycleRecord, client_id: &str) -> Result<()> {
+        let transaction = self.connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let payload: String = transaction.query_row("SELECT payload FROM session_record WHERE id=?1", [&session.id], |row| row.get(0))?;
+        let owner = decode_current_session(&payload)?.context("session format changed")?;
+        anyhow::ensure!(owner.lease_owner.as_deref() == Some(client_id), "plan acceptance lost session ownership");
+        for (table, id, mut payload, schema) in [
+            ("task_record", task.id.as_str(), serde_json::to_value(task)?, false),
+            ("goal_record", goal.id.as_str(), serde_json::to_value(goal)?, false),
+            ("plan_record", plan.id.as_str(), serde_json::to_value(plan)?, true),
+            ("plan_execution_record", execution.id.as_str(), serde_json::to_value(execution)?, true),
+            ("plan_lifecycle_record", lifecycle.id.as_str(), serde_json::to_value(lifecycle)?, true),
+        ] {
+            if schema { payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION); }
+            transaction.execute(&format!("INSERT INTO {table}(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload"), params![id, session.id, encode(&payload)?])?;
+        }
+        transaction.execute("UPDATE session_record SET payload=?2,updated_at_ms=?3 WHERE id=?1", params![session.id,encode_session(session)?,session.updated_at_ms])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Records an intent before waiting for execution ownership. Duplicate IDs never replay.
+    pub fn admit_task_operation(&mut self, operation: &crate::task::TaskOperation) -> Result<bool> {
+        let changed = self.connection.execute(
+            "INSERT OR IGNORE INTO task_operation(id,session_id,payload) VALUES(?1,?2,?3)",
+            params![operation.id, operation.session_id, encode(operation)?])?;
+        if changed == 0 {
+            let previous = self.load_task_operation(&operation.session_id, &operation.id)?.context("operation ID belongs to another conversation")?;
+            anyhow::ensure!(previous.action == operation.action, "operation ID was reused for a different action");
+        }
+        Ok(changed != 0)
+    }
+
+    /// Claims one admitted intent without allowing duplicate requests to execute it again.
+    pub fn claim_task_operation(&mut self, session_id: &str, id: &str) -> Result<bool> {
+        Ok(self.connection.execute(
+            "UPDATE task_operation SET payload=json_set(payload,'$.state','accepted') WHERE session_id=?1 AND id=?2 AND json_extract(payload,'$.state')='admitted'",
+            params![session_id, id])? == 1)
+    }
+
+    /// Queries an intent by its original identity after uncertain delivery.
+    pub fn load_task_operation(&self, session_id: &str, id: &str) -> Result<Option<crate::task::TaskOperation>> {
+        self.load_payload("SELECT payload FROM task_operation WHERE session_id=?1 AND id=?2", params![session_id,id])
+    }
+
+    /// Publishes a settled intent without dispatching its action again.
+    pub fn save_task_operation(&mut self, operation: &crate::task::TaskOperation) -> Result<()> {
+        self.save_scoped_payload("task_operation", &operation.id, &operation.session_id, operation)
+    }
+
+    /// Tests whether a later intent has superseded this pending activation.
+    pub fn latest_task_operation(&self, session_id: &str) -> Result<Option<crate::task::TaskOperation>> {
+        self.load_payload("SELECT payload FROM task_operation WHERE session_id=?1 ORDER BY rowid DESC LIMIT 1", [session_id])
+    }
+
     /// Open durable storage for the current Harness format.
     pub fn open(data_root: &Path) -> Result<Self> {
         fs::create_dir_all(data_root)
@@ -41,6 +152,7 @@ impl SqliteStore {
         let connection = Connection::open(data_root.join("harness.sqlite3"))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
+        connection.pragma_update(None, "synchronous", "FULL")?;
         connection.pragma_update(None, "foreign_keys", "ON")?;
         connection.execute_batch(
             r#"
@@ -59,6 +171,18 @@ impl SqliteStore {
                 workspace TEXT NOT NULL,
                 updated_at_ms INTEGER NOT NULL,
                 payload TEXT NOT NULL
+            );
+            CREATE TABLE IF NOT EXISTS task_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
+            );
+            CREATE TABLE IF NOT EXISTS task_operation (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
             CREATE INDEX IF NOT EXISTS session_workspace_activity
                 ON session_record(workspace, updated_at_ms DESC);
@@ -149,6 +273,8 @@ impl SqliteStore {
         )?;
         Ok(Self {
             connection,
+            session_lock: Default::default(),
+            data_root: data_root.to_owned(),
             objects,
         })
     }
@@ -187,6 +313,7 @@ impl SqliteStore {
         client_id: &str,
         now_ms: i64,
     ) -> Result<HarnessSession> {
+        self.lock_session(session_id)?;
         let transaction = self
             .connection
             .transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -200,6 +327,8 @@ impl SqliteStore {
         let mut session = decode_current_session(&payload)?
             .with_context(|| format!("Harness session {session_id} uses an outdated format"))?;
         discard_incompatible_plan_state(&transaction, &mut session)?;
+        session.lease_owner = None;
+        session.lease_expires_at_ms = None;
         session.acquire_lease(client_id, now_ms)?;
         transaction.execute(
             "UPDATE session_record SET payload=?2 WHERE id=?1",
@@ -233,6 +362,7 @@ impl SqliteStore {
             )?;
         }
         transaction.commit()?;
+        self.session_lock.remove(session_id);
         Ok(())
     }
 
@@ -963,8 +1093,8 @@ mod test {
             plan_auto_approve_revisions: true,
             context_window: None,
             fast_mode: false,
-            execution_mode: crate::session::ExecutionMode::Read,
-            mode: crate::session::HarnessMode::Read,
+            execution_mode: crate::session::PermissionMode::Read,
+            current_task_id: None, default_write_permission: crate::session::PermissionMode::Write, plan_permission: None,
             created_at_ms: 1,
             updated_at_ms: 1,
             active_plan_id: None,
@@ -1174,6 +1304,9 @@ mod test {
         first
             .renew_session_lease("session", "client-one", 25)
             .unwrap();
+        assert!(second.acquire_session_lease("session", "client-two", 30_026).is_err(),
+            "lease expiry must not replace a live runtime owner");
+        first.release_session_lease("session", "client-one").unwrap();
         let replacement = second
             .acquire_session_lease("session", "client-two", 30_026)
             .unwrap();
@@ -1249,6 +1382,8 @@ mod test {
         let temporary = tempfile::tempdir().unwrap();
         let mut store = SqliteStore::open(temporary.path()).unwrap();
         let preference = HarnessPreference {
+            default_write_permission: crate::session::PermissionMode::Write,
+            plan_permission: None,
             model: "remembered-model".into(),
             effort: "low".into(),
             model_setting: Default::default(),

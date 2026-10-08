@@ -339,8 +339,9 @@ impl ConnectionHost {
             );
             let admission = if matches!(
                 envelope.request.method.as_str(),
-                "turn.cancel" | "turn.restart" | "approval.resolve" | "shutdown"
-            ) {
+                "turn.cancel" | "turn.restart" | "approval.resolve" | "shutdown" | "health.get" | "task.operation"
+            ) || (envelope.request.method == "task.transition"
+                && matches!(envelope.request.params.get("action").and_then(serde_json::Value::as_str), Some("pause" | "clear"))) {
                 &control
             } else {
                 &ordinary

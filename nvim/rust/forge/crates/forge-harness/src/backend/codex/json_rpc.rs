@@ -13,7 +13,7 @@ use crate::control_tools::{
     control_tool_failure_json,
 };
 use crate::plan::{PlanDocument, render_plan};
-use crate::session::{ContextUsage, ExecutionMode};
+use crate::session::{ContextUsage, PermissionMode};
 use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
@@ -167,7 +167,7 @@ pub struct CodexJsonRpc {
     socket: WebSocketStream<MaybeTlsStream<TcpStream>>,
     next_id: u64,
     workspace: String,
-    execution_mode: ExecutionMode,
+    execution_mode: PermissionMode,
     planning_feedback: bool,
     plan_document: Option<PlanDocument>,
     control_runtime: Option<ControlToolRuntime>,
@@ -184,7 +184,7 @@ impl CodexJsonRpc {
     pub async fn connect(
         endpoint: &str,
         workspace: &str,
-        execution_mode: ExecutionMode,
+        execution_mode: PermissionMode,
         permission_coordinator: Arc<PermissionCoordinator>,
         event_sink: Option<BackendEventSink>,
         trace: Arc<TraceStore>,
@@ -214,7 +214,7 @@ impl CodexJsonRpc {
     pub fn set_request_context(
         &mut self,
         workspace: &str,
-        execution_mode: ExecutionMode,
+        execution_mode: PermissionMode,
         event_sink: Option<BackendEventSink>,
     ) {
         self.workspace = workspace.to_owned();
@@ -2053,7 +2053,7 @@ mod test {
                 "a catalog connection must leave broadcast controls to the turn owner");
         });
         let mut process = CodexJsonRpc::connect(
-            &endpoint, &workspace, ExecutionMode::Read,
+            &endpoint, &workspace, PermissionMode::Read,
             PermissionCoordinator::transient(&workspace)?, None,
             Arc::new(TraceStore::open(fixture.path())?), "session".into(),
         ).await?;
@@ -2525,7 +2525,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            ExecutionMode::Read,
+            PermissionMode::Read,
             PermissionCoordinator::transient(&workspace)?,
             Some(sink),
             Arc::new(TraceStore::open(fixture.path())?),
