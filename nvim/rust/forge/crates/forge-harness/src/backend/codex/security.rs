@@ -1,4 +1,4 @@
-use crate::session::ExecutionMode;
+use crate::session::PermissionMode;
 use serde_json::{Map, Value, json};
 
 const READ_PROFILE: &str = "harness_read";
@@ -10,11 +10,11 @@ const WRITE_PROFILE_OVERRIDE: &str = "permissions.harness_write={ extends = \":r
 /// Projects one Harness execution mode into Codex process and request settings.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct CodexSecurity {
-    execution_mode: ExecutionMode,
+    execution_mode: PermissionMode,
 }
 
 impl CodexSecurity {
-    pub const fn new(execution_mode: ExecutionMode) -> Self {
+    pub const fn new(execution_mode: PermissionMode) -> Self {
         Self { execution_mode }
     }
 
@@ -43,7 +43,7 @@ impl CodexSecurity {
     }
 
     pub const fn approval_policy(self) -> &'static str {
-        if matches!(self.execution_mode, ExecutionMode::Yolo) {
+        if matches!(self.execution_mode, PermissionMode::Yolo) {
             "never"
         } else {
             "on-request"
@@ -52,9 +52,9 @@ impl CodexSecurity {
 
     pub const fn permission_profile(self) -> &'static str {
         match self.execution_mode {
-            ExecutionMode::Read => READ_PROFILE,
-            ExecutionMode::Write => WRITE_PROFILE,
-            ExecutionMode::Full | ExecutionMode::Yolo => ":danger-full-access",
+            PermissionMode::Read => READ_PROFILE,
+            PermissionMode::Write => WRITE_PROFILE,
+            PermissionMode::Full | PermissionMode::Yolo => ":danger-full-access",
         }
     }
 
@@ -78,10 +78,10 @@ mod test {
     #[test]
     fn projects_every_execution_mode_without_combining_legacy_sandbox_fields() {
         for (mode, profile, approval_policy) in [
-            (ExecutionMode::Read, READ_PROFILE, "on-request"),
-            (ExecutionMode::Write, WRITE_PROFILE, "on-request"),
-            (ExecutionMode::Full, ":danger-full-access", "on-request"),
-            (ExecutionMode::Yolo, ":danger-full-access", "never"),
+            (PermissionMode::Read, READ_PROFILE, "on-request"),
+            (PermissionMode::Write, WRITE_PROFILE, "on-request"),
+            (PermissionMode::Full, ":danger-full-access", "on-request"),
+            (PermissionMode::Yolo, ":danger-full-access", "never"),
         ] {
             let mut params = json!({ "cwd": "D:/repo" });
             CodexSecurity::new(mode).apply(&mut params, "D:/repo");
@@ -94,7 +94,7 @@ mod test {
 
     #[test]
     fn inserts_profile_overrides_before_the_app_server_subcommand() {
-        let command = CodexSecurity::new(ExecutionMode::Read)
+        let command = CodexSecurity::new(PermissionMode::Read)
             .launch_command(&["codex".into(), "app-server".into()]);
         assert_eq!(command.first().map(String::as_str), Some("codex"));
         assert_eq!(command.last().map(String::as_str), Some("app-server"));

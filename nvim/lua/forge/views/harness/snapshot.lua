@@ -16,7 +16,19 @@ end
 ---@param result table
 function HarnessSnapshot.apply(state, result)
   result = presentation_value(result)
+  if state.session and result.session and state.session.id == result.session.id
+    and state.runtime_epoch == result.runtime_epoch
+    and (result.snapshot_revision or 0) < (state.snapshot_revision or 0) then return false end
+  if state.runtime_epoch and state.runtime_epoch ~= result.runtime_epoch then
+    state.task_operation, state.busy = nil, false
+    require("forge.views.harness.timeline_status").stop(state)
+  end
+  state.runtime_epoch, state.snapshot_revision = result.runtime_epoch, result.snapshot_revision
   if state.host_error then state.host_error, state.execution_notice = nil, nil end
+  local operation = result.task_operation
+  if operation and (operation.state == "failed" or operation.state == "outcome_unknown") then
+    state.execution_notice = operation.error or "Task outcome unknown. Refresh before resuming."
+  end
   local previous_session_id = state.session and state.session.id or nil
   local previous_context_usage = state.session and state.session.context_usage or nil
   state.session = result.session
@@ -33,6 +45,7 @@ function HarnessSnapshot.apply(state, result)
   timeline_cache.replace(state, result.timeline or {}, result.timeline_revision or 0)
   state.artifact = vim.deepcopy(result.artifact or {})
   state.no_checkpoint = result.no_checkpoint == true
+  state.task = result.task or {}
   state.goal = result.goal
   state.goal_execution = result.goal_execution
   state.active_plan = result.active_plan
@@ -47,6 +60,7 @@ function HarnessSnapshot.apply(state, result)
     if not selected_exists then state.selected_agent_run_id = nil end
   end
   if result.prompt_history then prompt_history.replace(result.prompt_history) end
+  return true
 end
 
 return HarnessSnapshot

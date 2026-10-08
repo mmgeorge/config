@@ -1,7 +1,7 @@
 use forge_harness::backend::BackendLaunch;
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::permissions::store::PermissionStore;
-use forge_harness::session::{ExecutionMode, HarnessMode};
+use forge_harness::session::{PermissionMode, HarnessMode};
 use forge_protocol::message::Request;
 use serde_json::json;
 use std::process::Command;
@@ -58,7 +58,7 @@ async fn opens_validates_and_atomically_replaces_the_permission_document() {
     let (temporary, mut broker) = broker_fixture();
     assert_eq!(
         broker.snapshot().unwrap().session.execution_mode,
-        ExecutionMode::Read
+        PermissionMode::Read
     );
 
     let opened = broker
@@ -106,10 +106,10 @@ async fn opens_validates_and_atomically_replaces_the_permission_document() {
 async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
     let (_temporary, mut broker) = broker_fixture();
     for (command, expected) in [
-        ("/write", ExecutionMode::Write),
-        ("/full", ExecutionMode::Full),
-        ("/yolo", ExecutionMode::Yolo),
-        ("/read", ExecutionMode::Read),
+        ("/write", PermissionMode::Write),
+        ("/full", PermissionMode::Full),
+        ("/yolo", PermissionMode::Yolo),
+        ("/read", PermissionMode::Read),
     ] {
         let response = broker
             .dispatch(Request {
@@ -140,7 +140,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         assert!(changed.response.error().is_none());
         let snapshot = broker.snapshot().unwrap();
         assert_eq!(snapshot.session.mode, HarnessMode::Plan);
-        assert_eq!(snapshot.session.execution_mode, ExecutionMode::Write);
+        assert_eq!(snapshot.session.execution_mode, PermissionMode::Write);
         assert!(snapshot.active_plan.is_none());
         assert!(snapshot.exchange.is_empty());
     }
@@ -154,7 +154,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
     assert!(planned.response.error().is_none());
     assert_eq!(
         broker.snapshot().unwrap().session.execution_mode,
-        ExecutionMode::Write
+        PermissionMode::Write
     );
     assert_eq!(broker.snapshot().unwrap().session.mode, HarnessMode::Plan);
     let before = broker.snapshot().unwrap();
@@ -179,7 +179,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
     assert!(accepted.response.error().is_none());
     assert_eq!(
         broker.snapshot().unwrap().session.execution_mode,
-        ExecutionMode::Write
+        PermissionMode::Write
     );
     assert_eq!(broker.snapshot().unwrap().session.mode, HarnessMode::Write);
 }

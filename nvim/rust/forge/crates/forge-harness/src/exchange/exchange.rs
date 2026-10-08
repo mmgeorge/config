@@ -33,7 +33,7 @@ pub struct Exchange {
     pub kind: ExchangeKind,
     #[serde(default)]
     /// Interaction mode retained independently of later session mode changes.
-    pub mode: Option<crate::session::HarnessMode>,
+    pub mode: Option<crate::session::PermissionMode>,
     #[serde(default)]
     pub plan_id: Option<String>,
     #[serde(default)]

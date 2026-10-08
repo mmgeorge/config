@@ -202,7 +202,7 @@ mod tests {
         let mut process = CodexJsonRpc::connect(
             &endpoint,
             &workspace,
-            crate::session::ExecutionMode::Read,
+            crate::session::PermissionMode::Read,
             permission,
             None,
             trace,

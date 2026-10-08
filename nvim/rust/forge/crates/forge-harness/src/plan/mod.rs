@@ -4,7 +4,7 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use crate::session::{ExecutionMode, continuation::ContinuationBudget};
+use crate::session::{PermissionMode, continuation::ContinuationBudget};
 
 mod audit;
 mod comment_lint;
@@ -327,13 +327,13 @@ pub struct PlanAcceptance {
     pub review_digest: String,
     #[serde(default)]
     pub saved_source_digest: Option<String>,
-    pub execution_mode_list: Vec<ExecutionMode>,
+    pub execution_mode_list: Vec<PermissionMode>,
     pub elicitation: PlanElicitation,
 }
 
 impl PlanAcceptance {
     /// Build acceptance questions from the execution modes exposed by the active backend.
-    pub fn new(review_digest: String, execution_mode_list: &[ExecutionMode]) -> Result<Self> {
+    pub fn new(review_digest: String, execution_mode_list: &[PermissionMode]) -> Result<Self> {
         anyhow::ensure!(
             !execution_mode_list.is_empty(),
             "the active backend exposes no execution mode"
@@ -369,15 +369,15 @@ impl PlanAcceptance {
     }
 
     /// Resolve the selected execution boundary only after every acceptance question has an answer.
-    pub fn execution_mode(&self) -> Result<ExecutionMode> {
+    pub fn execution_mode(&self) -> Result<PermissionMode> {
         if self.execution_mode_list.len() == 1 {
             return Ok(self.execution_mode_list[0]);
         }
         match selected_option(&self.elicitation, "acceptance-execution-mode")? {
-            "Read-only" => Ok(ExecutionMode::Read),
-            "Write workspace (Recommended)" => Ok(ExecutionMode::Write),
-            "Full access" => Ok(ExecutionMode::Full),
-            "YOLO" => Ok(ExecutionMode::Yolo),
+            "Read-only" => Ok(PermissionMode::Read),
+            "Write workspace (Recommended)" => Ok(PermissionMode::Write),
+            "Full access" => Ok(PermissionMode::Full),
+            "YOLO" => Ok(PermissionMode::Yolo),
             option => anyhow::bail!("unsupported execution access choice {option:?}"),
         }
     }
@@ -397,21 +397,21 @@ fn selected_option<'a>(elicitation: &'a PlanElicitation, question_id: &str) -> R
     }
 }
 
-const fn execution_mode_option_label(mode: ExecutionMode) -> &'static str {
+const fn execution_mode_option_label(mode: PermissionMode) -> &'static str {
     match mode {
-        ExecutionMode::Read => "Read-only",
-        ExecutionMode::Write => "Write workspace (Recommended)",
-        ExecutionMode::Full => "Full access",
-        ExecutionMode::Yolo => "YOLO",
+        PermissionMode::Read => "Read-only",
+        PermissionMode::Write => "Write workspace (Recommended)",
+        PermissionMode::Full => "Full access",
+        PermissionMode::Yolo => "YOLO",
     }
 }
 
-const fn execution_mode_option_description(mode: ExecutionMode) -> &'static str {
+const fn execution_mode_option_description(mode: PermissionMode) -> &'static str {
     match mode {
-        ExecutionMode::Read => "Inspect without changing workspace files.",
-        ExecutionMode::Write => "Modify workspace files through the normal approval policy.",
-        ExecutionMode::Full => "Use unrestricted filesystem and process access.",
-        ExecutionMode::Yolo => "Run without interactive approval checks.",
+        PermissionMode::Read => "Inspect without changing workspace files.",
+        PermissionMode::Write => "Modify workspace files through the normal approval policy.",
+        PermissionMode::Full => "Use unrestricted filesystem and process access.",
+        PermissionMode::Yolo => "Run without interactive approval checks.",
     }
 }
 
@@ -1917,7 +1917,7 @@ mod test {
     fn acceptance_requires_execution_access_before_execution() {
         let mut acceptance = PlanAcceptance::new(
             "digest".into(),
-            &[ExecutionMode::Write, ExecutionMode::Read],
+            &[PermissionMode::Write, PermissionMode::Read],
         )
         .unwrap();
         assert_eq!(acceptance.elicitation.question_set.questions.len(), 1);
@@ -1932,6 +1932,6 @@ mod test {
                 },
             )
             .unwrap();
-        assert_eq!(acceptance.execution_mode().unwrap(), ExecutionMode::Write);
+        assert_eq!(acceptance.execution_mode().unwrap(), PermissionMode::Write);
     }
 }

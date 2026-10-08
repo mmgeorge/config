@@ -22,7 +22,7 @@ use crate::permissions::document::PermissionDecision;
 use crate::permissions::matcher::{
     CompiledPermissionDocument, PermissionRequest, PermissionTarget,
 };
-use crate::session::ExecutionMode;
+use crate::session::PermissionMode;
 
 const MAX_REPLY_BYTES: usize = 256 * 1024;
 const MAX_FILE_BYTES: usize = 128 * 1024;
@@ -33,7 +33,7 @@ pub struct RepositoryToolScope {
     interaction: String,
     workspace: PathBuf,
     policy: Arc<CompiledPermissionDocument>,
-    mode: ExecutionMode,
+    mode: PermissionMode,
     repository: Arc<RepositoryStore>,
     diff: Arc<DiffEngine>,
     active: AtomicBool,
@@ -72,7 +72,7 @@ impl RepositoryToolScope {
         interaction: String,
         workspace: PathBuf,
         policy: Arc<CompiledPermissionDocument>,
-        mode: ExecutionMode,
+        mode: PermissionMode,
         cancelled: Arc<AtomicBool>,
         repository: Arc<RepositoryStore>,
         diff: Arc<DiffEngine>,
@@ -537,7 +537,7 @@ mod tests {
             "interaction".into(),
             workspace,
             policy,
-            ExecutionMode::Read,
+            PermissionMode::Read,
             Arc::clone(&cancelled),
             repository,
             diff,
@@ -569,7 +569,7 @@ mod tests {
             "interaction".into(),
             workspace,
             policy,
-            ExecutionMode::Read,
+            PermissionMode::Read,
             Arc::new(AtomicBool::new(false)),
             repository,
             diff,
@@ -607,7 +607,7 @@ mod tests {
                 "interaction".into(),
                 workspace.join("other"),
                 Arc::clone(&policy),
-                ExecutionMode::Read,
+                PermissionMode::Read,
                 Arc::new(AtomicBool::new(false)),
                 Arc::clone(&repository),
                 Arc::clone(&diff)
@@ -619,7 +619,7 @@ mod tests {
             "interaction".into(),
             workspace,
             policy,
-            ExecutionMode::Read,
+            PermissionMode::Read,
             Arc::new(AtomicBool::new(false)),
             repository,
             diff,
@@ -691,7 +691,7 @@ mod tests {
             "interaction".into(),
             workspace,
             policy,
-            ExecutionMode::Read,
+            PermissionMode::Read,
             Arc::new(AtomicBool::new(false)),
             Arc::clone(&repository),
             Arc::clone(&diff),

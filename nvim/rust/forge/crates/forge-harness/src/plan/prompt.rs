@@ -17,7 +17,7 @@ impl PlanPrompt {
     /// Build a decision-complete planning request for one user objective.
     pub fn draft(request: &str) -> String {
         format!(
-            r#"You are planning a software change in Harness Plan mode. The retained execution authorization governs every command and file operation. Planning may inspect source but must not modify project files.
+            r#"You are planning a software change in the Harness Plan task. The retained execution authorization governs every command and file operation. Planning may inspect source but must not modify project files.
 
 {PLANNING_CONTRACT}
 
@@ -29,7 +29,7 @@ User request:
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing Harness Plan mode conversation. The Harness already recorded and consumed the user's answers below. Do not call harness_question_answer or harness_question_withdraw for them. Incorporate the answers through harness_design_apply_patch edits. If another material product decision remains, call harness_question_ask and end the turn. Otherwise call harness_plan_submit with the exact canonical plan ID and version.
+            r#"Continue the existing the Harness Plan task conversation. The Harness already recorded and consumed the user's answers below. Do not call harness_question_answer or harness_question_withdraw for them. Incorporate the answers through harness_design_apply_patch edits. If another material product decision remains, call harness_question_ask and end the turn. Otherwise call harness_plan_submit with the exact canonical plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -60,7 +60,7 @@ Original request:
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("None");
         format!(
-            r#"Revise the saved canonical plan in Harness Plan mode. Resolve every annotation and overall comment with harness_design_apply_patch edits, then call harness_plan_submit with the exact resulting plan ID and version.
+            r#"Revise the saved canonical plan in the Harness Plan task. Resolve every annotation and overall comment with harness_design_apply_patch edits, then call harness_plan_submit with the exact resulting plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -85,7 +85,7 @@ Review comments:
     /// Keep review discussion read-only until the user requests a canonical plan revision.
     pub fn discussion(prompt: &str) -> String {
         format!(
-            "Continue discussing the active canonical plan in Harness Plan mode. \
+            "Continue discussing the active canonical plan in the Harness Plan task. \
 Answer questions without editing or resubmitting the plan. When the user requests changes, \
 revise the existing plan through harness_design_apply_patch, then submit the resulting plan ID and version \
 through harness_plan_submit. A successful edit starts a revision of the same plan. \
@@ -111,7 +111,7 @@ fn mutable_elicitation_prompt(
     format!(
         r#"The user is responding while a Harness question set remains pending. Treat the pending elicitation as mutable decision state, not as a modal lock.
 
-Remain in Harness Plan mode. The retained execution authorization governs repository access. Answer the user's follow-up directly, using repository evidence when relevant. {workflow_boundary}
+Remain in the Harness Plan task. The retained execution authorization governs repository access. Answer the user's follow-up directly, using repository evidence when relevant. {workflow_boundary}
 
 After answering, choose exactly one outcome:
 

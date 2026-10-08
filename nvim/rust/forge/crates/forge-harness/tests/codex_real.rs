@@ -1,6 +1,6 @@
 use forge_harness::backend::BackendLaunch;
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
-use forge_harness::session::ExecutionMode;
+use forge_harness::session::PermissionMode;
 use forge_protocol::message::Request;
 use serde_json::{Value, json};
 use std::path::Path;
@@ -276,7 +276,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
             ..
         }
     )));
-    assert_eq!(snapshot.session.execution_mode, ExecutionMode::Read);
+    assert_eq!(snapshot.session.execution_mode, PermissionMode::Read);
 
     let new_session = broker
         .dispatch(Request {
@@ -288,7 +288,7 @@ async fn asks_for_feedback_then_creates_a_plan_without_native_collaboration_mode
     assert!(new_session.response.error().is_none());
     assert_eq!(
         broker.snapshot().unwrap().session.execution_mode,
-        ExecutionMode::Read
+        PermissionMode::Read
     );
     let write_mode = broker
         .dispatch(Request {

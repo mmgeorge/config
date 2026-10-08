@@ -293,7 +293,9 @@ local function submit(review, method, params)
     if not completed.owner.closed then close_review(completed) end
     if result then controller.activate_snapshot(result) end
     controller.render()
-    if method == "plan.acceptance.begin" then vim.schedule(function() controller.present_plan_question(true) end) end
+    if method == "plan.acceptance.begin" then
+      controller.task_transition({ action = "execute", plan_id = review.plan.id, digest = review.plan.review_digest })
+    end
   end)
   if queued and (review.owner.submission_pending or review.owner.pending_operation) then hide_review(review) end
 end

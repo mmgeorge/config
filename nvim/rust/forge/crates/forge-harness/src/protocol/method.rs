@@ -3,6 +3,14 @@ use serde::Deserialize;
 /// Identifies an accepted Harness operation before session state is accessed.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq)]
 pub enum HarnessMethod {
+    #[serde(rename = "task.list")]
+    TaskList,
+    #[serde(rename = "task.transition")]
+    TaskTransition,
+    #[serde(rename = "task.operation")]
+    TaskOperation,
+    #[serde(rename = "health.get")]
+    Health,
     #[serde(rename = "state.get")]
     StateGet,
     #[serde(rename = "session.list")]
@@ -28,7 +36,7 @@ pub enum HarnessMethod {
     #[serde(rename = "permissions.save")]
     PermissionsSave,
     #[serde(rename = "session.execution_mode")]
-    SessionExecutionMode,
+    SessionPermissionMode,
     #[serde(rename = "session.mode")]
     SessionMode,
     #[serde(rename = "exchange.resume")]

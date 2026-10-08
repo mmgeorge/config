@@ -8,7 +8,7 @@ use crate::permissions::document::{
 };
 use crate::permissions::matcher::{PermissionRequest, PermissionTarget};
 use crate::permissions::store::PermissionStore;
-use crate::session::ExecutionMode;
+use crate::session::PermissionMode;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -83,12 +83,12 @@ impl PermissionCoordinator {
 
     pub async fn authorize(
         &self,
-        execution_mode: ExecutionMode,
+        execution_mode: PermissionMode,
         request: PermissionRequest,
         address: Option<crate::backend::ProviderAddress>,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalResolution> {
-        if execution_mode == ExecutionMode::Yolo {
+        if execution_mode == PermissionMode::Yolo {
             return Ok(ApprovalResolution::AllowOnce);
         }
         let evaluation = self
@@ -767,7 +767,7 @@ mod test {
         let waiting = tokio::spawn(async move {
             waiting_coordinator
                 .authorize(
-                    ExecutionMode::Read,
+                    PermissionMode::Read,
                     request,
                     None,
                     Some(&waiting_event_sink),
@@ -813,7 +813,7 @@ mod test {
         let waiting = tokio::spawn(async move {
             waiting_coordinator
                 .authorize(
-                    ExecutionMode::Full,
+                    PermissionMode::Full,
                     PermissionRequest {
                         id: "approval-deny".into(),
                         provider: "test".into(),
@@ -852,7 +852,7 @@ mod test {
         let waiting = tokio::spawn(async move {
             waiting_coordinator
                 .authorize(
-                    ExecutionMode::Read,
+                    PermissionMode::Read,
                     PermissionRequest {
                         id: "approval-cancel".into(),
                         provider: "test".into(),

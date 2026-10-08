@@ -1,7 +1,7 @@
 use forge_harness::backend::copilot::CopilotBackend;
 use forge_harness::backend::{Backend, BackendCatalogRequest, BackendLaunch};
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
-use forge_harness::session::ExecutionMode;
+use forge_harness::session::PermissionMode;
 use forge_protocol::message::Request;
 use serde_json::{Value, json};
 use std::process::Command;
@@ -15,7 +15,7 @@ async fn lists_native_copilot_skills_and_mcp_rows() {
     let request = BackendCatalogRequest {
         harness_session_id: "copilot-catalog".into(),
         workspace: temporary.path().to_string_lossy().into_owned(),
-        execution_mode: ExecutionMode::Read,
+        execution_mode: PermissionMode::Read,
         backend_session_id: None,
     };
     let skill_list =

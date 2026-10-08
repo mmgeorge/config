@@ -9,9 +9,12 @@ controller.refresh_winbar = function() end
 controller.drain = function() end
 state.composer_buf = vim.api.nvim_create_buf(false, true)
 state.busy = true
+state.session = { id = "steering-task" }
 state.capability = { native_steer = true }
 state.queue, state.pending_steer = {}, {}
 local calls, reply = {}, nil
+local transition
+controller.task_transition = function(action) transition = action end
 client.request = function(method, params, callback)
   calls[#calls + 1] = { method = method, params = params }
   reply = callback
@@ -27,12 +30,12 @@ assert(calls[1].params.target == nil and #state.queue == 0)
 reply({})
 draft("/plan convert to X")
 controller.submit()
-assert(#calls == 1 and state.queue[1] == "/plan convert to X", "active /plan command steered")
+assert(#calls == 1 and transition.action == "plan" and transition.text == "convert to X", "active /plan did not enter the coordinator")
 state.queue = {}
 state.selected_agent_run_id = "child"
 draft("/plan convert child to X")
 controller.submit()
-assert(#calls == 1 and state.queue[1] == "/plan convert child to X", "selected child intercepted queued plan")
+assert(#calls == 1 and transition.text == "convert child to X", "selected child intercepted task creation")
 state.selected_agent_run_id = nil
 state.queue = {}
 draft("please convert to X")
@@ -41,16 +44,16 @@ assert(#calls == 2 and calls[2].method == "turn.steer", "ordinary prompt did not
 reply({})
 draft("explicit follow-up")
 controller.queue_submit()
-assert(#calls == 2 and state.queue[1] == "explicit follow-up", "queue submission steered")
+assert(#calls == 2 and state.queue[1].text == "explicit follow-up", "queue submission steered")
 state.queue = {}
 state.busy, state.configuring = false, true
 draft("after configuration")
 controller.submit()
-assert(#calls == 2 and state.queue[1] == "after configuration", "configuration-only state attempted steering")
+assert(#calls == 2 and state.queue[1].text == "after configuration", "configuration-only state attempted steering")
 state.busy, state.configuring = true, false
 state.capability.native_steer = false
 state.queue = {}
 draft("unsupported backend")
 controller.submit()
-assert(#calls == 2 and state.queue[1] == "unsupported backend", "unsupported backend attempted steering")
+assert(#calls == 2 and state.queue[1].text == "unsupported backend", "unsupported backend attempted steering")
 print("harness_submit_steering: passed")

@@ -48,6 +48,12 @@ end
 ---@param state ForgeHarnessPresentationState
 ---@return table?
 function M.resolve(state)
+  if state.host_error or state.connection_error or state.sync_error or state.execution_notice then
+    return { id = "failure", kind = "error", text = state.host_error or state.connection_error or state.sync_error or state.execution_notice }
+  end
+  if state.task_operation and state.task_operation.state ~= "running" then
+    return { id = "task_transition", kind = "input", text = "Task " .. state.task_operation.state }
+  end
   local status = state.status or { kind = "idle" }
   if status.kind == "finalizing" then
     return { id = "finalizing", kind = status.error and "error" or "working",

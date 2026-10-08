@@ -16,7 +16,7 @@ use crate::control_tools::{
     ControlToolInvocation, ControlToolRegistry, ControlToolRuntime, ControlTurnContext,
     apply_invocation, control_tool_failure_json,
 };
-use crate::session::ExecutionMode;
+use crate::session::PermissionMode;
 use anyhow::{Context, Result};
 use async_trait::async_trait;
 use event_decoder::CopilotEventDecoder;
@@ -366,10 +366,10 @@ fn capability() -> BackendCapability {
         fast_mode: false,
         permission_control: true,
         execution_mode_list: vec![
-            ExecutionMode::Read,
-            ExecutionMode::Write,
-            ExecutionMode::Full,
-            ExecutionMode::Yolo,
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Full,
+            PermissionMode::Yolo,
         ],
         agent: AgentCapability {
             observe: true,
@@ -1017,6 +1017,16 @@ impl Backend for CopilotBackend {
         Ok(())
     }
 
+    async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
+        self.cancel_session(session_id).await?;
+        tokio::time::timeout(std::time::Duration::from_secs(8), async {
+            while self.has_active_turn(session_id).await {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+        }).await.context("Copilot cancellation was acknowledged but terminal completion remains unknown")?;
+        Ok(())
+    }
+
     async fn active_session_id(&self) -> Option<String> {
         None
     }
@@ -1388,7 +1398,7 @@ impl ToolHandler for CopilotControlToolHandler {
 }
 
 struct CopilotPermissionState {
-    execution_mode: ExecutionMode,
+    execution_mode: PermissionMode,
     workspace: String,
     event_sink: Option<BackendEventSink>,
 }
@@ -1403,7 +1413,7 @@ impl CopilotPermissionContext {
         Self {
             coordinator,
             state: StandardMutex::new(CopilotPermissionState {
-                execution_mode: ExecutionMode::Read,
+                execution_mode: PermissionMode::Read,
                 workspace: ".".into(),
                 event_sink: None,
             }),
@@ -1412,7 +1422,7 @@ impl CopilotPermissionContext {
 
     fn configure(
         &self,
-        execution_mode: ExecutionMode,
+        execution_mode: PermissionMode,
         workspace: String,
         event_sink: Option<BackendEventSink>,
     ) -> Result<()> {
@@ -1725,7 +1735,7 @@ mod test {
             effort: "low".into(),
             context_window: None,
             fast_mode: false,
-            execution_mode: ExecutionMode::Read,
+            execution_mode: PermissionMode::Read,
             backend_session_id: None,
             control_context: None,
         };

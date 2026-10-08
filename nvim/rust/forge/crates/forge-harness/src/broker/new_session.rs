@@ -1,4 +1,4 @@
-use crate::session::{ExecutionMode, HarnessMode, HarnessSession, ProviderForkState, SessionStore};
+use crate::session::{PermissionMode, HarnessSession, ProviderForkState, SessionStore};
 use crate::storage::SqliteStore;
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -50,8 +50,8 @@ pub fn prepare_new_session(
         context_window: preference.as_ref().and_then(|value| value.model_setting.get(&value.model))
             .and_then(|setting| setting.context_window.clone()).or(source.context_window),
         fast_mode: source.fast_mode,
-        execution_mode: ExecutionMode::Read,
-        mode: HarnessMode::Read,
+        execution_mode: PermissionMode::Read,
+        current_task_id: None, default_write_permission: preference.as_ref().map_or(source.default_write_permission, |value| value.default_write_permission), plan_permission: preference.as_ref().map_or(source.plan_permission, |value| value.plan_permission),
         created_at_ms: now_ms,
         updated_at_ms: now_ms,
         active_plan_id: None,

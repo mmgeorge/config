@@ -1,4 +1,5 @@
 vim.loader.enable(false)
+vim.o.columns = 130
 require("forge").setup({ harness = { backend = "mock" } })
 local client = require("forge.client")
 local settings = require("forge.views.harness.settings")
@@ -23,6 +24,8 @@ client.request_for = function(session_id, method, params, callback)
     return
   end
   if method == "session.configure" then
+    if params.default_write_permission then configured_session.default_write_permission = params.default_write_permission end
+    if params.plan_permission then configured_session.plan_permission = params.plan_permission end
     if params.plan_executor_enabled ~= nil then configured_session.plan_executor.enabled = params.plan_executor_enabled end
     if params.plan_compact ~= nil then configured_session.plan_compact = params.plan_compact end
     if params.plan_auto_approve_revisions ~= nil then configured_session.plan_auto_approve_revisions = params.plan_auto_approve_revisions end
@@ -45,18 +48,28 @@ local success, failure = xpcall(function()
   assert(not text:find("Plan Executor", 1, true) and not text:find("Plan Compact", 1, true), text)
   assert(text:find("Description", 1, true), text)
   assert(not text:find("[←", 1, true), text)
-  assert(text:find("Auto-approve plan revisions", 1, true), text)
-  vim.fn.maparg("<Right>", "n", false, true).callback()
+  assert(instance.spec.page_list[1].option_list[3].label == "Auto-approve plan revisions")
+  local options = instance.spec.page_list[1].option_list
+  assert(options[1].id == "default-write-permission" and options[2].id == "plan-permission")
+  instance.spec.action_list[2].callback({ option = options[1] })
+  assert(configured_session.default_write_permission == "full")
+  instance.spec.action_list[1].callback({ option = options[1] })
+  assert(configured_session.default_write_permission == "write")
+  instance.spec.action_list[2].callback({ option = options[2] })
+  assert(configured_session.plan_permission == "read")
+  instance.spec.action_list[1].callback({ option = options[2] })
+  assert(configured_session.plan_permission == vim.NIL)
+  instance.spec.action_list[2].callback({ option = options[3] })
   assert(configured_session.plan_auto_approve_revisions == false)
-  vim.fn.maparg("<Left>", "n", false, true).callback()
+  instance.spec.action_list[1].callback({ option = options[3] })
   assert(configured_session.plan_auto_approve_revisions == true)
-  local logging = instance.spec.page_list[1].option_list[2]
+  local logging = instance.spec.page_list[1].option_list[4]
   instance.spec.action_list[1].callback({ option = logging })
   assert(enabled and require("forge.infra.perf").enabled("harness"))
   instance.spec.action_list[1].callback({ option = logging })
   assert(not enabled and not require("forge.infra.perf").enabled("harness"))
-  assert(#instance.spec.page_list[1].option_list == 3)
-  local provider = instance.spec.page_list[1].option_list[3]
+  assert(#instance.spec.page_list[1].option_list == 5)
+  local provider = instance.spec.page_list[1].option_list[5]
   assert(provider.id == "provider" and provider.columns[2] == "Codex CLI")
   instance.spec.action_list[1].callback({ option = provider })
   assert(not enabled and picker.is_open("harness-config"), "Left opened the provider picker")

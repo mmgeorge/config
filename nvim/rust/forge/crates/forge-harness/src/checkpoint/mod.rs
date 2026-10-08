@@ -1204,7 +1204,8 @@ mod test {
         let store = SqliteStore::open(data.path()).unwrap();
         let snapshot = GitCheckpoint::new(repository.path());
         let before = snapshot
-            .capture_native(&store.objects, "session", 1, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 1)
+            .await
             .unwrap();
         fs::write(repository.path().join("tracked.txt"), "after\n").unwrap();
         fs::write(repository.path().join("new.txt"), "new\n").unwrap();
@@ -1216,7 +1217,8 @@ mod test {
         )
         .unwrap();
         let after = snapshot
-            .capture_native(&store.objects, "session", 2, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 2)
+            .await
             .unwrap();
         let diff = checkpoint_diff(&store.objects, &reads, &engine, &before, &after)
             .await
@@ -1259,11 +1261,13 @@ mod test {
         let store = SqliteStore::open(data.path()).unwrap();
         let checkpoint = GitCheckpoint::new(repository.path());
         let before = checkpoint
-            .capture_native(&store.objects, "session", 1, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 1)
+            .await
             .unwrap();
         fs::write(repository.path().join("tracked.txt"), "after\n").unwrap();
         let after = checkpoint
-            .capture_native(&store.objects, "session", 2, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 2)
+            .await
             .unwrap();
         let repositories = Arc::new(RepositoryStore::default());
         let handle = repositories
@@ -1322,7 +1326,8 @@ mod test {
         let store = SqliteStore::open(data.path()).unwrap();
         let checkpoint = GitCheckpoint::new(repository.path());
         let before = checkpoint
-            .capture_native(&store.objects, "session", 1, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 1)
+            .await
             .unwrap();
         let repositories = Arc::new(RepositoryStore::default());
         let handle = repositories
@@ -1465,18 +1470,18 @@ mod test {
             .max_blocking_threads(1)
             .build()
             .unwrap();
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let objects = ObjectStore::open(data.path()).unwrap();
+        let checkpoint = GitCheckpoint::new(repository.path());
+        let before = checkpoint
+            .capture_native(&objects, "session", 1, || Ok(()))
+            .unwrap();
+        fs::write(repository.path().join("tracked.txt"), "after\n").unwrap();
+        let after = checkpoint
+            .capture_native(&objects, "session", 2, || Ok(()))
+            .unwrap();
         executor.block_on(async {
-            let repository = repository();
-            let data = tempfile::tempdir().unwrap();
-            let objects = ObjectStore::open(data.path()).unwrap();
-            let checkpoint = GitCheckpoint::new(repository.path());
-            let before = checkpoint
-                .capture_native(&objects, "session", 1, || Ok(()))
-                .unwrap();
-            fs::write(repository.path().join("tracked.txt"), "after\n").unwrap();
-            let after = checkpoint
-                .capture_native(&objects, "session", 2, || Ok(()))
-                .unwrap();
             let repositories = Arc::new(RepositoryStore::default());
             let admitted = checkpoint
                 .admit_restore(Arc::clone(&repositories), after, before)
@@ -1523,21 +1528,21 @@ mod test {
         use std::task::Poll;
         let executor = tokio::runtime::Builder::new_current_thread()
             .enable_all()
-            .max_blocking_threads(1)
+            .max_blocking_threads(4)
             .build()
             .unwrap();
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let objects = ObjectStore::open(data.path()).unwrap();
+        let checkpoint = GitCheckpoint::new(repository.path());
+        let before = checkpoint
+            .capture_native(&objects, "session", 1, || Ok(()))
+            .unwrap();
+        fs::write(repository.path().join("tracked.txt"), "after\n").unwrap();
+        let after = checkpoint
+            .capture_native(&objects, "session", 2, || Ok(()))
+            .unwrap();
         executor.block_on(async {
-            let repository = repository();
-            let data = tempfile::tempdir().unwrap();
-            let objects = ObjectStore::open(data.path()).unwrap();
-            let checkpoint = GitCheckpoint::new(repository.path());
-            let before = checkpoint
-                .capture_native(&objects, "session", 1, || Ok(()))
-                .unwrap();
-            fs::write(repository.path().join("tracked.txt"), "after\n").unwrap();
-            let after = checkpoint
-                .capture_native(&objects, "session", 2, || Ok(()))
-                .unwrap();
             let repositories = Arc::new(RepositoryStore::default());
             let admitted = checkpoint
                 .admit_restore(Arc::clone(&repositories), after, before)
@@ -1591,12 +1596,14 @@ mod test {
         let store = SqliteStore::open(data.path()).unwrap();
         let snapshot = GitCheckpoint::new(repository.path());
         let before = snapshot
-            .capture_native(&store.objects, "session", 1, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 1)
+            .await
             .unwrap();
         fs::write(repository.path().join("tracked.txt"), "after\n").unwrap();
         fs::write(repository.path().join("external.txt"), "external\n").unwrap();
         let after = snapshot
-            .capture_native(&store.objects, "session", 2, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 2)
+            .await
             .unwrap();
         let selected = BTreeSet::from(["tracked.txt".to_owned()]);
 
@@ -1645,11 +1652,13 @@ mod test {
         let store = SqliteStore::open(data.path()).unwrap();
         let snapshot = GitCheckpoint::new(repository.path());
         let before = snapshot
-            .capture_native(&store.objects, "session", 1, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 1)
+            .await
             .unwrap();
         fs::write(repository.path().join("tracked.txt"), b"after\n").unwrap();
         let mut after = snapshot
-            .capture_native(&store.objects, "session", 2, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 2)
+            .await
             .unwrap();
         let large = store
             .objects
@@ -1685,12 +1694,14 @@ mod test {
         let store = SqliteStore::open(data.path()).unwrap();
         let snapshot = GitCheckpoint::new(repository.path());
         let before = snapshot
-            .capture_native(&store.objects, "session", 1, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 1)
+            .await
             .unwrap();
         fs::write(repository.path().join("binary.dat"), b"text\0data").unwrap();
         fs::write(repository.path().join("encoded.txt"), [0xff, 0xfe]).unwrap();
         let after = snapshot
-            .capture_native(&store.objects, "session", 2, || Ok(()))
+            .capture(&store.objects, &Arc::new(RepositoryStore::default()), "session", 2)
+            .await
             .unwrap();
         let diff = checkpoint_diff(&store.objects, &reads, &engine, &before, &after)
             .await

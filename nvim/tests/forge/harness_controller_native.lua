@@ -23,10 +23,12 @@ client.subscribe = function(callback) receive = callback return function() end e
 client.request_for = function(session_id, method, params, callback)
   assert(session_id == "native-controller")
   if method == "prompt.submit" then submitted = params submitted_callback = callback return end
-  if method == "goal.pause" or method == "goal.clear" then
-    goal_request[#goal_request + 1] = { method = method, callback = callback }
+  if method == "task.transition" then
+    goal_request[#goal_request + 1] = { method = method, params = params, callback = callback }
     return
   end
+  if method == "health.get" then callback({ responsive = true }) return end
+  if method == "state.get" then callback({ session = state.session }) return end
   if method == "history.record" then vim.schedule(function() callback({}) end) return end
   if method == "backend.models" then callback({}) return end
   assert(method == "harness.document")
@@ -56,9 +58,9 @@ local success, failure = xpcall(function()
   null_snapshot.session = state.session
   controller.activate_snapshot(null_snapshot)
   assert(state.goal == nil and state.active_elicitation == nil, "startup retained nullable state")
-  local original_state_request = client.request
+  local original_state_request = client.request_for
   local synchronized = false
-  client.request = function(method, _, callback)
+  client.request_for = function(_, method, _, callback)
     assert(method == "state.get")
     callback(null_snapshot)
     synchronized = true
@@ -66,7 +68,7 @@ local success, failure = xpcall(function()
   receive("plan_changes_requested", {}, "native-controller")
   assert(synchronized and not state.state_sync_pending, "reject snapshot synchronization did not settle")
   assert(state.goal == nil and state.active_elicitation == nil, "reject snapshot retained nullable state")
-  client.request = original_state_request
+  client.request_for = original_state_request
   assert(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)[1] == "Native transcript")
   assert(vim.wo[state.transcript_win].breakindent, "native attachment discarded Harness continuation indentation")
   assert(vim.wo[state.composer_win].winbar:find("submit", 1, true), "composer has no submit hint")
@@ -94,38 +96,29 @@ local success, failure = xpcall(function()
   assert(vim.wo[state.composer_win].winbar:find("queue", 1, true), "busy composer has no queue hint")
   state.goal = { state = "paused", created_at_ms = 1000 }
   receive("backend_event", { kind = "execution_state", data = {
-    session = { id = "native-controller", backend = "mock", model = "mock", execution_mode = "write" },
+    session = { id = "native-controller", backend = "mock", model = "mock", execution_mode = "write", current_task_id = "execution" },
+    task = { { id = "execution", kind = "execute", phase = "implement", status = "running" } },
     goal = { state = "active", created_at_ms = 1000 },
     goal_execution = { state = "active", created_at_ms = 1000, scheduler = { task = { { state = "active" } } } },
   } }, "native-controller")
   assert(state.busy and state.goal.state == "active" and state.session.execution_mode == "write")
-  assert(vim.wo[state.transcript_win].winbar:find("Plan active", 1, true))
+  assert(vim.wo[state.transcript_win].winbar:find("execute · implement · running", 1, true))
   receive("backend_event", { kind = "execution_state", data = {
     session = state.session, goal = vim.NIL, goal_execution = vim.NIL,
   } }, "native-controller")
   assert(state.goal == nil and state.goal_execution == nil, "absent execution state retained stale goal labels")
   state.busy = false
   state.session.execution_mode = "read"
-  for _, owner in ipairs({ "goal", "goal_execution" }) do
-    state[owner] = { state = "paused", created_at_ms = 1000 }
-    controller.refresh_winbar()
-    local label = owner == "goal" and "Goal paused" or "Plan paused"
-    assert(vim.wo[state.transcript_win].winbar:find(label, 1, true), "paused work disappeared from the winbar")
-    state[owner] = nil
-    controller.refresh_winbar()
-    assert(not vim.wo[state.transcript_win].winbar:find(label, 1, true), "stale pause label survived goal removal")
-  end
-  for status, label in pairs({ blocked = "blocked", stalled = "stalled",
-    usage_limited = "usage limited", budget_limited = "budget limited" }) do
-    for _, planning in ipairs({ false, true }) do
-      state.goal = { state = status, created_at_ms = 1000 }
-      state.goal_execution = planning and { state = "paused", created_at_ms = 1000 } or nil
+  for _, kind in ipairs({ "plan", "execute", "goal" }) do
+    for _, status in ipairs({ "paused", "blocked", "failed", "waiting" }) do
+      state.task = { { id = "execution", kind = kind, phase = "review", status = status } }
       controller.refresh_winbar()
-      assert(vim.wo[state.transcript_win].winbar:find((planning and "Plan " or "Goal ") .. label, 1, true),
-        "native stop reason disappeared from the winbar")
+      assert(vim.wo[state.transcript_win].winbar:find(kind .. " · review · " .. status, 1, true),
+        "durable task lifecycle disappeared from the winbar")
     end
   end
-  state.goal, state.goal_execution = nil, nil
+  state.goal, state.goal_execution, state.task = nil, nil, {}
+  state.session.current_task_id = nil
   controller.refresh_winbar()
   local original_window = state.transcript_win
   vim.api.nvim_set_current_win(original_window)
@@ -156,16 +149,16 @@ local success, failure = xpcall(function()
   receive("backend_event", { kind = "prompt_submission", data = { document = state.presentation.document,
     token = submitted.submission.token, state = "accepted" } }, "native-controller")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
-  local original_state_request = client.request
+  local original_state_request = client.request_for
   local recovered_state = false
-  client.request = function(method)
+  client.request_for = function(_, method)
     assert(method == "state.get")
     recovered_state = true
   end
   submitted_callback(nil, "simulated provider failure")
   assert(not state.busy and recovered_state, "provider failure did not reconcile execution state")
   state.state_sync_pending = false
-  client.request = original_state_request
+  client.request_for = original_state_request
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "draft after host collection" })
   generation = 2
   controller.render()
@@ -179,6 +172,8 @@ local success, failure = xpcall(function()
   controller.drain()
   assert(#state.queue == 1 and submitted == nil, "finalizing status drained queued input")
   state.status = { kind = "idle" }
+  assert(state.execution_notice, "provider failure lost its persistent notice")
+  state.execution_notice = nil
   controller.drain()
   assert(#state.queue == 0 and submitted ~= nil, "idle status did not resume queued input")
   local original_plain_request = client.request
@@ -216,7 +211,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "explicit follow-up" })
   require("forge.shared.keymaps").setup_view_keymaps(state.composer_buf, "harness", controller.command_set())
   vim.fn.maparg("<C-q>", "i", false, true).callback()
-  assert(vim.deep_equal(state.queue, { "explicit follow-up" }), "queue key steered an active wait or selected child")
+  assert(state.queue[1].text == "explicit follow-up", "queue key steered an active wait or selected child")
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
   assert(vim.fn.maparg("<C-s>", "i", false, true).desc == "Submit the composer")
   state.active_wait = nil
@@ -226,16 +221,11 @@ local success, failure = xpcall(function()
   for _, command in ipairs({ "pause", "clear" }) do
     vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/goal " .. command })
     controller.submit()
-    assert(goal_request[#goal_request] and goal_request[#goal_request].method == "goal." .. command,
+    assert(goal_request[#goal_request] and goal_request[#goal_request].params.action == command,
       "goal control was queued behind active work")
     assert(#state.queue == 1 and state.queue[1] == "keep queued work")
     assert(state.busy, "goal control cleared the running turn state")
-    goal_request[#goal_request].callback({ state = command == "pause" and "paused" or "cleared" })
-    if command == "pause" then
-      assert(state.goal and state.goal.state == "paused")
-    else
-      assert(state.goal == nil, "cleared goal survived the control acknowledgement")
-    end
+    goal_request[#goal_request].callback({ state = "accepted" })
     assert(state.busy, "goal acknowledgement cleared the running turn state")
   end
   state.goal = { state = "active" }

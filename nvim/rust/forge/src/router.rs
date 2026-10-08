@@ -507,6 +507,9 @@ impl HostRouter {
     pub(crate) async fn prepare(&self, envelope: &mut RoutedRequestEnvelope) -> Result<RoutedMethod> {
         let method = decode_method(&envelope.request.method)?;
         if let RoutedMethod::Harness(harness_method) = method {
+            if harness_method == HarnessMethod::TaskTransition {
+                self.host.harness.prepare_task(envelope.session_id.as_deref(), &envelope.request).await?;
+            }
             envelope.harness_admission = self.host
                 .harness
                 .prepare(envelope.session_id.as_deref(), harness_method)

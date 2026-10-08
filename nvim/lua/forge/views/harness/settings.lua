@@ -171,10 +171,25 @@ function M.open(state, host)
     local active = state.session
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
     local build_spec
-    local function toggle(context)
+    local function toggle(context, direction)
       if pending or not context.option then return end
       local id = context.option.id
-      if id == "plan-revisions" then
+      if id == "default-write-permission" or id == "plan-permission" then
+        local field = id == "default-write-permission" and "default_write_permission" or "plan_permission"
+        local values = field == "plan_permission" and { "keep", "read", "write", "full", "yolo" } or { "write", "full", "yolo" }
+        local selected = active[field]
+        if not selected or selected == vim.NIL then selected = "keep" end
+        local position = 1
+        for index, value in ipairs(values) do if value == selected then position = index end end
+        local next_value = values[(position - 1 + (direction or 1)) % #values + 1]
+        pending = true
+        client.request_for(session_id, "session.configure", { [field] = next_value == "keep" and vim.NIL or next_value }, function(result, failure)
+          pending = false
+          if failure then notifications.error(failure, "Harness permissions") return end
+          active[field] = result[field]
+          if picker.is_open("harness-config") then picker.update(build_spec()) end
+        end)
+      elseif id == "plan-revisions" then
         pending = true
         client.request_for(session_id, "session.configure", { plan_auto_approve_revisions = active.plan_auto_approve_revisions == false }, function(result, failure)
           pending = false
@@ -200,6 +215,8 @@ function M.open(state, host)
           id = "config", title = "Configuration", subtitle = "CLI: " .. (cli or "Unknown"),
           column_headers = { "Setting", "Value", "Description" },
           option_list = {
+            { id = "default-write-permission", label = "Default write permission", columns = { "Default write permission", picker_field.render(active.default_write_permission or "write", true), "Applied to new goals and accepted plans" } },
+            { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },
             { id = "logging", label = "Logging", columns = { "Logging", picker_field.render(status.enabled and "On" or "Off", true), "Save session log" } },
             { id = "provider", label = "Provider", columns = { "Provider", cli or "Unknown",
@@ -208,7 +225,7 @@ function M.open(state, host)
           footer = "←→ change setting  Enter change/select provider  q close",
         } },
         action_list = {
-          { id = "previous-value", key = "<Left>", callback = toggle },
+          { id = "previous-value", key = "<Left>", callback = function(context) toggle(context, -1) end },
           { id = "next-value", key = "<Right>", callback = toggle },
         },
         on_confirm = function(result)

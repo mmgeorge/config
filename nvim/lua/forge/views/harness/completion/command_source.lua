@@ -24,8 +24,15 @@ local command_list = {
   { label = "/bg", detail = "List and terminate background terminals" },
   { label = "/agent", detail = "Switch between Main and child-agent timelines", capability = "agent_observe" },
   { label = "/spawn", detail = "Spawn a child agent", capability = "agent_catalog" },
-  { label = "/plan", detail = "Enter Plan mode, or create a reviewed plan with a prompt" },
-  { label = "/replan", detail = "Start planning from a saved plan revision" },
+  { label = "/plan", detail = "Browse plans, or create a planning task with a prompt" },
+  { label = "/task", detail = "List current and previous tasks" },
+  { label = "/task new", detail = "Create a Plan, Execute, or Goal task" },
+  { label = "/task resume", detail = "Resume the current or latest unfinished task" },
+  { label = "/task pause", detail = "Pause the current task" },
+  { label = "/task clear", detail = "Cancel and detach the current task" },
+  { label = "/task refresh", detail = "Refresh authoritative task and connection state" },
+  { label = "/execute", detail = "Accept and execute a submitted plan" },
+  { label = "/execute last", detail = "Execute the latest submitted plan in this conversation" },
   { label = "/plan cancel", detail = "Cancel the active plan" },
   { label = "/sessions", detail = "Search, preview, resume, or delete a Harness session" },
   { label = "/undo", detail = "Roll back to an interaction and restore its prompt" },
@@ -236,7 +243,6 @@ function CommandSource:get_completions(_, callback)
       { name = "write", detail = "Allow workspace writes" },
       { name = "full", detail = "Allow machine-wide writes with approvals" },
       { name = "yolo", detail = "Allow machine-wide writes without approvals" },
-      { name = "plan", detail = "Plan with semantic artifacts under retained authorization" },
     }
     for _, mode in ipairs(mode_list) do
       items[#items + 1] = {
