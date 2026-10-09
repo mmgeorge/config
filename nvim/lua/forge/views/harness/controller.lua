@@ -1440,6 +1440,7 @@ function M.submit()
     local action = task_action and { action = task_action }
       or text == "/execute last" and { action = "execute", plan_id = "last" }
       or { action = task_kind, text = task_text }
+    prompt_history.record(text)
     M.task_transition(action, text)
     return
   end

@@ -59,9 +59,11 @@ feedback and the full planning contract for language-specific details.
 
 Keep the plan focused on delivered behavior and task-specific design. Do not repeat agent workflow
 or repository instructions such as reading AGENTS.md, loading skills, preserving unrelated edits,
-or following build conventions in plan prose. Include concrete required file changes in proposals,
-generated artifacts in Design, and exact checks in Verification. Tests inventory is planned coverage,
-not evidence of execution.
+or following build conventions in plan prose. Agent execution policies, including command timeouts,
+retry limits, permission procedures, and reporting requirements, belong to system and repository
+instructions, not plan metadata. Product behavior such as a network request timeout remains part
+of the design when relevant. Include concrete required file changes in proposals, generated artifacts
+in Design, and exact checks in Verification. Tests inventory is planned coverage, not evidence of execution.
 
 A successful harness_plan_submit requests review. End the turn after success. Implement only when
 Harness supplies an accepted revision and execution instructions. During Execute, follow the accepted

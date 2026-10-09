@@ -138,13 +138,15 @@ pub(super) fn order(design: &DeclarationDesign, included: &HashSet<String>) -> V
     for package_group in package_order {
         for package_id in package_group {
             let package = &packages[&package_id];
-            let files = owner
+            let mut files = owner
                 .iter()
                 .filter(|(_, identity)| **identity == package_id)
                 .map(|(path, _)| path.clone())
                 .collect::<Vec<_>>();
             let mut roots = vec![package.manifest.clone()];
-            roots.extend(package_configuration(&package.directory, &source));
+            let configuration = package_configuration(&package.directory, &source);
+            files.extend(configuration.iter().cloned());
+            roots.extend(configuration);
             let mut target = package.root.clone();
             target.sort_by(|left, right| (left.1, &left.0).cmp(&(right.1, &right.0)));
             roots.extend(target.into_iter().map(|(path, _)| path));
@@ -196,15 +198,15 @@ fn discover_packages(source: &BTreeMap<String, String>) -> BTreeMap<String, Pack
                     .get("path")
                     .and_then(toml::Value::as_str)
                     .unwrap_or("src/lib.rs");
-                add_root(&mut root, &directory, path, 1, source);
+                add_root(&mut root, &directory, path, 3, source);
             } else {
-                add_root(&mut root, &directory, "src/lib.rs", 1, source);
+                add_root(&mut root, &directory, "src/lib.rs", 3, source);
             }
             for (key, priority, fallback) in [
-                ("bin", 0, "src/main.rs"),
-                ("example", 2, "examples"),
-                ("test", 3, "tests"),
-                ("bench", 4, "benches"),
+                ("bin", 2, "src/main.rs"),
+                ("example", 1, "examples"),
+                ("test", 4, "tests"),
+                ("bench", 5, "benches"),
             ] {
                 if let Some(targets) = manifest.get(key).and_then(toml::Value::as_array) {
                     for target in targets {
@@ -249,9 +251,9 @@ fn discover_packages(source: &BTreeMap<String, String>) -> BTreeMap<String, Pack
                 }
             }
             if let Some(build) = package.get("build").and_then(toml::Value::as_str) {
-                add_root(&mut root, &directory, build, 5, source);
+                add_root(&mut root, &directory, build, 0, source);
             } else if package.get("build").and_then(toml::Value::as_bool) != Some(false) {
-                add_root(&mut root, &directory, "build.rs", 5, source);
+                add_root(&mut root, &directory, "build.rs", 0, source);
             }
             result.insert(
                 path.clone(),
@@ -892,6 +894,7 @@ fn is_configuration(path: &str) -> bool {
             | "tsconfig.json"
             | "jsconfig.json"
             | ".forge.json"
+            | ".gitignore"
     ) || name.starts_with("tsconfig.") && name.ends_with(".json")
 }
 
@@ -1305,6 +1308,16 @@ mod tests {
     fn multiple_cargo_targets_keep_package_order() {
         let design = design(&[
             (
+                "app/build.rs",
+                "fn main() {}\n",
+                Some("fn main() { println!(\"cargo:rerun-if-changed=build.rs\"); }\n"),
+            ),
+            (
+                "app/examples/hello.rs",
+                "fn main() {}\n",
+                Some("fn main() { println!(\"hello\"); }\n"),
+            ),
+            (
                 "app/Cargo.toml",
                 "[package]\nname='app'\nversion='0.1.0'\n[dependencies]\ncore={path='../core'}\n",
                 Some(
@@ -1341,6 +1354,8 @@ mod tests {
             paths(&design),
             [
                 "app/Cargo.toml",
+                "app/build.rs",
+                "app/examples/hello.rs",
                 "app/src/main.rs",
                 "app/src/lib.rs",
                 "app/src/feature.rs",
@@ -1452,6 +1467,8 @@ mod tests {
     #[test]
     fn mixed_packages_and_unknown_files_share_one_order() {
         let design = design(&[
+            (".gitignore", "", Some("/target/\n")),
+            ("web/.gitignore", "", Some("/dist/\n")),
             (
                 "Cargo.toml",
                 "[package]\nname='native'\nversion='0.1.0'\n",
@@ -1477,9 +1494,11 @@ mod tests {
         assert_eq!(
             paths(&design),
             [
+                ".gitignore",
                 "Cargo.toml",
                 "src/lib.rs",
                 "web/package.json",
+                "web/.gitignore",
                 "web/src/index.ts",
                 "misc/task.py"
             ]

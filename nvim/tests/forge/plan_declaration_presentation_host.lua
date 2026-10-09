@@ -578,6 +578,8 @@ local success, failure = xpcall(function()
   public_key()
   await(function() return review.public_only == true end, "Shift+Tab did not enable public visibility")
   assert(text(review.buf):find("Modified Cargo.toml", 1, true), "public filter hid manifest changes")
+  assert(text(review.buf):find("Modified .gitignore", 1, true) < text(review.buf):find("Modified Cargo.toml", 1, true),
+    "root ignore configuration must precede package files")
   assert(text(review.buf):find('version = "0.2.0"', 1, true), "public filter hid TOML values")
   for path in pairs(configuration) do
     assert(text(review.buf):find("Modified " .. path, 1, true), "public filter hid configuration: " .. path)

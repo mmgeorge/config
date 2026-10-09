@@ -84,14 +84,9 @@ detailed behavioral rules in Design, consequential choices in Decisions, and ind
 scenarios in Tests. Preserve an exact API, dependency, or mechanism here when the user explicitly
 requires it. Retain acceptance-critical error, recovery, compatibility, and scope constraints.
 
-Do not repeat agent workflow instructions or repository rules as product requirements. Do not
-promote every design choice into a mandatory requirement or create implementation milestones.
-
-Requirements describe properties of the delivered change, not instructions for the agent. Do not
-copy reminders to read AGENTS.md or skills, inspect before editing, obey permissions, preserve
-unrelated edits, use repository build conventions, or run checks before declaring completion into
-any plan section. These are already governed by the agent's instructions. Preserve task-specific
-product constraints such as compatibility, offline operation, or protecting user configuration.
+Requirements describe properties of the delivered change. Preserve task-specific constraints such
+as compatibility, offline operation, or protecting user configuration. Do not promote every design
+choice into a mandatory requirement or create implementation milestones.
 
 When following an existing rule requires concrete work, plan the resulting change instead of
 repeating the rule. Include supported file changes in the proposed files, explain task-specific
@@ -133,11 +128,23 @@ invent alternatives or rationale to fill the section. An empty list is valid.
 ### Design
 
 Write `design` as Markdown explaining how the proposed solution works and satisfies the requirements.
-Describe responsibilities, interfaces, data flow, and relevant lifecycle, ordering, and error boundaries.
-Use concrete names from the declarations. Include the detail needed to implement without the prior
-conversation, with no fixed paragraph limit. Preserve consequential rationale in Decisions and explain
-existing behavior in Background. Do not include executable implementation bodies, task milestones,
-mutable execution progress, or claims that implementation or verification has finished.
+Open with the central idea that makes the design understandable, such as its purpose, responsibility
+boundaries, lifecycle, or data flow. Choose the framing that fits the change.
+
+Then explain the ownership structure, moving from major components into their responsibilities,
+state, and subordinate parts. Introduce concrete names from the declarations as their roles become
+relevant. Trace the important flows through those owners, showing how inputs or events produce
+state changes and observable results. Explain ordering constraints and failure or recovery behavior
+alongside the flows they affect.
+
+Use Ownership and Flows as Markdown subsections within Design when that structure helps navigation.
+Give distinct flows descriptive names, such as Startup, Request handling, or Restart. For a small
+change, preserve the same progression in connected paragraphs without requiring subheadings.
+Ownership and flows remain content of the `design` string, not additional JSON fields or execution
+milestones. Include the detail needed to implement without the prior conversation, with no fixed
+paragraph limit. Preserve consequential rationale in Decisions and explain existing behavior in
+Background. Do not include executable implementation bodies, mutable execution progress, or claims
+that implementation or verification has finished.
 
 Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
 Encode paragraph breaks as `\n\n` inside JSON strings. Each rendered metadata section is limited
@@ -168,7 +175,7 @@ A plan's metadata can use this shape:
       "rationale": "A single publication point keeps each submitted frame's texture selection consistent."
     }
   ],
-  "design": "`TextureStreaming` returns a `TextureRequest` for progress and cancellation. `TextureRegistry` installs completed replacements at frame boundaries and retains previous allocations until their final GPU use completes.",
+  "design": "Texture replacement separates preparation from publication so a pending replacement leaves the current texture usable.\n\n### Ownership\n`TextureStreaming` owns preparation and exposes progress and cancellation through `TextureRequest`. `TextureRegistry` owns published handles and retains replaced allocations while submitted frames still use them.\n\n### Flows\n**Replacement.** A request prepares a new texture. Once ready, the registry publishes it at a frame boundary and releases the previous allocation after its final GPU use.\n\n**Cancellation.** Cancelling pending preparation leaves the published handle unchanged.",
   "verification": {
     "automated": "cargo test --release texture_replacement",
     "manual": "- Cancel a pending replacement and confirm the current texture remains visible.\n- Replace a texture with frames in flight and confirm rendering remains valid."
