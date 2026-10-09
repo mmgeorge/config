@@ -301,10 +301,39 @@ local function submit(review, method, params)
   if queued and (review.owner.submission_pending or review.owner.pending_operation) then hide_review(review) end
 end
 
+local function delete_tests(review)
+  if review.plan.historical_revision or review.plan.state ~= "awaiting_review" then
+    notice("Only plans awaiting review can have tests deleted") return
+  end
+  local tests, captured, failure = review.owner.selected_tests()
+  if not tests or not captured then notice(failure or "Cannot capture selected tests") return end
+  local lines = { ("Delete %d planned test%s?"):format(#tests, #tests == 1 and "" or "s"), "" }
+  for index = 1, math.min(#tests, 20) do
+    lines[#lines + 1] = vim.fn.strcharpart(tests[index].file .. ": " .. tests[index].name, 0, 110)
+  end
+  if #tests > 20 then lines[#lines + 1] = ("… and %d more"):format(#tests - 20) end
+  lines[#lines + 1] = ""
+  lines[#lines + 1] = "Removes entries from this plan. Source files are unchanged."
+  require("forge.infra.confirm").open(lines, function()
+    if not review.owner.is_current(captured, false) then notice("Plan changed while test deletion was awaiting confirmation") return end
+    if session.harness.busy then notice("A Harness request is already running") return end
+    session.harness.busy = true
+    local queued = review.owner.submit("plan.tests.delete", { tests = tests, expected_version = review.owner.version }, function(result, error)
+      session.harness.busy = false
+      if error then notice(error) return end
+      session.harness.active_plan = result.plan
+      if not close_review(review) then return end
+      vim.schedule(function() M.open(result.plan) end)
+    end)
+    if not queued then session.harness.busy = false end
+  end, nil, { title = "Delete planned tests" })
+end
+
 local function commands(review)
   local set = command_set.new()
   command_set.register(set, "toggle", function() toggle_task_fold(review, function() action(review, "toggle_declaration") end) end)
   command_set.register(set, "visual_line_with_gutter", review.owner.gutter_selection.start)
+  command_set.register(set, "delete_tests", function() delete_tests(review) end)
   for _, name in ipairs({ "open", "jump_entity", "references", "rename_entity", "entity_info", "schema", "comment", "question", "delete", "toggle_public" }) do command_set.register(set, name, function() action(review, name) end) end
   command_set.register(set, "save", function() if not review.plan.historical_revision then vim.cmd("write") end end)
   command_set.register(set, "accept", function() submit(review, "plan.acceptance.begin", {}) end)

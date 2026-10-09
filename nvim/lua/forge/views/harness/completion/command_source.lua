@@ -44,11 +44,10 @@ local command_list = {
   { label = "/goal pause", detail = "Pause automatic goal continuation" },
   { label = "/goal resume", detail = "Resume automatic goal continuation" },
   { label = "/goal clear", detail = "Clear the active goal" },
-  { label = "/read", detail = "Allow reads and network, deny local writes" },
-  { label = "/write", detail = "Allow workspace writes" },
-  { label = "/full", detail = "Allow machine-wide writes with approvals" },
-  { label = "/yolo", detail = "Allow machine-wide writes without approvals" },
-  { label = "/mode", detail = "Select the Harness execution mode" },
+  { label = "/read", detail = "Ask before edits and untrusted commands" },
+  { label = "/write", detail = "Apply saved approval rules" },
+  { label = "/yolo", detail = "Skip approval prompts" },
+  { label = "/mode", detail = "Select the approval mode" },
   { label = "/clear", detail = "Start a new session" },
   { label = "/new", detail = "Start a new session in another tab" },
   { label = "/compact", detail = "Compact provider-owned context", capability = "native_compact" },
@@ -240,10 +239,9 @@ function CommandSource:get_completions(_, callback)
   local mode_start = prefix:match("^%s*/mode%s+()([^%s]*)$")
   if mode_start then
     local mode_list = {
-      { name = "read", detail = "Allow reads and network, deny local writes" },
-      { name = "write", detail = "Allow workspace writes" },
-      { name = "full", detail = "Allow machine-wide writes with approvals" },
-      { name = "yolo", detail = "Allow machine-wide writes without approvals" },
+      { name = "read", detail = "Ask before edits and untrusted commands" },
+      { name = "write", detail = "Apply saved approval rules" },
+      { name = "yolo", detail = "Skip approval prompts" },
     }
     for _, mode in ipairs(mode_list) do
       items[#items + 1] = {

@@ -364,6 +364,29 @@ function M.attach(options, callback)
     end)
     return true
   end
+  ---@return {file: string, name: string}[]?, ForgeDocumentInput?, string?
+  function owner.selected_tests()
+    if not owner.attached() then return nil, nil, "Plan review is not ready" end
+    local view = owner.current_view()
+    if not view then return nil, nil, "Plan review window is no longer available" end
+    local mode = vim.fn.mode(1)
+    if mode ~= "v" and mode ~= "V" and mode ~= "\22" then return nil, nil, "Select the planned tests first" end
+    local first, last = vim.fn.getpos("v")[2] - 1, vim.api.nvim_win_get_cursor(view.window)[1] - 1
+    if first > last then first, last = last, first end
+    local selected, seen = {}, {}
+    for row = first, last do
+      local metadata = owner.projection.line_meta_list[row + 1]
+      local test = metadata and metadata.test
+      if type(test) == "table" then
+        local identity = vim.json.encode({ test.file, test.name })
+        if not seen[identity] then selected[#selected + 1] = vim.deepcopy(test) seen[identity] = true end
+      end
+    end
+    vim.cmd("normal! " .. string.char(27))
+    if #selected == 0 then return nil, nil, "The selection contains no planned tests" end
+    local captured, failure = input.capture(owner.replica, view, "delete_tests")
+    return selected, captured, failure
+  end
   return owner
 end
 

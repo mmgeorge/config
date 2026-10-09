@@ -106,6 +106,7 @@ pub fn prepare_provider_fork(
             effort: source.effort,
             context_window: source.context_window,
             service_tier: source.service_tier,
+            access: source.access,
             execution_mode: PermissionMode::Read,
             backend_session_id: fork_point.backend_session_id,
             control_context: None,

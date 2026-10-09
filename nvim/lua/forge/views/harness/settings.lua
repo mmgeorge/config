@@ -167,36 +167,69 @@ end
 function M.open(state, host)
   local session_id = state.session.id
   request(session_id, "trace.status", {}, function(status)
+    if state.session.id ~= session_id then return end
     local pending = false
     local active = state.session
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
     local build_spec
+    local access = require("forge.views.harness.access")
+    local function configure(params, completed)
+      if state.session.id ~= session_id then return end
+      pending = true
+      local session = require("forge.session")
+      local previous = session.harness
+      session.activate_harness(state)
+      require("forge.views.harness.controller").configure(params, false, function(applied)
+        pending = false
+        if state.session.id ~= session_id then return end
+        active = state.session
+        if completed then completed(applied) end
+        if picker.is_open("harness-config") then picker.update(build_spec()) end
+      end)
+      session.activate_harness(previous)
+    end
+    local function apply_access(policy, completed)
+      configure({ access = policy }, function(applied) if applied and completed then completed() end end)
+    end
     local function toggle(context, direction)
       if pending or not context.option then return end
       local id = context.option.id
+      if id == "sandbox" or id == "write-access" or id == "windows-sandbox" then
+        if active.backend ~= "codex" and active.backend ~= "mock" then
+          notifications.error("This provider does not expose sandbox configuration", "Harness access")
+          return
+        end
+        local policy = access.policy(active)
+        if id == "sandbox" then policy.sandbox = not policy.sandbox
+        elseif id == "write-access" then policy.write_access = policy.write_access == "workspace" and "full" or "workspace"
+        else
+          local values = { "elevated", "unelevated", "mxc" }
+          local position = 1
+          for index, value in ipairs(values) do if value == policy.windows_sandbox then position = index end end
+          policy.windows_sandbox = values[(position - 1 + (direction or 1)) % #values + 1]
+        end
+        apply_access(policy)
+        return
+      elseif id == "writable-directories" then
+        if active.backend ~= "codex" and active.backend ~= "mock" then
+          notifications.error("This provider does not expose sandbox configuration", "Harness access")
+          return
+        end
+        picker.close(false)
+        access.directories(state, host, apply_access, function() M.open(state, host) end)
+        return
+      end
       if id == "default-write-permission" or id == "plan-permission" then
         local field = id == "default-write-permission" and "default_write_permission" or "plan_permission"
-        local values = field == "plan_permission" and { "keep", "read", "write", "full", "yolo" } or { "write", "full", "yolo" }
+        local values = field == "plan_permission" and { "keep", "read", "write", "yolo" } or { "write", "yolo" }
         local selected = active[field]
         if not selected or selected == vim.NIL then selected = "keep" end
         local position = 1
         for index, value in ipairs(values) do if value == selected then position = index end end
         local next_value = values[(position - 1 + (direction or 1)) % #values + 1]
-        pending = true
-        client.request_for(session_id, "session.configure", { [field] = next_value == "keep" and vim.NIL or next_value }, function(result, failure)
-          pending = false
-          if failure then notifications.error(failure, "Harness permissions") return end
-          active[field] = result[field]
-          if picker.is_open("harness-config") then picker.update(build_spec()) end
-        end)
+        configure({ [field] = next_value == "keep" and vim.NIL or next_value })
       elseif id == "plan-revisions" then
-        pending = true
-        client.request_for(session_id, "session.configure", { plan_auto_approve_revisions = active.plan_auto_approve_revisions == false }, function(result, failure)
-          pending = false
-          if failure then notifications.error(failure, "Harness plan revisions") return end
-          active.plan_auto_approve_revisions = result.plan_auto_approve_revisions
-          if picker.is_open("harness-config") then picker.update(build_spec()) end
-        end)
+        configure({ plan_auto_approve_revisions = active.plan_auto_approve_revisions == false })
       elseif id == "logging" then
         pending = true
         client.request_for(session_id, "trace.configure", { enabled = not status.enabled }, function(result, failure)
@@ -209,6 +242,8 @@ function M.open(state, host)
       end
     end
     build_spec = function()
+      local policy = access.policy(active)
+      local supported = active.backend == "codex" or active.backend == "mock"
       return {
         owner = "harness-config", host = host,
         page_list = { {
@@ -218,6 +253,10 @@ function M.open(state, host)
             { id = "default-write-permission", label = "Default write permission", columns = { "Default write permission", picker_field.render(active.default_write_permission or "write", true), "Applied to new goals and accepted plans" } },
             { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },
+            { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true) or "Unsupported", "OS isolation, independent of approval mode" } },
+            { id = "write-access", label = "Write access", columns = { "Write access", picker_field.render(policy.write_access, true), policy.sandbox and "Directories writable inside the sandbox" or "Inactive · sandbox disabled permits full access" } },
+            { id = "writable-directories", label = "Additional writable directories", columns = { "Additional writable directories", tostring(#policy.writable_directory), "Enter to add, edit, or remove" } },
+            { id = "windows-sandbox", label = "Windows sandbox", columns = { "Windows sandbox", picker_field.render(policy.windows_sandbox, true), "Windows only · MXC requires host support" } },
             { id = "logging", label = "Logging", columns = { "Logging", picker_field.render(status.enabled and "On" or "Off", true), "Save session log" } },
             { id = "provider", label = "Provider", columns = { "Provider", cli or "Unknown",
               require("forge.views.harness").backend_switch_available() and "Choose a new chat or resume a session" or "Finish pending work to switch" } },

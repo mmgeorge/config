@@ -230,6 +230,7 @@ mod tests {
                 .to_string_lossy()
                 .into_owned(),
             backend_session_id: None,
+            access: Default::default(),
             execution_mode: crate::session::PermissionMode::Read,
         }
     }

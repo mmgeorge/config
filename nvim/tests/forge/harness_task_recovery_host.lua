@@ -65,10 +65,10 @@ local success, failure = xpcall(function()
   request(session_id, "task.transition", { operation_id = "goal-before-kill", action = "goal", text = "Retain interrupted goal" })
   await(function() return starts == 3 end, "goal did not start")
   client.request_for(session_id, "task.transition", { operation_id = "pause-before-settings", action = "pause" }, function(_, problem) assert(not problem, problem) end)
-  request(session_id, "task.transition", { operation_id = "settings-after-pause", action = "permission", mode = "full" })
+  request(session_id, "task.transition", { operation_id = "settings-after-pause", action = "permission", mode = "write" })
   await(function() return operation["settings-after-pause"] and operation["settings-after-pause"].state == "completed" end, "settings did not collect the pause")
   local changed = request(session_id, "state.get", {})
-  assert(changed.task[1].status == "paused" and changed.session.execution_mode == "full" and starts == 3,
+  assert(changed.task[1].status == "paused" and changed.session.execution_mode == "write" and starts == 3,
     "settings after pause restarted execution")
   request(session_id, "task.transition", { operation_id = "resume-before-kill", action = "resume" })
   await(function() return starts == 4 end, "explicit resume did not start")

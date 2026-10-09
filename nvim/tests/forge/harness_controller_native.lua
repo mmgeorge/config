@@ -79,6 +79,12 @@ local success, failure = xpcall(function()
   assert(title:find("Read • mock", 1, true), "winbar lost execution mode or model")
   assert(not title:find("Mock CLI", 1, true), "winbar still shows the CLI provider")
   assert(not title:find("Parser 100% coverage", 1, true), "session name remains in top bar")
+  assert(title:find(" • sandbox • ", 1, true), "sandbox indicator missing from top bar")
+  state.session.access = { sandbox = false }
+  controller.refresh_winbar()
+  title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+    { use_winbar = true, maxwidth = 200 }).str
+  assert(not title:find("sandbox", 1, true), "disabled sandbox remains in top bar")
   local tab_title = vim.api.nvim_eval_statusline(vim.o.tabline,
     { use_tabline = true, maxwidth = 200 }).str
   assert(tab_title:find("Parser 100% coverage", 1, true), "session name missing from tab")
@@ -102,7 +108,8 @@ local success, failure = xpcall(function()
     goal_execution = { state = "active", created_at_ms = 1000, scheduler = { task = { { state = "active" } } } },
   } }, "native-controller")
   assert(state.busy and state.goal.state == "active" and state.session.execution_mode == "write")
-  assert(vim.wo[state.transcript_win].winbar:find("execute · implement · running", 1, true))
+  assert(vim.wo[state.transcript_win].winbar:find("execute · implement", 1, true))
+  assert(not vim.wo[state.transcript_win].winbar:find("running", 1, true))
   receive("backend_event", { kind = "execution_state", data = {
     session = state.session, goal = vim.NIL, goal_execution = vim.NIL,
   } }, "native-controller")

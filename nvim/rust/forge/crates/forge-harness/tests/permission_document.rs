@@ -107,7 +107,6 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
     let (_temporary, mut broker) = broker_fixture();
     for (command, expected) in [
         ("/write", PermissionMode::Write),
-        ("/full", PermissionMode::Full),
         ("/yolo", PermissionMode::Yolo),
         ("/read", PermissionMode::Read),
     ] {

@@ -294,6 +294,7 @@ impl CopilotBackend {
             effort: "medium".into(),
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
+            access: request.access.clone(),
             execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
             control_context: None,
@@ -369,7 +370,6 @@ fn capability() -> BackendCapability {
         execution_mode_list: vec![
             PermissionMode::Read,
             PermissionMode::Write,
-            PermissionMode::Full,
             PermissionMode::Yolo,
         ],
         agent: AgentCapability {
@@ -1736,6 +1736,7 @@ mod test {
             effort: "low".into(),
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
+            access: Default::default(),
             execution_mode: PermissionMode::Read,
             backend_session_id: None,
             control_context: None,

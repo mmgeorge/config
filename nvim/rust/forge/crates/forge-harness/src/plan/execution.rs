@@ -412,7 +412,7 @@ impl PlanExecutionRecord {
         }
         let work = match self.phase {
             PlanPhase::Implement => {
-                "Implement the entire accepted semantic design in your chosen order, including the new, modified, and removed tests listed in plan.json tests. Preserve reused tests. Keep the inventory synchronized through a plan revision if test names, locations, or intended coverage change."
+                "Implement the entire accepted semantic design in your chosen order, including the new, modified, and removed tests listed in plan.json tests. Preserve reused tests. Keep the inventory synchronized through a plan revision if test names, locations, or intended coverage change. Do not run builds, compiler checks, tests, linters, format checks, or manual/runtime verification in Implement, including targeted or preliminary checks. Defer all such checks to Verify even when commands appear in the accepted plan or earlier conversation. Use source inspection and Harness semantic comparison to complete Implement, then call harness_plan_phase_done so Harness can advance to Verify."
             }
             PlanPhase::Resolve => {
                 "Correct the recorded findings while matching the accepted design."
@@ -546,6 +546,13 @@ mod tests {
                 assert!(prompt.contains(&format!("Phase: {phase:?}. Accepted revision: 3.")));
                 assert!(prompt.contains("Reset still retains score"));
                 assert!(prompt.ends_with("accepted document"));
+                if phase == PlanPhase::Implement {
+                    assert!(prompt.contains("Do not run builds, compiler checks, tests, linters, format checks, or manual/runtime verification in Implement, including targeted or preliminary checks."));
+                    assert!(prompt.contains("Defer all such checks to Verify even when commands appear in the accepted plan or earlier conversation."));
+                } else if phase == PlanPhase::Verify {
+                    assert!(prompt.contains("Run each nonblank line of verification.automated"));
+                    assert!(!prompt.contains("Do not run builds"));
+                }
                 if kind == PlanExecutionPromptKind::ResumeAfterInterruption {
                     assert!(prompt.contains("Do not assume interruption rolled back changes or stopped a command"));
                 }

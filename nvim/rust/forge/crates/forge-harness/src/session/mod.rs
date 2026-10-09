@@ -1,34 +1,34 @@
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
+mod access;
+pub use access::{AccessPolicy, WindowsSandbox, WriteAccess};
 pub mod continuation;
 pub mod state_machine;
 use std::collections::BTreeMap;
 
-/// Defines the execution boundary selected for one Harness session.
+/// Defines the approval policy selected for one Harness session.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PermissionMode {
     #[default]
     Read,
     Write,
-    Full,
     Yolo,
 }
 
 impl PermissionMode {
-    /// Return the stable user-facing label for this execution boundary.
+    /// Return the stable user-facing label for this approval policy.
     pub const fn label(self) -> &'static str {
         match self {
             Self::Read => "Read",
             Self::Write => "Write",
-            Self::Full => "Full",
             Self::Yolo => "YOLO",
         }
     }
 
-    /// Return whether this execution boundary permits workspace mutation.
-    pub const fn permits_workspace_write(self) -> bool {
+    /// Return whether this policy is eligible as the default for new execution tasks.
+    pub const fn is_write_default(self) -> bool {
         !matches!(self, Self::Read)
     }
 }
@@ -138,6 +138,7 @@ pub struct HarnessSession {
     #[serde(default)]
     pub service_tier: crate::backend::ServiceTier,
     #[serde(default)]
+    pub access: crate::session::AccessPolicy,
     pub execution_mode: PermissionMode,
     #[serde(default)]
     pub current_task_id: Option<String>,
@@ -162,6 +163,8 @@ pub struct HarnessSession {
 /// Stores the last model controls selected for one backend and workspace.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct HarnessPreference {
+    #[serde(default)]
+    pub access: crate::session::AccessPolicy,
     #[serde(default = "default_write_permission")]
     pub default_write_permission: PermissionMode,
     #[serde(default)]

@@ -128,10 +128,12 @@ runs, append a transient `Working (Ns)` row, update it once per second, keep the
 transcript at the tail unless the user is actively inspecting it, and remove
 the row without persisting it when the request finishes.
 
-Map `Shift-Tab` in both normal and insert mode to toggle Read and Write through
-the durable broker `mode.set` method. Queue a busy-turn toggle for the next safe
-boundary and mark the pending winbar mode with `*`. Preserve the explicit
-confirmation before enabling Write without Git checkpoints.
+Map `Shift-Tab` in both normal and insert mode to toggle Read and Write approval
+handling through the durable task transition coordinator. Keep approval mode independent
+from `session.access`. `/config` owns sandbox enablement, workspace/full write scope,
+additional writable directories, and Windows backend selection. Apply access changes
+through interrupt/finalize/resume and display failures instead of leaving the UI working.
+Validate directories before persisting them. Never disable isolation when selecting YOLO.
 
 Every `/plan` result must stop in a physical editable `PlanReview` file before
 execution. Accept only an explicit `harness_plan_submit` result or a complete

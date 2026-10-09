@@ -14,6 +14,7 @@ mod design;
 mod design_document;
 mod design_flows;
 mod design_tests;
+pub(crate) use design_tests::DesignTestSelection;
 pub(crate) mod calls;
 mod references;
 mod reference_context;
@@ -377,9 +378,9 @@ impl PlanAcceptance {
             return Ok(self.execution_mode_list[0]);
         }
         match selected_option(&self.elicitation, "acceptance-execution-mode")? {
-            "Read-only" => Ok(PermissionMode::Read),
-            "Write workspace (Recommended)" => Ok(PermissionMode::Write),
-            "Full access" => Ok(PermissionMode::Full),
+            "Read" => Ok(PermissionMode::Read),
+            "Write (Recommended)" => Ok(PermissionMode::Write),
+
             "YOLO" => Ok(PermissionMode::Yolo),
             option => anyhow::bail!("unsupported execution access choice {option:?}"),
         }
@@ -402,18 +403,18 @@ fn selected_option<'a>(elicitation: &'a PlanElicitation, question_id: &str) -> R
 
 const fn execution_mode_option_label(mode: PermissionMode) -> &'static str {
     match mode {
-        PermissionMode::Read => "Read-only",
-        PermissionMode::Write => "Write workspace (Recommended)",
-        PermissionMode::Full => "Full access",
+        PermissionMode::Read => "Read",
+        PermissionMode::Write => "Write (Recommended)",
+
         PermissionMode::Yolo => "YOLO",
     }
 }
 
 const fn execution_mode_option_description(mode: PermissionMode) -> &'static str {
     match mode {
-        PermissionMode::Read => "Inspect without changing workspace files.",
-        PermissionMode::Write => "Modify workspace files through the normal approval policy.",
-        PermissionMode::Full => "Use unrestricted filesystem and process access.",
+        PermissionMode::Read => "Ask before edits and untrusted commands.",
+        PermissionMode::Write => "Apply saved approval rules within configured access.",
+
         PermissionMode::Yolo => "Run without interactive approval checks.",
     }
 }
@@ -926,6 +927,39 @@ impl PlanFileStore {
             &rendered.navigation,
         )?;
         let checksum = digest(serde_json::to_vec(&document)?.as_slice());
+        Ok((document, rendered, checksum))
+    }
+
+    /// Publish a reviewed test-inventory edit without changing declarations or project files.
+    pub(crate) fn remove_tests(
+        &self, session_id: &str, plan_id: &str, revision: u32, expected_version: u64,
+        expected_digest: &str, selected: &[DesignTestSelection],
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let mut document = self.read_working_document(session_id, plan_id)?;
+        anyhow::ensure!(document.version == expected_version, "plan version changed before test deletion");
+        anyhow::ensure!(digest(&serde_json::to_vec(&document)?) == expected_digest, "plan changed before test deletion");
+        let before = render_plan_at(&document, &self.workspace)?;
+        let path = self.plan_dir(session_id, plan_id).join("working.json");
+        let annotation = review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(&path)?))?
+            .annotation().to_vec();
+        design_tests::remove(&mut document.design.as_mut().context("test deletion requires a declaration design")?.document.tests, selected)?;
+        document.version = document.version.checked_add(1).context("plan version exhausted")?;
+        document.validate_for_submission()?;
+        let (document, rendered, checksum) = self.persist_revision(session_id, plan_id, revision, document)?;
+        let mut retained = Vec::new();
+        for mut item in annotation {
+            let find = |line| before.navigation.resolve_line(line).and_then(|previous| rendered.navigation.anchor.iter()
+                .find(|current| current.target == previous.target && current.label == previous.label));
+            let (Some(start), Some(end)) = (find(item.source.start_line), find(item.source.end_line)) else { continue; };
+            if item.parent_id.as_ref().is_some_and(|parent| !retained.iter().any(|saved: &ReviewAnnotation| &saved.id == parent)) { continue; }
+            item.source.start_line = start.line.min(end.line);
+            item.source.end_line = start.line.max(end.line);
+            item.anchor = Some(review_annotation::ReviewAnnotationAnchor { start: start.target.clone(), end: end.target.clone() });
+            retained.push(item);
+        }
+        if !retained.is_empty() {
+            review_annotation::ReviewAnnotationStore::open(path.clone(), digest(&fs::read(path)?))?.replace(retained)?;
+        }
         Ok((document, rendered, checksum))
     }
 
@@ -1938,7 +1972,7 @@ mod test {
             .answer(
                 "acceptance-execution-mode",
                 PlanQuestionResponse::Selected {
-                    option: "Write workspace (Recommended)".into(),
+                    option: "Write (Recommended)".into(),
                     feedback: None,
                 },
             )

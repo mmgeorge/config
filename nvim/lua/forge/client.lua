@@ -7,6 +7,7 @@ local protocol = require("forge.protocol")
 local session = require("forge.session")
 local receive = require("forge.receive")
 local json_transfer = require("forge.json_transfer")
+local perf = require("forge.infra.perf")
 
 local launcher_for_test = nil
 local shutdown_autocmd = false
@@ -373,7 +374,10 @@ local function dispatch_message(message, timing)
     end
     for _, subscriber in pairs(client.document_subscriber) do
       if message.document == "" or message.document == subscriber.document then
-        subscriber.callback(message.event, update, client.generation)
+        perf.trace("harness", "ui.document.event", { event_type = message.event,
+          generation = client.generation }, function()
+          subscriber.callback(message.event, update, client.generation)
+        end)
       end
     end
     return
@@ -416,7 +420,10 @@ local function dispatch_message(message, timing)
       event_snapshot.active_elicitation = nil
     end
     for _, subscriber in pairs(client.subscriber) do
-      local ok, err = pcall(subscriber, message.event, message.payload, message.session_id)
+      local ok, err = pcall(perf.trace, "harness", "ui.session.event", {
+        event_type = message.event, session_id = message.session_id }, function()
+        subscriber(message.event, message.payload, message.session_id)
+      end)
       if not ok then notifications.error("Harness event subscriber failed: " .. tostring(err), "ForgeHarness") end
     end
     return

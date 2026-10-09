@@ -813,7 +813,7 @@ mod test {
         let waiting = tokio::spawn(async move {
             waiting_coordinator
                 .authorize(
-                    PermissionMode::Full,
+                    PermissionMode::Write,
                     PermissionRequest {
                         id: "approval-deny".into(),
                         provider: "test".into(),

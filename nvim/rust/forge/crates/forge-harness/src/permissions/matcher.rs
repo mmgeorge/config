@@ -205,30 +205,6 @@ impl CompiledPermissionDocument {
             .collect()
     }
 
-    fn ceiling_decision(
-        &self,
-        mode: PermissionMode,
-        target: &PermissionTarget,
-    ) -> PermissionDecision {
-        if mode == PermissionMode::Yolo {
-            return PermissionDecision::Allow;
-        }
-        match target {
-            PermissionTarget::Write { path } => match mode {
-                PermissionMode::Read => PermissionDecision::Deny,
-                PermissionMode::Write => normalized_path(Path::new(path))
-                    .filter(|path| path_starts_with(path, &self.workspace))
-                    .map_or(PermissionDecision::Deny, |_| PermissionDecision::Allow),
-                PermissionMode::Full | PermissionMode::Yolo => PermissionDecision::Allow,
-            },
-            PermissionTarget::Elevate { .. } => match mode {
-                PermissionMode::Read | PermissionMode::Write => PermissionDecision::Deny,
-                PermissionMode::Full | PermissionMode::Yolo => PermissionDecision::Allow,
-            },
-            _ => PermissionDecision::Allow,
-        }
-    }
-
     pub fn evaluate(
         &self,
         mode: PermissionMode,
@@ -236,11 +212,6 @@ impl CompiledPermissionDocument {
     ) -> PermissionEvaluation {
         let mut result_list = Vec::new();
         for target in &request.target_list {
-            let ceiling = self.ceiling_decision(mode, target);
-            if ceiling == PermissionDecision::Deny {
-                result_list.push((PermissionDecision::Deny, None));
-                continue;
-            }
             if mode == PermissionMode::Yolo {
                 result_list.push((PermissionDecision::Allow, None));
                 continue;
@@ -253,7 +224,10 @@ impl CompiledPermissionDocument {
                     result_list.push(self.best_rule(CATEGORY_READ, path, None));
                 }
                 PermissionTarget::Write { path } => {
-                    result_list.push(self.best_rule(CATEGORY_EDIT, path, None));
+                    let (decision, pattern) = self.best_rule(CATEGORY_EDIT, path, None);
+                    result_list.push((if mode == PermissionMode::Read && decision == PermissionDecision::Allow {
+                        PermissionDecision::Ask
+                    } else { decision }, pattern));
                 }
                 PermissionTarget::Network { target } => {
                     result_list.push(self.best_rule(CATEGORY_WEBFETCH, target, None));
@@ -386,7 +360,7 @@ mod test {
     }
 
     #[test]
-    fn clamps_writes_to_the_selected_execution_mode() {
+    fn approval_mode_does_not_define_filesystem_scope() {
         let permission = compiled(r#"{"permission":{"edit":{"*":"allow"}}}"#);
         let workspace_write = PermissionRequest {
             id: "1".into(),
@@ -400,7 +374,7 @@ mod test {
             permission
                 .evaluate(PermissionMode::Read, &workspace_write)
                 .decision,
-            PermissionDecision::Deny
+            PermissionDecision::Ask
         );
         assert_eq!(
             permission
@@ -416,10 +390,10 @@ mod test {
         };
         assert_eq!(
             permission.evaluate(PermissionMode::Write, &outside).decision,
-            PermissionDecision::Deny
+            PermissionDecision::Allow
         );
         assert_eq!(
-            permission.evaluate(PermissionMode::Full, &outside).decision,
+            permission.evaluate(PermissionMode::Write, &outside).decision,
             PermissionDecision::Allow
         );
     }

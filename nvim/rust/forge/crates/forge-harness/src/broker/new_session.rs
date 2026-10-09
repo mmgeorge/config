@@ -50,6 +50,7 @@ pub fn prepare_new_session(
         context_window: preference.as_ref().and_then(|value| value.model_setting.get(&value.model))
             .and_then(|setting| setting.context_window.clone()).or(source.context_window),
         service_tier: source.service_tier,
+        access: preference.as_ref().map_or_else(|| source.access.clone(), |value| value.access.clone()),
         execution_mode: PermissionMode::Read,
         current_task_id: None, default_write_permission: preference.as_ref().map_or(source.default_write_permission, |value| value.default_write_permission), plan_permission: preference.as_ref().map_or(source.plan_permission, |value| value.plan_permission),
         created_at_ms: now_ms,

@@ -507,15 +507,15 @@ fn rows(
         }
         if section == super::PlanSection::Tests {
             let changes_start = overview.len();
-            overview.push(forge_diff::projection::header(
+            overview.push(section_header(
                 BlockId("plan:section:changes".into()),
-                vec![TextChunk { text: "Proposed declaration changes:".into(), capture: "RenderMarkdownH1".into() }], 0,
+                "Changes",
             )?);
             let offset = overview.len() as u32;
             for anchor in &mut navigation.anchor { anchor.line += offset; }
             section_anchor.push(PlanNavigationAnchor {
                 line: offset, target: PlanReviewTarget::Section { section: super::PlanSection::Files },
-                json_path: "/design".into(), path: None, label: "Proposed declaration changes".into(),
+                json_path: "/design".into(), path: None, label: "Changes".into(),
             });
             overview.append(&mut block);
             fold(&mut overview, changes_start, "plan:section:changes")?;
@@ -536,9 +536,9 @@ fn rows(
         }
         if section == super::PlanSection::AutomatedVerification {
             verification_start = Some(overview.len());
-            overview.push(forge_diff::projection::header(
+            overview.push(section_header(
                 BlockId("plan:section:verification".into()),
-                vec![TextChunk { text: "Verification:".into(), capture: "RenderMarkdownH1".into() }], 0,
+                "Verification",
             )?);
             section_anchor.push(PlanNavigationAnchor {
                 line: overview.len() as u32,
@@ -549,16 +549,16 @@ fn rows(
         let start = overview.len();
         let fold_id = format!("plan:section:{name}");
         let nested = name.starts_with("verification/");
-        let heading_indent = if nested { "  " } else { "" };
         let text_indent = if section == super::PlanSection::ManualVerification { "  " } else if nested { "    " } else { "" };
         let title = metadata.title.rsplit('/').next().unwrap();
-        overview.push(forge_diff::projection::header(
-            BlockId(fold_id.clone()),
-            vec![TextChunk {
-                text: format!("{heading_indent}{title}:"),
-                capture: if nested { "ForgeStatusHeader" } else { "RenderMarkdownH1" }.into(),
-            }], 0,
-        )?);
+        overview.push(if nested {
+            forge_diff::projection::header(
+                BlockId(fold_id.clone()),
+                vec![TextChunk { text: format!("  {title}:"), capture: "ForgeStatusHeader".into() }], 0,
+            )?
+        } else {
+            section_header(BlockId(fold_id.clone()), title)?
+        });
         let text = if metadata.text.trim().is_empty() { "None specified." } else { metadata.text.as_str() };
         for (index, line) in text.lines().enumerate() {
             overview.push(BufferBlock {
@@ -586,10 +586,18 @@ fn rows(
     Ok((block, navigation, hidden, contextual_block))
 }
 
+fn section_header(id: BlockId, title: &str) -> Result<BufferBlock> {
+    Ok(forge_diff::projection::header(
+        id,
+        vec![TextChunk { text: format!(" {title} "), capture: "RenderMarkdownH1".into() }],
+        0,
+    )?)
+}
+
 fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
-    let mut block = vec![forge_diff::projection::header(
+    let mut block = vec![section_header(
         BlockId("plan:section:tests".into()),
-        vec![TextChunk { text: format!("Tests · {}", super::design_tests::summary(files)), capture: "RenderMarkdownH1".into() }], 0,
+        &format!("Tests · {}", super::design_tests::summary(files)),
     )?];
     let mut anchors = vec![PlanNavigationAnchor {
         line: 1, target: PlanReviewTarget::Section { section: super::PlanSection::Tests },
@@ -623,7 +631,7 @@ fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> Result<(Vec<
             }
             for line in case_start + 1..=block.len() {
                 anchors.push(PlanNavigationAnchor {
-                    line: line as u32, target: PlanReviewTarget::Section { section: super::PlanSection::Tests },
+                    line: line as u32, target: PlanReviewTarget::TestCase { path: file.file.clone(), name: case.name.clone() },
                     json_path: format!("/design/document/tests/{file_index}/cases/{case_index}"),
                     path: Some(file.file.clone()), label: format!("{}: {}", file.file, case.name),
                 });
@@ -749,7 +757,9 @@ fn public_blocks(
             .wire_rows()
             .iter()
             .all(|row| row.trim().is_empty());
-        if empty && blank {
+        // An empty declaration row cannot replace the unhighlighted section spacer.
+        let section_separator = item.id.0.starts_with("plan:section:") && item.id.0.ends_with(":separator");
+        if empty && blank && !section_separator {
             retained[position] = false;
         }
         blank = empty;
@@ -831,7 +841,14 @@ fn public_blocks(
         )?);
         tests += 1;
     }
-    let mut trailing = output.split_off(tests);
+    // Section spacing must remain visible when the preceding Changes fold is closed.
+    let mut changes_end = tests;
+    while changes_end > changes + 1
+        && output[changes_end - 1].id.0 == "plan:section:changes:separator"
+    {
+        changes_end -= 1;
+    }
+    let mut trailing = output.split_off(changes_end);
     output[changes].metadata.fold.clear();
     fold(&mut output, changes, "plan:section:changes")?;
     output.append(&mut trailing);
@@ -1021,6 +1038,7 @@ mod tests {
     fn test_inventory_preserves_file_folds_targets_and_change_markers() {
         let mut document = crate::plan::document::test_fixture("tests", "Tests");
         let mut design = super::super::DeclarationDesign::default();
+        design.proposed.insert("src/tool.rs".into(), "pub fn run();\n\n".into());
         design.document.tests = serde_json::from_value(serde_json::json!([
             {"file":"src/tool.rs", "cases":[
                 {"name":"tests::new_case", "change":"new", "description":"A long scenario retains its full expected result when the review window becomes narrow."},
@@ -1034,7 +1052,16 @@ mod tests {
             let width = WidthProfile { columns: 40, ..Default::default() };
             let (block, target) = project(&document, &width, &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
             let rows = block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>();
-            assert!(rows.contains(&"Tests · 1 new · 1 modified · 1 removed · 1 reused"));
+            assert!(rows.contains(&" Tests · 1 new · 1 modified · 1 removed · 1 reused "));
+            let tests_start = block.iter().position(|block| block.id.0 == "plan:section:tests").unwrap();
+            assert_eq!(block[tests_start - 1].text.row(0), Some(""));
+            assert_eq!(block[tests_start - 1].id.0, "plan:section:changes:separator");
+            assert!(block[tests_start - 1].metadata.decoration.is_empty());
+            assert!(block[tests_start - 1].metadata.gutter.is_empty());
+            let changes = block.iter().find(|block| block.id.0 == "plan:section:changes").unwrap();
+            let endpoint = &changes.metadata.fold[0].end;
+            let end_index = block.iter().position(|block| block.id == endpoint.block).unwrap();
+            assert!(end_index + usize::from(endpoint.position.row > 0) <= tests_start - 1);
             for expected in ["    + tests::new_case", "    ~ tests::changed_case", "    − tests::old_case", "    existing_case"] {
                 assert!(rows.contains(&expected));
             }
@@ -1070,8 +1097,12 @@ mod tests {
         document.design = Some(design);
         for public_only in [false, true] {
             let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
-            let heading = block.iter().find(|block| block.text.row(0) == Some("Flows:")).unwrap();
-            assert!(heading.metadata.decoration.iter().any(|style| style.capture == "RenderMarkdownH1"));
+            let heading = block.iter().find(|block| block.text.row(0) == Some(" Flows ")).unwrap();
+            assert!(heading.metadata.decoration.iter().any(|style| {
+                style.capture == "RenderMarkdownH1"
+                    && style.range.start.column == 0
+                    && style.range.end.column == " Flows ".len()
+            }));
             assert!(!heading.metadata.fold.is_empty());
             let node = block.iter().find(|block| block.text.row(0) == Some("cancel_request")).unwrap();
             assert!(node.metadata.markdown);
@@ -1166,12 +1197,12 @@ mod tests {
         assert!(
             rendered
                 .markdown
-                .starts_with("Objective:\nSupport observable cancellation and safe texture replacement.\n\nRequirements:")
+                .starts_with(" Objective \nSupport observable cancellation and safe texture replacement.\n\n Requirements ")
         );
         let task_anchor = rendered.navigation.resolve_line(1).unwrap();
         assert_eq!(task_anchor.json_path, "/design/document/objective");
         assert_eq!(task_anchor.target, PlanReviewTarget::Section { section: super::super::PlanSection::Objective });
-        let design_line = rendered.markdown.lines().position(|line| line == "Design:").unwrap() as u32 + 1;
+        let design_line = rendered.markdown.lines().position(|line| line == " Design ").unwrap() as u32 + 1;
         let anchor = rendered.navigation.resolve_line(design_line).unwrap();
         assert_eq!(anchor.json_path, "/design/document/design");
         let annotation = ReviewAnnotation {
@@ -1217,7 +1248,7 @@ mod tests {
             assert!(
                 block
                     .iter()
-                    .any(|block| block.text.row(0) == Some("Proposed declaration changes:"))
+                    .any(|block| block.text.row(0) == Some(" Changes "))
             );
             assert!(
                 block
@@ -1335,12 +1366,12 @@ mod tests {
         assert!(
             block
                 .iter()
-                .any(|block| block.text.row(0) == Some("Design:"))
+                .any(|block| block.text.row(0) == Some(" Design "))
         );
         assert!(
             block
                 .iter()
-                .any(|block| block.text.row(0) == Some("Proposed declaration changes:"))
+                .any(|block| block.text.row(0) == Some(" Changes "))
         );
         assert!(
             target
@@ -1392,7 +1423,7 @@ mod tests {
             render(&document)
                 .unwrap()
                 .markdown
-                .contains("Proposed declaration changes:\nNo declaration changes.")
+                .contains(" Changes \nNo declaration changes.")
         );
     }
 
@@ -1447,14 +1478,14 @@ mod tests {
             .filter(|block| !block.metadata.fold.is_empty())
             .collect();
         assert_eq!(folded_header.len(), 10);
-        assert_eq!(folded_header[0].text.row(0), Some("Objective:"));
-        assert_eq!(folded_header[1].text.row(0), Some("Requirements:"));
-        assert_eq!(folded_header[2].text.row(0), Some("Background:"));
-        assert_eq!(folded_header[3].text.row(0), Some("Design:"));
-        assert_eq!(folded_header[4].text.row(0), Some("Proposed declaration changes:"));
+        assert_eq!(folded_header[0].text.row(0), Some(" Objective "));
+        assert_eq!(folded_header[1].text.row(0), Some(" Requirements "));
+        assert_eq!(folded_header[2].text.row(0), Some(" Background "));
+        assert_eq!(folded_header[3].text.row(0), Some(" Design "));
+        assert_eq!(folded_header[4].text.row(0), Some(" Changes "));
         assert!(folded_header[5].text.row(0).unwrap().starts_with("Modified src/lib.rs"));
         assert!(folded_header[6].text.row(0).unwrap().starts_with("@@"));
-        assert_eq!(folded_header[7].text.row(0), Some("Verification:"));
+        assert_eq!(folded_header[7].text.row(0), Some(" Verification "));
         assert_eq!(folded_header[8].text.row(0), Some("  Automated:"));
         assert_eq!(folded_header[9].text.row(0), Some("  Manual:"));
         for header in folded_header {

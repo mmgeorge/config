@@ -30,9 +30,12 @@ local METADATA_FIELD = {
   status = true, code = true, enabled = true, cached = true, cancelled = true, generation = true,
   revision = true, queue_bytes = true, queue_count = true, active_jobs = true, retained_bytes = true,
   render_count = true,
+  span_id = true,
 }
 local writing = { diff = false, harness = false }
 local queue_bytes = { diff = 0, harness = 0 }
+local loop_timer
+local update_loop_watch
 
 M.options = {
   diff = { enabled = false, log_path = nil, slow_threshold_ms = 8, sample_rate = 1, flush_delay_ms = 25 },
@@ -45,6 +48,7 @@ M.flush_pending = { diff = false, harness = false }
 ---@param options? ForgePerfConfig
 function M.setup(options)
   M.options = vim.tbl_deep_extend("force", vim.deepcopy(M.options), options or {})
+  update_loop_watch()
 end
 
 ---@param options table?
@@ -193,6 +197,8 @@ function M.event(scope, event, payload)
   record.event = event:sub(1, 256)
   record.time = os.date("%Y-%m-%d %H:%M:%S")
   record.kind = "forge.infra.perf"
+  record.pid = vim.fn.getpid()
+  record.monotonic_us = math.floor(M.now() / 1000)
   local encoded = vim.json.encode(record)
   if #encoded > MAX_RECORD_BYTES then return end
   if queue_bytes[scope] + #encoded + 1 > MAX_QUEUE_BYTES then return end
@@ -204,6 +210,47 @@ function M.event(scope, event, payload)
   vim.defer_fn(function()
     M.flush(scope)
   end, scope_options(scope).flush_delay_ms or 25)
+end
+
+update_loop_watch = function()
+  if loop_timer then loop_timer:stop() loop_timer:close() loop_timer = nil end
+  if not M.enabled("harness") then return end
+  local timer = vim.uv.new_timer()
+  loop_timer = timer
+  local previous = M.now()
+  timer:start(250, 250, vim.schedule_wrap(function()
+    if loop_timer ~= timer then return end
+    local now = M.now()
+    local delay = (now - previous) / 1e6 - 250
+    previous = now
+    if delay >= 100 then M.event("harness", "ui.loop_lag", { elapsed_ms = delay }) end
+  end))
+end
+
+--- Measures a synchronous UI boundary without recording callback arguments or results.
+---@param scope ForgePerfScope
+---@param event string
+---@param payload table?
+---@param callback fun(): any
+---@return any ...
+function M.trace(scope, event, payload, callback)
+  if not M.enabled(scope) then return callback() end
+  local started = M.now()
+  local fields = M.payload(payload or {})
+  fields.span_id = tostring(M.sequence[scope] + 1)
+  fields.phase = "begin"
+  M.event(scope, event, fields)
+  local result = { n = 0 }
+  local function capture(...)
+    result = { n = select("#", ...), ... }
+  end
+  capture(pcall(callback))
+  fields.phase = "end"
+  fields.status = result[1] and "ok" or "error"
+  fields.elapsed_ms = M.elapsed_ms(started)
+  M.event(scope, event, fields)
+  if not result[1] then error(result[2], 0) end
+  return (table.unpack or unpack)(result, 2, result.n)
 end
 
 ---@param scope ForgePerfScope

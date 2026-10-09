@@ -1,4 +1,5 @@
 local M = {}
+local perf = require("forge.infra.perf")
 
 local failed = false
 local language_registered = false
@@ -82,9 +83,11 @@ end
 local function prune_extmarks(buf, range_list)
   local ok, ui = pcall(require, "render-markdown.core.ui")
   if not ok or not ui.ns then return end
-  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ui.ns, 0, -1, {})) do
-    if not row_in_range(mark[2], range_list) then pcall(vim.api.nvim_buf_del_extmark, buf, ui.ns, mark[1]) end
-  end
+  perf.trace("harness", "ui.markdown.prune", { buf = buf, count = #range_list }, function()
+    for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buf, ui.ns, 0, -1, {})) do
+      if not row_in_range(mark[2], range_list) then pcall(vim.api.nvim_buf_del_extmark, buf, ui.ns, mark[1]) end
+    end
+  end)
 end
 
 --- Clears markdown parser regions and rendered extmarks from a buffer.
@@ -116,9 +119,13 @@ function M.render(buf, win, range_list)
   if not ok or type(render_markdown.render) ~= "function" then return end
   local parser_ok, parser = pcall(vim.treesitter.get_parser, buf, "markdown")
   if not parser_ok then return end
-  pcall(parser.set_included_regions, parser, parser_region_list(range_list))
-  if type(parser.invalidate) == "function" then pcall(parser.invalidate, parser, true) end
-  local highlight_ok, highlight_error = pcall(vim.treesitter.start, buf, "markdown")
+  perf.trace("harness", "ui.markdown.regions", { buf = buf, count = #range_list }, function()
+    pcall(parser.set_included_regions, parser, parser_region_list(range_list))
+    if type(parser.invalidate) == "function" then pcall(parser.invalidate, parser, true) end
+  end)
+  local highlight_ok, highlight_error = pcall(perf.trace, "harness", "ui.markdown.highlight", { buf = buf }, function()
+    vim.treesitter.start(buf, "markdown")
+  end)
   if not highlight_ok then
     if not failed then
       failed = true
@@ -130,27 +137,29 @@ function M.render(buf, win, range_list)
   local concealcursor = vim.api.nvim_get_option_value("concealcursor", { scope = "local", win = win })
   local function handler(base)
     return { parse = function(context)
-      local marks = base.parse(context)
-      local ranges = layout_ranges[context.buf]
-      if not ranges then return marks end
-      marks = vim.deepcopy(marks)
-      for _, mark in ipairs(marks) do
-        for _, range in ipairs(ranges) do
-          if mark.start_row >= range.first0 and mark.start_row < range.after0 then
-            local padding = math.max(0, (range.indent or 2) - 2 - (range.source_indent or 0))
-            if mark.opts.virt_text_win_col then
-              mark.opts.virt_text_win_col = mark.opts.virt_text_win_col + math.max(0, (range.indent or 2) - 2)
-            end
-            if padding > 0 then
-              for _, line in ipairs(mark.opts.virt_lines or {}) do
-                table.insert(line, 1, { string.rep(" ", padding), "Normal" })
+      return perf.trace("harness", "ui.markdown.parse", { buf = context.buf }, function()
+        local marks = base.parse(context)
+        local ranges = layout_ranges[context.buf]
+        if not ranges then return marks end
+        marks = vim.deepcopy(marks)
+        for _, mark in ipairs(marks) do
+          for _, range in ipairs(ranges) do
+            if mark.start_row >= range.first0 and mark.start_row < range.after0 then
+              local padding = math.max(0, (range.indent or 2) - 2 - (range.source_indent or 0))
+              if mark.opts.virt_text_win_col then
+                mark.opts.virt_text_win_col = mark.opts.virt_text_win_col + math.max(0, (range.indent or 2) - 2)
               end
+              if padding > 0 then
+                for _, line in ipairs(mark.opts.virt_lines or {}) do
+                  table.insert(line, 1, { string.rep(" ", padding), "Normal" })
+                end
+              end
+              break
             end
-            break
           end
         end
-      end
-      return marks
+        return marks
+      end)
     end }
   end
   layout_ranges[buf] = range_list
@@ -178,23 +187,25 @@ function M.render(buf, win, range_list)
     vim.api.nvim_create_autocmd("BufWipeout", { callback = function(event) layout_ranges[event.buf] = nil end })
     layout_handlers = true
   end
-  local render_ok, render_error = pcall(render_markdown.render, {
-    buf = buf,
-    win = win,
-    config = {
-      enabled = true,
-      render_modes = true,
-      debounce = 0,
-      anti_conceal = { enabled = true, above = 0, below = 0 },
-      completions = { lsp = { enabled = false } },
-      sign = { enabled = false },
-      win_options = {
-        conceallevel = { default = conceallevel, rendered = 3 },
-        concealcursor = { default = concealcursor, rendered = "nvic" },
+  local render_ok, render_error = pcall(perf.trace, "harness", "ui.markdown.render", { buf = buf }, function()
+    return render_markdown.render({
+      buf = buf,
+      win = win,
+      config = {
+        enabled = true,
+        render_modes = true,
+        debounce = 0,
+        anti_conceal = { enabled = true, above = 0, below = 0 },
+        completions = { lsp = { enabled = false } },
+        sign = { enabled = false },
+        win_options = {
+          conceallevel = { default = conceallevel, rendered = 3 },
+          concealcursor = { default = concealcursor, rendered = "nvic" },
+        },
+        on = { render = function() prune_extmarks(buf, range_list) end },
       },
-      on = { render = function() prune_extmarks(buf, range_list) end },
-    },
-  })
+    })
+  end)
   if render_ok then
     prune_extmarks(buf, range_list)
   elseif not failed then

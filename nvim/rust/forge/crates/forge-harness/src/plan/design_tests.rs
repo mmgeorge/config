@@ -48,6 +48,30 @@ pub struct DesignTestCase {
     pub description: String,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Identifies one inventory entry independently of its rendered row or array index.
+pub(crate) struct DesignTestSelection {
+    pub file: String,
+    pub name: String,
+}
+
+/// Remove exactly the reviewed entries, rejecting stale or ambiguous selections before mutation.
+pub(crate) fn remove(files: &mut Vec<DesignTestFile>, selected: &[DesignTestSelection]) -> Result<()> {
+    ensure!(!selected.is_empty() && selected.len() <= 1024, "select between 1 and 1024 planned tests");
+    let selection: BTreeSet<_> = selected.iter().collect();
+    ensure!(selection.len() == selected.len(), "duplicate selected test");
+    for test in &selection {
+        ensure!(files.iter().any(|file| file.file == test.file && file.cases.iter().any(|case| case.name == test.name)),
+            "selected test no longer exists: {}: {}", test.file, test.name);
+    }
+    for file in files.iter_mut() {
+        file.cases.retain(|case| !selection.contains(&DesignTestSelection { file: file.file.clone(), name: case.name.clone() }));
+    }
+    files.retain(|file| !file.cases.is_empty());
+    Ok(())
+}
+
 /// Rejects ambiguous identities and unbounded inventories before a plan edit is committed.
 pub(super) fn validate(files: &[DesignTestFile]) -> Result<()> {
     ensure!(files.len() <= 256, "plan tests exceeds 256 files");

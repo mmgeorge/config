@@ -115,6 +115,7 @@ pub struct BackendRequest {
     pub context_window: Option<String>,
     /// Carries the session tier through explicit and continuation turns.
     pub service_tier: ServiceTier,
+    pub access: crate::session::AccessPolicy,
     pub execution_mode: PermissionMode,
     pub backend_session_id: Option<String>,
     #[serde(skip, default)]
@@ -1011,7 +1012,7 @@ impl Backend for MockBackend {
             question_withdrawal: None,
             control_error: None,
             evidence: TurnEvidence {
-                tool_called: request.execution_mode.permits_workspace_write(),
+                tool_called: request.execution_mode.is_write_default(),
                 structured_complete: execution_complete,
                 ..TurnEvidence::default()
             },
@@ -1114,7 +1115,6 @@ fn mock_capability() -> BackendCapability {
         execution_mode_list: vec![
             PermissionMode::Read,
             PermissionMode::Write,
-            PermissionMode::Full,
             PermissionMode::Yolo,
         ],
         agent: AgentCapability::default(),
@@ -1160,6 +1160,7 @@ mod test {
                         effort: "low".into(),
                         context_window: None,
                         service_tier: crate::backend::ServiceTier::Standard,
+                        access: Default::default(),
                         execution_mode: PermissionMode::Read,
                         backend_session_id: None,
                         control_context: None,

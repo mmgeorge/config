@@ -407,7 +407,7 @@ impl HarnessService {
         let mut prompt_admission = None;
         if matches!(
             method,
-            HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanEntityRename
+            HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete
         ) {
             let params = request
                 .params
@@ -601,7 +601,7 @@ struct SessionController {
     presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
     cancellation: Arc<TurnCancellation>,
     backend: Arc<dyn crate::backend::Backend>,
-    catalog_request: RwLock<crate::backend::BackendCatalogRequest>,
+    catalog_request: Arc<RwLock<crate::backend::BackendCatalogRequest>>,
     mcp_discovery: Mutex<crate::backend::mcp::McpDiscovery>,
     permission: Arc<crate::backend::approval::PermissionCoordinator>,
 }
@@ -631,7 +631,7 @@ impl SessionController {
             presentation: broker.presentation(),
             cancellation: broker.turn_cancellation(),
             backend: broker.backend_handle(),
-            catalog_request: RwLock::new(catalog_request),
+            catalog_request: Arc::new(RwLock::new(catalog_request)),
             mcp_discovery: Mutex::new(crate::backend::mcp::McpDiscovery::default()),
             permission: broker.permission_coordinator(),
             broker: Mutex::new(broker),
@@ -877,7 +877,7 @@ async fn route_request(
     while continuing {
         if continuation_store.latest_task_operation(&session_id)?.map(|operation| operation.id) != continuation_owner { break; }
         match dispatch_task_attempt(&mut broker, &session_id,
-            Request { id: 0, method: "goal.continue".into(), params: json!({}) }, message_sink).await {
+            Request { id: 0, method: "goal.continue".into(), params: json!({}) }, message_sink, Arc::clone(&controller.catalog_request)).await {
             Ok(next) => continuing = next,
             Err(error) => {
                 result.response = Response::failure(result.response.id, "continuation_failed", format!("{error:#}"));
@@ -942,8 +942,6 @@ fn admit_task_intent(controller: &SessionController, session_id: &str, request: 
         task.as_ref().is_some_and(|task| task.status == crate::task::TaskStatus::Running)
             || (task.is_none() && controller.execution_admission.available_permits() == 0));
     let resume_after_transition = if matches!(action, "pause" | "clear") { false }
-        else if action == "permission" && request.params["mode"] == "read"
-            && task.as_ref().is_some_and(|task| task.kind != crate::task::TaskKind::Plan) { false }
         else if matches!(action, "plan" | "execute" | "goal" | "fork" | "attach_plan" | "resume") { true }
         else { running_intent };
     let operation = crate::task::TaskOperation {
@@ -1045,7 +1043,7 @@ async fn execute_task_transition(
     let heartbeat = tokio::spawn(run_lease_heartbeat(root, session_id, client_id, stopped));
     let mut request = Request { id: 0, method: "task.transition".into(), params: action };
     let outcome = loop {
-        let result = dispatch_task_attempt(&mut broker, &operation.session_id, request, sink).await;
+        let result = dispatch_task_attempt(&mut broker, &operation.session_id, request, sink, Arc::clone(&controller.catalog_request)).await;
         match result {
             Err(error) => break Err(error),
             Ok(continuing) => {
@@ -1064,12 +1062,18 @@ async fn execute_task_transition(
     Ok(())
 }
 
-async fn dispatch_task_attempt(broker: &mut HarnessBroker, session_id: &str, request: Request, sink: &MessageSender) -> Result<bool> {
+async fn dispatch_task_attempt(broker: &mut HarnessBroker, session_id: &str, request: Request, sink: &MessageSender, catalog_request: Arc<RwLock<crate::backend::BackendCatalogRequest>>) -> Result<bool> {
     let (event_sink, mut event_stream) = crate::backend::events::channel();
     let output = sink.clone();
     let routed_session = session_id.to_owned();
     let forwarder = tokio::spawn(async move {
         while let Some(event) = event_stream.recv().await? {
+            if event.kind == "configuration_applied" {
+                *catalog_request.write().await = serde_json::from_value(event.data["catalog"].clone())?;
+                output.send_event(SessionEvent { session_id:routed_session.clone(),
+                    event:"session_configured".into(), payload:event.data }).await?;
+                continue;
+            }
             let (name, payload) = if event.kind == "timeline_patch" { ("timeline_patch", event.data) }
                 else { ("backend_event", serde_json::to_value(event)?) };
             output.send_event(SessionEvent { session_id: routed_session.clone(), event: name.into(), payload }).await?;

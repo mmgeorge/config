@@ -44,8 +44,8 @@ impl BackendRequest {
             "Use harness_question_answer only for an explicit answer to a currently pending question, and harness_question_withdraw only when that decision is no longer needed."
         };
         format!(
-            "Current Harness interaction\nEffective permission: {}.\nPurpose: {purpose}\n{question}",
-            self.execution_mode.label()
+            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\n{question}",
+            self.execution_mode.label(), serde_json::to_string(&self.access).expect("access policy serializes")
         )
     }
 }
@@ -68,6 +68,7 @@ mod test {
             effort: "low".into(),
             context_window: None,
             service_tier: ServiceTier::Standard,
+            access: Default::default(),
             execution_mode: PermissionMode::Read,
             backend_session_id: Some("existing".into()),
             control_context: Some(ControlTurnContext::inactive(PromptMode::Chat)),
@@ -75,7 +76,6 @@ mod test {
         for permission in [
             PermissionMode::Read,
             PermissionMode::Write,
-            PermissionMode::Full,
             PermissionMode::Yolo,
         ] {
             request.execution_mode = permission;

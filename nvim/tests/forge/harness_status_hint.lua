@@ -80,7 +80,7 @@ assert(marks[2][3] == 0 and marks[2][4].virt_text_pos == "eol")
 local first = marks[1][4].sign_text
 local state = require("forge.session").harness
 local original_session = state.session
-for _, mode in ipairs({ "read", "write", "full", "yolo", "plan" }) do
+for _, mode in ipairs({ "read", "write", "yolo", "plan" }) do
   state.session = { execution_mode = mode }
   hint.render(transcript, command_set, 120)
   local _, colored = working_marks()

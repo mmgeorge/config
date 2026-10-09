@@ -1573,7 +1573,6 @@ mod tests {
         for (mode, capture) in [
             ("read", "ForgeHarnessRead"),
             ("write", "ForgeHarnessWrite"),
-            ("full", "ForgeHarnessFull"),
             ("yolo", "ForgeHarnessYolo"),
         ] {
             for completed in [false, true] {

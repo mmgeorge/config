@@ -75,7 +75,6 @@ fn capability() -> BackendCapability {
         execution_mode_list: vec![
             PermissionMode::Read,
             PermissionMode::Write,
-            PermissionMode::Full,
             PermissionMode::Yolo,
         ],
         agent: crate::agent::AgentCapability::codex(),
@@ -117,7 +116,7 @@ impl CodexBackend {
         );
         Ok(Self {
             runtime: CodexRuntime::new(
-                CodexSecurity::new(PermissionMode::Read).launch_command(&command),
+                command.clone(),
             ),
             default_model: Mutex::new(None),
             steering_by_session: Mutex::new(HashMap::new()),
@@ -222,11 +221,16 @@ impl CodexBackend {
     }
 
     fn apply_security(params: &mut Value, request: &BackendRequest) {
-        CodexSecurity::new(request.execution_mode).apply(params, &request.workspace);
+        CodexSecurity::new(request.execution_mode, &request.access).apply_turn(params, &request.workspace);
     }
 
     fn secure(mut params: Value, request: &BackendRequest) -> Value {
         Self::apply_security(&mut params, request);
+        params
+    }
+
+    fn secure_thread(mut params: Value, request: &BackendRequest) -> Value {
+        CodexSecurity::new(request.execution_mode, &request.access).apply_thread(&mut params, &request.workspace);
         params
     }
 
@@ -245,7 +249,7 @@ impl CodexBackend {
         last_turn_id: String,
         request: &BackendRequest,
     ) -> Value {
-        Self::secure(
+        Self::secure_thread(
             json!({
                 "threadId": source_thread_id,
                 "cwd": request.workspace,
@@ -266,6 +270,7 @@ impl CodexBackend {
             effort: "medium".into(),
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
+            access: request.access.clone(),
             execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
             control_context: None,
@@ -299,7 +304,7 @@ impl CodexBackend {
             return Ok(None);
         };
         let (mut process, mut output) = self.catalog_process(&request).await?;
-        Self::load_terminal_thread(&mut process, &mut output, &thread_id, &request.workspace)
+        Self::load_terminal_thread(&mut process, &mut output, &thread_id, &Self::catalog_backend_request(&request))
             .await?;
         Ok(Some((process, output, thread_id)))
     }
@@ -308,14 +313,14 @@ impl CodexBackend {
         process: &mut CodexJsonRpc,
         output: &mut BackendOutput,
         thread_id: &str,
-        workspace: &str,
+        request: &BackendRequest,
     ) -> Result<()> {
         let mut retries_remaining = 4;
         loop {
             let id = process
                 .send_request(
                     "thread/resume",
-                    json!({ "threadId": thread_id, "cwd": workspace }),
+                    Self::secure_thread(json!({ "threadId": thread_id, "cwd": request.workspace }), request),
                 )
                 .await
                 .context("load Codex thread for background terminal request")?;
@@ -1021,7 +1026,7 @@ impl Backend for CodexBackend {
                 process
                     .request(
                         "thread/resume",
-                        Self::with_model(Self::secure(
+                        Self::with_model(Self::secure_thread(
                             json!({
                                 "threadId": thread_id,
                                 "cwd": request.workspace,
@@ -1040,7 +1045,7 @@ impl Backend for CodexBackend {
                     .request(
                         "thread/start",
                         Self::with_model(
-                            Self::secure(
+                            Self::secure_thread(
                                 json!({
                                     "cwd": request.workspace,
                                     "experimentalRawEvents": false,
@@ -1225,7 +1230,7 @@ impl Backend for CodexBackend {
                     .request(
                         "thread/start",
                         Self::with_model(
-                            Self::secure(
+                            Self::secure_thread(
                                 json!({
                                     "cwd": source_request.workspace,
                                     "historyMode": "legacy",
@@ -1347,7 +1352,7 @@ impl Backend for CodexBackend {
         process
             .request(
                 "thread/resume",
-                Self::secure(
+                Self::secure_thread(
                     json!({
                         "threadId": thread_id,
                         "cwd": request.workspace
@@ -1732,7 +1737,11 @@ mod test {
             &mut process,
             &mut BackendOutput::default(),
             "provider-thread",
-            &workspace,
+            &CodexBackend::catalog_backend_request(&BackendCatalogRequest {
+                harness_session_id: "session".into(), workspace: workspace.clone(),
+                access: Default::default(), execution_mode: PermissionMode::Read,
+                backend_session_id: Some("provider-thread".into()),
+            }),
         )
         .await;
         tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
@@ -1752,6 +1761,7 @@ mod test {
                     .to_string_lossy()
                     .into_owned(),
                 backend_session_id: None,
+                access: Default::default(),
                 execution_mode: PermissionMode::Read,
             }),
         )
@@ -1795,6 +1805,7 @@ mod test {
             effort: "medium".into(),
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
+            access: Default::default(),
             execution_mode: PermissionMode::Read,
             backend_session_id: Some("source-thread".into()),
             control_context: None,
@@ -1978,7 +1989,7 @@ mod test {
                     ];
                     if method != "turn/start" {
                         let instructions = request["params"]["developerInstructions"].as_str().unwrap();
-                        assert!(instructions.contains("Permission and task are independent"));
+                        assert!(instructions.contains("Approval mode, filesystem access, and task are independent"));
                         assert!(instructions.contains("Effective permission: Read."));
                         assert!(instructions.contains("Answer the current user request"));
                         messages.push(
@@ -2040,6 +2051,7 @@ mod test {
                         effort: "medium".into(),
                         context_window: None,
                         service_tier,
+                        access: Default::default(),
                         execution_mode: PermissionMode::Read,
                         backend_session_id: resumed.then(|| "parent".into()),
                         control_context: None,
@@ -2216,6 +2228,7 @@ mod test {
                         effort: "medium".into(),
                         context_window: None,
                         service_tier: crate::backend::ServiceTier::Standard,
+                        access: Default::default(),
                         execution_mode: PermissionMode::Read,
                         backend_session_id: Some("parent".into()),
                         control_context: None,

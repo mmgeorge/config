@@ -809,7 +809,7 @@ mod tests {
         let (_, rendered, _) = store.submit_document_revision("session", "validation", 1, 1).unwrap();
         let original = store.read_submitted_document("session", "validation", 1).unwrap();
         assert_eq!(original.design.as_ref().unwrap().document, changed.document);
-        assert!(rendered.markdown.contains("Verification:\n  Automated:\n    echo test > should-not-exist.txt\n    nvim --headless -l tests/score.lua"));
+        assert!(rendered.markdown.contains(" Verification \n  Automated:\n    echo test > should-not-exist.txt\n    nvim --headless -l tests/score.lua"));
         assert!(rendered.markdown.contains("  Manual:\n  - Start a new round"));
         assert!(!workspace.path().join("should-not-exist.txt").exists());
         let serialized = changed.read(Some("plan.json"), false).unwrap();
@@ -874,7 +874,7 @@ mod tests {
         let (_, rendered, _) = store.submit_document_revision("session", "specification", 1, 1).unwrap();
         let original = store.read_submitted_document("session", "specification", 1).unwrap();
         assert_eq!(serde_json::to_value(&original.design.as_ref().unwrap().document).unwrap(), metadata);
-        let headings = ["Objective:", "Usage:", "Requirements:", "Background:", "Decisions:", "Design:", "Flows:", "Proposed declaration changes:", "Tests · 1 new", "Verification:"];
+        let headings = [" Objective ", " Usage ", " Requirements ", " Background ", " Decisions ", " Design ", " Flows ", " Changes ", " Tests · 1 new ", " Verification "];
         let positions = headings.map(|heading| rendered.markdown.lines().position(|line| line == heading).unwrap());
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(rendered.markdown.contains("app cancel 42\nCancelled request 42"));
@@ -928,7 +928,7 @@ mod tests {
         document.version += 1;
         store.write_working_document("session", "specification", &document).unwrap();
         let (_, rendered, _) = store.submit_document_revision("session", "specification", 2, document.version).unwrap();
-        assert!(!rendered.markdown.lines().any(|line| matches!(line, "Usage:" | "Requirements:" | "Decisions:" | "Flows:")));
+        assert!(!rendered.markdown.lines().any(|line| matches!(line, " Usage " | " Requirements " | " Decisions " | " Flows ")));
         assert!(!rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == "/design/document/requirements"));
         let current = store.read_submitted_document("session", "specification", 2).unwrap();
         assert!(current.design.as_ref().unwrap().document.requirements.is_empty());

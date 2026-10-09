@@ -3,6 +3,7 @@ local Approval = {}
 local config = require("forge.infra.config")
 local picker = require("forge.views.picker")
 local keymaps = require("forge.shared.keymaps")
+local perf = require("forge.infra.perf")
 
 local function option_list(request)
   local result = {}
@@ -32,36 +33,39 @@ function Approval.open(request, host)
       end,
     }
   end
-  picker.open({
-    owner = "approval",
-    action_list = actions,
-    host = {
-      window_list = host.window_list or { host.transcript_win },
-      control_win = host.control_win or host.transcript_win,
-    },
-    page_list = {
-      {
-        id = request.id,
-        title = "Review Approval Request",
-        subtitle = request.title,
-        content_list = {
-          { text = request.detail or "", group = "ForgePickerText" },
-          request.reason and { text = "Reason: " .. request.reason, group = "ForgePickerText" } or nil,
-        },
-        column_headers = { "Decision" },
-        option_list = option_list(request),
-        footer = "↑↓ select  Enter confirm  q close"
-          .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. " interrupt") or ""),
+  perf.trace("harness", "ui.approval.open", { request_id = request.id,
+    count = #(request.choice_list or {}), bytes = #(request.detail or "") }, function()
+    picker.open({
+      owner = "approval",
+      action_list = actions,
+      host = {
+        window_list = host.window_list or { host.transcript_win },
+        control_win = host.control_win or host.transcript_win,
       },
-    },
-    on_confirm = function(result)
-      host.resolve(request.id, result.option.value, function(resolved)
-        if resolved then picker.close(false) end
-      end)
-      return false
-    end,
-    on_close = host.closed,
-  })
+      page_list = {
+        {
+          id = request.id,
+          title = "Review Approval Request",
+          subtitle = request.title,
+          content_list = {
+            { text = request.detail or "", group = "ForgePickerText" },
+            request.reason and { text = "Reason: " .. request.reason, group = "ForgePickerText" } or nil,
+          },
+          column_headers = { "Decision" },
+          option_list = option_list(request),
+          footer = "↑↓ select  Enter confirm  q close"
+            .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. " interrupt") or ""),
+        },
+      },
+      on_confirm = function(result)
+        host.resolve(request.id, result.option.value, function(resolved)
+          if resolved then picker.close(false) end
+        end)
+        return false
+      end,
+      on_close = host.closed,
+    })
+  end)
 end
 
 function Approval.is_open()

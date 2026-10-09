@@ -86,6 +86,7 @@
 ---@field help ForgeKeymap
 
 ---@class ForgePlanReviewKeymapConfig
+---@field delete_tests ForgeKeymap
 ---@field open ForgeKeymap
 ---@field jump_entity ForgeKeymap
 ---@field references ForgeKeymap
@@ -271,6 +272,7 @@ M.defaults = {
       help = "?",
     },
     plan_review = {
+      delete_tests = "j",
       references = { "or", "of" },
       visual_line_with_gutter = "W",
       toggle = "<Tab>",

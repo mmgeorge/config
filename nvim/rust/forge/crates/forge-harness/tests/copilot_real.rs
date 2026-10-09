@@ -15,6 +15,7 @@ async fn lists_native_copilot_skills_and_mcp_rows() {
     let request = BackendCatalogRequest {
         harness_session_id: "copilot-catalog".into(),
         workspace: temporary.path().to_string_lossy().into_owned(),
+        access: Default::default(),
         execution_mode: PermissionMode::Read,
         backend_session_id: None,
     };

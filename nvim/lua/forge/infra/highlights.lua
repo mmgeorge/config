@@ -8,7 +8,7 @@ local M = {}
 ---@param mode string?
 ---@return string
 function M.harness_mode(mode)
-  return ({ read = "ForgeHarnessRead", write = "ForgeHarnessWrite", full = "ForgeHarnessFull",
+  return ({ read = "ForgeHarnessRead", write = "ForgeHarnessWrite",
     yolo = "ForgeHarnessYolo", plan = "ForgeHarnessPlan" })[(mode or "read"):lower()] or "ForgeHarnessRead"
 end
 
@@ -80,7 +80,6 @@ function M.setup()
   vim.api.nvim_set_hl(0, "ForgeHarnessGoal", { fg = palette.green, bold = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessRead", { fg = palette.white, bold = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessWrite", { fg = palette.orange, bold = true })
-  vim.api.nvim_set_hl(0, "ForgeHarnessFull", { fg = palette.red, bold = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessYolo", { fg = palette.purple, bold = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessPlan", { fg = palette.purple, bold = true })
   vim.api.nvim_set_hl(0, "ForgeHarnessCommentary", { italic = true })

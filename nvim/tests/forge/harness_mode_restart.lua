@@ -51,7 +51,7 @@ for _, acknowledged_first in ipairs({ true, false }) do
   assert(last("state.get") and #failures == 0)
 end
 reset()
-controller.set_mode("full")
+controller.set_mode("write")
 local previous = last("task.transition")
 controller.set_mode("read")
 local latest = last("task.transition")

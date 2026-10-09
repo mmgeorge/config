@@ -106,7 +106,7 @@ impl TaskRecord {
             plan_id: None,
             goal_id: None,
             permission,
-            last_write_permission: if permission.permits_workspace_write() {
+            last_write_permission: if permission.is_write_default() {
                 permission
             } else {
                 PermissionMode::Write

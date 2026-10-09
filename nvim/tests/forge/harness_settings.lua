@@ -7,6 +7,9 @@ local picker = require("forge.views.picker")
 local path = vim.fn.tempname() .. ".jsonl"
 vim.fn.writefile({ '{"timestamp_ms":1700000000123,"event":"request","session_id":"settings-session","payload":{"method":"turn/start","items":["a,b","c"]}}' }, path)
 local enabled = false
+local controller = require("forge.views.harness.controller")
+local original_configure = controller.configure
+local state
 local configured_session = {
   id = "settings-session", backend = "codex", model = "mock-model", effort = "medium",
   plan_executor = { enabled = false, model = "mock-model", effort = "medium" }, plan_compact = false,
@@ -24,6 +27,7 @@ client.request_for = function(session_id, method, params, callback)
     return
   end
   if method == "session.configure" then
+    if params.access then configured_session.access = params.access end
     if params.default_write_permission then configured_session.default_write_permission = params.default_write_permission end
     if params.plan_permission then configured_session.plan_permission = params.plan_permission end
     if params.plan_executor_enabled ~= nil then configured_session.plan_executor.enabled = params.plan_executor_enabled end
@@ -38,8 +42,14 @@ client.request_for = function(session_id, method, params, callback)
   if method == "trace.session.clear" then vim.fn.writefile({}, path) end
   callback({ enabled = enabled, path = path })
 end
+controller.configure = function(params, _, completed)
+  client.request_for("settings-session", "session.configure", params, function(result)
+    state.session = result
+    completed(true)
+  end)
+end
 local success, failure = xpcall(function()
-  local state = { session = configured_session, capability = { model_selection = true, native_compact = true }, busy = true }
+  state = { session = configured_session, capability = { model_selection = true, native_compact = true }, busy = true }
   settings.open(state, { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() })
   local instance = picker._state_for_test()
   local text = table.concat(vim.api.nvim_buf_get_lines(instance.buf, 0, -1, false), "\n")
@@ -52,7 +62,7 @@ local success, failure = xpcall(function()
   local options = instance.spec.page_list[1].option_list
   assert(options[1].id == "default-write-permission" and options[2].id == "plan-permission")
   instance.spec.action_list[2].callback({ option = options[1] }, instance)
-  assert(configured_session.default_write_permission == "full")
+  assert(configured_session.default_write_permission == "yolo")
   instance.spec.action_list[1].callback({ option = options[1] }, instance)
   assert(configured_session.default_write_permission == "write")
   instance.spec.action_list[2].callback({ option = options[2] }, instance)
@@ -63,13 +73,20 @@ local success, failure = xpcall(function()
   assert(configured_session.plan_auto_approve_revisions == false)
   instance.spec.action_list[1].callback({ option = options[3] })
   assert(configured_session.plan_auto_approve_revisions == true)
-  local logging = instance.spec.page_list[1].option_list[4]
+  local sandbox = instance.spec.page_list[1].option_list[4]
+  local scope = instance.spec.page_list[1].option_list[5]
+  instance.spec.action_list[2].callback({ option = sandbox })
+  assert(configured_session.access.sandbox == false)
+  instance.spec.action_list[2].callback({ option = scope })
+  assert(configured_session.access.write_access == "full" and configured_session.access.sandbox == false)
+  assert(configured_session.default_write_permission == "write", "access changed approval mode")
+  local logging = instance.spec.page_list[1].option_list[8]
   instance.spec.action_list[1].callback({ option = logging })
   assert(enabled and require("forge.infra.perf").enabled("harness"))
   instance.spec.action_list[1].callback({ option = logging })
   assert(not enabled and not require("forge.infra.perf").enabled("harness"))
-  assert(#instance.spec.page_list[1].option_list == 5)
-  local provider = instance.spec.page_list[1].option_list[5]
+  assert(#instance.spec.page_list[1].option_list == 9)
+  local provider = instance.spec.page_list[1].option_list[9]
   assert(provider.id == "provider" and provider.columns[2] == "Codex CLI")
   instance.spec.action_list[1].callback({ option = provider })
   assert(not enabled and picker.is_open("harness-config"), "Left opened the provider picker")
@@ -103,6 +120,7 @@ local success, failure = xpcall(function()
   settings.log("settings-session", "off")
   assert(not enabled)
 end, debug.traceback)
+controller.configure = original_configure
 client.request_for = original_request
 vim.fn.delete(path)
 if not success then error(failure) end

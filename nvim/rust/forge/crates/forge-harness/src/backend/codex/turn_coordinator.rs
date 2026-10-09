@@ -842,7 +842,7 @@ mod test {
             harness_session_id: "session".into(), workspace,
             input: BackendInput::from_text("plan out a new one"), mode: PromptMode::Chat,
             model: "gpt-5.6-terra".into(), effort: "medium".into(), context_window: None,
-            service_tier: crate::backend::ServiceTier::Standard, execution_mode: PermissionMode::Read,
+            access: Default::default(), service_tier: crate::backend::ServiceTier::Standard, execution_mode: PermissionMode::Read,
             backend_session_id: Some("parent".into()), control_context: None,
         };
         let lane = SteeringLane::default();
@@ -898,7 +898,7 @@ mod test {
         let request = BackendRequest {
             harness_session_id: "session".into(), workspace, input: BackendInput::from_text("parent"),
             mode: PromptMode::Chat, model: "gpt-5.6-terra".into(), effort: "medium".into(),
-            context_window: None, service_tier: crate::backend::ServiceTier::Ultrafast, execution_mode: PermissionMode::Read,
+            access: Default::default(), context_window: None, service_tier: crate::backend::ServiceTier::Ultrafast, execution_mode: PermissionMode::Read,
             backend_session_id: Some("parent".into()), control_context: None,
         };
         let lane = crate::backend::steering::SteeringLane::default();
@@ -1028,6 +1028,7 @@ mod test {
                 effort: "medium".into(),
                 context_window: None,
                 service_tier: crate::backend::ServiceTier::Standard,
+                access: Default::default(),
                 execution_mode: PermissionMode::Read,
                 backend_session_id: Some("parent".into()),
                 control_context: None,

@@ -17,7 +17,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 38;
+const SESSION_FORMAT_VERSION: u32 = 39;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -285,10 +285,14 @@ impl SqliteStore {
         workspace: &str,
         backend: &str,
     ) -> Result<Option<HarnessPreference>> {
-        self.load_payload(
+        let payload: Option<serde_json::Value> = self.load_payload(
             "SELECT payload FROM preference_record WHERE workspace = ?1 AND backend = ?2",
             params![workspace, backend],
-        )
+        )?;
+        let Some(payload) = payload.filter(|payload| payload["format_version"] == SESSION_FORMAT_VERSION) else {
+            return Ok(None);
+        };
+        Ok(Some(serde_json::from_value(payload["preference"].clone())?))
     }
 
     /// Persist the last model controls selected for one backend and workspace.
@@ -301,7 +305,7 @@ impl SqliteStore {
         self.connection.execute(
             "INSERT INTO preference_record(workspace, backend, payload) VALUES(?1, ?2, ?3) \
              ON CONFLICT(workspace, backend) DO UPDATE SET payload=excluded.payload",
-            params![workspace, backend, encode(preference)?],
+            params![workspace, backend, encode(&serde_json::json!({"format_version":SESSION_FORMAT_VERSION,"preference":preference}))?],
         )?;
         Ok(())
     }
@@ -1090,6 +1094,7 @@ mod test {
             plan_auto_approve_revisions: true,
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
+            access: Default::default(),
             execution_mode: crate::session::PermissionMode::Read,
             current_task_id: None, default_write_permission: crate::session::PermissionMode::Write, plan_permission: None,
             created_at_ms: 1,
@@ -1387,6 +1392,7 @@ mod test {
         let temporary = tempfile::tempdir().unwrap();
         let mut store = SqliteStore::open(temporary.path()).unwrap();
         let preference = HarnessPreference {
+            access: Default::default(),
             default_write_permission: crate::session::PermissionMode::Write,
             plan_permission: None,
             model: "remembered-model".into(),

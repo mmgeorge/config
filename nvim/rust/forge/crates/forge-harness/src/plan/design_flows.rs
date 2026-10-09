@@ -1,31 +1,31 @@
 use std::collections::HashSet;
 
-use anyhow::{Result, ensure};
+use anyhow::{ensure, Result};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Records one operation from its entry point to its observable result.
+/// Records one runtime or data path from its producer to its consumers.
 pub struct DesignFlow {
-    /// Names the operation independently of its implementation steps.
+    /// Names the flow independently of its implementation steps.
     pub title: String,
     /// Explains the operation's purpose or result in concise prose.
     pub description: String,
-    /// Starts the operation's call, data-transfer, or state-transition tree.
+    /// Starts the path through producers, transformations, stores, and consumers.
     pub root: DesignFlowNode,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
-/// Identifies an operation and the downstream interactions it initiates.
+/// Identifies one component, value, state, store, or transformation in a data path.
 pub struct DesignFlowNode {
-    /// Names the concrete object, function, or state change at this point.
+    /// Gives one compact semantic label, without file paths or diagram formatting.
     pub text: String,
     /// Labels the incoming transfer or condition, absent on the root.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub via: Option<String>,
-    /// Lists downstream interactions in execution order, empty at a result.
+    /// Lists downstream transformations or consumers, branching where the path splits.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub children: Vec<DesignFlowNode>,
 }
@@ -96,7 +96,6 @@ pub(super) fn text(flows: &[DesignFlow]) -> String {
         .join("\n\n")
 }
 
-/// Keeps short chains together and wraps longer paths at object boundaries.
 fn append_node(node: &DesignFlowNode, prefix: &str, marker: &str, rows: &mut Vec<String>) {
     let label = |node: &DesignFlowNode| match &node.via {
         Some(via) => format!("{via} → {}", node.text),
@@ -105,10 +104,6 @@ fn append_node(node: &DesignFlowNode, prefix: &str, marker: &str, rows: &mut Vec
     let mut line = format!("{prefix}{marker}{}", label(node));
     let mut tail = node;
     while let [child] = tail.children.as_slice() {
-        // Keep a branching owner on its own row so its children attach unambiguously.
-        if child.children.len() > 1 {
-            break;
-        }
         let next = format!(" → {}", label(child));
         if line.chars().count() + next.chars().count() > 100 {
             break;
@@ -121,19 +116,25 @@ fn append_node(node: &DesignFlowNode, prefix: &str, marker: &str, rows: &mut Vec
         "{prefix}{}",
         if marker.starts_with('├') {
             "│  "
-        } else if marker.is_empty() {
-            ""
-        } else {
+        } else if marker.starts_with('└') {
             "   "
+        } else {
+            ""
         }
     );
+    // A width break continues the same path. Only a split adds branch indentation.
+    if let [child] = tail.children.as_slice() {
+        append_node(child, &continuation, "→ ", rows);
+        return;
+    }
+    let branch_prefix = format!("{continuation}  ");
     for (index, child) in tail.children.iter().enumerate() {
         let marker = if index + 1 == tail.children.len() {
-            "└─ "
+            "└→ "
         } else {
-            "├─ "
+            "├→ "
         };
-        append_node(child, &continuation, marker, rows);
+        append_node(child, &branch_prefix, marker, rows);
     }
 }
 
@@ -154,10 +155,70 @@ mod tests {
         })).unwrap();
         validate(std::slice::from_ref(&flow)).unwrap();
         let rendered = text(std::slice::from_ref(&flow));
-        assert!(rendered.contains("ImportSession.confirm\n└─ validated rows → ImportService.commit\n   ├─ valid records → ImportStore.save → saved count → ImportSession.complete\n   └─ invalid rows → ImportSession.errors"));
+        assert!(rendered.contains("ImportSession.confirm → validated rows → ImportService.commit\n  ├→ valid records → ImportStore.save → saved count → ImportSession.complete\n  └→ invalid rows → ImportSession.errors"));
         let mut long = flow;
         long.root.text = "LongOperation".repeat(7);
-        assert!(text(&[long]).contains("\n└─ validated rows → ImportService.commit"));
+        assert!(text(&[long]).contains("\n→ validated rows → ImportService.commit"));
+    }
+
+    #[test]
+    fn compact_data_paths_match_the_original_lua_layout() {
+        let flow: DesignFlow = serde_json::from_value(serde_json::json!({
+            "title": "Render particles", "description": "Route stored particles to their renderers.",
+            "root": {"text": "ParticleSpawn", "children": [{
+                "text": "ParticleRenderMode", "children": [{
+                    "text": "ParticleStorage", "children": [{
+                        "text": "ParticleInstanceSources", "children": [
+                            {"text": "ParticleBillboardRenderSystem"},
+                            {"text": "ModelRenderSystem", "children": [{
+                                "text": "ParticlePbRenderPipeline", "children": [{"text": "shared PBR shader path"}]
+                            }]}
+                        ]
+                    }]
+                }]
+            }]}
+        })).unwrap();
+        assert_eq!(
+            text(&[flow]),
+            "### Render particles\n\nRoute stored particles to their renderers.\n\n```text\nParticleSpawn → ParticleRenderMode → ParticleStorage → ParticleInstanceSources\n  ├→ ParticleBillboardRenderSystem\n  └→ ModelRenderSystem → ParticlePbRenderPipeline → shared PBR shader path\n```"
+        );
+    }
+
+    #[test]
+    fn wrapped_chains_preserve_branch_rails_without_adding_nesting() {
+        let flow: DesignFlow = serde_json::from_value(serde_json::json!({
+            "title": "Store imports", "description": "Persist each producer's records.",
+            "root": {"text": "ImportSource", "children": [
+                {"text": "FirstProducer", "children": [{
+                    "text": "LongTransform".repeat(5), "children": [{
+                        "text": "LongStorage".repeat(5), "children": [{"text": "FirstConsumer"}]
+                    }]
+                }]},
+                {"text": "SecondProducer", "children": [{
+                    "text": "LongTransform".repeat(5), "children": [{
+                        "text": "LongStorage".repeat(5), "children": [{"text": "SecondConsumer"}]
+                    }]
+                }]}
+            ]}
+        }))
+        .unwrap();
+        let rendered = text(&[flow]);
+        let diagram = rendered
+            .split("```text\n")
+            .nth(1)
+            .unwrap()
+            .trim_end_matches("\n```");
+        assert!(diagram.lines().all(|line| line.chars().count() <= 100));
+        assert!(diagram.contains(&format!(
+            "\n  │  → {} → FirstConsumer",
+            "LongStorage".repeat(5)
+        )));
+        assert!(diagram.contains(&format!(
+            "\n     → {} → SecondConsumer",
+            "LongStorage".repeat(5)
+        )));
+        assert_eq!(diagram.matches("├→").count(), 1);
+        assert_eq!(diagram.matches("└→").count(), 1);
     }
 
     #[test]
@@ -185,11 +246,9 @@ mod tests {
             };
         }
         flow.root = node;
-        assert!(
-            validate(&[flow])
-                .unwrap_err()
-                .to_string()
-                .contains("32 node levels")
-        );
+        assert!(validate(&[flow])
+            .unwrap_err()
+            .to_string()
+            .contains("32 node levels"));
     }
 }

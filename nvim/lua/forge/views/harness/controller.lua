@@ -218,30 +218,33 @@ end
 local function status_text()
   local state = harness_state()
   local active_session = state.session or {}
+  local current_task = task_control.current(state)
+  local pending_marker = state.busy and (not current_task or current_task.status == "running") and "*" or ""
   local raw_mode = state.pending_mode or active_session.execution_mode or "read"
   local mode = raw_mode:lower() == "yolo" and "YOLO" or (raw_mode:sub(1, 1):upper() .. raw_mode:sub(2))
-  if state.pending_mode then mode = mode .. "*" end
+  if state.pending_mode then mode = mode .. pending_marker end
   local configured_model = active_session.model or config.options.harness.model
   local model = active_session.resolved_model or (configured_model == "default" and "resolving model" or configured_model)
   local effort = selected_setting(state, "effort")
-  if state.pending_config and state.pending_config.model then model = state.pending_config.model .. "*" end
-  if effort ~= (active_session.effort or config.options.harness.effort) then effort = effort .. "*" end
+  local selected_model = selected_setting(state, "model")
+  if selected_model ~= configured_model then model = selected_model .. pending_marker end
+  if effort ~= (active_session.effort or config.options.harness.effort) then effort = effort .. pending_marker end
   local busy = state.host_error and " • host stopped"
     or state.execution_notice and " • stopped"
     or state.cancel_requested and " • cancelling"
     or state.busy and ""
     or (#state.queue > 0 and (" • queued " .. #state.queue) or "")
-  local current_task = task_control.current(state)
-  local goal = current_task and (" • " .. current_task.kind .. " · " .. current_task.phase .. " · " .. current_task.status) or nil
-  if state.task_operation and (state.task_operation.state ~= "running" or not current_task) then
+  local goal = current_task and (" • " .. current_task.kind .. " · " .. current_task.phase
+    .. (current_task.status == "running" and "" or " · " .. current_task.status)) or nil
+  if state.task_operation and state.task_operation.state ~= "running" then
     goal = " • Task " .. state.task_operation.state
   end
   if state.sync_error then goal = " • State unavailable: " .. state.sync_error end
   if state.connection_error then goal = " • " .. state.connection_error end
   local tier = selected_setting(state, "service_tier")
-  local tier_label = tier ~= "default" and (" " .. tier) or ""
-  if tier ~= (active_session.service_tier or "default") then
-    tier_label = " " .. (tier == "default" and "standard" or tier) .. "*"
+  local tier_label = ({ fast = " +", ultrafast = " ++" })[tier] or ""
+  if tier ~= (active_session.service_tier or "default") and pending_marker ~= "" then
+    tier_label = (tier == "default" and " standard" or tier_label) .. "*"
   end
   local segment_list = {
     {
@@ -253,6 +256,9 @@ local function status_text()
       group = "ForgeStatusLabel",
     },
   }
+  if (active_session.access or {}).sandbox ~= false then
+    segment_list[#segment_list + 1] = { text = " • sandbox", group = "ForgeStatusLabel" }
+  end
   local selected_run = selected_agent_run(state)
   segment_list[#segment_list + 1] = {
     text = selected_run and (" • " .. (selected_run.nickname or selected_run.definition)) or " • Main",
@@ -557,6 +563,8 @@ local function on_event(event, payload)
     state.cancel_requested = false
     state.state_sync_pending, state.state_sync_again, state.state_sync_callback = nil, nil, nil
     state.configuring, state.configuration_debounce = false, false
+    if state.configuration_completion then state.configuration_completion.complete(false) end
+    state.configuration_completion, state.task_config = nil, nil
     state.approval, state.active_wait = {}, nil
     state.ready = false
     if state.presentation and state.presentation.terminals then state.presentation.terminals.close() end
@@ -659,7 +667,7 @@ local function on_event(event, payload)
   elseif event == "plan_question_updated" then
     state.active_plan = payload.plan or state.active_plan
     M.refresh_winbar()
-  elseif event == "plan_created" or event == "plan_revision_created" or event == "plan_entity_renamed"
+  elseif event == "plan_created" or event == "plan_revision_created" or event == "plan_entity_renamed" or event == "plan_tests_deleted"
     or event == "plan_changes_requested"
     or event == "plan_acceptance_started" or event == "plan_acceptance_updated"
     or event == "plan_acceptance_cancelled"
@@ -712,6 +720,13 @@ local function on_event(event, payload)
       prompt_history.reset_navigation()
     end
     state.session = next_session
+    if payload.operation_id then state.pending_mode = nil end
+    local configuration = state.configuration_completion
+    if configuration and state.task_operation and payload.operation_id == state.task_operation.id then
+      state.configuration_completion = nil
+      state.task_config = nil
+      configuration.complete(true)
+    end
     if (event == "execution_mode_changed" or event == "mode_changed") then
       state.pending_mode = nil
     end
@@ -1485,7 +1500,7 @@ function M.submit()
     end)
     return
   end
-  if vim.tbl_contains({ "/read", "/write", "/full", "/yolo" }, text) then
+  if vim.tbl_contains({ "/read", "/write", "/yolo" }, text) then
     set_composer_text(state.composer_buf, "")
     M.set_mode(text:sub(2))
     return
@@ -1499,7 +1514,7 @@ function M.submit()
   if execution_mode then
     set_composer_text(state.composer_buf, "")
     execution_mode = execution_mode:lower()
-    if not vim.tbl_contains({ "read", "write", "full", "yolo" }, execution_mode) then
+    if not vim.tbl_contains({ "read", "write", "yolo" }, execution_mode) then
       report_configuration_error("Unknown execution mode: " .. execution_mode)
       return
     end
@@ -2032,7 +2047,13 @@ function M.task_transition(action, submitted_text, completed)
   local state = harness_state()
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
   if not state.session then notifications.warn("Harness is still initializing", "Harness task") return end
-  if action.action ~= "configure" then state.task_config = nil end
+  if action.action ~= "configure" then
+    state.task_config = nil
+    if state.configuration_completion then
+      state.configuration_completion.complete(false)
+      state.configuration_completion = nil
+    end
+  end
   state.last_provider_progress, state.wait_notice = vim.uv.now(), nil
   local current = task_control.current(state)
   if action.action == "resume" and current and current.status == "running"
@@ -2066,7 +2087,7 @@ end
 
 function M.set_mode(mode)
   mode = mode:lower()
-  if not vim.tbl_contains({ "read", "write", "full", "yolo" }, mode) then
+  if not vim.tbl_contains({ "read", "write", "yolo" }, mode) then
     report_configuration_error("Unknown permission: " .. mode)
     return
   end
@@ -2085,10 +2106,9 @@ function M.select_mode()
   local current_mode = state.pending_mode
     or (state.session and state.session.execution_mode) or "read"
   local detail_list = {
-    read = "Allow reads and network access while denying local writes.",
-    write = "Allow workspace writes within the current repository.",
-    full = "Allow machine-wide writes with approval prompts.",
-    yolo = "Allow machine-wide writes without approval prompts.",
+    read = "Ask before edits and untrusted commands.",
+    write = "Apply saved approval rules within configured access.",
+    yolo = "Skip approval prompts within configured access.",
   }
   local option_list = vim.tbl_map(function(mode)
     local label = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2))
@@ -2100,7 +2120,7 @@ function M.select_mode()
       highlight_group = require("forge.infra.highlights").harness_mode(mode),
       highlight_text = mode == "yolo" and "YOLO" or (mode:sub(1, 1):upper() .. mode:sub(2)),
     }
-  end, { "read", "write", "full", "yolo" })
+  end, { "read", "write", "yolo" })
   open_choice_picker(state, "Select Mode", nil, option_list,
     M.set_mode)
 end
@@ -2147,9 +2167,18 @@ function M.configure(next_config, validate_selection, completed)
     state.pending_config, state.pending_config_validate = nil, false
     local requested = vim.tbl_extend("force", state.task_config or {}, next_config, { validate = validate_selection == true })
     state.task_config = requested
+    if state.configuration_completion then state.configuration_completion.complete(false) end
+    local finished = false
+    local configuration = { complete = function(applied)
+      if finished then return end
+      finished = true
+      if completed then completed(applied) end
+    end }
+    state.configuration_completion = configuration
     M.task_transition({ action = "configure", config = requested }, nil, function(applied)
       if state.task_config == requested then state.task_config = nil end
-      if completed then completed(applied) end
+      if state.configuration_completion == configuration then state.configuration_completion = nil end
+      configuration.complete(false)
     end)
     return
   end

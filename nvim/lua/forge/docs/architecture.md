@@ -29,6 +29,11 @@ loads overview, file, check, and conversation sections. The review route then en
 batched mode. Notification PR subjects preserve repository, number, and workspace
 identity through that same public route, while browser fallback remains available.
 PlanReview retains its Lua controller and projects physical source rows through a native document.
+Each test-inventory source row carries its file and case identity. Visual `j` collects
+distinct cases across the selected rows and opens the shared confirmation dialog.
+Confirmation validates the captured view and source revision before `plan.tests.delete`
+creates a new reviewed plan revision. The broker removes only selected inventory entries,
+prunes empty file groups, and rejects stale confirmations. Project files remain unchanged.
 Harness analyzes the exact saved Markdown with the shared syntax engine before opening that
 document, after releasing the broker lock. The document retains the syntax handle across
 annotation insertions and view resizes. Native highlights include fenced language injections.
@@ -36,6 +41,8 @@ Block-relative conceal ranges hide Markdown delimiters without modifying source 
 Block-relative source overlays replace display cells such as unordered list markers.
 Source highlights apply inline-code and heading backgrounds independently from syntax captures.
 Heading overlays add one display cell of trailing padding at the source line endpoint.
+Generated PlanReview section headings use one highlighted space on each side of the title,
+omit the colon, and share the black-on-white `RenderMarkdownH1` presentation.
 The viewport provider reveals the original source on the cursor or selection rows according
 to the window's conceal policy. Overlays preserve source coordinates and rebase with edits.
 The Neovim replica applies those ranges. PlanReview hides editor line numbers and the status
@@ -1413,6 +1420,11 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
   timer. `diff_logging` records ForgeStatus, diffs, PRs, and shared UI work in
   `forge/diff-perf.log`. `harness_logging` records Harness lifecycle and provider timings in
   `forge/harness-perf.log`.
+  Harness UI traces record correlated begin/end boundaries for response callbacks,
+  transcript application, Markdown parser/render work, and approval display. Each record
+  includes the process ID and monotonic timestamp. A 250 ms heartbeat records main-loop
+  delays of at least 100 ms while Harness logging is enabled. Writes remain asynchronous
+  and bounded, and payloads contain counts and identities rather than conversation content.
 - **`paths.lua`** — path normalization and repo-relative resolution, case-insensitive on
   Windows.
 - **`util.lua`** — leaf helpers: diff stat counting, loaded-buffer lookup, NUL-byte
@@ -2023,15 +2035,22 @@ current context through `developerInstructions` on both thread start and resume,
 resumption. Copilot appends shared instructions when creating or resuming a session and sends current
 interaction context with every message, including messages to an already-live session.
 
-Plan metadata stores operation flows separately from the Design Markdown. `design_flows.rs` owns
+Plan metadata stores data flows separately from the Design Markdown. `design_flows.rs` owns
 the recursive `text`, optional incoming `via`, and `children` node schema, validates its size and
-depth, and generates code-fenced diagrams. Short chains share a line, longer chains break at node
-boundaries, and branches retain their incoming transfer or condition labels. The shared section
+depth, and generates code-fenced diagrams. The planning prompt follows values, requests, events,
+records, and artifacts through producers, transformations, stores, and consumers. Short labels name
+one semantic role each. Paired JSON and rendered examples demonstrate transformations, shared
+consumers, and alternative results. Scheduling rules and lifecycle guarantees stay in descriptions.
+Short chains share a line, longer chains continue with arrows at the same
+indentation, and only actual splits create indented branches. Branches retain their incoming
+transfer or condition labels and continuation rails. The shared section
 projection places Flows after Design and omits an empty inventory. Section reads, review output,
 and revision diffs use the same generated Markdown without changing the stored JSON.
 
 Plan review places Tests after proposed declaration changes and before Verification. Each section
 retains its own fold boundary and navigation targets in both full and public-only views.
+The blank row before Tests stays outside the Changes fold in both views.
+Public filtering preserves that unhighlighted section spacer even after an empty diff row.
 
 `plan/prompts/planning.md` owns the virtual file procedure, metadata roles, declaration syntax,
 validation contracts, and patch examples. `PlanPrompt` embeds it in draft, feedback, revision, and
@@ -2285,29 +2304,37 @@ request, closes its float, clears the winbar status, and presents the next queue
 Cancelling a turn drains the coordinator before provider teardown, preventing abandoned requests
 from reappearing through a later state snapshot.
 
-Read, Write, Full, and YOLO form the fixed execution-mode set. New and forked sessions start in Read,
-while resumed sessions retain their persisted mode. Plan creation, review, acceptance, rejection,
-and cancellation never change it. `Shift-Tab` cycles the four modes through
-`session.execution_mode` while idle. During any active execution it requests `turn.restart`, then
-persists the selected mode and resumes the cancelled interaction under that new security boundary.
-`:ForgePermissions` uses an `acwrite` JSON buffer, so invalid documents never replace the compiled policy.
-Non-Git modes that permit writes retain the checkpoint warning and confirmation path.
+Read, Write, and YOLO select approval handling. Read asks before edits and untrusted
+commands, Write applies saved permission rules, and YOLO skips approval prompts. These
+settings do not select a filesystem scope or disable the sandbox. `/mode` and its direct
+commands change only approvals through the durable task transition coordinator.
 
-Inline `/model`, `/effort`, and `/mode` commands cross the same broker capability boundary as
-their pickers. The broker validates explicit model identifiers and model-specific reasoning effort
-against backend discovery before mutating session state, while execution modes validate against the
-backend's advertised mode set. Accepted changes and rejected values render as session-level timeline
-status entries, giving inline commands the same visible outcome contract as session rename.
+`session.access` stores sandbox enablement, workspace/full write scope, additional writable
+directories, and the Windows sandbox backend. `/config` saves these settings per workspace
+and provider. The directory picker adds or edits existing directories using completion,
+confirms deletion, and marks covered paths. Full scope and disabled sandbox retain the list
+but make it inactive. Disabling the sandbox removes OS write restrictions, so the write-scope
+selector remains stored but inactive. Copilot does not expose these isolation controls.
 
-`CodexSecurity` projects every Codex thread and turn through the same native policy. Read selects a
-read-only profile with network access, Write adds workspace-root writes, Full selects unrestricted
-filesystem access with on-request approvals, and YOLO selects unrestricted access with native
-approval bypass. Copilot routes SDK permission callbacks through the same `PermissionCoordinator`,
-including shell, read, write, URL, MCP, custom-tool, memory, and hook requests. Provider-private
-operations that emit no client approval request remain outside the Harness policy boundary.
+Configuration uses the same interrupt/finalize/resume transition as approval changes. The
+broker validates and canonicalizes directory paths before committing settings. Provider
+failures remain visible through the existing failed-operation state. Updated session and
+preference envelopes hide incompatible earlier formats without deleting their records.
+The broker publishes applied settings before resuming provider execution. That event updates
+the terminal catalog policy and completes the configuration picker while the task continues.
 
-Codex owns operating-system sandbox selection. Harness supplies permission profiles and approval
-policy without forcing a Windows sandbox implementation.
+`CodexSecurity` sends `sandbox` plus per-thread configuration to thread start, resume, and
+fork, and sends `sandboxPolicy` to every turn start. Read maps to native `untrusted`, Write
+to `on-request`, and YOLO to `never`. Workspace writes include the workspace and configured
+directories. Full scope uses mounted filesystem roots while retaining OS isolation. Windows
+backend selection is independent of approvals. Background terminal thread resumes receive
+the same settings, so polling cannot restore an older policy.
+
+Native Codex commands and patches run under its filesystem sandbox. Explicit provider
+requests are evaluated by `PermissionCoordinator`, which no longer imposes an implicit
+workspace ceiling based on approval mode. Copilot routes SDK approval callbacks through
+the same coordinator. Provider-private operations without callbacks remain outside that
+approval boundary. MCP servers retain their own process permissions.
 
 The global Rulesync config omits the `permissions` feature only for `codexcli`. Codex therefore
 cannot apply a generated exec-policy denial before Harness evaluates the request. Direct Codex CLI

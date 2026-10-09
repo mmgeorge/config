@@ -2,6 +2,7 @@ local M = {}
 local client = require("forge.client")
 local replica = require("forge.buffer")
 local input = require("forge.input")
+local perf = require("forge.infra.perf")
 local transcript_options = {
   margin = 0,
   scrolloff = 3,
@@ -30,7 +31,11 @@ function M.open(options, callback)
     local range_list = markdown.ranges(owner.transcript)
     for window in pairs(owner.views) do
       if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
-        markdown.render(options.transcript_buffer, window, range_list)
+        perf.trace("harness", "ui.markdown", { session_id = options.session_id,
+          revision = owner.transcript.revision, buf = options.transcript_buffer,
+          line_count = vim.api.nvim_buf_line_count(options.transcript_buffer), count = #range_list }, function()
+          markdown.render(options.transcript_buffer, window, range_list)
+        end)
       end
     end
     owner.markdown_revision = owner.transcript.revision
@@ -39,8 +44,17 @@ function M.open(options, callback)
     if active or #queued == 0 then return end
     active = true
     local current = table.remove(queued, 1)
+    local started = perf.now()
+    perf.event("harness", "ui.request", { phase = "begin", session_id = options.session_id,
+      operation = current.params.operation, revision = current.params.revision,
+      queue_count = #queued, elapsed_ms = perf.elapsed_ms(current.queued_at) })
     local function receive(result, failure)
-      local accepted, callback_error = pcall(current.done, result, failure)
+      perf.event("harness", "ui.request", { phase = "end", session_id = options.session_id,
+        operation = current.params.operation, revision = current.params.revision,
+        elapsed_ms = perf.elapsed_ms(started), status = failure and "error" or "ok" })
+      local accepted, callback_error = pcall(perf.trace, "harness", "ui.response", {
+        session_id = options.session_id, operation = current.params.operation,
+        revision = current.params.revision }, function() current.done(result, failure) end)
       active = false
       dispatch_next()
       if not accepted then notice(tostring(callback_error)) end
@@ -55,7 +69,7 @@ function M.open(options, callback)
       return
     end
     if #queued >= 63 and params.operation ~= "close" then done(nil, "Harness presentation request capacity is full") return end
-    queued[#queued + 1] = { params = params, done = done }
+    queued[#queued + 1] = { params = params, done = done, queued_at = perf.now() }
     dispatch_next()
   end
   local function view_for(window)
@@ -156,13 +170,17 @@ function M.open(options, callback)
         return
       end
       owner.sync_failure = nil
-      if type(result.snapshot) == "table" then replica.apply_snapshot(owner.transcript, result.snapshot)
-      else
-        for _, patch in ipairs(result.patch or {}) do
-          local applied = replica.apply_patch(owner.transcript, patch)
-          if applied.kind ~= "Applied" then break end
+      perf.trace("harness", "ui.transcript.apply", { session_id = options.session_id,
+        revision = owner.transcript.revision, buf = options.transcript_buffer,
+        count = #(result.patch or {}), source = type(result.snapshot) == "table" and "snapshot" or "patch" }, function()
+        if type(result.snapshot) == "table" then replica.apply_snapshot(owner.transcript, result.snapshot)
+        else
+          for _, patch in ipairs(result.patch or {}) do
+            local applied = replica.apply_patch(owner.transcript, patch)
+            if applied.kind ~= "Applied" then break end
+          end
         end
-      end
+      end)
       local switched_timeline = owner.restore_timeline ~= nil
       if owner.restore_timeline then
         for window, saved in pairs(owner.timeline_view[owner.restore_timeline] or {}) do

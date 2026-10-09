@@ -44,6 +44,10 @@ pub enum PlanReviewReferenceKind {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "target_type", rename_all = "snake_case")]
 pub enum PlanReviewTarget {
+    TestCase {
+        path: String,
+        name: String,
+    },
     Section {
         section: PlanSection,
     },

@@ -14,6 +14,7 @@ pub struct CatalogCapability {
 pub struct BackendCatalogRequest {
     pub harness_session_id: String,
     pub workspace: String,
+    pub access: crate::session::AccessPolicy,
     pub execution_mode: PermissionMode,
     pub backend_session_id: Option<String>,
 }

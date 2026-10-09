@@ -143,6 +143,25 @@ local success, failure = xpcall(function()
   await(function() return state.plan_review and state.plan_review.owner.ready end, "declaration review did not open")
   local review = state.plan_review
   assert(text(review.buf):find("Tests · None planned", 1, true), "review omitted the empty test inventory")
+  local tests_source_index
+  for index, row in ipairs(review.owner.source) do
+    if row.block == "plan:section:tests" then tests_source_index = index break end
+  end
+  assert(tests_source_index, "Tests source row is missing")
+  local spacer = review.owner.source[tests_source_index - 1]
+  assert(spacer.block == "plan:section:changes:separator" and spacer.text == "",
+    "public filtering replaced the Tests spacer with a blank diff row")
+  local spacer_visible = false
+  for _, record in ipairs(review.owner.projection.source_record_list) do
+    if record.source_index == tests_source_index - 1 then
+      spacer_visible = true
+      assert(vim.api.nvim_buf_get_lines(review.buf, record.row, record.row + 1, false)[1] == "",
+        "Tests spacer is missing from the displayed buffer")
+      assert(vim.api.nvim_win_call(review.win, function() return vim.fn.foldlevel(record.row + 1) end) == 0,
+        "Tests spacer is hidden inside a declaration fold")
+    end
+  end
+  assert(spacer_visible, "Tests spacer has no displayed source row")
   assert(vim.wo[review.win].winbar:find("Awaiting review", 1, true), "attached review retained its loading navbar")
   local function visibility_label(public_only)
     local bar = vim.wo[review.win].winbar
@@ -179,14 +198,14 @@ local success, failure = xpcall(function()
   assert(review.owner.replica.gutter_selection == nil and vim.api.nvim_get_mode().mode == "n", "plan copy retained gutter selection")
   vim.g.clipboard = previous_clipboard
   assert(text(review.buf):find(document.design.document.design, 1, true), "change description is missing")
-  assert(text(review.buf):find("Objective:\n" .. document.design.document.objective, 1, true), "task overview is missing or misplaced")
+  assert(text(review.buf):find(" Objective \n" .. document.design.document.objective, 1, true), "task overview is missing or misplaced")
   local last_section = 0
-  for _, heading in ipairs({ "Objective:", "Requirements:", "Background:", "Design:", "Proposed declaration changes:", "Tests · None planned", "Verification:" }) do
+  for _, heading in ipairs({ " Objective ", " Requirements ", " Background ", " Design ", " Changes ", "Tests · None planned", " Verification " }) do
     local position = assert(text(review.buf):find(heading, 1, true), "missing plan section: " .. heading)
     assert(position > last_section, "plan sections are out of order: " .. heading)
     last_section = position
   end
-  assert(not text(review.buf):find("\nUsage:\n", 1, true) and not text(review.buf):find("\nDecisions:\n", 1, true),
+  assert(not text(review.buf):find("\n Usage \n", 1, true) and not text(review.buf):find("\n Decisions \n", 1, true),
     "empty optional metadata sections should be hidden")
   assert(text(review.buf):find("  pub second: u64,", 1, true), "compact member did not receive display indentation")
   assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "full view did not abbreviate trait implementation")
@@ -200,9 +219,9 @@ local success, failure = xpcall(function()
   assert(bytes(artifact_path) == artifact and bytes(plan.working_path) == projection, "opening rewrote the plan")
   local file_row, hunk_row, task_row, description_row, changes_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-    if line == "Design:" then description_row = row end
-    if line == "Objective:" then task_row = row end
-    if line == "Proposed declaration changes:" then changes_row = row end
+    if line == " Design " then description_row = row end
+    if line == " Objective " then task_row = row end
+    if line == " Changes " then changes_row = row end
     if line:find("Modified src/change.rs", 1, true) then file_row = row end
     if file_row and not hunk_row and line:find("@@", 1, true) then hunk_row = row end
   end

@@ -56,6 +56,36 @@ local test_success, failure = pcall(function()
   assert_equals(harness_record.scope, "harness", "Harness record scope mismatch")
   assert_equals(harness_record.event, "harness.fork", "Harness record event mismatch")
   assert_equals(#log_lines(diff_log_path), 1, "disabled diff scope appended a record")
+  local first, middle, last = perf.trace("harness", "test.callback", { request_id = "request", body = "private" }, function()
+    return "first", nil, "last"
+  end)
+  assert_equals(first, "first")
+  assert_equals(middle, nil)
+  assert_equals(last, "last", "tracing lost a result after nil")
+  local succeeded, callback_error = pcall(perf.trace, "harness", "test.failure", {}, function()
+    error("expected callback failure")
+  end)
+  assert_true(not succeeded and callback_error:find("expected callback failure", 1, true), "tracing swallowed a callback failure")
+  vim.uv.sleep(450)
+  local records = {}
+  assert_true(vim.wait(1500, function()
+    for _, line in ipairs(log_lines(harness_log_path)) do
+      local record = vim.json.decode(line)
+      records[record.event .. ":" .. tostring(record.phase)] = record
+    end
+    return records["ui.loop_lag:nil"] ~= nil and records["test.failure:end"] ~= nil
+  end, 10), "UI delay or callback traces did not reach the async log")
+  local begin, finish = records["test.callback:begin"], records["test.callback:end"]
+  assert_true(begin and finish and begin.span_id == finish.span_id, "callback trace boundaries lost correlation")
+  assert_true(finish.elapsed_ms >= 0 and finish.status == "ok")
+  assert_equals(records["test.failure:end"].status, "error")
+  assert_equals(begin.body, nil, "callback tracing retained private content")
+  assert_true(records["ui.loop_lag:nil"].elapsed_ms >= 100, "UI delay reported below its threshold")
+  perf.setup({ harness = { enabled = false } })
+  local called = false
+  perf.trace("harness", "test.disabled", {}, function() called = true end)
+  assert_true(called, "disabled tracing skipped its callback")
+  perf.setup({ harness = { enabled = true } })
   local cyclic = { source = string.rep("x", 1024 * 1024), body = "private payload", prompt = "private prompt", authorization = "private credential" }
   cyclic.nested = cyclic
   local bounded = perf.payload(cyclic)
@@ -80,6 +110,7 @@ local test_success, failure = pcall(function()
   end, 10), "Harness log did not replace data beyond the per-scope retention limit")
 end)
 
+perf.setup({ harness = { enabled = false }, diff = { enabled = false } })
 pcall(vim.fn.delete, test_root, "rf")
 
 if not test_success then

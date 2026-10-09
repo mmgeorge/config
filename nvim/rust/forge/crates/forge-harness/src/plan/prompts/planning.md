@@ -280,8 +280,8 @@ or claims that implementation or verification has finished.
 
 Before submission, review the Design against this template. Confirm that the opening describes the
 solution, explains its structure, and introduces the main objects. Define unexplained code names
-and move configuration or implementation detail out of Ownership. Confirm that each flow follows
-a code path from its entry point through the relevant objects and state changes to the result.
+and move configuration or implementation detail out of Ownership. Confirm that every flow arrow
+represents production, transformation, storage, or consumption through the described objects.
 Shorten any ownership paragraph exceeding two sentences instead of joining unrelated clauses.
 Keep acceptance-critical behavior in the plan, placing each detail in its designated section.
 
@@ -291,25 +291,103 @@ Write `flows` as an array of objects with `title`, `description`, and `root`. Ha
 section after Design, generating the headings, arrows, branches, and layout. Do not put diagrams
 or a Flows heading inside `design`.
 
-Each flow traces an operation through the concrete objects and functions established in Ownership.
-Start at the trigger or entry point, show what passes between owners or changes state, and end at
-the result. Use `description` for 1–2 sentences explaining the operation's purpose or result, not a
-second prose account of every step. Prefer 1–3 flows. Add another only for a distinct essential
-lifecycle or failure path. Use [] when the change has no meaningful runtime flow.
+Each flow follows one value, request, event, record, or artifact from its producer through
+transformations and stores to its consumers. Connect the concrete objects and functions established
+in Ownership. Use `description` for 1–2 sentences explaining the flow's purpose or result, keeping
+the diagram labels compact. Prefer 1–3 independent flows. Use [] when the change has no meaningful
+runtime or data flow.
 
 Each node has plain, single-line `text`, optional `via`, and optional `children`:
-- `text` identifies the concrete operation, object, or state change. Functions are valid nodes and
-  need no wrapper type. Use code names without backticks, bullets, arrows, or Markdown formatting.
-- `via` labels the incoming transfer, event, result, or condition. Omit it on the root.
-- `children` lists downstream interactions in execution order. A single child continues the chain.
-  Multiple children show separate interactions or branches, with conditions in `via` when needed.
-  Omit children or use [] at a leaf. Represent shared results again when separate branches reach them.
+- `text` gives each node one semantic role. Use nouns for components, workers, inputs, outputs,
+  states, stores, and artifacts. Use active verb phrases for operations and transformations.
+  Functions are valid nodes and need no wrapper type. Keep labels short, concrete, and free of
+  file paths, backticks, bullets, arrows, and Markdown formatting.
+- `via` names the value, event, result, or condition crossing the incoming boundary when that
+  relationship needs clarification. Omit it on the root.
+- `children` names the next transformations, stores, or consumers. A single child continues the
+  chain. Branch where data or execution paths split. Use one primary root per flow when supported
+  by the design. Represent convergence by repeating the shared downstream stage at the end of
+  each producer branch, and explain in the description that these labels name one shared stage.
+  Omit children or use [] at a leaf.
 
-Include ordering and failure paths when they determine the result. Keep local algorithms and
-configuration values in declarations. Do not replace an object interaction with a list of behavioral
-rules, user instructions, or generic actions such as "process data". Store facts and relationships,
-not hand-formatted diagram text. Flow titles must be unique. The structural limits are 32 flows,
+Show representation changes as explicit transformations and keep one stable name per representation.
+Each arrow means the next node consumes an output from the preceding node, through production,
+transformation, storage, or consumption. Keep scheduling rules, guards, lifecycle guarantees, and
+explanations in the description. Put a condition in the diagram only when it distinguishes
+alternative data paths. Choose a narrower flow when a diagram requires unrelated inputs or long
+explanatory labels. Keep local algorithms and configuration values in declarations. Before
+submission, check that each flow describes the same solution as Design and that
+every producer and consumer discussed in its description appears in the path. Store facts and
+relationships, not hand-formatted diagram text. Flow titles must be unique. The structural limits are 32 flows,
 512 total nodes, and 32 node levels, separate from the recommendation to keep flows concise.
+
+These examples pair structured flow fields with their generated output. Use the relevant pattern
+with the proposed solution's own objects and operations.
+
+**Transformation.** Each stage consumes the preceding output. The description explains when the
+application loads its configuration.
+
+```json
+{
+  "title": "Load configuration",
+  "description": "The application loads its configuration once at startup.",
+  "root": {"text": "Config file", "children": [
+    {"text": "parse_config", "children": [
+      {"text": "Config", "children": [{"text": "Application"}]}
+    ]}
+  ]}
+}
+```
+
+```text
+Config file → parse_config → Config → Application
+```
+
+**Shared consumers.** Branches identify separate consumers of the same stored data. The description
+explains the persistence guarantee rather than placing it inside a node.
+
+```json
+{
+  "title": "Preserve editor changes",
+  "description": "DraftCache retains editor changes across buffer closure for background saving and session recovery.",
+  "root": {"text": "Editor change", "children": [
+    {"text": "DraftCache", "children": [
+      {"text": "SyncWorker", "children": [
+        {"text": "SaveRequest", "children": [{"text": "Storage"}]}
+      ]},
+      {"text": "SessionRecovery", "children": [{"text": "Restored buffer"}]}
+    ]}
+  ]}
+}
+```
+
+```text
+Editor change → DraftCache
+  ├→ SyncWorker → SaveRequest → Storage
+  └→ SessionRecovery → Restored buffer
+```
+
+**Alternative results.** Branches identify the outputs and their consumers. The description explains
+the failure condition without adding a guard node.
+
+```json
+{
+  "title": "Decode a response",
+  "description": "Malformed response bytes produce a request failure without reaching the decoded-response consumer.",
+  "root": {"text": "Response bytes", "children": [
+    {"text": "decode_response", "children": [
+      {"text": "DecodedResponse", "children": [{"text": "RequestResult"}]},
+      {"text": "DecodeError", "children": [{"text": "RequestFailure"}]}
+    ]}
+  ]}
+}
+```
+
+```text
+Response bytes → decode_response
+  ├→ DecodedResponse → RequestResult
+  └→ DecodeError → RequestFailure
+```
 
 Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
 Encode paragraph breaks as `\n\n` inside JSON strings. Each rendered metadata section is limited
@@ -344,17 +422,30 @@ A plan's metadata can use this shape:
   "flows": [
     {
       "title": "Replace a texture",
-      "description": "Publish the prepared replacement at a frame boundary and retain the previous allocation until its last frame completes.",
+      "description": "Publish the prepared replacement at a frame boundary. Retire the previous allocation after its last submitted frame completes.",
       "root": {
-        "text": "TextureStreaming.prepare",
+        "text": "TextureRequest",
         "children": [
           {
-            "text": "TextureRegistry.publish",
-            "via": "prepared replacement at frame boundary",
+            "text": "TextureStreaming.prepare",
             "children": [
               {
-                "text": "TextureRegistry.retire",
-                "via": "previous allocation after final GPU use"
+                "text": "PreparedTexture",
+                "children": [
+                  {
+                    "text": "TextureRegistry.publish",
+                    "children": [
+                      {
+                        "text": "Published handle",
+                        "children": [{"text": "Renderer"}]
+                      },
+                      {
+                        "text": "Replaced allocation",
+                        "children": [{"text": "TextureRegistry.retire"}]
+                      }
+                    ]
+                  }
+                ]
               }
             ]
           }
@@ -363,17 +454,15 @@ A plan's metadata can use this shape:
     },
     {
       "title": "Cancel preparation",
-      "description": "Discard unpublished work while the renderer retains the current texture.",
+      "description": "The request handle sends cancellation to the preparation worker, which releases the unpublished allocation.",
       "root": {
         "text": "TextureRequest.cancel",
         "children": [
           {
             "text": "TextureStreaming.discard",
-            "via": "pending request",
             "children": [
               {
-                "text": "TextureRegistry.current remains unchanged",
-                "via": "unpublished replacement discarded"
+                "text": "Released allocation"
               }
             ]
           }

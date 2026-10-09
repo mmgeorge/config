@@ -30,6 +30,7 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         effort: "low".into(),
         context_window: None,
         service_tier: forge_harness::backend::ServiceTier::Fast,
+        access: Default::default(),
         execution_mode: if mode == PromptMode::Plan {
             PermissionMode::Read
         } else {
@@ -73,6 +74,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
     let catalog_request = BackendCatalogRequest {
         harness_session_id: "catalog-session".into(),
         workspace: repository.path().to_string_lossy().into_owned(),
+        access: Default::default(),
         execution_mode: PermissionMode::Read,
         backend_session_id: None,
     };

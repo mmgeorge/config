@@ -1120,10 +1120,16 @@ impl PlanReviewDocument {
                     .and_then(|target| self.target.get(&target.id))
                     .map(|anchor| anchor.line)
                     .unwrap_or(row.len() as u32 + 1);
+                let test = target.and_then(|target| self.target.get(&target.id)).and_then(|anchor| {
+                    match &anchor.target {
+                        super::PlanReviewTarget::TestCase { path, name } => Some(super::DesignTestSelection { file: path.clone(), name: name.clone() }),
+                        _ => None,
+                    }
+                });
                 row.push(
                     serde_json::json!({"id":format!("{}:{}",block.id.0,position), "text":text,
                     "source_line":line, "block":block.id, "position":{"row":position,"column":0},
-                    "target":target.map(|target| &target.id), "metadata":block.metadata}),
+                    "target":target.map(|target| &target.id), "metadata":block.metadata, "test":test}),
                 );
             }
         }

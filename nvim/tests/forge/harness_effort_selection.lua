@@ -40,6 +40,7 @@ assert(#requests == 0 and state.pending_config == nil, "cancelled idle selection
 controller.change_effort(-1)
 settled()
 assert(#requests == 1 and requests[1].params.effort == "low")
+assert(header:find("low", 1, true) and not header:find("*", 1, true), header)
 controller.change_effort(-1)
 settled()
 assert(#requests == 1, "idle configuration overlapped another request")
@@ -57,9 +58,9 @@ controller.change_effort(1)
 controller.change_effort(1)
 controller.configure_service_tier("fast")
 assert(#transition == 3 and state.task_config.effort == "medium" and state.task_config.service_tier == "fast")
-assert(header:find("medium* fast*", 1, true), header)
+assert(header:find("medium* +*", 1, true), header)
 controller.toggle_service_tier("ultrafast")
-assert(state.task_config.service_tier == "ultrafast" and header:find(" ultrafast*", 1, true), header)
+assert(state.task_config.service_tier == "ultrafast" and header:find(" ++*", 1, true), header)
 controller.toggle_service_tier("fast")
 assert(state.task_config.service_tier == "fast", "fast did not replace ultrafast")
 controller.toggle_service_tier("ultrafast")
@@ -74,6 +75,16 @@ state.task[1].status = "paused"
 task.receive(state, { id = latest.params.operation_id, state = "completed" })
 assert(not state.task_config and not state.busy and state.session.effort == "medium")
 assert(not header:find("fast", 1, true))
+state.pending_mode = "write"
+state.pending_config = { model = "other-model", effort = "high", service_tier = "fast" }
+controller.refresh_winbar()
+assert(header:find("Write", 1, true) and header:find("other-model high +", 1, true), header)
+assert(not header:find("*", 1, true), header)
+state.busy = true
+state.pending_config.service_tier = "ultrafast"
+controller.refresh_winbar()
+assert(header:find("other-model high ++", 1, true) and not header:find("*", 1, true), header)
+state.busy, state.pending_mode, state.pending_config = false, nil, nil
 local count = #requests
 state.capability.ultrafast_mode = false
 controller.toggle_service_tier("ultrafast")

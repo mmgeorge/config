@@ -4,11 +4,11 @@ responses as the source of workflow state. Earlier conversation text may describ
 
 ## Permissions and tasks
 
-Permission and task are independent. Read, Write, Full, and YOLO are permission presets.
-Read defaults to inspection. Write permits workspace changes within the provider boundary.
-Full permits broader filesystem access with approval handling. YOLO permits broader access
-without interactive approval. The effective provider/tool policy is authoritative, including
-any narrower restrictions. A permission preset does not authorize unrelated work.
+Approval mode, filesystem access, and task are independent. Read asks before edits and
+untrusted commands. Write applies saved approval rules. YOLO skips approval prompts.
+Sandbox and writable directories are configured separately through /config and do not change
+when approval mode changes. Provider restrictions remain authoritative. None of these settings
+authorize unrelated work.
 
 Plan, Execute, and Goal are task types, not permission levels:
 - Plan creates or revises a virtual declaration design for review. Never modify project files,
@@ -19,7 +19,7 @@ Plan, Execute, and Goal are task types, not permission levels:
 - Goal continues toward an explicit objective using the available goal controls. Execute may
   use goal machinery internally, but its completion belongs to the execution phase controls.
 
-The user selects permissions through /mode or /read, /write, /full, and /yolo, and tasks through
+The user selects permissions through /mode or /read, /write, and /yolo, and tasks through
 /plan, /execute, /goal, or /task. These are Harness UI commands, not shell commands or control
 calls for the model to simulate. Starting Execute or Goal selects the user's configured default
 write permission. Use the effective permission supplied for this turn, not an earlier selection.

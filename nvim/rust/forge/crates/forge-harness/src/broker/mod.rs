@@ -605,6 +605,7 @@ impl HarnessBroker {
                             plan_auto_approve_revisions: preference.as_ref().is_none_or(|value| value.plan_auto_approve_revisions),
                             context_window: None,
                             service_tier: preference.as_ref().map(|value| value.service_tier).unwrap_or_default(),
+                            access: preference.as_ref().map(|value| value.access.clone()).unwrap_or_default(),
                             execution_mode: PermissionMode::Read,
                             current_task_id: None, default_write_permission: preference.as_ref().map_or(PermissionMode::Write, |value| value.default_write_permission), plan_permission: preference.as_ref().and_then(|value| value.plan_permission),
                             created_at_ms: now_ms,
@@ -724,6 +725,7 @@ impl HarnessBroker {
         BackendCatalogRequest {
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
+            access: self.session.access.clone(),
             execution_mode: self.session.execution_mode,
             backend_session_id: self.session.backend_session_id.clone(),
         }
@@ -1160,6 +1162,7 @@ impl HarnessBroker {
             HarnessMethod::PlanAcceptanceBegin => self.begin_plan_acceptance(params),
             HarnessMethod::PlanAcceptanceCancel => self.cancel_plan_acceptance(),
             HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
+            HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
             HarnessMethod::PlanRustdocHover => self.rustdoc_hover(params).await,
             HarnessMethod::PlanRustdocSource => self.rustdoc_source(params).await,
             HarnessMethod::PlanRequestChanges => self.request_plan_changes(params).await,
@@ -1480,7 +1483,7 @@ impl HarnessBroker {
         let Some(mut task) = self.current_task()? else { return Ok(()) };
         if task.status.terminal() || task.status == TaskStatus::Paused { return Ok(()) }
         task.permission = self.session.execution_mode;
-        if task.permission.permits_workspace_write() { task.last_write_permission = task.permission; }
+        if task.permission.is_write_default() { task.last_write_permission = task.permission; }
         if let Some(message) = failure {
             task.status = if self.turn_cancellation.requested.load(Ordering::Acquire) { TaskStatus::Paused } else { TaskStatus::Failed };
             task.reason = Some(message);
@@ -1531,17 +1534,22 @@ impl HarnessBroker {
                 } else { self.session.execution_mode };
                 let task = self.current_task()?;
                 let waiting = task.as_ref().is_some_and(|task| task.status == TaskStatus::Waiting);
-                let resume = action.get("resume").and_then(Value::as_bool).unwrap_or(false)
-                    && task.as_ref().is_none_or(|task| task.kind == TaskKind::Plan || permission.permits_workspace_write());
+                let resume = action.get("resume").and_then(Value::as_bool).unwrap_or(false);
                 self.pause_task(false).await?;
                 match command.as_str() {
                     "configure" => { self.configure_session(action.get("config").cloned().context("configuration is required")?).await?; },
                     "compact" => { self.compact_session().await?; },
                     _ => { self.select_execution_mode(json!({"mode":permission}))?; },
                 }
+                self.emit_backend_event(BackendEvent {
+                    address: None, turn_boundary: None, kind: "configuration_applied".into(),
+                    text: None, data: json!({"session":self.session,"operation_id":self.active_operation_id,
+                        "catalog":self.backend_catalog_request()}),
+                    activity: None, summary: None, task_update: None,
+                }, &mut Vec::new()).await?;
                 if let Some(mut task) = self.current_task()? {
                     task.permission = permission;
-                    if permission.permits_workspace_write() { task.last_write_permission = permission; }
+                    if permission.is_write_default() { task.last_write_permission = permission; }
                     if waiting {
                         task.status = TaskStatus::Waiting;
                         self.session.active_plan_id = task.plan_id.clone();
@@ -1552,7 +1560,7 @@ impl HarnessBroker {
                     if resume {
                         let reason = match command.as_str() {
                             "permission" => format!("Permission changed to {}", permission.label()),
-                            "configure" => "Model settings changed".into(),
+                            "configure" => "Configuration changed".into(),
                             _ => "Context compacted".into(),
                         };
                         return Box::pin(self.transition_task(json!({"action":"resume","task_id":task.id,"reason":reason}))).await;
@@ -1583,7 +1591,7 @@ impl HarnessBroker {
                 self.session.current_task_id = Some(task.id.clone());
                 self.session.active_plan_id = task.plan_id.clone();
                 self.session.goal_id = task.goal_id.clone();
-                self.select_execution_mode(json!({"mode": if task.kind == TaskKind::Plan { task.permission } else { task.last_write_permission }}))?;
+                self.select_execution_mode(json!({"mode": task.permission}))?;
                 task.begin(self.clock.now_ms())?;
                 task.operation_id = self.active_operation_id.clone();
                 self.store.save_task(&task)?;
@@ -2333,9 +2341,6 @@ impl HarnessBroker {
         }
         if text == "/write" {
             return self.select_execution_mode(json!({ "mode": "write" }));
-        }
-        if text == "/full" {
-            return self.select_execution_mode(json!({ "mode": "full" }));
         }
         if text == "/yolo" {
             return self.select_execution_mode(json!({ "mode": "yolo" }));
@@ -5085,6 +5090,40 @@ Planning continuation: turn {} of {}.",
         ))
     }
 
+    fn delete_plan_tests(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let plan_id = required_text(&params, "plan_id")?;
+        let expected_digest = required_text(&params, "digest")?;
+        let expected_version = params.get("expected_version").and_then(Value::as_u64).context("test deletion requires the reviewed plan version")?;
+        let selected: Vec<crate::plan::DesignTestSelection> = serde_json::from_value(params.get("tests").cloned().context("test selection is missing")?)?;
+        let mut plan = self.store.load_plan(&plan_id)?.context("plan record is missing")?;
+        anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
+        anyhow::ensure!(plan.state == PlanState::AwaitingReview, "only plans awaiting review can have tests deleted");
+        anyhow::ensure!(plan.review_digest.as_deref() == Some(&expected_digest), "plan changed before test deletion");
+        let revision = plan.model_revision.saturating_add(1);
+        let (document, rendered, checksum) = self.plan_file.remove_tests(&self.session.id, &plan.id, revision,
+            expected_version, &expected_digest, &selected)?;
+        plan.model_revision = revision;
+        plan.user_revision = plan.user_revision.saturating_add(1);
+        plan.document_version = document.version;
+        plan.submitted_version = Some(document.version);
+        plan.review_digest = Some(checksum);
+        plan.acceptance = None;
+        plan.updated_at_ms = self.clock.now_ms();
+        self.store.save_plan(&plan)?;
+        self.session.active_plan_id = Some(plan.id.clone());
+        self.save_session()?;
+        let lifecycle = PlanLifecycleRecord {
+            title: plan.title.clone(), anchor: Some(self.plan_exchange_anchor(&plan.id)?),
+            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), plan_id: plan.id.clone(),
+            kind: PlanLifecycleKind::RevisionCreated, model_revision: plan.model_revision, user_revision: plan.user_revision,
+            overall_comment: Some(format!("Removed {} planned tests", selected.len())), annotation: Vec::new(),
+            question: None, answer: None, created_at_ms: self.clock.now_ms(),
+        };
+        self.store.save_plan_lifecycle(&lifecycle)?;
+        let payload = json!({ "plan": plan, "lifecycle": lifecycle, "content": rendered.markdown, "document": document });
+        Ok((payload.clone(), vec![self.event("plan_tests_deleted", payload)?]))
+    }
+
     fn rename_plan_entity(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let plan_id = params
             .get("plan_id")
@@ -6366,13 +6405,21 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn configure_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let mut configured = self.session.clone();
+        let access = params.get("access")
+            .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
+            .transpose()?.map(crate::session::AccessPolicy::validate).transpose()?;
+        if access.is_some() {
+            anyhow::ensure!(self.session.backend == "codex" || self.session.backend == "mock",
+                "current backend does not support sandbox configuration");
+        }
         if let Some(value) = params.get("default_write_permission") {
             let permission: PermissionMode = serde_json::from_value(value.clone())?;
-            anyhow::ensure!(permission.permits_workspace_write(), "default write permission must be Write, Full, or YOLO");
-            self.session.default_write_permission = permission;
+            anyhow::ensure!(permission.is_write_default(), "default write permission must be Write or YOLO");
+            configured.default_write_permission = permission;
         }
         if let Some(value) = params.get("plan_permission") {
-            self.session.plan_permission = serde_json::from_value(value.clone())?;
+            configured.plan_permission = serde_json::from_value(value.clone())?;
         }
         let requested_service_tier = params.get("service_tier")
             .map(|value| serde_json::from_value::<crate::backend::ServiceTier>(value.clone()))
@@ -6483,26 +6530,28 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         if let Some(model) = params.get("model").and_then(Value::as_str) {
             anyhow::ensure!(!model.trim().is_empty(), "model cannot be empty");
-            self.session.model = model.to_owned();
-            self.session.resolved_model = (model != "default").then(|| model.to_owned());
+            configured.model = model.to_owned();
+            configured.resolved_model = (model != "default").then(|| model.to_owned());
         }
         if let Some(effort) = params.get("effort").and_then(Value::as_str) {
             anyhow::ensure!(!effort.trim().is_empty(), "effort cannot be empty");
-            self.session.effort = effort.to_owned();
+            configured.effort = effort.to_owned();
         }
         if params.get("context_window").is_some() {
-            self.session.context_window = params
+            configured.context_window = params
                 .get("context_window")
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
         if let Some(service_tier) = requested_service_tier {
-            self.session.service_tier = service_tier;
+            configured.service_tier = service_tier;
         }
-        self.session.plan_executor = plan_executor;
-        self.session.plan_compact = plan_compact;
-        if let Some(enabled) = params.get("plan_auto_approve_revisions").and_then(Value::as_bool) { self.session.plan_auto_approve_revisions = enabled; }
-        self.save_session()?;
+        configured.plan_executor = plan_executor;
+        configured.plan_compact = plan_compact;
+        if let Some(enabled) = params.get("plan_auto_approve_revisions").and_then(Value::as_bool) { configured.plan_auto_approve_revisions = enabled; }
+        if let Some(access) = access { configured.access = access; }
+        let previous = std::mem::replace(&mut self.session, configured);
+        if let Err(error) = self.save_session() { self.session = previous; return Err(error); }
         let update_model_preference = requested_model.is_some()
             || requested_effort.is_some()
             || params.get("context_window").is_some();
@@ -6604,7 +6653,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             effort: self.session.effort.clone(),
             context_window: self.session.context_window.clone(),
             service_tier: self.session.service_tier,
-            execution_mode: if matches!(mode,PromptMode::Plan | PromptMode::PlanDiscussion | PromptMode::PlanQuestion) { PermissionMode::Read } else { self.session.execution_mode },
+            access: self.session.access.clone(),
+            execution_mode: self.session.execution_mode,
             backend_session_id: self.session.backend_session_id.clone(),
             control_context: self.control_turn_context(mode),
         }
@@ -6804,6 +6854,8 @@ fn preference_for_session(
         },
     );
     HarnessPreference {
+        access: session.access.clone(),
+
         default_write_permission: session.default_write_permission,
         plan_permission: session.plan_permission,
         model: session.model.clone(),
@@ -6892,6 +6944,32 @@ fn default_goal_max_turns() -> u32 {
 #[cfg(test)]
 mod test {
     #[tokio::test]
+    async fn access_configuration_is_atomic_persistent_and_independent_of_approvals() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let writable = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let policy = crate::session::AccessPolicy {
+            sandbox: false,
+            writable_directory: vec![writable.path().to_string_lossy().into_owned()],
+            ..Default::default()
+        };
+        broker.configure_session(json!({"access":policy})).await.unwrap();
+        let stored = broker.store.load_session(&broker.session.id).unwrap().unwrap();
+        assert!(!stored.access.sandbox);
+        assert_eq!(stored.access.writable_directory.len(), 1);
+        assert_eq!(stored.execution_mode, PermissionMode::Read);
+        let preference = broker.store.load_preference(&stored.workspace, &stored.backend).unwrap().unwrap();
+        assert_eq!(preference.access, stored.access);
+        broker.select_execution_mode(json!({"mode":"yolo"})).unwrap();
+        assert_eq!(broker.session.access, stored.access);
+        assert!(broker.configure_session(json!({"default_write_permission":"yolo","effort":""})).await.is_err());
+        assert_eq!(broker.session.default_write_permission, PermissionMode::Write);
+        assert!(broker.configure_session(json!({"access":{"sandbox":true,"write_access":"workspace","writable_directory":["relative"],"windows_sandbox":"elevated"}})).await.is_err());
+        assert_eq!(broker.session.access, stored.access);
+    }
+
+    #[tokio::test]
     async fn task_switch_retains_paused_history_and_clear_does_not_destroy_it() {
         use crate::task::{TaskKind, TaskStatus};
         let repository = repository();
@@ -6920,11 +6998,11 @@ mod test {
         let goal = broker.create_goal("Persist goal".into(), false).unwrap();
         broker.create_task(TaskKind::Goal, goal.objective.clone(), None, Some(goal.id)).unwrap();
         broker.pause_task(false).await.unwrap();
-        broker.transition_task(json!({"action":"permission","mode":"full"})).await.unwrap();
+        broker.transition_task(json!({"action":"permission","mode":"write"})).await.unwrap();
         let task = broker.current_task().unwrap().unwrap();
         assert_eq!(task.status, TaskStatus::Paused);
-        assert_eq!(task.permission, PermissionMode::Full);
-        assert_eq!(task.last_write_permission, PermissionMode::Full);
+        assert_eq!(task.permission, PermissionMode::Write);
+        assert_eq!(task.last_write_permission, PermissionMode::Write);
         assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
     }
 
@@ -6969,6 +7047,89 @@ mod test {
 
 
     use super::*;
+
+    #[tokio::test]
+    async fn deleting_selected_plan_tests_preserves_other_cases_and_rejects_stale_confirmation() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let result = broker.dispatch(Request { id: 1, method: "prompt.submit".into(),
+            params: json!({"text":"/plan add test coverage"}) }).await;
+        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        let mut plan = broker.snapshot().unwrap().active_plan.unwrap();
+        let mut document = broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap();
+        document.design.as_mut().unwrap().document.tests = serde_json::from_value(json!([
+            {"file":"src/game.rs","cases":[
+                {"name":"first","change":"new","description":"First expected result"},
+                {"name":"second","change":"new","description":"Second expected result"}]},
+            {"file":"tests/game.rs","cases":[
+                {"name":"first","change":"new","description":"Separate file"},
+                {"name":"fourth","change":"modified","description":"Fourth result"},
+                {"name":"keep","change":"reused","description":"Existing coverage"}]}
+        ])).unwrap();
+        let (_, _, checksum) = broker.plan_file.submit_validated_document_revision(&broker.session.id,
+            &plan.id, plan.model_revision, document.version, document.clone()).unwrap();
+        plan.review_digest = Some(checksum.clone());
+        broker.store.save_plan(&plan).unwrap();
+        let source = broker.capture_plan_review(&plan.id, &checksum).unwrap();
+        let review = crate::plan::review_document::PlanReviewDocument::new(
+            forge_buffer::identity::DocumentId("delete-tests".into()), forge_buffer::identity::ViewId("view".into()),
+            source, Default::default(), None).unwrap();
+        let store = crate::plan::review_document::PlanReviewStore::default();
+        let admission = store.admit(forge_buffer::identity::DocumentId("delete-tests".into())).unwrap();
+        let opened = store.insert(review, admission).unwrap();
+        assert!(opened["source_row"].as_array().unwrap().iter().any(|row| row["test"]["name"] == "fourth"));
+        let mut annotation = Vec::new();
+        for name in ["keep", "fourth"] {
+            let line = opened["source_row"].as_array().unwrap().iter()
+                .find(|row| row["test"]["name"] == name).unwrap()["source_line"].as_u64().unwrap() as u32;
+            annotation.push(crate::plan::ReviewAnnotation {
+                id: name.into(), parent_id: None,
+                source: crate::plan::PlanAnnotationInput { start_line: line, end_line: line, body: format!("Review {name}") },
+                anchor: None, kind: crate::plan::ReviewAnnotationKind::Comment, reply: None,
+            });
+        }
+        store.save_annotations(&forge_buffer::identity::DocumentId("delete-tests".into()),
+            opened["saved_source_digest"].as_str().unwrap(), annotation).unwrap();
+        let selected = json!([
+            {"file":"src/game.rs","name":"first"}, {"file":"src/game.rs","name":"second"},
+            {"file":"tests/game.rs","name":"first"}, {"file":"tests/game.rs","name":"fourth"}
+        ]);
+        let params = json!({"plan_id":plan.id,"digest":checksum,"expected_version":document.version,"tests":selected});
+        let mut invalid = params.clone();
+        invalid["tests"][3]["name"] = json!("missing");
+        assert!(broker.delete_plan_tests(invalid).is_err());
+        assert_eq!(broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap(), document);
+        let (result, _) = broker.delete_plan_tests(params.clone()).unwrap();
+        let updated = broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap();
+        let tests = &updated.design.as_ref().unwrap().document.tests;
+        assert_eq!(tests.len(), 1);
+        assert_eq!(tests[0].file, "tests/game.rs");
+        assert_eq!(tests[0].cases.len(), 1);
+        assert_eq!(tests[0].cases[0].name, "keep");
+        assert_eq!(document.design.as_ref().unwrap().proposed, updated.design.as_ref().unwrap().proposed);
+        assert_eq!(updated.version, document.version + 1);
+        assert_eq!(result["plan"]["model_revision"], plan.model_revision + 1);
+        assert!(broker.delete_plan_tests(params).unwrap_err().to_string().contains("plan changed"));
+        assert_eq!(broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap(), updated);
+        let reopened: PlanRecord = serde_json::from_value(result["plan"].clone()).unwrap();
+        let source = broker.capture_plan_review(&plan.id, reopened.review_digest.as_deref().unwrap()).unwrap();
+        assert!(source.rendered.markdown.contains("keep"));
+        let review = crate::plan::review_document::PlanReviewDocument::new(
+            forge_buffer::identity::DocumentId("after-delete".into()), forge_buffer::identity::ViewId("after-view".into()),
+            source, Default::default(), None).unwrap();
+        let admission = store.admit(forge_buffer::identity::DocumentId("after-delete".into())).unwrap();
+        let opened = store.insert(review, admission).unwrap();
+        assert_eq!(opened["annotation"].as_array().unwrap().len(), 1);
+        assert_eq!(opened["annotation"][0]["id"], "keep");
+        let line = opened["annotation"][0]["source"]["start_line"].as_u64().unwrap();
+        assert!(opened["source_row"].as_array().unwrap().iter().any(|row| row["source_line"] == line && row["test"]["name"] == "keep"));
+        assert!(!repository.path().join("src/game.rs").exists());
+        broker.delete_plan_tests(json!({"plan_id":plan.id,"digest":reopened.review_digest,
+            "expected_version":updated.version,"tests":[{"file":"tests/game.rs","name":"keep"}]})).unwrap();
+        assert!(broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap()
+            .design.unwrap().document.tests.is_empty());
+    }
 
     #[tokio::test]
     async fn declaration_design_acceptance_executes_verifies_resolves_and_completes() {
@@ -8907,6 +9068,7 @@ mod test {
             plan_auto_approve_revisions: true,
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
+            access: Default::default(),
             execution_mode: PermissionMode::Read,
             current_task_id: None, default_write_permission: PermissionMode::Write, plan_permission: None,
             created_at_ms: 0,
@@ -8934,6 +9096,7 @@ mod test {
         let preference = preference_for_session(
             &session,
             Some(HarnessPreference {
+                access: Default::default(),
                 default_write_permission: PermissionMode::Write,
                 plan_permission: None,
                 model: "other-model".into(),
@@ -9977,7 +10140,7 @@ mod test {
             .dispatch(Request {
                 id: 0,
                 method: "session.execution_mode".into(),
-                params: json!({ "mode": "full" }),
+                params: json!({ "mode": "write" }),
             })
             .await;
         let prompt = source
@@ -10224,7 +10387,7 @@ mod test {
             .dispatch(Request {
                 id: 21,
                 method: "session.execution_mode".into(),
-                params: json!({ "mode": "full" }),
+                params: json!({ "mode": "write" }),
             })
             .await;
         assert!(selected.response.error().is_none());
@@ -10274,7 +10437,7 @@ mod test {
         assert_eq!(restarted.session.model, "gpt-5.6");
         assert_eq!(restarted.session.effort, "low");
         assert_eq!(restarted.session.service_tier, crate::backend::ServiceTier::Ultrafast);
-        assert_eq!(restarted.session.execution_mode, PermissionMode::Full);
+        assert_eq!(restarted.session.execution_mode, PermissionMode::Write);
         assert!(
             !restarted
                 .snapshot()
@@ -10851,7 +11014,7 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let mut broker = planning_question_broker(repository.path(), data.path(), structured);
-            broker.session.execution_mode = PermissionMode::Full;
+            broker.session.execution_mode = PermissionMode::Write;
             let planned = broker.dispatch(Request { id:1, method:"prompt.submit".into(),
                 params:json!({"text":"/plan migrate"}) }).await;
             assert!(planned.response.error().is_none());
@@ -10861,7 +11024,7 @@ mod test {
             assert!(cancelled.response.error().is_none());
             let snapshot = broker.snapshot().unwrap();
             assert!(snapshot.active_plan.is_none());
-            assert_eq!(broker.session.execution_mode, PermissionMode::Full);
+            assert_eq!(broker.session.execution_mode, PermissionMode::Write);
             assert!(snapshot.active_elicitation.is_none());
             assert!(!snapshot.timeline.iter().any(|entry| matches!(entry, TimelineEntry::Status { .. })));
             assert!(broker.store.list_exchange(&broker.session.id).unwrap().iter()
