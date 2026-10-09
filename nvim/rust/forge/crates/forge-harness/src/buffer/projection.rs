@@ -1382,11 +1382,10 @@ fn truncate_to_cells(width: &WidthProfile, text: &str, max_cells: usize) -> Resu
     Ok(truncated)
 }
 
-fn token_display(tokens: Option<u64>) -> String {
+fn token_display(tokens: u64) -> String {
     match tokens {
-        Some(tokens) if tokens >= 1000 => format!("{:.1}k", tokens as f64 / 1000.0),
-        Some(tokens) => tokens.to_string(),
-        None => "—".into(),
+        tokens if tokens >= 1000 => format!("{:.1}k", tokens as f64 / 1000.0),
+        tokens => tokens.to_string(),
     }
 }
 
@@ -1425,22 +1424,35 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
         "▸ {}{activity} {duration}s",
         history_prefix(interaction.disposition)
     );
-    let tools = interaction.metrics.tool_ms(interaction.elapsed(now_ms))
-        .map(super::duration::duration_label)
-        .unwrap_or_else(|| "—s".into());
+    let count: usize = interaction.turn.iter().map(|turn| turn.tools().count()).sum();
+    if count > 0
+        && let Some(duration) = interaction.metrics.tool_ms(interaction.elapsed(now_ms)) {
+        summary.push_str(&format!(" ({} tools)", super::duration::duration_label(duration)));
+    }
+    let mut sections = vec![summary];
     let usage = interaction.usage();
-    let cached = usage.cached_percent().map(|percent| format!("{percent}%"))
-        .unwrap_or_else(|| "—".into());
-    let throughput = interaction.metrics.reported_output_tokens
+    if let Some((tokens, duration)) = interaction.metrics.reported_output_tokens
         .zip(interaction.metrics.reported_response_ms)
-        .filter(|(_, duration)| *duration > 0 && interaction.metrics.timing_complete)
-        .map(|(tokens, duration)| format!("~{:.0}", tokens as f64 * 1000.0 / duration as f64))
-        .unwrap_or_else(|| "—".into());
-    summary.push_str(&format!(
-        " ({tools} tools) │ {throughput} tok/s │ I {} ({cached}) · R {} · O {} │ {} req",
-        token_display(usage.input), token_display(usage.reasoning),
-        token_display(usage.non_reasoning_output()), interaction.metrics.request_count,
-    ));
+        .filter(|(tokens, duration)| *tokens > 0 && *duration > 0 && interaction.metrics.timing_complete) {
+        sections.push(format!("~{:.0} tok/s", tokens as f64 * 1000.0 / duration as f64));
+    }
+    let mut tokens = Vec::new();
+    if let Some(input) = usage.input {
+        let mut text = format!("I {}", token_display(input));
+        if let Some(percent) = usage.cached_percent() {
+            text.push_str(&format!(" ({percent}%)"));
+        }
+        tokens.push(text);
+    }
+    if let Some(reasoning) = usage.reasoning {
+        tokens.push(format!("R {}", token_display(reasoning)));
+    }
+    if let Some(output) = usage.non_reasoning_output() {
+        tokens.push(format!("O {}", token_display(output)));
+    }
+    if !tokens.is_empty() {
+        sections.push(tokens.join(" · "));
+    }
     let spawned = interaction
         .node_list
         .iter()
@@ -1450,33 +1462,33 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
         })
         .collect::<std::collections::HashSet<_>>()
         .len() as u64;
-    let count: usize = interaction
-        .turn
-        .iter()
-        .map(|turn| turn.tools().count())
-        .sum();
     let failed = interaction
         .turn
         .iter()
         .flat_map(|turn| turn.tools())
         .filter(|tool| tool.failed)
         .count();
-    {
-        summary.push_str(&format!(
-            " · {count} {}",
-            if count == 1 { "tool" } else { "tools" }
-        ));
+    let mut counts = Vec::new();
+    if interaction.metrics.request_count > 0 {
+        counts.push(format!("{} req", interaction.metrics.request_count));
+    }
+    if count > 0 {
+        let mut tools = format!("{count} {}", if count == 1 { "tool" } else { "tools" });
         if failed > 0 {
-            summary.push_str(&format!(" ({failed} failed)"));
+            tools.push_str(&format!(" ({failed} failed)"));
         }
+        counts.push(tools);
     }
+    let mut activity = counts.join(" · ");
     if spawned > 0 {
-        let count = spawned;
-        summary.push_str(&format!(
-            ", {count} {} spawned",
-            if count == 1 { "agent" } else { "agents" }
+        if !activity.is_empty() { activity.push_str(", "); }
+        activity.push_str(&format!(
+            "{spawned} {} spawned",
+            if spawned == 1 { "agent" } else { "agents" }
         ));
     }
+    if !activity.is_empty() { sections.push(activity); }
+    let mut summary = sections.join(" │ ");
     if let Some(error) = &interaction.finalization_error {
         summary.push_str(&format!(" — {}", error.replace(['\n', '\r'], " ")));
     }
@@ -2819,7 +2831,7 @@ mod tests {
                 exchange.finish(state, 4000).unwrap();
                 assert_eq!(
                     super::exchange_activity_summary(&exchange, 90_000),
-                    format!("▸ {label} 3s (0ms tools) │ — tok/s │ I — (—) · R — · O — │ 0 req · 0 tools")
+                    format!("▸ {label} 3s")
                 );
             }
         }
@@ -2848,13 +2860,13 @@ mod tests {
             for now in [4000, 90_000] {
                 assert_eq!(
                     super::exchange_activity_summary(&exchange, now),
-                    format!("▸ {paused} 3s (0ms tools) │ — tok/s │ I — (—) · R — · O — │ 0 req · 0 tools")
+                    format!("▸ {paused} 3s")
                 );
             }
             exchange.resume(90_000).unwrap();
             assert_eq!(
                 super::exchange_activity_summary(&exchange, 92_000),
-                format!("▸ {running} 5s (0ms tools) │ — tok/s │ I — (—) · R — · O — │ 0 req · 0 tools")
+                format!("▸ {running} 5s")
             );
         }
     }
@@ -2890,7 +2902,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 summary.text.wire_rows().join("").split_whitespace().collect::<Vec<_>>().join(" "),
-                format!("▸ {marker} · Failed 3s (0ms tools) │ — tok/s │ I — (—) · R — · O — │ 0 req · 0 tools")
+                format!("▸ {marker} · Failed 3s")
             );
             assert_eq!(exchange.state, ExchangeState::Failed);
             assert_eq!(exchange.elapsed(90_000), 3000);
@@ -2996,7 +3008,7 @@ mod tests {
         exchange.metrics.timing_complete = false;
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "▸ Thought 3s (—s tools) │ — tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)"
+            "▸ Thought 3s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)"
         );
     }
 
@@ -3019,13 +3031,43 @@ mod tests {
         };
         exchange.observe_turn(&event, 3000).unwrap();
         assert_eq!(super::exchange_activity_summary(&exchange, 4000),
-            "▸ Thinking 3s (0ms tools) │ ~50 tok/s │ I 1.0k (90%) · R 40 · O 60 │ 1 req · 0 tools");
+            "▸ Thinking 3s │ ~50 tok/s │ I 1.0k (90%) · R 40 · O 60 │ 1 req");
         exchange.observe_turn(&event, 6000).unwrap();
         assert!(super::exchange_activity_summary(&exchange, 6000).contains("~50 tok/s"));
         event.data["id"] = json!("second");
         exchange.observe_turn(&event, 6000).unwrap();
         assert_eq!(super::exchange_activity_summary(&exchange, 9000),
-            "▸ Thinking 8s (0ms tools) │ ~40 tok/s │ I 2.0k (90%) · R 80 · O 120 │ 2 req · 0 tools");
+            "▸ Thinking 8s │ ~40 tok/s │ I 2.0k (90%) · R 80 · O 120 │ 2 req");
+    }
+
+    #[test]
+    fn summary_omits_missing_usage_and_preserves_reported_zeroes() {
+        use crate::backend::{BackendEvent, ProviderAddress};
+        let mut original: Exchange = serde_json::from_value(json!({
+            "id":"partial", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Work", "kind":"chat", "state":"running", "created_at_ms":1000,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        })).unwrap();
+        original.resume(1000).unwrap();
+        let address = ProviderAddress { thread_id: "parent".into(), turn_id: "turn".into() };
+        original.start_turn(address.clone(), 1000).unwrap();
+        assert_eq!(super::exchange_activity_summary(&original, 4000), "▸ Thinking 3s");
+        for (usage, expected) in [
+            (json!({}), "▸ Thinking 3s │ 1 req"),
+            (json!({"input":1000,"output":100}), "▸ Thinking 3s │ ~50 tok/s │ I 1.0k │ 1 req"),
+            (json!({"reasoning":23}), "▸ Thinking 3s │ R 23 │ 1 req"),
+            (json!({"input":1000,"cached_input":0,"reasoning":0,"output":0}),
+                "▸ Thinking 3s │ I 1.0k (0%) · R 0 · O 0 │ 1 req"),
+        ] {
+            let mut exchange = original.clone();
+            let event = BackendEvent {
+                address: Some(address.clone()), turn_boundary: None, kind: "usage".into(), text: None,
+                data: json!({"id":"first", "usage":usage, "cumulative":null,"cumulative_total":null}),
+                activity: None, summary: None, task_update: None,
+            };
+            exchange.observe_turn(&event, 3000).unwrap();
+            assert_eq!(super::exchange_activity_summary(&exchange, 4000), expected);
+        }
     }
 
     #[test]
@@ -3040,7 +3082,7 @@ mod tests {
         interaction.resume(1000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 4200),
-            "▸ Planning 3s (0ms tools) │ — tok/s │ I — (—) · R — · O — │ 0 req · 0 tools"
+            "▸ Planning 3s"
         );
         interaction.pause(5500);
         interaction
@@ -3071,7 +3113,7 @@ mod tests {
         interaction.awaiting_input = true;
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "▸ Planning paused 4s (0ms tools) │ — tok/s │ I 1.0k (90%) · R 200 · O 80 │ 0 req · 0 tools"
+            "▸ Planning paused 4s │ I 1.0k (90%) · R 200 · O 80"
         );
         interaction.kind = ExchangeKind::Chat;
         interaction
@@ -3079,7 +3121,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "▸ Thought 4s (0ms tools) │ — tok/s │ I 1.0k (90%) · R 200 · O 80 │ 0 req · 0 tools"
+            "▸ Thought 4s │ I 1.0k (90%) · R 200 · O 80"
         );
     }
 }

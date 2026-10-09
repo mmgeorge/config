@@ -880,9 +880,9 @@ mod tests {
         for path in ["objective", "usage", "requirements", "background", "decisions", "design", "verification/automated", "verification/manual", "tests"] {
             assert!(rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == format!("/design/document/{path}")));
         }
-        for field in ["objective", "background", "design", "requirements"] {
+        for field in ["objective", "background", "design"] {
             let mut invalid = metadata.clone();
-            invalid[field] = if field == "requirements" { serde_json::json!([]) } else { serde_json::json!("") };
+            invalid[field] = serde_json::json!("");
             let incomplete = empty.patch(workspace.path(), &Default::default(), &replace(&empty, &invalid)).unwrap();
             assert!(incomplete.document.validate_for_submission().is_err(), "{field}");
         }
@@ -916,13 +916,15 @@ mod tests {
         revised_metadata.as_object_mut().unwrap().remove("usage");
         revised_metadata["decisions"] = serde_json::json!([]);
         revised_metadata["tests"][0]["cases"][0]["change"] = serde_json::json!("reused");
-        revised_metadata["requirements"] = serde_json::json!(["Cancellation preserves the published texture and reports its terminal state."]);
+        revised_metadata["requirements"] = serde_json::json!([]);
         document.design = Some(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &revised_metadata)).unwrap());
         document.version += 1;
         store.write_working_document("session", "specification", &document).unwrap();
         let (_, rendered, _) = store.submit_document_revision("session", "specification", 2, document.version).unwrap();
-        assert!(!rendered.markdown.lines().any(|line| matches!(line, "Usage:" | "Decisions:")));
+        assert!(!rendered.markdown.lines().any(|line| matches!(line, "Usage:" | "Requirements:" | "Decisions:")));
+        assert!(!rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == "/design/document/requirements"));
         let current = store.read_submitted_document("session", "specification", 2).unwrap();
+        assert!(current.design.as_ref().unwrap().document.requirements.is_empty());
         let delta = crate::plan::revision::DeclarationDelta::between(Some(&original), &current).unwrap();
         assert!(delta.files.is_empty());
         assert!(delta.document.contains("a/Usage b/Usage") && delta.document.contains("a/Decisions b/Decisions"));

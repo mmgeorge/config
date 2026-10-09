@@ -62,10 +62,9 @@ function M.foldtext(line)
 end
 
 --- Formats a numeric token count as an abbreviated string.
----@param value number? Numeric token count.
----@return string formatted Formatted token count or unavailable marker.
+---@param value number Numeric token count.
+---@return string formatted Formatted token count.
 local function format_token_count(value)
-  if type(value) ~= "number" then return "—" end
   if value >= 1000 then return ("%.1fk"):format(value / 1000) end
   return tostring(value)
 end
@@ -86,7 +85,7 @@ local function format_exchange_usage(interaction, metrics)
     end
     if available then totals[field] = total end
   end
-  local cached = "—"
+  local cached
   if totals.input and totals.input > 0 and totals.cached_input and totals.cached_input <= totals.input then
     cached = ("%d%%"):format(math.floor(totals.cached_input / totals.input * 100 + 0.5))
   end
@@ -94,13 +93,20 @@ local function format_exchange_usage(interaction, metrics)
   if totals.output and totals.reasoning and totals.output >= totals.reasoning then
     output = totals.output - totals.reasoning
   end
-  local throughput = "—"
+  local sections = {}
   if metrics.timing_complete and type(metrics.reported_output_tokens) == "number"
+    and metrics.reported_output_tokens > 0
     and type(metrics.reported_response_ms) == "number" and metrics.reported_response_ms > 0 then
-    throughput = ("~%.0f"):format(math.floor(metrics.reported_output_tokens * 1000 / metrics.reported_response_ms + 0.5))
+    sections[#sections + 1] = ("~%.0f tok/s"):format(math.floor(metrics.reported_output_tokens * 1000 / metrics.reported_response_ms + 0.5))
   end
-  return ("%s tok/s │ I %s (%s) · R %s · O %s"):format(
-    throughput, format_token_count(totals.input), cached, format_token_count(totals.reasoning), format_token_count(output))
+  local tokens = {}
+  if totals.input then
+    tokens[#tokens + 1] = "I " .. format_token_count(totals.input) .. (cached and " (" .. cached .. ")" or "")
+  end
+  if totals.reasoning then tokens[#tokens + 1] = "R " .. format_token_count(totals.reasoning) end
+  if output then tokens[#tokens + 1] = "O " .. format_token_count(output) end
+  if #tokens > 0 then sections[#sections + 1] = table.concat(tokens, " · ") end
+  return table.concat(sections, " │ ")
 end
 
 --- Formats a concise summary of tool execution counts and failure metrics.
@@ -576,8 +582,8 @@ local function append_exchange_summary(result, interaction, options)
   end
   local duration = math.floor(duration_ms / 1000)
   local metrics = interaction.metrics or {}
-  local tools = "—s"
-  if metrics.timing_complete then
+  local tools
+  if tool_count > 0 and metrics.timing_complete then
     local elapsed = metrics.tool_duration_ms or 0
     if type(metrics.tool_started_ms) == "number" then
       elapsed = elapsed + math.max(0, duration_ms - metrics.tool_started_ms)
@@ -597,14 +603,26 @@ local function append_exchange_summary(result, interaction, options)
   local history = { rolled_back = "Rolled back · ", superseded = "Superseded · " }
   local key = ("exchange:%s"):format(interaction.id or interaction.ordinal)
   local expanded = not complete or result.expanded[key] == true
-  local summary = ("%s %s%s %ds (%s tools) │ %s │ %d req · %d %s"):format(
-    expanded and "▾" or "▸", history[interaction.disposition] or "", verb, duration, tools,
-    format_exchange_usage(interaction, metrics), metrics.request_count or 0,
-    tool_count, tool_count == 1 and "tool" or "tools")
-  if failed_count > 0 then summary = summary .. (" (%d failed)"):format(failed_count) end
-  if agent_count > 0 then
-    summary = summary .. (", %d %s spawned"):format(agent_count, agent_count == 1 and "agent" or "agents")
+  local summary = ("%s %s%s %ds"):format(
+    expanded and "▾" or "▸", history[interaction.disposition] or "", verb, duration)
+  if tools then summary = summary .. (" (%s tools)"):format(tools) end
+  local sections = { summary }
+  local usage = format_exchange_usage(interaction, metrics)
+  if usage ~= "" then sections[#sections + 1] = usage end
+  local counts = {}
+  if (metrics.request_count or 0) > 0 then counts[#counts + 1] = ("%d req"):format(metrics.request_count) end
+  if tool_count > 0 then
+    local tools_label = ("%d %s"):format(tool_count, tool_count == 1 and "tool" or "tools")
+    if failed_count > 0 then tools_label = tools_label .. (" (%d failed)"):format(failed_count) end
+    counts[#counts + 1] = tools_label
   end
+  local activity = table.concat(counts, " · ")
+  if agent_count > 0 then
+    activity = activity .. (activity ~= "" and ", " or "")
+      .. ("%d %s spawned"):format(agent_count, agent_count == 1 and "agent" or "agents")
+  end
+  if activity ~= "" then sections[#sections + 1] = activity end
+  summary = table.concat(sections, " │ ")
   if type(interaction.finalization_error) == "string" then
     summary = summary .. " — " .. interaction.finalization_error:gsub("[\r\n]", " ")
   end

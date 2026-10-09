@@ -53,10 +53,10 @@ local ok, failure = pcall(function()
   exchange.metrics.reported_output_tokens = 4300
   assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1433 tok/s │ I 80.0k (86%) · R 3.0k · O 1.3k │ 2 req · 1 tool (1 failed)")
   exchange.turn[2].usage.reasoning = vim.NIL
-  assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1433 tok/s │ I 80.0k (86%) · R — · O — │ 2 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1433 tok/s │ I 80.0k (86%) │ 2 req · 1 tool (1 failed)")
   exchange.turn[2].usage = vim.NIL
   exchange.metrics.timing_complete = false
-  assert_equals(summary(), "▸ Thought 6s (—s tools) │ — tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 2 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 2 req · 1 tool (1 failed)")
   exchange.state = "running"
   exchange.completed_at_ms = vim.NIL
   exchange.execution_started_at_ms = 10000
@@ -67,7 +67,24 @@ local ok, failure = pcall(function()
   exchange.execution_started_at_ms = vim.NIL
   assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s (3s tools) │ ~1433 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 2 req · 1 tool (1 failed)")
   exchange.metrics.request_count = 0
-  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s (3s tools) │ ~1433 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 0 req · 1 tool (1 failed)")
+  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s (3s tools) │ ~1433 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 tool (1 failed)")
+  exchange.metrics = { timing_complete = true, request_count = 0 }
+  exchange.turn = {}
+  assert_equals(summary(), "▾ Paused 6s")
+  exchange.metrics.request_count = 1
+  assert_equals(summary(), "▾ Paused 6s │ 1 req")
+  exchange.turn = { { id = "partial", usage = { input = 1000, output = 100 } } }
+  assert_equals(summary(), "▾ Paused 6s │ I 1.0k │ 1 req")
+  exchange.turn[1].usage = { reasoning = 23 }
+  assert_equals(summary(), "▾ Paused 6s │ R 23 │ 1 req")
+  exchange.turn[1].usage = { input = 1000, cached_input = 0, reasoning = 0, output = 0 }
+  exchange.metrics.reported_output_tokens = 0
+  exchange.metrics.reported_response_ms = 2000
+  assert_equals(summary(), "▾ Paused 6s │ I 1.0k (0%) · R 0 · O 0 │ 1 req")
+  exchange.turn = {}
+  exchange.metrics = { request_count = 0 }
+  exchange.node_list = { { kind = "agent_reference", agent = { child_agent_id = "child" } } }
+  assert_equals(summary(), "▾ Paused 6s │ 1 agent spawned")
   assert_equals(renderer.foldtext("▸ Thought 6s (3s)")[1][2], "ForgeHarnessThought")
 end)
 

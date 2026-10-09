@@ -486,7 +486,7 @@ fn rows(
     for metadata in design.document.sections() {
         let name = metadata.path;
         let section = metadata.section;
-        if matches!(section, super::PlanSection::Usage | super::PlanSection::Decisions)
+        if matches!(section, super::PlanSection::Usage | super::PlanSection::Requirements | super::PlanSection::Decisions)
             && metadata.text.trim().is_empty() {
             continue;
         }

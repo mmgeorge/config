@@ -36,6 +36,12 @@ modify project files.
 6. Keep `plan.json` consistent with the final declarations. Call `harness_plan_submit` with the exact current `plan_id` and `expected_version`. End the turn
    after successful submission. Submission requests review and never authorizes implementation.
 
+## Dependency selection
+
+For new projects, use the latest stable dependency version unless an explicit user requirement
+or verified compatibility constraint requires an older release. Record the concrete constraint
+when selecting an older release. Documentation retrieval failures alone do not justify downgrading.
+
 ## Plan metadata
 
 Harness creates a virtual `plan.json` containing `objective`, optional `usage`, `requirements`,
@@ -47,6 +53,9 @@ Write for an implementer who can inspect the repository and proposed declaration
 conversation history. Preserve settled user requirements and consequential decisions in this metadata.
 Do not depend on phrases such as "as discussed" or details available only in earlier messages.
 Keep every section consistent with the final declarations and update it when review changes the plan.
+
+Consult `technical-writing` and its Architectural Overview profile before drafting or revising plan
+prose. Apply its guidance within the structure and length limits below.
 
 The review order is Objective, Usage when present, Requirements, Background, Decisions when nonempty,
 Design, proposed declaration changes, Tests, and Verification. Each section has a distinct role:
@@ -73,26 +82,31 @@ Distinguish illustrative values from exact required output.
 
 ### Requirements
 
-Write `requirements` as a JSON array of nonempty strings describing the essential outcomes and
-constraints used to accept or reject the finished change. Prefer a short, scannable list, usually
-3–6 entries for a focused task. This is guidance, not a minimum or maximum: preserve additional
-independent requirements when the scope warrants them.
+Identify the 2–4 key requirements: requested outcomes and essential acceptance constraints.
+Write them as a JSON array of nonempty strings. For bug fixes, this section can be omitted by
+leaving `requirements` empty when the objective and design already capture the acceptance criteria.
 
 Keep entries at a consistent level of abstraction. Group closely related behaviors without
-combining unrelated requirements merely to reduce the count. Put implementation mechanisms and
-detailed behavioral rules in Design, consequential choices in Decisions, and individual test
-scenarios in Tests. Preserve an exact API, dependency, or mechanism here when the user explicitly
-requires it. Retain acceptance-critical error, recovery, compatibility, and scope constraints.
+combining unrelated requirements merely to reduce the count. Put ownership and lifecycle mechanisms
+in Design, exact defaults and local behavioral contracts in declarations, consequential choices in
+Decisions, and individual test scenarios in Tests. Preserve an exact API, dependency, or mechanism
+here when the user explicitly requires it. Retain acceptance-critical error, recovery, compatibility,
+and scope constraints.
 
 Requirements describe properties of the delivered change. Preserve task-specific constraints such
 as compatibility, offline operation, or protecting user configuration. Do not promote every design
-choice into a mandatory requirement or create implementation milestones.
+choice into a mandatory requirement or create implementation milestones. Keep routine validation
+and implementation safeguards in the relevant Design or declaration unless they are explicitly
+requested or essential to a task-specific acceptance constraint. Do not invent numeric limits or
+additional product requirements. Ground any required limit in the user's request or a verified
+constraint.
 
 When following an existing rule requires concrete work, plan the resulting change instead of
 repeating the rule. Include supported file changes in the proposed files and put exact verification
 commands and observable manual checks in Verification. Mention a generated artifact or unsupported
-file change in Design only when it carries task-specific behavior or a deliverable that is not
-represented elsewhere, using a brief sentence alongside its owning component. Do not invent
+file change in Design only when its specific contents are essential to the requested change and are
+not represented elsewhere, using a brief sentence alongside its owning component. A routine README
+contents list does not explain the design and belongs outside this section. Do not invent
 placeholder generated contents or add a separate file inventory.
 
 When the change introduces generated files, inspect the project's existing ignore rules and
@@ -121,11 +135,35 @@ starting repository, available infrastructure, and relevant conventions.
 ### Decisions
 
 Write `decisions` as a JSON array of objects with nonempty `decision` and `rationale` strings.
-Record choices where a reasonable alternative would materially change the design, behavior, or
-implementation constraints. For each, state the choice and the task-specific reason for it. Explain
-the tradeoff or constraint that makes the choice matter. Omit routine conventions, dependency
-selections without a compatibility reason, and requirements already imposed by the user. Do not
-invent alternatives or rationale to fill the section. An empty list is valid.
+
+Record consequential choices that resolve questions left open by the task. The answer may come
+from asking the user or from your own planning. Include choices where a different answer would
+materially change the behavior, scope, or integration contract.
+
+In `decision`, state the selected answer directly. In `rationale`, explain why it fits this task
+and any consequence or tradeoff the implementer must preserve. Record the settled choice, not
+the conversation or deliberation that produced it.
+
+A choice resolved through user clarification belongs here. Requirements already fixed by the
+original request do not need repeating. Omit solution summaries, component inventories, routine
+conventions, and dependency selections without a task-specific tradeoff. An empty list is valid.
+
+These examples show rendered decisions. Store each bold sentence as `decision` without the bold
+markers and its explanation as `rationale`. Derive the actual choices from the current task rather
+than copying these examples:
+
+- **Update matching records and create unmatched records.** Users can import revised CSV files
+  to maintain existing data instead of creating duplicates.
+- **Reject the entire import if any row is invalid.** Report row-specific errors and leave stored
+  data unchanged, so users can correct and retry the file without reconciling a partial import.
+- **Resume interrupted jobs from the last completed item.** Completed work remains recorded, and
+  restarting retries only unfinished items. This requires durable progress tracking.
+- **Pause synchronization when both copies of a file have changed.** Preserve both versions and
+  ask the user to resolve the conflict, preventing automatic synchronization from discarding an edit.
+- **Preserve the public API during the internal refactor.** Existing callers can adopt the change
+  without modifying their code. Public API cleanup remains outside this refactor.
+- **Generate reports as background jobs.** Large reports can finish after the user leaves the page.
+  Users receive a completion notification and download the result when it is ready.
 
 ### Design
 
@@ -134,28 +172,108 @@ Always use this structure in order: an unheaded opening paragraph, `### Ownershi
 Use this template, replacing the bracketed instructions with task-specific content:
 
 ```markdown
-[2–3 sentences beginning with the central design idea, then introducing the main components and how their relationship implements it.]
+[One paragraph of 2–3 sentences: describe the concrete solution, explain the main structural choice and its reason, then introduce the main objects and their roles.]
 
 ### Ownership
-[One short paragraph per main component, explaining the responsibility and state or lifecycle it controls.]
+[One paragraph of 1–2 sentences per main owner: its responsibility, the meaning of its owned state, and its boundary with other owners. Define supporting code names as they appear.]
 
 ### Flows
-**[Flow name].** [1–2 concise sentences tracing the trigger through its owners to the result.]
+**[Scenario name].** [1–2 concise sentences tracing the code path from its trigger or entry point through the relevant functions, objects, and state changes to the result.]
 ```
 
-**Opening — 2–3 sentences.** Begin with the central design idea and what it enables or preserves.
-Then introduce the main components and explain how their relationship implements that idea.
+**Opening.** Write one paragraph of 2–3 sentences explaining how the design solves the user's task.
+Follow this progression:
 
-**Ownership.** Expand the main components introduced in the opening, in the same order. Use one
-paragraph per component, with 1–2 sentences explaining its responsibility and the state or lifecycle
-it controls. Group supporting modules and data types under their owner. Keep the same level of
-detail across paragraphs and use prose rather than bullets or a type inventory.
+1. Concrete solution: state what will be implemented or changed and its defining behavior.
+   Describe the proposed solution, not just the objective.
+2. Structural choice and reason: explain the main organizing choice and one concrete capability
+   or guarantee it provides.
+3. Main objects: introduce the principal components by their actual code names and briefly
+   explain their roles.
 
-**Flows.** Prefer at most three named flows, each comprising 1–2 concise sentences. Trace a concrete
-trigger through the established owners to its result, including ordering or failure behavior when
-it determines the outcome. Add another flow only for a distinct, essential lifecycle or failure
-path. Separate flows with a blank line and keep each sentence focused rather than compressing an
-implementation checklist into it.
+Combine the structural reason and component introduction when two sentences suffice. Expand
+responsibilities in Ownership and interactions in Flows. Keep configuration values, detailed
+algorithms, and secondary components out of the opening.
+
+The examples below demonstrate structure and level of detail. Derive the solution, reasoning,
+and component names from the current task and design. Do not copy the examples' implementation
+choices. The generated opening is one paragraph without the example labels.
+
+**Feature: CSV import**
+
+Solution: Implement CSV import as a workflow that previews incoming records, reports validation
+errors, and saves the import after confirmation.
+
+Reason: Separate validation from persistence so users can correct invalid records before
+changing stored data.
+
+Objects: `ImportSession` holds the pending records and validation results, while `ImportService`
+validates the data and commits the confirmed import.
+
+**Feature: log-search CLI**
+
+Solution: Implement log search as a command that filters files by time range and severity, then
+prints matching records.
+
+Reason: Process files incrementally so memory use does not grow with the total size of the
+input files.
+
+Objects: `SearchCommand` handles arguments, `LogScanner` reads and filters records, and
+`MatchWriter` formats the output.
+
+**Bugfix: cancellation leaves the interface stuck**
+
+Solution: Make cancelling a request stop its active work and return the interface to idle.
+
+Reason: Associate callbacks with a request generation so results arriving after cancellation
+cannot restore stale progress.
+
+Objects: `RequestController` owns the active generation and cancellation handle, while `RunState`
+records the status displayed by the interface.
+
+**Refactor: duplicated authentication**
+
+Solution: Move authentication from individual route handlers into shared middleware while
+preserving existing responses.
+
+Reason: Centralize credential validation so every protected route applies the same expiry and
+revocation checks.
+
+Objects: `AuthMiddleware` gates protected requests, `TokenVerifier` validates credentials, and
+`RequestIdentity` carries the authenticated user to the handler.
+
+**Bugfix: interrupted saves corrupt settings**
+
+Solution: Preserve the last complete settings file when saving is interrupted or fails.
+
+Reason: Write the replacement to a temporary file and publish it atomically so readers never
+observe partially written settings.
+
+Objects: `SettingsStore` owns serialization and loading, while `AtomicFileWriter` manages the
+temporary file and final replacement.
+
+**Ownership.** Expand the owners introduced in the opening, in the same order, using one paragraph
+of 1–2 sentences per owner. State what each owner creates, changes, or retains, and where its authority
+ends. Introduce supporting types with their meaning, such as "`ImportSession`, the pending records
+and validation results", rather than listing names after "owns". Group supporting modules and data under that
+owner. Use connected prose, not bullets, file inventories, or paragraphs for every type.
+Keep thin composition wrappers in the opening unless they own a separate lifecycle. Begin Ownership
+with the component that controls the central state, not its configuration or launcher. Configuration
+fields, numeric defaults, key bindings, visual styling, algorithms, and schedule-by-schedule details
+belong in the relevant declarations. Include a detail here only when changing it changes the
+ownership boundary. Do not add README contents, documentation chores, or repeated setup descriptions.
+
+**Flows.** Describe how the code performs each important operation. Start at its trigger or entry
+point, follow the relevant functions and objects, explain the data or state changes between them,
+and end with the result. Include branches, ordering, and failure handling when they determine
+what happens.
+
+Use concrete code names established in Ownership. Trace the calls and interactions needed to
+understand the operation without listing every implementation step.
+
+Prefer up to three named scenarios, each explained in 1–2 sentences. Add another flow only for a
+distinct, essential lifecycle or failure path. Separate flows with a blank line and keep each
+sentence focused rather than compressing an implementation checklist into it.
 
 Describe the scope of the change, not the architecture of the entire system. For bugfixes, explain
 the invariant being restored and the mechanism that restores it. Describe only the existing owners
@@ -164,15 +282,23 @@ for a localized change, and an existing function or module can be the owner. Do 
 components to fill the template.
 
 Describe the target design in present tense. Preserve terminology across sections, remove repeated
-claims, and demonstrate guarantees through concrete mechanisms. Keep defaults and API details in
-declarations, rationale in Decisions, and existing behavior in Background. Execution instructions
-remain governed by the active system and repository instructions. The complete plan must support
-implementation without the prior conversation.
+claims, and demonstrate guarantees through concrete mechanisms. Keep detailed contracts in
+declarations, detailed tradeoffs in Decisions, and existing behavior in Background. Flows retain the ordering
+and failure rules needed to explain the result, without repeating local algorithms or configuration
+values. Execution instructions remain governed by the active system and repository instructions.
+The complete plan must support implementation without the prior conversation.
 
 Ownership and Flows remain content of the `design` string, not additional JSON fields. Omit a Files
 and artifacts section, repeated file inventories, routine housekeeping, and explanations of Harness
 format limitations. Do not include executable implementation bodies, mutable execution progress,
 or claims that implementation or verification has finished.
+
+Before submission, review the Design against this template. Confirm that the opening describes the
+solution, explains its structure, and introduces the main objects. Define unexplained code names
+and move configuration or implementation detail out of Ownership. Confirm that each flow follows
+a code path from its entry point through the relevant objects and state changes to the result.
+Shorten any ownership paragraph or flow exceeding two sentences instead of joining unrelated clauses.
+Keep acceptance-critical behavior in the plan, placing each detail in its designated section.
 
 Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
 Encode paragraph breaks as `\n\n` inside JSON strings. Each rendered metadata section is limited
@@ -203,7 +329,7 @@ A plan's metadata can use this shape:
       "rationale": "A single publication point keeps each submitted frame's texture selection consistent."
     }
   ],
-  "design": "Texture replacement separates preparation from publication so pending work leaves the current texture usable. `TextureStreaming` prepares replacements for `TextureRegistry`, which publishes the handles used by the renderer.\n\n### Ownership\n`TextureStreaming` controls preparation and exposes progress and cancellation through `TextureRequest`.\n\n`TextureRegistry` controls publication and retains replaced allocations while submitted frames still use them.\n\n### Flows\n**Replacement.** A request prepares a new texture. Once ready, the registry publishes it at a frame boundary and releases the previous allocation after its final GPU use.\n\n**Cancellation.** Cancelling pending preparation leaves the published handle unchanged.",
+  "design": "Support texture replacement that reports progress and can be cancelled while the current texture remains visible. Separate preparation from publication so pending work leaves the current texture usable. `TextureStreaming`, the preparation service, passes completed replacements to `TextureRegistry`, the owner of the handles used by the renderer.\n\n### Ownership\n`TextureStreaming` creates and prepares each replacement, exposing its progress and cancellation through `TextureRequest`, the caller's handle to pending work. Preparation leaves the published texture unchanged.\n\n`TextureRegistry` controls which texture the renderer can use and retains replaced allocations while submitted frames still reference them. Only the registry publishes or retires a texture.\n\n### Flows\n**Replace a texture.** The caller submits a replacement to `TextureStreaming`, which returns a `TextureRequest` to track preparation and passes the ready texture to `TextureRegistry`. The registry publishes the new handle at a frame boundary and releases the previous allocation after its final GPU use.\n\n**Cancel preparation.** Cancelling a pending `TextureRequest` causes `TextureStreaming` to stop preparation and discard the unpublished replacement. `TextureRegistry` retains the current handle, so the renderer continues using the original texture.",
   "verification": {
     "automated": "cargo test --release texture_replacement",
     "manual": "- Cancel a pending replacement and confirm the current texture remains visible.\n- Replace a texture with frames in flight and confirm rendering remains valid."

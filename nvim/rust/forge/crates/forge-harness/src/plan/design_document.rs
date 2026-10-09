@@ -13,7 +13,7 @@ pub struct DesignDocument {
     /// Illustrates successful use when an observable interaction clarifies the change.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<String>,
-    /// Defines the behavior and restrictions every valid implementation must satisfy.
+    /// Records key acceptance criteria when they need a separate review section.
     pub requirements: Vec<String>,
     /// Describes inspected existing behavior and integration points needed by a new implementer.
     pub background: String,
@@ -155,10 +155,6 @@ impl DesignDocument {
                 "plan.json {name} is required before submission"
             );
         }
-        ensure!(
-            !self.requirements.is_empty(),
-            "plan.json requirements must contain at least one requirement before submission"
-        );
         Ok(())
     }
 }

@@ -2125,10 +2125,12 @@ The same report captures cumulative generated tokens and active elapsed time min
 of tool, approval, and delegated waits. Their quotient supplies approximate effective throughput,
 rounded to whole tokens per second. Both operands stay fixed until the next report, so ongoing
 requests cannot lower the displayed rate before reporting their tokens. Provider and transport
-overhead remain in this estimate. Missing timing or zero duration displays `— tok/s`.
-Elapsed and active tool time tick independently. Missing tool starts display `—s tools`.
-Headers show `0 req` before any usage report and retain tool-failure and spawned-agent suffixes.
-Both renderers retain compact token formatting and show `—` for unavailable categories.
+overhead remain in this estimate. Throughput appears only when generated tokens and a valid,
+positive duration are available. Elapsed and active tool time tick independently. Tool time appears
+after a tool is recorded and only while its timing is complete.
+Both renderers omit unavailable token categories, unknown cache percentages, and zero request or
+tool counts. Reported zero token counts and zero cache-hit percentages remain visible. Separators
+join populated sections only, including tool failures and spawned agents when present.
 Private session format 36 hides earlier sessions without migration.
 
 
@@ -2283,6 +2285,9 @@ filesystem access with on-request approvals, and YOLO selects unrestricted acces
 approval bypass. Copilot routes SDK permission callbacks through the same `PermissionCoordinator`,
 including shell, read, write, URL, MCP, custom-tool, memory, and hook requests. Provider-private
 operations that emit no client approval request remain outside the Harness policy boundary.
+
+Codex owns operating-system sandbox selection. Harness supplies permission profiles and approval
+policy without forcing a Windows sandbox implementation.
 
 The global Rulesync config omits the `permissions` feature only for `codexcli`. Codex therefore
 cannot apply a generated exec-policy denial before Harness evaluates the request. Direct Codex CLI
