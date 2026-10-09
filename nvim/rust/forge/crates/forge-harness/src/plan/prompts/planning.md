@@ -23,8 +23,8 @@ modify project files.
 4. Design complete declaration files and required configuration changes. Preserve unchanged declarations, private members, complete
    types, generics, visibility, documentation, and associations. Add only useful requested work.
    Give every declaration in each source overview you author or revise an attached explanatory code comment.
-   Record objective, requirements, background, decisions, design, verification, and tests in virtual `plan.json`. Add usage examples only when useful.
-   Do not author JSON entities, flows, tasks, stages, prerequisites, or execution reports.
+   Record objective, requirements, background, decisions, design, flows, verification, and tests in virtual `plan.json`. Add usage examples only when useful.
+   Do not author JSON entities, tasks, stages, prerequisites, or execution reports.
 5. Edit with `harness_design_apply_patch`, supplying `plan_id`, `expected_version`, and `patch`.
    An optional `title` names the design. Multiple files and chunks can change atomically. Use the
    returned version in the next call. The response includes a compact applied diff. Use it to confirm
@@ -45,7 +45,7 @@ when selecting an older release. Documentation retrieval failures alone do not j
 ## Plan metadata
 
 Harness creates a virtual `plan.json` containing `objective`, optional `usage`, `requirements`,
-`background`, `decisions`, `design`, `verification`, and `tests`. It is plan metadata, never a project file
+`background`, `decisions`, `design`, `flows`, `verification`, and `tests`. It is plan metadata, never a project file
 or declaration overview. Read and update it through the same tools as declaration files. Do not
 move it, delete it, or add other fields. Drafts start with empty strings and lists, with `usage` absent.
 
@@ -58,7 +58,7 @@ Consult `technical-writing` and its Architectural Overview profile before drafti
 prose. Apply its guidance within the structure and length limits below.
 
 The review order is Objective, Usage when present, Requirements, Background, Decisions when nonempty,
-Design, proposed declaration changes, Tests, and Verification. Each section has a distinct role:
+Design, Flows when nonempty, proposed declaration changes, Tests, and Verification. Each section has a distinct role:
 
 ### Objective
 
@@ -168,7 +168,7 @@ than copying these examples:
 ### Design
 
 Write `design` as Markdown explaining how the proposed solution works and satisfies the requirements.
-Always use this structure in order: an unheaded opening paragraph, `### Ownership`, then `### Flows`.
+Use an unheaded opening paragraph followed by `### Ownership`. Store flows separately in `flows`.
 Use this template, replacing the bracketed instructions with task-specific content:
 
 ```markdown
@@ -176,9 +176,6 @@ Use this template, replacing the bracketed instructions with task-specific conte
 
 ### Ownership
 [One paragraph of 1–2 sentences per main owner: its responsibility, the meaning of its owned state, and its boundary with other owners. Define supporting code names as they appear.]
-
-### Flows
-**[Scenario name].** [1–2 concise sentences tracing the code path from its trigger or entry point through the relevant functions, objects, and state changes to the result.]
 ```
 
 **Opening.** Write one paragraph of 2–3 sentences explaining how the design solves the user's task.
@@ -263,18 +260,6 @@ fields, numeric defaults, key bindings, visual styling, algorithms, and schedule
 belong in the relevant declarations. Include a detail here only when changing it changes the
 ownership boundary. Do not add README contents, documentation chores, or repeated setup descriptions.
 
-**Flows.** Describe how the code performs each important operation. Start at its trigger or entry
-point, follow the relevant functions and objects, explain the data or state changes between them,
-and end with the result. Include branches, ordering, and failure handling when they determine
-what happens.
-
-Use concrete code names established in Ownership. Trace the calls and interactions needed to
-understand the operation without listing every implementation step.
-
-Prefer up to three named scenarios, each explained in 1–2 sentences. Add another flow only for a
-distinct, essential lifecycle or failure path. Separate flows with a blank line and keep each
-sentence focused rather than compressing an implementation checklist into it.
-
 Describe the scope of the change, not the architecture of the entire system. For bugfixes, explain
 the invariant being restored and the mechanism that restores it. Describe only the existing owners
 and interactions relevant to the fix. A single ownership paragraph and one flow are sufficient
@@ -288,7 +273,7 @@ and failure rules needed to explain the result, without repeating local algorith
 values. Execution instructions remain governed by the active system and repository instructions.
 The complete plan must support implementation without the prior conversation.
 
-Ownership and Flows remain content of the `design` string, not additional JSON fields. Omit a Files
+Only the opening and Ownership belong in the `design` string. Omit a Files
 and artifacts section, repeated file inventories, routine housekeeping, and explanations of Harness
 format limitations. Do not include executable implementation bodies, mutable execution progress,
 or claims that implementation or verification has finished.
@@ -297,8 +282,34 @@ Before submission, review the Design against this template. Confirm that the ope
 solution, explains its structure, and introduces the main objects. Define unexplained code names
 and move configuration or implementation detail out of Ownership. Confirm that each flow follows
 a code path from its entry point through the relevant objects and state changes to the result.
-Shorten any ownership paragraph or flow exceeding two sentences instead of joining unrelated clauses.
+Shorten any ownership paragraph exceeding two sentences instead of joining unrelated clauses.
 Keep acceptance-critical behavior in the plan, placing each detail in its designated section.
+
+### Flows
+
+Write `flows` as an array of objects with `title`, `description`, and `root`. Harness renders this
+section after Design, generating the headings, arrows, branches, and layout. Do not put diagrams
+or a Flows heading inside `design`.
+
+Each flow traces an operation through the concrete objects and functions established in Ownership.
+Start at the trigger or entry point, show what passes between owners or changes state, and end at
+the result. Use `description` for 1–2 sentences explaining the operation's purpose or result, not a
+second prose account of every step. Prefer 1–3 flows. Add another only for a distinct essential
+lifecycle or failure path. Use [] when the change has no meaningful runtime flow.
+
+Each node has plain, single-line `text`, optional `via`, and optional `children`:
+- `text` identifies the concrete operation, object, or state change. Functions are valid nodes and
+  need no wrapper type. Use code names without backticks, bullets, arrows, or Markdown formatting.
+- `via` labels the incoming transfer, event, result, or condition. Omit it on the root.
+- `children` lists downstream interactions in execution order. A single child continues the chain.
+  Multiple children show separate interactions or branches, with conditions in `via` when needed.
+  Omit children or use [] at a leaf. Represent shared results again when separate branches reach them.
+
+Include ordering and failure paths when they determine the result. Keep local algorithms and
+configuration values in declarations. Do not replace an object interaction with a list of behavioral
+rules, user instructions, or generic actions such as "process data". Store facts and relationships,
+not hand-formatted diagram text. Flow titles must be unique. The structural limits are 32 flows,
+512 total nodes, and 32 node levels, separate from the recommendation to keep flows concise.
 
 Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
 Encode paragraph breaks as `\n\n` inside JSON strings. Each rendered metadata section is limited
@@ -310,7 +321,7 @@ Include inline test modules and separate test files consistently. List existing 
 reused, omit unrelated repository tests, and use [] when no tests apply. Keep names unique within
 a file and list each file once. At most 256 files and 1024 cases are allowed. Tests is rendered
 before Verification and records planned coverage. Verification retains execution commands and manual checks.
-Objective, Background, Design, and at least one Requirement must be nonempty before submission.
+Objective, Background, and Design must be nonempty before submission.
 
 A plan's metadata can use this shape:
 
@@ -329,7 +340,47 @@ A plan's metadata can use this shape:
       "rationale": "A single publication point keeps each submitted frame's texture selection consistent."
     }
   ],
-  "design": "Support texture replacement that reports progress and can be cancelled while the current texture remains visible. Separate preparation from publication so pending work leaves the current texture usable. `TextureStreaming`, the preparation service, passes completed replacements to `TextureRegistry`, the owner of the handles used by the renderer.\n\n### Ownership\n`TextureStreaming` creates and prepares each replacement, exposing its progress and cancellation through `TextureRequest`, the caller's handle to pending work. Preparation leaves the published texture unchanged.\n\n`TextureRegistry` controls which texture the renderer can use and retains replaced allocations while submitted frames still reference them. Only the registry publishes or retires a texture.\n\n### Flows\n**Replace a texture.** The caller submits a replacement to `TextureStreaming`, which returns a `TextureRequest` to track preparation and passes the ready texture to `TextureRegistry`. The registry publishes the new handle at a frame boundary and releases the previous allocation after its final GPU use.\n\n**Cancel preparation.** Cancelling a pending `TextureRequest` causes `TextureStreaming` to stop preparation and discard the unpublished replacement. `TextureRegistry` retains the current handle, so the renderer continues using the original texture.",
+  "design": "Support texture replacement that reports progress and can be cancelled while the current texture remains visible. Separate preparation from publication so pending work leaves the current texture usable. `TextureStreaming`, the preparation service, passes completed replacements to `TextureRegistry`, the owner of the handles used by the renderer.\n\n### Ownership\n`TextureStreaming` creates and prepares each replacement, exposing its progress and cancellation through `TextureRequest`, the caller's handle to pending work. Preparation leaves the published texture unchanged.\n\n`TextureRegistry` controls which texture the renderer can use and retains replaced allocations while submitted frames still reference them. Only the registry publishes or retires a texture.",
+  "flows": [
+    {
+      "title": "Replace a texture",
+      "description": "Publish the prepared replacement at a frame boundary and retain the previous allocation until its last frame completes.",
+      "root": {
+        "text": "TextureStreaming.prepare",
+        "children": [
+          {
+            "text": "TextureRegistry.publish",
+            "via": "prepared replacement at frame boundary",
+            "children": [
+              {
+                "text": "TextureRegistry.retire",
+                "via": "previous allocation after final GPU use"
+              }
+            ]
+          }
+        ]
+      }
+    },
+    {
+      "title": "Cancel preparation",
+      "description": "Discard unpublished work while the renderer retains the current texture.",
+      "root": {
+        "text": "TextureRequest.cancel",
+        "children": [
+          {
+            "text": "TextureStreaming.discard",
+            "via": "pending request",
+            "children": [
+              {
+                "text": "TextureRegistry.current remains unchanged",
+                "via": "unpublished replacement discarded"
+              }
+            ]
+          }
+        ]
+      }
+    }
+  ],
   "verification": {
     "automated": "cargo test --release texture_replacement",
     "manual": "- Cancel a pending replacement and confirm the current texture remains visible.\n- Replace a texture with frames in flight and confirm rendering remains valid."

@@ -406,7 +406,7 @@ impl DeclarationDesign {
                 let original = format!("{}\n", serde_json::to_string_pretty(&candidate.document)?);
                 let text = patch_file(&original, body)?;
                 candidate.document = serde_json::from_str(&text)
-                    .context("plan.json requires objective, requirements, background, decisions, design, and verification with automated and manual strings; usage is optional")?;
+                    .context("plan.json requires objective, requirements, background, decisions, design, verification with automated and manual strings, and tests; flows is an array of {title, description, root} objects and usage is optional")?;
                 continue;
             }
             match kind {
@@ -856,6 +856,7 @@ mod tests {
             "background": "`src/request.rs` owns pending uploads. Publication currently happens immediately.",
             "decisions": [{"decision": "Publish at frame boundaries.", "rationale": "Each frame observes one consistent texture selection."}],
             "design": "`Request` retains cancellation state until pending work finishes.",
+            "flows": [{"title":"Cancel request", "description":"Cancel before publication and retain the current texture.", "root":{"text":"Request.cancel", "children":[{"text":"TextureStreaming.discard", "via":"cancellation"}]}}],
             "verification": {"automated": "cargo test --release cancellation", "manual": "- Cancel an upload and confirm the current texture remains visible."},
             "tests": [{"file":"src/request.rs", "cases":[{"name":"tests::cancellation", "change":"new", "description":"Cancel before publication and retain the current texture."}]}]
         });
@@ -873,11 +874,12 @@ mod tests {
         let (_, rendered, _) = store.submit_document_revision("session", "specification", 1, 1).unwrap();
         let original = store.read_submitted_document("session", "specification", 1).unwrap();
         assert_eq!(serde_json::to_value(&original.design.as_ref().unwrap().document).unwrap(), metadata);
-        let headings = ["Objective:", "Usage:", "Requirements:", "Background:", "Decisions:", "Design:", "Proposed declaration changes:", "Tests · 1 new", "Verification:"];
+        let headings = ["Objective:", "Usage:", "Requirements:", "Background:", "Decisions:", "Design:", "Flows:", "Proposed declaration changes:", "Tests · 1 new", "Verification:"];
         let positions = headings.map(|heading| rendered.markdown.lines().position(|line| line == heading).unwrap());
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(rendered.markdown.contains("app cancel 42\nCancelled request 42"));
-        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "verification/automated", "verification/manual", "tests"] {
+        assert!(rendered.markdown.contains("Request.cancel → cancellation → TextureStreaming.discard"));
+        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "flows", "verification/automated", "verification/manual", "tests"] {
             assert!(rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == format!("/design/document/{path}")));
         }
         for field in ["objective", "background", "design"] {
@@ -894,6 +896,10 @@ mod tests {
             invalid_metadata["decisions"] = serde_json::json!([invalid]);
             assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid_metadata)).is_err());
         }
+        let mut invalid_flow = metadata.clone();
+        invalid_flow["flows"][0]["root"]["text"] = serde_json::json!("");
+        assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid_flow)).is_err());
+        assert_eq!(store.read_submitted_document("session", "specification", 1).unwrap(), original);
         for tests in [
             serde_json::json!([{"file":"../outside.rs", "cases":metadata["tests"][0]["cases"]}]),
             serde_json::json!([metadata["tests"][0].clone(), metadata["tests"][0].clone()]),
@@ -917,11 +923,12 @@ mod tests {
         revised_metadata["decisions"] = serde_json::json!([]);
         revised_metadata["tests"][0]["cases"][0]["change"] = serde_json::json!("reused");
         revised_metadata["requirements"] = serde_json::json!([]);
+        revised_metadata["flows"] = serde_json::json!([]);
         document.design = Some(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &revised_metadata)).unwrap());
         document.version += 1;
         store.write_working_document("session", "specification", &document).unwrap();
         let (_, rendered, _) = store.submit_document_revision("session", "specification", 2, document.version).unwrap();
-        assert!(!rendered.markdown.lines().any(|line| matches!(line, "Usage:" | "Requirements:" | "Decisions:")));
+        assert!(!rendered.markdown.lines().any(|line| matches!(line, "Usage:" | "Requirements:" | "Decisions:" | "Flows:")));
         assert!(!rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == "/design/document/requirements"));
         let current = store.read_submitted_document("session", "specification", 2).unwrap();
         assert!(current.design.as_ref().unwrap().document.requirements.is_empty());
@@ -929,6 +936,7 @@ mod tests {
         assert!(delta.files.is_empty());
         assert!(delta.document.contains("a/Usage b/Usage") && delta.document.contains("a/Decisions b/Decisions"));
         assert!(delta.document.contains("a/Requirements b/Requirements"));
+        assert!(delta.document.contains("a/Flows b/Flows"));
         assert!(delta.document.contains("a/Tests b/Tests"));
         assert!(rendered.markdown.contains("Tests · 1 reused"));
         assert!(!rendered.markdown.contains("= tests::cancellation"));

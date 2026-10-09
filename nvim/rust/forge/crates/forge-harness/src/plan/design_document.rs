@@ -19,8 +19,11 @@ pub struct DesignDocument {
     pub background: String,
     /// Preserves consequential choices and the reasons for selecting them.
     pub decisions: Vec<DesignDecision>,
-    /// Explains the proposed responsibilities, interactions, and lifecycle.
+    /// Explains the proposed solution and ownership boundaries.
     pub design: String,
+    /// Traces operations between concrete objects independently of Design prose.
+    #[serde(default)]
+    pub flows: Vec<super::design_flows::DesignFlow>,
     /// Records the checks required before execution can complete.
     pub verification: DesignVerification,
     /// Inventories changed and reused tests by file, independently of source language.
@@ -84,6 +87,12 @@ impl DesignDocument {
                 text: self.design.clone(),
             },
             DesignSection {
+                path: "flows",
+                title: "Flows",
+                section: PlanSection::Flows,
+                text: super::design_flows::text(&self.flows),
+            },
+            DesignSection {
                 path: "tests",
                 title: "Tests",
                 section: PlanSection::Tests,
@@ -106,6 +115,7 @@ impl DesignDocument {
 
     /// Rejects malformed or oversized metadata while allowing incomplete drafts.
     pub(crate) fn validate(&self) -> Result<()> {
+        super::design_flows::validate(&self.flows)?;
         super::design_tests::validate(&self.tests)?;
         ensure!(
             self.requirements.len() <= 256,

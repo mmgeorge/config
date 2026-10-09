@@ -45,12 +45,27 @@ pub(super) fn project(
     revealed: &HashSet<(String, String)>,
 ) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
     let (source, navigation, hidden, contextual) = rows(document, syntax, public_only, true, trace, revealed)?;
+    // Parse the complete generated section so code-fence context survives per-row projection.
+    let flow_text = super::design_flows::text(&document.design.as_ref().context("declaration review has no design")?.document.flows);
+    let flow_markdown = forge_buffer::markdown::MarkdownRenderer::source(
+        BlockId("plan:flow-markdown".into()), &flow_text, width,
+    )?;
     let mut target = HashMap::new();
     let mut block = Vec::new();
     let mut source_end = HashMap::new();
     let mut omitted = 0;
     for (index, mut row) in source.into_iter().enumerate() {
-        if row.id.0.starts_with("plan:metadata:")
+        if let Some(index) = row.id.0.strip_prefix("plan:metadata:flows:").and_then(|index| index.parse::<usize>().ok()) {
+            row.metadata.markdown = true;
+            for decoration in &flow_markdown.block.metadata.decoration {
+                if decoration.range.start.row == index {
+                    let mut decoration = decoration.clone();
+                    decoration.range.start.row = 0;
+                    decoration.range.end.row = 0;
+                    row.metadata.decoration.push(decoration);
+                }
+            }
+        } else if row.id.0.starts_with("plan:metadata:")
             && !row.id.0.starts_with("plan:metadata:verification/automated:") {
             row = forge_buffer::markdown::MarkdownRenderer::source(
                 row.id.clone(),
@@ -486,7 +501,7 @@ fn rows(
     for metadata in design.document.sections() {
         let name = metadata.path;
         let section = metadata.section;
-        if matches!(section, super::PlanSection::Usage | super::PlanSection::Requirements | super::PlanSection::Decisions)
+        if matches!(section, super::PlanSection::Usage | super::PlanSection::Requirements | super::PlanSection::Decisions | super::PlanSection::Flows)
             && metadata.text.trim().is_empty() {
             continue;
         }
@@ -1041,6 +1056,33 @@ mod tests {
     }
 
     #[test]
+    fn structured_flows_keep_code_labels_literal_in_both_review_views() {
+        let mut document = crate::plan::document::test_fixture("flows", "Cancel work");
+        let mut design = super::super::DeclarationDesign::default();
+        design.document.design = "Keep the published value while cancelling pending work.".into();
+        design.document.flows = serde_json::from_value(serde_json::json!([{
+            "title":"Cancel pending work", "description":"Retain the published value.",
+            "root":{"text":"cancel_request", "children":[
+                {"text":"pending_work.stop", "via":"active handle"},
+                {"text":"published_value stays unchanged", "via":"after cancellation"}
+            ]}
+        }])).unwrap();
+        document.design = Some(design);
+        for public_only in [false, true] {
+            let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
+            let heading = block.iter().find(|block| block.text.row(0) == Some("Flows:")).unwrap();
+            assert!(heading.metadata.decoration.iter().any(|style| style.capture == "RenderMarkdownH1"));
+            assert!(!heading.metadata.fold.is_empty());
+            let node = block.iter().find(|block| block.text.row(0) == Some("cancel_request")).unwrap();
+            assert!(node.metadata.markdown);
+            assert!(node.metadata.decoration.iter().any(|style| style.capture == "@markup.raw.block"));
+            assert!(!node.metadata.decoration.iter().any(|style| style.capture == "@markup.italic"));
+            assert!(target.values().any(|anchor| anchor.json_path == "/design/document/flows"));
+            forge_buffer::document::BufferDocument::new(forge_buffer::identity::DocumentId("flows".into()), block).unwrap();
+        }
+    }
+
+    #[test]
     fn validation_evidence_stays_out_of_review_projection() {
         let mut document = crate::plan::document::test_fixture("validation", "Validation");
         let mut design = super::super::DeclarationDesign::default();
@@ -1358,6 +1400,7 @@ mod tests {
     fn review_reuses_diff_gutters_and_preserves_both_comment_sides() {
         let mut document = crate::plan::document::test_fixture("plan", "Review");
         let mut design = super::super::DeclarationDesign::default();
+        design.document.requirements.push("Preserve review targets on both sides of a declaration change.".into());
         design.baseline.insert(
             "src/lib.rs".into(),
             super::super::DeclarationFile {

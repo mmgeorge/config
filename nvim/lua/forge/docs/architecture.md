@@ -1931,7 +1931,7 @@ recovery also restores that source session. Ordinary Harness startup still resum
 same-workspace session for its configured provider.
 
 Declaration design records use schema 6. Older plan records are excluded from storage reads,
-and older document schemas fail validation. Planning no longer authors entities, flows, stages,
+and older document schemas fail validation. Planning no longer authors entities, stages,
 or implementation tasks.
 
 Harness captures nonignored Git working-tree Rust, TypeScript, TSX, Lua, JSON/JSONC, TOML, YAML, and XML files. Tree-sitter
@@ -2012,6 +2012,13 @@ control context rather than a phrase found in user text. Codex receives the shar
 current context through `developerInstructions` on both thread start and resume, including native goal
 resumption. Copilot appends shared instructions when creating or resuming a session and sends current
 interaction context with every message, including messages to an already-live session.
+
+Plan metadata stores operation flows separately from the Design Markdown. `design_flows.rs` owns
+the recursive `text`, optional incoming `via`, and `children` node schema, validates its size and
+depth, and generates code-fenced diagrams. Short chains share a line, longer chains break at node
+boundaries, and branches retain their incoming transfer or condition labels. The shared section
+projection places Flows after Design and omits an empty inventory. Section reads, review output,
+and revision diffs use the same generated Markdown without changing the stored JSON.
 
 Plan review places Tests after proposed declaration changes and before Verification. Each section
 retains its own fold boundary and navigation targets in both full and public-only views.
