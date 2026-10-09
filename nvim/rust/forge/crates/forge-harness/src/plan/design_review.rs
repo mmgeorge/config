@@ -494,7 +494,7 @@ fn rows(
             let changes_start = overview.len();
             overview.push(forge_diff::projection::header(
                 BlockId("plan:section:changes".into()),
-                vec![TextChunk { text: "Proposed declaration changes:".into(), capture: "ForgeStatusHeader".into() }], 0,
+                vec![TextChunk { text: "Proposed declaration changes:".into(), capture: "RenderMarkdownH1".into() }], 0,
             )?);
             let offset = overview.len() as u32;
             for anchor in &mut navigation.anchor { anchor.line += offset; }
@@ -523,7 +523,7 @@ fn rows(
             verification_start = Some(overview.len());
             overview.push(forge_diff::projection::header(
                 BlockId("plan:section:verification".into()),
-                vec![TextChunk { text: "Verification:".into(), capture: "ForgeStatusHeader".into() }], 0,
+                vec![TextChunk { text: "Verification:".into(), capture: "RenderMarkdownH1".into() }], 0,
             )?);
             section_anchor.push(PlanNavigationAnchor {
                 line: overview.len() as u32,
@@ -539,7 +539,10 @@ fn rows(
         let title = metadata.title.rsplit('/').next().unwrap();
         overview.push(forge_diff::projection::header(
             BlockId(fold_id.clone()),
-            vec![TextChunk { text: format!("{heading_indent}{title}:"), capture: "ForgeStatusHeader".into() }], 0,
+            vec![TextChunk {
+                text: format!("{heading_indent}{title}:"),
+                capture: if nested { "ForgeStatusHeader" } else { "RenderMarkdownH1" }.into(),
+            }], 0,
         )?);
         let text = if metadata.text.trim().is_empty() { "None specified." } else { metadata.text.as_str() };
         for (index, line) in text.lines().enumerate() {
@@ -571,7 +574,7 @@ fn rows(
 fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
     let mut block = vec![forge_diff::projection::header(
         BlockId("plan:section:tests".into()),
-        vec![TextChunk { text: format!("Tests · {}", super::design_tests::summary(files)), capture: "ForgeStatusHeader".into() }], 0,
+        vec![TextChunk { text: format!("Tests · {}", super::design_tests::summary(files)), capture: "RenderMarkdownH1".into() }], 0,
     )?];
     let mut anchors = vec![PlanNavigationAnchor {
         line: 1, target: PlanReviewTarget::Section { section: super::PlanSection::Tests },

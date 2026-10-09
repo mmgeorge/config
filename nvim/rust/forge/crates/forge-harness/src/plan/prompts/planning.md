@@ -89,16 +89,18 @@ as compatibility, offline operation, or protecting user configuration. Do not pr
 choice into a mandatory requirement or create implementation milestones.
 
 When following an existing rule requires concrete work, plan the resulting change instead of
-repeating the rule. Include supported file changes in the proposed files, explain task-specific
-generated artifacts or unsupported file changes in Design, and put exact verification commands
-and observable manual checks in Verification. Do not invent placeholder generated contents.
+repeating the rule. Include supported file changes in the proposed files and put exact verification
+commands and observable manual checks in Verification. Mention a generated artifact or unsupported
+file change in Design only when it carries task-specific behavior or a deliverable that is not
+represented elsewhere, using a brief sentence alongside its owning component. Do not invent
+placeholder generated contents or add a separate file inventory.
 
 When the change introduces generated files, inspect the project's existing ignore rules and
 propose any needed .gitignore addition or update as a normal virtual file change. Preserve existing
 comments, negations, and unrelated rules. Add appropriate generated paths, such as /target/ for a
 root Rust package. Do not propose an empty file merely because .gitignore is absent. Keep source
-and required lockfiles tracked. Describe generation or retention of a required lockfile in Design
-when needed, without presenting it as a product requirement or generating it in Plan. The model
+and required lockfiles tracked. Generate or update required lockfiles during implementation, not
+in Plan. Routine lockfile handling belongs to implementation and needs no Design prose. The model
 creates or updates the actual file during implementation. Do not modify workspace files in Plan.
 
 ### Background
@@ -128,23 +130,49 @@ invent alternatives or rationale to fill the section. An empty list is valid.
 ### Design
 
 Write `design` as Markdown explaining how the proposed solution works and satisfies the requirements.
-Open with the central idea that makes the design understandable, such as its purpose, responsibility
-boundaries, lifecycle, or data flow. Choose the framing that fits the change.
+Always use this structure in order: an unheaded opening paragraph, `### Ownership`, then `### Flows`.
+Use this template, replacing the bracketed instructions with task-specific content:
 
-Then explain the ownership structure, moving from major components into their responsibilities,
-state, and subordinate parts. Introduce concrete names from the declarations as their roles become
-relevant. Trace the important flows through those owners, showing how inputs or events produce
-state changes and observable results. Explain ordering constraints and failure or recovery behavior
-alongside the flows they affect.
+```markdown
+[2–3 sentences beginning with the central design idea, then introducing the main components and how their relationship implements it.]
 
-Use Ownership and Flows as Markdown subsections within Design when that structure helps navigation.
-Give distinct flows descriptive names, such as Startup, Request handling, or Restart. For a small
-change, preserve the same progression in connected paragraphs without requiring subheadings.
-Ownership and flows remain content of the `design` string, not additional JSON fields or execution
-milestones. Include the detail needed to implement without the prior conversation, with no fixed
-paragraph limit. Preserve consequential rationale in Decisions and explain existing behavior in
-Background. Do not include executable implementation bodies, mutable execution progress, or claims
-that implementation or verification has finished.
+### Ownership
+[One short paragraph per main component, explaining the responsibility and state or lifecycle it controls.]
+
+### Flows
+**[Flow name].** [1–2 concise sentences tracing the trigger through its owners to the result.]
+```
+
+**Opening — 2–3 sentences.** Begin with the central design idea and what it enables or preserves.
+Then introduce the main components and explain how their relationship implements that idea.
+
+**Ownership.** Expand the main components introduced in the opening, in the same order. Use one
+paragraph per component, with 1–2 sentences explaining its responsibility and the state or lifecycle
+it controls. Group supporting modules and data types under their owner. Keep the same level of
+detail across paragraphs and use prose rather than bullets or a type inventory.
+
+**Flows.** Prefer at most three named flows, each comprising 1–2 concise sentences. Trace a concrete
+trigger through the established owners to its result, including ordering or failure behavior when
+it determines the outcome. Add another flow only for a distinct, essential lifecycle or failure
+path. Separate flows with a blank line and keep each sentence focused rather than compressing an
+implementation checklist into it.
+
+Describe the scope of the change, not the architecture of the entire system. For bugfixes, explain
+the invariant being restored and the mechanism that restores it. Describe only the existing owners
+and interactions relevant to the fix. A single ownership paragraph and one flow are sufficient
+for a localized change, and an existing function or module can be the owner. Do not invent new
+components to fill the template.
+
+Describe the target design in present tense. Preserve terminology across sections, remove repeated
+claims, and demonstrate guarantees through concrete mechanisms. Keep defaults and API details in
+declarations, rationale in Decisions, and existing behavior in Background. Execution instructions
+remain governed by the active system and repository instructions. The complete plan must support
+implementation without the prior conversation.
+
+Ownership and Flows remain content of the `design` string, not additional JSON fields. Omit a Files
+and artifacts section, repeated file inventories, routine housekeeping, and explanations of Harness
+format limitations. Do not include executable implementation bodies, mutable execution progress,
+or claims that implementation or verification has finished.
 
 Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
 Encode paragraph breaks as `\n\n` inside JSON strings. Each rendered metadata section is limited
@@ -175,7 +203,7 @@ A plan's metadata can use this shape:
       "rationale": "A single publication point keeps each submitted frame's texture selection consistent."
     }
   ],
-  "design": "Texture replacement separates preparation from publication so a pending replacement leaves the current texture usable.\n\n### Ownership\n`TextureStreaming` owns preparation and exposes progress and cancellation through `TextureRequest`. `TextureRegistry` owns published handles and retains replaced allocations while submitted frames still use them.\n\n### Flows\n**Replacement.** A request prepares a new texture. Once ready, the registry publishes it at a frame boundary and releases the previous allocation after its final GPU use.\n\n**Cancellation.** Cancelling pending preparation leaves the published handle unchanged.",
+  "design": "Texture replacement separates preparation from publication so pending work leaves the current texture usable. `TextureStreaming` prepares replacements for `TextureRegistry`, which publishes the handles used by the renderer.\n\n### Ownership\n`TextureStreaming` controls preparation and exposes progress and cancellation through `TextureRequest`.\n\n`TextureRegistry` controls publication and retains replaced allocations while submitted frames still use them.\n\n### Flows\n**Replacement.** A request prepares a new texture. Once ready, the registry publishes it at a frame boundary and releases the previous allocation after its final GPU use.\n\n**Cancellation.** Cancelling pending preparation leaves the published handle unchanged.",
   "verification": {
     "automated": "cargo test --release texture_replacement",
     "manual": "- Cancel a pending replacement and confirm the current texture remains visible.\n- Replace a texture with frames in flight and confirm rendering remains valid."
@@ -211,8 +239,8 @@ and declaration edits can share one atomic patch:
 -  "objective": "",
 +  "objective": "Support observable, cancellable texture requests.",
 @@
--  "design": "",
-+  "design": "`TextureStreaming` returns observable request handles and supports cancellation.",
+-  "usage": "",
++  "usage": "Start a replacement, cancel it before publication, and confirm the existing texture remains visible.",
 *** End Patch
 ```
 
@@ -444,8 +472,9 @@ numbers. Other rows use proposed line numbers. Comments follow each excerpt as `
 input. Resolve each comment against the saved design and preserve its intended context.
 Read current proposed files before revising them. Preserve useful decisions and submit the new version.
 
-Unsupported file formats cannot be edited through declaration controls. Describe required changes
-to those files in Design, without inventing a supported-file substitute. Planning never writes
+Unsupported file formats cannot be edited through declaration controls. Preserve essential changes
+to those files briefly alongside their owning component in Design when not represented elsewhere,
+without explaining the format limitation or inventing a supported-file substitute. Planning never writes
 implementation bodies or performs execution. For a function behavior change, retain the signature
 when it remains valid and add or update its Change summary in the virtual declaration. Explain the
 behavior in Design and include its coverage in Tests. Never manufacture an interface change to make
