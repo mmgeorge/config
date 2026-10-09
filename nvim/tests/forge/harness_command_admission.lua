@@ -43,4 +43,26 @@ state.busy = true
 vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan" })
 controller.submit()
 assert(#requests == 3 and #warnings == 0 and #state.queue == 0)
+state.busy = false
+state.capability = { fast_mode = true, ultrafast_mode = true }
+controller.configure = function(params) state.session.service_tier = params.service_tier end
+for _, submit in ipairs({ controller.submit, controller.queue_submit }) do
+  for _, selection in ipairs({ { "/fast", "fast" }, { "/ultrafast", "ultrafast" }, { "/ultrafast", "default" } }) do
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { selection[1] })
+    submit()
+    assert(state.session.service_tier == selection[2], "slash command selected the wrong tier")
+    assert(#state.queue == 0, "service-tier command was queued as a prompt")
+  end
+end
+vim.cmd("new")
+vim.api.nvim_set_current_buf(state.composer_buf)
+vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/x" })
+vim.api.nvim_win_set_cursor(0, { 1, 1 })
+for _, supported in ipairs({ true, false }) do
+  state.capability.ultrafast_mode = supported
+  local completion
+  source.new():get_completions({}, function(result) completion = result end)
+  assert(vim.iter(completion.items):any(function(item) return item.label == "/ultrafast" end) == supported,
+    "ultrafast completion ignored backend capability")
+end
 print("harness_command_admission: passed")

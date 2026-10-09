@@ -50,8 +50,8 @@ pub(super) fn project(
     let mut source_end = HashMap::new();
     let mut omitted = 0;
     for (index, mut row) in source.into_iter().enumerate() {
-        if row.id.0.starts_with("plan:description:") || row.id.0.starts_with("plan:task:")
-            || row.id.0.starts_with("plan:validation/manual:") {
+        if row.id.0.starts_with("plan:metadata:")
+            && !row.id.0.starts_with("plan:metadata:verification/automated:") {
             row = forge_buffer::markdown::MarkdownRenderer::source(
                 row.id.clone(),
                 &row.text.wire_rows().join("\n"),
@@ -474,40 +474,57 @@ fn rows(
     }
     let mut overview = Vec::new();
     let mut section_anchor = Vec::new();
-    let mut validation_start = None;
-    for (name, title, text, section, label) in [
-        ("task", "Task", design.document.task.as_str(), super::PlanSection::Task, "Requested task"),
-        ("description", "Description", design.document.description.as_str(), super::PlanSection::Overview, "Change description"),
-        ("validation/automated", "Automated", design.document.validation.automated.as_str(), super::PlanSection::AutomatedValidation, "Automated validation commands"),
-        ("validation/manual", "Manual", design.document.validation.manual.as_str(), super::PlanSection::ManualValidation, "Manual validation checks"),
-    ] {
-        if name == "validation/automated" {
-            validation_start = Some(overview.len());
+    let mut verification_start = None;
+    for metadata in design.document.sections() {
+        let name = metadata.path;
+        let section = metadata.section;
+        if matches!(section, super::PlanSection::Usage | super::PlanSection::Decisions)
+            && metadata.text.trim().is_empty() {
+            continue;
+        }
+        if section == super::PlanSection::AutomatedVerification {
+            let changes_start = overview.len();
             overview.push(forge_diff::projection::header(
-                BlockId("plan:section:validation".into()),
-                vec![TextChunk { text: "Validation:".into(), capture: "ForgeStatusHeader".into() }], 0,
+                BlockId("plan:section:changes".into()),
+                vec![TextChunk { text: "Proposed declaration changes:".into(), capture: "ForgeStatusHeader".into() }], 0,
+            )?);
+            let offset = overview.len() as u32;
+            for anchor in &mut navigation.anchor { anchor.line += offset; }
+            section_anchor.push(PlanNavigationAnchor {
+                line: offset, target: PlanReviewTarget::Section { section: super::PlanSection::Files },
+                json_path: "/design".into(), path: None, label: "Proposed declaration changes".into(),
+            });
+            overview.append(&mut block);
+            fold(&mut overview, changes_start, "plan:section:changes")?;
+            overview.push(BufferBlock {
+                id: BlockId("plan:section:changes:separator".into()),
+                text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
+            });
+            verification_start = Some(overview.len());
+            overview.push(forge_diff::projection::header(
+                BlockId("plan:section:verification".into()),
+                vec![TextChunk { text: "Verification:".into(), capture: "ForgeStatusHeader".into() }], 0,
             )?);
             section_anchor.push(PlanNavigationAnchor {
                 line: overview.len() as u32,
-                target: PlanReviewTarget::Section { section: super::PlanSection::Validation },
-                json_path: "/design/document/validation".into(), path: None, label: "Validation requirements".into(),
+                target: PlanReviewTarget::Section { section: super::PlanSection::Verification },
+                json_path: "/design/document/verification".into(), path: None, label: "Verification".into(),
             });
         }
         let start = overview.len();
         let fold_id = format!("plan:section:{name}");
-        let nested = name.starts_with("validation/");
+        let nested = name.starts_with("verification/");
         let heading_indent = if nested { "  " } else { "" };
-        let text_indent = if name == "validation/manual" { "  " } else if nested { "    " } else { "" };
+        let text_indent = if section == super::PlanSection::ManualVerification { "  " } else if nested { "    " } else { "" };
+        let title = metadata.title.rsplit('/').next().unwrap();
         overview.push(forge_diff::projection::header(
             BlockId(fold_id.clone()),
             vec![TextChunk { text: format!("{heading_indent}{title}:"), capture: "ForgeStatusHeader".into() }], 0,
         )?);
-        let text = if text.trim().is_empty() {
-            match name { "task" => "No task overview.", "description" => "No description.", _ => "None specified." }
-        } else { text };
+        let text = if metadata.text.trim().is_empty() { "None specified." } else { metadata.text.as_str() };
         for (index, line) in text.lines().enumerate() {
             overview.push(BufferBlock {
-                id: BlockId(format!("plan:{name}:{index}")),
+                id: BlockId(format!("plan:metadata:{name}:{index}")),
                 text: BufferText::from_rows([format!("{text_indent}{line}")])?, metadata: BlockMetadata::default(),
             });
         }
@@ -515,7 +532,7 @@ fn rows(
         for line in start as u32 + 1..=overview.len() as u32 {
             section_anchor.push(PlanNavigationAnchor {
                 line, target: PlanReviewTarget::Section { section },
-                json_path: format!("/design/document/{name}"), path: None, label: label.into(),
+                json_path: format!("/design/document/{name}"), path: None, label: metadata.title.into(),
             });
         }
         overview.push(BufferBlock {
@@ -523,34 +540,8 @@ fn rows(
             text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
         });
     }
-    if let Some(start) = validation_start {
-        fold(&mut overview, start, "plan:section:validation")?;
-    }
-    let changes_start = overview.len();
-    overview.push(forge_diff::projection::header(
-        BlockId("plan:section:changes".into()),
-        vec![TextChunk {
-            text: "Changes:".into(),
-            capture: "ForgeStatusHeader".into(),
-        }],
-        0,
-    )?);
-    let count = overview.len() as u32;
-    for anchor in &mut navigation.anchor {
-        anchor.line += count;
-    }
+    if let Some(start) = verification_start { fold(&mut overview, start, "plan:section:verification")?; }
     navigation.anchor.extend(section_anchor);
-    navigation.anchor.push(PlanNavigationAnchor {
-        line: count,
-        target: PlanReviewTarget::Section {
-            section: super::PlanSection::Files,
-        },
-        json_path: "/design".into(),
-        path: None,
-        label: "Declaration changes".into(),
-    });
-    overview.extend(block);
-    fold(&mut overview, changes_start, "plan:section:changes")?;
     block = overview;
     navigation.anchor.sort_by_key(|anchor| anchor.line);
     ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
@@ -735,11 +726,15 @@ fn public_blocks(
         .iter()
         .position(|block| block.id.0 == "plan:section:changes")
         .context("changes section is missing")?;
-    if output[changes + 1..]
+    let mut verification = output
         .iter()
-        .all(|block| block.id.0.starts_with("plan:annotation:"))
+        .position(|block| block.id.0 == "plan:section:verification")
+        .context("verification section is missing")?;
+    if output[changes + 1..verification]
+        .iter()
+        .all(|block| block.id.0.starts_with("plan:annotation:") || block.text.wire_rows().iter().all(|row| row.trim().is_empty()))
     {
-        output.push(forge_diff::projection::header(
+        output.insert(changes + 1, forge_diff::projection::header(
             BlockId("plan:design:public:empty".into()),
             vec![TextChunk {
                 text: "No public declaration changes.".into(),
@@ -747,9 +742,12 @@ fn public_blocks(
             }],
             0,
         )?);
+        verification += 1;
     }
+    let mut trailing = output.split_off(verification);
     output[changes].metadata.fold.clear();
     fold(&mut output, changes, "plan:section:changes")?;
+    output.append(&mut trailing);
     Ok(output)
 }
 
@@ -937,8 +935,8 @@ mod tests {
         let mut document = crate::plan::document::test_fixture("validation", "Validation");
         let mut design = super::super::DeclarationDesign::default();
         design.proposed.insert("lib.rs".into(), "pub struct State;\n".into());
-        design.document.validation.automated = "cargo test -- --test-threads=1\nprintf '# *literal*'".into();
-        design.document.validation.manual = "- Resize and confirm `State` remains visible.".into();
+        design.document.verification.automated = "cargo test -- --test-threads=1\nprintf '# *literal*'".into();
+        design.document.verification.manual = "- Resize and confirm `State` remains visible.".into();
         design.validation = Some(crate::declaration::DeclarationValidation {
             diagnostic: vec![crate::declaration::DeclarationDiagnostic {
                 path: "plan".into(), line: 1, column: 0, reference: String::new(), error: false,
@@ -950,10 +948,10 @@ mod tests {
         for public_only in [false, true] {
             let (block, target) = project(&document, &Default::default(), &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
             assert!(block.iter().flat_map(|block| block.text.wire_rows()).all(|line| !line.contains("Cargo source resolution failed") && !line.contains("dependency source is unavailable")));
-            let command = block.iter().find(|block| block.id.0 == "plan:validation/automated:1").unwrap();
+            let command = block.iter().find(|block| block.id.0 == "plan:metadata:verification/automated:1").unwrap();
             assert_eq!(command.text.row(0), Some("    printf '# *literal*'"));
-            assert!(target.values().any(|anchor| anchor.json_path == "/design/document/validation/automated"));
-            assert!(target.values().any(|anchor| anchor.json_path == "/design/document/validation/manual"));
+            assert!(target.values().any(|anchor| anchor.json_path == "/design/document/verification/automated"));
+            assert!(target.values().any(|anchor| anchor.json_path == "/design/document/verification/manual"));
             forge_buffer::document::BufferDocument::new(forge_buffer::identity::DocumentId("validation".into()), block.clone()).unwrap();
             let declaration = block.iter().find(|block| block.text.row(0) == Some("pub struct State;")).unwrap();
             assert!(declaration.metadata.target.iter().any(|range| target.contains_key(&range.id)));
@@ -964,7 +962,7 @@ mod tests {
     fn declaration_folds_keep_attributes_and_valid_filtered_endpoints() {
         let mut document = crate::plan::document::test_fixture("containers", "Containers");
         let mut design = super::super::DeclarationDesign::default();
-        design.document.description = "Expose configuration failures and state.".into();
+        design.document.design = "Expose configuration failures and state.".into();
         design.proposed.insert("config.rs".into(), "#[derive(Debug)]\npub enum ConfigError {\n  /// Invalid arena size.\n  ArenaSize,\n  Radius,\n}\n\npub struct State {\n  pub count: u64,\n  private: u64,\n}\n\nimpl State {\n  pub fn count(&self) -> u64;\n  fn hidden();\n}\n\npub struct Empty {\n  private: u64,\n}\n".into());
         document.design = Some(design);
         for public_only in [false, true] {
@@ -995,21 +993,24 @@ mod tests {
     fn behavior_only_description_retains_comment_targets_in_both_views() {
         let mut document = crate::plan::document::test_fixture("summary", "Summary");
         let mut design = super::super::DeclarationDesign::default();
-        design.document.task = "Support observable cancellation and safe texture replacement.".into();
-        design.document.description = "Requests retain their cancellation state until all pending work finishes. Publication occurs only after upload completion and the previous allocation remains alive until submitted frames finish.".into();
+        design.document.objective = "Support observable cancellation and safe texture replacement.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Requests retain their cancellation state until all pending work finishes. Publication occurs only after upload completion and the previous allocation remains alive until submitted frames finish.".into();
         document.design = Some(design);
         let saved = serde_json::to_vec(&document).unwrap();
         let rendered = render(&document).unwrap();
         assert!(
             rendered
                 .markdown
-                .starts_with("Task:\nSupport observable cancellation and safe texture replacement.\n\nDescription:\nRequests retain")
+                .starts_with("Objective:\nSupport observable cancellation and safe texture replacement.\n\nRequirements:")
         );
         let task_anchor = rendered.navigation.resolve_line(1).unwrap();
-        assert_eq!(task_anchor.json_path, "/design/document/task");
-        assert_eq!(task_anchor.target, PlanReviewTarget::Section { section: super::super::PlanSection::Task });
-        let anchor = rendered.navigation.resolve_line(4).unwrap();
-        assert_eq!(anchor.json_path, "/design/document/description");
+        assert_eq!(task_anchor.json_path, "/design/document/objective");
+        assert_eq!(task_anchor.target, PlanReviewTarget::Section { section: super::super::PlanSection::Objective });
+        let design_line = rendered.markdown.lines().position(|line| line == "Design:").unwrap() as u32 + 1;
+        let anchor = rendered.navigation.resolve_line(design_line).unwrap();
+        assert_eq!(anchor.json_path, "/design/document/design");
         let annotation = ReviewAnnotation {
                 parent_id: None,
                 kind: Default::default(),
@@ -1017,8 +1018,8 @@ mod tests {
             id: "description".into(),
             anchor: None,
             source: super::super::PlanAnnotationInput {
-                start_line: 5,
-                end_line: 5,
+                start_line: design_line + 1,
+                end_line: design_line + 1,
                 body: "Confirm the cancellation lifecycle".into(),
             },
         };
@@ -1037,23 +1038,23 @@ mod tests {
             .unwrap();
             let description = block
                 .iter()
-                .find(|block| block.id.0 == "plan:description:0")
+                .find(|block| block.id.0 == "plan:metadata:design:0")
                 .unwrap();
             assert_eq!(description.text.row_count(), 1);
             assert_eq!(
                 description.text.row(0),
-                Some(document.design.as_ref().unwrap().document.description.as_str()),
+                Some(document.design.as_ref().unwrap().document.design.as_str()),
             );
             let header = block
                 .iter()
-                .find(|block| block.id.0 == "plan:section:description")
+                .find(|block| block.id.0 == "plan:section:design")
                 .unwrap();
             let endpoint = &header.metadata.fold[0].end;
             assert_eq!(endpoint.block.0, "plan:annotation:description");
             assert!(
                 block
                     .iter()
-                    .any(|block| block.text.row(0) == Some("Changes:"))
+                    .any(|block| block.text.row(0) == Some("Proposed declaration changes:"))
             );
             assert!(
                 block
@@ -1065,7 +1066,7 @@ mod tests {
             assert!(
                 target
                     .values()
-                    .any(|anchor| anchor.json_path == "/design/document/description")
+                    .any(|anchor| anchor.json_path == "/design/document/design")
             );
             assert!(
                 block
@@ -1171,12 +1172,12 @@ mod tests {
         assert!(
             block
                 .iter()
-                .any(|block| block.text.row(0) == Some("Description:"))
+                .any(|block| block.text.row(0) == Some("Design:"))
         );
         assert!(
             block
                 .iter()
-                .any(|block| block.text.row(0) == Some("Changes:"))
+                .any(|block| block.text.row(0) == Some("Proposed declaration changes:"))
         );
         assert!(
             target
@@ -1228,7 +1229,7 @@ mod tests {
             render(&document)
                 .unwrap()
                 .markdown
-                .contains("Changes:\nNo declaration changes.")
+                .contains("Proposed declaration changes:\nNo declaration changes.")
         );
     }
 
@@ -1281,21 +1282,17 @@ mod tests {
             .iter()
             .filter(|block| !block.metadata.fold.is_empty())
             .collect();
-        assert_eq!(folded_header.len(), 8);
-        assert_eq!(folded_header[0].text.row(0), Some("Task:"));
-        assert_eq!(folded_header[1].text.row(0), Some("Description:"));
-        assert_eq!(folded_header[2].text.row(0), Some("Validation:"));
-        assert_eq!(folded_header[3].text.row(0), Some("  Automated:"));
-        assert_eq!(folded_header[4].text.row(0), Some("  Manual:"));
-        assert_eq!(folded_header[5].text.row(0), Some("Changes:"));
-        assert!(
-            folded_header[6]
-                .text
-                .row(0)
-                .unwrap()
-                .starts_with("Modified src/lib.rs")
-        );
-        assert!(folded_header[7].text.row(0).unwrap().starts_with("@@"));
+        assert_eq!(folded_header.len(), 10);
+        assert_eq!(folded_header[0].text.row(0), Some("Objective:"));
+        assert_eq!(folded_header[1].text.row(0), Some("Requirements:"));
+        assert_eq!(folded_header[2].text.row(0), Some("Background:"));
+        assert_eq!(folded_header[3].text.row(0), Some("Design:"));
+        assert_eq!(folded_header[4].text.row(0), Some("Proposed declaration changes:"));
+        assert!(folded_header[5].text.row(0).unwrap().starts_with("Modified src/lib.rs"));
+        assert!(folded_header[6].text.row(0).unwrap().starts_with("@@"));
+        assert_eq!(folded_header[7].text.row(0), Some("Verification:"));
+        assert_eq!(folded_header[8].text.row(0), Some("  Automated:"));
+        assert_eq!(folded_header[9].text.row(0), Some("  Manual:"));
         for header in folded_header {
             let fold = &header.metadata.fold[0];
             assert!(fold.heading_start.is_none());

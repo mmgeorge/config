@@ -434,7 +434,7 @@ impl<'a> CodexTurnCoordinator<'a> {
                 "input": [{ "type": "text", "text": text }],
                 "cwd": self.request.workspace,
                 "effort": self.request.effort,
-                "serviceTier": if self.request.fast_mode { Value::String("fast".into()) } else { Value::Null }
+                "serviceTier": self.request.service_tier
             }), self.request), &self.request.model),
         ).await?;
         let id = turn
@@ -842,7 +842,7 @@ mod test {
             harness_session_id: "session".into(), workspace,
             input: BackendInput::from_text("plan out a new one"), mode: PromptMode::Chat,
             model: "gpt-5.6-terra".into(), effort: "medium".into(), context_window: None,
-            fast_mode: false, execution_mode: PermissionMode::Read,
+            service_tier: crate::backend::ServiceTier::Standard, execution_mode: PermissionMode::Read,
             backend_session_id: Some("parent".into()), control_context: None,
         };
         let lane = SteeringLane::default();
@@ -881,6 +881,7 @@ mod test {
             let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
             let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
             assert_eq!(request["method"], "turn/start");
+            assert_eq!(request["params"]["serviceTier"], "ultrafast");
             for message in [
                 json!({"method":"item/completed","params":{"threadId":"child","turnId":"child-turn","item":{"id":"child-answer","type":"agentMessage","phase":"final_answer","text":"CHILD-PROGRESS"}}}),
                 json!({"method":"turn/completed","params":{"threadId":"child","turn":{"id":"child-turn","status":"completed"}}}),
@@ -897,7 +898,7 @@ mod test {
         let request = BackendRequest {
             harness_session_id: "session".into(), workspace, input: BackendInput::from_text("parent"),
             mode: PromptMode::Chat, model: "gpt-5.6-terra".into(), effort: "medium".into(),
-            context_window: None, fast_mode: false, execution_mode: PermissionMode::Read,
+            context_window: None, service_tier: crate::backend::ServiceTier::Ultrafast, execution_mode: PermissionMode::Read,
             backend_session_id: Some("parent".into()), control_context: None,
         };
         let lane = crate::backend::steering::SteeringLane::default();
@@ -1026,7 +1027,7 @@ mod test {
                 model: "gpt-5.6-terra".into(),
                 effort: "medium".into(),
                 context_window: None,
-                fast_mode: false,
+                service_tier: crate::backend::ServiceTier::Standard,
                 execution_mode: PermissionMode::Read,
                 backend_session_id: Some("parent".into()),
                 control_context: None,

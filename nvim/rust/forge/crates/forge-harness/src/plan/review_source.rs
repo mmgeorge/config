@@ -204,8 +204,10 @@ mod tests {
             "registry.rs".into(),
             "pub struct Registry {\n    first: u64,\n    second: u64,\n}\n".into(),
         );
-        design.document.description = "Revise registry declarations.".into();
-        design.document.task = "Revise the registry interface.".into();
+        design.document.design = "Revise registry declarations.".into();
+        design.document.objective = "Revise the registry interface.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
         design.proposed.get_mut("registry.rs").unwrap().push_str("pub fn inspect(registry: &Registry);\n");
         design.proposed_calls.insert("registry.rs".into(), crate::plan::calls::extract("registry.rs", "pub fn inspect(registry: &Registry) { registry.first; registry.second; }").unwrap());
         document.design = Some(design);

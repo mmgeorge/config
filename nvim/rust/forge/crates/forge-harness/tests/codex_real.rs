@@ -121,7 +121,7 @@ async fn initialize_real_codex_broker(
             params: json!({
                 "model": selected_model,
                 "effort": configured_effort,
-                "fast_mode": true
+                "service_tier": "fast"
             }),
         })
         .await;

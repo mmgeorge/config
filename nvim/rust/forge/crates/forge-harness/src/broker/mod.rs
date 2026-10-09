@@ -604,7 +604,7 @@ impl HarnessBroker {
                             plan_compact: preference.as_ref().is_some_and(|value| value.plan_compact),
                             plan_auto_approve_revisions: preference.as_ref().is_none_or(|value| value.plan_auto_approve_revisions),
                             context_window: None,
-                            fast_mode: preference.as_ref().is_some_and(|value| value.fast_mode),
+                            service_tier: preference.as_ref().map(|value| value.service_tier).unwrap_or_default(),
                             execution_mode: PermissionMode::Read,
                             current_task_id: None, default_write_permission: preference.as_ref().map_or(PermissionMode::Write, |value| value.default_write_permission), plan_permission: preference.as_ref().and_then(|value| value.plan_permission),
                             created_at_ms: now_ms,
@@ -1448,7 +1448,7 @@ impl HarnessBroker {
         let mut task = self.current_task()?;
         if let Some(task) = task.as_mut() {
             if !task.status.terminal() {
-                if self.current_goal()?.is_some_and(|goal| goal.state == GoalState::Active) {
+                if self.current_goal()?.is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused)) {
                     events.extend(self.pause_goal().await?.1);
                 }
                 task.status = if clear { TaskStatus::Cancelled } else { TaskStatus::Paused };
@@ -1587,6 +1587,15 @@ impl HarnessBroker {
                 task.begin(self.clock.now_ms())?;
                 task.operation_id = self.active_operation_id.clone();
                 self.store.save_task(&task)?;
+                if task.kind == TaskKind::Execute
+                    && let Some(plan_id) = task.plan_id.as_deref()
+                    && self.store.load_plan(plan_id)?.is_some_and(|plan| plan.state == PlanState::AwaitingReview)
+                {
+                    task.status = TaskStatus::Waiting;
+                    self.store.save_task(&task)?;
+                    self.save_session()?;
+                    return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
+                }
                 let resumed = match task.kind {
                     TaskKind::Plan => "Planning resumed".to_owned(),
                     TaskKind::Execute => format!("Execution resumed · {}", task.phase),
@@ -4270,7 +4279,7 @@ Planning continuation: turn {} of {}.",
     /// Retry finalization without submitting provider input or replaying tool execution.
     async fn cancel_settled_execution(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let mut event = Vec::new();
-        if self.current_goal()?.is_some_and(|goal| goal.state == GoalState::Active) {
+        if self.current_goal()?.is_some_and(|goal| matches!(goal.state, GoalState::Active | GoalState::Paused)) {
             let (_, goal_event) = self.pause_goal().await?;
             event.extend(goal_event);
         }
@@ -5677,13 +5686,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let document = self.plan_file.read_submitted_document(&self.session.id, &plan_id, revision)?;
         let design = document.design.context("plan has no declaration snapshot")?;
         let text = if params.get("document").and_then(Value::as_bool).unwrap_or(false) {
-            match path.as_str() {
-                "Task" => design.document.task.clone(),
-                "Description" => design.document.description.clone(),
-                "Validation/Automated" => design.document.validation.automated.clone(),
-                "Validation/Manual" => design.document.validation.manual.clone(),
-                _ => anyhow::bail!("unknown plan overview section"),
-            }
+            design.document.sections().into_iter().find(|section| section.title == path)
+                .context("unknown plan overview section")?.text
         } else if baseline {
             crate::plan::calls::present(&path, &design.baseline.get(&path).context("declaration baseline not found")?.text, design.baseline_calls.get(&path).map(Vec::as_slice).unwrap_or_default())?.declaration.text
         } else {
@@ -5951,7 +5955,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             });
         let admission = if mode == PromptMode::ExecutePlan
             && self.store.list_exchange(&self.session.id)?.last()
-                .is_some_and(|exchange| exchange.state == ExchangeState::Complete)
+                .is_some_and(|exchange| exchange.completed_at_ms.is_some())
         {
             self.store.list_plan_execution(&self.session.id)?.into_iter()
                 .find(|execution| execution.goal_id == goal.id)
@@ -6370,11 +6374,16 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         if let Some(value) = params.get("plan_permission") {
             self.session.plan_permission = serde_json::from_value(value.clone())?;
         }
-        if params.get("fast_mode").and_then(Value::as_bool).is_some() {
-            anyhow::ensure!(
-                self.capability.native_goal,
-                "fast mode requires the Codex backend"
-            );
+        let requested_service_tier = params.get("service_tier")
+            .map(|value| serde_json::from_value::<crate::backend::ServiceTier>(value.clone()))
+            .transpose()?;
+        if let Some(tier) = requested_service_tier {
+            let supported = match tier {
+                crate::backend::ServiceTier::Standard => true,
+                crate::backend::ServiceTier::Fast => self.capability.fast_mode,
+                crate::backend::ServiceTier::Ultrafast => self.capability.ultrafast_mode,
+            };
+            anyhow::ensure!(supported, "current backend does not support the requested service tier");
         }
         let requested_model = params.get("model").and_then(Value::as_str);
         let requested_effort = params.get("effort").and_then(Value::as_str);
@@ -6487,8 +6496,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 .and_then(Value::as_str)
                 .map(str::to_owned);
         }
-        if let Some(fast_mode) = params.get("fast_mode").and_then(Value::as_bool) {
-            self.session.fast_mode = fast_mode;
+        if let Some(service_tier) = requested_service_tier {
+            self.session.service_tier = service_tier;
         }
         self.session.plan_executor = plan_executor;
         self.session.plan_compact = plan_compact;
@@ -6594,7 +6603,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             model: self.session.model.clone(),
             effort: self.session.effort.clone(),
             context_window: self.session.context_window.clone(),
-            fast_mode: self.session.fast_mode,
+            service_tier: self.session.service_tier,
             execution_mode: if matches!(mode,PromptMode::Plan | PromptMode::PlanDiscussion | PromptMode::PlanQuestion) { PermissionMode::Read } else { self.session.execution_mode },
             backend_session_id: self.session.backend_session_id.clone(),
             control_context: self.control_turn_context(mode),
@@ -6800,7 +6809,7 @@ fn preference_for_session(
         model: session.model.clone(),
         effort: session.effort.clone(),
         model_setting,
-        fast_mode: session.fast_mode,
+        service_tier: session.service_tier,
         plan_executor: session.plan_executor.clone(),
         plan_compact: session.plan_compact,
         plan_auto_approve_revisions: session.plan_auto_approve_revisions,
@@ -6986,8 +6995,8 @@ mod test {
         let source = broker.capture_plan_review(&revised.id,revised.review_digest.as_deref().unwrap()).unwrap();
         assert!(source.rendered.markdown.contains("reviewed_change"));
         let overview = &source.document.design.as_ref().unwrap().document;
-        for (path, expected) in [("Task", &overview.task), ("Description", &overview.description),
-            ("Validation/Automated", &overview.validation.automated), ("Validation/Manual", &overview.validation.manual)] {
+        for (path, expected) in [("Objective", &overview.objective), ("Design", &overview.design),
+            ("Verification/Automated", &overview.verification.automated), ("Verification/Manual", &overview.verification.manual)] {
             let (snapshot, _) = broker.read_plan_declaration(json!({"plan_id":revised.id,
                 "revision":2,"document":true,"path":path})).unwrap();
             assert_eq!(snapshot["text"].as_str().unwrap(), expected);
@@ -7104,23 +7113,30 @@ mod test {
             let document = context.plan_document.as_ref().unwrap();
             let plan_id = document.plan_id.clone();
             let version = document.version;
-            let description = &document.design.as_ref().unwrap().document.description;
+            let description = &document.design.as_ref().unwrap().document.design;
             let before = serde_json::to_string(description)?;
             let after = serde_json::to_string(&format!("{description} Preserve score reset behavior."))?;
             std::fs::write(Path::new(&request.workspace).join("added.rs"), "pub fn extra() {}\n")?;
-            let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": {before}\n+  \"description\": {after}\n*** Update File: added.rs\n@@\n-pub fn extra();\n+pub fn extra() -> u32;\n*** End Patch");
+            let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": {before},\n+  \"design\": {after},\n*** Update File: added.rs\n@@\n-pub fn extra();\n+pub fn extra() -> u32;\n*** End Patch");
             let mut runtime = ControlToolRuntime::new(context);
             runtime.invoke(ControlToolInvocation { name:"harness_design_apply_patch".into(), arguments:json!({"plan_id":plan_id,"expected_version":version,"patch":patch}) }).await?;
             let result = runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(), arguments:json!({"plan_id":plan_id,"expected_version":version+1,"reason":"Verification needs an explicit score reset requirement"}) }).await?;
             assert!(result.message.contains("transitioned"));
-            Ok(crate::backend::BackendOutput { backend_session_id:Some("revision-execution".into()), ..Default::default() })
+            Ok(crate::backend::BackendOutput {
+                backend_session_id:Some("revision-execution".into()),
+                capability: crate::backend::BackendCapability {
+                    execution_mode_list: vec![PermissionMode::Write],
+                    ..Default::default()
+                },
+                ..Default::default()
+            })
         }
         async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
     }
 
     #[tokio::test]
     async fn execution_revisions_preserve_the_original_and_respect_review_and_user_pause() {
-        for decision in ["automatic", "accept", "recovered_accept", "paused_accept", "reject", "changes"] {
+        for decision in ["automatic", "accept", "recovered_accept", "recovered_interrupted", "recovered_cancelled", "recovered_failed", "paused_accept", "reject", "changes"] {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = InitializeRequest {
@@ -7149,12 +7165,26 @@ mod test {
                 assert_eq!(execution.revision, 1);
                 assert_eq!(execution.state, PlanExecutionState::Paused);
                 assert!(broker.resume_goal(None, None).await.unwrap_err().to_string().contains("review the pending"));
-                if decision == "recovered_accept" {
+                if decision.starts_with("recovered_") {
                     let mut previous = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
-                    broker.capture_final_checkpoint(&mut previous, ExchangeState::Complete).await.unwrap();
+                    let outcome = match decision {
+                        "recovered_interrupted" => ExchangeState::Interrupted,
+                        "recovered_cancelled" => ExchangeState::Cancelled,
+                        "recovered_failed" => ExchangeState::Failed,
+                        _ => ExchangeState::Complete,
+                    };
+                    broker.capture_final_checkpoint(&mut previous, outcome).await.unwrap();
                     broker.exchange_runtime = None;
                 }
-                if decision == "paused_accept" { broker.pause_goal().await.unwrap(); }
+                if decision == "paused_accept" {
+                    broker.pause_task(false).await.unwrap();
+                    let before = broker.store.list_exchange(&broker.session.id).unwrap().len();
+                    let resumed = broker.dispatch(Request { id:3, method:"task.transition".into(), params:json!({"action":"resume"}) }).await;
+                    assert!(resumed.response.error().is_none(), "{:?}", resumed.response.error());
+                    assert_eq!(broker.current_task().unwrap().unwrap().status, crate::task::TaskStatus::Waiting);
+                    assert_eq!(broker.store.list_exchange(&broker.session.id).unwrap().len(), before,
+                        "pending revision resume started provider work before review");
+                }
                 let events = if decision == "reject" { broker.cancel_plan().unwrap().1 }
                     else if decision == "changes" { broker.request_plan_changes(json!({"comment":"Retain the approved scope"})).await.unwrap().1 }
                     else { broker.begin_plan_acceptance(json!({"plan_id":plan.id})).unwrap().1 };
@@ -7177,14 +7207,14 @@ mod test {
                     broker.backend = Arc::new(NoProgressExecutionBackend);
                     broker.continue_goal().await.unwrap();
                     let continued = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
-                    assert_eq!(continued.id == previous.id, decision != "recovered_accept");
+                    assert_eq!(continued.id == previous.id, !decision.starts_with("recovered_"));
                     assert_eq!(continued.execution_id.as_deref(), Some(execution_id.as_str()));
                     assert_eq!(continued.kind, ExchangeKind::PlanExecution);
                 }
             }
             assert_eq!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 1).unwrap(), original);
             let revised = broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 2).unwrap().design.unwrap();
-            assert!(revised.document.description.contains("score reset"));
+            assert!(revised.document.design.contains("score reset"));
             assert!(revised.proposed.contains_key("added.rs"));
             assert!(!revised.baseline.contains_key("added.rs"), "implemented additions must not become the original baseline");
             assert!(broker.execution_review(&plan.id).unwrap().unwrap().contains("Original approved revision: 1"));
@@ -8253,8 +8283,10 @@ mod test {
         let previous_metadata = serde_json::to_string_pretty(&design.document).unwrap()
             .lines().map(|line| format!("-{line}\n")).collect::<String>();
         let mut metadata = design.document.clone();
-        metadata.task = "Implement the migration strategy.".into();
-        metadata.description = overview.into();
+        metadata.objective = "Implement the migration strategy.".into();
+        metadata.background = "The fixture contains the original implementation.".into();
+        metadata.requirements = vec!["Preserve the migration contract.".into()];
+        metadata.design = overview.into();
         let proposed_metadata = serde_json::to_string_pretty(&metadata).unwrap()
             .lines().map(|line| format!("+{line}\n")).collect::<String>();
         let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{previous_metadata}{proposed_metadata}*** End Patch"));
@@ -8874,7 +8906,7 @@ mod test {
             plan_compact: false,
             plan_auto_approve_revisions: true,
             context_window: None,
-            fast_mode: false,
+            service_tier: crate::backend::ServiceTier::Standard,
             execution_mode: PermissionMode::Read,
             current_task_id: None, default_write_permission: PermissionMode::Write, plan_permission: None,
             created_at_ms: 0,
@@ -8907,7 +8939,7 @@ mod test {
                 model: "other-model".into(),
                 effort: "high".into(),
                 model_setting,
-                fast_mode: false,
+                service_tier: crate::backend::ServiceTier::Standard,
                 plan_executor: Default::default(),
                 plan_compact: false,
                 plan_auto_approve_revisions: true,
@@ -9428,8 +9460,8 @@ mod test {
             .find(|block| block.id.0 == "child-exchange:summary")
             .unwrap();
         assert_eq!(
-            summary.text.wire_rows().join(""),
-            "▸ Thought 1s (1s), 1.0k I (90%) → 100 R / 100 O (~200 tps), 1 request"
+            summary.text.wire_rows().join("").split_whitespace().collect::<Vec<_>>().join(" "),
+            "▸ Thought 1s (0s tools) │ ~200 tok/s │ I 1.0k (90%) · R 100 · O 100 │ 1 req · 0 tools"
         );
     }
 
@@ -10102,11 +10134,20 @@ mod test {
                     "model": "gpt-5.6",
                     "effort": "low",
                     "context_window": "default",
-                    "fast_mode": true
+                    "service_tier": "ultrafast"
                 }),
             })
             .await;
         assert!(configured.response.error().is_none());
+        for invalid in [json!("warp"), json!(true), json!(null)] {
+            assert!(broker.configure_session(json!({"service_tier":invalid})).await.is_err());
+            assert_eq!(broker.session.service_tier, crate::backend::ServiceTier::Ultrafast);
+        }
+        broker.capability.ultrafast_mode = false;
+        assert!(broker.configure_session(json!({"service_tier":"ultrafast"})).await.is_err());
+        assert_eq!(broker.session.service_tier, crate::backend::ServiceTier::Ultrafast);
+        broker.capability.ultrafast_mode = true;
+
         broker
             .dispatch(Request {
                 id: 11,
@@ -10156,7 +10197,7 @@ mod test {
         assert_eq!(session["model"], "gpt-5.6");
         assert_eq!(session["effort"], "low");
         assert_eq!(session["context_window"], "default");
-        assert_eq!(session["fast_mode"], true);
+        assert_eq!(session["service_tier"], "ultrafast");
         assert_eq!(session["execution_mode"], "read");
         drop(broker);
         let mut broker = HarnessBroker::initialize_with_clock(
@@ -10232,7 +10273,7 @@ mod test {
         .unwrap();
         assert_eq!(restarted.session.model, "gpt-5.6");
         assert_eq!(restarted.session.effort, "low");
-        assert!(restarted.session.fast_mode);
+        assert_eq!(restarted.session.service_tier, crate::backend::ServiceTier::Ultrafast);
         assert_eq!(restarted.session.execution_mode, PermissionMode::Full);
         assert!(
             !restarted

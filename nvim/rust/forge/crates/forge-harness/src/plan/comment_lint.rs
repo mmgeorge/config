@@ -377,8 +377,10 @@ mod test {
             "/// Returns settings.\npub fn standard();\n",
         );
         let mut design = design("lib.rs", proposed, None);
-        design.document.task = "Introduce settings".into();
-        design.document.description = "Provide default settings".into();
+        design.document.objective = "Introduce settings".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Provide default settings".into();
         design.validation = Some(crate::declaration::DeclarationValidation {
             fingerprint: crate::declaration::fingerprint(&design),
             checked: 0,

@@ -6,6 +6,8 @@ pub mod copilot;
 pub mod events;
 mod execution;
 mod steering;
+mod service_tier;
+pub use service_tier::ServiceTier;
 pub(crate) mod text_generation;
 pub use text_generation::TextGeneration;
 pub mod terminal;
@@ -69,6 +71,8 @@ pub struct BackendCapability {
     pub model_selection: bool,
     pub effort_selection: bool,
     pub fast_mode: bool,
+    /// Enables ultrafast tier selection for this provider.
+    pub ultrafast_mode: bool,
     pub permission_control: bool,
     #[serde(default)]
     pub execution_mode_list: Vec<PermissionMode>,
@@ -108,7 +112,8 @@ pub struct BackendRequest {
     pub model: String,
     pub effort: String,
     pub context_window: Option<String>,
-    pub fast_mode: bool,
+    /// Carries the session tier through explicit and continuation turns.
+    pub service_tier: ServiceTier,
     pub execution_mode: PermissionMode,
     pub backend_session_id: Option<String>,
     #[serde(skip, default)]
@@ -672,6 +677,42 @@ impl Backend for MockBackend {
         let steering = self.steering_lane(&request.harness_session_id);
         let mut active_steering = steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
+        let event = BackendEvent {
+            address: None,
+            turn_boundary: None,
+            kind: "assistant_message".into(),
+            text: Some(if request.mode == PromptMode::PlanQuestion {
+                "This declaration defines the proposed interface and separates its responsibility from the surrounding code. Implementation details remain outside the declaration plan.".into()
+            } else { format!("Mock response: {}", request.input.text()) }),
+            data: Value::Null,
+            activity: None,
+            summary: None,
+            task_update: None,
+        };
+        if self.emit_before_delay
+            && let Some(event_sink) = event_sink.as_ref()
+        {
+            let _ = event_sink.send_wait(event.clone()).await;
+        }
+        if self.write_before_delay {
+            std::fs::write(
+                std::path::Path::new(&request.workspace).join("mock-provider-change.txt"),
+                "changed before cancellation\n",
+            )?;
+        }
+        if let Some(delay) = self.delay {
+            let delay = tokio::time::sleep(delay);
+            tokio::pin!(delay);
+            loop {
+                tokio::select! {
+                    () = &mut delay => break,
+                    Some(command) = active_steering.receive() => {
+                        steering_text_list.push(command.text.clone());
+                        command.complete(Ok(())).await;
+                    }
+                }
+            }
+        }
         if request.mode == PromptMode::Plan {
             if let Some(document) = request.control_context.as_ref().and_then(|context| context.plan_document.as_ref()).filter(|document| document.design.is_some()) {
                 let path = "src/change.rs";
@@ -708,8 +749,10 @@ impl Backend for MockBackend {
                 }
                 let metadata = serde_json::to_string_pretty(&design.document)?.lines().map(|line| format!("-{line}\n")).collect::<String>();
                 let mut revised_metadata = design.document.clone();
-                revised_metadata.task = "Revise the registry interface.".into();
-                revised_metadata.description = "Revise the registry interface while preserving its ownership boundary.".into();
+                revised_metadata.objective = "Revise the registry interface.".into();
+                revised_metadata.background = "The registry owns published handles used by its callers.".into();
+                revised_metadata.requirements = vec!["Preserve the registry ownership boundary.".into()];
+                revised_metadata.design = "Revise the registry interface while preserving its ownership boundary.".into();
                 let added = serde_json::to_string_pretty(&revised_metadata)?.lines().map(|line| format!("+{line}\n")).collect::<String>();
                 let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{metadata}{added}*** End Patch"));
                 let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Design the requested change".into()),source_digests };
@@ -719,42 +762,6 @@ impl Backend for MockBackend {
                     design_patch:vec![change],plan_submit:Some(PlanSubmitRequest { plan_id:document.plan_id.clone(),expected_version:proposed.version }),
                     structured_plan:true,capability:mock_capability(),..Default::default()
                 });
-            }
-        }
-        let event = BackendEvent {
-            address: None,
-            turn_boundary: None,
-            kind: "assistant_message".into(),
-            text: Some(if request.mode == PromptMode::PlanQuestion {
-                "This declaration defines the proposed interface and separates its responsibility from the surrounding code. Implementation details remain outside the declaration plan.".into()
-            } else { format!("Mock response: {}", request.input.text()) }),
-            data: Value::Null,
-            activity: None,
-            summary: None,
-            task_update: None,
-        };
-        if self.emit_before_delay
-            && let Some(event_sink) = event_sink.as_ref()
-        {
-            let _ = event_sink.send_wait(event.clone()).await;
-        }
-        if self.write_before_delay {
-            std::fs::write(
-                std::path::Path::new(&request.workspace).join("mock-provider-change.txt"),
-                "changed before cancellation\n",
-            )?;
-        }
-        if let Some(delay) = self.delay {
-            let delay = tokio::time::sleep(delay);
-            tokio::pin!(delay);
-            loop {
-                tokio::select! {
-                    () = &mut delay => break,
-                    Some(command) = active_steering.receive() => {
-                        steering_text_list.push(command.text.clone());
-                        command.complete(Ok(())).await;
-                    }
-                }
             }
         }
         let planning_note = (request.mode == PromptMode::Plan).then(|| {
@@ -1101,6 +1108,7 @@ fn mock_capability() -> BackendCapability {
         model_selection: true,
         effort_selection: true,
         fast_mode: true,
+        ultrafast_mode: true,
         permission_control: true,
         execution_mode_list: vec![
             PermissionMode::Read,
@@ -1150,7 +1158,7 @@ mod test {
                         model: "mock-model".into(),
                         effort: "low".into(),
                         context_window: None,
-                        fast_mode: false,
+                        service_tier: crate::backend::ServiceTier::Standard,
                         execution_mode: PermissionMode::Read,
                         backend_session_id: None,
                         control_context: None,

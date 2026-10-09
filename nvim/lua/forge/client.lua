@@ -14,8 +14,12 @@ local RESERVED_METHOD = {
   initialize = true,
   ["harness.initialize"] = true,
   ["plan.scope_deviation_review"] = true,
+  ["trace.configure"] = true,
   ["turn.cancel"] = true,
   ["turn.restart"] = true,
+  ["task.transition"] = true,
+  ["task.operation"] = true,
+  ["health.get"] = true,
   ["approval.resolve"] = true,
   shutdown = true,
 }
@@ -106,14 +110,14 @@ end
 ---@return integer?
 local function admit_request(method, callback)
   local client = state()
-  if client.draining then callback(nil, "Forge host is draining") return nil end
+  if client.draining then callback(nil, "Forge host is draining", { code = "not_admitted" }) return nil end
   local count, ordinary = 0, 0
   for _, pending in pairs(client.pending) do
     count = count + 1
     if not RESERVED_METHOD[pending.method] then ordinary = ordinary + 1 end
   end
   if count >= 64 or (not RESERVED_METHOD[method] and ordinary >= 60) or client.next_id >= 9007199254740991 then
-    callback(nil, "Forge request admission is full")
+    callback(nil, "Forge request admission is full", { code = "not_admitted" })
     return nil
   end
   client.next_id = client.next_id + 1

@@ -515,8 +515,10 @@ mod tests {
             crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
         let mut document = crate::plan::document::test_fixture("uses", "Connect internal behavior");
         let mut design = design("lib.rs", "pub fn install() { worker(); }\nfn worker() {}\n");
-        design.document.task = "Connect internal behavior".into();
-        design.document.description = "Register the internal operation".into();
+        design.document.objective = "Connect internal behavior".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Register the internal operation".into();
         design.validation = Some(crate::declaration::DeclarationValidation {
             fingerprint: crate::declaration::fingerprint(&design),
             checked: 0,

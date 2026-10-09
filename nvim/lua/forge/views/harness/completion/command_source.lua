@@ -57,6 +57,7 @@ local command_list = {
   { label = "/effort", detail = "Select reasoning effort", capability = "effort_selection" },
   { label = "/model", detail = "Select the backend model", capability = "model_selection" },
   { label = "/fast", detail = "Toggle backend fast mode", capability = "fast_mode" },
+  { label = "/ultrafast", detail = "Toggle backend ultrafast mode", capability = "ultrafast_mode" },
 }
 
 ---@param text string

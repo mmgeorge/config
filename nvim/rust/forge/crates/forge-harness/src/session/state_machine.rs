@@ -3,7 +3,7 @@ use serde::Serialize;
 use crate::{
     broker::ElicitationOwner,
     exchange::{ActiveWait, Exchange, ExchangeKind, ExchangeState},
-    plan::{PlanRecord, PlanState},
+    plan::{PlanPhase, PlanRecord, PlanState, execution::SemanticProgress},
 };
 
 /// Represents the user-visible work class rendered by the timeline status.
@@ -29,6 +29,7 @@ pub enum SessionPhase {
         started_at_ms: i64,
         activity: WorkflowActivity,
         reasoning_summary: Option<String>,
+        execution: Option<ExecutionStatus>,
     },
     AwaitingInput {
         owner: ElicitationOwner,
@@ -52,6 +53,17 @@ pub enum SessionPhase {
     WaitingForAgent {
         agent_count: usize,
     },
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+/// Retains file comparison evidence independently of the model's reasoning summary.
+pub struct ExecutionStatus {
+    /// Execution identity used to preserve detail folds across progress updates.
+    pub id: String,
+    /// Current gate of the accepted plan's execution.
+    pub phase: PlanPhase,
+    /// Latest comparison of the accepted design and workspace files.
+    pub progress: SemanticProgress,
 }
 
 impl SessionPhase {
@@ -166,6 +178,7 @@ impl SessionPhase {
                 started_at_ms,
                 activity,
                 reasoning_summary,
+                execution: None,
             };
         }
         Self::Idle
@@ -238,6 +251,7 @@ mod test {
             SessionPhase::Working {
                 started_at_ms: 42,
                 activity: WorkflowActivity::Planning,
+                execution: None,
                 reasoning_summary: None,
             }
         );
@@ -343,6 +357,7 @@ mod test {
             SessionPhase::Working {
                 started_at_ms: 100,
                 activity: WorkflowActivity::Working,
+                execution: None,
                 reasoning_summary: None,
             }
         );

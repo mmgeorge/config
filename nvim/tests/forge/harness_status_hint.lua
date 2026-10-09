@@ -7,6 +7,7 @@ local transcript = buffer.open("status-hint", {})
 local command_set = commands.new()
 commands.register(command_set, "open_artifact", function() end)
 commands.register(command_set, "cancel", function() end)
+commands.register(command_set, "background", function() end)
 local original = vim.deepcopy(config.options.keymaps.harness.open_artifact)
 local original_cancel = vim.deepcopy(config.options.keymaps.harness.cancel)
 local namespace = vim.api.nvim_create_namespace("ForgeHarnessStatusHint")
@@ -40,14 +41,14 @@ for _, chunk in ipairs(review_hint[1][4].virt_text) do
 end
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 1, block = { {
-    id = "status", text = { "", "Working (1s)" },
+    id = "status", text = { "", "Working · 1s" },
     metadata = { target = {}, decoration = {}, fold = {}, editable_region = {} },
   } },
 }).kind == "Applied")
 assert(displayed() == "", "review hint must disappear when the status changes")
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 2, block = { {
-    id = "status", text = { "", "Working (2s · Inspecting repository structure)" },
+    id = "status", text = { "", "Working · 2s · Inspecting repository structure" },
     metadata = { target = { { id = "status:working", range = {
       start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
     } } }, decoration = {}, fold = {}, editable_region = {} },
@@ -61,21 +62,26 @@ local function working_marks()
     if mark[4].sign_text then
       assert(not mark[4].virt_text, "spinner inserted into status text")
     else
-      assert(mark[4].virt_text_pos == "inline")
-      for _, chunk in ipairs(mark[4].virt_text) do text[#text + 1] = chunk[1] end
+      if mark[4].virt_text then
+        assert(mark[4].virt_text_pos == "eol")
+        for _, chunk in ipairs(mark[4].virt_text) do text[#text + 1] = chunk[1] end
+      end
+      for _, line in ipairs(mark[4].virt_lines or {}) do
+        for _, chunk in ipairs(line) do text[#text + 1] = chunk[1] end
+      end
     end
   end
   return table.concat(text), marks
 end
 local text, marks = working_marks()
-assert(text:find("<C-c> to interrupt", 1, true), text)
+assert(text:find("<C-c> interrupt", 1, true), text)
 assert(#marks == 2 and marks[1][2] == 1 and marks[1][3] == 0)
-assert(marks[2][3] == #"Working (2s · Inspecting repository structure)" - 1)
+assert(marks[2][3] == 0 and marks[2][4].virt_text_pos == "eol")
 local first = marks[1][4].sign_text
 local state = require("forge.session").harness
 local original_session = state.session
 for _, mode in ipairs({ "read", "write", "full", "yolo", "plan" }) do
-  state.session = { mode = mode }
+  state.session = { execution_mode = mode }
   hint.render(transcript, command_set, 120)
   local _, colored = working_marks()
   local capture = require("forge.infra.highlights").harness_mode(mode)
@@ -99,7 +105,7 @@ assert(vim.wait(500, function()
 end, 20), "spinner did not animate")
 config.options.keymaps.harness.cancel = "<F7>"
 hint.render(transcript, command_set, 120)
-assert(working_marks():find("<F7> to interrupt", 1, true))
+assert(working_marks():find("<F7> interrupt", 1, true))
 config.options.keymaps.harness.cancel = false
 hint.render(transcript, command_set, 120)
 local _, disabled = working_marks()
@@ -107,26 +113,44 @@ assert(#disabled == 1, "disabled interrupt binding should leave only the spinner
 config.options.keymaps.harness.cancel = original_cancel
 transcript.background_terminals = { supported = true, terminal = { { id = "1" }, { id = "2" } } }
 hint.render(transcript, command_set, 120)
-assert(working_marks():find("2 background terminals", 1, true))
+assert(working_marks():find("2 terminals running · ot open · <C-c> interrupt", 1, true))
+local original_terminal_key = config.options.keymaps.harness.background
+config.options.keymaps.harness.background = "<F9>"
+hint.render(transcript, command_set, 120)
+assert(working_marks():find("<F9> open", 1, true))
+config.options.keymaps.harness.background = false
+hint.render(transcript, command_set, 120)
+assert(not working_marks():find(" open", 1, true), "disabled terminal binding was advertised")
+config.options.keymaps.harness.background = original_terminal_key
+transcript.background_terminals.terminal = { { id = "1" } }
+hint.render(transcript, command_set, 32)
+local narrow = vim.api.nvim_buf_get_extmark_by_id(transcript.buffer, namespace, 3, { details = true })
+local narrow_text = {}
+for _, line in ipairs(narrow[3].virt_lines) do
+  assert(vim.fn.strdisplaywidth(line[1][1]) <= 32, "terminal footer exceeded the window width")
+  narrow_text[#narrow_text + 1] = line[1][1]
+end
+assert(table.concat(narrow_text, " "):find("1 terminal running · ot open", 1, true))
+transcript.background_terminals.terminal = { { id = "1" }, { id = "2" } }
 transcript.recap = { text = "We fixed terminal counts." }
 hint.render(transcript, command_set, 120)
 local during_work = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
-assert(#during_work == 3, "recap replaced the working spinner or interrupt hint")
+assert(#during_work == 2, "recap replaced the working spinner or interrupt hint")
 transcript.recap = nil
 hint.render(transcript, command_set, 120)
 transcript.rename_status = "Generating session name…"
 hint.render(transcript, command_set, 120)
 local naming = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
-assert(#naming == 3, "naming replaced the main spinner or interrupt hint")
+assert(#naming == 2, "naming replaced the main spinner or interrupt hint")
 local footer = vim.api.nvim_buf_get_extmark_by_id(transcript.buffer, namespace, 3, { details = true })
 assert(footer[3].virt_lines[1][1][1] == "Generating session name…")
-assert(footer[1] == 1, "naming status was not placed below Working")
+assert(footer[1] == 2 and footer[3].virt_lines_above, "footer was not anchored outside trailing folds")
 transcript.rename_status = nil
 hint.render(transcript, command_set, 120)
-assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working (2s · Inspecting repository structure)",
+assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working · 2s · Inspecting repository structure",
   "terminal status modified the exchange clock")
 for revision, phase in ipairs({ "review-plan", "working" }) do
-  local label = phase == "working" and "Working (1s)" or "Awaiting plan review"
+  local label = phase == "working" and "Working · 1s" or "Awaiting plan review"
   assert(buffer.apply_snapshot(transcript, {
     document = transcript.document, revision = revision + 2, block = { {
       id = "status", text = { "", label },
@@ -140,7 +164,7 @@ end
 local _, resumed = working_marks()
 assert(resumed[1][4].sign_text and not resumed[1][4].virt_text,
   "resumed planning inserted its spinner inside the status label")
-assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working (1s)")
+assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working · 1s")
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 5, block = { {
     id = "finished", text = { "Thought for 2s", "Finished response" },
@@ -149,7 +173,7 @@ assert(buffer.apply_snapshot(transcript, {
 }).kind == "Applied")
 hint.render(transcript, command_set, 120)
 local idle = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
-assert(#idle == 1 and idle[1][4].virt_lines[2][1][1] == "2 background terminals running")
+assert(#idle == 1 and idle[1][4].virt_lines[1][1][1] == "2 terminals running · ot open")
 transcript.background_terminals = { supported = true, terminal = {} }
 hint.render(transcript, command_set, 120)
 assert(#vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, {}) == 0)
@@ -207,5 +231,31 @@ assert(#vim.api.nvim_buf_get_extmarks(question_transcript.buffer, namespace, 0, 
 config.options.keymaps.harness.reopen_question = original_question_key
 hint.clear(question_transcript.buffer)
 buffer.close(question_transcript)
+local details = buffer.open("implementation-details-hint", {})
+assert(buffer.apply_snapshot(details, {
+  document = details.document, revision = 0, block = {
+    { id = "status", text = { "", "Implementing · 133s · 1 file needs attention" },
+      metadata = { decoration = {}, fold = {}, editable_region = {}, target = { { id = "status:working", range = {
+        start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
+      } } } } },
+    { id = "status:implementation:execution", text = { "Implementation details", "src/player.rs", "move_player differs" },
+      metadata = { decoration = {}, target = {}, editable_region = {}, fold = { { id = "implementation", start = { row = 0, column = 0 },
+        ["end"] = { block = "status:implementation:execution", position = { row = 3, column = 0 } }, closed = true } } } },
+  },
+}).kind == "Applied")
+details.background_terminals = { supported = true, terminal = { { id = "1" } } }
+hint.render(details, command_set, 100)
+local spinner_mark = vim.api.nvim_buf_get_extmark_by_id(details.buffer, namespace, 1, { details = true })
+assert(spinner_mark[1] == 1, "details moved the spinner off the status heading")
+local terminal_mark = vim.api.nvim_buf_get_extmark_by_id(details.buffer, namespace, 3, { details = true })
+assert(terminal_mark[1] == 5 and terminal_mark[3].virt_lines_above,
+  "terminal footer must remain outside the collapsed implementation section")
+details.background_terminals.terminal = {}
+hint.render(details, command_set, 100)
+local interrupt_mark = vim.api.nvim_buf_get_extmark_by_id(details.buffer, namespace, 2, { details = true })
+assert(interrupt_mark[1] == 1, "interrupt hint did not return to the status heading")
+assert(#vim.api.nvim_buf_get_extmark_by_id(details.buffer, namespace, 3, {}) == 0)
+hint.clear(details.buffer)
+buffer.close(details)
 print("harness status hint passed")
 vim.cmd("qa!")

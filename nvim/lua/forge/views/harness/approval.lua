@@ -2,6 +2,7 @@ local Approval = {}
 
 local config = require("forge.infra.config")
 local picker = require("forge.views.picker")
+local keymaps = require("forge.shared.keymaps")
 
 local function option_list(request)
   local result = {}
@@ -18,8 +19,22 @@ end
 ---@param request table
 ---@param host table
 function Approval.open(request, host)
+  local interrupt_keys = keymaps.view_keys_for("harness", "cancel")
+  local actions = {}
+  for _, key in ipairs(interrupt_keys) do
+    actions[#actions + 1] = {
+      key = key,
+      modes = { "n", "i" },
+      desc = "Interrupt Harness task",
+      callback = function()
+        picker.close(true)
+        host.interrupt()
+      end,
+    }
+  end
   picker.open({
     owner = "approval",
+    action_list = actions,
     host = {
       window_list = host.window_list or { host.transcript_win },
       control_win = host.control_win or host.transcript_win,
@@ -35,7 +50,8 @@ function Approval.open(request, host)
         },
         column_headers = { "Decision" },
         option_list = option_list(request),
-        footer = "↑↓ select  Enter confirm  q close",
+        footer = "↑↓ select  Enter confirm  q close"
+          .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. " interrupt") or ""),
       },
     },
     on_confirm = function(result)

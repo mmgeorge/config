@@ -105,7 +105,7 @@ pub fn prepare_provider_fork(
             model: source.model,
             effort: source.effort,
             context_window: source.context_window,
-            fast_mode: source.fast_mode,
+            service_tier: source.service_tier,
             execution_mode: PermissionMode::Read,
             backend_session_id: fork_point.backend_session_id,
             control_context: None,

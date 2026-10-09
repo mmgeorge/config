@@ -587,7 +587,7 @@ pub struct PlanTask {
 }
 
 pub const PROVISIONAL_PLAN_TITLE: &str = "Planning in progress";
-pub const PLAN_SCHEMA_VERSION: u32 = 6;
+pub const PLAN_SCHEMA_VERSION: u32 = 7;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -721,8 +721,7 @@ impl PlanDocument {
     pub fn validate_for_submission(&self) -> Result<()> {
         if let Some(design) = &self.design {
             self.validate()?;
-            anyhow::ensure!(!design.document.task.trim().is_empty(), "plan.json task is required before submission");
-            anyhow::ensure!(!design.document.description.trim().is_empty(), "plan.json description is required before submission");
+            design.document.validate_for_submission()?;
             return Ok(());
         }
         validate_plan_submission(self)
@@ -1125,6 +1124,6 @@ mod test {
         let mut document = test_fixture("plan", "Version plans.");
         document.schema_version = PLAN_SCHEMA_VERSION + 1;
         let unsupported = document.validate().unwrap_err().to_string();
-        assert!(unsupported.contains("supported PlanDocument schema version 6"));
+        assert!(unsupported.contains("supported PlanDocument schema version 7"));
     }
 }

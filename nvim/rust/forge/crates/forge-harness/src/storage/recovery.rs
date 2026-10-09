@@ -36,10 +36,11 @@ impl SqliteStore {
             {
                 continue;
             }
-            // The persisted clock start is a lower bound, never the restart time.
-            let observed_at = exchange
-                .execution_started_at_ms
-                .unwrap_or(exchange.created_at_ms);
+            // Recover only observed execution time, excluding the offline interval.
+            let observed_at = exchange.execution_started_at_ms.map_or(exchange.created_at_ms, |started| {
+                let active = exchange.metrics.observed_elapsed_ms.saturating_sub(exchange.duration_ms);
+                started.saturating_add(active.min(i64::MAX as u64) as i64)
+            });
             exchange.finish(ExchangeState::Interrupted, observed_at)?;
             transaction.execute(
                 "UPDATE exchange_record SET payload=?2 WHERE id=?1",

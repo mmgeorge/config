@@ -145,13 +145,21 @@ local success, failure = xpcall(function()
   review.command_set.action_by_id.accept.run({})
   assert(pending and pending.params.review.document == review.owner.document and pending.params.digest == nil)
   assert(state.plan_review == review and not review.owner.closed, "approval closed before its capture completed")
-  pending.callback({ session = { id = "plan-session" } })
+  pending.callback({ session = { id = "plan-session" }, active_plan = { acceptance = {} } })
   assert(activated and state.plan_review == nil and not state.busy)
   assert(execution.action == "execute" and execution.plan_id == "plan" and execution.digest == "canonical")
   assert(vim.api.nvim_get_current_win() == state.transcript_win, "approval did not return to Harness")
   assert(vim.api.nvim_buf_is_valid(review.buf), "closing PlanReview deleted its physical buffer")
   assert(vim.deep_equal(vim.fn.readfile(path), { "# Physical plan" }))
   local native = require("forge.views.plan_review.native_controller")
+  execution = nil
+  native.open(review.plan)
+  review = state.plan_review
+  review.command_set.action_by_id.accept.run({})
+  pending.callback({ session = { id = "plan-session" }, active_plan = { state = "accepted", acceptance = vim.NIL },
+    goal_execution = { state = "paused" } })
+  assert(execution == nil and state.plan_review == nil,
+    "revision approval overrode the backend pause with an execute request")
   native.open(review.plan)
   review = state.plan_review
   local popup = require("forge.infra.popup_window")

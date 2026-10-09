@@ -261,6 +261,7 @@ M.defaults = {
       abort_plan = "or",
       agent = "og",
       sessions = "os",
+      background = "ot",
       open_timeline = { "<CR>", "." },
       reopen_question = "oe",
       model = "oM",

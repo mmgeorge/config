@@ -57,16 +57,19 @@ local success, failure = xpcall(function()
   local review = state.plan_review
   local validation_row
   for position, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-    if line == "Validation:" then validation_row = position break end
+    if line == "Verification:" then validation_row = position break end
   end
-  assert(validation_row, "Validation requirements are missing")
+  assert(validation_row, "Verification requirements are missing")
   local validation_text = table.concat(vim.api.nvim_buf_get_lines(review.buf, validation_row - 1, validation_row + 6, false), "\n")
   assert(validation_text:find("  Automated:", 1, true) and validation_text:find("  Manual:", 1, true), validation_text)
   vim.api.nvim_win_set_cursor(review.win, { validation_row, 0 })
   vim.api.nvim_win_call(review.win, function()
     vim.cmd("normal! zc")
     assert(vim.fn.foldclosed(validation_row) == validation_row)
-    assert(vim.fn.foldclosedend(validation_row) < vim.fn.search("^Changes:", "nw"))
+    assert(vim.fn.search("^Proposed declaration changes:", "bnw") < validation_row)
+    local execution_row = vim.fn.search("Execution:", "nw")
+    assert(execution_row > 0 and vim.fn.foldclosedend(validation_row) < execution_row,
+      "verification fold includes the execution report: " .. table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"))
     vim.cmd("normal! zo")
     assert(vim.fn.foldclosed(validation_row) == -1)
   end)

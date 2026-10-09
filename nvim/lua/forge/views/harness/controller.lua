@@ -36,7 +36,7 @@ local queue_only_commands = { ["/plan"] = true }
 ---@param field string
 ---@return string|boolean
 local function applied_setting(state, field)
-  if field == "fast_mode" then return state.session ~= nil and state.session.fast_mode == true end
+  if field == "service_tier" then return (state.session and state.session.service_tier) or "default" end
   return (state.session and state.session[field]) or config.options.harness[field]
 end
 
@@ -54,7 +54,7 @@ end
 local function prune_pending_settings(state)
   local pending = state.pending_config
   if not pending then return end
-  for _, field in ipairs({ "effort", "fast_mode" }) do
+  for _, field in ipairs({ "effort", "service_tier" }) do
     local applied = applied_setting(state, field)
     local inflight = state.configuring_config and state.configuring_config[field]
     if pending[field] == applied and (inflight == nil or inflight == applied) then pending[field] = nil end
@@ -238,16 +238,18 @@ local function status_text()
   end
   if state.sync_error then goal = " • State unavailable: " .. state.sync_error end
   if state.connection_error then goal = " • " .. state.connection_error end
-  local fast_enabled = selected_setting(state, "fast_mode")
-  local fast = fast_enabled and " fast" or ""
-  if fast_enabled ~= (active_session.fast_mode == true) then fast = fast_enabled and " fast*" or " standard*" end
+  local tier = selected_setting(state, "service_tier")
+  local tier_label = tier ~= "default" and (" " .. tier) or ""
+  if tier ~= (active_session.service_tier or "default") then
+    tier_label = " " .. (tier == "default" and "standard" or tier) .. "*"
+  end
   local segment_list = {
     {
       text = mode,
       group = require("forge.infra.highlights").harness_mode(raw_mode),
     },
     {
-      text = (" • %s %s%s"):format(model, effort, fast),
+      text = (" • %s %s%s"):format(model, effort, tier_label),
       group = "ForgeStatusLabel",
     },
   }
@@ -734,6 +736,7 @@ function M.present_approval()
   state.approval_open = true
   state.presented_approval_id = request.id
   require("forge.views.harness.approval").open(request, {
+    interrupt = M.cancel_turn,
     transcript_win = state.transcript_win,
     window_list = picker_host(state).window_list,
     control_win = picker_host(state).control_win,
@@ -1205,9 +1208,9 @@ end
 ---@field checkpoint_before string
 
 ---@param interaction ForgeRollbackInteraction
-local function restore_interaction_prompt(interaction)
+local function restore_composer_prompt(text)
   local state = harness_state()
-  set_composer_text(state.composer_buf, interaction.prompt or "")
+  set_composer_text(state.composer_buf, text)
   layout.resize_composer(state.composer_buf, state.composer_win)
   vim.schedule(function()
     if not (state.composer_buf and vim.api.nvim_buf_is_valid(state.composer_buf)
@@ -1236,7 +1239,7 @@ local function rollback_exchange(interaction)
       return
     end
     synchronize_state()
-    restore_interaction_prompt(interaction)
+    restore_composer_prompt(interaction.prompt or "")
   end)
 end
 
@@ -1425,7 +1428,7 @@ function M.submit()
     set_composer_text(state.composer_buf, "")
     task_control.new(picker_host(state), function(kind)
       if kind == "execute" then task_control.plans(state, picker_host(state), true, M.task_transition)
-      else set_composer_text(state.composer_buf, "/" .. kind .. " ") end
+      else restore_composer_prompt("/" .. kind .. " ") end
     end)
     return
   end
@@ -1653,14 +1656,14 @@ function M.submit()
     M.configure({ effort = effort }, true)
     return
   end
-  if text == "/fast" then
+  if text == "/fast" or text == "/ultrafast" then
     set_composer_text(state.composer_buf, "")
-    M.toggle_fast_mode()
+    M.toggle_service_tier(text:sub(2))
     return
   end
-  if text:match("^/fast%s") then
+  if text:match("^/fast%s") or text:match("^/ultrafast%s") then
     set_composer_text(state.composer_buf, "")
-    state.configuration_error = "Use /fast without arguments to toggle fast mode"
+    state.configuration_error = "Use /fast or /ultrafast without arguments to toggle the service tier"
     M.refresh_winbar()
     return
   end
@@ -1773,7 +1776,7 @@ function M.queue_submit()
   if text == "" then return end
   if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
   if text:match("^/task") or text:match("^/execute") or text:match("^/plan") or text:match("^/goal") or text == "/config" or text == "/log" or text:match("^/log%s") then M.submit() return end
-  if text == "/bg" or text == "/recap" or text == "/mcp" or text == "/replan" or text == "/plan cancel" or text == "/fast" or text:match("^/fast%s") then M.submit() return end
+  if text == "/fast" or text == "/ultrafast" or text:match("^/fast%s") or text:match("^/ultrafast%s") or text == "/bg" or text == "/recap" or text == "/mcp" or text == "/replan" or text == "/plan cancel" then M.submit() return end
   if text == "/model" then
     M.select_model(function(next_config)
       local command = "/model " .. next_config.model .. (next_config.effort and (" " .. next_config.effort) or "")
@@ -1863,20 +1866,23 @@ function M.select_effort()
   end)
 end
 
----@param enabled boolean
-function M.configure_fast_mode(enabled)
+---@param tier "default"|"fast"|"ultrafast"
+function M.configure_service_tier(tier)
   local state = harness_state()
-  if state.capability.fast_mode ~= true then
-    state.configuration_error = "The current backend does not support fast mode"
+  if (tier == "fast" and state.capability.fast_mode ~= true)
+    or (tier == "ultrafast" and state.capability.ultrafast_mode ~= true)
+  then
+    state.configuration_error = "The current backend does not support " .. tier .. " mode"
     M.refresh_winbar()
     return
   end
-  M.configure({ fast_mode = enabled })
+  M.configure({ service_tier = tier })
 end
 
-function M.toggle_fast_mode()
+---@param tier "fast"|"ultrafast"
+function M.toggle_service_tier(tier)
   local state = harness_state()
-  M.configure_fast_mode(not selected_setting(state, "fast_mode"))
+  M.configure_service_tier(selected_setting(state, "service_tier") == tier and "default" or tier)
 end
 
 function M.select_model(on_confirm)
@@ -2112,7 +2118,7 @@ configure_now = function(next_config, validate_selection, completed)
     state.configuring = false
     state.configuring_config = nil
     if request_error then
-      if next_config.model == nil and (next_config.effort ~= nil or next_config.fast_mode ~= nil) then
+      if next_config.model == nil and (next_config.effort ~= nil or next_config.service_tier ~= nil) then
         state.configuration_error = request_error
       else
         report_configuration_error(request_error)
@@ -2148,7 +2154,7 @@ function M.configure(next_config, validate_selection, completed)
   end
   local tuning_only = not completed and next(next_config) ~= nil
   for field in pairs(next_config) do
-    if field ~= "effort" and field ~= "fast_mode" then tuning_only = false end
+    if field ~= "effort" and field ~= "service_tier" then tuning_only = false end
   end
   state.configuration_error = nil
   if state.busy or state.configuring or tuning_only then
@@ -2246,6 +2252,7 @@ function M.command_set()
   command_set.register(set, "abort_plan", M.abort_plan)
   command_set.register(set, "agent", M.open_agent_picker)
   command_set.register(set, "sessions", M.open_session_picker)
+  command_set.register(set, "background", M.open_background_picker)
   command_set.register(set, "open_timeline", M.open_timeline_entry)
   command_set.register(set, "reopen_question", M.reopen_question)
   command_set.register(set, "model", M.select_model)

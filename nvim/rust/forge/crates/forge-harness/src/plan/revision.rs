@@ -86,13 +86,12 @@ impl DeclarationDelta {
             )?;
         }
         let mut document = Vec::new();
-        for (section, before, after) in [
-            ("Task", previous.map(|design| design.document.task.as_str()), design.document.task.as_str()),
-            ("Description", previous.map(|design| design.document.description.as_str()), design.document.description.as_str()),
-            ("Validation/Automated", previous.map(|design| design.document.validation.automated.as_str()), design.document.validation.automated.as_str()),
-            ("Validation/Manual", previous.map(|design| design.document.validation.manual.as_str()), design.document.validation.manual.as_str()),
-        ] {
-            write_file(section, section, before, Some(after), &mut document)?;
+        let previous_sections = previous.map(|design| design.document.sections()).unwrap_or_default();
+        for section in design.document.sections() {
+            let before = previous_sections.iter().find(|previous| previous.path == section.path)
+                .map(|previous| previous.text.as_str()).filter(|text| !text.trim().is_empty());
+            let after = (!section.text.trim().is_empty()).then_some(section.text.as_str());
+            write_file(section.title, section.title, before, after, &mut document)?;
         }
         Ok(Self {
             files: String::from_utf8(patch)?,
@@ -238,7 +237,7 @@ mod tests {
         design
             .proposed
             .insert("src/renamed.rs".into(), "pub struct Renamed;\n".into());
-        design.document.description = "Previous description".into();
+        design.document.design = "Previous description".into();
         previous.design = Some(design);
         let mut current = previous.clone();
         let design = current.design.as_mut().unwrap();
@@ -256,11 +255,11 @@ mod tests {
         design
             .proposed
             .insert("src/added.rs".into(), "pub struct Added;\n".into());
-        design.document.description = "Revised description".into();
+        design.document.design = "Revised description".into();
         let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
         let patch = UnifiedPatch::parse(&delta.files).unwrap();
         assert_eq!(patch.file.len(), 4);
-        assert!(!delta.files.contains("unchanged.rs") && !delta.files.contains("Description:"));
+        assert!(!delta.files.contains("unchanged.rs") && !delta.files.contains("Design:"));
         assert!(
             delta.files.contains("-pub struct Before;")
                 && delta.files.contains("+pub struct After;")
@@ -278,7 +277,7 @@ mod tests {
         );
         let overview = UnifiedPatch::parse(&delta.document).unwrap();
         assert_eq!(overview.file.len(), 1);
-        assert_eq!(overview.file[0].new_path.as_deref(), Some("Description"));
+        assert_eq!(overview.file[0].new_path.as_deref(), Some("Design"));
         assert!(!delta.document.contains("plan.json") && !delta.document.contains("\"description\""));
         let unchanged = DeclarationDelta::between(Some(&current), &current).unwrap();
         assert!(unchanged.files.is_empty() && unchanged.document.is_empty());
@@ -288,18 +287,22 @@ mod tests {
     fn overview_deltas_preserve_plain_paragraphs_and_separate_changed_sections() {
         let mut previous = super::super::document::test_fixture("overview", "Overview");
         let mut design = DeclarationDesign::default();
-        design.document.task = "Original task.".into();
-        design.document.description = "First paragraph.\n\nOriginal second paragraph.".into();
+        design.document.objective = "Original task.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "First paragraph.\n\nOriginal second paragraph.".into();
         previous.design = Some(design);
         let mut current = previous.clone();
         let design = current.design.as_mut().unwrap();
-        design.document.task = "Revised task.".into();
-        design.document.description = "First paragraph.\n\nRevised `State` paragraph.".into();
+        design.document.objective = "Revised task.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "First paragraph.\n\nRevised `State` paragraph.".into();
         let delta = DeclarationDelta::between(Some(&previous), &current).unwrap();
         let patch = UnifiedPatch::parse(&delta.document).unwrap();
         assert_eq!(patch.file.len(), 2);
-        assert_eq!(patch.file[0].new_path.as_deref(), Some("Task"));
-        assert_eq!(patch.file[1].new_path.as_deref(), Some("Description"));
+        assert_eq!(patch.file[0].new_path.as_deref(), Some("Objective"));
+        assert_eq!(patch.file[1].new_path.as_deref(), Some("Design"));
         assert!(delta.document.contains("-Original second paragraph.") && delta.document.contains("+Revised `State` paragraph."));
         assert!(!delta.document.contains("\\n") && !delta.document.contains("\"task\""));
     }

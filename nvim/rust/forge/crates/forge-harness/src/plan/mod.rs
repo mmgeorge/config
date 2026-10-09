@@ -11,6 +11,7 @@ mod comment_lint;
 mod usage;
 pub(crate) use design::workspace_source;
 mod design;
+mod design_document;
 pub(crate) mod calls;
 mod references;
 mod reference_context;
@@ -1081,8 +1082,10 @@ mod test {
         fs::write(temporary.path().join("src/lib.rs"), "invalid source {").unwrap();
         let mut document = document::test_fixture("rename", "Rename a planned definition");
         let mut design = DeclarationDesign::default();
-        design.document.task = "Introduce a function".into();
-        design.document.description = "Keep its calls consistent".into();
+        design.document.objective = "Introduce a function".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Keep its calls consistent".into();
         design.baseline.insert(
             "src/lib.rs".into(),
             DeclarationFile {
@@ -1208,11 +1211,13 @@ mod test {
         assert!(design.baseline.is_empty());
         let invalid = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n name = \"arena\"\n+name = \"duplicate\"\n*** End Patch";
         assert!(design.patch(temporary.path(), &Default::default(), invalid).is_err());
-        let patch = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n-engine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n+engine = { version = \"1.3\", default-features = false, features = [\"render\", \"input\"] }\n*** Add File: config/arena.toml\n+[arena]\n+speed = 200\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Enable engine input and configure arena speed.\"\n*** End Patch";
+        let patch = "*** Begin Patch\n*** Update File: Cargo.toml\n@@\n-engine = { version = \"1.2\", default-features = false, features = [\"render\"] }\n+engine = { version = \"1.3\", default-features = false, features = [\"render\", \"input\"] }\n*** Add File: config/arena.toml\n+[arena]\n+speed = 200\n*** Update File: plan.json\n@@\n-  \"design\": \"\",\n+  \"design\": \"Enable engine input and configure arena speed.\",\n*** End Patch";
         let mut document = document::test_fixture("plan", "Arena dependencies");
         document.design = Some(design.patch(temporary.path(), &Default::default(), patch).unwrap());
-        document.design.as_mut().unwrap().document.task =
+        document.design.as_mut().unwrap().document.objective =
             "Enable keyboard input with configurable arena movement.".into();
+        document.design.as_mut().unwrap().document.background = "Cargo.toml already enables engine rendering.".into();
+        document.design.as_mut().unwrap().document.requirements = vec!["Enable input without disabling rendering.".into()];
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         store
             .write_working_document("session", "plan", &document)
@@ -1331,8 +1336,10 @@ mod test {
             .patch(temporary.path(), &Default::default(), "*** Begin Patch\n*** Delete File: settings.jsonc\n*** End Patch")
             .unwrap();
         assert!(!design.proposed.contains_key("settings.jsonc"));
-        design.document.task = "Update project configuration across supported formats.".into();
-        design.document.description =
+        design.document.objective = "Update project configuration across supported formats.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design =
             "Update package metadata, type checks, CI, and the XML project.".into();
         let mut document = document::test_fixture("plan", "Configuration");
         document.design = Some(design);
@@ -1390,9 +1397,11 @@ mod test {
         fs::write(temporary.path().join("registry.rs"), source).unwrap();
         let mut document = document::test_fixture("plan", "Registry");
         let mut design = DeclarationDesign::default();
-        design.document.task =
+        design.document.objective =
             "Format registry declarations without changing their interface.".into();
-        design.document.description = "Preserve the registry interface.".into();
+        design.document.background = "registry.rs declares two public fields.".into();
+        design.document.requirements = vec!["Preserve the public interface.".into()];
+        design.document.design = "Preserve the registry interface.".into();
         design.line_width = 60;
         design.baseline.insert(
             "registry.rs".into(),

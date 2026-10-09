@@ -491,9 +491,11 @@ mod test {
         context.mode = PromptMode::PlanDiscussion;
         context.plan_state = Some(PlanState::AwaitingReview);
         context.plan_document.as_mut().unwrap().design = Some(crate::plan::DeclarationDesign::default());
-        context.plan_document.as_mut().unwrap().design.as_mut().unwrap().document.task = "Own private state.".into();
+        context.plan_document.as_mut().unwrap().design.as_mut().unwrap().document.objective = "Own private state.".into();
+        context.plan_document.as_mut().unwrap().design.as_mut().unwrap().document.background = "The fixture contains the declarations under review.".into();
+        context.plan_document.as_mut().unwrap().design.as_mut().unwrap().document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
         let mut runtime = ControlToolRuntime::new(context);
-        let patch = "*** Begin Patch\n*** Add File: src/lib.rs\n+pub struct Owner;\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Introduce an owner for private state.\"\n*** End Patch";
+        let patch = "*** Begin Patch\n*** Add File: src/lib.rs\n+pub struct Owner;\n*** Update File: plan.json\n@@\n-  \"design\": \"\",\n+  \"design\": \"Introduce an owner for private state.\",\n*** End Patch";
         assert!(runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(),arguments:json!({"plan_id":"plan","expected_version":1}) }).await.is_err());
         let change = |version,patch:&str| ControlToolInvocation { name:"harness_design_apply_patch".into(),arguments:json!({"plan_id":"plan","expected_version":version,"patch":patch}) };
         assert!(runtime.invoke(change(99,patch)).await.is_err());
@@ -504,7 +506,7 @@ mod test {
         runtime.invoke(change(1,patch)).await.unwrap();
         let metadata = runtime.invoke(ControlToolInvocation { name:"harness_plan_read".into(),arguments:json!({"plan_id":"plan","path":"plan.json"}) }).await.unwrap();
         assert!(metadata.message.contains("Introduce an owner"));
-        runtime.invoke(change(2,"*** Begin Patch\n*** Update File: plan.json\n@@\n   \"description\": \"Introduce an owner for private state.\"\n*** End Patch")).await.unwrap();
+        runtime.invoke(change(2,"*** Begin Patch\n*** Update File: plan.json\n@@\n   \"design\": \"Introduce an owner for private state.\",\n*** End Patch")).await.unwrap();
         assert_eq!(runtime.plan_document().unwrap().version, 2);
         runtime.invoke(change(2,"*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub struct Owner;\n+pub struct Owner { private: u64 }\n*** End Patch")).await.unwrap();
         let read = runtime.invoke(ControlToolInvocation { name:"harness_plan_read".into(),arguments:json!({"plan_id":"plan","path":"src/lib.rs"}) }).await.unwrap();
@@ -533,8 +535,10 @@ mod test {
         let mut design = crate::plan::DeclarationDesign::default();
         design.proposed.insert("src/lib.rs".into(), source.into());
         design.baseline.insert("src/lib.rs".into(), crate::plan::DeclarationFile { text: source.into(), source_digest: crate::plan::digest(source.as_bytes()) });
-        design.document.task = "Rename the count accessor.".into();
-        design.document.description = "Preserve the target count while renaming its accessor.".into();
+        design.document.objective = "Rename the count accessor.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Preserve the target count while renaming its accessor.".into();
         context.plan_document.as_mut().unwrap().design = Some(design);
         let mut runtime = ControlToolRuntime::new(context);
         let read = |arguments| ControlToolInvocation { name: "harness_plan_read".into(), arguments };
@@ -558,8 +562,10 @@ mod test {
     async fn declaration_submission_keeps_unverified_evidence_out_of_tool_output() {
         let mut context = planning_context();
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Expose a generated interface.".into();
-        design.document.description = "Keep generated declarations outside the hand-authored API.".into();
+        design.document.objective = "Expose a generated interface.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Keep generated declarations outside the hand-authored API.".into();
         design.proposed.insert("src/lib.rs".into(), "/// Declares generated types supplied during implementation.\npub mod generated;\nuse generated::*;\n/// Accepts the generated request.\npub fn inspect(value: Generated);\n".into());
         context.plan_document.as_mut().unwrap().design = Some(design);
         let mut runtime = ControlToolRuntime::new(context);
@@ -589,8 +595,10 @@ mod test {
     async fn declaration_submit_returns_reference_errors_and_allows_repair() {
         let mut context = planning_context();
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Define the public API.".into();
-        design.document.description = "Expose a typed API.".into();
+        design.document.objective = "Define the public API.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Expose a typed API.".into();
         design.proposed.insert("tsconfig.json".into(), "{\"compilerOptions\":{\"noLib\":true}}".into());
         design.proposed.insert("api.ts".into(), "export interface Api { item: Missing; }\n".into());
         context.plan_document.as_mut().unwrap().design = Some(design);

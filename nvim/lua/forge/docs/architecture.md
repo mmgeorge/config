@@ -568,7 +568,7 @@ joining agent tables, grouping interactions, or reconstructing workflow phase.
 
 `Idle` remains a structural Rust phase but produces no status entry. `Working`, `RetryingPlanGeneration`,
 `AwaitingInput`, `AwaitingPlanReview`, `PlanningFailed`, and `WaitingForAgent` occupy the final timeline position.
-Rust derives the transient `Working (Ns)` row from the retained Rust start timestamp during each document sync.
+Rust derives the transient `Working · Ns` or `Planning · Ns` row from the retained Rust start timestamp during each document sync.
 Lua supplies the one-second sync cadence but does not own the status text or persist elapsed time. Lua never
 reopens a question after a continuation error. It renders the next Rust patch, which either contains a new
 `AwaitingInput` owner or a terminal failure. The timeline and status debug logs record session id, base revision,
@@ -724,16 +724,24 @@ otherwise leaves the terminal in its last hidden TUI state. This global transiti
 mapping only the picker window's `Cursor` highlight does not hide the focused terminal cursor.
 Do not replace the paired `guicursor` transition with window-local highlighting, and do not restore
 an empty cursor option directly after hiding it. Either change leaves cursor visibility stuck in the
-terminal's previous state. Models, effort, fast mode, artifacts, agents, interaction rollback,
+terminal's previous state. Models, effort, service tier, artifacts, agents, interaction rollback,
 approvals, lease conflicts, execution confirmations, and planning questions therefore share the
 same geometry and focus contract without duplicating popup mechanics.
 
 Configuration pickers never depend on the serialized provider-turn request lane to become visible.
 Harness resolves and caches backend model metadata when the view activates, then `/model` opens from
-that presentation cache even while a provider turn runs. Model, effort, fast-mode, backend, and
+that presentation cache even while a provider turn runs. Model, effort, service-tier, backend, and
 execution-mode selections continue through their normal mutation owners. Configuration and backend
 changes queue for the next safe boundary, while execution mode retains its active-turn restart
 contract.
+
+`/fast` and `/ultrafast` select mutually exclusive service tiers. Repeating the selected command
+returns to standard processing. The session, workspace preference, fork, and backend request share
+one typed `service_tier` value. Completion and configuration admission use backend capability flags.
+Codex advertises both tiers and Copilot advertises neither. Codex receives the selected tier on thread
+creation, resume, explicit turns, and Harness-driven continuations. Disabling acceleration sends
+`default` explicitly because a null tier can inherit the thread's previous selection. Provider errors
+retain their normal failure path when a model or account cannot use the requested tier.
 
 `views/harness/provider_catalog.lua` owns per-session caches for backend skills and MCP definitions.
 `/skills` toggles future skill eligibility and inserts enabled `$skill` selectors, while the completion
@@ -1894,7 +1902,7 @@ client-observed completion latency in the `forge/harness-perf.log` JSONL stream 
 `harness_logging` is enabled.
 Broker initialization selects the most recently updated session for the resolved repository
 and configured backend, then restores its interaction timeline, plan, goal, model controls,
-and provider session identity. Independent model, effort, and fast-mode preferences remain available
+and provider session identity. Independent model, effort, and service-tier preferences remain available
 when older sessions become invisible. `:ForgeHarness` therefore resumes current repository-local work across Neovim restarts,
 while `/clear` remains the explicit boundary for creating a new session. Resumed sessions retain
 their persisted execution mode. New and forked sessions establish a fresh Read boundary.
@@ -2128,15 +2136,20 @@ baseline and proposed positions, with proposed positions owning ordinary row act
 folds start open. PlanReview, ForgeStatus hunks, and Harness changes use the shared
 header-fold constructor. A closed file shows only its file header, and a closed hunk
 shows only its hunk header. PlanReview toggles headers through the shared Lua fold engine.
-The declaration design also owns a virtual `plan.json` with model-authored `task`, `description`,
-and `validation`. Validation contains `automated` and `manual` strings. Each nonblank Automated
+The declaration design also owns a virtual `plan.json` with model-authored `objective`, optional `usage`,
+`requirements`, `background`, `decisions`, `design`, and `verification`. Verification contains `automated` and `manual` strings. Each nonblank Automated
 line is a separate command, executed in listed order from the project workspace through normal
 agent tools and permissions. Manual contains a Markdown list of actions and expected results.
 Either field can be empty when no checks of that kind apply. Verify instructions require results
 for these checks and a blocked outcome when a required check cannot be performed. Saved requirements
 remain separate from semantic validation diagnostics and recorded verification results.
-Task states the requested outcome and scope. Description explains the proposed design for a reviewer,
-including responsibility boundaries and important lifecycle behavior, rather than inventorying changes.
+Objective states the requested outcome and scope. Optional Usage illustrates successful interaction,
+such as CLI input and output, a UI action and visible result, or an API call and return value.
+Requirements lists the behavior and restrictions every valid implementation must satisfy. Background
+records inspected existing behavior, paths, ownership, and integration points that a new implementer
+needs without prior conversation history. Decisions records consequential choices and their rationale.
+Design explains the proposed responsibilities, interactions, and lifecycle. These fields contain the
+reviewed specification. Execution progress remains in the implementation state machine.
 Planning prompts require an attached explanatory comment on every declaration in authored or revised
 source overviews, including private declarations and members. Agents must read the repository's
 code-comment guidance and the available technical-writing profiles. These comments record roles,
@@ -2144,13 +2157,16 @@ ownership, domain meaning, and behavioral contracts without implementation bodie
 attributes, parameters, and configuration entries do not require individual declaration comments.
 The read tool lists it alongside declaration paths. The patch tool edits these fields and
 declaration files atomically at one optimistic version, while source baselines and workspace checks
-exclude plan metadata. Submission requires Task and Description to be nonempty. Each metadata string
-has a 16 KiB limit. Review renders `Task:`, `Description:`, `Validation:`, and `Changes:`. Validation
-contains independently foldable `Automated:` and `Manual:` subsections. Automated preserves literal
+exclude plan metadata. Submission requires nonempty Objective, Background, and Design, plus at least one Requirement.
+Each projected metadata section has a 16 KiB limit. Requirements allows at most 256 entries and
+Decisions allows at most 128 entries, each with a nonempty choice and rationale. Review renders
+Objective, Usage, Requirements, Background, Decisions, Design, Proposed declaration changes, then
+Verification. Empty Usage and Decisions are hidden. Verification contains independently foldable
+`Automated:` and `Manual:` subsections. Automated preserves literal
 command text and Manual supports Markdown list styling. All
 sections start expanded and use the shared fold-header constructor and native Tab behavior, with
-independent file and hunk folds below Changes. Section endpoints include wrapped text and comments.
-Task and Description retain their complete saved source rows. Neovim owns soft word wrapping in
+independent file and hunk folds below Proposed declaration changes. Section endpoints include wrapped text and comments.
+Metadata sections retain their complete saved source rows. Neovim owns soft word wrapping in
 each window, so resizing or opening a split reflows paragraphs without reprojecting source rows,
 changing canonical text, or moving comment anchors. The review projection must not hard-wrap these
 fields to the width captured when the review opens.
@@ -2192,7 +2208,7 @@ working draft and submitted revision unchanged. Every submission repeats the che
 of cached signature validation. Editing, rendering, and reopening historical revisions do not run it.
 The public filter retains all headings and an explicit empty state when no public changes remain.
 Review retains both overviews in either visibility mode and maps comments separately to
-`/design/document/task` and `/design/document/description`. Behavior-only proposals carry both fields.
+`/design/document/objective` and `/design/document/design`, with distinct targets for the other metadata sections. Behavior-only proposals retain the same specification fields.
 
 Trait implementation bodies render as empty braces in both inspection modes. Inherent implementation
 methods remain visible according to the selected visibility mode. Public-only inspection retains Rust
@@ -2411,6 +2427,9 @@ submitting its verification assessment.
 
 Comparison checks fresh declaration projections, supported configuration contents, planned call
 relationships, deletions, and supported source changes outside the approved file set. It compares
+declarations with bounded diagnostics containing the first differing overview line and its expected
+and observed text, so the model can repair source differences without guessing a design revision.
+It compares
 against the execution's initial repository checkpoint, so preexisting workspace edits do not become
 execution deviations. Workspaces without a repository checkpoint retain an explicit warning that workspace-wide deviation
 detection is unavailable. Unsupported analysis remains explicit. Semantic conformance does not prove
@@ -2434,8 +2453,17 @@ available alongside the current accepted revision and their complete diff.
 When recovery has finalized the exchange that requested review, continuation creates a new
 execution exchange linked to the same plan and goal. It never reopens a completed exchange.
 
-Forge scans planned files at five-second intervals while a provider turn runs. It places phase and
-matched, missing, different, and unverified counts in the existing Working status row. PlanReview
+Forge scans planned files at five-second intervals while a provider turn runs. The status retains
+execution phase and file comparison evidence separately from the model's reasoning summary. It shows
+`Implementing · Ns · N files need attention`, with distinct labels for Verify and Resolve. The folded
+Implementation details section contains file findings and a separate Matched files group. File folds
+use execution and path identities across clock ticks and comparison updates. Details expose reported
+symbol names when available without inferring symbol statuses from file-level findings. Matched files
+remain inspectable and do not imply successful behavioral verification.
+Lua renders `N terminals running` on a separate transient line with the configured terminal-picker
+shortcut (`ot` by default) and interrupt hint. Without terminals, the interrupt hint stays on the status
+heading. Status hints locate the heading independently of the details and keep the footer outside
+collapsed folds. PlanReview
 contains a folded execution report with file findings, verification references, revision decisions,
 and the original-to-current comparison. The timeline retains compact lifecycle events, normal tool
 calls, and native snapshot diffs. Completion records the original-to-implemented revision diff.
@@ -5366,13 +5394,37 @@ closes conflicting execution admission, collects the previous provider attempt, 
 checkpoint finalization, and applies the latest intent. Superseded intents cannot start a
 provider attempt. Ctrl-C submits a pause intent. Backend goal continuation stays inside the
 service-owned execution lifetime rather than relying on Lua to submit the next turn.
+The execution permit, rather than a contended broker mutex, identifies provider work that needs
+cleanup. Catalog and snapshot readers cannot cause an idle permission change to interrupt the
+provider. Cleanup after the steering receiver has settled is a no-op, while steering input still
+requires an active receiver. The execution permit remains held through finalization and delivery.
 `task.operation` queries the original ID after uncertain acknowledgement and never replays it.
+Failed status reads preserve the admitted operation state and retry with a visible diagnostic.
+Resuming an execution with a pending plan revision restores its review wait without starting
+the provider or treating the unmet review prerequisite as an execution failure.
+An explicit pause clears review-triggered continuation even when review already paused the
+goal. Approval can continue a terminal exchange only by admitting a new exchange within the
+same execution. Completed, cancelled, interrupted, and failed exchanges remain immutable.
+A successful read clears that diagnostic. Local admission rejection carries `not_admitted`,
+so the UI does not report an unknown write outcome for a request that never left Neovim.
+Startup configuration, task transitions, status queries, and health checks share reserved
+client capacity that ordinary presentation requests cannot exhaust.
+The host reserves four of its 64 request slots for the same control methods. Concurrent
+health, operation, cancellation, and approval requests can use those slots and borrow unused
+ordinary capacity. Ordinary requests cannot consume the four reserved slots.
 
 SQLite uses WAL and FULL synchronization. Acceptance commits the task, goal, execution,
 accepted revision, and acceptance event together. Session ownership includes an operating-system
 file lock, so an expired timestamp cannot admit a second live runtime. Restart recovery retains
 committed phase and completion evidence, suspends unfinished attempts, and marks unsettled
 operations outcome-unknown. No recovered task starts a provider automatically.
+Exchange recovery retains the last persisted active elapsed coordinate. It excludes the
+offline interval and may omit activity after the last saved provider event.
+The approval picker shares the configured Harness interrupt key. Interrupt closes the picker
+and pauses the task without approving the pending tool. Closing with `q` leaves approval pending.
+Review UI starts execution only when acceptance creates an initial acceptance record. Revision
+approval respects the backend's existing pause or continuation decision. A completed execution
+exchange is labelled `Plan turn complete`, independently of the task's completion gates.
 
 Health requests use reserved admission and output scheduling independently of the broker
 execution lock. The UI sends at most one outstanding health request per conversation. Ten

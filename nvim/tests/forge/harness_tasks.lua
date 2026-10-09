@@ -47,10 +47,24 @@ assert(state.task_operation.id == retained.params.operation_id and settled == 2,
 task.receive(state, { id = retained.params.operation_id, state = "completed" })
 assert(settled == 3)
 
+begin({ action = "resume" })
+local polled = requests[#requests]
+polled.reply({ state = "running" })
+timers[#timers]()
+requests[#requests].reply(nil, "Forge request admission is full", { code = "not_admitted" })
+assert(state.task_operation.state == "running" and settled == 3,
+  "a failed status read changed the admitted operation outcome")
+assert(state.execution_notice:find("Task status check failed", 1, true))
+timers[#timers]()
+requests[#requests].reply({ state = "running" })
+assert(state.execution_notice == nil, "a successful status read retained the transient failure")
+task.receive(state, { id = polled.params.operation_id, state = "completed" })
+assert(settled == 4)
+
 begin({ action = "execute", plan_id = "plan" })
 local old_conversation = requests[#requests]
 state.session = { id = "another-conversation" }
 old_conversation.reply({ state = "completed" })
-assert(settled == 3, "old conversation callback must not settle current state")
+assert(settled == 4, "old conversation callback must not settle current state")
 print("harness_tasks: passed")
 vim.cmd("qa!")

@@ -166,7 +166,9 @@ local function accept(plan, review)
     end
     local controller = require("forge.views.harness.controller")
     controller.render()
-    controller.task_transition({ action = "execute", plan_id = plan.id, digest = plan.review_digest })
+    if type(vim.tbl_get(result or {}, "active_plan", "acceptance")) == "table" then
+      controller.task_transition({ action = "execute", plan_id = plan.id, digest = plan.review_digest })
+    end
   end)
 end
 

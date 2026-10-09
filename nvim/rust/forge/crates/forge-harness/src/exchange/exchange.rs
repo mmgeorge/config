@@ -173,6 +173,7 @@ impl Exchange {
                 event.turn_boundary.is_none(),
                 "provider turn boundary has no execution address"
             );
+            self.metrics.observe_elapsed(self.elapsed(now_ms));
             return Ok(true);
         };
         if event.kind == "usage" {
@@ -187,6 +188,7 @@ impl Exchange {
                 self.turn[index].record_usage(usage);
                 self.metrics.record_throughput(self.usage().output, self.elapsed(now_ms));
             }
+            self.metrics.observe_elapsed(self.elapsed(now_ms));
             return Ok(true);
         }
         match event.turn_boundary {
@@ -271,6 +273,7 @@ impl Exchange {
                 }
             }
         }
+        self.metrics.observe_elapsed(self.elapsed(now_ms));
         Ok(true)
     }
     /// Record provider execution, including late start evidence received during cleanup.

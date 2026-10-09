@@ -130,8 +130,12 @@ impl SteeringLane {
             .lock()
             .expect("steering lane lock poisoned")
             .sender
-            .clone()
-            .context("backend has no active turn to steer")?;
+            .clone();
+        let Some(sender) = sender else {
+            anyhow::ensure!(operation == ActiveTurnOperation::CleanupExecution,
+                "backend has no active turn to steer");
+            return Ok(());
+        };
         anyhow::ensure!(
             text.len() <= MAX_STEERING_BYTES,
             "steering input exceeds 64 KiB"
@@ -220,6 +224,22 @@ impl Drop for SteerCommand {
 #[cfg(test)]
 mod test {
     use super::SteeringLane;
+
+    #[tokio::test]
+    async fn cleanup_after_provider_settlement_does_not_require_a_live_steering_receiver() {
+        let lane = SteeringLane::default();
+        lane.cleanup_execution().await.unwrap();
+        let mut active = lane.activate(None).unwrap();
+        let mut cleanup = Box::pin(lane.cleanup_execution());
+        assert!(futures_util::poll!(cleanup.as_mut()).is_pending());
+        let command = active.receive().await.unwrap();
+        assert_eq!(command.operation, super::ActiveTurnOperation::CleanupExecution);
+        command.complete(Ok(())).await;
+        cleanup.await.unwrap();
+        drop(active);
+        lane.cleanup_execution().await.unwrap();
+        assert!(lane.steer("late input".into()).await.is_err());
+    }
 
     #[tokio::test]
     async fn bounded_steering_preserves_interrupt_admission_and_inflight_accounting() {

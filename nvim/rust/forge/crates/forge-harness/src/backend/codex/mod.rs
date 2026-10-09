@@ -70,6 +70,7 @@ fn capability() -> BackendCapability {
         model_selection: true,
         effort_selection: true,
         fast_mode: true,
+        ultrafast_mode: true,
         permission_control: true,
         execution_mode_list: vec![
             PermissionMode::Read,
@@ -272,7 +273,7 @@ impl CodexBackend {
             model: "default".into(),
             effort: "medium".into(),
             context_window: None,
-            fast_mode: false,
+            service_tier: crate::backend::ServiceTier::Standard,
             execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
             control_context: None,
@@ -1033,7 +1034,7 @@ impl Backend for CodexBackend {
                                 "threadId": thread_id,
                                 "cwd": request.workspace,
                                 "config": { "model_reasoning_effort": request.effort },
-                                "serviceTier": if request.fast_mode { Value::String("fast".into()) } else { Value::Null }
+                                "serviceTier": request.service_tier
                             }),
                             &request,
                         ), &request.model),
@@ -1052,7 +1053,8 @@ impl Backend for CodexBackend {
                                     "experimentalRawEvents": false,
                                     "historyMode": "legacy",
                                     "developerInstructions": super::HARNESS_SYSTEM_MESSAGE,
-                                    "dynamicTools": dynamic_tool_list
+                                    "dynamicTools": dynamic_tool_list,
+                                    "serviceTier": request.service_tier
                                 }),
                                 &request,
                             ),
@@ -1141,7 +1143,7 @@ impl Backend for CodexBackend {
                                 "input": input,
                                 "cwd": request.workspace,
                                 "effort": request.effort,
-                                "serviceTier": if request.fast_mode { Value::String("fast".into()) } else { Value::Null }
+                                "serviceTier": request.service_tier
                             }),
                             &request,
                         ),
@@ -1808,7 +1810,7 @@ mod test {
             model: "default".into(),
             effort: "medium".into(),
             context_window: None,
-            fast_mode: false,
+            service_tier: crate::backend::ServiceTier::Standard,
             execution_mode: PermissionMode::Read,
             backend_session_id: Some("source-thread".into()),
             control_context: None,
@@ -1972,7 +1974,12 @@ mod test {
     #[tokio::test]
     async fn explicit_turn_excludes_stale_activity_before_and_after_admission() -> Result<()> {
         use futures_util::{SinkExt, StreamExt};
-        for sends_started in [true, false] {
+        for (sends_started, service_tier, resumed) in [
+            (true, crate::backend::ServiceTier::Standard, true),
+            (false, crate::backend::ServiceTier::Fast, true),
+            (true, crate::backend::ServiceTier::Ultrafast, true),
+            (true, crate::backend::ServiceTier::Ultrafast, false),
+        ] {
             let fixture = tempfile::tempdir()?;
             let workspace = fixture.path().to_string_lossy().into_owned();
             let permission = PermissionCoordinator::transient(&workspace)?;
@@ -1987,17 +1994,18 @@ mod test {
             let server = tokio::spawn(async move {
                 let (stream, _) = listener.accept().await.unwrap();
                 let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
-                for method in ["thread/resume", "turn/start"] {
+                for method in [if resumed { "thread/resume" } else { "thread/start" }, "turn/start"] {
                     let request: Value =
                         serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap())
                             .unwrap();
                     assert_eq!(request["method"], method);
+                    assert_eq!(request["params"]["serviceTier"], serde_json::to_value(service_tier).unwrap());
                     let mut messages = vec![
                         json!({"method":"turn/started","params":{"threadId":"parent","turn":{"id":"old","status":"inProgress"}}}),
                         json!({"method":"item/completed","params":{"threadId":"parent","turnId":"old","item":{"id":"old-answer","type":"agentMessage","phase":"final_answer","text":"STALE"}}}),
                         json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"old","status":"completed"}}}),
                     ];
-                    if method == "thread/resume" {
+                    if method != "turn/start" {
                         messages.push(
                             json!({"method":"thread/goal/cleared","params":{"threadId":"parent"}}),
                         );
@@ -2056,9 +2064,9 @@ mod test {
                         model: "gpt-5.6-terra".into(),
                         effort: "medium".into(),
                         context_window: None,
-                        fast_mode: false,
+                        service_tier,
                         execution_mode: PermissionMode::Read,
-                        backend_session_id: Some("parent".into()),
+                        backend_session_id: resumed.then(|| "parent".into()),
                         control_context: None,
                     },
                     None,
@@ -2229,7 +2237,7 @@ mod test {
                         model: "gpt-5.6-terra".into(),
                         effort: "medium".into(),
                         context_window: None,
-                        fast_mode: false,
+                        service_tier: crate::backend::ServiceTier::Standard,
                         execution_mode: PermissionMode::Read,
                         backend_session_id: Some("parent".into()),
                         control_context: None,

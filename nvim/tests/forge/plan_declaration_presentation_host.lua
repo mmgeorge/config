@@ -82,7 +82,7 @@ local success, failure = xpcall(function()
   local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(transcript:find("Proposed changes", 1, true) and transcript:find("Modified src/change.rs", 1, true),
     "submitted declaration plan did not expose individual file changes")
-  assert(transcript:find("Plan overview 2 sections", 1, true) and not transcript:find("Artifact:", 1, true),
+  assert(transcript:find("Plan overview 4 sections", 1, true) and not transcript:find("Artifact:", 1, true),
     "declaration submission still displays the rendered artifact diff")
   for _, baseline in ipairs({ false, true }) do
     local declaration, declaration_failure
@@ -114,8 +114,8 @@ local success, failure = xpcall(function()
     if line:match("^/// ") then assert(#line <= 60, "submitted prose did not wrap") end
   end
   assert(document.design.proposed["src/change.rs"] == "pub fn reviewed_change();\n")
-  assert(document.design.document.description == "Revise the registry interface while preserving its ownership boundary.")
-  assert(document.design.document.task == "Revise the registry interface.")
+  assert(document.design.document.design == "Revise the registry interface while preserving its ownership boundary.")
+  assert(document.design.document.objective == "Revise the registry interface.")
   assert(document.design.validation and document.design.validation.fingerprint, "submission did not retain reference validation")
   local projection = bytes(plan.working_path)
   local original_request = client.request_for
@@ -176,8 +176,16 @@ local success, failure = xpcall(function()
     and clipboard.lines[1]:find("pub second:", 1, true), "plan copy omitted the gutter or source")
   assert(review.owner.replica.gutter_selection == nil and vim.api.nvim_get_mode().mode == "n", "plan copy retained gutter selection")
   vim.g.clipboard = previous_clipboard
-  assert(text(review.buf):find(document.design.document.description, 1, true), "change description is missing")
-  assert(text(review.buf):find("Task:\n" .. document.design.document.task, 1, true), "task overview is missing or misplaced")
+  assert(text(review.buf):find(document.design.document.design, 1, true), "change description is missing")
+  assert(text(review.buf):find("Objective:\n" .. document.design.document.objective, 1, true), "task overview is missing or misplaced")
+  local last_section = 0
+  for _, heading in ipairs({ "Objective:", "Requirements:", "Background:", "Design:", "Proposed declaration changes:", "Verification:" }) do
+    local position = assert(text(review.buf):find(heading, 1, true), "missing plan section: " .. heading)
+    assert(position > last_section, "plan sections are out of order: " .. heading)
+    last_section = position
+  end
+  assert(not text(review.buf):find("\nUsage:\n", 1, true) and not text(review.buf):find("\nDecisions:\n", 1, true),
+    "empty optional metadata sections should be hidden")
   assert(text(review.buf):find("  pub second: u64,", 1, true), "compact member did not receive display indentation")
   assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "full view did not abbreviate trait implementation")
   assert(not text(review.buf):find("fn default", 1, true), "full view exposed trait implementation members")
@@ -190,9 +198,9 @@ local success, failure = xpcall(function()
   assert(bytes(artifact_path) == artifact and bytes(plan.working_path) == projection, "opening rewrote the plan")
   local file_row, hunk_row, task_row, description_row, changes_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
-    if line == "Description:" then description_row = row end
-    if line == "Task:" then task_row = row end
-    if line == "Changes:" then changes_row = row end
+    if line == "Design:" then description_row = row end
+    if line == "Objective:" then task_row = row end
+    if line == "Proposed declaration changes:" then changes_row = row end
     if line:find("Modified src/change.rs", 1, true) then file_row = row end
     if file_row and not hunk_row and line:find("@@", 1, true) then hunk_row = row end
   end
@@ -577,8 +585,8 @@ local success, failure = xpcall(function()
   assert(text(review.buf):find("pub(super) fn configure_parent()", 1, true), "public filter hid parent visibility")
   assert(not text(review.buf):find("fn hidden_helper()", 1, true), "public filter exposed a private helper")
   assert(not text(review.buf):find("secret:", 1, true), "public filter exposed a private field")
-  assert(text(review.buf):find(document.design.document.description, 1, true), "public filter hid change description")
-  assert(text(review.buf):find(document.design.document.task, 1, true), "public filter hid task overview")
+  assert(text(review.buf):find(document.design.document.design, 1, true), "public filter hid change description")
+  assert(text(review.buf):find(document.design.document.objective, 1, true), "public filter hid task overview")
   assert(text(review.buf):find("#[derive(Debug, Clone)]\npub struct ArenaPlugin {}", 1, true),
     "empty public struct did not compact with its attributes")
   assert(text(review.buf):find("impl Default for ArenaPlugin {}", 1, true), "public view did not abbreviate trait implementation")
@@ -641,7 +649,7 @@ local success, failure = xpcall(function()
   for _, saved in ipairs(vim.json.decode(bytes(annotation_path)).annotation) do
     if saved.source.body == "Clarify the behavior in the description" then description_anchor = saved.anchor end
   end
-  assert(description_anchor and description_anchor.start.target_type == "section" and description_anchor.start.section == "overview",
+  assert(description_anchor and description_anchor.start.target_type == "section" and description_anchor.start.section == "design",
     "description comment did not retain its metadata target")
   toggle(description_row)
   assert(closed(description_comment_row + 1) == description_row, "description fold left its comment visible")
@@ -671,7 +679,7 @@ local success, failure = xpcall(function()
   for _, saved in ipairs(vim.json.decode(bytes(annotation_path)).annotation) do
     if saved.source.body == "Clarify the requested outcome" then task_anchor = saved.anchor end
   end
-  assert(task_anchor and task_anchor.start.target_type == "section" and task_anchor.start.section == "task",
+  assert(task_anchor and task_anchor.start.target_type == "section" and task_anchor.start.section == "objective",
     "task comment did not retain its separate metadata target")
   toggle(task_row)
   assert(closed(task_comment_row + 1) == task_row, "task fold left its comment visible")

@@ -3,7 +3,7 @@
 Design the final interfaces and ownership structures required by the user's request.
 Harness starts with an empty declaration design and captures each existing file's immutable
 baseline on its first successful edit. Edit virtual
-overview files, complete configuration files, and the virtual plan.json task, description, and validation requirements, then submit them for mandatory review. Do not implement the design or
+overview files, complete configuration files, and the virtual plan.json specification, then submit them for mandatory review. Do not implement the design or
 modify project files.
 
 ## Procedure
@@ -36,81 +36,139 @@ modify project files.
 6. Keep `plan.json` consistent with the final declarations. Call `harness_plan_submit` with the exact current `plan_id` and `expected_version`. End the turn
    after successful submission. Submission requests review and never authorizes implementation.
 
-## Task and change overview
+## Plan metadata
 
-Harness creates a virtual `plan.json` with `task` and `description` strings and a `validation`
-object containing `automated` and `manual` strings. All strings start empty.
-Read and update it through the same tools as declaration files. It is plan metadata, never a
-project file or declaration overview. Do not add fields, move it, or delete it.
+Harness creates a virtual `plan.json` containing `objective`, optional `usage`, `requirements`,
+`background`, `decisions`, `design`, and `verification`. It is plan metadata, never a project file
+or declaration overview. Read and update it through the same tools as declaration files. Do not
+move it, delete it, or add other fields. Drafts start with empty strings and lists, with `usage` absent.
 
-Write `task` as a short statement of the requested outcome and scope. Explain what the user needs
-to be able to do, or which existing failure needs correction. For new functionality, state the
-task directly rather than inventing a defect. Resolve terse requests using inspected context and
-accepted decisions. Do not substitute a list of files, objects, dependencies, or implementation steps.
+Write for an implementer who can inspect the repository and proposed declarations but has no
+conversation history. Preserve settled user requirements and consequential decisions in this metadata.
+Do not depend on phrases such as "as discussed" or details available only in earlier messages.
+Keep every section consistent with the final declarations and update it when review changes the plan.
 
-Write `description` as a reviewer-oriented change overview in one to three focused paragraphs.
-Open with what the proposal provides and how it fulfills the task. Explain the design through its
-principal responsibility boundaries and how they cooperate, using concrete names from the declarations.
-Include important lifecycle behavior, ordering rules, error boundaries, or limits that help a reviewer
-judge the design. Explain why a boundary or constraint matters instead of merely naming it.
+The review order is Objective, Usage when present, Requirements, Background, Decisions when nonempty,
+Design, proposed declaration changes, and Verification. Each section has a distinct role:
 
-Use Markdown inline code in `task` and `description` whenever referring to a specific code
-identifier, including types, traits, interfaces, functions, methods, fields, enum variants,
-modules, and plugins. For example, write `HelloGamePlugin`, `GameConfig`, and `RoundEntity`.
-Also format concrete file paths and commands as inline code. Keep ordinary prose unformatted.
+### Objective
 
-Select details that explain the change. Do not inventory every feature, object, manifest entry,
-dependency version, or validation command. Include those details only when they explain a design
-decision or user-visible constraint. Do not repeat the task verbatim, write execution instructions,
-or claim implementation or verification has finished. Keep both fields consistent with the final
-proposal and revise them when feedback changes the scope or design.
-Use plain paragraphs, with paragraph breaks encoded as `\n\n` inside the JSON string.
+Write `objective` as a short statement of the requested outcome and scope. State what the user
+needs to accomplish or which failure needs correction. For new functionality, state the task
+without inventing a defect. Do not substitute an inventory of files or implementation steps.
 
-Both fields must be nonempty for submission, including behavior-only changes. This example
-separates the requested outcome from the proposed mechanism:
+### Usage
+
+Use the optional Markdown string `usage` for representative successful use. Omit the field when
+examples add no useful information, such as an internal refactor. An empty string or null also
+hides this section. State the relevant starting conditions, input or action, and observable result.
+Distinguish illustrative values from exact required output.
+
+- For a CLI, show the command or stdin followed by stdout, stderr, and exit status.
+- For a UI, show the starting state, user action, and visible result.
+- For an API, show the request, response, and observable side effects.
+- For a library, show the call and preconditions, then its return value, mutation, or error.
+- For a background process, show the trigger and eventual observable result.
+- For a data migration, show representative data before and after the migration.
+
+### Requirements
+
+Write `requirements` as a JSON array of nonempty strings. Each entry states one concrete behavior
+or restriction every valid implementation must satisfy. Include relevant error, cancellation,
+recovery, compatibility, and scope boundaries. Requirements define success independently of the
+chosen implementation. Do not repeat the design or create implementation milestones.
+
+### Background
+
+Write `background` as Markdown explaining the existing system directly relevant to this task.
+Identify inspected components using repository-relative paths and symbol names. Explain what each
+owns, how the affected operation currently flows between them, and the integration points for this
+change. Include existing behavior that must be understood or preserved, such as persistence,
+error propagation, and platform limits. Explain the current limitation when applicable.
+
+Record facts established through inspection and explicitly identify material unknowns. Include only
+details that affect implementation. Do not give a repository tour, summarize the conversation, repeat
+the requested behavior, or describe the proposed solution. For a new project, briefly describe the
+starting repository, available infrastructure, and relevant conventions.
+
+### Decisions
+
+Write `decisions` as a JSON array of objects with nonempty `decision` and `rationale` strings.
+Record consequential settled choices another implementer might otherwise reconsider. Explain why
+the approach was selected and significant tradeoffs or rejected alternatives when relevant. Do not
+invent alternatives, record routine implementation details, or duplicate requirements. Use an empty
+array when no consequential decision needs a separate explanation.
+
+### Design
+
+Write `design` as Markdown explaining how the proposed solution works and satisfies the requirements.
+Describe responsibilities, interfaces, data flow, and relevant lifecycle, ordering, and error boundaries.
+Use concrete names from the declarations. Include the detail needed to implement without the prior
+conversation, with no fixed paragraph limit. Preserve consequential rationale in Decisions and explain
+existing behavior in Background. Do not include executable implementation bodies, task milestones,
+mutable execution progress, or claims that implementation or verification has finished.
+
+Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
+Encode paragraph breaks as `\n\n` inside JSON strings. Each rendered metadata section is limited
+to 16 KiB. Requirements allow at most 256 entries and Decisions at most 128 entries.
+Objective, Background, Design, and at least one Requirement must be nonempty before submission.
+
+A plan's metadata can use this shape:
 
 ```json
 {
-  "task": "Support asynchronous texture replacement with observable progress and cancellation while keeping textures used by submitted frames valid.",
-  "validation": {
-    "automated": "cargo check\ncargo test",
-    "manual": "- Cancel a pending replacement and confirm the current texture remains visible.\n- Replace a texture while frames are in flight and confirm rendering remains valid."
-  },
-  "description": "The proposal gives callers a `TextureRequest` for each pending replacement so they can observe loading and cancel it before publication. `TextureStreaming` coordinates decoding and upload, while `TextureRegistry` owns the published texture version.\n\n`TextureRegistry` publishes replacements at frame boundaries after upload completes. It retains previous allocations until their final GPU use completes, so a replacement cannot invalidate a texture still used by a submitted frame."
+  "objective": "Support observable, cancellable texture replacement.",
+  "usage": "Start a replacement, cancel it before publication, and confirm the existing texture remains visible.",
+  "requirements": [
+    "Cancelling before publication preserves the current texture.",
+    "Submitted frames retain valid texture allocations until completion."
+  ],
+  "background": "The existing renderer obtains published handles from `TextureRegistry`. Submitted frames can outlive the frame in which a replacement is requested.",
+  "decisions": [
+    {
+      "decision": "Publish replacements at frame boundaries.",
+      "rationale": "A single publication point keeps each submitted frame's texture selection consistent."
+    }
+  ],
+  "design": "`TextureStreaming` returns a `TextureRequest` for progress and cancellation. `TextureRegistry` installs completed replacements at frame boundaries and retains previous allocations until their final GPU use completes.",
+  "verification": {
+    "automated": "cargo test --release texture_replacement",
+    "manual": "- Cancel a pending replacement and confirm the current texture remains visible.\n- Replace a texture with frames in flight and confirm rendering remains valid."
+  }
 }
 ```
 
-Use the actual saved text when updating it. Read it when that text is not already available.
-Task, description, validation, and declaration edits can share one
-atomic patch:
+This example illustrates the schema. Use inspected project facts and actual supported commands
+for the real plan. Read the saved text before patching when it is not already available. Metadata
+and declaration edits can share one atomic patch:
 
 ```text
 *** Begin Patch
 *** Update File: plan.json
 @@
--  "task": "",
-+  "task": "Support observable, cancellable texture requests.",
+-  "objective": "",
++  "objective": "Support observable, cancellable texture requests.",
 @@
--  "description": ""
-+  "description": "`TextureStreaming` returns observable request handles and supports cancellation."
+-  "design": "",
++  "design": "`TextureStreaming` returns observable request handles and supports cancellation.",
 *** End Patch
 ```
 
-## Validation requirements
+### Verification
 
-Record the checks needed to verify the final implementation in `validation`.
-Write `automated` as newline-separated executable commands, one command per nonblank line.
-Use exact commands supported by the inspected project, in the order they should run from the
-project workspace. Include a directory change in a command when it needs another working directory.
-Do not add bullets, numbering, Markdown fences, prose, or multiline shell scripts to this field.
-Encode line breaks as `\n` inside the JSON string.
+Record the checks needed to demonstrate the requirements in `verification`, an object containing
+`automated` and `manual` strings. Write `automated` as newline-separated executable commands,
+one command per nonblank line. Use exact commands supported by the inspected project, in the order
+they should run from the project workspace. Include a directory change when another working
+directory is required. Do not add bullets, numbering, Markdown fences, prose, or multiline shell
+scripts to this field. Encode line breaks as `\n` inside the JSON string.
 
-Write `manual` as a Markdown list, one observable check per line. State the action and expected
-result. Identify checks that require a person or unavailable hardware. These are requirements,
-not completed results. Leave either string empty when no checks of that kind apply.
-Keep both fields consistent with the design and revise them when review changes the scope.
-Planning records commands without running implementation validation. During execution, Verify
-runs the automated commands and performs or reports blockers for the manual checks before completion.
+Write `manual` as a Markdown list of actions and expected results. Identify checks that require a
+person or unavailable hardware. These are requirements, not completed results. Leave either string
+empty when no checks of that kind apply. Planning records commands without running implementation
+verification. During execution, Verify runs the automated commands and performs or reports blockers
+for manual checks before completion. Execution state, milestones, progress, and results remain
+Harness-owned and must not be added to `plan.json`.
 
 ## Overview syntax
 
@@ -326,8 +384,7 @@ input. Resolve each comment against the saved design and preserve its intended c
 Read current proposed files before revising them. Preserve useful decisions and submit the new version.
 
 Other configuration formats, project documentation, implementation bodies, dependency graphs,
-and task execution are outside this MVP. If only function behavior changes, explain that no declaration
-changes are represented in `plan.json` and submit the unchanged declaration proposal. Never manufacture interface changes
+and task execution are outside this MVP. If only function behavior changes, describe the behavior change in `plan.json` and explain why it needs no declaration changes and submit the unchanged declaration proposal. Never manufacture interface changes
 to make a diff appear. Validation checks declaration syntax, not unwritten implementation behavior.
 
 If affected workspace source changed since extraction, report the need for a fresh baseline.

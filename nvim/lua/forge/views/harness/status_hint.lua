@@ -10,15 +10,18 @@ local animation = {}
 ---@param transcript table
 ---@param row integer
 ---@param width integer
----@param terminal_text string?
-local function render_footer(transcript, row, width, terminal_text)
+---@param terminal_chunks table[]?
+local function render_footer(transcript, row, width, terminal_chunks)
   local lines = {}
   if transcript.rename_status then
     lines[#lines + 1] = { { transcript.rename_status, "ForgeStatusHint" } }
   end
-  if terminal_text then
-    lines[#lines + 1] = { { "", "ForgeStatusHint" } }
-    lines[#lines + 1] = { { terminal_text, "ForgeStatusHint" } }
+  if terminal_chunks then
+    local text = {}
+    for _, chunk in ipairs(terminal_chunks) do text[#text + 1] = chunk[1] end
+    for _, line in ipairs(require("forge.render.display_text").wrap(table.concat(text), width, "", "")) do
+      lines[#lines + 1] = { { line, "ForgeStatusHint" } }
+    end
   end
   if transcript.recap then
     local text = transcript.recap.loading and "Loading..." or transcript.recap.text
@@ -33,7 +36,9 @@ local function render_footer(transcript, row, width, terminal_text)
     end
   end
   if #lines > 0 then
-    vim.api.nvim_buf_set_extmark(transcript.buffer, namespace, math.max(0, row), 0, { id = 3, virt_lines = lines })
+    vim.api.nvim_buf_set_extmark(transcript.buffer, namespace, row + 1, 0, {
+      id = 3, virt_lines = lines, virt_lines_above = true,
+    })
   end
 end
 
@@ -46,6 +51,46 @@ function M.clear(target_buffer)
   end
 end
 
+local function status_location(transcript)
+  local cached = transcript.status_hint_location
+  if cached and cached.revision == transcript.revision then return cached.row, cached.target end
+  cached = { revision = transcript.revision }
+  transcript.status_hint_location = cached
+  for index = transcript.sequence:count() - 1, 0, -1 do
+    local node = transcript.sequence:at(index)
+    for _, target in ipairs(node.entry.metadata.target or {}) do
+      if target.id:match(":working$") or target.id:match(":question$") or target.id:match(":review%-plan$") then
+        local _, source_row = transcript.sequence:position(node.id)
+        cached.row = buffer.physical_row(transcript, source_row) + target.range.start.row
+        cached.target = target.id
+        return cached.row, cached.target
+      end
+    end
+    if not node.id:find(":implementation:", 1, true) then return nil end
+  end
+end
+
+local function hint_chunks(commands, context, width)
+  local entries = keymaps.view_hint_entries("harness", commands, {}, context)
+  local formatted = keymaps.render_hintbar(entries, width, { inline = true })
+  local evaluated = vim.api.nvim_eval_statusline(formatted, { maxwidth = width, highlights = true })
+  local chunks = {}
+  for index, highlight in ipairs(evaluated.highlights) do
+    local following = evaluated.highlights[index + 1]
+    local finish = following and following.start or #evaluated.str
+    if finish > highlight.start then
+      chunks[#chunks + 1] = { evaluated.str:sub(highlight.start + 1, finish), highlight.group }
+    end
+  end
+  return chunks
+end
+
+local function append_hint(chunks, extra)
+  if #extra == 0 then return end
+  if #chunks > 0 then chunks[#chunks + 1] = { " · ", "ForgeStatusHint" } end
+  vim.list_extend(chunks, extra)
+end
+
 ---@param transcript table
 ---@param commands table
 ---@param width integer
@@ -53,9 +98,9 @@ function M.render(transcript, commands, width)
   local target_buffer = transcript.buffer
   if not vim.api.nvim_buf_is_valid(target_buffer) then M.clear(target_buffer) return end
   vim.api.nvim_buf_clear_namespace(target_buffer, namespace, 0, -1)
-  local row = vim.api.nvim_buf_line_count(target_buffer) - 1
-  local location = buffer.locate(transcript, row, 0)
-  local working = location and location.target and location.target:match(":working$")
+  local last_row = vim.api.nvim_buf_line_count(target_buffer) - 1
+  local row, target = status_location(transcript)
+  local working = target and target:match(":working$")
   if transcript.execution_notice then
     M.clear(target_buffer)
     local text = transcript.execution_notice:gsub("%s+", " ")
@@ -67,68 +112,50 @@ function M.render(transcript, commands, width)
         virt_text_win_col = 0, priority = 200,
       })
     else
-      vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
+      vim.api.nvim_buf_set_extmark(target_buffer, namespace, last_row, 0, {
         id = 1, virt_lines = { { { text, "ForgeHarnessToolFailure" } } },
       })
     end
     return
   end
-  local question = location and location.target and location.target:match(":question$")
+  local question = target and target:match(":question$")
   local inventory = transcript.background_terminals
   local terminal_count = inventory and inventory.supported and #(inventory.terminal or {}) or 0
-  local terminal_text = inventory and inventory.unavailable and "Background terminal status unavailable"
-    or terminal_count > 0 and ("%d background terminal%s"):format(terminal_count, terminal_count == 1 and "" or "s") or nil
-  if not (working or question or location and location.target and location.target:match(":review%-plan$")) then
-    M.clear(target_buffer)
-    render_footer(transcript, row, width, terminal_text and (terminal_text .. (terminal_count > 0 and " running" or "")))
-    return
-  end
+  local terminal_text = inventory and inventory.unavailable and "Terminal status unavailable"
+    or terminal_count > 0 and ("%d terminal%s running"):format(terminal_count, terminal_count == 1 and "" or "s") or nil
+  local terminal_chunks = terminal_text and { { terminal_text, "ForgeStatusHint" } } or nil
+  if terminal_count > 0 then append_hint(terminal_chunks, hint_chunks(commands, "terminal_status", width)) end
   if working then
     local session = require("forge.session").harness.session or {}
     local capture = require("forge.infra.highlights").harness_mode(session.execution_mode)
     local text = vim.api.nvim_buf_get_lines(target_buffer, row, row + 1, false)[1]
-    local function draw()
-      if not vim.api.nvim_buf_is_valid(target_buffer) then M.clear(target_buffer) return end
-      vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
-        id = 1, sign_text = spinner.frame_at(vim.uv.now()), sign_hl_group = capture,
-        end_row = row, end_col = #text, hl_group = capture, priority = 110,
-      })
-    end
-    draw()
+    vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
+      id = 1, sign_text = spinner.frame_at(vim.uv.now()), sign_hl_group = capture,
+      end_row = row, end_col = #text, hl_group = capture, priority = 110,
+    })
     if not animation[target_buffer] then
       local timer = vim.uv.new_timer()
       animation[target_buffer] = timer
       timer:start(120, 120, vim.schedule_wrap(function()
-        if animation[target_buffer] == timer then
-          M.render(transcript, commands, width)
-        end
+        if animation[target_buffer] == timer then M.render(transcript, commands, width) end
       end))
     end
   elseif animation[target_buffer] then
     M.clear(target_buffer)
   end
-  render_footer(transcript, row, width)
-  local context = working and "working_status" or question and "question_status" or "review_status"
-  local entries = keymaps.view_hint_entries("harness", commands, {}, context)
-  if #entries == 0 and not terminal_text then return end
-  local formatted = keymaps.render_hintbar(entries, width, { inline = true })
-  local evaluated = vim.api.nvim_eval_statusline(formatted, { maxwidth = width, highlights = true })
-  if evaluated.str == "" and not terminal_text then return end
-  local chunks = { { working and " · " or "  ", "ForgeStatusHint" } }
-  if terminal_text then
-    chunks[#chunks + 1] = { terminal_text .. (evaluated.str ~= "" and " · " or ""), "ForgeStatusHint" }
-  end
-  for index, highlight in ipairs(evaluated.highlights) do
-    local following = evaluated.highlights[index + 1]
-    local finish = following and following.start or #evaluated.str
-    if finish > highlight.start then
-      chunks[#chunks + 1] = { evaluated.str:sub(highlight.start + 1, finish), highlight.group }
+  local context = working and "working_status" or question and "question_status" or target and "review_status"
+  if context then
+    local chunks = hint_chunks(commands, context, width)
+    if working and terminal_chunks then
+      append_hint(terminal_chunks, chunks)
+    elseif #chunks > 0 then
+      table.insert(chunks, 1, { " · ", "ForgeStatusHint" })
+      vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
+        id = 2, virt_text = chunks, virt_text_pos = "eol", hl_mode = "combine",
+      })
     end
   end
-  local line = vim.api.nvim_buf_get_lines(target_buffer, row, row + 1, false)[1]
-  vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, working and math.max(0, #line - 1) or 0, {
-    id = 2, virt_text = chunks, virt_text_pos = working and "inline" or "eol", hl_mode = "combine",
-  })
+  render_footer(transcript, last_row, width, terminal_chunks)
 end
 
 return M

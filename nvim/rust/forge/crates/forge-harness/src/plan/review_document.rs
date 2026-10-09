@@ -1307,8 +1307,10 @@ mod tests {
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         let mut canonical = crate::plan::document::test_fixture("plan", "Inspect containers.");
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Expose configuration.".into();
-        design.document.description = "Reject invalid configuration.".into();
+        design.document.objective = "Expose configuration.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Reject invalid configuration.".into();
         design.proposed.insert("src/lib.rs".into(), "#[derive(Debug)]\n/// Rejects invalid dimensions.\npub enum ConfigError {\n  /// Invalid arena.\n  ArenaSize,\n}\n\n/// Stores configuration.\npub struct Config {\n  /// Internal limit.\n  limit: u32,\n  /// Public count.\n  pub count: u32,\n}\n".into());
         design.proposed.get_mut("src/lib.rs").unwrap().push_str("pub fn inspect(config: &Config);\n");
         design.proposed_calls.insert("src/lib.rs".into(), crate::plan::calls::extract("src/lib.rs", "pub fn inspect(config: &Config) { config.limit; }").unwrap());
@@ -1353,8 +1355,10 @@ mod tests {
         let file = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         let mut canonical = crate::plan::document::test_fixture("plan", "Question the API.");
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Expose shared state.".into();
-        design.document.description = "Use a focused state owner.".into();
+        design.document.objective = "Expose shared state.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Use a focused state owner.".into();
         design.proposed.insert("state.rs".into(), "/// Owns shared state.\npub struct State;\n".into());
         canonical.design = Some(design);
         file.write_working_document("session", "plan", &canonical).unwrap();
@@ -1554,8 +1558,10 @@ mod tests {
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         let mut canonical = crate::plan::document::test_fixture("plan", "Declarations");
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Define the API.".into();
-        design.document.description = "Expose users through the API.".into();
+        design.document.objective = "Define the API.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Expose users through the API.".into();
         design.proposed.insert(
             "tsconfig.json".into(),
             "{\"compilerOptions\":{\"noLib\":true}}".into(),
@@ -1706,8 +1712,10 @@ mod tests {
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         let mut canonical = crate::plan::document::test_fixture("plan", "Module navigation");
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Expose the assets module.".into();
-        design.document.description = "Keep asset declarations in their own module.".into();
+        design.document.objective = "Expose the assets module.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Keep asset declarations in their own module.".into();
         design
             .proposed
             .insert("lib.rs".into(), "pub mod assets;\npub mod stable;\n".into());
@@ -1933,8 +1941,10 @@ mod tests {
         let file = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         let mut canonical = crate::plan::document::test_fixture("plan", "Movement declarations");
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Define movement interfaces.".into();
-        design.document.description = "Separate movement intent from entity transforms.".into();
+        design.document.objective = "Define movement interfaces.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Separate movement intent from entity transforms.".into();
         design.proposed.insert("Cargo.toml".into(), "[package]\nname = \"arena\"\nversion = \"0.1.0\"\nedition = \"2024\"\n[dependencies]\nbevy = \"=0.19.1\"\n".into());
         design.proposed.insert(
             "src/lib.rs".into(),
@@ -2213,8 +2223,10 @@ mod tests {
         let mut canonical =
             crate::plan::document::test_fixture("plan", "Uncaptured property navigation");
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Review a captured caller".into();
-        design.document.description = "Navigate to an uncaptured property definition".into();
+        design.document.objective = "Review a captured caller".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Navigate to an uncaptured property definition".into();
         let caller = "import { Client } from './client';\nexport function run(client: Client): void { client.count; }\n";
         std::fs::write(temporary.path().join("run.ts"), caller).unwrap();
         let text = forge_diff::syntax::DeclarationOverview::extract("run.ts", caller).unwrap();
@@ -2295,8 +2307,10 @@ mod tests {
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         let mut canonical = crate::plan::document::test_fixture("plan", "Property navigation");
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Add a client count property.".into();
-        design.document.description = "Expose property uses for review.".into();
+        design.document.objective = "Add a client count property.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Expose property uses for review.".into();
         design.proposed.insert("client.ts".into(), "/// Tracks requests.\nexport interface Client {\n  /// Current request count.\n  count: number;\n}\n".into());
         design.proposed.insert("run.ts".into(), "import { Client } from './client';\n/// Updates request count.\nfunction run(client: Client): void;\n".into());
         design.proposed_calls.insert("run.ts".into(), crate::plan::calls::extract("run.ts", "import { Client } from './client'; function run(client: Client) { client.count++; client.count; }").unwrap());
@@ -2402,8 +2416,10 @@ mod tests {
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         let mut canonical = crate::plan::document::test_fixture("plan", "Import visibility");
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Define shared record declarations.".into();
-        design.document.description = "Expose records through public exports.".into();
+        design.document.objective = "Define shared record declarations.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Expose records through public exports.".into();
         design.proposed.insert("Cargo.toml".into(), "[package]\nname = 'records'\nversion = '0.1.0'\nedition = '2021'\n".into());
         design.proposed.insert("src/lib.rs".into(), "pub mod model;\npub mod consumer;\npub use crate::model::Record;\npub(crate) use crate::model::Record as CrateRecord;\n".into());
         design.proposed.insert("src/model.rs".into(), "/// Holds a shared record.\npub struct Record {}\n".into());
@@ -2439,8 +2455,10 @@ mod tests {
         let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
         let mut canonical = crate::plan::document::test_fixture("plan", "Call navigation");
         let mut design = crate::plan::DeclarationDesign::default();
-        design.document.task = "Define call relationships.".into();
-        design.document.description = "Expose sender relationships for review.".into();
+        design.document.objective = "Define call relationships.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Expose sender relationships for review.".into();
         design.proposed.insert("client.ts".into(), "/// Sends a request.\nexport function send(): void;\n".into());
         design.proposed.insert("run.ts".into(), "import { send } from './client';\n/// Dispatches work.\nclass Runner { private run(): void; }\n".into());
         design.proposed_calls.insert("run.ts".into(), vec![crate::plan::FunctionBody { change: None, owner: "Runner.run".into(), call: Some(vec![crate::plan::CallSite { kind: crate::plan::CallKind::Call, name: "send".into(), source: None, unresolved: false }]) }]);

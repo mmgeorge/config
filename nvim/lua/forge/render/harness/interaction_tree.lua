@@ -587,7 +587,7 @@ local function append_exchange_summary(result, interaction, options)
   if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
     verb = (interaction.awaiting_input or paused) and "Planning paused" or complete and "Planned" or "Planning"
   elseif interaction.kind == "plan_execution" then
-    verb = complete and "Executed plan" or paused and "Plan execution paused" or "Executing plan"
+    verb = complete and "Plan turn complete" or paused and "Plan execution paused" or "Executing plan"
   elseif paused then
     verb = "Paused"
   end

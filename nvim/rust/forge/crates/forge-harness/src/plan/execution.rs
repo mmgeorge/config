@@ -62,7 +62,7 @@ pub struct PlanPhaseDone {
     pub verification: Option<VerificationReport>,
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 /// Retains source identities and comparison findings without claiming behavioral proof.
 pub struct SemanticProgress {
     pub matched: Vec<String>,
@@ -114,8 +114,9 @@ impl SemanticProgress {
                                 .push(format!("{path}: source changed during comparison"));
                             continue;
                         }
-                        let declarations_match = expected.replace("\r\n", "\n").trim()
-                            == actual.text.replace("\r\n", "\n").trim();
+                        let expected_text = expected.replace("\r\n", "\n");
+                        let actual_text = actual.text.replace("\r\n", "\n");
+                        let declarations_match = expected_text.trim() == actual_text.trim();
                         let mut calls_match = true;
                         let mut call_difference = None;
                         for planned in design.proposed_calls.get(&path).into_iter().flatten() {
@@ -186,16 +187,22 @@ impl SemanticProgress {
                         if declarations_match && calls_match {
                             progress.matched.push(path);
                         } else {
-                            progress.different.push(format!(
-                                "{path}: {}",
-                                if !declarations_match {
-                                    "declarations or configuration differ"
-                                } else {
-                                    call_difference
-                                        .as_deref()
-                                        .unwrap_or("planned call relationships differ")
-                                }
-                            ));
+                            let difference = if !declarations_match {
+                                let expected_line = expected_text.trim().lines().collect::<Vec<_>>();
+                                let actual_line = actual_text.trim().lines().collect::<Vec<_>>();
+                                let row = (0..expected_line.len().max(actual_line.len()))
+                                    .find(|row| expected_line.get(*row) != actual_line.get(*row))
+                                    .expect("different declarations have a differing line");
+                                let preview = |line: Option<&&str>| line.map_or_else(
+                                    || "<end of file>".into(),
+                                    |line| line.chars().take(240).collect::<String>(),
+                                );
+                                format!("declarations or configuration differ at overview line {}: expected {:?}; observed {:?}. Correct the source to match the accepted overview before considering a design revision.",
+                                    row + 1, preview(expected_line.get(row)), preview(actual_line.get(row)))
+                            } else {
+                                call_difference.unwrap_or_else(|| "planned call relationships differ".into())
+                            };
+                            progress.different.push(format!("{path}: {difference}"));
                         }
                     }
                 },
@@ -411,7 +418,7 @@ impl PlanExecutionRecord {
                 "Correct the recorded findings while matching the accepted design."
             }
             PlanPhase::Verify => {
-                "Read plan.json with harness_plan_read and verify its validation requirements. Run each nonblank line of validation.automated as a separate command in the project workspace, in listed order, using normal execution tools and permissions. Perform every validation.manual check and record the observed result. Report blocked when a required check cannot be performed, including checks requiring user action. Do not claim passed with outstanding checks. After running checks, call harness_plan_read with only plan_id to retrieve execution.verification_evidence. Use its exact tool IDs in verification.evidence, not command descriptions or output text. Select affected checks to rerun and justify any reused evidence. Report passed, failed, or blocked with evidence and concrete findings."
+                "Read plan.json with harness_plan_read and verify its verification requirements. Run each nonblank line of verification.automated as a separate command in the project workspace, in listed order, using normal execution tools and permissions. Perform every verification.manual check and record the observed result. Report blocked when a required check cannot be performed, including checks requiring user action. Do not claim passed with outstanding checks. After running checks, call harness_plan_read with only plan_id to retrieve execution.verification_evidence. Use its exact tool IDs in verification.evidence, not command descriptions or output text. Select affected checks to rerun and justify any reused evidence. Report passed, failed, or blocked with evidence and concrete findings."
             }
         };
         format!(
@@ -678,6 +685,22 @@ mod tests {
         assert_eq!(execution.state, PlanExecutionState::Blocked);
         assert_eq!(execution.verification.len(), 1);
         assert!(execution.completed_at_ms.is_none());
+    }
+
+    #[test]
+    fn semantic_scan_reports_the_first_expected_and_observed_declaration() {
+        let workspace = tempfile::tempdir().unwrap();
+        let path = workspace.path().join("counter.rs");
+        std::fs::write(&path, "/// Accepted documentation.\npub struct Counter { pub value: i32 }\n").unwrap();
+        let mut design = DeclarationDesign::default();
+        let (file, _) = design.source(workspace.path(), "counter.rs").unwrap();
+        design.proposed.insert("counter.rs".into(), file.text);
+        std::fs::write(&path, "/// Changed documentation.\npub struct Counter { pub value: i32 }\n").unwrap();
+        let progress = SemanticProgress::scan(&design, workspace.path()).unwrap();
+        assert!(!progress.conforms());
+        assert!(progress.different[0].contains("overview line 1"));
+        assert!(progress.different[0].contains("expected \"/// Accepted documentation.\""));
+        assert!(progress.different[0].contains("observed \"/// Changed documentation.\""));
     }
 
     #[test]

@@ -1,7 +1,7 @@
 use forge_harness::backend::BackendLaunch;
 use forge_harness::broker::{HarnessBroker, InitializeRequest};
 use forge_harness::permissions::store::PermissionStore;
-use forge_harness::session::{PermissionMode, HarnessMode};
+use forge_harness::session::PermissionMode;
 use forge_protocol::message::Request;
 use serde_json::json;
 use std::process::Command;
@@ -139,7 +139,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
             .await;
         assert!(changed.response.error().is_none());
         let snapshot = broker.snapshot().unwrap();
-        assert_eq!(snapshot.session.mode, HarnessMode::Plan);
+        assert!(snapshot.session.current_task_id.is_none());
         assert_eq!(snapshot.session.execution_mode, PermissionMode::Write);
         assert!(snapshot.active_plan.is_none());
         assert!(snapshot.exchange.is_empty());
@@ -148,7 +148,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         .dispatch(Request {
             id: 13,
             method: "prompt.submit".into(),
-            params: json!({ "text": "preserve the selected mode" }),
+            params: json!({ "text": "/plan preserve the selected mode" }),
         })
         .await;
     assert!(planned.response.error().is_none());
@@ -156,7 +156,7 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         broker.snapshot().unwrap().session.execution_mode,
         PermissionMode::Write
     );
-    assert_eq!(broker.snapshot().unwrap().session.mode, HarnessMode::Plan);
+    assert!(broker.snapshot().unwrap().session.current_task_id.is_some());
     let before = broker.snapshot().unwrap();
     let retained = broker
         .dispatch(Request {
@@ -181,5 +181,5 @@ async fn cycles_explicit_modes_without_changing_mode_during_plan_control() {
         broker.snapshot().unwrap().session.execution_mode,
         PermissionMode::Write
     );
-    assert_eq!(broker.snapshot().unwrap().session.mode, HarnessMode::Write);
+    assert!(broker.snapshot().unwrap().session.current_task_id.is_some());
 }

@@ -29,7 +29,8 @@ local ok, failure = xpcall(function()
     end)
     assert(recovered)
     if action == "retry" then
-      assert(recovery_options == nil, "retry replaced the leased session with a new session")
+      assert(recovery_options.session_id == "leased-session" and recovery_options.lease_conflict_action == nil,
+        "retry replaced the leased session with a new session")
     else
       assert(recovery_options.lease_conflict_action == "new")
     end
@@ -40,15 +41,27 @@ local ok, failure = xpcall(function()
   client._set_launcher_for_test(function() launch_count = launch_count + 1 error("stopped build launched a host") end)
   local completed, rejected = 0, 0
   for _ = 1, 70 do
-    client.request_host("repository.revisions", { workspace = "fixture" }, function(_, request_error)
+    client.request_host("repository.revisions", { workspace = "fixture" }, function(_, request_error, detail)
       assert(request_error)
       completed = completed + 1
-      if request_error:find("admission is full", 1, true) then rejected = rejected + 1 end
+      if request_error:find("admission is full", 1, true) then
+        assert(detail and detail.code == "not_admitted")
+        rejected = rejected + 1
+      end
     end)
   end
   assert(rejected == 10 and completed == 10)
   assert(vim.tbl_count(client._client.pending) == 60)
+  local control_completed = 0
+  for _, method in ipairs({ "task.transition", "task.operation", "health.get" }) do
+    client.request_host(method, {}, function(_, request_error)
+      assert(request_error and not request_error:find("admission is full", 1, true))
+      control_completed = control_completed + 1
+    end)
+  end
+  assert(vim.tbl_count(client._client.pending) == 63, "ordinary requests consumed task control capacity")
   client.stop()
+  assert(control_completed == 3)
   assert(completed == 70, "stopping the host failed or duplicated a queued request")
   assert(vim.tbl_isempty(client._client.pending))
   assert(finish_build)

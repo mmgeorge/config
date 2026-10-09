@@ -5,6 +5,7 @@ use anyhow::{Context, Result, ensure};
 use forge_diff::syntax::DeclarationOverview;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+use super::design_document::DesignDocument;
 
 /// Retains the immutable declaration source and workspace content identity.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -17,29 +18,6 @@ const PLAN_DOCUMENT_PATH: &str = "plan.json";
 
 type SourceOverviewCache = std::sync::Mutex<BTreeMap<String, (DeclarationFile, Vec<super::FunctionBody>)>>;
 static SOURCE_OVERVIEW_CACHE: std::sync::OnceLock<SourceOverviewCache> = std::sync::OnceLock::new();
-
-/// Records the requested outcome and proposed design independently of declaration files.
-#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-pub struct DesignDocument {
-    /// States the requested outcome and scope without prescribing implementation steps.
-    #[serde(default)]
-    pub task: String,
-    /// Records the checks required to verify the accepted implementation.
-    pub validation: DesignValidation,
-    /// Describes the intended behavioral change and its design.
-    pub description: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-/// Stores validation requirements separately from semantic validation results.
-pub struct DesignValidation {
-    /// Contains one executable command per nonblank line, without Markdown wrappers.
-    pub automated: String,
-    /// Contains a Markdown list of observable checks to perform manually.
-    pub manual: String,
-}
 
 /// Owns baseline declarations and the agent's proposed file contents.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
@@ -196,15 +174,7 @@ impl DeclarationDesign {
             (40..=240).contains(&self.line_width),
             "declaration line width must be between 40 and 240"
         );
-        for (name, text) in [
-            ("task", &self.document.task),
-            ("description", &self.document.description),
-            ("validation.automated", &self.document.validation.automated),
-            ("validation.manual", &self.document.validation.manual),
-        ] {
-            ensure!(text.len() <= 16 * 1024, "plan {name} exceeds 16 KiB");
-            ensure!(!text.contains('\0'), "plan {name} contains a NUL byte");
-        }
+        self.document.validate()?;
         let mut bytes = 0usize;
         for (path, text) in &self.cargo_lock {
             validate_relative_path(path)?;
@@ -436,7 +406,7 @@ impl DeclarationDesign {
                 let original = format!("{}\n", serde_json::to_string_pretty(&candidate.document)?);
                 let text = patch_file(&original, body)?;
                 candidate.document = serde_json::from_str(&text)
-                    .context("plan.json requires task and description strings and a validation object with automated and manual strings")?;
+                    .context("plan.json requires objective, requirements, background, decisions, design, and verification with automated and manual strings; usage is optional")?;
                 continue;
             }
             match kind {
@@ -743,11 +713,13 @@ mod tests {
     #[test]
     fn description_and_declaration_edits_commit_atomically() {
         let workspace = tempfile::tempdir().unwrap();
-        let design = DeclarationDesign::default();
-        let patch = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"task\": \"\",\n+  \"task\": \"Support cancellable texture loading.\",\n@@\n-  \"description\": \"\"\n+  \"description\": \"Add cancellable requests.\"\n*** Add File: src/request.rs\n+pub struct Request;\n*** End Patch";
+        let mut design = DeclarationDesign::default();
+        design.document.background = "Texture requests currently run to completion.".into();
+        design.document.requirements = vec!["Cancellation must prevent publication.".into()];
+        let patch = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"objective\": \"\",\n+  \"objective\": \"Support cancellable texture loading.\",\n@@\n-  \"design\": \"\",\n+  \"design\": \"Add cancellable requests.\",\n*** Add File: src/request.rs\n+pub struct Request;\n*** End Patch";
         let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
-        assert_eq!(changed.document.task, "Support cancellable texture loading.");
-        assert_eq!(changed.document.description, "Add cancellable requests.");
+        assert_eq!(changed.document.objective, "Support cancellable texture loading.");
+        assert_eq!(changed.document.design, "Add cancellable requests.");
         assert_eq!(changed.changed_paths(), vec!["src/request.rs"]);
         assert!(!changed.proposed.contains_key("plan.json"));
         let read = changed.read(Some("plan.json"), false).unwrap();
@@ -770,8 +742,8 @@ mod tests {
                 .patch(workspace.path(), &Default::default(), &patch.replace("pub struct Request;", "fn invalid() {}"))
                 .is_err()
         );
-        assert!(design.document.description.is_empty() && design.proposed.is_empty());
-        let invalid = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"\"\n+  \"description\": \"Change\",\n+  \"tasks\": []\n*** End Patch";
+        assert!(design.document.design.is_empty() && design.proposed.is_empty());
+        let invalid = "*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": \"\",\n+  \"design\": \"Change\",\n+  \"tasks\": []\n*** End Patch";
         assert!(design.patch(workspace.path(), &Default::default(), invalid).is_err());
         assert!(
             design
@@ -779,14 +751,14 @@ mod tests {
                 .is_err()
         );
         assert!(design.patch(workspace.path(), &Default::default(), "*** Begin Patch\n*** Update File: plan.json\n*** Move to: other.rs\n@@\n {}\n*** End Patch").is_err());
-        let mut document = crate::plan::document::test_fixture("description", "Description");
+        let mut document = crate::plan::document::test_fixture("description", "Design");
         document.design = Some(design);
         assert!(document.validate_for_submission().is_err());
         document.design = Some(changed.clone());
         document.validate_for_submission().unwrap();
-        document.design.as_mut().unwrap().document.task.clear();
+        document.design.as_mut().unwrap().document.objective.clear();
         assert!(document.validate_for_submission().is_err());
-        let oversized = changed.patch(workspace.path(), &Default::default(), &format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"description\": \"Add cancellable requests.\"\n+  \"description\": \"{}\"\n*** End Patch", "x".repeat(16 * 1024 + 1)));
+        let oversized = changed.patch(workspace.path(), &Default::default(), &format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-  \"design\": \"Add cancellable requests.\",\n+  \"design\": \"{}\",\n*** End Patch", "x".repeat(16 * 1024 + 1)));
         assert!(oversized.is_err());
     }
 
@@ -795,8 +767,10 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let store = crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
         let mut design = DeclarationDesign::default();
-        design.document.task = "Verify score resets.".into();
-        design.document.description = "Reset score when a new round starts.".into();
+        design.document.objective = "Verify score resets.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Reset score when a new round starts.".into();
         let patch = r#"*** Begin Patch
 *** Update File: plan.json
 @@
@@ -812,12 +786,12 @@ mod tests {
         let (_, rendered, _) = store.submit_document_revision("session", "validation", 1, 1).unwrap();
         let original = store.read_submitted_document("session", "validation", 1).unwrap();
         assert_eq!(original.design.as_ref().unwrap().document, changed.document);
-        assert!(rendered.markdown.contains("Validation:\n  Automated:\n    echo test > should-not-exist.txt\n    nvim --headless -l tests/score.lua"));
+        assert!(rendered.markdown.contains("Verification:\n  Automated:\n    echo test > should-not-exist.txt\n    nvim --headless -l tests/score.lua"));
         assert!(rendered.markdown.contains("  Manual:\n  - Start a new round"));
         assert!(!workspace.path().join("should-not-exist.txt").exists());
         let serialized = changed.read(Some("plan.json"), false).unwrap();
         let metadata: serde_json::Value = serde_json::from_str(serialized["text"].as_str().unwrap()).unwrap();
-        assert_eq!(metadata["validation"]["automated"], changed.document.validation.automated);
+        assert_eq!(metadata["verification"]["automated"], changed.document.verification.automated);
 
         let revised = changed.patch(workspace.path(), &Default::default(), r#"*** Begin Patch
 *** Update File: plan.json
@@ -835,7 +809,7 @@ mod tests {
         let current = store.read_submitted_document("session", "validation", 2).unwrap();
         let delta = crate::plan::revision::DeclarationDelta::between(Some(&original), &current).unwrap();
         assert!(delta.files.is_empty());
-        assert!(delta.document.contains("a/Validation/Automated b/Validation/Automated"));
+        assert!(delta.document.contains("a/Verification/Automated b/Verification/Automated"));
         assert!(delta.document.contains("-echo test > should-not-exist.txt"));
         assert!(delta.document.contains("-- Start a new round and confirm the score is zero."));
         assert_eq!(store.read_submitted_document("session", "validation", 1).unwrap(), original);
@@ -843,8 +817,74 @@ mod tests {
         for invalid in ["\\u0000".to_owned(), "x".repeat(16 * 1024 + 1)] {
             let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-    \"automated\": \"\",\n+    \"automated\": \"{invalid}\",\n*** Add File: unwanted.rs\n+pub struct Unwanted;\n*** End Patch");
             assert!(design.patch(workspace.path(), &Default::default(), &patch).is_err());
-            assert!(design.document.validation.automated.is_empty() && design.proposed.is_empty());
+            assert!(design.document.verification.automated.is_empty() && design.proposed.is_empty());
         }
+    }
+
+    #[test]
+    fn complete_specification_survives_review_and_optional_section_removal() {
+        let workspace = tempfile::tempdir().unwrap();
+        let store = crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
+        let empty = DeclarationDesign::default();
+        let metadata = serde_json::json!({
+            "objective": "Make cancellation observable.",
+            "usage": "```text\napp cancel 42\nCancelled request 42\n```",
+            "requirements": ["Cancellation preserves the published texture."],
+            "background": "`src/request.rs` owns pending uploads. Publication currently happens immediately.",
+            "decisions": [{"decision": "Publish at frame boundaries.", "rationale": "Each frame observes one consistent texture selection."}],
+            "design": "`Request` retains cancellation state until pending work finishes.",
+            "verification": {"automated": "cargo test --release cancellation", "manual": "- Cancel an upload and confirm the current texture remains visible."}
+        });
+        let replace = |design: &DeclarationDesign, metadata: &serde_json::Value| {
+            let before = design.read(Some("plan.json"), false).unwrap();
+            let after = serde_json::to_string_pretty(metadata).unwrap();
+            format!("*** Begin Patch\n*** Update File: plan.json\n@@\n{}\n{}\n*** End Patch",
+                before["text"].as_str().unwrap().lines().map(|line| format!("-{line}")).collect::<Vec<_>>().join("\n"),
+                after.lines().map(|line| format!("+{line}")).collect::<Vec<_>>().join("\n"))
+        };
+        let changed = empty.patch(workspace.path(), &Default::default(), &replace(&empty, &metadata)).unwrap();
+        let mut document = crate::plan::document::test_fixture("specification", "Cancellation");
+        document.design = Some(changed.clone());
+        store.write_working_document("session", "specification", &document).unwrap();
+        let (_, rendered, _) = store.submit_document_revision("session", "specification", 1, 1).unwrap();
+        let original = store.read_submitted_document("session", "specification", 1).unwrap();
+        assert_eq!(serde_json::to_value(&original.design.as_ref().unwrap().document).unwrap(), metadata);
+        let headings = ["Objective:", "Usage:", "Requirements:", "Background:", "Decisions:", "Design:", "Proposed declaration changes:", "Verification:"];
+        let positions = headings.map(|heading| rendered.markdown.lines().position(|line| line == heading).unwrap());
+        assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
+        assert!(rendered.markdown.contains("app cancel 42\nCancelled request 42"));
+        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "verification/automated", "verification/manual"] {
+            assert!(rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == format!("/design/document/{path}")));
+        }
+        for field in ["objective", "background", "design", "requirements"] {
+            let mut invalid = metadata.clone();
+            invalid[field] = if field == "requirements" { serde_json::json!([]) } else { serde_json::json!("") };
+            let incomplete = empty.patch(workspace.path(), &Default::default(), &replace(&empty, &invalid)).unwrap();
+            assert!(incomplete.document.validate_for_submission().is_err(), "{field}");
+        }
+        for invalid in [
+            serde_json::json!({"decision": "Choose an approach.", "rationale": ""}),
+            serde_json::json!({"decision": "Choose an approach.", "rationale": "Reason", "milestone": 1}),
+        ] {
+            let mut invalid_metadata = metadata.clone();
+            invalid_metadata["decisions"] = serde_json::json!([invalid]);
+            assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid_metadata)).is_err());
+        }
+        let mut revised_metadata = metadata.clone();
+        revised_metadata.as_object_mut().unwrap().remove("usage");
+        revised_metadata["decisions"] = serde_json::json!([]);
+        revised_metadata["requirements"] = serde_json::json!(["Cancellation preserves the published texture and reports its terminal state."]);
+        document.design = Some(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &revised_metadata)).unwrap());
+        document.version += 1;
+        store.write_working_document("session", "specification", &document).unwrap();
+        let (_, rendered, _) = store.submit_document_revision("session", "specification", 2, document.version).unwrap();
+        assert!(!rendered.markdown.lines().any(|line| matches!(line, "Usage:" | "Decisions:")));
+        let current = store.read_submitted_document("session", "specification", 2).unwrap();
+        let delta = crate::plan::revision::DeclarationDelta::between(Some(&original), &current).unwrap();
+        assert!(delta.files.is_empty());
+        assert!(delta.document.contains("a/Usage b/Usage") && delta.document.contains("a/Decisions b/Decisions"));
+        assert!(delta.document.contains("a/Requirements b/Requirements"));
+        assert_eq!(store.read_submitted_document("session", "specification", 1).unwrap(), original);
     }
 
     #[test]

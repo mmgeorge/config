@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -12,7 +12,7 @@ use forge_buffer::width::WidthProfile;
 use serde::Serialize;
 
 use crate::exchange::{Exchange, ExchangeKind, ExchangeNode, ExchangeState};
-use crate::session::state_machine::SessionPhase;
+use crate::session::state_machine::{ExecutionStatus, SessionPhase, WorkflowActivity};
 use crate::timeline::{SessionEventKind, TimelineEntry};
 
 use super::document::TranscriptEntry;
@@ -228,7 +228,8 @@ impl TimelineRenderer<'_> {
                     SessionPhase::Working {
                         started_at_ms,
                         reasoning_summary,
-                        ..
+                        activity,
+                        execution,
                     } => {
                         let elapsed_seconds =
                             self.now_ms.saturating_sub(*started_at_ms).max(0) / 1_000;
@@ -236,6 +237,8 @@ impl TimelineRenderer<'_> {
                             self.width,
                             elapsed_seconds,
                             reasoning_summary.as_deref(),
+                            *activity,
+                            execution.as_ref(),
                         )?
                     }
                     SessionPhase::AwaitingInput { .. } => "Awaiting input".into(),
@@ -313,6 +316,9 @@ impl TimelineRenderer<'_> {
                     });
                 }
                 self.push(block)?;
+                if let SessionPhase::Working { execution: Some(execution), .. } = status {
+                    self.implementation_details(id, execution)?;
+                }
             }
             TimelineEntry::AgentLifecycle {
                 id,
@@ -554,6 +560,50 @@ impl TimelineRenderer<'_> {
             self.markdown(&format!("{id}:answer"), answer, MarkdownRole::Detail)?;
         }
         self.finish_section(section, id, true);
+        Ok(())
+    }
+
+    fn implementation_details(&mut self, status_id: &str, execution: &ExecutionStatus) -> Result<()> {
+        let identity = format!("{status_id}:implementation:{}", execution.id);
+        self.literal(&identity, "▸ Implementation details", None)?;
+        let section = self.begin_section(2);
+        let progress = &execution.progress;
+        let mut file = BTreeMap::<&str, Vec<(&str, &str)>>::new();
+        for (state, findings) in [
+            ("missing", &progress.missing),
+            ("different", &progress.different),
+            ("unverified", &progress.unverified),
+        ] {
+            for finding in findings {
+                let (path, detail) = finding.split_once(": ").unwrap_or((finding, ""));
+                file.entry(path).or_default().push((state, detail));
+            }
+        }
+        for (path, findings) in &file {
+            let file_id = format!("{identity}:{}", crate::plan::digest(path.as_bytes()));
+            let state = findings.iter().map(|(state, _)| *state).collect::<std::collections::BTreeSet<_>>()
+                .into_iter().collect::<Vec<_>>().join(" · ");
+            self.literal(&file_id, &format!("▸ {path} · {state}"), None)?;
+            let detail_section = self.begin_section(2);
+            for (index, (state, detail)) in findings.iter().enumerate() {
+                self.literal(&format!("{file_id}:finding:{index}"),
+                    if detail.is_empty() { state } else { detail }, None)?;
+            }
+            self.finish_section(detail_section, &file_id, true);
+        }
+        if !progress.matched.is_empty() {
+            let matched_id = format!("{identity}:matched");
+            self.literal(&matched_id, &format!("▸ Matched files · {}", progress.matched.len()), None)?;
+            let matched_section = self.begin_section(2);
+            for path in &progress.matched {
+                self.literal(&format!("{identity}:{}", crate::plan::digest(path.as_bytes())), path, None)?;
+            }
+            self.finish_section(matched_section, &matched_id, true);
+        }
+        if file.is_empty() && progress.matched.is_empty() {
+            self.literal(&format!("{identity}:pending"), "Waiting for file comparison", None)?;
+        }
+        self.finish_section(section, &identity, true);
         Ok(())
     }
 
@@ -1275,23 +1325,42 @@ fn working_status_text(
     width: &WidthProfile,
     elapsed_seconds: i64,
     reasoning_summary: Option<&str>,
+    activity: WorkflowActivity,
+    execution: Option<&ExecutionStatus>,
 ) -> Result<String> {
-    let prefix = format!("Working ({elapsed_seconds}s");
+    if let Some(execution) = execution {
+        let phase = match execution.phase {
+            crate::plan::PlanPhase::Implement => "Implementing",
+            crate::plan::PlanPhase::Verify => "Verifying",
+            crate::plan::PlanPhase::Resolve => "Resolving",
+        };
+        let progress = &execution.progress;
+        let count = progress.missing.iter().chain(&progress.different).chain(&progress.unverified)
+            .map(|finding| finding.split_once(": ").map_or(finding.as_str(), |(path, _)| path))
+            .collect::<std::collections::BTreeSet<_>>().len();
+        let attention = if count == 1 { "1 file needs attention".into() }
+            else if count > 1 { format!("{count} files need attention") }
+            else if progress.matched.is_empty() { "comparing files".into() }
+            else { "all files matched".into() };
+        return Ok(format!("{phase} · {elapsed_seconds}s · {attention}"));
+    }
+    let phase = match activity { WorkflowActivity::Planning => "Planning", WorkflowActivity::Working => "Working" };
+    let prefix = format!("{phase} · {elapsed_seconds}s");
     let Some(reasoning_summary) = reasoning_summary else {
-        return Ok(format!("{prefix})"));
+        return Ok(prefix);
     };
     let bounded = reasoning_summary.chars().take(4_096).collect::<String>();
     let normalized = bounded.split_whitespace().collect::<Vec<_>>().join(" ");
     if normalized.is_empty() {
-        return Ok(format!("{prefix})"));
+        return Ok(prefix);
     }
     let occupied = width.cells(&prefix, 0)? + 4 + WORKING_STATUS_RESERVED_CELLS;
     let available = width.columns.saturating_sub(occupied);
     if available < 4 {
-        return Ok(format!("{prefix})"));
+        return Ok(prefix);
     }
     let summary = truncate_to_cells(width, &normalized, available)?;
-    Ok(format!("{prefix} · {summary})"))
+    Ok(format!("{prefix} · {summary}"))
 }
 
 fn truncate_to_cells(width: &WidthProfile, text: &str, max_cells: usize) -> Result<String> {
@@ -1344,7 +1413,7 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
             }
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if complete => "Planned",
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => "Planning",
-            ExchangeKind::PlanExecution if complete => "Executed plan",
+            ExchangeKind::PlanExecution if complete => "Plan turn complete",
             ExchangeKind::PlanExecution if paused => "Plan execution paused",
             ExchangeKind::PlanExecution => "Executing plan",
             ExchangeKind::Chat if complete => "Thought",
@@ -2507,6 +2576,46 @@ mod tests {
     }
 
     #[test]
+    fn implementation_status_keeps_file_findings_in_stable_nested_folds() {
+        let mut execution = crate::session::state_machine::ExecutionStatus {
+            id: "execution".into(), phase: crate::plan::PlanPhase::Implement,
+            progress: crate::plan::execution::SemanticProgress {
+                matched: vec!["Cargo.toml".into()],
+                missing: vec!["src/ui.rs".into()],
+                different: vec!["src/player.rs: planned call relationships differ for move_player".into()],
+                unverified: vec!["src/player.rs: unresolved reference".into()],
+                ..Default::default()
+            },
+        };
+        let render = |execution| project_at(&TimelineEntry::Status {
+            id: "session:status".into(), created_at_ms: 0,
+            status: SessionPhase::Working {
+                started_at_ms: 0, activity: WorkflowActivity::Working,
+                reasoning_summary: Some("Checking files".into()), execution: Some(execution),
+            },
+        }, &WidthProfile::default(), 133_000).unwrap();
+        let initial = render(execution.clone());
+        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Implementing · 133s · 2 files need attention"]);
+        assert!(initial.entry.block[0].metadata.target[0].id.0.ends_with(":working"));
+        assert!(initial.entry.block[1].metadata.fold[0].closed);
+        let file_id = format!("session:status:implementation:execution:{}", crate::plan::digest(b"src/player.rs"));
+        let file = initial.entry.block.iter().find(|block| block.id.0 == file_id).unwrap();
+        assert!(file.metadata.fold[0].closed);
+        assert!(initial.entry.block.iter().any(|block| block.text.wire_rows().join(" ").contains("move_player")));
+        let repeated = render(execution.clone());
+        assert_eq!(initial.entry.block[1].metadata.fold, repeated.entry.block[1].metadata.fold);
+        println!("IMPLEMENTATION_STATUS_FIXTURE:{}", serde_json::to_string(&initial.entry.block).unwrap());
+        execution.phase = crate::plan::PlanPhase::Verify;
+        execution.progress.missing.clear();
+        execution.progress.different.clear();
+        execution.progress.unverified.clear();
+        execution.progress.matched.extend(["src/player.rs".into(), "src/ui.rs".into()]);
+        let matched = render(execution);
+        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Verifying · 133s · all files matched"]);
+        assert!(matched.entry.block.iter().any(|block| block.id.0 == file_id));
+    }
+
+    #[test]
     fn working_status_reports_elapsed_seconds_without_persisting_a_timer_value() {
         let projection = project_at(
             &TimelineEntry::Status {
@@ -2515,6 +2624,7 @@ mod tests {
                 status: SessionPhase::Working {
                     started_at_ms: 1_000,
                     activity: WorkflowActivity::Working,
+                    execution: None,
                     reasoning_summary: None,
                 },
             },
@@ -2525,7 +2635,7 @@ mod tests {
 
         assert_eq!(
             projection.entry.block[0].text.wire_rows(),
-            vec!["", "Working (3s)"]
+            vec!["", "Working · 3s"]
         );
         let status = &projection.entry.block[0].metadata;
         assert!(status.gutter.is_empty(), "status text must not be split into the sign column");
@@ -2541,6 +2651,7 @@ mod tests {
                 status: SessionPhase::Working {
                     started_at_ms: 1_000,
                     activity: WorkflowActivity::Working,
+                    execution: None,
                     reasoning_summary: Some(
                         "Inspecting\n repository   structure before making changes".into(),
                     ),
@@ -2554,7 +2665,7 @@ mod tests {
         assert_eq!(projection.entry.block[0].text.row_count(), 2);
         assert_eq!(
             projection.entry.block[0].text.wire_rows(),
-            vec!["", "Working (3s · Inspecting repository structure befo…)"]
+            vec!["", "Working · 3s · Inspecting repository structure bef…"]
         );
     }
 

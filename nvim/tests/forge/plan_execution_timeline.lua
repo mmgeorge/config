@@ -87,7 +87,7 @@ local ok, failure = pcall(function()
   local summary_count = 0
   local text = table.concat(result.lines, "\n")
   for _, line in ipairs(result.lines) do
-    if line:find("▾ Executed plan", 1, true) then summary_count = summary_count + 1 end
+    if line:find("▾ Plan turn complete", 1, true) then summary_count = summary_count + 1 end
   end
   assert_equals(summary_count, 2, "each expanded exchange should retain its own summary")
   assert_equals(text:find("First continuation", 1, true) ~= nil, true,
@@ -102,7 +102,7 @@ local ok, failure = pcall(function()
     "the next canonical task should render once")
   assert_equals(text:find("! Plan deviation recorded: Add the missing input path", 1, true) ~= nil, true,
     "persisted deviations should render immediately")
-  assert_equals(text:find("Executed plan (", 1, true), nil,
+  assert_equals(text:find("Plan turn complete (", 1, true), nil,
     "provider task snapshots should not drive accepted-plan progress")
 end)
 

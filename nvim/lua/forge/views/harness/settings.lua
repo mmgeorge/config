@@ -226,7 +226,7 @@ function M.open(state, host)
         } },
         action_list = {
           { id = "previous-value", key = "<Left>", callback = function(context) toggle(context, -1) end },
-          { id = "next-value", key = "<Right>", callback = toggle },
+          { id = "next-value", key = "<Right>", callback = function(context) toggle(context, 1) end },
         },
         on_confirm = function(result)
           if result.option.id == "provider" then

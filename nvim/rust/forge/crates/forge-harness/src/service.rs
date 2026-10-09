@@ -1011,18 +1011,22 @@ async fn execute_task_transition(
     }
     operation.state = "stopping".into();
     store.save_task_operation(operation)?;
-    if controller.broker.try_lock().is_err() {
-        controller.cancellation.begin_cleanup(false, false)?;
-        controller.permission.cancel_all(None).await?;
-        if let Err(error) = controller.backend.cleanup_execution(&operation.session_id).await {
-            controller.cancellation.fail_cleanup(&error);
-            return Err(error.context("collect current task before transition"));
+    let execution = match Arc::clone(&controller.execution_admission).try_acquire_owned() {
+        Ok(execution) => execution,
+        Err(tokio::sync::TryAcquireError::Closed) => anyhow::bail!("session execution admission is closed"),
+        Err(tokio::sync::TryAcquireError::NoPermits) => {
+            controller.cancellation.begin_cleanup(false, false)?;
+            controller.permission.cancel_all(None).await?;
+            if let Err(error) = controller.backend.cleanup_execution(&operation.session_id).await {
+                controller.cancellation.fail_cleanup(&error);
+                return Err(error.context("collect current task before transition"));
+            }
+            controller.cancellation.request(false);
+            // Execution ownership includes finalization and response delivery, independently of read-only broker locks.
+            tokio::time::timeout(Duration::from_secs(10), Arc::clone(&controller.execution_admission).acquire_owned())
+                .await.context("previous execution did not finish finalization within 10s. Inspect task state before resuming")??
         }
-        controller.cancellation.request(false);
-    }
-    // The old request retains this permit through finalization and output delivery.
-    let execution = tokio::time::timeout(Duration::from_secs(10), Arc::clone(&controller.execution_admission).acquire_owned())
-        .await.context("previous execution did not finish finalization within 10s. Inspect task state before resuming")??;
+    };
     if store.latest_task_operation(&operation.session_id)?.is_none_or(|latest| latest.id != operation.id) {
         operation.state = "superseded".into();
         return Ok(());
@@ -1683,6 +1687,31 @@ mod tests {
             backend.request.lock().await[0],
             ("parent-session".into(), correction.into())
         );
+    }
+
+    #[tokio::test]
+    async fn idle_task_transition_waits_for_readers_without_provider_cleanup() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await.unwrap();
+        let mut controller = registry.controller_by_id.write().await.remove(&session_id).unwrap();
+        Arc::get_mut(&mut controller).unwrap().backend = Arc::new(SteeringBackend {
+            mode: crate::agent::AgentControlMode::Unsupported, request: Mutex::new(Vec::new()),
+        });
+        let mut store = SqliteStore::open(PathBuf::from(&registry.initialize.data_root).as_path()).unwrap();
+        let mut operation = admit_task_intent(&controller, &session_id, &Request {
+            id: 2, method: "task.transition".into(),
+            params: json!({"operation_id":"idle-pause","action":"pause"}),
+        }, &mut store).unwrap();
+        let reader = controller.broker.lock().await;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        let mut transition = Box::pin(execute_task_transition(&registry, &controller, &mut operation, &mut store, &sink));
+        assert!(futures_util::poll!(transition.as_mut()).is_pending(), "read-only ownership was treated as provider execution");
+        drop(reader);
+        tokio::time::timeout(Duration::from_secs(2), transition).await.unwrap().unwrap();
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
     }
 
     #[tokio::test]

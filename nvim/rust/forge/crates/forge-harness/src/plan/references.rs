@@ -1097,8 +1097,10 @@ mod tests {
         let mut document =
             super::super::document::test_fixture("properties", "Inherited properties");
         let mut design = super::super::DeclarationDesign::default();
-        design.document.task = "Introduce a property and a callable member".into();
-        design.document.description = "Resolve their inherited and value references".into();
+        design.document.objective = "Introduce a property and a callable member".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Resolve their inherited and value references".into();
         design.proposed.insert("client.ts".into(), "export interface Base { count: number; send(): void; }\nexport interface Derived extends Base {}\nexport type Alias = Derived;\nexport type Cycle = Cycle;\n".into());
         design.proposed.insert("run.ts".into(), "import { Alias, Cycle } from './client';\nfunction run(client: Alias, cyclic: Cycle): void;\n".into());
         design.proposed_calls.insert("run.ts".into(), super::super::calls::extract("run.ts", "function run(client: Alias, cyclic: Cycle) { client.count++; const callback = client.send; cyclic.count; }").unwrap());
@@ -1161,8 +1163,10 @@ mod tests {
         let mut document =
             super::super::document::test_fixture("properties", "Property references");
         let mut design = super::super::DeclarationDesign::default();
-        design.document.task = "Add a count field".into();
-        design.document.description =
+        design.document.objective = "Add a count field".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design =
             "Preserve the property identity across calls and accesses".into();
         let baseline =
             "pub struct Client { pub existing: usize }\nimpl Client { pub fn count(&self); }\n";
@@ -1300,8 +1304,10 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut document = super::super::document::test_fixture("rename", "Rename");
         let mut design = super::super::DeclarationDesign::default();
-        design.document.task = "Rename the API".into();
-        design.document.description = "Keep all plan references consistent".into();
+        design.document.objective = "Rename the API".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Keep all plan references consistent".into();
         design
             .proposed
             .insert("client.ts".into(), "export function send(): void;\n".into());
@@ -1378,8 +1384,10 @@ mod tests {
         let workspace = tempfile::tempdir().unwrap();
         let mut document = super::super::document::test_fixture("rename", "Rename");
         let mut design = super::super::DeclarationDesign::default();
-        design.document.task = "Rename the API".into();
-        design.document.description = "Keep all plan references consistent".into();
+        design.document.objective = "Rename the API".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Keep all plan references consistent".into();
         design.proposed.insert(
             "client.ts".into(),
             "export function send(): void;\nexport function dispatch(): void;\n".into(),
@@ -1425,8 +1433,10 @@ mod tests {
         .unwrap();
         let mut document = super::super::document::test_fixture("rename", "Rename");
         let mut design = super::super::DeclarationDesign::default();
-        design.document.task = "Rename the owner".into();
-        design.document.description = "Keep Calls consistent".into();
+        design.document.objective = "Rename the owner".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Keep Calls consistent".into();
         design.proposed.insert("src/lib.rs".into(),"pub struct Client { pub endpoint: u32 }\nimpl Client {\n    pub fn send(&self);\n}\npub fn run(client: &Client);\n".into());
         design.proposed_calls.insert(
             "src/lib.rs".into(),
@@ -1596,8 +1606,10 @@ mod tests {
         assert!(destination.path.ends_with("client.lua"));
         assert_eq!(destination.line, 2);
         assert!(destination.proposed);
-        document.design.as_mut().unwrap().document.task = "Rename Lua API".into();
-        document.design.as_mut().unwrap().document.description = "Update saved calls".into();
+        document.design.as_mut().unwrap().document.objective = "Rename Lua API".into();
+        document.design.as_mut().unwrap().document.background = "The fixture contains the declarations under review.".into();
+        document.design.as_mut().unwrap().document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        document.design.as_mut().unwrap().document.design = "Update saved calls".into();
         let renamed = index
             .renamed(&document, identity, "deliver")
             .unwrap();
@@ -1758,8 +1770,10 @@ mod tests {
         let mut design = super::super::DeclarationDesign::default();
         design.proposed.insert("api.lua".into(), forge_diff::syntax::DeclarationOverview::extract("api.lua", source).unwrap());
         design.proposed_calls.insert("api.lua".into(), super::super::calls::extract("api.lua", source).unwrap());
-        design.document.task = "Rename the module".into();
-        design.document.description = "Preserve module definitions and calls".into();
+        design.document.objective = "Rename the module".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Preserve module definitions and calls".into();
         document.design = Some(design);
         let index = PlanReferenceIndex::planned(&document, workspace.path()).unwrap();
         let symbol = index.declaration["api.lua"].symbol.iter().find(|symbol| symbol.name == "M").unwrap();
@@ -1822,8 +1836,10 @@ mod tests {
                 }]),
             }],
         );
-        design.document.task = "Rename the exported send API".into();
-        design.document.description = "Preserve opaque callback bindings".into();
+        design.document.objective = "Rename the exported send API".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Preserve opaque callback bindings".into();
         document.design = Some(design);
         let index = PlanReferenceIndex::build(&document, workspace.path(), false).unwrap();
         let key = (

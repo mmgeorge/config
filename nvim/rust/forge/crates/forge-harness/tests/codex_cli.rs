@@ -29,7 +29,7 @@ fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
         model: "gpt-5.6-terra".into(),
         effort: "low".into(),
         context_window: None,
-        fast_mode: true,
+        service_tier: forge_harness::backend::ServiceTier::Fast,
         execution_mode: if mode == PromptMode::Plan {
             PermissionMode::Read
         } else {
@@ -201,10 +201,8 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
             .is_some_and(|model| model != "default" && !model.is_empty())
     );
     assert!(
-        answered
-            .metrics
-            .token_count
-            .is_some_and(|token_count| token_count > 0),
+        answered.event.iter().any(|event| event.kind == "usage"
+            && event.data.pointer("/usage/output").and_then(serde_json::Value::as_u64).is_some_and(|output| output > 0)),
         "Codex should report final turn token usage"
     );
     let model_list = backend

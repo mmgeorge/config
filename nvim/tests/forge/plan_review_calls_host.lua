@@ -69,7 +69,7 @@ local success, failure = xpcall(function()
   assert(not vim.wo[review.win].number and not vim.wo[review.win].relativenumber and vim.wo[review.win].statuscolumn == "",
     "PlanReview displayed editor line numbers")
   local description_row
-  local paragraph = vim.split(document.design.document.description, "\n", { plain = true })[1]
+  local paragraph = vim.split(document.design.document.design, "\n", { plain = true })[1]
   for index, row in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
     if row == paragraph then description_row = index break end
   end

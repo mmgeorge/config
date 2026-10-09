@@ -293,7 +293,8 @@ local function submit(review, method, params)
     if not completed.owner.closed then close_review(completed) end
     if result then controller.activate_snapshot(result) end
     controller.render()
-    if method == "plan.acceptance.begin" then
+    if method == "plan.acceptance.begin"
+        and type(vim.tbl_get(result or {}, "active_plan", "acceptance")) == "table" then
       controller.task_transition({ action = "execute", plan_id = review.plan.id, digest = review.plan.review_digest })
     end
   end)

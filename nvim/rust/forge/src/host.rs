@@ -18,6 +18,50 @@ use tokio::time::{Instant, timeout};
 use crate::router::{HostRouter, RoutedMethod, validate_initialize};
 use crate::runtime::{ForgeRuntime, SHUTDOWN_DEADLINE};
 const WRITER_STOP_DEADLINE: Duration = Duration::from_millis(100);
+const RESERVED_CONTROL_REQUESTS: usize = 4;
+
+struct RequestAdmission {
+    ordinary: Arc<Semaphore>,
+    control: Arc<Semaphore>,
+}
+
+impl RequestAdmission {
+    fn new() -> Self {
+        Self {
+            ordinary: Arc::new(Semaphore::new(
+                forge_protocol::MAX_ACTIVE_REQUESTS - RESERVED_CONTROL_REQUESTS,
+            )),
+            control: Arc::new(Semaphore::new(RESERVED_CONTROL_REQUESTS)),
+        }
+    }
+
+    fn acquire(
+        &self,
+        method: &str,
+    ) -> Result<tokio::sync::OwnedSemaphorePermit, tokio::sync::TryAcquireError> {
+        let control = matches!(
+            method,
+            "initialize"
+                | "harness.initialize"
+                | "plan.scope_deviation_review"
+                | "trace.configure"
+                | "turn.cancel"
+                | "turn.restart"
+                | "task.transition"
+                | "task.operation"
+                | "health.get"
+                | "approval.resolve"
+                | "shutdown"
+        );
+        if control {
+            Arc::clone(&self.control)
+                .try_acquire_owned()
+                .or_else(|_| Arc::clone(&self.ordinary).try_acquire_owned())
+        } else {
+            Arc::clone(&self.ordinary).try_acquire_owned()
+        }
+    }
+}
 
 type TaskOutcome = std::result::Result<(Id, Result<()>), JoinError>;
 
@@ -291,8 +335,7 @@ impl ConnectionHost {
         &self,
         connection: &mut ConnectionIo<Input>,
     ) -> Result<Option<u64>> {
-        let ordinary = Arc::new(Semaphore::new(forge_protocol::MAX_ACTIVE_REQUESTS - 1));
-        let control = Arc::new(Semaphore::new(1));
+        let admission = RequestAdmission::new();
         loop {
             let sink = connection.sink.as_ref().expect("active Forge output");
             let line = tokio::select! {
@@ -337,16 +380,7 @@ impl ConnectionHost {
                 "duplicate in-flight Forge request id: {}",
                 envelope.request.id
             );
-            let admission = if matches!(
-                envelope.request.method.as_str(),
-                "turn.cancel" | "turn.restart" | "approval.resolve" | "shutdown" | "health.get" | "task.operation"
-            ) || (envelope.request.method == "task.transition"
-                && matches!(envelope.request.params.get("action").and_then(serde_json::Value::as_str), Some("pause" | "clear"))) {
-                &control
-            } else {
-                &ordinary
-            };
-            let permit = match Arc::clone(admission).try_acquire_owned() {
+            let permit = match admission.acquire(&envelope.request.method) {
                 Ok(permit) => permit,
                 Err(_) => {
                     sink.send_control(Message::Response(Response::failure(
@@ -599,6 +633,37 @@ async fn write_messages<Output: AsyncWrite + Unpin>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn control_requests_share_spare_capacity_and_survive_ordinary_saturation() {
+        let admission = RequestAdmission::new();
+        let ordinary: Vec<_> = (0..forge_protocol::MAX_ACTIVE_REQUESTS - RESERVED_CONTROL_REQUESTS)
+            .map(|_| admission.acquire("state.get").unwrap())
+            .collect();
+        assert!(admission.acquire("state.get").is_err());
+        let control: Vec<_> = [
+            "health.get",
+            "task.operation",
+            "turn.cancel",
+            "approval.resolve",
+        ]
+        .map(|method| admission.acquire(method).unwrap())
+        .into();
+        assert!(admission.acquire("shutdown").is_err());
+        drop(ordinary);
+        let additional = admission.acquire("task.transition").unwrap();
+        assert!(admission.acquire("state.get").is_ok());
+        drop(additional);
+        drop(control);
+        assert_eq!(
+            admission.control.available_permits(),
+            RESERVED_CONTROL_REQUESTS
+        );
+        assert_eq!(
+            admission.ordinary.available_permits(),
+            forge_protocol::MAX_ACTIVE_REQUESTS - RESERVED_CONTROL_REQUESTS
+        );
+    }
 
     #[tokio::test]
     async fn request_timeout_retains_its_runtime_and_admission_until_completion() {

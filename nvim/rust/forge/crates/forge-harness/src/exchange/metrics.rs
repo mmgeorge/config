@@ -8,6 +8,8 @@ use crate::backend::usage::{TokenUsage, UsageUpdate};
 #[serde(default)]
 /// Owns exchange usage cursors and the union of observed non-model activity intervals.
 pub struct ExchangeMetrics {
+    /// Lower bound on active execution time observed before a runtime interruption.
+    pub observed_elapsed_ms: u64,
     /// Completed model requests observed through distinct admitted usage reports.
     pub request_count: u64,
     /// Accumulated tool, approval, and delegated wait occupancy in active execution milliseconds.
@@ -37,8 +39,14 @@ struct UsageCursor {
 }
 
 impl ExchangeMetrics {
+    /// Retains the latest active elapsed coordinate without counting offline time.
+    pub(crate) fn observe_elapsed(&mut self, elapsed_ms: u64) {
+        self.observed_elapsed_ms = self.observed_elapsed_ms.max(elapsed_ms);
+    }
+
     /// Record one identified activity transition in the exchange's active elapsed coordinate.
     pub(crate) fn block(&mut self, id: String, running: bool, elapsed_ms: u64) {
+        self.observe_elapsed(elapsed_ms);
         if id.starts_with("tool:") {
             if running {
                 if self.tool.insert(id.clone()) && self.tool_started_ms.is_none() {
@@ -59,6 +67,7 @@ impl ExchangeMetrics {
 
     /// Cap outstanding activity at an interruption or finalization boundary.
     pub(crate) fn settle(&mut self, elapsed_ms: u64) {
+        self.observe_elapsed(elapsed_ms);
         self.close(elapsed_ms);
         self.blocker.clear();
         self.close_tools(elapsed_ms);
@@ -74,6 +83,7 @@ impl ExchangeMetrics {
 
     /// Captures both operands together so throughput stays fixed between usage reports.
     pub(crate) fn record_throughput(&mut self, output: Option<u64>, elapsed_ms: u64) {
+        self.observe_elapsed(elapsed_ms);
         self.reported_output_tokens = output;
         self.reported_response_ms = self.response_ms(elapsed_ms);
     }
@@ -157,6 +167,7 @@ impl ExchangeMetrics {
 impl Default for ExchangeMetrics {
     fn default() -> Self {
         Self {
+            observed_elapsed_ms: 0,
             request_count: 0,
             blocked_duration_ms: 0,
             blocked_started_ms: None,

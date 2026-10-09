@@ -90,6 +90,17 @@ function M.transition(state, action, refresh, settled, admitted)
       operation.poll_pending = true
       client.request_for(session_id, "task.operation", { operation_id = identity }, function(result, failure)
         operation.poll_pending = false
+        if not current() then return end
+        if failure then
+          local notice = "Task status check failed: " .. failure .. ". Checking again."
+          if operation.poll_error ~= notice then notifications.error(notice, "Harness task") end
+          operation.poll_error = notice
+          state.execution_notice = notice
+          refresh()
+          return
+        end
+        if operation.poll_error and state.execution_notice == operation.poll_error then state.execution_notice = nil end
+        operation.poll_error = nil
         receive(result, failure)
       end)
     end

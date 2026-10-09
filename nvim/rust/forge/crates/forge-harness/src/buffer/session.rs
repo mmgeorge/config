@@ -1778,6 +1778,7 @@ mod tests {
                 status: SessionPhase::Working {
                     started_at_ms: 0,
                     activity: crate::session::state_machine::WorkflowActivity::Working,
+                    execution: None,
                     reasoning_summary: None,
                 },
             },

@@ -136,7 +136,7 @@ pub struct HarnessSession {
     #[serde(default)]
     pub context_window: Option<String>,
     #[serde(default)]
-    pub fast_mode: bool,
+    pub service_tier: crate::backend::ServiceTier,
     #[serde(default)]
     pub execution_mode: PermissionMode,
     #[serde(default)]
@@ -171,7 +171,7 @@ pub struct HarnessPreference {
     #[serde(default)]
     pub model_setting: BTreeMap<String, ModelSetting>,
     #[serde(default)]
-    pub fast_mode: bool,
+    pub service_tier: crate::backend::ServiceTier,
     #[serde(default)]
     pub plan_executor: PlanExecutor,
     #[serde(default)]

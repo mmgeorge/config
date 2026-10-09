@@ -110,18 +110,14 @@ impl HarnessBroker {
         execution: &PlanExecutionRecord,
     ) {
         if let crate::session::state_machine::SessionPhase::Working {
-            reasoning_summary, ..
+            execution: progress, ..
         } = status
         {
-            let progress = &execution.progress;
-            *reasoning_summary = Some(format!(
-                "{:?} · {} matched · {} missing · {} different · {} unverified",
-                execution.phase,
-                progress.matched.len(),
-                progress.missing.len(),
-                progress.different.len(),
-                progress.unverified.len()
-            ));
+            *progress = Some(crate::session::state_machine::ExecutionStatus {
+                id: execution.id.clone(),
+                phase: execution.phase,
+                progress: execution.progress.clone(),
+            });
         }
     }
 
