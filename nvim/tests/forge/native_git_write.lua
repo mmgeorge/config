@@ -15,7 +15,7 @@ local ok, failure = xpcall(function()
     operation_list[#operation_list + 1] = params.operation
     if params.operation == "prepare" then
       assert(params.workspace == "fixture" and params.action.kind == "push")
-      callback({ intent = "prepared" }, nil)
+      callback({ intent = "prepared", timing_us = { write_queue = 1250000 } }, nil)
     elseif params.operation == "submit" then
       assert(params.intent == "prepared")
       progress({ stream = "stderr", sequence = 0, bytes = vim.base64.encode("Push") })
@@ -37,7 +37,7 @@ local ok, failure = xpcall(function()
   assert(result.ok and result.stderr == "Pushing\r\ndone")
   assert(table.concat(chunks) == "Pushing\ndone" and acknowledged)
   assert(table.concat(operation_list, ",") == "prepare,submit,acknowledge")
-  local expected = { "git.write.prepare.start", "git.write.prepare.complete", "git.write.submit.start",
+  local expected = { "git.write.prepare.start", "git.write.prepare.complete", "git.write.prepare.native.write_queue", "git.write.submit.start",
     "git.write.progress.first", "git.write.complete", "git.write.acknowledge.start", "git.write.acknowledge.complete" }
   assert(#event_list == #expected, "writer timing count differs")
   for index, event in ipairs(event_list) do
@@ -45,7 +45,8 @@ local ok, failure = xpcall(function()
     assert(event.payload.request_id == "test-write", "writer timing lost action correlation")
     assert(event.payload.elapsed_ms >= 0, "writer timing omitted elapsed time")
   end
-  assert(event_list[5].payload.operation_id == "1" and event_list[5].payload.code == 0)
+  assert(event_list[3].payload.ms == 1250, "native timing lost microsecond conversion")
+  assert(event_list[6].payload.operation_id == "1" and event_list[6].payload.code == 0)
 
   client.request_host = function(_, params, callback)
     if params.operation == "prepare" then callback({ intent = "uncertain" }, nil)

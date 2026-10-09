@@ -1,7 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeMap, HashMap, HashSet},
     fs::OpenOptions,
     io::Read,
+    time::Instant,
 };
 
 use anyhow::{Context, Result, ensure};
@@ -165,12 +166,16 @@ impl WritePrecondition {
         repository: &RepositoryState,
         action: &GitWriteAction,
         check: &mut dyn FnMut() -> Result<()>,
+        timing: &mut BTreeMap<&'static str, u128>,
     ) -> Result<Self> {
         check()?;
         if let GitWriteAction::UpdateRepositoryConfig { expected, .. } = action {
             super::config::validate(repository, expected, check)?;
         }
+        let started = Instant::now();
         let head = read_head(local)?;
+        timing.insert("head", started.elapsed().as_micros());
+        let started = Instant::now();
         let publish_upstream = if let GitWriteAction::PublishBranch {
             name,
             expected_head,
@@ -204,11 +209,15 @@ impl WritePrecondition {
         } else {
             None
         };
+        timing.insert("upstream", started.elapsed().as_micros());
+        let started = Instant::now();
         let index = if action.paths().is_empty() {
             Some(read_index_stamp(&repository.identity.index, check)?)
         } else {
             None
         };
+        timing.insert("index", started.elapsed().as_micros());
+        let started = Instant::now();
         let mut path = Vec::new();
         let mut index_bytes = 0;
         let selected = action.paths();
@@ -226,8 +235,14 @@ impl WritePrecondition {
             };
             action.paths().into_iter().map(move |path| (path, policy))
         }).collect();
+        timing.insert("target_setup", started.elapsed().as_micros());
+        let started = Instant::now();
         let mut selected_index = bulk_index(repository, &selected, check)?;
+        timing.insert("selected_index", started.elapsed().as_micros());
+        let started = Instant::now();
         let selected_head = bulk_head(repository, &selected, &head, check)?;
+        timing.insert("selected_head", started.elapsed().as_micros());
+        let started = Instant::now();
         for target in &selected {
             let worktree_policy = policy[target];
             let index = if worktree_policy == WorktreePolicy::Current {
@@ -249,17 +264,25 @@ impl WritePrecondition {
                 worktree,
             });
         }
+        timing.insert("selected_paths", started.elapsed().as_micros());
+        let started = Instant::now();
         validate_patch(local, repository, action, check)?;
+        timing.insert("patch_validation", started.elapsed().as_micros());
+        let started = Instant::now();
         ensure!(
             head == read_head(local)?,
             "HEAD changed while preparing write"
         );
+        timing.insert("head_recheck", started.elapsed().as_micros());
+        let started = Instant::now();
         if let Some(index) = &index {
             ensure!(
                 *index == read_index_stamp(&repository.identity.index, check)?,
                 "index changed while preparing write"
             );
         }
+        timing.insert("index_recheck", started.elapsed().as_micros());
+        let started = Instant::now();
         let mut current_index = bulk_index(repository, &selected, check)?;
         for target in &path {
             ensure!(
@@ -285,6 +308,7 @@ impl WritePrecondition {
         if let GitWriteAction::UpdateRepositoryConfig { expected, .. } = action {
             super::config::validate(repository, expected, check)?;
         }
+        timing.insert("target_recheck", started.elapsed().as_micros());
         Ok(Self {
             head,
             index,
@@ -300,7 +324,7 @@ impl WritePrecondition {
         action: &GitWriteAction,
         check: &mut dyn FnMut() -> Result<()>,
     ) -> Result<()> {
-        let current = Self::capture(local, repository, action, check)?;
+        let current = Self::capture(local, repository, action, check, &mut BTreeMap::new())?;
         ensure!(
             *self == current,
             "captured HEAD, index entry, mode, or source bytes changed"

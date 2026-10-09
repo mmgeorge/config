@@ -1,7 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -125,11 +125,13 @@ impl RepositoryWriteGateway {
                         "prepared Git intent admission is closed or full"
                     );
                 }
+                let opening = Instant::now();
                 let repository = self
                     .repository
                     .open(workspace)
                     .await?
                     .context("workspace is not a Git repository")?;
+                let repository_open_us = opening.elapsed().as_micros();
                 let intent = self
                     .writer
                     .prepare(repository, action.into_action()?)
@@ -144,8 +146,10 @@ impl RepositoryWriteGateway {
                     .checked_add(1)
                     .context("prepared intent sequence exhausted")?;
                 let token = format!("{}:{}", self.epoch, state.sequence);
+                let mut timing = intent.preparation_timing().clone();
+                timing.insert("repository_open", repository_open_us);
                 state.intent.insert(token.clone(), intent);
-                Ok(json!({"intent": token}))
+                Ok(json!({"intent": token, "timing_us": timing}))
             }
             WriteRequest::Submit { intent } => {
                 let mut intent = self

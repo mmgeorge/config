@@ -1100,6 +1100,15 @@ The admission reservation spans root lookup and queue settlement through active-
 active session remains exclusive through process exit, so repeated commit keys cannot
 start concurrent Git writers or editor clients.
 
+Commit diagnostics retain one request ID from the user action through native write
+preparation. Successful preparation returns microsecond timings for repository
+opening, admission, write-queue waiting, read-worker dispatch, and individual
+HEAD/index/source capture and recheck stages. Lua records these as
+`git.write.prepare.native.*` events in `forge/diff-perf.log`, converted to
+milliseconds. `capture_total` includes its individual capture stages and must not
+be added to them. Failed preparation retains the existing overall duration and
+error result without reporting incomplete stage timings as successful work.
+
 The Ignored section never enters the Git journal. `I` moves whole Unstaged files into
 the virtual marker set, while `U` removes those markers without invoking Git. `S`
 temporarily suppresses selected markers and submits ordinary whole-file stage targets,

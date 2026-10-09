@@ -88,6 +88,9 @@ function M.execute(workspace, action, callback, progress, trace_id)
       finish(nil, "Git write preparation returned no intent")
       return
     end
+    for _, phase in ipairs(vim.fn.sort(vim.tbl_keys(prepared.timing_us or {}))) do
+      record("prepare.native." .. phase, { ms = prepared.timing_us[phase] / 1000 })
+    end
     intent = prepared.intent
     if cancelled then cancel() finish(nil, "Git write cancelled before submission") return end
     submitted = perf.now()

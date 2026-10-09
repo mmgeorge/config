@@ -117,6 +117,7 @@ pub enum GitWriteAction {
 pub type SettlementHandler = Arc<dyn Fn(&WriteOutcome) -> Result<()> + Send + Sync>;
 
 pub struct GitWriteIntent {
+    preparation_timing: BTreeMap<&'static str, u128>,
     store: Arc<RepositoryStore>,
     repository: Arc<RepositoryState>,
     action: GitWriteAction,
@@ -206,6 +207,7 @@ impl GitWriteService {
         let operation = self.store.writes.admit(action.scopes(&repository)?, action.retained_bytes()?)?;
         Ok(GitWriteIntent {
             store: Arc::clone(&self.store), repository, action, precondition: None,
+            preparation_timing: BTreeMap::new(),
             expected: Mutex::new(None),
             reservation: IntentReservation { store: Arc::clone(&self.store), operation, submitted: false },
             progress: None, settlement: None,
@@ -219,6 +221,8 @@ impl GitWriteService {
         repository: Arc<RepositoryState>,
         action: GitWriteAction,
     ) -> Result<GitWriteIntent> {
+        let started = Instant::now();
+        let mut timing = BTreeMap::new();
         action.validate()?;
         let retained = action.retained_bytes()?;
         let operation = self
@@ -231,13 +235,18 @@ impl GitWriteService {
             submitted: false,
         };
         let worker = Arc::clone(&repository);
+        timing.insert("admission", started.elapsed().as_micros());
+        let waiting = Instant::now();
         self.store.writes.wait_ready(operation).await?;
+        timing.insert("write_queue", waiting.elapsed().as_micros());
+        let dispatching = Instant::now();
         let prepared = self
             .store
             .read(
                 Arc::clone(&repository),
                 retained,
                 move |mut local, cancellation| {
+                    timing.insert("read_dispatch", dispatching.elapsed().as_micros());
                     let started = Instant::now();
                     let mut check = || {
                         cancellation.check()?;
@@ -248,8 +257,9 @@ impl GitWriteService {
                         Ok(())
                     };
                     let precondition =
-                        WritePrecondition::capture(&mut local, &worker, &action, &mut check)?;
-                    Ok((action, precondition))
+                        WritePrecondition::capture(&mut local, &worker, &action, &mut check, &mut timing)?;
+                    timing.insert("capture_total", started.elapsed().as_micros());
+                    Ok((action, precondition, timing))
                 },
             )
             .await?
@@ -259,6 +269,7 @@ impl GitWriteService {
             repository,
             action: prepared.0,
             precondition: Some(prepared.1),
+            preparation_timing: prepared.2,
             expected: Mutex::new(None),
             reservation,
             progress: None,
@@ -374,6 +385,11 @@ impl Drop for IntentReservation {
 }
 
 impl GitWriteIntent {
+    /// Reports completed preparation stages in microseconds, including admission and worker dispatch.
+    pub fn preparation_timing(&self) -> &BTreeMap<&'static str, u128> {
+        &self.preparation_timing
+    }
+
     /// Rejects displayed source observations that differ from this prepared write.
     /// Checks selected index entries and worktree stamps without reading unrelated paths.
     /// Failure leaves the intent unsubmitted and performs no Git mutation.
@@ -733,7 +749,7 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
     };
     let prepared = (|| -> Result<()> {
         if intent.precondition.is_none() {
-            intent.precondition = Some(WritePrecondition::capture(&mut local, &intent.repository, &intent.action, &mut check)?);
+            intent.precondition = Some(WritePrecondition::capture(&mut local, &intent.repository, &intent.action, &mut check, &mut intent.preparation_timing)?);
         }
         if let Some((head, observed)) = intent.expected.lock().expect("write expected-source lock").as_ref() {
             intent.precondition().validate_observed(head, observed)?;
