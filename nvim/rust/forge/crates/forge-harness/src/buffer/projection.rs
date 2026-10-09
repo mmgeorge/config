@@ -789,6 +789,10 @@ impl TimelineRenderer<'_> {
                                 }
                             }
                             if calls.is_empty() { continue; }
+                            let duration_width = calls.iter().map(|(_, tool)| {
+                                tool.elapsed_ms(self.now_ms).map(super::duration::duration_label)
+                                    .map_or(1, |label| label.chars().count())
+                            }).max().unwrap_or(0);
                             let start = self.block.len();
                             let count = calls.len();
                             let last_tool_id = &calls.last().expect("nonempty tool group").1.id;
@@ -812,10 +816,10 @@ impl TimelineRenderer<'_> {
                             self.literal(&format!("{id}:tools"), &label, None)?;
                             for (index, (id, tool)) in calls.into_iter().enumerate() {
                                 if tool.state() == crate::turn::ToolState::Running {
-                                    self.tool(turn.id(), tool)?;
+                                    self.tool(turn.id(), tool, duration_width)?;
                                 } else {
                                     let tool_start = self.block.len();
-                                    self.tool(turn.id(), tool)?;
+                                    self.tool(turn.id(), tool, duration_width)?;
                                     if let Some(diff) = crate::exchange::ProviderDiffBuilder::build(
                                         std::slice::from_ref(tool),
                                     ) {
@@ -1030,7 +1034,7 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn tool(&mut self, interaction: &str, tool: &crate::exchange::ToolCall) -> Result<()> {
+    fn tool(&mut self, interaction: &str, tool: &crate::exchange::ToolCall, duration_width: usize) -> Result<()> {
         let call_id = format!("{interaction}:{}", tool.id);
         ensure!(
             !self.tool.contains_key(&call_id),
@@ -1053,6 +1057,7 @@ impl TimelineRenderer<'_> {
             target.clone(),
             &tool.kind,
             tool.elapsed_ms(self.now_ms),
+            duration_width,
             tool.failed,
             &label,
             &output.preview(self.expanded_tool.contains(&call_id)),
@@ -1968,6 +1973,54 @@ mod tests {
         let text = completed.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
         assert!(text.find("I mean a Rust CLI").unwrap() < text.find("You answered: Scope: Rust CLI").unwrap());
         assert!(text.find("You answered: Scope: Rust CLI").unwrap() < text.find("Proceeding with Rust").unwrap());
+    }
+
+    #[test]
+    fn tool_groups_align_mixed_durations_as_running_timers_change() {
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"aligned", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Inspect", "kind":"chat", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        })).unwrap();
+        exchange.resume(0).unwrap();
+        let address = ProviderAddress { thread_id: "thread".into(), turn_id: "turn".into() };
+        exchange.start_turn(address.clone(), 0).unwrap();
+        let mut event = BackendEvent {
+            address: Some(address), turn_boundary: None, kind: "tool".into(), text: None,
+            data: serde_json::Value::Null, activity: None, summary: None, task_update: None,
+        };
+        let mut clock = 1;
+        for (index, duration) in [Some(4), Some(21), Some(1000), Some(626), None].into_iter().enumerate() {
+            event.activity = Some(ToolActivity {
+                id: format!("tool-{index}"), kind: if index % 2 == 0 { ToolActivityKind::Command } else { ToolActivityKind::ToolCall },
+                title: format!("inspect_{index}"), output: None, output_delta: false,
+                status: Some("running".into()), change: Default::default(),
+            });
+            exchange.observe_turn(&event, clock).unwrap();
+            if let Some(duration) = duration {
+                clock += duration;
+                event.activity.as_mut().unwrap().status = Some("completed".into());
+                exchange.observe_turn(&event, clock).unwrap();
+            }
+            clock += 1;
+        }
+        for now in [clock, clock + 10_000_000] {
+            let projected = project_at(&TimelineEntry::Exchange {
+                id: exchange.id.clone(), created_at_ms: 0, exchange: exchange.clone(), agent_by_id: HashMap::new(),
+            }, &WidthProfile::default(), now).unwrap();
+            let headings = projected.entry.block.iter().filter_map(|block| block.text.row(0))
+                .filter(|row| row.contains("• ")).collect::<Vec<_>>();
+            assert_eq!(headings.len(), 5);
+            let column = headings[0].find("inspect_").unwrap();
+            assert!(headings.iter().all(|row| row.find("inspect_") == Some(column)), "{headings:?}");
+            assert!(headings[0].contains("   4ms inspect_0"));
+            assert!(headings[2].contains("    1s inspect_2"));
+            for block in projected.entry.block.iter().filter(|block| block.text.row(0).is_some_and(|row| row.contains("• "))) {
+                assert!(block.metadata.decoration.iter().filter(|decoration| matches!(decoration.capture.as_str(), "ForgeHarnessCommand" | "ForgeHarnessMcpName"))
+                    .all(|decoration| decoration.range.start.column == column));
+            }
+        }
     }
 
     #[test]

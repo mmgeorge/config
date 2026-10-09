@@ -2,6 +2,12 @@ vim.loader.enable(false)
 local client = require("forge.client")
 local writer = require("forge.git.write")
 local original = client.request_host
+local perf = require("forge.infra.perf")
+local original_event = perf.event
+local event_list = {}
+perf.event = function(_, event, payload)
+  event_list[#event_list + 1] = { event = event, payload = vim.deepcopy(payload) }
+end
 local ok, failure = xpcall(function()
   local acknowledged, operation_list, chunks = false, {}, {}
   client.request_host = function(method, params, callback, progress)
@@ -27,10 +33,19 @@ local ok, failure = xpcall(function()
   writer.execute("fixture", { kind = "push" }, function(value) result = value end, function(text, stream)
     assert(stream == "stderr")
     chunks[#chunks + 1] = text
-  end)
+  end, "test-write")
   assert(result.ok and result.stderr == "Pushing\r\ndone")
   assert(table.concat(chunks) == "Pushing\ndone" and acknowledged)
   assert(table.concat(operation_list, ",") == "prepare,submit,acknowledge")
+  local expected = { "git.write.prepare.start", "git.write.prepare.complete", "git.write.submit.start",
+    "git.write.progress.first", "git.write.complete", "git.write.acknowledge.start", "git.write.acknowledge.complete" }
+  assert(#event_list == #expected, "writer timing count differs")
+  for index, event in ipairs(event_list) do
+    assert(event.event == expected[index], "writer timing order differs")
+    assert(event.payload.request_id == "test-write", "writer timing lost action correlation")
+    assert(event.payload.elapsed_ms >= 0, "writer timing omitted elapsed time")
+  end
+  assert(event_list[5].payload.operation_id == "1" and event_list[5].payload.code == 0)
 
   client.request_host = function(_, params, callback)
     if params.operation == "prepare" then callback({ intent = "uncertain" }, nil)
@@ -120,4 +135,5 @@ local ok, failure = xpcall(function()
   assert(table.concat(operation_list, ",") == "prepare,submit,cancel", "uncertain cancellation acknowledged a recoverable outcome")
 end, debug.traceback)
 client.request_host = original
+perf.event = original_event
 if not ok then vim.api.nvim_err_writeln(failure) vim.cmd("cquit 1") else vim.cmd("qa!") end

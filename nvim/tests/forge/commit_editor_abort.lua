@@ -15,6 +15,7 @@ vim.fn.writefile({ "original message" }, target)
 local completed = 0
 local function open_editor()
   commit._active = { win = window, prev_buf = origin, prev_winbar = "", root = vim.fn.getcwd(),
+    trace = { started = vim.uv.hrtime(), id = "abort-test", operation = "commit" },
     console = vim.api.nvim_create_buf(false, true), on_done = function() completed = completed + 1 end }
   commit.editor(target, "invalid-forge-test-editor-socket")
   return vim.api.nvim_win_get_buf(window)
@@ -31,6 +32,7 @@ assert(completed == 1 and commit._active == nil)
 assert(cleared == 0 and cached, "aborted commit consumed About")
 local succeeded = 0
 commit._active = { win = window, prev_buf = origin, prev_winbar = "", root = vim.fn.getcwd(),
+  trace = { started = vim.uv.hrtime(), id = "success-test", operation = "commit" },
   console = vim.api.nvim_create_buf(false, true), on_done = function() completed = completed + 1 end,
   on_success = function() succeeded = succeeded + 1 end }
 commit._finish(0)

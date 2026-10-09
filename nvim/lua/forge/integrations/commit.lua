@@ -20,6 +20,24 @@ local M = {}
 
 local session = require("forge.session")
 local git_write = require("forge.git.write")
+local perf = require("forge.infra.perf")
+
+---@class ForgeCommitTrace
+---@field started integer
+---@field id string
+---@field operation string
+---@field editor_opened? integer
+---@field submitted? integer
+
+---@param trace ForgeCommitTrace
+---@param event string
+---@param fields? table
+local function record(trace, event, fields)
+  local payload = vim.tbl_extend("force", {
+    request_id = trace.id, operation = trace.operation, elapsed_ms = perf.elapsed_ms(trace.started),
+  }, fields or {})
+  perf.event("diff", "commit." .. event, payload)
+end
 
 -- Active commit session.
 -- { win, list_win, prev_buf, prev_winbar, console, on_done, aborted }
@@ -135,14 +153,19 @@ end
 ---@param client_addr string headless client's server address
 function M.editor(target, client_addr)
   local st = M._active
+  local editor_started = perf.now()
+  if st then record(st.trace, "editor.requested") end
   local function signal(abort)
     local ok, chan = pcall(vim.fn.sockconnect, "pipe", client_addr, { rpc = true })
     if ok and chan ~= 0 then
       local sent, failure = pcall(vim.rpcnotify, chan, "nvim_command", abort and "cq" or "qall")
+      if st then record(st.trace, "editor.signal", { status = sent and "sent" or "failed", cancelled = abort }) end
       if not sent then
         pcall(vim.fn.chanclose, chan)
         vim.notify("Failed to signal commit editor: " .. tostring(failure), vim.log.levels.ERROR)
       end
+    elseif st then
+      record(st.trace, "editor.signal", { status = "connection_failed", cancelled = abort })
     end
   end
 
@@ -171,11 +194,16 @@ function M.editor(target, client_addr)
   local function finish(abort)
     if finished then return end
     finished = true
+    record(st.trace, "editor.submit", {
+      cancelled = abort, ms = st.trace.editor_opened and perf.elapsed_ms(st.trace.editor_opened),
+    })
     if vim.api.nvim_buf_is_valid(buf) then vim.b[buf].forge_ai_commit_revision = (vim.b[buf].forge_ai_commit_revision or 0) + 1 end
     if M._active then M._active.aborted = abort end
     if abort and vim.api.nvim_buf_is_valid(buf) then vim.bo[buf].modified = false end
     if not abort and vim.api.nvim_buf_is_valid(buf) then
+      local write_started = perf.now()
       local ok, err = pcall(vim.api.nvim_buf_call, buf, function() vim.cmd("silent write") end)
+      record(st.trace, "editor.write", { ms = perf.elapsed_ms(write_started), status = ok and "ok" or "failed" })
       if not ok then
         finished = false
         vim.notify("Failed to write commit message: " .. tostring(err), vim.log.levels.ERROR, { title = "Forge commit" })
@@ -189,6 +217,7 @@ function M.editor(target, client_addr)
       append(st.console, { "Finalizing commit..." })
       winbar(st.win, " Committing... ")
     end
+    st.trace.submitted = perf.now()
     signal(abort)
     -- Git still owns the process lifetime; M._finish hands the window back to
     -- the preview when hooks/commit finalization finish.
@@ -210,6 +239,8 @@ function M.editor(target, client_addr)
   vim.api.nvim_set_current_win(st.win)
   -- Enter in normal mode (no startinsert): keeps <C-q>/<C-c><C-c> reliable.
   pcall(vim.api.nvim_win_set_cursor, st.win, { 1, 0 })
+  st.trace.editor_opened = perf.now()
+  record(st.trace, "editor.opened", { ms = perf.elapsed_ms(editor_started) })
   if not st.amend then
     require("forge.integrations.ai_commit").populate_commit_buffer_when_ready(buf, st.root or vim.fn.getcwd(), function(message, level)
       vim.notify(message, level, { title = "Forge commit" })
@@ -221,11 +252,18 @@ end
 
 --- Hand the borrowed window back to the Forge preview and refresh.
 local function restore_preview(st)
+  local started = perf.now()
   if st.prev_buf and vim.api.nvim_buf_is_valid(st.prev_buf)
       and st.win and vim.api.nvim_win_is_valid(st.win) then
     pcall(vim.api.nvim_win_set_buf, st.win, st.prev_buf)
   end
-  if st.on_done then pcall(st.on_done) end
+  record(st.trace, "preview.restored", { ms = perf.elapsed_ms(started) })
+  if st.on_done then
+    local refresh_started = perf.now()
+    record(st.trace, "refresh.dispatch")
+    local ok = pcall(st.on_done)
+    record(st.trace, "refresh.dispatched", { ms = perf.elapsed_ms(refresh_started), status = ok and "ok" or "failed" })
+  end
 end
 
 --- Report the result of the commit: success/abort hand the window back to the
@@ -233,6 +271,10 @@ end
 function M._finish(code)
   local st = M._active
   if not st then return end
+  record(st.trace, "finished", {
+    code = code, cancelled = st.aborted,
+    ms = st.trace.submitted and perf.elapsed_ms(st.trace.submitted),
+  })
   M._active = nil
 
   local output = (st.console and vim.api.nvim_buf_is_valid(st.console))
@@ -243,9 +285,11 @@ function M._finish(code)
 
   if code == 0 or st.aborted then
     if code == 0 then
+      local cleanup_started = perf.now()
       if st.on_success then pcall(st.on_success) end
       local ai_commit = require("forge.integrations.ai_commit")
       if ai_commit.state(st.root, "HEAD") then ai_commit.clear(st.root) end
+      record(st.trace, "cleanup", { ms = perf.elapsed_ms(cleanup_started) })
     end
     vim.notify(code == 0 and (st.amend and "Amend complete" or "Commit complete") or "Commit aborted", vim.log.levels.INFO)
     if st.console and vim.api.nvim_buf_is_valid(st.console) then
@@ -293,6 +337,10 @@ function M.commit(opts)
     return
   end
   M._admission_pending = true
+  local started = perf.now()
+  local trace = { started = started, id = ("commit:%s:%s"):format(vim.fn.getpid(), started),
+    operation = opts.amend and "amend" or "commit" }
+  record(trace, "started")
 
   local function resolve_root(command, system_options, callback)
     if opts.workspace then
@@ -307,6 +355,7 @@ function M.commit(opts)
     stderr = true,
   }, function(result)
     vim.schedule(function()
+      record(trace, "root.resolved", { ms = perf.elapsed_ms(started), code = result.code })
       local root = vim.trim(result.stdout or "")
       if result.code ~= 0 or root == "" then
         M._admission_pending = false
@@ -325,6 +374,7 @@ function M.commit(opts)
         vim.bo[console].filetype = "git"
 
         M._active = {
+          trace = trace,
           win = win,
           list_win = opts.list_win,
           prev_buf = vim.api.nvim_win_get_buf(win),
@@ -349,6 +399,7 @@ function M.commit(opts)
         if server == nil or server == "" then server = vim.fn.serverstart() end
 
         local editor = remote_editor_cmd()
+        record(trace, "write.dispatch")
         local commit_ok, commit_process_or_error = pcall(git_write.execute, root, {
           kind = "commit_editor", command = editor, nvim_server = server, amend = opts.amend == true,
         }, function(commit_result)
@@ -358,9 +409,10 @@ function M.commit(opts)
           M._finish(commit_result.code)
         end, function(data)
           append_text(console, data)
-        end)
+        end, trace.id)
 
         if not commit_ok then
+          record(trace, "write.start_failed")
           local message = "Failed to start `git commit`: " .. tostring(commit_process_or_error)
           append(console, { message })
           vim.notify(message, vim.log.levels.ERROR, { title = "Diff Review" })
@@ -369,6 +421,7 @@ function M.commit(opts)
     end)
   end)
   if not ok then
+    record(trace, "root.failed")
     M._admission_pending = false
     vim.notify(
       "Failed to start `git rev-parse`: " .. tostring(root_process_or_error),

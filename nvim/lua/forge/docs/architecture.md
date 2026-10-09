@@ -1356,6 +1356,16 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
   The 2 KiB mutation diagnostic preserves its prefix and tail at UTF-8 boundaries.
   Lua anchors pending-line matching so newline-free progress does not trigger a
   quadratic pattern search.
+  With `diff_logging` enabled, `commit.*` and `git.write.*` events share a request ID
+  and record root lookup, native preparation/submission, first stream output,
+  editor opening, message-writing time, editor signalling, receipt, cleanup, and
+  preview restoration. `commit.finished.ms` measures receipt latency after editor
+  submission, excluding time spent editing the message. Native submission includes
+  Git hooks and receipt settlement, not only the Git process. Separate
+  `status.refresh.*` events identify the Status document and measure request,
+  recovery snapshot, and patch application through refresh completion. These events
+  use the bounded asynchronous `forge/diff-perf.log` writer and contain timing and
+  identity metadata, never commit messages, paths, or command output.
 - **`conventional_commit.lua`** — parses the `type(scope)!:` prefix of a subject into
   colored segments for consistent highlighting across commit rows.
 - **`datetime.lua`** — formats epochs/ISO timestamps into relative ("2 hours ago") or
@@ -2149,6 +2159,9 @@ settles any outstanding call at that boundary. Completed timestamps survive sess
 Calls first observed at completion have unavailable duration (`—`). Subsecond calls display their measured milliseconds, such as `439ms`.
 Longer calls display rounded tenths, such as `2.5s`. These labels do not round the stored
 timestamps or throughput operands.
+Each contiguous tool group right-aligns its duration labels to the widest current label,
+keeping command and MCP names in one column. Expanded headings use the same width, and
+the group recomputes its width when a running timer changes.
 These durations measure Harness lifecycle observations rather than provider CPU execution time.
 
 `/plan` uses the same `Thinking` and `Thought` interaction summaries as every model turn. A

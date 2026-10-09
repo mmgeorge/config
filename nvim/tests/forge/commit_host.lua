@@ -3,6 +3,12 @@ vim.loader.enable(false)
 local commit = require("forge.integrations.commit")
 local ai_commit = require("forge.integrations.ai_commit")
 local git_write = require("forge.git.write")
+local perf = require("forge.infra.perf")
+local original_event = perf.event
+local event_list = {}
+perf.event = function(scope, event, payload)
+  if event:match("^commit%.") then event_list[#event_list + 1] = { event = event, payload = vim.deepcopy(payload) } end
+end
 
 local repository = vim.fn.tempname()
 assert(vim.fn.mkdir(repository, "p") == 1)
@@ -125,9 +131,28 @@ local function run()
     "amend changed the committed tree")
   assert_true(git({ "diff", "--cached", "--name-only" }):find("tracked.txt", 1, true) ~= nil,
     "amend consumed staged changes")
+
+  local expected = { "commit.started", "commit.root.resolved", "commit.write.dispatch", "commit.editor.requested",
+    "commit.editor.opened", "commit.editor.submit", "commit.editor.write", "commit.editor.signal", "commit.finished",
+    "commit.cleanup", "commit.preview.restored" }
+  assert_true(#event_list == #expected * 2, "commit timing event count differs: " .. vim.inspect(event_list))
+  for index, event in ipairs(event_list) do
+    local position = (index - 1) % #expected + 1
+    assert_true(event.event == expected[position], "commit timing order differs: " .. event.event)
+    local start = event_list[index - position + 1].payload
+    assert_true(event.payload.request_id == start.request_id, "commit timing lost correlation")
+    assert_true(event.payload.elapsed_ms >= 0, "commit timing missing elapsed time")
+    if event.event == "commit.finished" then
+      assert_true(type(event.payload.ms) == "number" and event.payload.ms <= event.payload.elapsed_ms,
+        "post-submit timing includes pre-submit time")
+    end
+  end
+  assert_true(event_list[1].payload.request_id ~= event_list[#expected + 1].payload.request_id,
+    "amend reused the prior commit trace")
 end
 
 local ok, failure = xpcall(run, debug.traceback)
+perf.event = original_event
 git_write.execute = original_execute
 ai_commit.reset_backend()
 ai_commit.set_backend(original_backend)

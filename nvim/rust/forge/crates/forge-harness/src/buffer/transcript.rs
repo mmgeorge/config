@@ -119,6 +119,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         target: TargetId,
         kind: &str,
         elapsed_ms: Option<u64>,
+        duration_width: usize,
         failed: bool,
         title: &str,
         output: &ToolOutputPreview<'_>,
@@ -133,15 +134,16 @@ impl<'profile> TranscriptRenderer<'profile> {
         let arguments = expanded.then(|| title.split_once('('))
             .flatten().filter(|_| kind == "tool_call")
             .and_then(|(name, arguments)| arguments.strip_suffix(')').map(|arguments| (name, arguments)));
+        let label = elapsed_ms.map(duration_label).unwrap_or_else(|| "—".into());
+        let duration = format!("{label:>duration_width$}");
         let mut row = if let Some((name, arguments)) = arguments {
-            let mut row = vec![tool_heading(self.profile, kind, name, elapsed_ms)?];
+            let mut row = vec![tool_heading(self.profile, kind, name, &duration)?];
             row.extend(tool_body_rows(self.profile, arguments, true)?);
             row
         } else if expanded {
-            let duration = elapsed_ms.map(duration_label).unwrap_or_else(|| "—".into());
             self.profile.wrap_plain(&format!("  • {duration} {title}"), 4.min(self.profile.columns - 1))?
         } else {
-            vec![tool_heading(self.profile, kind, title, elapsed_ms)?]
+            vec![tool_heading(self.profile, kind, title, &duration)?]
         };
         let title_rows = row.len();
         for (index, text) in output.row.iter().enumerate() {
@@ -216,10 +218,9 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
 }
 
 /// Formats a bounded display title without changing the retained provider call.
-fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, elapsed_ms: Option<u64>) -> Result<String> {
+fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str) -> Result<String> {
     let title = if kind == "command" { shell_command(title) } else { title };
     let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let duration = elapsed_ms.map(duration_label).unwrap_or_else(|| "—".into());
     let full = format!("  • {duration} {normalized}");
     if profile.cells(&full, 0)? <= profile.columns {
         return Ok(full);
@@ -322,6 +323,14 @@ fn decorate_tool_heading(block: &mut BufferBlock, title_rows: usize, kind: &str,
     }
 }
 
+/// Skips the padded duration column so timing text never receives command or MCP styling.
+fn tool_content_start(text: &str) -> usize {
+    let after_bullet = text.split_once("• ").map(|(_, tail)| tail).unwrap_or("");
+    let title = after_bullet.trim_start().split_once(char::is_whitespace)
+        .map(|(_, title)| title.trim_start()).unwrap_or("");
+    text.len() - title.len()
+}
+
 fn decorate_command(block: &mut BufferBlock, title_rows: usize) {
     let mut expects_command = true;
     for row in 0..title_rows {
@@ -329,10 +338,7 @@ fn decorate_command(block: &mut BufferBlock, title_rows: usize) {
             continue;
         };
         let content_start = if row == 0 {
-            text.find("• ").and_then(|column| {
-                let start = column + "• ".len();
-                text[start..].find(' ').map(|end| start + end + 1)
-            }).unwrap_or(text.len())
+            tool_content_start(&text)
         } else {
             text.len() - text.trim_start().len()
         };
@@ -368,10 +374,7 @@ fn decorate_tool_call(block: &mut BufferBlock, title_rows: usize) {
             continue;
         };
         let content_start = if row == 0 {
-            text.find("• ").and_then(|column| {
-                let start = column + "• ".len();
-                text[start..].find(' ').map(|end| start + end + 1)
-            }).unwrap_or(text.len())
+            tool_content_start(&text)
         } else {
             text.len() - text.trim_start().len()
         };
@@ -473,7 +476,7 @@ mod test {
         let renderer = TranscriptRenderer::new(&profile)?;
         let arguments = r#"{"entity_name":"CosmosDbClient","file_path":"cosmos-db-client.ts","hops":1,"token_budget":3500}"#;
         let block = renderer.tool_preview(
-            BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), false,
+            BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), 0, false,
             &format!("sem.sem_context({arguments})"),
             &ToolOutputPreview { row: vec!["response"], hidden_rows: 0, total_rows: 1 }, true,
         )?;
@@ -497,7 +500,7 @@ mod test {
             let renderer = TranscriptRenderer::new(&profile)?;
             for expanded in [false, true] {
                 let block = renderer.tool_preview(
-                    BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), true,
+                    BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), 0, true,
                     "harness_plan_read", &ToolOutputPreview { row: vec![response], hidden_rows: 0, total_rows: 1 }, expanded,
                 )?;
                 let rows = block.text.wire_rows();
@@ -521,13 +524,13 @@ mod test {
             for expanded in [false, true] {
                 let block = renderer.tool_preview(
                     BlockId("tool:duration".into()), TargetId("expand:duration".into()),
-                    "command", Some(elapsed_ms), false, "cargo test",
+                    "command", Some(elapsed_ms), 5, false, "cargo test",
                     &ToolOutputPreview { row: vec![], hidden_rows: 0, total_rows: 0 }, expanded,
                 )?;
-                assert_eq!(block.text.row(0), Some(format!("  • {label} cargo test").as_str()));
+                assert_eq!(block.text.row(0), Some(format!("  • {label:>5} cargo test").as_str()));
                 assert!(block.metadata.decoration.iter().any(|decoration| {
                     decoration.capture == "ForgeHarnessCommand"
-                        && decoration.range.start.column == format!("  • {label} ").len()
+                        && decoration.range.start.column == format!("  • {label:>5} ").len()
                 }));
             }
         }
@@ -537,11 +540,11 @@ mod test {
     #[test]
     fn tool_titles_strip_launchers_and_close_truncated_arguments() -> Result<()> {
         let profile = WidthProfile { columns: 90, ..WidthProfile::default() };
-        assert_eq!(tool_heading(&profile, "command", r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#, Some(2000))?, "  • 2s git status --short");
-        assert_eq!(tool_heading(&profile, "command", "bash -lc 'cargo test'", Some(2000))?, "  • 2s cargo test");
+        assert_eq!(tool_heading(&profile, "command", r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#, "2s")?, "  • 2s git status --short");
+        assert_eq!(tool_heading(&profile, "command", "bash -lc 'cargo test'", "2s")?, "  • 2s cargo test");
         assert_eq!(shell_command("pwsh -File build.ps1"), "pwsh -File build.ps1");
         let call = r#"sem.sem_context({"entity_name":"ServiceBusSender","file_path":"service-bus-queue.ts","fresh":true})"#;
-        let heading = tool_heading(&profile, "tool_call", call, Some(2000))?;
+        let heading = tool_heading(&profile, "tool_call", call, "2s")?;
         assert!(heading.starts_with("  • 2s sem.sem_context({"));
         assert!(heading.ends_with("…\"})"), "{heading}");
         assert!(profile.cells(&heading, 0)? <= profile.columns);
@@ -558,6 +561,7 @@ mod test {
             TargetId("expand:1".into()),
             "command",
             Some(2000),
+            0,
             false,
             "cargo test --lib parser",
             &ToolOutputPreview {
@@ -602,6 +606,7 @@ mod test {
             TargetId("expand:empty".into()),
             "command",
             Some(2000),
+            0,
             false,
             "cargo check",
             &ToolOutputPreview {
@@ -632,6 +637,7 @@ mod test {
             TargetId("active:tool".into()),
             "tool_call",
             Some(2000),
+            0,
             true,
             "docs_lookup(crate, Item)",
             &output.preview(false),

@@ -2,6 +2,7 @@ local M = {}
 local buffer = require("forge.status_render")
 local input = require("forge.input")
 local history = require("forge.status_history")
+local perf = require("forge.infra.perf")
 local next_document = 0
 local runner_for_test
 local host_unavailable_message = "Forge host stopped or restarted; refresh or reopen this document"
@@ -354,13 +355,25 @@ function M.refresh(state, callback)
   end
   if callback then state.refresh_callback[#state.refresh_callback + 1] = callback end
   if state.refresh_active then return end
+  local started = perf.now()
+  local trace_id = ("status-refresh:%s:%s"):format(vim.fn.getpid(), started)
+  local function record(event, fields)
+    perf.event("diff", "status.refresh." .. event, vim.tbl_extend("force", {
+      request_id = trace_id, session_id = state.document, elapsed_ms = perf.elapsed_ms(started),
+      revision = state.refresh_epoch,
+    }, fields or {}))
+  end
+  record("start")
   state.refresh_active = true
   state.navigation = nil
   local run
   run = function()
     local epoch = state.refresh_epoch
+    local request_started = perf.now()
+    record("request")
     local function complete(failure)
       if epoch ~= state.refresh_epoch then
+        record("superseded")
         state.refresh_recover = true
         run()
         return
@@ -375,10 +388,13 @@ function M.refresh(state, callback)
         if state.context then state.context.refresh() end
         M.demand(state)
       end
+      record("complete", { status = failure and "failed" or "ok" })
       for _, complete in ipairs(callbacks) do complete(not failure, failure) end
     end
     local function finish(result, failure, snapshot)
+      local apply_started = perf.now()
       if epoch ~= state.refresh_epoch then
+        record("superseded")
         state.refresh_recover = true
         run()
         return
@@ -386,6 +402,7 @@ function M.refresh(state, callback)
       if failure then complete(failure) return end
       if snapshot then
         buffer.apply_snapshot(state.replica, result, function(applied)
+          record("snapshot.applied", { ms = perf.elapsed_ms(apply_started), status = applied.kind })
           if applied.kind ~= "Applied" then complete("Status snapshot could not be applied") return end
           state.refresh_recover = false
           state.done = {}
@@ -395,14 +412,19 @@ function M.refresh(state, callback)
       end
       if result and result ~= vim.NIL then
         local applied = buffer.apply_patch(state.replica, result)
+        record("patch.applied", { ms = perf.elapsed_ms(apply_started), status = applied.kind })
         if applied.kind ~= "Applied" then complete("Status refresh could not be applied") return end
         state.done = {}
       end
       complete()
     end
     request(state, { operation = "refresh", document = state.document }, function(result, failure)
+      record("response", { ms = perf.elapsed_ms(request_started), status = failure and "failed" or "ok" })
       if epoch == state.refresh_epoch and not failure and state.refresh_recover then
+        local snapshot_started = perf.now()
+        record("snapshot.request")
         request(state, { operation = "snapshot", document = state.document }, function(snapshot, snapshot_failure)
+          record("snapshot.response", { ms = perf.elapsed_ms(snapshot_started), status = snapshot_failure and "failed" or "ok" })
           finish(snapshot, snapshot_failure or (not snapshot and "Missing status snapshot" or nil), true)
         end)
       else finish(result, failure, false) end
