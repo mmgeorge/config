@@ -368,7 +368,7 @@ function M.open(plan)
   end
   if not recovery then
     vim.bo[native_buffer].buftype = "nofile"
-    vim.bo[native_buffer].filetype = "forge"
+    vim.bo[native_buffer].filetype = "ForgePlan"
     vim.bo[native_buffer].modifiable = true
     vim.api.nvim_buf_set_lines(native_buffer, 0, -1, false, { "Loading plan review…" })
     vim.bo[native_buffer].modified = false

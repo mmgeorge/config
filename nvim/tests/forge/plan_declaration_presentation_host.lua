@@ -132,7 +132,7 @@ local success, failure = xpcall(function()
   assert(pending_open, "opening did not request a native snapshot")
   local loading = state.plan_review
   assert(loading and not loading.owner.ready, "held snapshot attached prematurely")
-  assert(vim.bo[loading.buf].filetype == "forge", "pending review used Markdown presentation")
+  assert(vim.bo[loading.buf].filetype == "ForgePlan", "pending review lost its dedicated filetype")
   assert(not vim.bo[loading.buf].modifiable and not vim.bo[loading.buf].modified, "pending review allowed edits")
   assert(text(loading.buf) == "Loading plan review…", "pending review exposed the saved Markdown projection")
   assert(vim.wo[loading.win].winbar:find("PlanReview", 1, true)
@@ -181,7 +181,7 @@ local success, failure = xpcall(function()
   assert(text(review.buf):find(document.design.document.design, 1, true), "change description is missing")
   assert(text(review.buf):find("Objective:\n" .. document.design.document.objective, 1, true), "task overview is missing or misplaced")
   local last_section = 0
-  for _, heading in ipairs({ "Objective:", "Requirements:", "Background:", "Design:", "Proposed declaration changes:", "Verification:" }) do
+  for _, heading in ipairs({ "Objective:", "Requirements:", "Background:", "Design:", "Proposed declaration changes:", "Tests · None planned", "Verification:" }) do
     local position = assert(text(review.buf):find(heading, 1, true), "missing plan section: " .. heading)
     assert(position > last_section, "plan sections are out of order: " .. heading)
     last_section = position
@@ -379,7 +379,7 @@ local success, failure = xpcall(function()
   vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<C-o>", true, false, true), "xt", false)
   await(function() return vim.api.nvim_get_current_buf() == review.buf and review.owner.attached() end,
     "returning from dependency source lost the review attachment")
-  assert(vim.bo[review.buf].filetype == "forge" and vim.wo[review.win].winbar:find("PlanReview", 1, true),
+  assert(vim.bo[review.buf].filetype == "ForgePlan" and vim.wo[review.win].winbar:find("PlanReview", 1, true),
     "returning from dependency source lost review presentation")
   if bevy_navigation then
     for _, public_only in ipairs({ false, true }) do
@@ -485,8 +485,10 @@ local success, failure = xpcall(function()
   local intermediate_redraw = 0
   local redraw_trace = {}
   vim.api.nvim__redraw = function(options)
-    intermediate_redraw = intermediate_redraw + 1
-    redraw_trace[#redraw_trace + 1] = debug.traceback("redraw during collapse", 2)
+    if options.flush ~= false then
+      intermediate_redraw = intermediate_redraw + 1
+      redraw_trace[#redraw_trace + 1] = debug.traceback("redraw during collapse", 2)
+    end
     return redraw(options)
   end
   toggle(declaration_row("ArenaSize,"))

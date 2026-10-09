@@ -67,13 +67,11 @@ impl DesignDocument {
                 text: self
                     .decisions
                     .iter()
-                    .enumerate()
-                    .map(|(index, decision)| {
+                    .map(|decision| {
                         format!(
-                            "{}. **{}**\n   {}",
-                            index + 1,
+                            "- **{}** {}",
                             decision.decision.split_whitespace().collect::<Vec<_>>().join(" "),
-                            decision.rationale.replace('\n', "\n   ")
+                            decision.rationale.split_whitespace().collect::<Vec<_>>().join(" ")
                         )
                     })
                     .collect::<Vec<_>>()
@@ -86,6 +84,12 @@ impl DesignDocument {
                 text: self.design.clone(),
             },
             DesignSection {
+                path: "tests",
+                title: "Tests",
+                section: PlanSection::Tests,
+                text: super::design_tests::text(&self.tests),
+            },
+            DesignSection {
                 path: "verification/automated",
                 title: "Verification/Automated",
                 section: PlanSection::AutomatedVerification,
@@ -96,12 +100,6 @@ impl DesignDocument {
                 title: "Verification/Manual",
                 section: PlanSection::ManualVerification,
                 text: self.verification.manual.clone(),
-            },
-            DesignSection {
-                path: "tests",
-                title: "Tests",
-                section: PlanSection::Tests,
-                text: super::design_tests::text(&self.tests),
             },
         ]
     }

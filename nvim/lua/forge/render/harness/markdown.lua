@@ -10,7 +10,7 @@ local cursor_attached = {}
 ---@return boolean registered True if registration succeeded.
 local function ensure_language()
   if language_registered then return true end
-  local ok, register_error = pcall(vim.treesitter.language.register, "markdown", "ForgeHarness")
+  local ok, register_error = pcall(vim.treesitter.language.register, "markdown", { "ForgeHarness", "ForgePlan" })
   if ok then
     language_registered = true
     return true

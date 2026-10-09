@@ -49,7 +49,7 @@ Do not depend on phrases such as "as discussed" or details available only in ear
 Keep every section consistent with the final declarations and update it when review changes the plan.
 
 The review order is Objective, Usage when present, Requirements, Background, Decisions when nonempty,
-Design, proposed declaration changes, Verification, and Tests. Each section has a distinct role:
+Design, proposed declaration changes, Tests, and Verification. Each section has a distinct role:
 
 ### Objective
 
@@ -148,7 +148,7 @@ removed, or reused), and a description of the scenario and expected result or re
 Include inline test modules and separate test files consistently. List existing coverage being
 reused, omit unrelated repository tests, and use [] when no tests apply. Keep names unique within
 a file and list each file once. At most 256 files and 1024 cases are allowed. Tests is rendered
-last and records planned coverage. Verification retains execution commands and manual checks.
+before Verification and records planned coverage. Verification retains execution commands and manual checks.
 Objective, Background, Design, and at least one Requirement must be nonempty before submission.
 
 A plan's metadata can use this shape:

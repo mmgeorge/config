@@ -873,7 +873,7 @@ mod tests {
         let (_, rendered, _) = store.submit_document_revision("session", "specification", 1, 1).unwrap();
         let original = store.read_submitted_document("session", "specification", 1).unwrap();
         assert_eq!(serde_json::to_value(&original.design.as_ref().unwrap().document).unwrap(), metadata);
-        let headings = ["Objective:", "Usage:", "Requirements:", "Background:", "Decisions:", "Design:", "Proposed declaration changes:", "Verification:", "Tests · 1 new"];
+        let headings = ["Objective:", "Usage:", "Requirements:", "Background:", "Decisions:", "Design:", "Proposed declaration changes:", "Tests · 1 new", "Verification:"];
         let positions = headings.map(|heading| rendered.markdown.lines().position(|line| line == heading).unwrap());
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(rendered.markdown.contains("app cancel 42\nCancelled request 42"));

@@ -58,6 +58,7 @@ pub(super) fn project(
                 width,
             )?
             .block;
+            row.metadata.markdown = true;
             if row.id.0.starts_with("plan:metadata:decisions:") {
                 for decoration in &mut row.metadata.decoration {
                     if decoration.capture == "@markup.strong" {
@@ -485,22 +486,11 @@ fn rows(
     for metadata in design.document.sections() {
         let name = metadata.path;
         let section = metadata.section;
-        if section == super::PlanSection::Tests {
-            if let Some(start) = verification_start.take() {
-                fold(&mut overview, start, "plan:section:verification")?;
-            }
-            let offset = overview.len() as u32;
-            let (mut tests, mut anchors) = test_inventory(&design.document.tests)?;
-            for anchor in &mut anchors { anchor.line += offset; }
-            overview.append(&mut tests);
-            section_anchor.append(&mut anchors);
-            continue;
-        }
         if matches!(section, super::PlanSection::Usage | super::PlanSection::Decisions)
             && metadata.text.trim().is_empty() {
             continue;
         }
-        if section == super::PlanSection::AutomatedVerification {
+        if section == super::PlanSection::Tests {
             let changes_start = overview.len();
             overview.push(forge_diff::projection::header(
                 BlockId("plan:section:changes".into()),
@@ -518,6 +508,18 @@ fn rows(
                 id: BlockId("plan:section:changes:separator".into()),
                 text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
             });
+            let offset = overview.len() as u32;
+            let (mut tests, mut anchors) = test_inventory(&design.document.tests)?;
+            for anchor in &mut anchors { anchor.line += offset; }
+            overview.append(&mut tests);
+            section_anchor.append(&mut anchors);
+            overview.push(BufferBlock {
+                id: BlockId("plan:section:tests:separator".into()),
+                text: BufferText::from_rows([""])?, metadata: BlockMetadata::default(),
+            });
+            continue;
+        }
+        if section == super::PlanSection::AutomatedVerification {
             verification_start = Some(overview.len());
             overview.push(forge_diff::projection::header(
                 BlockId("plan:section:verification".into()),
@@ -793,11 +795,11 @@ fn public_blocks(
         .iter()
         .position(|block| block.id.0 == "plan:section:changes")
         .context("changes section is missing")?;
-    let mut verification = output
+    let mut tests = output
         .iter()
-        .position(|block| block.id.0 == "plan:section:verification")
-        .context("verification section is missing")?;
-    if output[changes + 1..verification]
+        .position(|block| block.id.0 == "plan:section:tests")
+        .context("tests section is missing")?;
+    if output[changes + 1..tests]
         .iter()
         .all(|block| block.id.0.starts_with("plan:annotation:") || block.text.wire_rows().iter().all(|row| row.trim().is_empty()))
     {
@@ -809,9 +811,9 @@ fn public_blocks(
             }],
             0,
         )?);
-        verification += 1;
+        tests += 1;
     }
-    let mut trailing = output.split_off(verification);
+    let mut trailing = output.split_off(tests);
     output[changes].metadata.fold.clear();
     fold(&mut output, changes, "plan:section:changes")?;
     output.append(&mut trailing);
@@ -1021,10 +1023,14 @@ mod tests {
             assert!(!rows.iter().any(|row| row.contains("= existing_case")));
             assert!(target.values().any(|anchor| anchor.json_path == "/design/document/tests/1/cases/0"));
             let tests_start = block.iter().position(|block| block.id.0 == "plan:section:tests").unwrap();
-            let verification = block.iter().find(|block| block.id.0 == "plan:section:verification").unwrap();
-            let endpoint = &verification.metadata.fold[0].end.block;
+            let verification_start = block.iter().position(|block| block.id.0 == "plan:section:verification").unwrap();
+            assert!(tests_start < verification_start);
+            let endpoint = &block[tests_start].metadata.fold[0].end.block;
+            assert!(block.iter().position(|block| &block.id == endpoint).unwrap() < verification_start);
+            assert_eq!(block[tests_start..verification_start].iter().map(|block| block.metadata.fold.len()).sum::<usize>(), 3);
+            let changes = block.iter().find(|block| block.id.0 == "plan:section:changes").unwrap();
+            let endpoint = &changes.metadata.fold[0].end.block;
             assert!(block.iter().position(|block| &block.id == endpoint).unwrap() < tests_start);
-            assert_eq!(block[tests_start..].iter().map(|block| block.metadata.fold.len()).sum::<usize>(), 3);
             forge_buffer::document::BufferDocument::new(forge_buffer::identity::DocumentId("test-inventory".into()), block).unwrap();
         }
         document.design.as_mut().unwrap().document.tests.clear();
@@ -1038,6 +1044,9 @@ mod tests {
         design.proposed.insert("lib.rs".into(), "pub struct State;\n".into());
         design.document.verification.automated = "cargo test -- --test-threads=1\nprintf '# *literal*'".into();
         design.document.verification.manual = "- Resize and confirm `State` remains visible.".into();
+        design.document.decisions.push(super::super::design_document::DesignDecision {
+            decision: "Keep state explicit.".into(), rationale: "Callers can inspect it.".into(),
+        });
         design.validation = Some(crate::declaration::DeclarationValidation {
             diagnostic: vec![crate::declaration::DeclarationDiagnostic {
                 path: "plan".into(), line: 1, column: 0, reference: String::new(), error: false,
@@ -1051,10 +1060,18 @@ mod tests {
             assert!(block.iter().flat_map(|block| block.text.wire_rows()).all(|line| !line.contains("Cargo source resolution failed") && !line.contains("dependency source is unavailable")));
             let command = block.iter().find(|block| block.id.0 == "plan:metadata:verification/automated:1").unwrap();
             assert_eq!(command.text.row(0), Some("    printf '# *literal*'"));
+            assert!(!command.metadata.markdown);
+            let decision = block.iter().find(|block| block.id.0 == "plan:metadata:decisions:0").unwrap();
+            assert_eq!(decision.text.row(0), Some("- **Keep state explicit.** Callers can inspect it."));
+            assert!(decision.metadata.markdown);
+            assert!(decision.metadata.decoration.iter().any(|style| style.capture == "ForgeStatusHeader"));
+            assert!(block.iter().filter(|block| block.id.0.starts_with("plan:metadata:verification/manual:")).all(|block| block.metadata.markdown));
+            assert!(block.iter().filter(|block| block.id.0.starts_with("plan:section:")).all(|block| !block.metadata.markdown));
             assert!(target.values().any(|anchor| anchor.json_path == "/design/document/verification/automated"));
             assert!(target.values().any(|anchor| anchor.json_path == "/design/document/verification/manual"));
             forge_buffer::document::BufferDocument::new(forge_buffer::identity::DocumentId("validation".into()), block.clone()).unwrap();
             let declaration = block.iter().find(|block| block.text.row(0) == Some("pub struct State;")).unwrap();
+            assert!(!declaration.metadata.markdown);
             assert!(declaration.metadata.target.iter().any(|range| target.contains_key(&range.id)));
         }
     }

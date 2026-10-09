@@ -221,6 +221,10 @@ function M.attach(options, callback)
       end
       if owner.comment_state and options.configure_view then options.configure_view(owner.view, owner) end
       if retained_folds then require("forge.folds").restore(owner.replica, retained_folds) retained_folds = nil end
+      local ranges = require("forge.views.plan_review.markdown").ranges(source, projection)
+      for _, window in ipairs(vim.fn.win_findbuf(options.buffer)) do
+        require("forge.render.harness.markdown").render(options.buffer, window, ranges)
+      end
     end
     owner.replica.physical_row = nil
     owner.comment_state = comments.attach(options.buffer, options.window, source_lines, annotation, {
@@ -236,7 +240,7 @@ function M.attach(options, callback)
     projection_attached = true
     show_answers(opened.annotation)
   end
-  owner.replica = buffer.open(owner.document, { buffer = options.buffer, generated = true, preserve_view = true,
+  owner.replica = buffer.open(owner.document, { buffer = options.buffer, filetype = "ForgePlan", generated = true, preserve_view = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice })
   local function open_view(window)
     local columns = require("forge.window_presentation").capture(window)
@@ -244,6 +248,10 @@ function M.attach(options, callback)
     local view = input.open(owner.replica, window, { columns = columns, virtualedit = "", conceal = { level = 3, cursor = "" },
       wrapping = { indent = columns.breakindent, options = columns.breakindentopt } })
     owner.views[window] = view
+    if owner.projection then
+      require("forge.render.harness.markdown").render(options.buffer, window,
+        require("forge.views.plan_review.markdown").ranges(owner.source, owner.projection))
+    end
     if owner.ready and alive() then
       request({ operation = "plan_view", document = owner.document, view = view.id, width = owner.source_width }, function(_, failure)
         if failure and options.notice then options.notice(failure) end

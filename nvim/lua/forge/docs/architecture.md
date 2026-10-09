@@ -2013,6 +2013,9 @@ current context through `developerInstructions` on both thread start and resume,
 resumption. Copilot appends shared instructions when creating or resuming a session and sends current
 interaction context with every message, including messages to an already-live session.
 
+Plan review places Tests after proposed declaration changes and before Verification. Each section
+retains its own fold boundary and navigation targets in both full and public-only views.
+
 `plan/prompts/planning.md` owns the virtual file procedure, metadata roles, declaration syntax,
 validation contracts, and patch examples. `PlanPrompt` embeds it in draft, feedback, revision, and
 editable discussion requests. Execution prompts retain execution ID, plan ID, accepted revision,
