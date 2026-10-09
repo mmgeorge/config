@@ -9461,7 +9461,7 @@ mod test {
             .unwrap();
         assert_eq!(
             summary.text.wire_rows().join("").split_whitespace().collect::<Vec<_>>().join(" "),
-            "▸ Thought 1s (0s tools) │ ~200 tok/s │ I 1.0k (90%) · R 100 · O 100 │ 1 req · 0 tools"
+            "▸ Thought 1s (0ms tools) │ ~200 tok/s │ I 1.0k (90%) · R 100 · O 100 │ 1 req · 0 tools"
         );
     }
 

@@ -1,4 +1,5 @@
 local M = {}
+local duration = require("forge.render.harness.duration")
 
 --- Splits text into wrapped substrings based on display column width.
 ---@param text string Content text string to wrap.
@@ -54,7 +55,7 @@ end
 --- Get observed elapsed time, retaining the terminal timestamp when available.
 ---@param tool table Tool descriptor table.
 ---@param now_ms? number Current render timestamp in milliseconds.
----@return string duration Whole seconds or an unavailable marker.
+---@return string duration Observed duration with units or an unavailable marker.
 local function tool_duration(tool, now_ms)
   if type(tool.started_at_ms) ~= "number" then return "—" end
   local finish = tool.completed_at_ms
@@ -66,7 +67,7 @@ local function tool_duration(tool, now_ms)
     if terminal[status] then return "—" end
     finish = now_ms or os.time() * 1000
   end
-  return ("%ds"):format(math.floor(math.max(0, finish - tool.started_at_ms) / 1000))
+  return duration.label(math.max(0, finish - tool.started_at_ms))
 end
 
 --- Extracts tool name and argument substrings from an MCP call signature.

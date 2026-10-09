@@ -307,6 +307,17 @@ mod test {
     }
 
     #[test]
+    fn throughput_preserves_subsecond_tool_time() {
+        let mut metrics = ExchangeMetrics::default();
+        metrics.block("tool:first".into(), true, 1000);
+        metrics.block("tool:first".into(), false, 1439);
+        metrics.record_throughput(Some(4200), 6000);
+        assert_eq!(metrics.tool_ms(6000), Some(439));
+        assert_eq!(metrics.reported_output_tokens, Some(4200));
+        assert_eq!(metrics.reported_response_ms, Some(5561));
+    }
+
+    #[test]
     fn tool_occupancy_excludes_other_waits_and_throughput_freezes_between_reports() {
         let mut metrics = ExchangeMetrics::default();
         metrics.block("tool:first".into(), true, 1000);

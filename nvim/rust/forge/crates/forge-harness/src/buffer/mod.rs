@@ -1,4 +1,5 @@
 mod changes;
+mod duration;
 mod markdown_math;
 mod layout;
 mod syntax;

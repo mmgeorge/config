@@ -2587,6 +2587,8 @@ Running, paused, and completed headers share the layout
 The outer duration includes tools, approvals, and delegated waits within active execution and
 freezes across explicit pauses. The parenthetical counts tool-only wall time, taking the union
 of overlapping calls and capping outstanding intervals at interruption or completion.
+Tool time uses milliseconds below one second and rounded tenths of a second thereafter,
+omitting a zero fractional digit. The outer duration remains whole seconds.
 
 Each distinct admitted usage report refreshes cumulative input, cache percentage, reasoning,
 non-reasoning output, and request count immediately. Turns that have not reported usage do not
@@ -2610,7 +2612,9 @@ timestamp. Tool headings show `• 2s command`, updating through the existing on
 refresh. Parallel calls measure their own observed wall-clock intervals. Repeated progress never
 resets the start, and repeated completion never extends the end. Turn completion or interruption
 settles any outstanding call at that boundary. Completed timestamps survive session reopening.
-Calls first observed at completion have unavailable duration (`—`). Subsecond calls display `0s`.
+Calls first observed at completion have unavailable duration (`—`). Subsecond calls display their measured milliseconds, such as `439ms`.
+Longer calls display rounded tenths, such as `2.5s`. These labels do not round the stored
+timestamps or throughput operands.
 These durations measure Harness lifecycle observations rather than provider CPU execution time.
 
 `/plan` uses the same `Thinking` and `Thought` interaction summaries as every model turn. A

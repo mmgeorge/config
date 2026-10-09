@@ -29,6 +29,14 @@ local ok, failure = pcall(function()
     error("exchange summary is missing")
   end
   assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1400 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
+  exchange.metrics.tool_duration_ms = 439
+  exchange.metrics.reported_response_ms = 5561
+  assert_equals(summary(), "▸ Thought 6s (439ms tools) │ ~755 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
+  exchange.metrics.tool_duration_ms = 2500
+  exchange.metrics.reported_response_ms = 3500
+  assert_equals(summary(), "▸ Thought 6s (2.5s tools) │ ~1200 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
+  exchange.metrics.tool_duration_ms = 3000
+  exchange.metrics.reported_response_ms = 3000
   exchange.duration_ms = 6500
   assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1400 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
   exchange.duration_ms = 3500

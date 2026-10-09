@@ -1,6 +1,7 @@
 local M = {}
 
 local display_text = require("forge.render.display_text")
+local duration_format = require("forge.render.harness.duration")
 
 local comment_box = require("forge.render.comment_box")
 local diff_tree = require("forge.render.diff_tree")
@@ -581,7 +582,7 @@ local function append_exchange_summary(result, interaction, options)
     if type(metrics.tool_started_ms) == "number" then
       elapsed = elapsed + math.max(0, duration_ms - metrics.tool_started_ms)
     end
-    tools = ("%ds"):format(math.floor(elapsed / 1000))
+    tools = duration_format.label(elapsed)
   end
   local verb = complete and "Thought" or "Thinking"
   if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then

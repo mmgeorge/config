@@ -8,6 +8,7 @@ use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 
 use super::markdown_math;
+use super::duration::duration_label;
 use super::tool::ToolOutputPreview;
 
 pub struct TranscriptRenderer<'profile> {
@@ -137,7 +138,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             row.extend(tool_body_rows(self.profile, arguments, true)?);
             row
         } else if expanded {
-            let duration = elapsed_ms.map(|value| format!("{}s", value / 1000)).unwrap_or_else(|| "—".into());
+            let duration = elapsed_ms.map(duration_label).unwrap_or_else(|| "—".into());
             self.profile.wrap_plain(&format!("  • {duration} {title}"), 4.min(self.profile.columns - 1))?
         } else {
             vec![tool_heading(self.profile, kind, title, elapsed_ms)?]
@@ -218,7 +219,7 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
 fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, elapsed_ms: Option<u64>) -> Result<String> {
     let title = if kind == "command" { shell_command(title) } else { title };
     let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let duration = elapsed_ms.map(|value| format!("{}s", value / 1000)).unwrap_or_else(|| "—".into());
+    let duration = elapsed_ms.map(duration_label).unwrap_or_else(|| "—".into());
     let full = format!("  • {duration} {normalized}");
     if profile.cells(&full, 0)? <= profile.columns {
         return Ok(full);
@@ -506,6 +507,28 @@ mod test {
                 }).collect::<String>();
                 assert_eq!(restored, response);
                 assert!(rows.iter().all(|row| profile.cells(row, 0).unwrap() <= columns));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tool_runtime_precision_preserves_command_decoration_in_both_views() -> Result<()> {
+        let profile = WidthProfile::default();
+        let renderer = TranscriptRenderer::new(&profile)?;
+        for (elapsed_ms, label) in [(0, "0ms"), (2, "2ms"), (439, "439ms"),
+            (999, "999ms"), (1000, "1s"), (1050, "1.1s"), (2500, "2.5s")] {
+            for expanded in [false, true] {
+                let block = renderer.tool_preview(
+                    BlockId("tool:duration".into()), TargetId("expand:duration".into()),
+                    "command", Some(elapsed_ms), false, "cargo test",
+                    &ToolOutputPreview { row: vec![], hidden_rows: 0, total_rows: 0 }, expanded,
+                )?;
+                assert_eq!(block.text.row(0), Some(format!("  • {label} cargo test").as_str()));
+                assert!(block.metadata.decoration.iter().any(|decoration| {
+                    decoration.capture == "ForgeHarnessCommand"
+                        && decoration.range.start.column == format!("  • {label} ").len()
+                }));
             }
         }
         Ok(())
