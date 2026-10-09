@@ -23,7 +23,7 @@ modify project files.
 4. Design complete declaration files and required configuration changes. Preserve unchanged declarations, private members, complete
    types, generics, visibility, documentation, and associations. Add only useful requested work.
    Give every declaration in each source overview you author or revise an attached explanatory code comment.
-   Write the task overview, reviewer-oriented design overview, and validation requirements in the separate virtual `plan.json`.
+   Record objective, requirements, background, decisions, design, verification, and tests in virtual `plan.json`. Add usage examples only when useful.
    Do not author JSON entities, flows, tasks, stages, prerequisites, or execution reports.
 5. Edit with `harness_design_apply_patch`, supplying `plan_id`, `expected_version`, and `patch`.
    An optional `title` names the design. Multiple files and chunks can change atomically. Use the
@@ -39,7 +39,7 @@ modify project files.
 ## Plan metadata
 
 Harness creates a virtual `plan.json` containing `objective`, optional `usage`, `requirements`,
-`background`, `decisions`, `design`, and `verification`. It is plan metadata, never a project file
+`background`, `decisions`, `design`, `verification`, and `tests`. It is plan metadata, never a project file
 or declaration overview. Read and update it through the same tools as declaration files. Do not
 move it, delete it, or add other fields. Drafts start with empty strings and lists, with `usage` absent.
 
@@ -49,7 +49,7 @@ Do not depend on phrases such as "as discussed" or details available only in ear
 Keep every section consistent with the final declarations and update it when review changes the plan.
 
 The review order is Objective, Usage when present, Requirements, Background, Decisions when nonempty,
-Design, proposed declaration changes, and Verification. Each section has a distinct role:
+Design, proposed declaration changes, Verification, and Tests. Each section has a distinct role:
 
 ### Objective
 
@@ -73,10 +73,38 @@ Distinguish illustrative values from exact required output.
 
 ### Requirements
 
-Write `requirements` as a JSON array of nonempty strings. Each entry states one concrete behavior
-or restriction every valid implementation must satisfy. Include relevant error, cancellation,
-recovery, compatibility, and scope boundaries. Requirements define success independently of the
-chosen implementation. Do not repeat the design or create implementation milestones.
+Write `requirements` as a JSON array of nonempty strings describing the essential outcomes and
+constraints used to accept or reject the finished change. Prefer a short, scannable list, usually
+3–6 entries for a focused task. This is guidance, not a minimum or maximum: preserve additional
+independent requirements when the scope warrants them.
+
+Keep entries at a consistent level of abstraction. Group closely related behaviors without
+combining unrelated requirements merely to reduce the count. Put implementation mechanisms and
+detailed behavioral rules in Design, consequential choices in Decisions, and individual test
+scenarios in Tests. Preserve an exact API, dependency, or mechanism here when the user explicitly
+requires it. Retain acceptance-critical error, recovery, compatibility, and scope constraints.
+
+Do not repeat agent workflow instructions or repository rules as product requirements. Do not
+promote every design choice into a mandatory requirement or create implementation milestones.
+
+Requirements describe properties of the delivered change, not instructions for the agent. Do not
+copy reminders to read AGENTS.md or skills, inspect before editing, obey permissions, preserve
+unrelated edits, use repository build conventions, or run checks before declaring completion into
+any plan section. These are already governed by the agent's instructions. Preserve task-specific
+product constraints such as compatibility, offline operation, or protecting user configuration.
+
+When following an existing rule requires concrete work, plan the resulting change instead of
+repeating the rule. Include supported file changes in the proposed files, explain task-specific
+generated artifacts or unsupported file changes in Design, and put exact verification commands
+and observable manual checks in Verification. Do not invent placeholder generated contents.
+
+When the change introduces generated files, inspect the project's existing ignore rules and
+propose any needed .gitignore addition or update as a normal virtual file change. Preserve existing
+comments, negations, and unrelated rules. Add appropriate generated paths, such as /target/ for a
+root Rust package. Do not propose an empty file merely because .gitignore is absent. Keep source
+and required lockfiles tracked. Describe generation or retention of a required lockfile in Design
+when needed, without presenting it as a product requirement or generating it in Plan. The model
+creates or updates the actual file during implementation. Do not modify workspace files in Plan.
 
 ### Background
 
@@ -86,18 +114,21 @@ owns, how the affected operation currently flows between them, and the integrati
 change. Include existing behavior that must be understood or preserved, such as persistence,
 error propagation, and platform limits. Explain the current limitation when applicable.
 
-Record facts established through inspection and explicitly identify material unknowns. Include only
-details that affect implementation. Do not give a repository tour, summarize the conversation, repeat
-the requested behavior, or describe the proposed solution. For a new project, briefly describe the
+Describe established starting conditions and explicitly identify material unresolved constraints.
+Omit discovery chronology, tool failures, and evidence-gathering details unless they leave an
+uncertainty that changes implementation or verification. Include only facts needed to understand
+or implement this change. Do not give a repository tour, summarize the conversation, repeat the
+requested behavior, or describe the proposed solution. For a new project, briefly describe the
 starting repository, available infrastructure, and relevant conventions.
 
 ### Decisions
 
 Write `decisions` as a JSON array of objects with nonempty `decision` and `rationale` strings.
-Record consequential settled choices another implementer might otherwise reconsider. Explain why
-the approach was selected and significant tradeoffs or rejected alternatives when relevant. Do not
-invent alternatives, record routine implementation details, or duplicate requirements. Use an empty
-array when no consequential decision needs a separate explanation.
+Record choices where a reasonable alternative would materially change the design, behavior, or
+implementation constraints. For each, state the choice and the task-specific reason for it. Explain
+the tradeoff or constraint that makes the choice matter. Omit routine conventions, dependency
+selections without a compatibility reason, and requirements already imposed by the user. Do not
+invent alternatives or rationale to fill the section. An empty list is valid.
 
 ### Design
 
@@ -111,6 +142,13 @@ mutable execution progress, or claims that implementation or verification has fi
 Use Markdown inline code for code identifiers, concrete paths, and commands in prose fields.
 Encode paragraph breaks as `\n\n` inside JSON strings. Each rendered metadata section is limited
 to 16 KiB. Requirements allow at most 256 entries and Decisions at most 128 entries.
+The required tests array inventories every test involved in the plan, grouped by project-relative
+file. Each cases entry names the test (module-qualified when needed), its change (new, modified,
+removed, or reused), and a description of the scenario and expected result or removal rationale.
+Include inline test modules and separate test files consistently. List existing coverage being
+reused, omit unrelated repository tests, and use [] when no tests apply. Keep names unique within
+a file and list each file once. At most 256 files and 1024 cases are allowed. Tests is rendered
+last and records planned coverage. Verification retains execution commands and manual checks.
 Objective, Background, Design, and at least one Requirement must be nonempty before submission.
 
 A plan's metadata can use this shape:
@@ -134,7 +172,24 @@ A plan's metadata can use this shape:
   "verification": {
     "automated": "cargo test --release texture_replacement",
     "manual": "- Cancel a pending replacement and confirm the current texture remains visible.\n- Replace a texture with frames in flight and confirm rendering remains valid."
-  }
+  },
+  "tests": [
+    {
+      "file": "src/texture.rs",
+      "cases": [
+        {
+          "name": "tests::texture_replacement_cancellation_preserves_published_handle",
+          "change": "new",
+          "description": "Cancel before publication and verify the original texture handle remains published."
+        },
+        {
+          "name": "tests::texture_replacement_retains_in_flight_allocation",
+          "change": "new",
+          "description": "Replace a texture with frames in flight and verify its allocation remains valid until their completion."
+        }
+      ]
+    }
+  ]
 }
 ```
 
@@ -174,7 +229,7 @@ Harness-owned and must not be added to `plan.json`.
 
 Paths match project-relative source paths. Supported extensions are `.rs`, `.ts`, `.tsx`, `.lua`, and
 `.toml`, `.json`, `.jsonc`, `.yaml`, `.yml`, and XML configuration paths (including `.xml`,
-`.csproj`, `.fsproj`, `.vbproj`, `.props`, `.targets`, `.resx`, and `.plist`). Source overviews retain native layouts but are not compilable implementation files. Never write
+`.csproj`, `.fsproj`, `.vbproj`, `.props`, `.targets`, `.resx`, and `.plist`), plus `.gitignore` files whose contents are preserved verbatim. Source overviews retain native layouts but are not compilable implementation files. Never write
 executable function bodies, empty or placeholder bodies, pseudocode, or executable initializers. Preserve
 reference qualifiers, generic arguments, and complete return types. Do not infer missing types.
 
@@ -238,9 +293,8 @@ Start newly added or edited comments with `Get` instead of `Returns`. Submission
 whose first word is `Returns`, ignoring case. The rule applies only to the start of the complete
 comment, not later sentences or continuation lines. Unchanged captured comments remain valid.
 
-Read and follow the repository's code-comment instructions before drafting these comments.
-When the technical-writing skill is available, read its Code Comments profile and use its API
-Documentation profile for declaration contracts. This planning requirement makes declaration
+Follow the repository's code-comment instructions and, when available, the technical-writing
+skill's Code Comments and API Documentation profiles. Reuse instructions already loaded in context. This planning requirement makes declaration
 comments mandatory even when general source-comment guidance permits omission.
 
 Explain the declaration's role, ownership boundary, or behavioral contract. For fields and
@@ -267,7 +321,7 @@ pub struct TextureRegistry {
 
 /// Exposes the published texture and the frame-boundary replacement operation.
 impl TextureRegistry {
-  /// Returns the published handle without changing the active texture version.
+  /// Get the published handle without changing the active texture version.
   pub fn current(&self) -> Option<TextureHandle>;
 
   /// Installs a completed upload at a frame boundary and retains the previous allocation until its final GPU use.
@@ -311,7 +365,7 @@ Do not add function-closing `end` to signature-only headers:
 ---Exposes access to the currently published texture handles.
 local M
 
----Returns the published handle for the requested texture.
+---Get the published handle for the requested texture.
 ---@param id string
 ---@return TextureHandle
 function M.get(id)
@@ -321,7 +375,7 @@ return M
 
 ## Manifests and configuration
 
-JSON, JSONC, TOML, YAML, and XML files retain their complete contents, including values, comments
+JSON, JSONC, TOML, YAML, XML, and .gitignore files retain their complete contents, including values, comments
 where allowed, arrays, attributes, and nested structures. These are editable configuration proposals
 rather than abbreviated declarations. Include every affected manifest and configuration file when
 changing dependencies, features, scripts, package settings, workspace members, or build targets.
@@ -383,9 +437,12 @@ numbers. Other rows use proposed line numbers. Comments follow each excerpt as `
 input. Resolve each comment against the saved design and preserve its intended context.
 Read current proposed files before revising them. Preserve useful decisions and submit the new version.
 
-Other configuration formats, project documentation, implementation bodies, dependency graphs,
-and task execution are outside this MVP. If only function behavior changes, describe the behavior change in `plan.json` and explain why it needs no declaration changes and submit the unchanged declaration proposal. Never manufacture interface changes
-to make a diff appear. Validation checks declaration syntax, not unwritten implementation behavior.
+Unsupported file formats cannot be edited through declaration controls. Describe required changes
+to those files in Design, without inventing a supported-file substitute. Planning never writes
+implementation bodies or performs execution. For a function behavior change, retain the signature
+when it remains valid and add or update its Change summary in the virtual declaration. Explain the
+behavior in Design and include its coverage in Tests. Never manufacture an interface change to make
+a diff appear. Declaration conformance does not prove runtime behavior.
 
 If affected workspace source changed since extraction, report the need for a fresh baseline.
 Do not silently replace the baseline or modify project source.

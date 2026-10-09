@@ -555,8 +555,8 @@ impl Backend for CopilotBackend {
             }
         };
         let prompt = format!(
-            "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_question_ask with the complete question set. While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains. The question tools work outside planning. Do not claim control actions through prose.\n\n{}",
-            provider_text
+            "{}\n\n{}",
+            request.interaction_contract(), provider_text
         );
         self.trace.record(&request.harness_session_id, "copilot.session.send", json!({"session_id":session.id().to_string(),"prompt":prompt}));
         session

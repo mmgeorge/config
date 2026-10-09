@@ -23,6 +23,8 @@ pub struct DesignDocument {
     pub design: String,
     /// Records the checks required before execution can complete.
     pub verification: DesignVerification,
+    /// Inventories changed and reused tests by file, independently of source language.
+    pub tests: Vec<super::design_tests::DesignTestFile>,
 }
 
 impl DesignDocument {
@@ -68,14 +70,14 @@ impl DesignDocument {
                     .enumerate()
                     .map(|(index, decision)| {
                         format!(
-                            "{}. {}\n\n   {}",
+                            "{}. **{}**\n   {}",
                             index + 1,
-                            decision.decision.replace('\n', "\n   "),
+                            decision.decision.split_whitespace().collect::<Vec<_>>().join(" "),
                             decision.rationale.replace('\n', "\n   ")
                         )
                     })
                     .collect::<Vec<_>>()
-                    .join("\n\n"),
+                    .join("\n"),
             },
             DesignSection {
                 path: "design",
@@ -95,11 +97,18 @@ impl DesignDocument {
                 section: PlanSection::ManualVerification,
                 text: self.verification.manual.clone(),
             },
+            DesignSection {
+                path: "tests",
+                title: "Tests",
+                section: PlanSection::Tests,
+                text: super::design_tests::text(&self.tests),
+            },
         ]
     }
 
     /// Rejects malformed or oversized metadata while allowing incomplete drafts.
     pub(crate) fn validate(&self) -> Result<()> {
+        super::design_tests::validate(&self.tests)?;
         ensure!(
             self.requirements.len() <= 256,
             "plan requirements exceeds 256 entries"

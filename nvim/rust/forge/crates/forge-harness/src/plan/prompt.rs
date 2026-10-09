@@ -17,7 +17,7 @@ impl PlanPrompt {
     /// Build a decision-complete planning request for one user objective.
     pub fn draft(request: &str) -> String {
         format!(
-            r#"You are planning a software change in the Harness Plan task. The retained execution authorization governs every command and file operation. Planning may inspect source but must not modify project files.
+            r#"You are planning a software change in the Harness Plan task. The effective permission for this turn governs repository access. Planning may inspect source but must not modify project files.
 
 {PLANNING_CONTRACT}
 
@@ -29,7 +29,7 @@ User request:
     /// Continue one paused planning conversation with the user's selected feedback.
     pub fn feedback(request: &str, answer: &str) -> String {
         format!(
-            r#"Continue the existing the Harness Plan task conversation. The Harness already recorded and consumed the user's answers below. Do not call harness_question_answer or harness_question_withdraw for them. Incorporate the answers through harness_design_apply_patch edits. If another material product decision remains, call harness_question_ask and end the turn. Otherwise call harness_plan_submit with the exact canonical plan ID and version.
+            r#"Continue the existing Harness Plan task. The Harness already recorded and consumed the user's answers below. Do not call harness_question_answer or harness_question_withdraw for them. Incorporate the answers through harness_design_apply_patch edits. Resolve any remaining material decision under the user's question preferences, then call harness_plan_submit with the exact canonical plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -60,7 +60,7 @@ Original request:
             .filter(|value| !value.trim().is_empty())
             .unwrap_or("None");
         format!(
-            r#"Revise the saved canonical plan in the Harness Plan task. Resolve every annotation and overall comment with harness_design_apply_patch edits, then call harness_plan_submit with the exact resulting plan ID and version.
+            r#"Revise the saved canonical plan in the Harness Plan task. Address every annotation and overall comment. Apply requested design changes with harness_design_apply_patch. Explain when a comment needs no edit or conflicts with another requirement. Do not invent an edit merely to close a comment. Then call harness_plan_submit with the exact resulting plan ID and version.
 
 {PLANNING_CONTRACT}
 
@@ -82,6 +82,24 @@ Review comments:
         format!("Active declaration design:\n```json\n{document_json}\n```\n\n{prompt}")
     }
 
+    /// Restore execution identity and phase without replaying completed work after interruption.
+    pub(crate) fn execution(
+        execution: &super::execution::PlanExecutionRecord,
+        kind: PlanExecutionPromptKind,
+        document_json: &str,
+    ) -> String {
+        let continuation = match kind {
+            PlanExecutionPromptKind::Start => "Start the Execute task for this accepted plan. Inspect the current workspace before implementation.",
+            PlanExecutionPromptKind::Continue => "Continue the same Execute task at the persisted phase below. Reuse confirmed work and check whether existing evidence still applies.",
+            PlanExecutionPromptKind::ResumeAfterInterruption => "Resume the same Execute task after interruption. Preserve its plan, accepted revision, and phase. Inspect current files, completed tool results, and any background commands before retrying unfinished work. Do not assume interruption rolled back changes or stopped a command.",
+        };
+        format!(
+            "{continuation}\nExecution ID: {}\nPlan ID: {}\n{}\nUnresolved findings: {}\nAccepted semantic design:\n{}",
+            execution.id, execution.plan_id, execution.instructions(),
+            execution.findings.join("\n"), document_json
+        )
+    }
+
     /// Keep review discussion read-only until the user requests a canonical plan revision.
     pub fn discussion(prompt: &str) -> String {
         format!(
@@ -89,8 +107,8 @@ Review comments:
 Answer questions without editing or resubmitting the plan. When the user requests changes, \
 revise the existing plan through harness_design_apply_patch, then submit the resulting plan ID and version \
 through harness_plan_submit. A successful edit starts a revision of the same plan. \
-Ask for clarification when the requested change is unclear. Resolve pending questions before editing. \
-Do not implement the plan or modify project files.\n\n{prompt}"
+Resolve material uncertainty under the user's question preferences. Resolve pending questions before editing. \
+Do not implement the plan or modify project files. The authoring procedure below applies only when the user requests a revision. For discussion alone, answer without editing or submitting.\n\n{PLANNING_CONTRACT}\n\nUser request:\n{prompt}"
         )
     }
 }
@@ -101,7 +119,7 @@ fn mutable_elicitation_prompt(
     question: &str,
 ) -> String {
     let workflow_boundary = if planning_request.is_some() {
-        "Do not continue or submit the plan during this turn."
+        "Remain in the Harness Plan task. Do not continue or submit the plan during this turn."
     } else {
         "Do not continue the original request during this turn."
     };
@@ -111,7 +129,7 @@ fn mutable_elicitation_prompt(
     format!(
         r#"The user is responding while a Harness question set remains pending. Treat the pending elicitation as mutable decision state, not as a modal lock.
 
-Remain in the Harness Plan task. The retained execution authorization governs repository access. Answer the user's follow-up directly, using repository evidence when relevant. {workflow_boundary}
+The effective permission for this turn governs repository access. Answer the user's follow-up directly, using repository evidence when relevant. {workflow_boundary}
 
 After answering, choose exactly one outcome:
 
@@ -224,6 +242,7 @@ mod test {
         let prompt = PlanPrompt::question_follow_up("{\"question\":\"Format?\"}", "Use JSON");
         assert!(prompt.contains("Do not continue the original request"));
         assert!(!prompt.contains("Original planning request"));
+        assert!(!prompt.contains("Harness Plan task"));
         assert!(prompt.contains("harness_question_answer"));
     }
 

@@ -3125,7 +3125,7 @@ impl HarnessBroker {
         )?;
         self.store.save_exchange(&interaction)?;
         let prompt = format!(
-            "The user answered the pending Harness questions. Continue the original request using these responses.\n\n{feedback}"
+            "The user answered the pending Harness questions. Harness already recorded these answers and resolved the question set. Do not call harness_question_answer or harness_question_withdraw for it. Continue the original request using these responses and the current task context.\n\n{feedback}"
         );
         let (value, mut event) = if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some()
             && interaction.plan_id.is_some() {
@@ -3292,7 +3292,7 @@ impl HarnessBroker {
                 "Continue the active planning task. The previous provider turn ended without a \
 terminal planning action. Edit the proposed declaration files if needed, then call \
 harness_plan_submit. Ask only a genuinely new unresolved question with \
-harness_question_ask. Do not repeat resolved questions or return prose.\n\n\
+harness_question_ask when the user's question preferences allow it. Do not repeat resolved questions. Prose alone does not submit a plan. Report persistent control failures clearly instead of retrying unchanged rejected requests.\n\n\
 Planning continuation: turn {} of {}.",
                 plan.generation.budget.turn_count + 1,
                 plan.generation.budget.max_turn_count
@@ -5354,7 +5354,7 @@ Planning continuation: turn {} of {}.",
             &mut pre_execution_event,
         )
         .await?;
-        let execution_prompt = format!("{}\nAccepted semantic design:\n{}", execution_record.instructions(), accepted_document.model_json()?);
+        let execution_prompt = PlanPrompt::execution(&execution_record, PlanExecutionPromptKind::Start, &accepted_document.model_json()?);
         let mut admission = ExchangeAdmission::execution(
             format!("Accept plan: {}", plan.request), plan.id.clone(),
             execution_record.id.clone(), goal.id.clone());

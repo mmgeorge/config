@@ -587,7 +587,7 @@ pub struct PlanTask {
 }
 
 pub const PROVISIONAL_PLAN_TITLE: &str = "Planning in progress";
-pub const PLAN_SCHEMA_VERSION: u32 = 7;
+pub const PLAN_SCHEMA_VERSION: u32 = 8;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -1124,6 +1124,6 @@ mod test {
         let mut document = test_fixture("plan", "Version plans.");
         document.schema_version = PLAN_SCHEMA_VERSION + 1;
         let unsupported = document.validate().unwrap_err().to_string();
-        assert!(unsupported.contains("supported PlanDocument schema version 7"));
+        assert!(unsupported.contains(&format!("supported PlanDocument schema version {PLAN_SCHEMA_VERSION}")));
     }
 }

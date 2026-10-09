@@ -596,13 +596,13 @@ impl SqliteStore {
 
     /// Load a plan by stable Harness identifier.
     pub fn load_plan(&self, plan_id: &str) -> Result<Option<PlanRecord>> {
-        self.load_payload("SELECT payload FROM plan_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=7", [plan_id])
+        self.load_payload("SELECT payload FROM plan_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=8", [plan_id])
     }
 
     /// Load every plan artifact for one session in creation order.
     pub fn list_plan(&self, session_id: &str) -> Result<Vec<PlanRecord>> {
         self.list_payload(
-            "SELECT payload FROM plan_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=7 ORDER BY rowid",
+            "SELECT payload FROM plan_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=8 ORDER BY rowid",
             [session_id],
         )
     }
@@ -627,7 +627,7 @@ impl SqliteStore {
     /// Load plan lifecycle events in their insertion order.
     pub fn list_plan_lifecycle(&self, session_id: &str) -> Result<Vec<PlanLifecycleRecord>> {
         self.list_payload(
-            "SELECT payload FROM plan_lifecycle_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=7 ORDER BY rowid",
+            "SELECT payload FROM plan_lifecycle_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=8 ORDER BY rowid",
             [session_id],
         )
     }
@@ -667,7 +667,7 @@ impl SqliteStore {
     /// Load one accepted-plan execution by stable identifier.
     pub fn load_plan_execution(&self, execution_id: &str) -> Result<Option<PlanExecutionRecord>> {
         self.load_payload(
-            "SELECT payload FROM plan_execution_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=7",
+            "SELECT payload FROM plan_execution_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=8",
             [execution_id],
         )
     }
@@ -675,7 +675,7 @@ impl SqliteStore {
     /// Load every accepted-plan execution for one session.
     pub fn list_plan_execution(&self, session_id: &str) -> Result<Vec<PlanExecutionRecord>> {
         self.list_payload(
-            "SELECT payload FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=7 ORDER BY rowid",
+            "SELECT payload FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=8 ORDER BY rowid",
             [session_id],
         )
     }
@@ -697,7 +697,7 @@ impl SqliteStore {
     /// Load every plan deviation for one session in chronological order.
     pub fn list_plan_deviation(&self, session_id: &str) -> Result<Vec<crate::plan::PlanDeviation>> {
         self.list_payload(
-            "SELECT payload FROM plan_deviation_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=7 ORDER BY rowid",
+            "SELECT payload FROM plan_deviation_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=8 ORDER BY rowid",
             [session_id],
         )
     }
@@ -714,7 +714,7 @@ impl SqliteStore {
     /// Load every plan audit for one session in chronological order.
     pub fn list_plan_audit(&self, session_id: &str) -> Result<Vec<crate::plan::PlanAudit>> {
         self.list_payload(
-            "SELECT payload FROM plan_audit_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=7 ORDER BY rowid",
+            "SELECT payload FROM plan_audit_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=8 ORDER BY rowid",
             [session_id],
         )
     }
@@ -738,7 +738,7 @@ impl SqliteStore {
         session_id: &str,
     ) -> Result<Vec<crate::plan::PlanResolutionRecord>> {
         self.list_payload(
-            "SELECT payload FROM plan_resolution_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=7 ORDER BY rowid",
+            "SELECT payload FROM plan_resolution_record WHERE session_id=?1 AND json_extract(payload, '$.schema_version')=8 ORDER BY rowid",
             [session_id],
         )
     }
@@ -1001,7 +1001,7 @@ fn discard_incompatible_plan_state(
 ) -> Result<()> {
     if let Some(plan_id) = session.active_plan_id.as_ref() {
         let supported: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM plan_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=7)",
+            "SELECT EXISTS(SELECT 1 FROM plan_record WHERE id=?1 AND json_extract(payload, '$.schema_version')=8)",
             [plan_id], |row| row.get(0))?;
         if !supported {
             session.active_plan_id = None;
@@ -1010,7 +1010,7 @@ fn discard_incompatible_plan_state(
 
     if let Some(goal_id) = session.goal_id.as_ref() {
         let incompatible: bool = connection.query_row(
-            "SELECT EXISTS(SELECT 1 FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload, '$.goal_id')=?2 AND coalesce(json_extract(payload, '$.schema_version'),0)<>7)",
+            "SELECT EXISTS(SELECT 1 FROM plan_execution_record WHERE session_id=?1 AND json_extract(payload, '$.goal_id')=?2 AND coalesce(json_extract(payload, '$.schema_version'),0)<>8)",
             params![session.id, goal_id], |row| row.get(0))?;
         if incompatible {
             session.goal_id = None;

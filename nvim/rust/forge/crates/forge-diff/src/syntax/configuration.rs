@@ -15,6 +15,8 @@ pub enum ConfigurationFormat {
     Yaml,
     /// Well-formed XML documents and project manifests.
     Xml,
+    /// Git ignore patterns retained verbatim, including comments, escapes, and negation.
+    Gitignore,
 }
 
 impl ConfigurationFormat {
@@ -23,10 +25,11 @@ impl ConfigurationFormat {
         jsonc_parser::parse_to_serde_value::<serde_json::Value>(text, &jsonc_parser::ParseOptions::default())
             .map_err(|error| SyntaxError::Query(error.to_string()))
     }
-    /// Select a configuration format by extension and established JSONC filenames.
+    /// Select a configuration format by extension or recognized configuration filename.
     pub fn for_path(path: &str) -> Option<Self> {
         let normalized = path.replace('\\', "/").to_ascii_lowercase();
         let name = normalized.rsplit('/').next()?;
+        if name == ".gitignore" { return Some(Self::Gitignore); }
         let extension = name.rsplit_once('.')?.1;
         match extension {
             "json"
@@ -57,6 +60,7 @@ impl ConfigurationFormat {
             Self::Toml => "toml",
             Self::Yaml => "yaml",
             Self::Xml => "xml",
+            Self::Gitignore => "gitignore",
         }
     }
 
@@ -69,6 +73,9 @@ impl ConfigurationFormat {
             ))
         };
         match self {
+            Self::Gitignore => {
+                if text.contains('\0') { return Err(invalid("NUL is not allowed".into())); }
+            }
             Self::Json => {
                 serde_json::from_str::<serde_json::Value>(text)
                     .map_err(|error| invalid(error.to_string()))?;
@@ -130,6 +137,8 @@ mod tests {
     #[test]
     fn configuration_preserves_values_layout_visibility_and_navigation() {
         for (path, text) in [
+            (".gitignore", "# Build output\r\n/target/\r\n!Cargo.lock\r\n\\#literal\r\ncache\\ \r\n"),
+            ("nested/.gitignore", "*.tmp\n!keep.tmp\n"),
             (
                 "package.json",
                 "{\r\n  \"scripts\": {\"start\": \"node server.js\"}\r\n}\r\n",
@@ -182,6 +191,7 @@ mod tests {
     #[test]
     fn malformed_configuration_and_wrong_json_dialect_are_rejected() {
         for (path, text) in [
+            (".gitignore", "target\0/"),
             ("package.json", "{\"name\": \"app\",}"),
             ("package.json", "// Comment\n{}"),
             ("package.json", "{} {}"),

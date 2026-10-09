@@ -5,6 +5,7 @@ pub mod codex;
 pub mod copilot;
 pub mod events;
 mod execution;
+mod prompt;
 mod steering;
 mod service_tier;
 pub use service_tier::ServiceTier;
@@ -729,7 +730,7 @@ impl Backend for MockBackend {
                 } else { format!("*** Begin Patch\n*** Add File: {path}\n+pub fn requested_change();\n*** End Patch") };
                 let mut patch = patch;
                 let mut configuration = design.proposed.clone();
-                for path in ["Cargo.toml", "package.json", "tsconfig.json", "ci.yaml", "App.csproj"] {
+                for path in ["Cargo.toml", "package.json", "tsconfig.json", "ci.yaml", "App.csproj", ".gitignore"] {
                     if !configuration.contains_key(path) && !design.baseline.contains_key(path)
                         && std::path::Path::new(&request.workspace).join(path).is_file()
                     {

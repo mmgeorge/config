@@ -58,6 +58,13 @@ pub(super) fn project(
                 width,
             )?
             .block;
+            if row.id.0.starts_with("plan:metadata:decisions:") {
+                for decoration in &mut row.metadata.decoration {
+                    if decoration.capture == "@markup.strong" {
+                        decoration.capture = "ForgeStatusHeader".into();
+                    }
+                }
+            }
         }
         let context = contextual.contains(&row.id);
         if context { omitted += 1; }
@@ -478,6 +485,17 @@ fn rows(
     for metadata in design.document.sections() {
         let name = metadata.path;
         let section = metadata.section;
+        if section == super::PlanSection::Tests {
+            if let Some(start) = verification_start.take() {
+                fold(&mut overview, start, "plan:section:verification")?;
+            }
+            let offset = overview.len() as u32;
+            let (mut tests, mut anchors) = test_inventory(&design.document.tests)?;
+            for anchor in &mut anchors { anchor.line += offset; }
+            overview.append(&mut tests);
+            section_anchor.append(&mut anchors);
+            continue;
+        }
         if matches!(section, super::PlanSection::Usage | super::PlanSection::Decisions)
             && metadata.text.trim().is_empty() {
             continue;
@@ -546,6 +564,55 @@ fn rows(
     navigation.anchor.sort_by_key(|anchor| anchor.line);
     ensure!(block.len() <= 65536, "declaration diff exceeds 65536 rows");
     Ok((block, navigation, hidden, contextual_block))
+}
+
+fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
+    let mut block = vec![forge_diff::projection::header(
+        BlockId("plan:section:tests".into()),
+        vec![TextChunk { text: format!("Tests · {}", super::design_tests::summary(files)), capture: "ForgeStatusHeader".into() }], 0,
+    )?];
+    let mut anchors = vec![PlanNavigationAnchor {
+        line: 1, target: PlanReviewTarget::Section { section: super::PlanSection::Tests },
+        json_path: "/design/document/tests".into(), path: None, label: "Tests".into(),
+    }];
+    for (file_index, file) in files.iter().enumerate() {
+        let start = block.len();
+        let id = format!("plan:tests:file:{}", super::digest(file.file.as_bytes()));
+        block.push(forge_diff::projection::header(
+            BlockId(id.clone()),
+            vec![TextChunk { text: format!("  {}", file.file), capture: "ForgeStatusHeader".into() }], 0,
+        )?);
+        anchors.push(PlanNavigationAnchor {
+            line: block.len() as u32, target: PlanReviewTarget::Section { section: super::PlanSection::Tests },
+            json_path: format!("/design/document/tests/{file_index}"), path: Some(file.file.clone()), label: file.file.clone(),
+        });
+        for (case_index, case) in file.cases.iter().enumerate() {
+            let case_start = block.len();
+            let case_id = format!("{id}:{}", super::digest(case.name.as_bytes()));
+            let (marker, capture) = case.change.presentation();
+            block.push(forge_diff::projection::header(
+                BlockId(case_id.clone()),
+                vec![TextChunk { text: format!("    {marker}"), capture: capture.into() },
+                    TextChunk { text: case.name.clone(), capture: "Normal".into() }], 0,
+            )?);
+            for (line_index, line) in case.description.lines().enumerate() {
+                block.push(BufferBlock {
+                    id: BlockId(format!("{case_id}:description:{line_index}")),
+                    text: BufferText::from_rows([format!("      {line}")])?, metadata: BlockMetadata::default(),
+                });
+            }
+            for line in case_start + 1..=block.len() {
+                anchors.push(PlanNavigationAnchor {
+                    line: line as u32, target: PlanReviewTarget::Section { section: super::PlanSection::Tests },
+                    json_path: format!("/design/document/tests/{file_index}/cases/{case_index}"),
+                    path: Some(file.file.clone()), label: format!("{}: {}", file.file, case.name),
+                });
+            }
+        }
+        fold(&mut block, start, &id)?;
+    }
+    fold(&mut block, 0, "plan:section:tests")?;
+    Ok((block, anchors))
 }
 
 fn declaration_folds(
@@ -928,6 +995,40 @@ mod tests {
             }
         }
         assert_eq!(document, original);
+    }
+
+    #[test]
+    fn test_inventory_preserves_file_folds_targets_and_change_markers() {
+        let mut document = crate::plan::document::test_fixture("tests", "Tests");
+        let mut design = super::super::DeclarationDesign::default();
+        design.document.tests = serde_json::from_value(serde_json::json!([
+            {"file":"src/tool.rs", "cases":[
+                {"name":"tests::new_case", "change":"new", "description":"A long scenario retains its full expected result when the review window becomes narrow."},
+                {"name":"tests::changed_case", "change":"modified", "description":"Updated expectation."},
+                {"name":"tests::old_case", "change":"removed", "description":"The supported behavior was removed."}]},
+            {"file":"tests/runtime.rs", "cases":[
+                {"name":"existing_case", "change":"reused", "description":"Existing coverage remains applicable."}]}
+        ])).unwrap();
+        document.design = Some(design);
+        for public_only in [false, true] {
+            let width = WidthProfile { columns: 40, ..Default::default() };
+            let (block, target) = project(&document, &width, &[], &HashMap::new(), None, &HashMap::new(), public_only, None, &HashSet::new()).unwrap();
+            let rows = block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>();
+            assert!(rows.contains(&"Tests · 1 new · 1 modified · 1 removed · 1 reused"));
+            for expected in ["    + tests::new_case", "    ~ tests::changed_case", "    − tests::old_case", "    existing_case"] {
+                assert!(rows.contains(&expected));
+            }
+            assert!(!rows.iter().any(|row| row.contains("= existing_case")));
+            assert!(target.values().any(|anchor| anchor.json_path == "/design/document/tests/1/cases/0"));
+            let tests_start = block.iter().position(|block| block.id.0 == "plan:section:tests").unwrap();
+            let verification = block.iter().find(|block| block.id.0 == "plan:section:verification").unwrap();
+            let endpoint = &verification.metadata.fold[0].end.block;
+            assert!(block.iter().position(|block| &block.id == endpoint).unwrap() < tests_start);
+            assert_eq!(block[tests_start..].iter().map(|block| block.metadata.fold.len()).sum::<usize>(), 3);
+            forge_buffer::document::BufferDocument::new(forge_buffer::identity::DocumentId("test-inventory".into()), block).unwrap();
+        }
+        document.design.as_mut().unwrap().document.tests.clear();
+        assert!(render(&document).unwrap().markdown.contains("Tests · None planned"));
     }
 
     #[test]

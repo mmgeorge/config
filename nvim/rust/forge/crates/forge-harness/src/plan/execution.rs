@@ -412,17 +412,17 @@ impl PlanExecutionRecord {
         }
         let work = match self.phase {
             PlanPhase::Implement => {
-                "Implement the entire accepted semantic design in your chosen order."
+                "Implement the entire accepted semantic design in your chosen order, including the new, modified, and removed tests listed in plan.json tests. Preserve reused tests. Keep the inventory synchronized through a plan revision if test names, locations, or intended coverage change."
             }
             PlanPhase::Resolve => {
                 "Correct the recorded findings while matching the accepted design."
             }
             PlanPhase::Verify => {
-                "Read plan.json with harness_plan_read and verify its verification requirements. Run each nonblank line of verification.automated as a separate command in the project workspace, in listed order, using normal execution tools and permissions. Perform every verification.manual check and record the observed result. Report blocked when a required check cannot be performed, including checks requiring user action. Do not claim passed with outstanding checks. After running checks, call harness_plan_read with only plan_id to retrieve execution.verification_evidence. Use its exact tool IDs in verification.evidence, not command descriptions or output text. Select affected checks to rerun and justify any reused evidence. Report passed, failed, or blocked with evidence and concrete findings."
+                "Read plan.json with harness_plan_read and verify its verification requirements and tests inventory. Confirm each new, modified, or reused test is covered by the executed checks, and confirm removed tests were intentionally removed. Do not treat a listed test as evidence that it ran. Run each nonblank line of verification.automated as a separate command in the project workspace, in listed order, using normal execution tools and permissions. Perform every verification.manual check and record the observed result. Report blocked when a required check cannot be performed, including checks requiring user action. Do not claim passed with outstanding checks. After running checks, call harness_plan_read with only plan_id to retrieve execution.verification_evidence. Use its exact tool IDs in verification.evidence, not command descriptions or output text. Select affected checks to rerun and justify any reused evidence. Report passed, failed, or blocked with evidence and concrete findings."
             }
         };
         format!(
-            "{work} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done when this phase is finished. Ending a turn does not end the phase. Prefer matching the plan. If a design change is necessary, use harness_design_apply_patch and harness_plan_submit with a revision reason. Do not call harness_goal_complete for this execution.",
+            "{work} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Prefer matching the plan. If a design change is necessary, use harness_design_apply_patch and harness_plan_submit with a revision reason, then end the turn after success and await Harness continuation. Do not call harness_goal_complete for this execution.",
             self.phase, self.revision
         )
     }
@@ -524,6 +524,32 @@ mod tests {
             observed_check: BTreeSet::new(),
             created_at_ms: 0,
             completed_at_ms: None,
+        }
+    }
+
+    #[test]
+    fn continuation_prompts_retain_the_persisted_execution_phase_and_revision() {
+        use crate::plan::{PlanExecutionPromptKind, PlanPrompt};
+        let mut record = execution();
+        record.revision = 3;
+        record.findings.push("Reset still retains score".into());
+        for phase in [PlanPhase::Implement, PlanPhase::Verify, PlanPhase::Resolve] {
+            record.phase = phase;
+            for (kind, prefix) in [
+                (PlanExecutionPromptKind::Start, "Start the Execute task"),
+                (PlanExecutionPromptKind::Continue, "Continue the same Execute task"),
+                (PlanExecutionPromptKind::ResumeAfterInterruption, "Resume the same Execute task after interruption"),
+            ] {
+                let prompt = PlanPrompt::execution(&record, kind, "accepted document");
+                assert!(prompt.starts_with(prefix));
+                assert!(prompt.contains("Execution ID: execution\nPlan ID: plan"));
+                assert!(prompt.contains(&format!("Phase: {phase:?}. Accepted revision: 3.")));
+                assert!(prompt.contains("Reset still retains score"));
+                assert!(prompt.ends_with("accepted document"));
+                if kind == PlanExecutionPromptKind::ResumeAfterInterruption {
+                    assert!(prompt.contains("Do not assume interruption rolled back changes or stopped a command"));
+                }
+            }
         }
     }
 

@@ -498,7 +498,7 @@ fn validate_path(path: &str) -> Result<()> {
     validate_relative_path(path)?;
     ensure!(
         DeclarationOverview::supports(path),
-        "unsupported declaration path: {path}. Supported files are .rs, .ts, .tsx, .lua, JSON/JSONC, TOML, YAML, and XML configuration."
+        "unsupported declaration path: {path}. Supported files are .rs, .ts, .tsx, .lua, JSON/JSONC, TOML, YAML, XML, and .gitignore configuration."
     );
     Ok(())
 }
@@ -522,7 +522,8 @@ pub(crate) fn workspace_source(workspace: &Path, path: &str) -> Result<Option<St
     Ok(Some(source))
 }
 
-fn validate_relative_path(path: &str) -> Result<()> {
+/// Rejects absolute and escaping paths before accessing project-relative plan data.
+pub(super) fn validate_relative_path(path: &str) -> Result<()> {
     ensure!(
         !path.is_empty()
             && !path.contains(['\\', ':', '\n', '\r', '\0'])
@@ -763,6 +764,28 @@ mod tests {
     }
 
     #[test]
+    fn ignore_file_proposals_preserve_rules_without_modifying_the_workspace() {
+        let workspace = tempfile::tempdir().unwrap();
+        let empty = DeclarationDesign::default();
+        let added = empty.patch(workspace.path(), &Default::default(),
+            "*** Begin Patch\n*** Add File: .gitignore\n+# Build output\n+/target/\n+!Cargo.lock\n*** End Patch").unwrap();
+        assert_eq!(added.read(Some(".gitignore"), false).unwrap()["text"], "# Build output\n/target/\n!Cargo.lock\n");
+        assert!(!workspace.path().join(".gitignore").exists());
+
+        let existing = "# Keep local exceptions\n*.log\n!important.log\n";
+        std::fs::write(workspace.path().join(".gitignore"), existing).unwrap();
+        let updated = empty.patch(workspace.path(), &Default::default(),
+            "*** Begin Patch\n*** Update File: .gitignore\n@@\n !important.log\n+/target/\n*** End Patch").unwrap();
+        assert_eq!(updated.baseline[".gitignore"].text, existing);
+        assert_eq!(updated.proposed[".gitignore"], format!("{existing}/target/\n"));
+        assert_eq!(updated.formatted().unwrap().proposed, updated.proposed);
+        let mut document = crate::plan::document::test_fixture("ignore", "Ignore outputs");
+        document.design = Some(updated);
+        assert!(crate::plan::render_plan_at(&document, workspace.path()).unwrap().markdown.contains("/target/"));
+        assert_eq!(std::fs::read_to_string(workspace.path().join(".gitignore")).unwrap(), existing);
+    }
+
+    #[test]
     fn validation_requirements_survive_submission_and_revision_without_running_commands() {
         let workspace = tempfile::tempdir().unwrap();
         let store = crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
@@ -833,7 +856,8 @@ mod tests {
             "background": "`src/request.rs` owns pending uploads. Publication currently happens immediately.",
             "decisions": [{"decision": "Publish at frame boundaries.", "rationale": "Each frame observes one consistent texture selection."}],
             "design": "`Request` retains cancellation state until pending work finishes.",
-            "verification": {"automated": "cargo test --release cancellation", "manual": "- Cancel an upload and confirm the current texture remains visible."}
+            "verification": {"automated": "cargo test --release cancellation", "manual": "- Cancel an upload and confirm the current texture remains visible."},
+            "tests": [{"file":"src/request.rs", "cases":[{"name":"tests::cancellation", "change":"new", "description":"Cancel before publication and retain the current texture."}]}]
         });
         let replace = |design: &DeclarationDesign, metadata: &serde_json::Value| {
             let before = design.read(Some("plan.json"), false).unwrap();
@@ -849,11 +873,11 @@ mod tests {
         let (_, rendered, _) = store.submit_document_revision("session", "specification", 1, 1).unwrap();
         let original = store.read_submitted_document("session", "specification", 1).unwrap();
         assert_eq!(serde_json::to_value(&original.design.as_ref().unwrap().document).unwrap(), metadata);
-        let headings = ["Objective:", "Usage:", "Requirements:", "Background:", "Decisions:", "Design:", "Proposed declaration changes:", "Verification:"];
+        let headings = ["Objective:", "Usage:", "Requirements:", "Background:", "Decisions:", "Design:", "Proposed declaration changes:", "Verification:", "Tests · 1 new"];
         let positions = headings.map(|heading| rendered.markdown.lines().position(|line| line == heading).unwrap());
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(rendered.markdown.contains("app cancel 42\nCancelled request 42"));
-        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "verification/automated", "verification/manual"] {
+        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "verification/automated", "verification/manual", "tests"] {
             assert!(rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == format!("/design/document/{path}")));
         }
         for field in ["objective", "background", "design", "requirements"] {
@@ -870,9 +894,28 @@ mod tests {
             invalid_metadata["decisions"] = serde_json::json!([invalid]);
             assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid_metadata)).is_err());
         }
+        for tests in [
+            serde_json::json!([{"file":"../outside.rs", "cases":metadata["tests"][0]["cases"]}]),
+            serde_json::json!([metadata["tests"][0].clone(), metadata["tests"][0].clone()]),
+            serde_json::json!([{"file":"src/request.rs", "cases":[]}]),
+            serde_json::json!([{"file":"src/request.rs", "cases":[metadata["tests"][0]["cases"][0].clone(), metadata["tests"][0]["cases"][0].clone()]}]),
+            serde_json::json!([{"file":"src/request.rs", "cases":[{"name":"", "change":"new", "description":"Expected behavior."}]}]),
+            serde_json::json!([{"file":"src/request.rs", "cases":[{"name":"test", "change":"passed", "description":"Expected behavior."}]}]),
+            serde_json::json!([{"file":"src/request.rs", "cases":[{"name":"test", "change":"new", "description":" "}]}]),
+            serde_json::json!([{"file":"src/request.rs", "cases":[{"name":"test", "change":"new", "description":"Expected behavior.", "result":"passed"}]}]),
+        ] {
+            let mut invalid = metadata.clone();
+            invalid["tests"] = tests;
+            assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &invalid)).is_err());
+            assert_eq!(store.read_submitted_document("session", "specification", 1).unwrap(), original);
+        }
+        let mut missing_inventory = metadata.clone();
+        missing_inventory.as_object_mut().unwrap().remove("tests");
+        assert!(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &missing_inventory)).is_err());
         let mut revised_metadata = metadata.clone();
         revised_metadata.as_object_mut().unwrap().remove("usage");
         revised_metadata["decisions"] = serde_json::json!([]);
+        revised_metadata["tests"][0]["cases"][0]["change"] = serde_json::json!("reused");
         revised_metadata["requirements"] = serde_json::json!(["Cancellation preserves the published texture and reports its terminal state."]);
         document.design = Some(changed.patch(workspace.path(), &Default::default(), &replace(&changed, &revised_metadata)).unwrap());
         document.version += 1;
@@ -884,6 +927,9 @@ mod tests {
         assert!(delta.files.is_empty());
         assert!(delta.document.contains("a/Usage b/Usage") && delta.document.contains("a/Decisions b/Decisions"));
         assert!(delta.document.contains("a/Requirements b/Requirements"));
+        assert!(delta.document.contains("a/Tests b/Tests"));
+        assert!(rendered.markdown.contains("Tests · 1 reused"));
+        assert!(!rendered.markdown.contains("= tests::cancellation"));
         assert_eq!(store.read_submitted_document("session", "specification", 1).unwrap(), original);
     }
 

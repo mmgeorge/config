@@ -600,13 +600,7 @@ impl HarnessBroker {
             &plan.id,
             accepted_revision,
         )?;
-        let _ = kind;
-        Ok(Some(format!(
-            "{}\nUnresolved findings: {}\nAccepted semantic design:\n{}",
-            execution.instructions(),
-            execution.findings.join("\n"),
-            accepted.model_json()?
-        )))
+        Ok(Some(super::PlanPrompt::execution(&execution, kind, &accepted.model_json()?)))
     }
 
     pub(super) fn sync_plan_execution(&mut self, goal: &GoalRecord) -> Result<()> {

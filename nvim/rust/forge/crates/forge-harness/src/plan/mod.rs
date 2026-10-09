@@ -12,6 +12,7 @@ mod usage;
 pub(crate) use design::workspace_source;
 mod design;
 mod design_document;
+mod design_tests;
 pub(crate) mod calls;
 mod references;
 mod reference_context;

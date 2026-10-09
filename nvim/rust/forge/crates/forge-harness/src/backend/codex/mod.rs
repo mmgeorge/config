@@ -87,14 +87,6 @@ fn capability() -> BackendCapability {
     }
 }
 
-fn question_contract(mode: PromptMode, request_text: &str) -> &'static str {
-    if mode == PromptMode::Plan && request_text.contains("Planning feedback:") {
-        "The planning feedback in this turn has already been recorded and consumed. Do not call harness_question_answer or harness_question_withdraw for it."
-    } else {
-        "While questions remain pending, use harness_question_answer only for an explicit user answer and harness_question_withdraw only when no material user decision remains."
-    }
-}
-
 impl CodexBackend {
     /// Build a Codex backend with an isolated conservative permission registry.
     pub fn new(command: Vec<String>) -> Result<Self> {
@@ -1034,6 +1026,7 @@ impl Backend for CodexBackend {
                                 "threadId": thread_id,
                                 "cwd": request.workspace,
                                 "config": { "model_reasoning_effort": request.effort },
+                                "developerInstructions": request.system_message(),
                                 "serviceTier": request.service_tier
                             }),
                             &request,
@@ -1052,7 +1045,7 @@ impl Backend for CodexBackend {
                                     "cwd": request.workspace,
                                     "experimentalRawEvents": false,
                                     "historyMode": "legacy",
-                                    "developerInstructions": super::HARNESS_SYSTEM_MESSAGE,
+                                    "developerInstructions": request.system_message(),
                                     "dynamicTools": dynamic_tool_list,
                                     "serviceTier": request.service_tier
                                 }),
@@ -1074,11 +1067,7 @@ impl Backend for CodexBackend {
             .or(request.backend_session_id.clone())
             .context("Codex thread response omitted thread id")?;
         output.backend_session_id = Some(thread_id.clone());
-        let question_contract = question_contract(request.mode, &request_text);
-        let mut prompt = format!(
-            "Harness interaction contract: when the user explicitly asks for interactive or multiple-choice questions, call harness_question_ask with the complete question set. {question_contract} The question tools work outside planning. Do not claim control actions through prose.\n\n{}",
-            request_text
-        );
+        let mut prompt = request_text.clone();
         if request.mode == PromptMode::GoalContinuation {
             let objective = request
                 .input
@@ -1103,11 +1092,6 @@ impl Backend for CodexBackend {
             } else {
                 prompt = "Continue working toward the active goal.".into();
             }
-        }
-        if request.backend_session_id.is_some() {
-            prompt = format!(
-                "Use Markdown for user-facing responses unless the user requests another format. Use fenced code blocks with language tags for code and inline code for identifiers and commands. Do not wrap the entire response in a code fence. Keep structured tool arguments in their required schema.\n\n{prompt}"
-            );
         }
         let mut input = vec![json!({ "type": "text", "text": prompt })];
         if let BackendInput::Skill { name, .. } = &request.input {
@@ -1928,19 +1912,6 @@ mod test {
     }
 
     #[test]
-    fn planning_feedback_omits_pending_question_resolution_instructions() {
-        let contract = question_contract(
-            PromptMode::Plan,
-            "Planning feedback:\n- Geometry: Native Arrow",
-        );
-        assert!(contract.contains("already been recorded and consumed"));
-        assert!(contract.contains("Do not call harness_question_answer"));
-
-        let ordinary = question_contract(PromptMode::Chat, "Use Native Arrow");
-        assert!(ordinary.contains("While questions remain pending"));
-    }
-
-    #[test]
     fn ignores_a_child_completion_while_waiting_for_the_parent_turn() {
         let child = json!({
             "method": "turn/completed",
@@ -2006,6 +1977,10 @@ mod test {
                         json!({"method":"turn/completed","params":{"threadId":"parent","turn":{"id":"old","status":"completed"}}}),
                     ];
                     if method != "turn/start" {
+                        let instructions = request["params"]["developerInstructions"].as_str().unwrap();
+                        assert!(instructions.contains("Permission and task are independent"));
+                        assert!(instructions.contains("Effective permission: Read."));
+                        assert!(instructions.contains("Answer the current user request"));
                         messages.push(
                             json!({"method":"thread/goal/cleared","params":{"threadId":"parent"}}),
                         );
@@ -2138,6 +2113,9 @@ mod test {
                         .unwrap();
                 assert_eq!(request["method"], "thread/resume");
                 assert_eq!(request["params"]["model"], "gpt-5.6-terra");
+                let instructions = request["params"]["developerInstructions"].as_str().unwrap();
+                assert!(instructions.contains("active Goal task"));
+                assert!(instructions.contains("Effective permission: Read."));
                 assert_eq!(
                     request["params"]["config"]["model_reasoning_effort"],
                     "medium"

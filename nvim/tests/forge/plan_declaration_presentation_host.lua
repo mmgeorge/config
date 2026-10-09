@@ -31,6 +31,7 @@ local manifest = '[package]\nname = "arena"\nversion = "0.1.0"\nedition = "2024"
 if bevy_navigation then manifest = manifest .. 'bevy = { version = "=0.19.1", default-features = false }\n' end
 vim.fn.writefile(vim.split(manifest:gsub("\n$", ""), "\n", { plain = true }), workspace .. "/Cargo.toml")
 local configuration = {
+  [".gitignore"] = '# Fixture "0.1.0"\n/target/\n*.log\n!important.log\n',
   ["package.json"] = '{"name":"arena","version":"0.1.0"}\n',
   ["tsconfig.json"] = '{// Type checks\n"version":"0.1.0","compilerOptions":{"strict":true,},}\n',
   ["ci.yaml"] = 'version: "0.1.0"\nscript: |\n  echo build\n',
@@ -82,7 +83,7 @@ local success, failure = xpcall(function()
   local transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
   assert(transcript:find("Proposed changes", 1, true) and transcript:find("Modified src/change.rs", 1, true),
     "submitted declaration plan did not expose individual file changes")
-  assert(transcript:find("Plan overview 4 sections", 1, true) and not transcript:find("Artifact:", 1, true),
+  assert(transcript:find("Plan overview 5 sections", 1, true) and not transcript:find("Artifact:", 1, true),
     "declaration submission still displays the rendered artifact diff")
   for _, baseline in ipairs({ false, true }) do
     local declaration, declaration_failure
@@ -141,6 +142,7 @@ local success, failure = xpcall(function()
   original_request(unpack(pending_open))
   await(function() return state.plan_review and state.plan_review.owner.ready end, "declaration review did not open")
   local review = state.plan_review
+  assert(text(review.buf):find("Tests · None planned", 1, true), "review omitted the empty test inventory")
   assert(vim.wo[review.win].winbar:find("Awaiting review", 1, true), "attached review retained its loading navbar")
   local function visibility_label(public_only)
     local bar = vim.wo[review.win].winbar
