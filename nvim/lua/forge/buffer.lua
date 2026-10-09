@@ -445,14 +445,39 @@ local function commit_patch(session, patch)
   if editable.suspend_generated_text(session.editable) then
     return { kind = "Deferred", edit_sequence = session.editable.sequence }
   end
+  local perf = require("forge.infra.perf")
+  local descriptor = type(patch) == "table" and patch or {}
+  local timing = perf.enabled("harness") and { document = session.document, revision = descriptor.next,
+    rows = descriptor.next_rows, text_edits = type(descriptor.text_edit) == "table" and #descriptor.text_edit or nil,
+    metadata_edits = type(descriptor.metadata_edit) == "table" and #descriptor.metadata_edit or nil } or nil
+  local started = timing and perf.now() or 0
+  local previous = started
+  local function checkpoint(phase)
+    if not timing then return end
+    local now = perf.now()
+    timing[phase .. "_ms"] = (now - previous) / 1e6
+    previous = now
+  end
+  local function finish(status)
+    if not timing then return end
+    timing.status, timing.elapsed_ms = status, perf.elapsed_ms(started)
+    perf.event("harness", "ui.buffer.patch", timing)
+  end
   local ok, prepared = pcall(M.preflight, session, patch)
-  if not ok then return M.fail_apply(session, prepared) end
+  checkpoint("preflight")
+  if not ok then finish("preflight_failed") return M.fail_apply(session, prepared) end
   local retained_view = buffer_view.capture(session, function(id)
     local entry = not prepared.retired[id] and (prepared.block[id] or session.block[id])
     return entry ~= nil and entry ~= false and entry.row_count > 0
   end)
+  checkpoint("view_capture")
+  prepared.retain_folds = true
+  for _, edit in ipairs(patch.text_edit) do
+    if edit.removed_rows ~= 1 or #edit.text ~= 1 then prepared.retain_folds = false break end
+  end
   local readonly = vim.bo[session.buffer].readonly
   folds.capture(session)
+  checkpoint("fold_capture")
   ok, prepared.failure = pcall(function()
     assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
     session.applying = true
@@ -460,6 +485,7 @@ local function commit_patch(session, patch)
     for id in pairs(prepared.retired) do session.block[id] = nil end
     for id, entry in pairs(prepared.block) do session.block[id] = entry end
     folds.update(session, prepared, false)
+    checkpoint("sequence_and_folds")
     editable.applying(session.editable, true)
     if not session.physical then
       vim.bo[session.buffer].readonly = false
@@ -472,25 +498,32 @@ local function commit_patch(session, patch)
       if session.row_count == 0 then finish = 1 end
       vim.api.nvim_buf_set_lines(session.buffer, edit.start_row, finish, true, edit.text)
     end
+    checkpoint("text")
     install_metadata(session, prepared, false)
+    checkpoint("metadata")
     assert(vim.api.nvim_buf_line_count(session.buffer) == math.max(1, patch.next_rows), "native result row count differs")
     if not session.physical then vim.bo[session.buffer].modifiable = false end
   end)
   session.applying, session.fold_pending, session.fold_pending_index = nil, nil, nil
   pcall(function() vim.bo[session.buffer].readonly = readonly end)
   editable.applying(session.editable, false)
-  if not ok then return M.fail_apply(session, prepared.failure) end
+  if not ok then finish("mutation_failed") return M.fail_apply(session, prepared.failure) end
   for id in pairs(prepared.released_region) do session.region_owner[id] = nil end
   for id, owner in pairs(prepared.region_owner) do session.region_owner[id] = owner end
   ok, prepared.failure = pcall(function()
     attach_regions(session, prepared)
   end)
-  if not ok then return M.fail_apply(session, prepared.failure) end
+  checkpoint("regions")
+  if not ok then finish("regions_failed") return M.fail_apply(session, prepared.failure) end
   session.row_count, session.revision = patch.next_rows, patch.next
   session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
   decorations.attach(session)
+  checkpoint("decorations")
   folds.refresh(session)
+  checkpoint("fold_refresh")
   buffer_view.restore(session, retained_view)
+  checkpoint("view_restore")
+  finish("ok")
   return { kind = "Applied", revision = session.revision }
 end
 

@@ -89,7 +89,14 @@ local ok, failure = xpcall(function()
   vim.cmd("normal! zo")
   late_patch.base, late_patch.next = 1, 2
   late_patch.text_edit = { { start_row = 1, removed_rows = 1, text = { "source" } } }
+  local original_command, recomputations = vim.cmd, 0
+  vim.cmd = setmetatable({}, { __index = original_command, __call = function(_, command)
+    if command == "normal! zX" then recomputations = recomputations + 1 end
+    return original_command(command)
+  end })
   assert(replica.apply_patch(late, late_patch).kind == "Applied")
+  vim.cmd = original_command
+  assert(recomputations == 0, "single-line output rebuilt every native fold")
   assert(vim.fn.foldclosed(1) == -1, "body update overwrote the user's expanded fold intent")
   input.close(late_view)
   replica.close(late)

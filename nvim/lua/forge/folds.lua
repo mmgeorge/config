@@ -161,10 +161,25 @@ end
 function M.update(session, prepared, replace_all)
   if replace_all or not session.fold then session.fold = { record = {}, owner = {}, endpoint = {} } end
   local state, affected = session.fold, {}
+  local retained = {}
+  for owner in pairs(prepared.changed) do
+    for _, fold in ipairs(prepared.block[owner].metadata.fold or {}) do
+      local previous = state.record[fold.id]
+      if prepared.retain_folds and previous and previous.owner == owner and vim.deep_equal(previous.fold, fold) then
+        retained[fold.id] = true
+      end
+    end
+  end
   for _, changed in ipairs({ prepared.changed, prepared.retired }) do
     for owner in pairs(changed) do
       for id in pairs(state.owner[owner] or {}) do affected[id] = true end
       for id in pairs(state.endpoint[owner] or {}) do affected[id] = true end
+    end
+  end
+  for id in pairs(affected) do
+    local record = state.record[id]
+    if prepared.retain_folds and (retained[id] or not prepared.changed[record.owner] and not prepared.retired[record.owner]) then
+      affected[id] = nil
     end
   end
   for id in pairs(affected) do
@@ -188,18 +203,20 @@ function M.update(session, prepared, replace_all)
   end
   for owner in pairs(prepared.changed) do
     for _, fold in ipairs(prepared.block[owner].metadata.fold or {}) do
-      assert(not state.record[fold.id], "duplicate fold identity")
-      state.record[fold.id] = { owner = owner, fold = fold }
-      state.owner[owner] = state.owner[owner] or {}
-      state.owner[owner][fold.id] = true
-      if fold.heading_start then
-        local heading = fold.heading_start.block
-        state.endpoint[heading] = state.endpoint[heading] or {}
-        state.endpoint[heading][fold.id] = true
+      if not retained[fold.id] then
+        assert(not state.record[fold.id], "duplicate fold identity")
+        state.record[fold.id] = { owner = owner, fold = fold }
+        state.owner[owner] = state.owner[owner] or {}
+        state.owner[owner][fold.id] = true
+        if fold.heading_start then
+          local heading = fold.heading_start.block
+          state.endpoint[heading] = state.endpoint[heading] or {}
+          state.endpoint[heading][fold.id] = true
+        end
+        state.endpoint[fold["end"].block] = state.endpoint[fold["end"].block] or {}
+        state.endpoint[fold["end"].block][fold.id] = true
+        affected[fold.id] = true
       end
-      state.endpoint[fold["end"].block] = state.endpoint[fold["end"].block] or {}
-      state.endpoint[fold["end"].block][fold.id] = true
-      affected[fold.id] = true
     end
   end
   for id in pairs(affected) do

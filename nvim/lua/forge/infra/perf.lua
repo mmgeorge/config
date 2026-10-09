@@ -31,6 +31,10 @@ local METADATA_FIELD = {
   revision = true, queue_bytes = true, queue_count = true, active_jobs = true, retained_bytes = true,
   render_count = true,
   span_id = true,
+  document = true, text_edits = true, metadata_edits = true,
+  preflight_ms = true, view_capture_ms = true, fold_capture_ms = true,
+  sequence_and_folds_ms = true, text_ms = true, metadata_ms = true,
+  regions_ms = true, decorations_ms = true, fold_refresh_ms = true, view_restore_ms = true,
 }
 local writing = { diff = false, harness = false }
 local queue_bytes = { diff = 0, harness = 0 }

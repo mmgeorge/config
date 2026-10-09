@@ -146,15 +146,23 @@ impl<'profile> TranscriptRenderer<'profile> {
             vec![tool_heading(self.profile, kind, title, &duration)?]
         };
         let title_rows = row.len();
+        let mut hidden_rows = output.hidden_rows;
         for (index, text) in output.row.iter().enumerate() {
-            row.extend(tool_body_rows(self.profile, text, index == 0)?);
+            let wrapped = tool_body_rows(self.profile, text, index == 0)?;
+            let remaining = 4_usize.saturating_sub(row.len() - title_rows);
+            if !expanded && wrapped.len() > remaining {
+                row.extend(wrapped.into_iter().take(remaining));
+                hidden_rows += output.row.len() - index;
+                break;
+            }
+            row.extend(wrapped);
         }
         if output.row.is_empty() {
             row.extend(tool_body_rows(self.profile, "no output", true)?);
         }
-        if output.hidden_rows > 0 {
+        if hidden_rows > 0 {
             row.extend(tool_body_rows(self.profile,
-                &format!("…({} hidden)", output.hidden_rows), false,
+                &format!("…({hidden_rows} hidden)"), false,
             )?);
         }
         let text = BufferText::from_rows(row)?;
@@ -505,10 +513,18 @@ mod test {
                 )?;
                 let rows = block.text.wire_rows();
                 assert!(rows[1].starts_with("    └ {\"ok\":false"));
-                let restored = rows[1..].iter().enumerate().map(|(index, row)| {
+                let truncated = rows.last().is_some_and(|row| row.contains("…(1 hidden)"));
+                let content_end = rows.len() - usize::from(truncated);
+                let restored = rows[1..content_end].iter().enumerate().map(|(index, row)| {
                     if index == 0 { row.strip_prefix("    └ ").unwrap() } else { row.strip_prefix("      ").unwrap() }
                 }).collect::<String>();
-                assert_eq!(restored, response);
+                if truncated {
+                    assert!(!expanded);
+                    assert_eq!(content_end - 1, 4);
+                    assert!(response.starts_with(&restored));
+                } else {
+                    assert_eq!(restored, response);
+                }
                 assert!(rows.iter().all(|row| profile.cells(row, 0).unwrap() <= columns));
             }
         }
@@ -676,6 +692,32 @@ mod test {
                 .iter()
                 .any(|decoration| decoration.capture == "ForgeHarnessMcpArguments")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn wrapped_tool_output_limits_preview_and_preserves_expansion() -> Result<()> {
+        let profile = WidthProfile { columns: 24, ..WidthProfile::default() };
+        let renderer = TranscriptRenderer::new(&profile)?;
+        let source = format!("{}\nsecond\nthird\n", "界".repeat(60));
+        let output = super::super::tool::ToolOutputView::new("wrapped".into(), source.clone().into())?;
+        let render = |expanded| renderer.tool_preview(
+            BlockId("wrapped:tool".into()), TargetId("wrapped:tool".into()),
+            "command", Some(10), 0, false, "inspect",
+            &output.preview(expanded), expanded,
+        );
+        let preview = render(false)?;
+        let rows = preview.text.wire_rows();
+        assert_eq!(rows.len(), 6, "preview must contain a heading, four output rows, and a hidden-count row");
+        assert_eq!(rows[5], "      …(3 hidden)");
+        assert!(!rows.iter().any(|row| row.contains("second")));
+        let expanded = render(true)?;
+        let restored = expanded.text.wire_rows().iter().skip(1)
+            .map(|row| row.strip_prefix("    └ ").or_else(|| row.strip_prefix("      ")).unwrap())
+            .collect::<String>();
+        assert_eq!(restored, source.replace('\n', ""));
+        preview.validate()?;
+        expanded.validate()?;
         Ok(())
     }
 

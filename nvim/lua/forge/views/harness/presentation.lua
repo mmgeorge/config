@@ -41,7 +41,7 @@ function M.open(options, callback)
     owner.markdown_revision = owner.transcript.revision
   end
   local function dispatch_next()
-    if active or #queued == 0 then return end
+    if active or owner.applying or #queued == 0 then return end
     active = true
     local current = table.remove(queued, 1)
     local started = perf.now()
@@ -160,9 +160,9 @@ function M.open(options, callback)
     end
     owner.pending, owner.syncing = false, true
     request({ operation = "sync", document = identity, revision = owner.transcript.revision }, function(result, failure)
-      owner.syncing = false
-      if not alive() then return end
+      if not alive() then owner.syncing = false return end
       if failure then
+        owner.syncing = false
         if owner.sync_failure ~= failure then
           owner.sync_failure = failure
           notice(failure)
@@ -170,31 +170,66 @@ function M.open(options, callback)
         return
       end
       owner.sync_failure = nil
-      perf.trace("harness", "ui.transcript.apply", { session_id = options.session_id,
-        revision = owner.transcript.revision, buf = options.transcript_buffer,
-        count = #(result.patch or {}), source = type(result.snapshot) == "table" and "snapshot" or "patch" }, function()
-        if type(result.snapshot) == "table" then replica.apply_snapshot(owner.transcript, result.snapshot)
-        else
-          for _, patch in ipairs(result.patch or {}) do
-            local applied = replica.apply_patch(owner.transcript, patch)
-            if applied.kind ~= "Applied" then break end
+      owner.applying = true
+      local patch_index = 1
+      local function complete()
+        owner.applying, owner.syncing = false, false
+        local switched_timeline = owner.restore_timeline ~= nil
+        if owner.restore_timeline then
+          for window, saved in pairs(owner.timeline_view[owner.restore_timeline] or {}) do
+            if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
+              vim.api.nvim_win_call(window, function() vim.fn.winrestview(saved) end)
+            end
           end
+          owner.restore_timeline = nil
         end
-      end)
-      local switched_timeline = owner.restore_timeline ~= nil
-      if owner.restore_timeline then
-        for window, saved in pairs(owner.timeline_view[owner.restore_timeline] or {}) do
-          if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
-            vim.api.nvim_win_call(window, function() vim.fn.winrestview(saved) end)
-          end
-        end
-        owner.restore_timeline = nil
+        render_markdown(switched_timeline)
+        if options.on_update then options.on_update() end
+        if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
+        if result.syntax_pending then owner.highlight() end
+        if owner.pending then owner.sync() end
+        dispatch_next()
       end
-      render_markdown(switched_timeline)
-      if options.on_update then options.on_update() end
-      if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
-      if result.syntax_pending then owner.highlight() end
-      if owner.pending then owner.sync() end
+      local advance
+      advance = function()
+        if not alive() then
+          owner.applying, owner.syncing = false, false
+          dispatch_next()
+          return
+        end
+        local succeeded, apply_error = pcall(function()
+          local started, first_patch = perf.now(), patch_index
+          repeat
+            local applied
+            perf.trace("harness", "ui.transcript.apply", { session_id = options.session_id,
+              revision = owner.transcript.revision, buf = options.transcript_buffer, count = 1,
+              source = type(result.snapshot) == "table" and "snapshot" or "patch" }, function()
+              if type(result.snapshot) == "table" then
+                applied = replica.apply_snapshot(owner.transcript, result.snapshot)
+              elseif result.patch and result.patch[patch_index] then
+                applied = replica.apply_patch(owner.transcript, result.patch[patch_index])
+              end
+            end)
+            if applied and applied.kind ~= "Applied" then
+              owner.applying, owner.syncing = false, false
+              dispatch_next()
+              return
+            end
+            patch_index = patch_index + 1
+            if type(result.snapshot) == "table" or patch_index > #(result.patch or {}) then
+              complete()
+              return
+            end
+          until patch_index - first_patch >= 8 or perf.elapsed_ms(started) >= 4
+          vim.defer_fn(advance, 1)
+        end)
+        if not succeeded then
+          owner.applying, owner.syncing = false, false
+          dispatch_next()
+          notice("Harness transcript update failed: " .. tostring(apply_error))
+        end
+      end
+      advance()
     end)
   end
 

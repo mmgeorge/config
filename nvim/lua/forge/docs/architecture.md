@@ -1812,8 +1812,10 @@ thought. Later checklist rewrites never reparent historical work.
 
 The live protocol publishes `ActiveThoughtUpdate` counters plus one replaceable latest-tool
 record while a thought remains mutable. The Harness tree shows `Running N tools`, the latest
-tool heading, and at most four output lines without exposing a fold whose contents could change
-while open. Each lifecycle event replaces that preview, so a newly started tool displaces the
+tool heading, and at most four wrapped output rows plus a hidden-count indicator. Native
+previews apply this limit after display-cell wrapping, including when one source line spans
+multiple rows. Explicit expansion retains the complete output. The live preview does not
+expose a fold whose contents could change while open. Each lifecycle event replaces that preview, so a newly started tool displaces the
 previous tool instead of accumulating mutable rows. When the next thought or turn boundary
 closes that thought, the broker merges successful completed provider file-change items in their
 first-seen order and publishes one immutable `CompletedThought`. The UI then changes
@@ -1935,6 +1937,21 @@ Fork responses carry transient performance diagnostics for provider process star
 native fork work, broker persistence, and snapshot projection. Neovim records those phases alongside
 client-observed completion latency in the `forge/harness-perf.log` JSONL stream when
 `harness_logging` is enabled.
+
+Transcript synchronization keeps its request active until all received patches have been
+applied in revision order. Each editor callback applies at most eight patches and yields
+after four milliseconds between patches. Individual patches remain atomic on Neovim's
+main thread, so this scheduling budget does not bound one patch's duration. Queued document
+requests wait for application to finish. Closing the view or replacing the host cancels
+remaining application callbacks, and validation failures release the queue for snapshot
+recovery. Commands continue in the provider process throughout these editor updates.
+
+Row-preserving single-line edits and metadata-only updates retain identical fold definitions.
+Structural edits rebuild native folds and restore each window's fold preferences. With
+Harness logging enabled, `ui.buffer.patch` records validation, view capture, fold capture,
+sequence updates, buffer text writes, metadata installation, editable-region attachment,
+decorations, fold refresh, and view restoration separately in milliseconds.
+
 Broker initialization selects the most recently updated session for the resolved repository
 and configured backend, then restores its interaction timeline, plan, goal, model controls,
 and provider session identity. Independent model, effort, and service-tier preferences remain available
