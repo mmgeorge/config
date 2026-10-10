@@ -17,11 +17,17 @@ if vim.g.forge_fold_marker_child then
       ["end"] = { block = last, position = { row = 1, column = 0 } }, closed = false } } end
     return { id = id, text = { text }, metadata = metadata }
   end
+  local exchange = block("exchange", "▸ Executing plan", "▸", 2, "tool-result")
+  exchange.metadata.fold[#exchange.metadata.fold + 1] = {
+    id = "exchange-inner", start = { row = 0, column = 0 },
+    ["end"] = { block = "tool", position = { row = 1, column = 0 } }, closed = false,
+  }
   assert(replica.apply_snapshot(owner, { document = owner.document, revision = 0, block = {
     block("prompt", "● /execute last", "●"),
     block("event", "◇ Plan accepted", "◇"),
-    block("exchange", "▸ Executing plan", "▸", 2, "tool"),
+    exchange,
     block("tool", "• 2s cargo build"),
+    block("tool-result", "Build complete"),
     block("file", "Modified game.rs", "▸", 4, "change"),
     block("hunk", "@@ +1 -1 restart", nil, 4, "change"),
     block("change", "+ reset_round();"),
@@ -75,11 +81,17 @@ local ok, failure = xpcall(function()
   assert(screen.opened:find("▾ Modified game.rs", 1, true), screen.opened)
   assert(screen.closed:find("▸ Modified game.rs", 1, true), screen.closed)
   assert(screen.opened:find("• 2s cargo build", 1, true), screen.opened)
+  assert(not screen.opened:find("▾▾", 1, true), "coincident fold starts displayed multiple arrows")
   assert(not screen.opened:find("▾ @@", 1, true) and not screen.opened:find("▸ @@", 1, true), screen.opened)
   run([[vim.api.nvim_set_current_win(marker_fixture.opened); vim.api.nvim_win_set_cursor(0, {3,0}); vim.cmd("normal! zc")]])
   assert(capture().opened:find("▸ Executing plan", 1, true), "native close did not change the arrow")
   run([[vim.cmd("normal! zo")]])
   assert(capture().opened:find("▾ Executing plan", 1, true), "native open did not change the arrow")
+  run([[require("forge.folds").set_open(marker_fixture.owner, marker_fixture.opened, "exchange-inner", false)]])
+  local nested = capture().opened
+  assert(nested:find("▸ Executing plan", 1, true), "closed inner fold did not change the row arrow")
+  assert(not nested:find("▾▸", 1, true) and not nested:find("▸▸", 1, true),
+    "nested fold state displayed multiple arrows")
   assert(run("return vim.api.nvim_buf_get_lines(marker_fixture.owner.buffer,0,-1,false)")[3] == "▸ Executing plan",
     "window-local markers changed shared buffer text")
 end, debug.traceback)

@@ -149,8 +149,12 @@ columns without adding gutter bytes to the source text.
 `forge.folds` owns native manual fold ranges and renders collapsed labels from header text
 and semantic decorations. Each attached window retains its own open or closed preference.
 Ordinary patches remove and recreate only affected fold subtrees. Unchanged native ranges
-survive timer updates. Attaching a window or replacing an authoritative snapshot rebuilds
-the native ranges without replacing retained window preferences. Fold actions capture the
+survive timer updates. Subtree deletion selects the complete native range before removing
+its descendants, including folds that share a header row. Creation temporarily opens
+containing folds so Neovim does not widen a child range to a closed ancestor. Both operations
+restore retained ancestor preferences within the atomic buffer update. Attaching a window
+or replacing an authoritative snapshot rebuilds the native ranges without replacing retained
+window preferences. Fold actions capture the
 affected window's choices immediately. Detaching retains those choices even after its buffer
 has changed, and a replacement window inherits the document's most recently detached view.
 An existing window restores its own choices. Native ranges are rebuilt once from those
@@ -319,6 +323,20 @@ validates each target before preparing the action. Status inventory and source v
 Whole-file staging writes current worktree contents when the native queue executes it.
 It does not capture or hash worktree contents or require the displayed index entry to
 remain unchanged. The same policy applies to whole-file targets inside a batch.
+The writer groups adjacent compatible targets into commands of at most 256 paths,
+including selections smaller than 256. Stage, unstage, and tracked discard send literal
+NUL-delimited pathspecs through stdin. Selected untracked deletions form separate groups
+and do not spawn Git. Mixed action lists retain their original order and merge only
+adjacent groups with the same operation and source behavior.
+Patch stage, unstage, and worktree discard combine distinct-file patches with the same
+direction into one `git apply` input, bounded to 256 targets and 16 MiB. Staged-hunk
+discard and compound rollback retain their dependent preflight and mutation steps.
+Before each group, the writer verifies every selected source. A failed command marks
+every target in that group as uncertain, preserves completed earlier groups, and leaves
+later groups unstarted. Settlement observes every affected path before queue handoff.
+Whole-file staging retains an index scan to reject directory targets but skips HEAD-tree
+membership and repeated index-content comparisons that its current-content policy does
+not require.
 Hunk staging checks the displayed worktree metadata against execution-time metadata,
 then checks it again before the target write. It retains exact index-source validation
 for patch application. A changed source rejects the hunk without applying its patch.
@@ -586,8 +604,10 @@ Timeline prompts and final-response bodies use `●`, thoughts use `○`, non-fo
 `▸` when closed and `▾` when open. Rust assigns markers from actual fold ownership, including
 file headings. Response summaries retain `●` until they own foldable content. Tool calls
 retain `•`, and hunk headers retain their ForgeStatus presentation without arrows.
-Neovim renders fold direction per window through its native fold column and visible-row
-decorations. Native fold commands and split windows update indicators without rewriting the
+Neovim renders fold direction per window through its status column and visible-row
+decorations. Each marked heading has one arrow derived from native fold state. The status
+column does not use multi-level `%C` rendering, which can display multiple arrows when nested
+fold ranges start on the same row. Native fold commands and split windows update indicators without rewriting the
 shared buffer. Collapsed labels retain the same indentation and marker column as open headings.
 Tool groups inherit the same layout depth as commentary. Their rows start with the `•` marker
 without additional leading spaces. Output branches add two columns relative to that marker.

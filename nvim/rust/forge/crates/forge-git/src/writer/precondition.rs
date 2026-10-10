@@ -235,12 +235,17 @@ impl WritePrecondition {
             };
             action.paths().into_iter().map(move |path| (path, policy))
         }).collect();
+        let inspected: Vec<_> = selected
+            .iter()
+            .filter(|path| policy[*path] != WorktreePolicy::Current)
+            .cloned()
+            .collect();
         timing.insert("target_setup", started.elapsed().as_micros());
         let started = Instant::now();
         let mut selected_index = bulk_index(repository, &selected, check)?;
         timing.insert("selected_index", started.elapsed().as_micros());
         let started = Instant::now();
-        let selected_head = bulk_head(repository, &selected, &head, check)?;
+        let selected_head = bulk_head(repository, &inspected, &head, check)?;
         timing.insert("selected_head", started.elapsed().as_micros());
         let started = Instant::now();
         for target in &selected {
@@ -283,7 +288,7 @@ impl WritePrecondition {
         }
         timing.insert("index_recheck", started.elapsed().as_micros());
         let started = Instant::now();
-        let mut current_index = bulk_index(repository, &selected, check)?;
+        let mut current_index = bulk_index(repository, &inspected, check)?;
         for target in &path {
             ensure!(
                 target.worktree_policy == WorktreePolicy::Current
@@ -381,7 +386,16 @@ impl WritePrecondition {
             self.head == read_head(&repository.repository.to_thread_local())?,
             "HEAD changed before chunk execution"
         );
-        let mut index = bulk_index(repository, path, check)?;
+        let inspected: Vec<_> = path
+            .iter()
+            .filter(|path| {
+                self.path.iter().any(|captured| {
+                    captured.path == **path && captured.worktree_policy != WorktreePolicy::Current
+                })
+            })
+            .cloned()
+            .collect();
+        let mut index = bulk_index(repository, &inspected, check)?;
         for path in path {
             let captured = self
                 .path

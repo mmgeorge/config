@@ -82,6 +82,18 @@ fn path(name: &str) -> RepositoryPath {
     RepositoryPath::new(name.as_bytes().to_vec()).unwrap()
 }
 
+fn write_command_count(store: &RepositoryStore, operation: OperationId) -> u64 {
+    let trace = serde_json::to_value(store.writes.trace(None)).unwrap();
+    trace["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|event| event["operation_id"].as_u64() == Some(operation.value()))
+        .filter_map(|event| event["command_count"].as_u64())
+        .max()
+        .unwrap()
+}
+
 async fn run(
     service: &GitWriteService,
     repository: &Arc<RepositoryState>,
@@ -464,6 +476,87 @@ async fn patch_stages_one_raw_hunk_and_unstages_it() {
 }
 
 #[tokio::test]
+async fn patch_groups_batch_distinct_files_and_preserve_unselected_hunks() {
+    use forge_diff::{
+        raw::compute_hunks,
+        source::{Representation, SourcePair, SourceVersion},
+    };
+    let (directory, store, repository, service) = fixture().await;
+    let names = ["sample.txt", "second.txt"];
+    let original = b"one\ntwo\nthree\nfour\nfive\n";
+    let changed = b"ONE\ntwo\nthree\nfour\nFIVE\n";
+    let staged = b"ONE\ntwo\nthree\nfour\nfive\n";
+    for name in names {
+        std::fs::write(directory.path().join(name), original).unwrap();
+    }
+    git(directory.path(), &["add", "--", "."]);
+    git(directory.path(), &["commit", "-m", "patch fixture"]);
+    for name in names {
+        std::fs::write(directory.path().join(name), changed).unwrap();
+    }
+    for direction in [
+        PatchDirection::Stage,
+        PatchDirection::Unstage,
+        PatchDirection::Discard,
+    ] {
+        let new: &[u8] = if direction == PatchDirection::Unstage {
+            staged
+        } else {
+            changed
+        };
+        let action = names
+            .into_iter()
+            .map(|name| {
+                let analysis = compute_hunks(SourcePair {
+                    old: SourceVersion::new(original.to_vec(), Representation::GitCanonical)
+                        .unwrap(),
+                    new: SourceVersion::new(new.to_vec(), Representation::GitCanonical).unwrap(),
+                })
+                .unwrap();
+                let selected = vec![analysis.hunks()[0].id];
+                GitWriteAction::Patch {
+                    direction,
+                    target: PatchTarget {
+                        path: path(name),
+                        analysis,
+                        selected,
+                    },
+                }
+            })
+            .collect();
+        let outcome = run(&service, &repository, GitWriteAction::Batch { action }).await;
+        assert!(
+            outcome
+                .target
+                .iter()
+                .all(|target| target.completion == TargetCompletion::Completed),
+            "{outcome:?}"
+        );
+        assert_eq!(write_command_count(&store, outcome.operation), 1);
+        for name in names {
+            let expected: &[u8] = if direction == PatchDirection::Stage {
+                staged
+            } else {
+                original
+            };
+            assert_eq!(
+                git(directory.path(), &["show", &format!(":{name}")]),
+                expected
+            );
+            let expected: &[u8] = if direction == PatchDirection::Discard {
+                b"one\ntwo\nthree\nfour\nFIVE\n"
+            } else {
+                changed
+            };
+            assert_eq!(
+                std::fs::read(directory.path().join(name)).unwrap(),
+                expected
+            );
+        }
+    }
+}
+
+#[tokio::test]
 async fn staged_hunk_discard_preserves_other_staged_and_unstaged_changes() {
     use forge_diff::{
         raw::compute_hunks,
@@ -559,7 +652,7 @@ async fn staged_hunk_conflict_fails_preflight_without_modifying_index() {
 
 #[tokio::test]
 async fn parent_intent_stages_and_unstages_more_than_256_captured_paths() {
-    let (directory, _, repository, service) = fixture().await;
+    let (directory, store, repository, service) = fixture().await;
     let selected: Vec<_> = (0..257)
         .map(|index| {
             let name = format!("selected-{index:04}.txt");
@@ -584,6 +677,7 @@ async fn parent_intent_stages_and_unstages_more_than_256_captured_paths() {
         "{staged:?}"
     );
     assert_eq!(staged.settled.as_ref().unwrap().path.len(), 257);
+    assert_eq!(write_command_count(&store, staged.operation), 2);
     let unstaged = run(
         &service,
         &repository,
@@ -733,7 +827,7 @@ async fn progress_sequence_spans_commands_with_independent_streams() {
 }
 
 #[tokio::test]
-async fn completed_target_survives_later_rejection_and_remaining_targets_do_not_run() {
+async fn failed_path_group_reconciles_every_target_without_claiming_partial_success() {
     let (directory, _, repository, service) = fixture().await;
     std::fs::write(directory.path().join("sample.txt"), "changed\n").unwrap();
     std::fs::write(directory.path().join(".gitignore"), "ignored.txt\n").unwrap();
@@ -747,17 +841,202 @@ async fn completed_target_survives_later_rejection_and_remaining_targets_do_not_
         },
     )
     .await;
-    assert_eq!(outcome.target[0].completion, TargetCompletion::Completed);
-    assert_eq!(
-        outcome.target[1].completion,
-        TargetCompletion::OutcomeUnknown
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::OutcomeUnknown)
     );
-    assert_eq!(outcome.target[2].completion, TargetCompletion::NotStarted);
+    assert!(outcome.settled.is_some());
     assert_eq!(
         git(directory.path(), &["show", ":sample.txt"]),
         b"changed\n"
     );
+    assert_eq!(git(directory.path(), &["show", ":last.txt"]), b"last\n");
+}
+
+#[tokio::test]
+async fn small_path_writes_batch_literal_paths_and_preserve_unselected_files() {
+    let (directory, store, repository, service) = fixture().await;
+    let names = [
+        "first.txt",
+        "space name.txt",
+        "[literal].txt",
+        "-leading.txt",
+        "file-five.txt",
+        "file-six.txt",
+        "file-seven.txt",
+    ];
+    for name in names {
+        std::fs::write(directory.path().join(name), "original\n").unwrap();
+    }
+    git(directory.path(), &["add", "--", "."]);
+    git(directory.path(), &["commit", "-m", "batch fixture"]);
+    for name in names {
+        std::fs::write(directory.path().join(name), "changed\n").unwrap();
+    }
+    std::fs::write(directory.path().join("sample.txt"), "unselected\n").unwrap();
+    let selected: Vec<_> = names.into_iter().map(path).collect();
+    for action in [
+        GitWriteAction::Stage {
+            path: selected.clone(),
+        },
+        GitWriteAction::Unstage {
+            path: selected.clone(),
+        },
+        GitWriteAction::Discard {
+            path: selected,
+            source: DiscardSource::Index,
+        },
+    ] {
+        let is_stage = matches!(action, GitWriteAction::Stage { .. });
+        let outcome = run(&service, &repository, action).await;
+        assert!(
+            outcome
+                .target
+                .iter()
+                .all(|target| target.completion == TargetCompletion::Completed),
+            "{outcome:?}"
+        );
+        assert!(outcome.settled.is_some());
+        assert_eq!(outcome.affected.len(), names.len());
+        assert_eq!(write_command_count(&store, outcome.operation), 1);
+        for name in names {
+            let source = format!(":{name}");
+            let expected: &[u8] = if is_stage {
+                b"changed\n"
+            } else {
+                b"original\n"
+            };
+            assert_eq!(git(directory.path(), &["show", &source]), expected);
+        }
+    }
+    for name in names {
+        assert_eq!(
+            std::fs::read(directory.path().join(name)).unwrap(),
+            b"original\n"
+        );
+    }
+    assert_eq!(
+        std::fs::read(directory.path().join("sample.txt")).unwrap(),
+        b"unselected\n"
+    );
+}
+
+#[tokio::test]
+async fn mixed_batch_groups_adjacent_actions_and_stops_after_failed_group() {
+    let (directory, store, repository, service) = fixture().await;
+    for name in ["first.txt", "second.txt", "last.txt"] {
+        std::fs::write(directory.path().join(name), "selected\n").unwrap();
+    }
+    std::fs::write(directory.path().join("sample.txt"), "staged\n").unwrap();
+    git(directory.path(), &["add", "sample.txt"]);
+    std::fs::write(directory.path().join(".gitignore"), "ignored.txt\n").unwrap();
+    std::fs::write(directory.path().join("ignored.txt"), "ignored\n").unwrap();
+    let outcome = run(
+        &service,
+        &repository,
+        GitWriteAction::Batch {
+            action: vec![
+                GitWriteAction::Stage {
+                    path: vec![path("first.txt")],
+                },
+                GitWriteAction::Stage {
+                    path: vec![path("second.txt")],
+                },
+                GitWriteAction::Unstage {
+                    path: vec![path("sample.txt")],
+                },
+                GitWriteAction::Stage {
+                    path: vec![path("ignored.txt")],
+                },
+                GitWriteAction::Unstage {
+                    path: vec![path("last.txt")],
+                },
+            ],
+        },
+    )
+    .await;
+    assert_eq!(
+        outcome
+            .target
+            .iter()
+            .map(|target| target.completion)
+            .collect::<Vec<_>>(),
+        vec![
+            TargetCompletion::Completed,
+            TargetCompletion::Completed,
+            TargetCompletion::Completed,
+            TargetCompletion::OutcomeUnknown,
+            TargetCompletion::NotStarted,
+        ]
+    );
+    assert_eq!(write_command_count(&store, outcome.operation), 3);
+    for name in ["first.txt", "second.txt"] {
+        assert_eq!(
+            git(directory.path(), &["show", &format!(":{name}")]),
+            b"selected\n"
+        );
+    }
+    assert_eq!(
+        git(directory.path(), &["show", ":sample.txt"]),
+        b"original\n"
+    );
     assert_eq!(git(directory.path(), &["ls-files", "last.txt"]), b"");
+}
+
+#[tokio::test]
+async fn mixed_discard_batches_tracked_paths_and_deletes_only_selected_untracked_paths() {
+    let (directory, store, repository, service) = fixture().await;
+    std::fs::write(directory.path().join("second.txt"), "original\n").unwrap();
+    git(directory.path(), &["add", "second.txt"]);
+    git(directory.path(), &["commit", "-m", "second file"]);
+    for name in [
+        "sample.txt",
+        "second.txt",
+        "new-first.txt",
+        "new-second.txt",
+        "untouched.txt",
+    ] {
+        std::fs::write(directory.path().join(name), "changed\n").unwrap();
+    }
+    let outcome = run(
+        &service,
+        &repository,
+        GitWriteAction::Discard {
+            path: [
+                "sample.txt",
+                "second.txt",
+                "new-first.txt",
+                "new-second.txt",
+            ]
+            .into_iter()
+            .map(path)
+            .collect(),
+            source: DiscardSource::Index,
+        },
+    )
+    .await;
+    assert!(
+        outcome
+            .target
+            .iter()
+            .all(|target| target.completion == TargetCompletion::Completed),
+        "{outcome:?}"
+    );
+    assert_eq!(write_command_count(&store, outcome.operation), 1);
+    for name in ["sample.txt", "second.txt"] {
+        assert_eq!(
+            std::fs::read(directory.path().join(name)).unwrap(),
+            b"original\n"
+        );
+    }
+    assert!(!directory.path().join("new-first.txt").exists());
+    assert!(!directory.path().join("new-second.txt").exists());
+    assert_eq!(
+        std::fs::read(directory.path().join("untouched.txt")).unwrap(),
+        b"changed\n"
+    );
 }
 
 #[tokio::test]

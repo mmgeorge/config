@@ -284,6 +284,14 @@ local function apply_defaults(session, window, saved, changed)
     if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= session.buffer then return end
     vim.api.nvim_win_call(window, function()
       local view = vim.fn.winsaveview()
+      -- A closed ancestor expands an Ex range to its entire fold.
+      local ancestor = vim.fn.foldclosed(range.start)
+      for _ = 1, vim.fn.foldlevel(range.start) do
+        if ancestor < 0 then break end
+        if not opened[ancestor] then closed[ancestor] = true end
+        vim.cmd(tostring(range.start) .. "foldopen")
+        ancestor = vim.fn.foldclosed(range.start)
+      end
       vim.cmd(("%d,%dfold"):format(range.start, range.finish))
       vim.cmd(tostring(range.start) .. "foldopen!")
       vim.fn.winrestview(view)
@@ -353,11 +361,37 @@ local function remove_native(session, affected)
         vim.api.nvim_win_call(window, function()
           local view = vim.fn.winsaveview()
           if range.finish > removed_end and range.finish >= range.start and vim.fn.foldlevel(range.start) > 0 then
-            while vim.fn.foldclosed(range.start) >= 0 and vim.fn.foldclosed(range.start) < range.start do
-              vim.cmd(range.start .. "foldopen")
-            end
-            vim.api.nvim_win_set_cursor(window, { range.start, 0 })
-            vim.cmd("silent! normal! zD")
+            local minimum_lines = vim.wo.foldminlines
+            vim.wo.foldminlines = 0
+            local ancestors = {}
+            local ok, failure = pcall(function()
+              local closed = vim.fn.foldclosed(range.start)
+              while closed >= 0 and (closed < range.start or vim.fn.foldclosedend(range.start) > range.finish) do
+                ancestors[#ancestors + 1] = closed
+                vim.cmd(range.start .. "foldopen")
+                closed = vim.fn.foldclosed(range.start)
+              end
+              local depth = vim.fn.foldlevel(range.start)
+              vim.cmd(range.start .. "foldopen!")
+              -- Select the outermost removed fold before deleting its descendants.
+              for _ = 1, depth do
+                vim.cmd(range.start .. "foldclose")
+                if vim.fn.foldclosed(range.start) < range.start
+                  or vim.fn.foldclosedend(range.start) > range.finish then
+                  vim.cmd(range.start .. "foldopen")
+                  break
+                end
+              end
+              assert(vim.fn.foldclosed(range.start) == range.start
+                and vim.fn.foldclosedend(range.start) == range.finish,
+                "native fold range differs from the removed subtree")
+              vim.api.nvim_win_set_cursor(window, { range.start, 0 })
+              vim.cmd("normal! zD")
+            end)
+            for index = #ancestors, 1, -1 do close_open_fold(ancestors[index]) end
+            vim.wo.foldminlines = minimum_lines
+            vim.fn.winrestview(view)
+            if not ok then error(failure, 0) end
             removed_end = range.finish
           end
           vim.fn.winrestview(view)
@@ -583,7 +617,10 @@ function M.sign()
   local layout = node and location.position.row == 0 and node.entry.metadata.layout
   local marker = layout and layout.marker
   if not marker or marker == vim.NIL or layout.indent ~= 2 then return "  " end
-  return "%#" .. marker.capture .. "#" .. (marker.text == "▸" and "%C" or marker.text .. " ") .. "%*"
+  local icon = marker.text == "▸"
+    and "%{foldlevel(v:lnum) == 0 ? ' ' : (foldclosed(v:lnum) == v:lnum ? '▸' : '▾')}"
+    or marker.text
+  return "%#" .. marker.capture .. "#" .. icon .. " %*"
 end
 
 ---@return string|table[]

@@ -39,6 +39,13 @@ enum BulkAction {
     Unstage,
     DiscardIndex,
     DiscardHead,
+    DeleteUntracked,
+}
+
+struct WriteGroup {
+    bulk_action: Option<BulkAction>,
+    patch_direction: Option<PatchDirection>,
+    target: Vec<Option<RepositoryPath>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -536,13 +543,6 @@ impl GitWriteAction {
                 source: DiscardSource::Head,
                 ..
             } => Some(BulkAction::DiscardHead),
-            Self::Batch { action } => {
-                let first = action.first()?.bulk_action()?;
-                action
-                    .iter()
-                    .all(|action| action.bulk_action() == Some(first))
-                    .then_some(first)
-            }
             _ => None,
         }
     }
@@ -568,6 +568,63 @@ impl GitWriteAction {
             vec![None]
         } else {
             path.into_iter().map(Some).collect()
+        }
+    }
+
+    fn write_groups(&self, precondition: &WritePrecondition) -> Vec<WriteGroup> {
+        let actions = match self {
+            Self::Batch { action } => action.as_slice(),
+            action => std::slice::from_ref(action),
+        };
+        let mut groups: Vec<WriteGroup> = Vec::new();
+        for action in actions {
+            let patch_direction = match action {
+                Self::Patch {
+                    direction: PatchDirection::Index { .. },
+                    ..
+                } => Some(PatchDirection::Stage),
+                Self::Patch { direction, .. } if *direction != PatchDirection::DiscardStaged => {
+                    Some(*direction)
+                }
+                _ => None,
+            };
+            for target in action.targets() {
+                let bulk_action = match action.bulk_action() {
+                    Some(BulkAction::DiscardIndex | BulkAction::DiscardHead)
+                        if target
+                            .as_ref()
+                            .is_some_and(|path| !precondition.tracked(path)) =>
+                    {
+                        Some(BulkAction::DeleteUntracked)
+                    }
+                    bulk_action => bulk_action,
+                };
+                if let Some(group) = groups.last_mut().filter(|group| {
+                    (bulk_action.is_some() || patch_direction.is_some())
+                        && group.bulk_action == bulk_action
+                        && group.patch_direction == patch_direction
+                        && group.target.len() < 256
+                }) {
+                    group.target.push(target);
+                } else {
+                    groups.push(WriteGroup {
+                        bulk_action,
+                        patch_direction,
+                        target: vec![target],
+                    });
+                }
+            }
+        }
+        groups
+    }
+
+    fn for_target(&self, path: Option<&RepositoryPath>) -> Result<&Self> {
+        match self {
+            Self::Batch { action } => action
+                .iter()
+                .find(|action| path.is_some_and(|path| action.paths().contains(path)))
+                .context("batch target has no action"),
+            action => Ok(action),
         }
     }
 
@@ -812,27 +869,8 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
     };
     intent.store.writes.phase(intent.operation(), "executing");
     let mut stopped = false;
-    let targets = intent.action.targets();
-    let mut bulk = intent.action.bulk_action();
-    if matches!(
-        bulk,
-        Some(BulkAction::DiscardIndex | BulkAction::DiscardHead)
-    ) {
-        let tracked = targets
-            .iter()
-            .flatten()
-            .filter(|path| intent.precondition().tracked(path))
-            .count();
-        if tracked != 0 && tracked != targets.len() {
-            bulk = None;
-        }
-    }
-    let chunk_size = if bulk.is_some() && targets.len() > 256 {
-        256
-    } else {
-        1
-    };
-    for chunk in targets.chunks(chunk_size) {
+    for group in intent.action.write_groups(intent.precondition()) {
+        let chunk = group.target;
         if stopped {
             outcome
                 .target
@@ -845,7 +883,7 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
             continue;
         }
         let path: Vec<_> = chunk.iter().flatten().cloned().collect();
-        let validated = if chunk_size > 1 {
+        let validated = if group.bulk_action.is_some() || group.patch_direction.is_some() {
             intent
                 .precondition()
                 .validate_targets(&intent.repository, &path, &mut check)
@@ -875,13 +913,15 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
             stopped = true;
             continue;
         }
-        let result = if chunk_size > 1 {
+        let result = if let Some(bulk_action) = group.bulk_action {
             run_path_chunk(
                 &intent,
-                bulk.expect("validated bulk action"),
+                bulk_action,
                 &path,
                 &mut check,
             )
+        } else if let Some(direction) = group.patch_direction {
+            run_patch_group(&intent, direction, &path, &mut check)
         } else {
             run_target(&intent, chunk[0].as_ref(), &mut check)
         };
@@ -1017,10 +1057,7 @@ fn run_path_chunk(
         !path.is_empty() && path.len() <= 256,
         "invalid write chunk size"
     );
-    let mut command = git_command(&intent.repository)?;
-    if matches!(action, BulkAction::DiscardIndex | BulkAction::DiscardHead)
-        && !intent.precondition().tracked(&path[0])
-    {
+    if action == BulkAction::DeleteUntracked {
         for path in path {
             check()?;
             let destination = crate::validate_path(
@@ -1044,6 +1081,7 @@ fn run_path_chunk(
             stderr: Vec::new(),
         });
     }
+    let mut command = git_command(&intent.repository)?;
     match action {
         BulkAction::Stage => {
             command.arg("add");
@@ -1063,6 +1101,7 @@ fn run_path_chunk(
         BulkAction::DiscardHead => {
             command.args(["restore", "--source=HEAD", "--staged", "--worktree"]);
         }
+        BulkAction::DeleteUntracked => unreachable!("untracked deletion does not invoke Git"),
     }
     command.args(["--pathspec-from-file=-", "--pathspec-file-nul"]);
     let mut input = Vec::new();
@@ -1070,6 +1109,58 @@ fn run_path_chunk(
         input.extend_from_slice(path.raw());
         input.push(0);
     }
+    intent.store.writes.command_started(intent.operation());
+    progress_command(
+        &mut command,
+        CommandLimits {
+            stdout_bytes: 64 * 1024,
+            stderr_bytes: 64 * 1024,
+            timeout: Duration::from_secs(120),
+        },
+        Some(&input),
+        intent.progress.as_ref(),
+        check,
+    )
+}
+
+fn run_patch_group(
+    intent: &GitWriteIntent,
+    direction: PatchDirection,
+    path: &[RepositoryPath],
+    check: &mut dyn FnMut() -> Result<()>,
+) -> Result<std::process::Output> {
+    let mut input = Vec::new();
+    for path in path {
+        check()?;
+        let GitWriteAction::Patch { direction, target } = intent.action.for_target(Some(path))?
+        else {
+            anyhow::bail!("patch group contains a non-patch target");
+        };
+        let (before_exists, after_exists) = intent.precondition().patch_presence(path, *direction);
+        let patch = encode_patch(target, before_exists, after_exists)?;
+        ensure!(
+            input.len() + patch.len() <= MAX_INPUT,
+            "patch group exceeds 16 MiB"
+        );
+        input.extend_from_slice(&patch);
+    }
+    let mut command = git_command(&intent.repository)?;
+    command.args(["apply", "--unidiff-zero", "--whitespace=nowarn"]);
+    match direction {
+        PatchDirection::Stage | PatchDirection::Index { .. } => {
+            command.arg("--cached");
+        }
+        PatchDirection::Unstage => {
+            command.args(["--cached", "--reverse"]);
+        }
+        PatchDirection::Discard => {
+            command.arg("--reverse");
+        }
+        PatchDirection::DiscardStaged => {
+            anyhow::bail!("staged discard requires ordered index and worktree steps")
+        }
+    }
+    command.arg("-");
     intent.store.writes.command_started(intent.operation());
     progress_command(
         &mut command,
@@ -1092,13 +1183,7 @@ fn run_target(
     check()?;
     let mut command = git_command(&intent.repository)?;
     let mut input = None;
-    let action = match &intent.action {
-        GitWriteAction::Batch { action } => action
-            .iter()
-            .find(|action| path.is_some_and(|path| action.paths().contains(path)))
-            .context("batch target has no action")?,
-        action => action,
-    };
+    let action = intent.action.for_target(path)?;
     if let GitWriteAction::Patch {
         direction: PatchDirection::DiscardStaged,
         target,
@@ -1123,63 +1208,10 @@ fn run_target(
                 check,
             );
         }
-        GitWriteAction::Stage { .. } => {
-            command.args(["add", "--"]);
-        }
-        GitWriteAction::Unstage { .. } => {
-            if intent.precondition().unborn() {
-                command.args(["rm", "--cached", "-f", "--"]);
-            } else {
-                command.args(["reset", "--quiet", "HEAD", "--"]);
-            }
-        }
-        GitWriteAction::Discard { source, .. } => {
-            let path = path.context("discard requires path")?;
-            if intent.precondition().tracked(path) {
-                if *source == DiscardSource::Head {
-                    if intent.precondition().unborn() {
-                        command.args(["rm", "-f", "--"]);
-                    } else {
-                        command.args(["restore", "--source=HEAD", "--staged", "--worktree", "--"]);
-                    }
-                } else {
-                    command.args(["restore", "--worktree", "--"]);
-                }
-            } else {
-                let destination = crate::validate_path(
-                    intent
-                        .repository
-                        .identity
-                        .worktree_root
-                        .as_ref()
-                        .context("discard root missing")?,
-                    path,
-                )?;
-                std::fs::remove_file(destination).context("delete captured untracked file")?;
-                command.args(["diff", "--quiet", "--"]);
-            }
-        }
-        GitWriteAction::Patch { direction, target } => {
-            command.args(["apply", "--unidiff-zero", "--whitespace=nowarn"]);
-            match direction {
-                PatchDirection::Stage | PatchDirection::Index { .. } => {
-                    command.arg("--cached");
-                }
-                PatchDirection::Unstage => {
-                    command.args(["--cached", "--reverse"]);
-                }
-                PatchDirection::Discard => {
-                    command.arg("--reverse");
-                }
-                PatchDirection::DiscardStaged => {
-                    command.args(["--index", "--reverse"]);
-                }
-            }
-            command.arg("-");
-            let (before_exists, after_exists) =
-                intent.precondition().patch_presence(&target.path, *direction);
-            input = Some(encode_patch(target, before_exists, after_exists)?);
-        }
+        GitWriteAction::Stage { .. }
+        | GitWriteAction::Unstage { .. }
+        | GitWriteAction::Discard { .. } => anyhow::bail!("path mutation requires grouped execution"),
+        GitWriteAction::Patch { .. } => anyhow::bail!("patch mutation requires grouped execution"),
         GitWriteAction::CreateBranch { name } => {
             command.args(["switch", "-c", name]);
         }

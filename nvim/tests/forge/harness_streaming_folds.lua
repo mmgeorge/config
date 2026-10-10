@@ -35,6 +35,7 @@ vim.defer_fn(function()
     patch.text_edit = { { start_row = 0, removed_rows = 1, text = { "Thought" } } }
     assert(buffer.apply_patch(replica, patch).kind == "Applied")
     vim.api.nvim_win_call(transcript_window, function()
+      assert(vim.fn.foldlevel(1) == 1, "completion duplicated the native exchange fold")
       assert(vim.fn.foldclosed(1) == 1, "completed activity must close while the composer retains Insert mode")
       vim.cmd("1foldopen")
     end)
