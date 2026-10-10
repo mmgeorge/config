@@ -2280,6 +2280,7 @@ impl HarnessBroker {
                 .or_else(|| model.default_context_window.clone());
         }
         if self.session.model == "default"
+            && self.session.resolved_model.is_none()
             && let Some(model) = model_list
                 .iter()
                 .find(|model| model.is_default)
@@ -3731,7 +3732,9 @@ Planning continuation: turn {} of {}.",
         if !output.runtime.provider.is_empty() {
             self.session.provider_label = output.runtime.provider.clone();
         }
-        self.session.resolved_model = output.runtime.model.clone();
+        if output.runtime.model.is_some() {
+            self.session.resolved_model = output.runtime.model.clone();
+        }
         output.event.clear();
 
         if let Some(control_error) = output.control_error.take() {
@@ -4541,6 +4544,25 @@ Planning continuation: turn {} of {}.",
         mut backend_event: BackendEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        if backend_event.kind == "runtime_resolved" {
+            let resolved: crate::backend::BackendRuntime =
+                serde_json::from_value(backend_event.data.clone())?;
+            anyhow::ensure!(backend_event.address.is_none(), "runtime identity must belong to the session stream");
+            if !resolved.provider.is_empty() {
+                self.session.provider_label = resolved.provider;
+            }
+            if let Some(model) = resolved.model.filter(|model| !model.is_empty()) {
+                self.session.resolved_model = Some(model);
+            }
+            self.save_session()?;
+            backend_event.data = json!({
+                "session_id": self.session.id,
+                "provider": self.session.provider_label,
+                "model": self.session.resolved_model,
+            });
+            self.emit_backend_event(backend_event, event).await?;
+            return Ok(());
+        }
         if let Some(received) = backend_event.received_at_ms {
             self.trace.record(&self.session.id,"broker.provider.dequeued",json!({
                 "event_type":backend_event.kind,
@@ -5019,7 +5041,7 @@ Planning continuation: turn {} of {}.",
             backend_event.data = json!({"node":{"prompt":backend_event.data.pointer("/node/prompt")}});
         } else if !matches!(backend_event.kind.as_str(), "execution_state" | "prompt_submission"
             | "approval_requested" | "approval_resolved" | "approval_cancelled" | "agent_updated"
-            | "context_usage" | "timeline_wait_updated" | "plan_execution_progress" | "configuration_applied" | "error") {
+            | "context_usage" | "runtime_resolved" | "timeline_wait_updated" | "plan_execution_progress" | "configuration_applied" | "error") {
             backend_event.data = Value::Null;
             backend_event.text = None;
             backend_event.activity = None;
@@ -9733,6 +9755,46 @@ mod test {
                 .and_then(|execution| execution.active_turn_id.as_deref())
                 .is_none()
         );
+    }
+
+    #[tokio::test]
+    async fn publishes_and_persists_resolved_model_before_provider_turn_starts() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.session.model = "default".into();
+        broker.session.resolved_model = None;
+        let mut exchange = completed_interaction("runtime-identity", &broker.session.id, Vec::new());
+        exchange.state = ExchangeState::Running;
+        exchange.completed_at_ms = None;
+        let mut runtime = ExchangeRuntime {
+            exchange_id: exchange.id.clone(),
+            synthetic_turn: None,
+            task: TaskTracker::default(),
+            retraction_eligible: true,
+            active_wait: None,
+        };
+        let mut events = Vec::new();
+        broker.process_backend_event(
+            &mut runtime,
+            &mut exchange,
+            crate::backend::BackendRuntime {
+                provider: "Codex CLI".into(),
+                model: Some("resolved-model".into()),
+            }.resolved_event(),
+            &mut events,
+        ).await.unwrap();
+
+        assert_eq!(broker.session.resolved_model.as_deref(), Some("resolved-model"));
+        let persisted = broker.store.load_session(&broker.session.id).unwrap().unwrap();
+        assert_eq!(persisted.resolved_model.as_deref(), Some("resolved-model"));
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].payload["kind"], "runtime_resolved");
+        assert_eq!(events[0].payload["data"]["model"], "resolved-model");
+        assert_eq!(events[0].payload["data"]["session_id"], broker.session.id);
+        assert!(exchange.turn.is_empty());
+        assert!(runtime.synthetic_turn.is_none());
+        assert!(runtime.retraction_eligible);
     }
 
     #[tokio::test]

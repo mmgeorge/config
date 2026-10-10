@@ -607,6 +607,12 @@ local function on_event(event, payload)
     elseif payload.kind == "agent_updated" then
       state.agent = vim.deepcopy(payload.data or payload)
       require("forge.views.harness.agent_picker").refresh()
+    elseif payload.kind == "runtime_resolved" then
+      local runtime = payload.data or {}
+      if not state.session or runtime.session_id ~= state.session.id then return end
+      state.session.provider_label = runtime.provider
+      state.session.resolved_model = runtime.model
+      M.refresh_winbar()
     elseif payload.kind == "context_usage" then
       if state.session then state.session.context_usage = payload.data or payload end
       M.refresh_winbar()

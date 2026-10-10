@@ -20,8 +20,13 @@ impl CopilotEventDecoder {
         output: &mut BackendOutput,
         event_sink: Option<&BackendEventSink>,
     ) {
-        if let Some(model) = string_field(&provider_event.data, &["model"]) {
+        if provider_event.agent_id.is_none()
+            && let Some(model) = string_field(&provider_event.data, &["model"])
+            && !model.is_empty()
+            && output.runtime.model.as_ref() != Some(&model)
+        {
             output.runtime.model = Some(model);
+            publish(output.runtime.resolved_event(), output, event_sink).await;
         }
         match provider_event.event_type.as_str() {
             "assistant.turn_start" | "assistant.turn_end" => {
@@ -302,6 +307,9 @@ impl CopilotEventDecoder {
 }
 
 fn address_event(event: &mut BackendEvent, output: &BackendOutput) {
+    if event.kind == "runtime_resolved" {
+        return;
+    }
     if event.address.is_none() {
         let thread_id = event
             .data
@@ -592,6 +600,30 @@ mod test {
             event_type: event_type.into(),
             data,
         }
+    }
+
+    #[tokio::test]
+    async fn publishes_root_model_before_turn_and_ignores_child_model() {
+        let decoder = CopilotEventDecoder;
+        let mut output = BackendOutput {
+            runtime: crate::backend::BackendRuntime {
+                provider: "Copilot CLI".into(),
+                model: None,
+            },
+            ..BackendOutput::default()
+        };
+        decoder.decode(&event("session.start", json!({"model":"root-model"})), &mut output, None).await;
+        assert_eq!(output.event.len(), 1);
+        assert_eq!(output.event[0].kind, "runtime_resolved");
+        assert_eq!(output.event[0].data["model"], "root-model");
+        assert!(output.event[0].address.is_none());
+
+        let mut child = event("session.start", json!({"model":"child-model"}));
+        child.agent_id = Some("child".into());
+        decoder.decode(&child, &mut output, None).await;
+        decoder.decode(&event("session.start", json!({"model":"root-model"})), &mut output, None).await;
+        assert_eq!(output.runtime.model.as_deref(), Some("root-model"));
+        assert_eq!(output.event.len(), 1);
     }
 
     #[tokio::test]

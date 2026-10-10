@@ -2581,6 +2581,12 @@ Codex resolves the configured `default` sentinel through the `isDefault` entry f
 model catalog into the same picker and applies supported reasoning effort when it creates,
 resumes, or reconfigures the active session. Before resolution, the winbar says `resolving model`
 instead of presenting `default` as though it were a real model ID.
+Codex publishes `runtime_resolved` immediately after selecting its model, before starting
+the provider turn. Copilot publishes the same event when the root session reports its model.
+The broker persists this identity and forwards it directly to the winbar without waiting for
+turn completion or a model-picker catalog request. Runtime identity events have no turn
+address or transcript content, and child-agent model reports cannot replace the session model.
+Catalog lookups only fill an unresolved default and never overwrite an observed runtime model.
 
 `/rename <name>` routes directly to the broker's durable `session.rename` request rather
 than entering the model transcript. The broker retains rename metadata without displaying a

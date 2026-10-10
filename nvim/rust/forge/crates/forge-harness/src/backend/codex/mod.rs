@@ -1009,6 +1009,12 @@ impl Backend for CodexBackend {
         let resolved_model = self.resolve_model(&request, process, &mut output).await?;
         output.runtime.provider = "Codex CLI".into();
         output.runtime.model = Some(resolved_model);
+        let runtime_event = output.runtime.resolved_event();
+        if let Some(sink) = coordinator_event_sink.as_ref() {
+            sink.send_wait(runtime_event).await?;
+        } else {
+            output.event.push(runtime_event);
+        }
         let dynamic_tool_list = ControlToolRegistry
             .definition_list()
             .into_iter()

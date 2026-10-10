@@ -95,6 +95,19 @@ local success, failure = xpcall(function()
   assert(tab_title:find("123456789012345678901234567890", 1, true) and not tab_title:find("extra", 1, true),
     "tab must show only the first 30 session-name characters")
   state.busy = true
+  state.session.model, state.session.resolved_model = "default", nil
+  receive("backend_event", { kind = "runtime_resolved", data = {
+    session_id = "native-controller", provider = "Mock CLI", model = "resolved-model",
+  } }, "native-controller")
+  title = vim.api.nvim_eval_statusline(vim.wo[state.transcript_win].winbar,
+    { use_winbar = true, maxwidth = 200 }).str
+  assert(title:find("resolved-model", 1, true) and not title:find("resolving model", 1, true),
+    "running session did not publish the resolved model immediately")
+  receive("backend_event", { kind = "runtime_resolved", data = {
+    session_id = "other-session", model = "wrong-model",
+  } }, "native-controller")
+  assert(state.session.resolved_model == "resolved-model", "foreign runtime replaced the active model")
+  state.session.model, state.session.resolved_model = "mock", nil
   state.recap = { text = "Old recap" }
   receive("backend_event", { kind = "turn_started" }, "native-controller")
   assert(state.recap == nil and state.busy, "provider continuation retained recap or changed busy state")

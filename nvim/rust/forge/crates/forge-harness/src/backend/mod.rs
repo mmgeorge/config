@@ -379,6 +379,23 @@ pub struct BackendRuntime {
     pub model: Option<String>,
 }
 
+impl BackendRuntime {
+    /// Publishes resolved provider identity independently of turn content and completion.
+    pub fn resolved_event(&self) -> BackendEvent {
+        BackendEvent {
+            received_at_ms: None,
+            address: None,
+            turn_boundary: None,
+            kind: "runtime_resolved".into(),
+            text: None,
+            data: serde_json::json!(self),
+            activity: None,
+            summary: None,
+            task_update: None,
+        }
+    }
+}
+
 /// Represents one measured provider phase returned to broker diagnostics.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendTimingRecord {
