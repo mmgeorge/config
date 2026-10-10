@@ -110,6 +110,7 @@ impl TimelineStream {
         let Some(index) = self.exchange_owner.get(&exchange.id).copied() else { return Ok(None); };
         let Some(address) = event.address.as_ref() else { return Ok(None); };
         let Some(activity) = event.activity.as_ref() else { return Ok(None); };
+        if activity.kind == crate::backend::ToolActivityKind::FileChange { return Ok(None); }
         let entry_id = self.entry_list[index].id();
         let target = self.entry_list[index].exchange_mut(&exchange.id).expect("indexed exchange");
         let Some(turn) = target.turn.iter_mut().find(|turn| turn.provider() == address) else { return Ok(None); };
@@ -409,6 +410,48 @@ mod test {
             created_at_ms: 0,
             status: kind,
         }
+    }
+
+    #[test]
+    fn file_edit_output_reconciles_the_change_node_without_a_tool_cache() -> anyhow::Result<()> {
+        use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
+        let mut exchange: crate::exchange::Exchange = serde_json::from_value(serde_json::json!({
+            "id":"edit", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Implement", "kind":"chat", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = ProviderAddress { thread_id:"thread".into(), turn_id:"turn".into() };
+        exchange.start_turn(address.clone(), 0)?;
+        let mut event = BackendEvent {
+            received_at_ms:None, address:Some(address), turn_boundary:None, kind:"tool".into(),
+            text:None, data:serde_json::Value::Null, summary:None, task_update:None,
+            activity:Some(ToolActivity {
+                id:"patch".into(), kind:ToolActivityKind::FileChange, title:"file changes".into(),
+                output:None, output_delta:false, status:Some("running".into()), change:Default::default(),
+            }),
+        };
+        exchange.observe_turn(&event, 1)?;
+        let mut stream = TimelineStream::new("session".into());
+        stream.initialize(vec![TimelineEntry::Exchange {
+            id:exchange.id.clone(), created_at_ms:0, exchange:exchange.clone(), agent_by_id:Default::default(),
+        }])?;
+        let activity = event.activity.as_mut().unwrap();
+        activity.output = Some("Patch context did not match".into());
+        activity.output_delta = true;
+        activity.status = Some("failed".into());
+        exchange.observe_turn(&event, 2)?;
+        assert!(stream.append_tool_output(&exchange, &event)?.is_none());
+        assert_eq!(stream.revision(), 1);
+        let patch = stream.update_live(Some(&exchange), None, SessionPhase::Idle)?;
+        assert!(matches!(patch.operation.as_slice(), [TimelineOperation::Replace { .. }]));
+        let TimelineEntry::Exchange { exchange:updated, .. } = &stream.entry_list()[0] else {
+            panic!("expected reconciled exchange");
+        };
+        let tool = updated.turn[0].tools().next().unwrap();
+        assert_eq!(tool.output, "Patch context did not match");
+        assert!(tool.failed);
+        Ok(())
     }
 
     #[test]

@@ -11,29 +11,21 @@ local native_option = { number = false, relativenumber = false, signcolumn = "no
 
 local function release_window(view)
   if view.document_folds then
-    presentation.release(view.window, view, function() require("forge.folds").release(view.window) end)
+    presentation.release(view.window, view, function() require("forge.nodes").release(view.window) end)
   end
 end
 
 local function present(view)
   if not view.document_folds then return end
-  require("forge.folds").attach(view.session, view.window)
+  require("forge.nodes").attach(view.session, view.window)
   local applied = vim.deepcopy(native_option)
   applied.virtualedit = view.virtualedit
   if view.scrolloff ~= nil then applied.scrolloff = view.scrolloff end
   applied.statuscolumn = string.rep(" ", view.margin)
   for name, value in pairs(view.columns) do applied[name] = value end
   if view.fold_markers then
-    applied.statuscolumn = "%{%v:lua.require'forge.folds'.sign()%}"
+    applied.statuscolumn = "%{%v:lua.require'forge.nodes'.sign()%}"
     applied.signcolumn, applied.foldcolumn = view.columns.signcolumn or "no", "0"
-    local fillchars = {}
-    for item in vim.wo[view.window].fillchars:gmatch("[^,]+") do
-      if not item:match("^foldopen:") and not item:match("^foldclose:") and not item:match("^foldsep:") then
-        fillchars[#fillchars + 1] = item
-      end
-    end
-    vim.list_extend(fillchars, { "foldopen:▾", "foldclose:▸", "foldsep: " })
-    applied.fillchars = table.concat(fillchars, ",")
   end
   if view.conceal then
     applied.conceallevel = view.conceal.level
@@ -57,7 +49,7 @@ end
 ---@field active boolean
 ---@field document string
 ---@field effect table<string, boolean>
----@field document_folds boolean Whether this view owns native document fold options.
+---@field document_folds boolean Whether this view owns projected document presentation.
 ---@field margin integer Number of fixed leading display cells.
 ---@field scrolloff? integer Minimum context rows around the cursor.
 ---@field fold_markers boolean Whether the status column displays window-local timeline markers.
@@ -135,7 +127,9 @@ function M.capture(session, view, action)
   view.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
   view.effect = {}
   return { document = session.document, revision = session.revision, view = view.id, sequence = view.sequence,
-    action = action, block = location.block, position = location.position, target = location.target }
+    action = action, block = location.block,
+    position = session.locate and location.position
+      or require("forge.node_projection").source_position(session, location.block, location.position), target = location.target }
 end
 
 ---@param view ForgeInputView

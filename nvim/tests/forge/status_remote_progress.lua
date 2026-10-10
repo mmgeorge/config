@@ -22,7 +22,7 @@ local snapshot = { document = replica.document, revision = 0, view = { kind = "s
 assert(render.apply_snapshot(replica, snapshot).kind == "Applied")
 local view = require("forge.input").open(replica, vim.api.nvim_get_current_win())
 local file_row = select(2, replica.sequence:position("file:1")) + 1
-vim.cmd(file_row .. "foldopen")
+require("forge.buffer").set_expansion(replica, "file:1", true)
 assert(render.apply_body(replica, { document = replica.document, file = 1, generation = 1, more = false,
   state = { state = "ready" }, snapshot = { document = "body:1:1", revision = 1, block = {
     { id = "body:line", text = { "expanded source" }, metadata = { target = {}, decoration = {}, editable_region = {}, fold = {} } },
@@ -39,7 +39,7 @@ local function expect(value)
   assert(vim.api.nvim_get_current_buf() == replica.buffer, "remote operation switched the Status buffer")
   assert(replica.status == "Applied", "remote progress desynchronized Status")
   assert(replica.file[1].body == body, "header progress discarded the expanded diff")
-  assert(vim.fn.foldclosed(select(2, replica.sequence:position("file:1")) + 1) == -1, "header progress closed the expanded file")
+  assert(not require("forge.nodes").closed(replica, "file:1"), "header progress closed the expanded file")
   assert(text():find(value, 1, true), "missing progress: " .. value .. "\n" .. text())
 end
 local buffer_count = #vim.api.nvim_list_bufs()

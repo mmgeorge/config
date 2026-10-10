@@ -56,7 +56,6 @@ function M.apply(session, view, effect)
       view.effect[effect.id] = true
       if effect.jump then vim.api.nvim_win_call(view.window, function() vim.cmd("normal! m'") end) end
       vim.api.nvim_win_set_cursor(view.window, { start_row + position.row + 1, position.column })
-      vim.api.nvim_win_call(view.window, function() vim.cmd("normal! zv") end)
       if effect.viewport then require("forge.buffer_view").restore_viewport(session, effect.viewport) end
       view.cursor = vim.api.nvim_win_get_cursor(view.window)
     elseif effect.kind == "open_source" then
@@ -102,7 +101,7 @@ function M.apply(session, view, effect)
       view.effect[effect.id] = true
       vim.api.nvim_win_call(view.window, function()
         vim.api.nvim_cmd({ cmd = command, args = { effect.path } }, {})
-        require("forge.folds").restore_inherited(view.window, vim.api.nvim_get_current_win())
+        require("forge.nodes").restore_inherited(view.window, vim.api.nvim_get_current_win())
         local target = vim.api.nvim_get_current_buf()
         row = math.min(row, vim.api.nvim_buf_line_count(target) - 1)
         local text = vim.api.nvim_buf_get_lines(target, row, row + 1, true)[1]

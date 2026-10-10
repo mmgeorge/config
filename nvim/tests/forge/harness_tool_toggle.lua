@@ -22,7 +22,7 @@ local success, failure = xpcall(function()
   requests[1].callback({ transcript = { document = opened.document, revision = 0, block = {
     { id = "call:tool", text = { "tool()", "one", "two", "three", "four", "…(2 hidden)" },
       metadata = { node = { id = "call:tool", kind = "tool", lifecycle = "settled",
-        generation = 1, content_revision = 1, loaded_rows = 5, loaded_bytes = 20,
+        generation = 1, content_revision = 1, loaded_rows = 5, loaded_bytes = 20, order = 0, more = false,
         default_display = "heading", display = "full", expansion = true },
         target = { { id = "call:tool", range = {
         start = { row = 0, column = 0 }, ["end"] = { row = 6, column = 0 },

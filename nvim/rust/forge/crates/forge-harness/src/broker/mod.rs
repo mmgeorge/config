@@ -4549,6 +4549,10 @@ Planning continuation: turn {} of {}.",
                 .require_settled_exchange_tree(&self.session.id, &descendants)?;
 
             let WorkspaceKind::Git(workspace) = &self.workspace_kind else {
+                let mut changes = crate::exchange::ProviderDiffBuilder::default();
+                self.visit_provider_exchanges(interaction, |exchange| changes.record(exchange))?;
+                interaction.attributed_diff_text = changes.finish();
+                interaction.attributed_matches_checkpoint = false;
                 interaction.finish(outcome, self.clock.now_ms())?;
                 return Ok(None);
             };
@@ -4626,9 +4630,19 @@ Planning continuation: turn {} of {}.",
         interaction: &Exchange,
     ) -> Result<ProviderChangeIndex> {
         let mut index = ProviderChangeIndex::default();
-        index.record(interaction);
+        self.visit_provider_exchanges(interaction, |exchange| index.record(exchange))?;
+        Ok(index)
+    }
+
+    fn visit_provider_exchanges(
+        &self,
+        interaction: &Exchange,
+        mut visit: impl FnMut(&Exchange),
+    ) -> Result<()> {
+        visit(interaction);
         let mut pending = referenced_child_exchange_list(interaction);
         let mut visited = HashSet::new();
+        visited.insert(interaction.id.clone());
         while let Some((agent_id, exchange_id)) = pending.pop() {
             if !visited.insert(exchange_id.clone()) {
                 continue;
@@ -4639,11 +4653,11 @@ Planning continuation: turn {} of {}.",
                 .into_iter()
                 .find(|record| record.id == exchange_id)
             {
-                index.record(&record);
+                visit(&record);
                 pending.extend(referenced_child_exchange_list(&record));
             }
         }
-        Ok(index)
+        Ok(())
     }
 
     async fn process_backend_event(
@@ -12782,6 +12796,39 @@ mod test {
     }
 
     #[tokio::test]
+    async fn non_git_exchanges_save_reported_changes_without_initializing_repository() {
+        let workspace = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = HarnessBroker::initialize_with_clock(
+            InitializeRequest {
+                data_root: data.path().to_string_lossy().into_owned(),
+                permission_file: None,
+                workspace: workspace.path().to_string_lossy().into_owned(),
+                client_id: "reported-edits-test".into(),
+                backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+                model: "mock-model".into(), effort: "low".into(), session_id: None,
+                new_session_name: None, goal_max_turns: 20, lease_conflict_action: None,
+            },
+            Box::new(FixedClock(300)),
+        ).unwrap();
+        broker.backend = Arc::new(NestedWriteBackend);
+        let result = broker.dispatch(Request {
+            id: 1, method: "prompt.submit".into(), params: json!({"text":"create a module"}),
+        }).await;
+        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
+        let exchange = &exchanges[0];
+        assert_eq!(exchange.state, ExchangeState::Complete);
+        assert!(exchange.checkpoint_before.is_none() && exchange.checkpoint_after.is_none());
+        assert!(exchange.checkpoint_diff_text.is_none());
+        assert!(!exchange.attributed_matches_checkpoint);
+        let diff = exchange.attributed_diff_text.as_deref().expect("persisted reported edits");
+        assert!(diff.contains("seed.txt") && diff.contains("+provider edit"));
+        assert!(!diff.contains("apps/new/deep/module/lib.rs"), "command edits have no provider provenance");
+        assert!(!workspace.path().join(".git").exists());
+    }
+
+    #[tokio::test]
     async fn provider_and_command_changes_use_separate_diff_sources() {
         let repository = repository();
         std::fs::write(repository.path().join(".gitignore"), "target/\n").unwrap();
@@ -12933,9 +12980,9 @@ mod test {
         );
     }
 
-    #[test]
-    fn provider_change_index_includes_referenced_child_turns() {
-        let repository = repository();
+    #[tokio::test]
+    async fn provider_change_index_includes_referenced_child_turns() {
+        let repository = tempfile::tempdir().unwrap();
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
@@ -13000,7 +13047,7 @@ mod test {
 
         child_interaction.agent_id = child_run_id.into();
         broker.store.save_exchange(&child_interaction).unwrap();
-        let parent_interaction = completed_interaction(
+        let mut parent_interaction = completed_interaction(
             "parent-interaction",
             &broker.session.id,
             vec![ExchangeNode::AgentReference {
@@ -13024,6 +13071,11 @@ mod test {
             index.paths().iter().map(String::as_str).collect::<Vec<_>>(),
             vec!["child.rs"]
         );
+        parent_interaction.state = ExchangeState::Running;
+        parent_interaction.completed_at_ms = None;
+        broker.capture_final_checkpoint(&mut parent_interaction, ExchangeState::Complete).await.unwrap();
+        let diff = parent_interaction.attributed_diff_text.as_deref().expect("reported child edits");
+        assert!(diff.contains("child.rs") && !diff.contains("unrelated.rs"));
     }
 
     #[tokio::test]

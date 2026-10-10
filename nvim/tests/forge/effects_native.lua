@@ -79,10 +79,8 @@ local ok, failure = xpcall(function()
     { id = "body", text = { "header", "file", "hunk", "body" }, metadata = { target = {}, decoration = {}, editable_region = {} } },
   } }).kind == "Applied")
   vim.api.nvim_win_call(view.window, function()
-    vim.wo.foldmethod = "manual"
-    vim.cmd("2,4fold")
     vim.api.nvim_win_set_cursor(0, { 1, 0 })
-    assert(vim.fn.foldclosed(3) == 2)
+    assert(not vim.wo.foldenable)
   end)
   assert(input.capture(session, view, "navigate"))
   local navigation = { id = "navigate", document = session.document, revision = 1, view = view.id,
@@ -91,7 +89,7 @@ local ok, failure = xpcall(function()
   assert(effects.apply(session, view, navigation) == "Applied")
   assert(vim.api.nvim_get_current_win() == foreground, "cursor effect changed the foreground window")
   assert(vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), { 3, 0 }))
-  assert(vim.api.nvim_win_call(view.window, function() return vim.fn.foldclosed(3) end) == -1,
+  assert(not vim.wo[view.window].foldenable,
     "cursor effect left its destination hidden in a closed fold")
   input.close(view)
 end, debug.traceback)

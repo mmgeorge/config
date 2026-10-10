@@ -67,7 +67,7 @@ local ok, failure = xpcall(function()
   assert_true(vim.wait(2000, function() return state.replica.status == "Applied" end, 10),
     "native Status did not apply the merged hunk snapshot")
   vim.api.nvim_win_set_cursor(0, { 4, 0 })
-  vim.cmd("normal! za")
+  vim.fn.maparg("<Tab>", "n", false, true).callback()
   status.demand(state)
   assert(vim.wait(2000, function() return state.replica.file[1].body ~= nil end))
   local lines = vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false)

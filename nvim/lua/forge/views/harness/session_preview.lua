@@ -23,9 +23,7 @@ function SessionPreview.open(transcript_win)
   vim.wo[transcript_win].breakindent = true
   vim.wo[transcript_win].breakindentopt = "shift:0"
   vim.wo[transcript_win].foldmethod = "manual"
-  vim.wo[transcript_win].foldenable = true
-  vim.wo[transcript_win].foldtext = "v:lua.require'forge.render.harness.interaction_tree'.foldtext()"
-  vim.wo[transcript_win].fillchars = "fold: "
+  vim.wo[transcript_win].foldenable = false
   layout.configure_gutterless_window(transcript_win)
   layout.attach_scroll_boundary(preview_buf, transcript_win)
   active = {

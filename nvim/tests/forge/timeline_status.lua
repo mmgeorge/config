@@ -11,7 +11,7 @@ local view = require("forge.input").open(transcript, vim.api.nvim_get_current_wi
   fold_markers = true, columns = { signcolumn = "yes:1", statuscolumn = "%s" },
 })
 assert(vim.wo.signcolumn == "yes:1", "fold markers hid the status sign column")
-assert(vim.wo.statuscolumn == "%{%v:lua.require'forge.folds'.sign()%}",
+assert(vim.wo.statuscolumn == "%{%v:lua.require'forge.nodes'.sign()%}",
   "timeline must use one marker column")
 local revision = 0
 local function publish(text, animated, context)

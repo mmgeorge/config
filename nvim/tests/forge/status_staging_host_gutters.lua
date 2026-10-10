@@ -39,16 +39,16 @@ local ok, failure = xpcall(function()
   key("<Tab>")
   await(function()
     local _, current_row = state.replica.sequence:position("file:" .. neighbor)
-    return vim.fn.foldclosed(current_row + 1) == -1 and not next(client._client.pending)
+    return not require("forge.nodes").closed(state.replica, "file:" .. neighbor) and not next(client._client.pending)
   end, "neighbor expansion")
   local function audit_neighbor()
     local _, current_row = state.replica.sequence:position("file:" .. neighbor)
-    assert(vim.fn.foldlevel(current_row + 1) > 0, "neighbor lost its fold")
-    assert(vim.fn.foldclosed(current_row + 1) == -1, "mutation closed the expanded neighboring file")
+    assert(state.replica.fold.record["file:" .. neighbor] ~= nil, "neighbor lost its fold")
+    assert(not require("forge.nodes").closed(state.replica, "file:" .. neighbor), "mutation closed the expanded neighboring file")
     for _, file in ipairs(state.replica.inventory.file) do
       if file.path ~= "source_01.rs" and file.path ~= "source_02.rs" then
         local _, file_row = state.replica.sequence:position("file:" .. file.id)
-        assert(vim.fn.foldclosed(file_row + 1) == file_row + 1, "mutation opened unrelated file " .. file.path)
+        assert(require("forge.nodes").closed(state.replica, "file:" .. file.id), "mutation opened unrelated file " .. file.path)
       end
     end
   end

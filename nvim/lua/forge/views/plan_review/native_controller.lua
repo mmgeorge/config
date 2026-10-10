@@ -9,107 +9,14 @@ local buffer = require("forge.buffer")
 
 local function notice(message) notifications.error(message, "ForgePlanReview") end
 
----@class ForgeNativePlanFold
----@field id string
----@field owner string
----@field heading_start_line integer
----@field start_line integer
----@field end_line integer
----@field record table
-
----@param review table
----@return ForgeNativePlanFold[]
-local function task_folds(review, owner)
-  local replica = owner and owner.replica or (review.owner and review.owner.replica)
-  local state = replica and replica.fold
-  local result = {}
-  for id, record in pairs(state and state.record or {}) do
-    if id:match("^plan:design:") or id:match("^plan:section:") then
-      local _, block_row = replica.sequence:position(record.owner)
-      block_row = buffer.physical_row(replica, block_row)
-      local heading_row = block_row
-      if record.fold.heading_start then
-        heading_row = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold.heading_start.block)) + record.fold.heading_start.position.row)
-      end
-      local finish_block_row = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold["end"].block)))
-      result[#result + 1] = {
-        id = id,
-        owner = record.owner,
-        heading_start_line = heading_row + 1,
-        start_line = buffer.physical_row(replica, select(2, replica.sequence:position(record.owner)) + record.fold.start.row) + 1,
-        end_line = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold["end"].block)) + record.fold["end"].position.row + 1),
-        record = record,
-      }
-    end
-  end
-  table.sort(result, function(left, right)
-    if left.start_line == right.start_line then return left.end_line < right.end_line end
-    return left.start_line < right.start_line
-  end)
-  return result
-end
-
----@param review table
----@param owner table?
----@return ForgeNativePlanFold[]
-local function default_closed_folds(review, owner)
-  local replica = owner and owner.replica or (review.owner and review.owner.replica)
-  local state = replica and replica.fold
-  local result = {}
-  for id, record in pairs(state and state.record or {}) do
-    if record.fold.closed and not (id:match("^plan:design:") or id:match("^plan:section:")) then
-      local _, block_row = replica.sequence:position(record.owner)
-      local finish_block_row = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold["end"].block)))
-      result[#result + 1] = {
-        id = id,
-        owner = record.owner,
-        heading_start_line = buffer.physical_row(replica, block_row) + 1,
-        start_line = buffer.physical_row(replica, block_row + record.fold.start.row) + 1,
-        end_line = buffer.physical_row(replica, select(2, replica.sequence:position(record.fold["end"].block)) + record.fold["end"].position.row + 1),
-        record = record,
-      }
-    end
-  end
-  return result
-end
-
----@param review table
----@param id string
----@param folded boolean
-local function set_task_folded(review, id, folded)
-  review.task_folded_by_id[id] = folded
-end
-
----@param review table
----@param window integer
-local function apply_task_folds(review, window, owner)
-  if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= review.buf then return end
-  vim.api.nvim_win_call(window, function()
-    local saved_view = vim.fn.winsaveview()
-    vim.cmd("silent! normal! zx")
-    local folds = task_folds(review, owner)
-    vim.list_extend(folds, default_closed_folds(review, owner))
-    table.sort(folds, function(left, right) return left.start_line > right.start_line end)
-    for _, fold in ipairs(folds) do
-      local closed = review.task_folded_by_id[fold.id]
-      if closed == nil then closed = fold.record.fold.closed end
-      if closed then
-        vim.api.nvim_win_set_cursor(window, { fold.start_line, 0 })
-        vim.cmd("silent! normal! zc")
-      end
-    end
-    vim.fn.winrestview(saved_view)
-  end)
-end
 
 ---@param review table
 ---@param on_projected fun()
 local function toggle_task_fold(review, on_projected)
   local view = review.owner.current_view()
   if not view then return end
-  require("forge.folds").toggle_heading(review.owner.replica, view.window, {
+  require("forge.nodes").toggle_heading(review.owner.replica, view.window, {
     on_projected = on_projected,
-    on_toggled = function(id, closed) set_task_folded(review, id, closed) end,
   })
 end
 
@@ -156,7 +63,7 @@ local function show_document(review, snapshot, title, filetype, selection)
   if buffer.apply_snapshot(replica, snapshot).kind ~= "Applied" then buffer.close(replica) return end
   if selection then
     vim.api.nvim_win_set_cursor(window, { selection.row + 1, selection.column })
-    vim.api.nvim_win_call(window, function() vim.cmd("normal! zv") end)
+
   end
   local closed = false
   local function close()
@@ -226,7 +133,7 @@ local function action(review, name)
       refresh_winbar(review)
     elseif name == "comment" or name == "question" then
       if result.local_draft then
-        vim.cmd("silent! normal! zv")
+
         vim.cmd("startinsert")
         return
       end
@@ -235,7 +142,7 @@ local function action(review, name)
       if row and view then
         vim.api.nvim_set_current_win(view.window)
         vim.api.nvim_win_set_cursor(view.window, { row + result.row + 1, 0 })
-        vim.cmd("silent! normal! zv")
+
         vim.cmd("startinsert")
       end
     elseif name == "delete" then
@@ -409,7 +316,7 @@ function M.open(plan)
   vim.bo[native_buffer].bufhidden = "hide"
   vim.bo[native_buffer].swapfile = false
   local review = { plan = plan, buf = native_buffer, win = window, tab = vim.api.nvim_get_current_tabpage(),
-    return_win = origin, return_tab = origin_tab, session_id = session.harness.session.id, task_folded_by_id = {} }
+    return_win = origin, return_tab = origin_tab, session_id = session.harness.session.id }
   session.harness.plan_review = review
   local loading_commands = command_set.new()
   command_set.register(loading_commands, "close", function() close_review(review) end)
@@ -417,8 +324,7 @@ function M.open(plan)
   keymaps.apply_view_winbar(window, "PlanReview", "plan_review", loading_commands, "Loading review")
   review.owner = require("forge.views.plan_review.document").attach({ plan = plan, session_id = review.session_id,
     buffer = native_buffer, window = window, recovery = recovery, notice = notice,
-    recovery_provider = recovery and function() return previous.owner.recovery() end or nil,
-    configure_view = function(view, owner) apply_task_folds(review, view.window, owner) end }, function(owner, failure)
+    recovery_provider = recovery and function() return previous.owner.recovery() end or nil }, function(owner, failure)
     if failure then
       discard_failed_attachment(review)
       if recovery then session.harness.plan_review = previous end
@@ -427,7 +333,6 @@ function M.open(plan)
     end
     review.owner = owner
     review.public_only = owner.public_only
-    apply_task_folds(review, owner.view.window)
     local set = commands(review)
     review.command_set = set
     keymaps.setup_view_keymaps(native_buffer, "plan_review", set)

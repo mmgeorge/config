@@ -70,10 +70,6 @@ function M.viewport(session, window)
     local range_list = {}
     local row, after = vim.fn.line("w0") - 1, math.min(vim.fn.line("w$"), session.sequence:rows())
     while row < after do
-      local closed = vim.fn.foldclosedend(row + 1)
-      if closed >= 0 then
-        row = closed
-      else
         local node = session.sequence:locate(row)
         if not node then break end
         local _, first = session.sequence:position(node.id)
@@ -85,7 +81,6 @@ function M.viewport(session, window)
             id = node.id, version = entry.version, generation = session.markdown_generation }
         end
         row = first + entry.row_count
-      end
     end
     return range_list
   end)

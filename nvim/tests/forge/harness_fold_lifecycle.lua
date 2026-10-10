@@ -1,6 +1,6 @@
 vim.opt.runtimepath:prepend("nvim")
 local buffer = require("forge.buffer")
-local folds = require("forge.folds")
+local folds = require("forge.nodes")
 local owner = buffer.open("harness-fold-lifecycle")
 vim.api.nvim_set_current_buf(owner.buffer)
 local function metadata(id, endpoint, rows)
@@ -27,23 +27,20 @@ local second_window = vim.api.nvim_get_current_win()
 folds.attach(owner, second_window)
 
 local function check()
-  local last = 3 + #tool_rows
+  local exchange_closed = folds.closed(owner, "exchange")
+  local tools_closed = folds.closed(owner, "tools")
+  local expected = exchange_closed and 3 or tools_closed and 5 or 4 + #tool_rows
+  assert(vim.api.nvim_buf_line_count(owner.buffer) == expected)
   for _, window in ipairs({ first_window, second_window }) do
-    vim.api.nvim_win_call(window, function()
-      for row = 1, last + 1 do
-        local expected = row >= 4 and row <= last and 2 or row >= 2 and row <= last and 1 or 0
-        assert(vim.fn.foldlevel(row) == expected,
-          ("revision %d, row %d: expected fold depth %d, got %d"):format(owner.revision, row, expected, vim.fn.foldlevel(row)))
-      end
-    end)
+    assert(not vim.wo[window].foldenable)
   end
-  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(owner.buffer, 3, last, true), tool_rows))
+  assert(vim.deep_equal(owner.projection.source.block.tools.text, tool_rows))
 end
 
 local function patch(text_edit, metadata_edit, next_rows)
   local result = buffer.apply_patch(owner, {
     document = owner.document, base = owner.revision, next = owner.revision + 1,
-    base_rows = owner.row_count, next_rows = next_rows or owner.row_count,
+    base_rows = owner.projection.source.row_count, next_rows = next_rows or owner.projection.source.row_count,
     base_blocks = 5, next_blocks = 5, block_edit = {}, removed_block = {},
     text_edit = text_edit, metadata_edit = metadata_edit or {},
   })

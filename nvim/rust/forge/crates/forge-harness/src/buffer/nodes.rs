@@ -205,7 +205,9 @@ impl NodeMap {
         let revision = state.content_revision;
         let source = block.metadata.node.as_mut().expect("validated source node");
         source.generation = generation;
-        source.resolve(self.choice.get(&source.id.0).copied());
+        if let Some(expanded) = self.choice.get(&source.id.0).copied() {
+            source.resolve(Some(expanded));
+        }
         source.content_revision = revision;
     }
 }

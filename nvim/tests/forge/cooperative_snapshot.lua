@@ -1,6 +1,6 @@
 vim.loader.enable(false)
 local buffer = require("forge.buffer")
-local folds = require("forge.folds")
+local folds = require("forge.nodes")
 local input = require("forge.input")
 local block = {}
 for index = 1, 3000 do
@@ -26,9 +26,9 @@ assert(not input.capture(replica, view, "activate"), "partial snapshot accepted 
 assert(vim.wait(10000, function() return result ~= nil end, 1), "snapshot did not settle")
 assert(result.kind == "Applied", result.diagnostic)
 assert(tick > 20, "snapshot blocked the main loop")
-assert(replica.revision == 7 and replica.row_count == 30000)
-assert(vim.api.nvim_buf_get_lines(replica.buffer, 29999, 30000, true)[1] == "history 3000 row 10")
-assert(vim.fn.foldclosed(29991) == 29991, "scheduled fold construction lost the last fold")
+assert(replica.revision == 7 and replica.row_count == 3000)
+assert(vim.api.nvim_buf_get_lines(replica.buffer, 2999, 3000, true)[1] == "history 3000 row 1")
+assert(folds.closed(replica, "fold:3000"), "scheduled projection lost the last node")
 assert(not vim.bo[replica.buffer].modifiable)
 assert(replica.update_timing.maximum_prepare_ms < 50, "snapshot preparation exceeded 50ms")
 assert(replica.update_timing.maximum_commit_ms < 250, "atomic snapshot commit exceeded 250ms")
@@ -55,10 +55,10 @@ vim.api.nvim_buf_set_lines = write_lines
 assert(recovering.kind == "Applied", recovering.diagnostic)
 assert(vim.api.nvim_win_get_cursor(view.window)[1] == 93,
   "recovery lost the reader's latest cursor identity when rows were inserted above it")
-assert(vim.api.nvim_get_current_line() == "history 10 row 1", "recovery selected a different history entry")
+assert(vim.api.nvim_get_current_line() == "history 91 row 1", "recovery selected a different history entry")
 assert(replica.update_timing.maximum_prepare_ms < 50, "recovery preparation exceeded 50ms")
 assert(recovery_writes == 1, "snapshot cleared or incrementally refilled the live buffer")
-assert(vim.fn.foldclosed(29993) == 29993)
+assert(folds.closed(replica, "fold:3000"))
 local patch_result
 local replacement = {}
 for row = 1, 30000 do replacement[row] = "expanded output row " .. row end

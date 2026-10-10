@@ -2,7 +2,7 @@ local M = {}
 local editable = require("forge.editable")
 local snapshot_transfer = require("forge.snapshot")
 local BlockSequence = require("forge.block_sequence")
-local folds = require("forge.folds")
+local nodes = require("forge.nodes")
 local node_contract = require("forge.node_contract")
 local decorations = require("forge.decorations")
 local buffer_view = require("forge.buffer_view")
@@ -187,6 +187,7 @@ function M.open(document, options)
     vim.bo[buffer].modifiable = false
   end
   local session = {
+    source_projected = options.source_projected == true,
     physical = physical, generated = generated, previous_native = previous_native,
     preserve_view = options.preserve_view == true,
     before_commit = options.before_commit,
@@ -361,7 +362,7 @@ function M.preflight(session, patch, options)
           region_owner[editable_region.id] = id
         end
       end
-      folds.validate(session.sequence, changed, retired, session.fold, read_row)
+      nodes.validate(session.sequence, changed, retired, session.fold, read_row)
       node_contract.validate(session.sequence, changed, retired, session)
     end)
     session.sequence:rollback()
@@ -479,7 +480,7 @@ local function attach_regions(session, prepared)
   end
 end
 
---- Applies descending edits while preserving native fold membership for unchanged rows.
+--- Applies descending edits while retaining untouched text and extmarks.
 ---@param buffer integer
 ---@param edits {start_row: integer, removed_rows: integer, text: string[]}[]
 ---@param empty? boolean Whether the old document consists only of Neovim's placeholder line.
@@ -532,16 +533,13 @@ local function commit_patch(session, patch)
       if edit.removed_rows ~= 1 or #edit.text ~= 1 then prepared.retain_folds = false break end
     end
     local readonly = vim.bo[session.buffer].readonly
-    ok, prepared.failure = pcall(folds.prepare, session, prepared, patch.text_edit)
-    checkpoint("fold_capture")
-    if not ok then finish("fold_capture_failed") return M.fail_apply(session, prepared.failure) end
     ok, prepared.failure = pcall(function()
       assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
       session.applying = true
       change_sequence(session.sequence, patch, prepared.block)
       for id in pairs(prepared.retired) do session.block[id] = nil end
       for id, entry in pairs(prepared.block) do session.block[id] = entry end
-      folds.update(session, prepared, false)
+      nodes.update(session, prepared, false)
       checkpoint("sequence_and_folds")
       editable.applying(session.editable, true)
       if not session.physical then
@@ -579,8 +577,6 @@ local function commit_patch(session, patch)
     ok, prepared.failure = pcall(function()
       decorations.attach(session)
       checkpoint("decorations")
-      folds.refresh(session)
-      checkpoint("fold_refresh")
       buffer_view.restore(session, retained_view)
       checkpoint("view_restore")
     end)
@@ -590,14 +586,14 @@ local function commit_patch(session, patch)
   end)
 end
 
-function M.apply_patch(session, patch)
+function M.apply_projected_patch(session, patch)
   if session.status == "Closed" then return { kind = "Closed" } end
   if session.local_projection then return { kind = "Deferred" } end
   if editable.suspend_generated_text(session.editable) then return { kind = "Deferred" } end
   return commit_patch(session, patch)
 end
 
-function M.apply_snapshot(session, snapshot)
+function M.apply_projected_snapshot(session, snapshot)
   if session.status == "Closed" then return { kind = "Closed" } end
   if session.expected_changedtick ~= nil and vim.api.nvim_buf_is_valid(session.buffer)
     and vim.api.nvim_buf_get_changedtick(session.buffer) ~= session.expected_changedtick
@@ -637,7 +633,7 @@ function M.apply_snapshot(session, snapshot)
       for _, editable_region in ipairs(entry.metadata.editable_region) do region_owner[editable_region.id] = id end
       cooperative.checkpoint()
     end
-    folds.validate(sequence, changed, {}, nil, function(row) return text[row + 1] end)
+    nodes.validate(sequence, changed, {}, nil, function(row) return text[row + 1] end)
     node_contract.validate(sequence, changed, {})
     return { sequence = sequence, block = block, text = text, region = region, changed = changed,
       position = position, region_owner = region_owner, retired = {} }
@@ -649,8 +645,6 @@ function M.apply_snapshot(session, snapshot)
       return prepared.block[id] ~= nil and prepared.block[id].row_count > 0
     end)
     local readonly = vim.bo[session.buffer].readonly
-    ok, prepared.failure = pcall(folds.reset, session)
-    if not ok then return M.fail_apply(session, prepared.failure) end
     ok, prepared.failure = pcall(function()
       assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
       editable.detach(session.editable)
@@ -663,7 +657,7 @@ function M.apply_snapshot(session, snapshot)
         session.generated_owned = true
       end
       session.sequence, session.block, session.region_owner = prepared.sequence, prepared.block, prepared.region_owner
-      folds.update(session, prepared, true)
+      nodes.update(session, prepared, true)
       if not session.physical then
         vim.bo[session.buffer].readonly = false
         vim.bo[session.buffer].modifiable = true
@@ -684,7 +678,6 @@ function M.apply_snapshot(session, snapshot)
     session.expected_changedtick = nil
     ok, prepared.failure = pcall(function()
       decorations.attach(session)
-      folds.refresh(session)
       buffer_view.restore(session, retained_view)
     end)
     if not ok then return M.fail_apply(session, prepared.failure) end
@@ -760,7 +753,7 @@ local function release(session, preserve_buffer)
     session.lifecycle_autocmd = nil
   end
   editable.detach(session.editable)
-  folds.detach(session)
+  nodes.detach(session)
   decorations.detach(session)
   if vim.api.nvim_buf_is_valid(session.buffer) then
     if preserve_buffer or session.physical or (session.generated and not session.generated_owned) then
@@ -879,37 +872,161 @@ end
 
 ---@param snapshot table
 ---@return ForgeBufferFragment
-function M.fragment(snapshot)
+function M.fragment(snapshot, editable_source, previous)
   identity(snapshot.document)
   counter(snapshot.revision)
-  local fragment = { document = snapshot.document, revision = snapshot.revision, fragment = true,
+  local fragment = { document = snapshot.document, revision = snapshot.revision, fragment = true, editable_source = editable_source,
     status = "Applied", row_count = 0, block = {}, marks = {}, region_owner = {} }
   local order, entries, text, changed, position = {}, {}, {}, {}, {}
   for _, block in ipairs(array(snapshot.block)) do
     identity(block.id)
     assert(not fragment.block[block.id], "duplicate body block")
-    local entry = { row_count = #rows(block.text), text = block.text, metadata = block.metadata }
+    local entry = previous and previous.block[block.id]
+    if not entry or entry.text ~= block.text or entry.metadata ~= block.metadata then
+      entry = { row_count = #rows(block.text), text = block.text, metadata = block.metadata }
+      decorations.prepare(entry)
+    end
     fragment.block[block.id] = entry
     order[#order + 1], entries[#entries + 1] = block.id, { id = block.id, entry = entry }
     changed[block.id], position[block.id] = true, #text
     vim.list_extend(text, block.text)
-    decorations.prepare(entry)
   end
   local region = validate_order(order, fragment.block, #text, function(row) return text[row + 1] end)
-  assert(next(region) == nil, "status bodies cannot contain editable regions")
+  assert(editable_source or next(region) == nil, "status bodies cannot contain editable regions")
+  for id, entry in pairs(fragment.block) do
+    for _, field in ipairs(entry.metadata.editable_region) do fragment.region_owner[field.id] = id end
+  end
   fragment.sequence, fragment.row_count = BlockSequence.from(entries), #text
-  folds.validate(fragment.sequence, changed, {}, nil, function(row) return text[row + 1] end)
+  nodes.validate(fragment.sequence, changed, {}, nil, function(row) return text[row + 1] end)
   node_contract.validate(fragment.sequence, changed, {})
   node_contract.update(fragment, { block = fragment.block, changed = changed, retired = {} }, true)
-  folds.update(fragment, { block = fragment.block, changed = changed, retired = {} }, true)
+  nodes.update(fragment, { block = fragment.block, changed = changed, retired = {} }, true)
   return fragment
+end
+
+local function publish_projection(session)
+  local projection = require("forge.node_projection")
+  local snapshot, mapping = projection.render(session.projection)
+  local owner = session.projection
+  session.next_projection_mapping = mapping
+  local result
+  if session.revision == nil or session.status ~= "Applied" then
+    result = M.apply_projected_snapshot(session, snapshot)
+  else
+    local patch = projection.patch(session, snapshot)
+    patch.next = patch.base + 1
+    result = M.apply_projected_patch(session, patch)
+  end
+  if result.kind == "Applied" then
+    session.revision = owner.source.revision
+    result.revision = session.revision
+    owner.blocks, owner.mapping = snapshot.block, mapping
+  end
+  session.next_projection_mapping = nil
+  return result
+end
+
+function M.apply_snapshot(session, snapshot)
+  if session.physical or session.source_projected then return M.apply_projected_snapshot(session, snapshot) end
+  if editable.suspend_generated_text(session.editable) then return {kind="Deferred"} end
+  local nested = session.projection ~= nil
+  for _, block in ipairs(snapshot.block) do nested = nested or #(block.metadata.fold or {}) > 0 end
+  if not nested then return M.apply_projected_snapshot(session, snapshot) end
+  local ok, source = pcall(M.fragment, snapshot, true, session.projection and session.projection.source)
+  if not ok then return M.fail_apply(session, source) end
+  source.editable_source = true
+  local owner = session.projection or require("forge.node_projection").new(source)
+  owner.source = source
+  session.projection = owner
+  local applied, result = pcall(publish_projection, session)
+  if not applied then session.next_projection_mapping = nil return M.fail_apply(session, result) end
+  return result
+end
+
+function M.apply_patch(session, patch)
+  if session.physical or session.source_projected then return M.apply_projected_patch(session, patch) end
+  if editable.suspend_generated_text(session.editable) then return {kind="Deferred"} end
+  if not session.projection then
+    local nested = false
+    for _, edit in ipairs(patch.metadata_edit or {}) do nested = nested or #(edit.metadata.fold or {}) > 0 end
+    if not nested then return M.apply_projected_patch(session, patch) end
+    local snapshot = {document=session.document,revision=session.revision,block={}}
+    for index=0,session.sequence:count()-1 do
+      local node=session.sequence:at(index)
+      local _,start=session.sequence:position(node.id)
+      snapshot.block[#snapshot.block+1]={id=node.id,metadata=node.entry.metadata,
+        text=vim.api.nvim_buf_get_lines(session.buffer,start,start+node.entry.row_count,true)}
+    end
+    local source=M.fragment(snapshot,true)
+    session.projection=require("forge.node_projection").new(source)
+    session.projection.blocks=snapshot.block
+  end
+  local owner = session.projection
+  if not owner then return M.fail_apply(session, "document projection requires a snapshot") end
+  local ok, failure = pcall(function()
+    local source = owner.source
+    local prepared = M.prepare_fragment_patch(source, patch)
+    M.apply_fragment_patch(source, patch, prepared)
+  end)
+  if not ok then return M.fail_apply(session, failure) end
+  local applied, result = pcall(publish_projection, session)
+  if not applied then session.next_projection_mapping = nil return M.fail_apply(session, result) end
+  return result
+end
+
+function M.set_expansion(session, id, expanded)
+  if not session.projection then return false end
+  local owner = session.projection
+  local previous = vim.tbl_extend("force", {}, owner.choice)
+  owner.choice[id] = not expanded
+  local source = owner.source
+  local record = source.fold.record[id]
+  if not record then owner.choice = previous return false end
+  local definition = record.fold
+  if expanded and definition.expand_children or not expanded and definition.collapse_children then
+    local _, start = source.sequence:position(record.owner)
+    local _, finish = source.sequence:position(definition["end"].block)
+    start, finish = start + definition.start.row, finish + definition["end"].position.row
+    for child_id, child in pairs(source.fold.record) do
+      local _, first = source.sequence:position(child.owner)
+      local _, last = source.sequence:position(child.fold["end"].block)
+      first, last = first + child.fold.start.row, last + child.fold["end"].position.row
+      if child_id ~= id and first > start and last <= finish then owner.choice[child_id] = not expanded end
+    end
+  end
+  local preserve_view = session.preserve_view
+  session.preserve_view = true
+  local ok, result = pcall(function()
+    if session.project_source then return session.project_source() end
+    return publish_projection(session)
+  end)
+  session.preserve_view = preserve_view
+  if not ok then result = M.fail_apply(session, result) end
+  if result ~= true and (type(result) ~= "table" or result.kind ~= "Applied") then owner.choice = previous return false end
+  return true
 end
 
 ---@param fragment ForgeBufferFragment
 ---@param patch table
----@param read_original fun(row: integer): string
 ---@return table
-function M.prepare_fragment_patch(fragment, patch, read_original)
+function M.prepare_fragment_patch(fragment, patch)
+  local original = {}
+  for index = 0, fragment.sequence:count() - 1 do
+    local node = fragment.sequence:at(index)
+    local _, start = fragment.sequence:position(node.id)
+    original[#original + 1] = { start = start, entry = node.entry }
+  end
+  local function retained_row(row)
+    local low, high = 1, #original
+    while low <= high do
+      local middle = math.floor((low + high) / 2)
+      local item = original[middle]
+      if row < item.start then high = middle - 1
+      elseif row >= item.start + item.entry.row_count then low = middle + 1
+      else return item.entry.text[row-item.start+1] end
+    end
+    error("source row is missing")
+  end
   local function read_row(row)
     local delta = 0
     for index = #patch.text_edit, 1, -1 do
@@ -919,10 +1036,10 @@ function M.prepare_fragment_patch(fragment, patch, read_original)
       if row < start + #edit.text then return edit.text[row - start + 1] end
       delta = delta + #edit.text - edit.removed_rows
     end
-    return read_original(row - delta)
+    return retained_row(row - delta)
   end
   local prepared = M.preflight(fragment, patch, { read_row = read_row })
-  assert(next(prepared.region) == nil, "status bodies cannot contain editable regions")
+  assert(fragment.editable_source or next(prepared.region) == nil, "status bodies cannot contain editable regions")
   for id, entry in pairs(prepared.block) do
     entry.text = {}
     for row = 0, entry.row_count - 1 do entry.text[row + 1] = read_row(prepared.position[id] + row) end
@@ -930,7 +1047,7 @@ function M.prepare_fragment_patch(fragment, patch, read_original)
   return prepared
 end
 
---- Adopts a validated fragment patch after its owner has removed affected native folds.
+--- Adopts a validated source patch without changing its visible projection.
 ---@param fragment ForgeBufferFragment
 ---@param patch table
 ---@param prepared table
@@ -939,7 +1056,9 @@ function M.apply_fragment_patch(fragment, patch, prepared)
   for id in pairs(prepared.retired) do fragment.block[id] = nil end
   for id, entry in pairs(prepared.block) do fragment.block[id] = entry end
   node_contract.update(fragment, prepared, false)
-  folds.update(fragment, prepared, false)
+  nodes.update(fragment, prepared, false)
+  for id in pairs(prepared.released_region) do fragment.region_owner[id] = nil end
+  for id, owner in pairs(prepared.region_owner) do fragment.region_owner[id] = owner end
   fragment.revision, fragment.row_count = patch.next, patch.next_rows
 end
 

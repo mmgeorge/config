@@ -19,7 +19,7 @@ assert(vim.wo.wrap and vim.wo.linebreak and not vim.wo.breakindent and vim.wo.st
 local original = vim.api.nvim_buf_get_lines(replica.buffer, 0, -1, false)
 local function verify()
   for _, role in ipairs({ "head", "upstream", "push" }) do
-    local block = replica.block["status:context:" .. role]
+    local block = replica.source_entry["status:context:" .. role]
     local _, start = replica.sequence:position("status:context:" .. role)
     assert(#block.chunk == 1, "header was split into physical buffer lines")
     local parts = {}

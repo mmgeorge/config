@@ -64,8 +64,19 @@ function M.capture(session, retained)
       local block, offset = node.id, original_row - start
       if not retained(block) then
         block, offset = nil, 0
+        local ancestor_size
+        for _, record in pairs(session.fold and session.fold.record or {}) do
+          local _, first = session.sequence:position(record.owner)
+          local _, last = session.sequence:position(record.fold["end"].block)
+          first = first + record.fold.start.row
+          last = last + record.fold["end"].position.row
+          if original_row >= first and original_row < last and retained(record.owner)
+            and (not ancestor_size or last - first < ancestor_size) then
+            block, offset, ancestor_size = record.owner, record.fold.start.row, last - first
+          end
+        end
         local distance
-        for _, direction in ipairs({ -1, 1 }) do
+        for _, direction in ipairs(block and {} or { -1, 1 }) do
           local candidate_index = index + direction
           while candidate_index >= 0 and candidate_index < session.sequence:count() do
             local candidate = session.sequence:at(candidate_index)
@@ -85,6 +96,8 @@ function M.capture(session, retained)
       end
       result[#result + 1] = {
         window = window, block = block, row = offset, original_row = original_row, column = cursor[2],
+        source_row = block and session.projection and not session.project_source
+          and require("forge.node_projection").source_position(session, block, {row=offset,column=0}).row or nil,
         view = vim.api.nvim_win_call(window, vim.fn.winsaveview),
       }
     end
@@ -101,12 +114,14 @@ function M.restore(session, retained)
       local node = saved.block and session.sequence.node[saved.block]
       if node then
         local _, start = session.sequence:position(saved.block)
-        row = start + math.min(saved.row, node.entry.row_count - 1)
+        local offset = saved.row
+        if saved.source_row and session.next_projection_mapping then
+          offset = require("forge.node_projection").visible_position(session.next_projection_mapping, saved.block, saved.source_row) or 0
+        end
+        row = start + math.min(offset, node.entry.row_count - 1)
       end
       vim.api.nvim_win_call(saved.window, function()
-        local closed = vim.fn.foldclosed(row + 1)
         local column = saved.column
-        if closed >= 0 then row, column = closed - 1, 0 end
         local line = vim.api.nvim_buf_get_lines(session.buffer, row, row + 1, true)[1] or ""
         local insertion = vim.api.nvim_get_current_win() == saved.window and vim.fn.mode(1):match("^[iR]") ~= nil
         column = math.min(column, math.max(0, #line - (insertion and 0 or 1)))

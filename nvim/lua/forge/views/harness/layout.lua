@@ -70,9 +70,7 @@ function M.configure_transcript_window(win)
   vim.wo[win].breakindent = true
   vim.wo[win].breakindentopt = "shift:0"
   vim.wo[win].foldmethod = "manual"
-  vim.wo[win].foldenable = true
-  vim.wo[win].foldtext = "v:lua.require'forge.render.harness.interaction_tree'.foldtext()"
-  vim.wo[win].fillchars = "fold: "
+  vim.wo[win].foldenable = false
   M.configure_gutterless_window(win)
 end
 

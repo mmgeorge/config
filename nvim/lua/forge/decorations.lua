@@ -70,7 +70,7 @@ vim.api.nvim_set_decoration_provider(namespace, {
     local relative = location.position.row
     if relative == 0 then
       require("forge.content_layout").draw_fold(window, buffer, namespace, row,
-        node.entry.metadata.layout, node.entry.metadata.node)
+        node.entry.metadata.layout, require("forge.nodes").display(node.entry))
     end
     emit(node.entry.visible_decoration, buffer, row, relative)
     local source_overlay = node.entry.source_overlay_row[relative]

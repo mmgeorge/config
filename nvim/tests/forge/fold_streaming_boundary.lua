@@ -1,6 +1,6 @@
 vim.opt.runtimepath:prepend("nvim")
 local buffer = require("forge.buffer")
-local folds = require("forge.folds")
+local folds = require("forge.nodes")
 
 local function metadata(definition)
   return { target = {}, decoration = {}, editable_region = {}, fold = definition or {} }
@@ -42,15 +42,12 @@ for _, count in ipairs({ 4, 7, 2, 0, 4 }) do
     metadata_edit = { { block = "output", row_count = count, metadata = metadata() } },
   })
   assert(result.kind == "Applied", vim.inspect(result))
+  assert(owner.row_count == 7 + count)
+  assert(folds.closed(owner, "sibling"), "stream update opened its sibling")
+  assert(not owner.sequence.node["end"], "empty boundary should not add a visible row")
   for _, window in ipairs({ first_window, second_window }) do
-    vim.api.nvim_win_call(window, function()
-      for row = 6, 6 + count do
-        assert(vim.fn.foldlevel(row) == 3,
-          ("streamed output escaped its enclosing folds at row %d: expected 3, got %d"):format(row, vim.fn.foldlevel(row)))
-      end
-      assert(vim.fn.foldclosed(7 + count) == 7 + count,
-        "streaming output changed its sibling's closed state")
-    end)
+    assert(not vim.wo[window].foldenable)
+    assert(vim.api.nvim_win_get_buf(window) == owner.buffer)
   end
   previous = count
 end

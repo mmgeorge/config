@@ -133,6 +133,34 @@ pub fn project<'source>(
     project_at_with_separator(entry.into(), width, now_ms, leading_separator, expansion, tool_limit)
 }
 
+fn reported_changes(exchange: &Exchange, agents: &HashMap<&str, &TimelineEntry>) -> Option<String> {
+    fn record(
+        builder: &mut crate::exchange::ProviderDiffBuilder,
+        exchange: &Exchange,
+        agents: &HashMap<&str, &TimelineEntry>,
+        visited: &mut std::collections::HashSet<String>,
+    ) {
+        if !visited.insert(exchange.id.clone()) { return; }
+        builder.record(exchange);
+        for node in &exchange.node_list {
+            let ExchangeNode::AgentReference { agent } = node else { continue };
+            let Some(TimelineEntry::AgentLifecycle { exchange, agent: children, .. }) = agents
+                .get(agent.id.as_str()).or_else(|| agents.get(agent.child_agent_id.as_str())).copied()
+            else { continue };
+            let Some(exchange) = exchange.iter().find(|exchange| exchange.id == agent.child_exchange_id)
+            else { continue };
+            let children = children.iter().filter_map(|entry| match entry {
+                TimelineEntry::AgentLifecycle { id, .. } => Some((id.as_str(), entry)),
+                _ => None,
+            }).collect();
+            record(builder, exchange, &children, visited);
+        }
+    }
+    let mut builder = crate::exchange::ProviderDiffBuilder::default();
+    record(&mut builder, exchange, agents, &mut std::collections::HashSet::new());
+    builder.finish()
+}
+
 fn tool_group_label<'tool>(calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>,
     settled: bool, now_ms: i64) -> String {
     let mut count = 0;
@@ -850,12 +878,19 @@ impl TimelineRenderer<'_> {
         }
         self.content(interaction, agents, depth, &layout.results, Some(&layout.questions), MarkdownRole::Response)?;
         self.verification_result(interaction)?;
-        if let Some(diff) = &interaction.attributed_diff_text {
+        let reported = if interaction.completed_at_ms.is_some()
+            && interaction.checkpoint_after.is_none() && interaction.attributed_diff_text.is_none()
+        {
+            reported_changes(interaction, agents)
+        } else { None };
+        if let Some(diff) = interaction.attributed_diff_text.as_ref().or(reported.as_ref()) {
             self.diff(
                 &format!("{}:changes", interaction.id),
                 "Changed",
                 diff,
-                if interaction.attributed_matches_checkpoint {
+                if interaction.checkpoint_after.is_none() {
+                    " · reported edits"
+                } else if interaction.attributed_matches_checkpoint {
                     " · checkpoint matched"
                 } else {
                     ""
@@ -1042,12 +1077,26 @@ impl TimelineRenderer<'_> {
                                 self.offset_layout(start, 1);
                             }
                         }
-                        crate::turn::TurnItem::Tool { .. } => {
+                        crate::turn::TurnItem::Tool { id: tool_id } => {
                             if rendered_tool.contains(id) {
                                 continue;
                             }
-                            let group = visible.iter().skip(position).take_while(|node| matches!(node,
-                                ExchangeNode::TurnContent { turn_id: owner, item: crate::turn::TurnItem::Tool { .. }, .. } if owner == turn_id));
+                            let tool = turn.tools().find(|tool| tool.id == *tool_id)
+                                .context("timeline content references a missing tool")?;
+                            if tool.kind == "file_change" {
+                                let start = self.block.len();
+                                self.margin += 2;
+                                self.file_change(id, tool)?;
+                                self.margin -= 2;
+                                self.offset_layout(start, 1);
+                                continue;
+                            }
+                            let group = visible.iter().skip(position).take_while(|node| match node {
+                                ExchangeNode::TurnContent { turn_id: owner, item: crate::turn::TurnItem::Tool { id }, .. }
+                                    if owner == turn_id => turn.tools().find(|tool| tool.id == *id)
+                                        .is_some_and(|tool| tool.kind != "file_change"),
+                                _ => false,
+                            });
                             let mut calls = Vec::new();
                             for node in group {
                                 let ExchangeNode::TurnContent {
@@ -1086,16 +1135,9 @@ impl TimelineRenderer<'_> {
                             let group_id = format!("{id}:tools");
                             let label = tool_group_label(calls.iter().map(|(_, tool)| *tool), settled, self.now_ms);
                             self.literal(&group_id, &label, None)?;
-                            for (index, (id, tool)) in calls.into_iter().enumerate() {
+                            for (index, (_, tool)) in calls.into_iter().enumerate() {
                                 let tool_start = self.block.len();
                                 self.tool(turn.id(), tool, &group_id, !settled && index + 1 == count)?;
-                                if tool.state() != crate::turn::ToolState::Running {
-                                    if let Some(diff) = crate::exchange::ProviderDiffBuilder::build(std::slice::from_ref(tool)) {
-                                        let diff_start = self.block.len();
-                                        self.diff(&format!("{id}:changes"), "Changed", &diff, "", None, None)?;
-                                        self.offset_layout(diff_start, 2);
-                                    }
-                                }
                                 let node = format!("{}:{}:tool", turn.id(), tool.id);
                                 self.fold(tool_start, &node, settled || index + 1 < count, NodeKind::Tool);
                                 if let Some(node) = &mut self.block[tool_start].metadata.node {
@@ -1342,6 +1384,33 @@ impl TimelineRenderer<'_> {
         let section = self.begin_section(2);
         self.content(exchange, agents, depth, &clarification.content, None, MarkdownRole::Message)?;
         self.finish_section(section, &id, closed);
+        Ok(())
+    }
+
+    fn file_change(&mut self, id: &str, tool: &crate::exchange::ToolCall) -> Result<()> {
+        use crate::turn::ToolState;
+        let identity = format!("{id}:changes");
+        if let Some(diff) = crate::exchange::ProviderDiffBuilder::build(std::slice::from_ref(tool)) {
+            return self.diff(&identity, "Changed", &diff, "", None, None);
+        }
+        let label = match tool.state() {
+            ToolState::Running => {
+                let count = tool.change.file.len();
+                if count == 0 { "Changing files".into() }
+                else { format!("Changing {count} {}", if count == 1 { "file" } else { "files" }) }
+            }
+            ToolState::Completed if !tool.failed => "Changed files · details unavailable".into(),
+            ToolState::Completed | ToolState::Failed => "File changes failed".into(),
+            ToolState::Cancelled => "File changes cancelled".into(),
+            ToolState::Interrupted => "File changes interrupted".into(),
+        };
+        let details = tool.state() != ToolState::Running && !tool.output.trim().is_empty();
+        self.literal(&identity, &format!("{} {label}", if details { "▸" } else { "◇" }), None)?;
+        if details {
+            let section = self.begin_section(2);
+            self.markdown(&format!("{identity}:details"), &tool.output, MarkdownRole::Detail)?;
+            self.finish_section(section, &identity, true);
+        }
         Ok(())
     }
 
@@ -2442,6 +2511,82 @@ mod tests {
     }
 
     #[test]
+    fn file_changes_split_tool_groups_and_restore_non_git_summary() -> anyhow::Result<()> {
+        use crate::backend::{BackendEvent, ProviderAddress, ProviderChangeKind, ProviderChangeSet,
+            ProviderFileChange, ToolActivity, ToolActivityKind, TurnBoundary};
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"edits", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Implement", "kind":"plan_execution", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        exchange.resume(0)?;
+        let address = ProviderAddress { thread_id:"thread".into(), turn_id:"turn".into() };
+        exchange.start_turn(address.clone(), 0)?;
+        let mut event = BackendEvent {
+            received_at_ms:None, address:Some(address), turn_boundary:None, kind:"tool".into(),
+            text:None, data:serde_json::Value::Null, activity:None, summary:None, task_update:None,
+        };
+        for (index, (id, kind, status, diff)) in [
+            ("inspect", ToolActivityKind::Command, "completed", ""),
+            ("add", ToolActivityKind::FileChange, "completed", "@@ -0,0 +1 @@\n+first"),
+            ("read", ToolActivityKind::Command, "completed", ""),
+            ("edit", ToolActivityKind::FileChange, "completed", "@@ -1 +1 @@\n-first\n+second"),
+            ("rejected", ToolActivityKind::FileChange, "failed", "@@ -1 +1 @@\n-second\n+wrong"),
+            ("check", ToolActivityKind::Command, "completed", ""),
+        ].into_iter().enumerate() {
+            let file_change = kind == ToolActivityKind::FileChange;
+            event.activity = Some(ToolActivity {
+                id:id.into(), kind, title:if file_change { "file changes".into() } else { id.into() },
+                output:None, output_delta:false, status:Some("running".into()),
+                change:ProviderChangeSet { file:if file_change { vec![ProviderFileChange {
+                    path:"src/lib.rs".into(), move_path:None,
+                    kind:if id == "add" { ProviderChangeKind::Add } else { ProviderChangeKind::Update },
+                    diff:diff.into(),
+                }] } else { Vec::new() } },
+            });
+            exchange.observe_turn(&event, index as i64 * 10 + 1)?;
+            if file_change {
+                let projected = project_at(&TimelineEntry::Exchange {
+                    id:"edits".into(), created_at_ms:0, exchange:exchange.clone(), agent_by_id:HashMap::new(),
+                }, &WidthProfile::default(), 100)?;
+                assert!(projected.entry.block.iter().any(|block| block.text.wire_rows().join("").contains("Changing 1 file")));
+            }
+            event.activity.as_mut().unwrap().status = Some(status.into());
+            exchange.observe_turn(&event, index as i64 * 10 + 2)?;
+        }
+        event.activity = None;
+        event.turn_boundary = Some(TurnBoundary::Finished { outcome:crate::turn::TurnOutcome::Completed });
+        exchange.observe_turn(&event, 70)?;
+        exchange.finish(crate::exchange::ExchangeState::Complete, 70)?;
+        let restored = serde_json::from_value(serde_json::to_value(exchange)?)?;
+        let projected = project_at(&TimelineEntry::Exchange {
+            id:"edits".into(), created_at_ms:0, exchange:restored, agent_by_id:HashMap::new(),
+        }, &WidthProfile::default(), 100)?;
+        let blocks = &projected.entry.block;
+        let groups: Vec<_> = blocks.iter().filter(|block| block.id.0.ends_with(":tools")).collect();
+        assert_eq!(groups.len(), 3);
+        assert!(groups.iter().all(|block| block.text.wire_rows().join("").contains("Ran 1 tool")));
+        let headings: Vec<_> = blocks.iter().filter(|block| block.id.0.ends_with(":changes"))
+            .map(|block| block.text.wire_rows().join("")).collect();
+        assert_eq!(headings.len(), 4);
+        assert!(headings[0].contains("Changed 1 file") && headings[1].contains("Changed 1 file"));
+        assert!(headings[2].contains("File changes failed"));
+        assert!(headings[3].contains("Changed 1 file") && headings[3].contains("reported edits"));
+        assert_eq!(projected.tool.len(), 3, "file edits must not register generic output views");
+        assert!(!blocks.iter().any(|block| block.text.wire_rows().join("").contains("file changes")));
+        let summary = blocks.iter().position(|block| block.id.0 == "edits:changes").unwrap();
+        let activity = blocks.iter().find(|block| block.metadata.fold.iter().any(|fold| fold.id.0 == "edits:exchange")).unwrap();
+        let endpoint = &activity.metadata.fold.iter().find(|fold| fold.id.0 == "edits:exchange").unwrap().end.block;
+        assert!(blocks.iter().position(|block| &block.id == endpoint).unwrap() < summary);
+        let aggregate = match projected.action.get(&super::TargetId("edits:changes".into())).unwrap() {
+            super::TranscriptAction::Diff { text } => text,
+            _ => panic!("aggregate must expose its reported patch"),
+        };
+        assert!(aggregate.contains("+first") && aggregate.contains("+second") && !aggregate.contains("+wrong"));
+        Ok(())
+    }
+
+    #[test]
     fn tool_groups_align_mixed_durations_as_running_timers_change() {
         use crate::backend::{BackendEvent, ProviderAddress, ToolActivity, ToolActivityKind};
         let mut exchange: Exchange = serde_json::from_value(json!({
@@ -3097,16 +3242,16 @@ mod tests {
         assert_eq!(streaming_response.metadata.layout, completed_response.metadata.layout,
             "completion must not change final response indentation");
         let commentary = text.find("Inspecting ownership").unwrap();
-        let tools = text.find("Ran 1 tool").unwrap();
+        let changes = text.find("Changed 1 file").unwrap();
         let steering = text.find("Also check tests").unwrap();
         let response = text.find("Finished the work").unwrap();
-        assert!(commentary < tools && tools < steering && steering < response);
+        assert!(commentary < changes && changes < steering && steering < response);
         assert_eq!(text.matches("Finished the work").count(), 1);
-        assert_eq!(projected.tool.len(), 1);
+        assert!(projected.tool.is_empty(), "file edits must not create generic tool output");
         assert!(
             projected.action.values().any(|action| matches!(action,
             super::TranscriptAction::Diff { text } if text.contains("owned.rs"))),
-            "native tool lost its derived file diff"
+            "file edit lost its derived diff"
         );
         let summary = projected
             .entry

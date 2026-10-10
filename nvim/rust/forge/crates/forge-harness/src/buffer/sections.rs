@@ -765,6 +765,9 @@ fn render(
             let loaded_bytes = output[heading + 1..].iter().map(|block|block.text.byte_count()).sum();
             if let Some(node) = &mut output[heading].metadata.node {
                 node.resolve(intent.get(id).copied());
+                if expanded && node.display == forge_buffer::node::NodeDisplay::Heading {
+                    node.display = forge_buffer::node::NodeDisplay::Full;
+                }
                 node.loaded_rows = loaded_rows;
                 node.loaded_bytes = loaded_bytes;
                 node.more = more;
@@ -1232,6 +1235,15 @@ mod tests {
             .cloned()
             .collect();
         assert_eq!(first_body.len(), 3, "a page counts rows across small hunks");
+        for block in &first.block {
+            if let Some(node) = &block.metadata.node
+                && node.kind == forge_buffer::node::NodeKind::Hunk
+                && first_body.iter().any(|body| body.metadata.content_node.as_ref() == Some(&node.id))
+            {
+                assert_eq!(node.display, forge_buffer::node::NodeDisplay::Full,
+                    "a materialized hunk must not advertise a collapsed heading");
+            }
+        }
         assert!(
             first
                 .block

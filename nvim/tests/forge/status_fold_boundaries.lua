@@ -13,7 +13,7 @@ assert(render.apply_snapshot(replica, { document = replica.document, revision = 
   head = { state = "attached", reference = "refs/heads/main", object = "abc123" }, context = vim.NIL,
   section = { { kind = "unstaged", file = { 1, 2 } } }, file = { record(1), record(2) } }).kind == "Applied")
 local view = input.open(replica, vim.api.nvim_get_current_win(), { margin = 0 })
-vim.cmd("4foldopen")
+assert(require("forge.nodes").set_open(replica, 0, "file:1", true))
 local function metadata(definitions)
   return { target = {}, decoration = {}, editable_region = {}, fold = definitions or {} }
 end
@@ -36,11 +36,9 @@ for _, count in ipairs({ 5, 1, 0, 4 }) do
       text_edit = { { start_row = 1, removed_rows = previous, text = text } }, block_edit = {}, removed_block = {},
       metadata_edit = { { block = "content", row_count = count, metadata = metadata() } } },
   }).kind == "Applied", table.concat(notices, "\n"))
-  for row = 5, 5 + count do
-    assert(vim.fn.foldlevel(row) == 3, "body update lost a section, file, or hunk fold at " .. row)
-  end
-  assert(vim.fn.foldlevel(4) == 2 and vim.fn.foldclosed(4) == -1, "body update changed its file state")
-  assert(vim.fn.foldclosed(6 + count) == 6 + count, "body update opened the next file")
+  assert(replica.row_count == 6 + count)
+  assert(not require("forge.nodes").closed(replica,"file:1"))
+  assert(require("forge.nodes").closed(replica,"file:2"))
   previous = count
 end
 assert(#notices == 0, table.concat(notices, "\n"))
@@ -55,7 +53,7 @@ local invalid = render.apply_body(replica, { document = replica.document, file =
 assert(invalid.kind == "Desynchronized" and #notices == 1, "invalid patch did not report failure")
 assert(body.revision == revision and vim.deep_equal(text, vim.api.nvim_buf_get_lines(replica.buffer, 0, -1, true)),
   "invalid patch changed the committed body")
-assert(vim.fn.foldlevel(9) == 3 and vim.fn.foldclosed(10) == 10, "invalid patch changed native folds")
+assert(require("forge.nodes").closed(replica,"file:2"), "invalid patch changed expansion state")
 input.close(view)
 render.close(replica)
 print("status fold boundaries: body resizing, empty output, and invalid patch preservation passed")

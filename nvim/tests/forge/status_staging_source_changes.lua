@@ -34,15 +34,10 @@ local function select_file(path, section)
 end
 
 local function source_row(text, select)
-  for id, block in pairs(state.replica.block) do
-    for offset, row in ipairs(block.text or {}) do
-      if row:find(text, 1, true) then
-        if select then
-          local _, start = state.replica.sequence:position(id)
-          vim.api.nvim_win_set_cursor(0, { start + offset, 0 })
-        end
-        return true
-      end
+  for row, value in ipairs(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false)) do
+    if value:find(text, 1, true) then
+      if select then vim.api.nvim_win_set_cursor(0, {row, 0}) end
+      return true
     end
   end
   return false
@@ -88,7 +83,7 @@ local ok, failure = xpcall(function()
   end, "reject stale hunk")
   assert(git({ "diff", "--cached", "--name-only" }) == "", "stale hunk changed index")
   select_file("source_01.rs", "unstaged")
-  if vim.fn.foldclosed(vim.api.nvim_win_get_cursor(0)[1]) >= 0 then key("<Tab>") end
+  if require("forge.nodes").closed(state.replica, require("forge.buffer").locate(state.replica, vim.api.nvim_win_get_cursor(0)[1]-1, 0).block) then key("<Tab>") end
   await(function() return settled() and source_row(expected) end, "refresh changed source")
   if retired then assert(not source_row(retired), "retained stale hunk body") end
   audit(true)

@@ -33,7 +33,7 @@ assert(vim.wait(2000, function() return state.ready end), table.concat(notices, 
 assert(state.replica.status == "Applied")
 assert(not pending, "collapsed file triggered demand")
 vim.api.nvim_win_set_cursor(0, { 4, 0 })
-vim.cmd("normal! za")
+assert(require("forge.nodes").toggle_heading(state.replica, vim.api.nvim_get_current_win()))
 status.demand(state)
 assert(vim.wait(2000, function() return pending ~= nil end), table.concat(notices, "\n"))
 pending()

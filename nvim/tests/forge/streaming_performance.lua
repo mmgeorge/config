@@ -1,7 +1,7 @@
 vim.loader.enable(false)
 local buffer = require("forge.buffer")
-local folds = require("forge.folds")
-local session = buffer.open("streaming-performance", { editable = { send = function() return true end } })
+local folds = require("forge.nodes")
+local session = buffer.open("streaming-performance", { source_projected = true, editable = { send = function() return true end } })
 vim.api.nvim_set_current_buf(session.buffer)
 local metadata = function() return { target = {}, decoration = {}, editable_region = {}, fold = {} } end
 local block = {}
@@ -33,7 +33,7 @@ for revision = 1, 100 do
   assert(session.sequence.visits < 200, "streaming traversed retained history")
   assert(native.shadow.sequence.visits < 150, "streaming traversed the editable shadow")
   assert(session.sequence.node["history:1"] == retained_history, "streaming replaced retained history")
-  assert(vim.fn.foldclosed(30001) == -1, "streaming closed the active tool")
+  assert(not folds.closed(session, "tool-fold"), "streaming closed the active tool")
 end
 table.sort(times)
 local result = { rows = 30006, updates = #times, p95_ms = times[95], maximum_ms = times[100], maximum_sequence_visits = maximum_visits }

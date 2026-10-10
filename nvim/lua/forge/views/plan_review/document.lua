@@ -191,15 +191,29 @@ function M.attach(options, callback)
         end_source_line = item.source.end_line, body = item.source.body, kind = item.kind, parent_id = item.parent_id,
         heading = item.kind == "question" and "Plan question" or nil }
     end
+    owner.comment_state = nil
     local source = assert(opened.source_row, "Plan review source rows are missing")
     owner.source = source
+    local projection = require("forge.node_projection")
+    local source_document = buffer.fragment(opened.snapshot, true)
+    local node_owner = owner.replica.projection or projection.new(source_document)
+    node_owner.source = source_document
+    owner.replica.projection = node_owner
+    local function project_source()
+      local _, mapping = projection.render(node_owner)
+      node_owner.mapping = mapping
+      for _, row in ipairs(source) do row.hidden = not projection.contains(node_owner, row.block, row.position.row) end
+      if owner.comment_state then comments.update(options.buffer, {}) end
+      return true
+    end
+    owner.replica.project_source = project_source
+    project_source()
     local source_lines = {}
     for _, row in ipairs(source) do
       source_lines[#source_lines + 1] = row.text
       row.annotation_anchor = row.target ~= nil and row.target ~= vim.NIL and row.source_line > 0
     end
     local namespace = vim.api.nvim_create_namespace("ForgePlanDraftSource" .. options.buffer)
-    local retained_folds, projection_attached
     local function paint(_, _, projection)
       owner.source_generation = (owner.source_generation or 0) + 1
       vim.api.nvim_buf_clear_namespace(options.buffer, namespace, 0, -1)
@@ -220,27 +234,23 @@ function M.attach(options, callback)
         end
       end
       if owner.comment_state and options.configure_view then options.configure_view(owner.view, owner) end
-      if retained_folds then require("forge.folds").restore(owner.replica, retained_folds) retained_folds = nil end
       local ranges = require("forge.views.plan_review.markdown").ranges(source, projection)
       for _, window in ipairs(vim.fn.win_findbuf(options.buffer)) do
         require("forge.render.harness.markdown").render(options.buffer, window, ranges)
       end
     end
+    owner.comment_state = nil
     owner.replica.physical_row = nil
     owner.comment_state = comments.attach(options.buffer, options.window, source_lines, annotation, {
       source_provider = function() return source end, after_render = paint,
-      before_render = function()
-        if projection_attached then retained_folds = require("forge.folds").capture(owner.replica) end
-      end,
       baseline = recovered and baseline or nil,
       readonly = options.plan.historical_revision ~= nil,
       guard_source = true,
     })
     require("forge.draft_source").attach(owner.replica, owner.comment_state, source)
-    projection_attached = true
     show_answers(opened.annotation)
   end
-  owner.replica = buffer.open(owner.document, { buffer = options.buffer, filetype = "ForgePlan", generated = true, preserve_view = true,
+  owner.replica = buffer.open(owner.document, { buffer = options.buffer, filetype = "ForgePlan", generated = true, preserve_view = true, source_projected = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice })
   local function open_view(window)
     local columns = require("forge.window_presentation").capture(window)

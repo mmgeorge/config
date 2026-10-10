@@ -57,10 +57,6 @@ end
 function M.draw_fold(window, buffer, namespace, row, layout, state)
   local marker = layout and layout.marker
   if not marker or marker == vim.NIL or marker.text ~= "▸" or layout.indent == 2 then return end
-  local closed = vim.api.nvim_eval_statusline("%{foldclosed(v:lnum)}", {
-    winid = window, use_statuscol_lnum = row + 1,
-  }).str
-  if closed ~= "-1" then return end
   local icon = state and state.display == "heading" and "▸" or "▾"
   vim.api.nvim_buf_set_extmark(buffer, namespace, row, 0, {
     ephemeral = true, priority = 201,

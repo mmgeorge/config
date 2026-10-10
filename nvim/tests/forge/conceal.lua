@@ -26,9 +26,8 @@ local success, failure = xpcall(function()
   vim.api.nvim_set_current_buf(session.buffer)
   vim.wo.conceallevel = 2
   local view = input.open(session, 0, { conceal = { level = 2, cursor = "" } })
-  assert(vim.fn.foldtextresult(1) == "日本語", "fold summary retained Markdown markers: " .. vim.inspect({ text = vim.fn.foldtextresult(1), level = vim.wo.conceallevel }))
-  vim.wo.conceallevel = 0
-  assert(vim.fn.foldtextresult(1) == source[1], "disabled concealment changed fold text")
+  assert(vim.deep_equal(vim.api.nvim_buf_get_lines(session.buffer, 0, -1, true), {source[1]}))
+  assert(buffer.set_expansion(session, "task", true))
   assert(vim.deep_equal(vim.api.nvim_buf_get_lines(session.buffer, 0, -1, true), source))
   local marks = vim.api.nvim_buf_get_extmarks(session.buffer, session.namespace, 0, -1, { details = true })
   local concealed = 0

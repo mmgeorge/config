@@ -51,7 +51,10 @@ for _, moved_id in ipairs({ 1, 3 }) do
       head = { state = "attached", reference = "main", object = "abc" },
       section = { { kind = "unstaged", file = { 1, 2, 3 } } },
       file = { record(1, "unstaged"), record(2, "unstaged"), record(3, "unstaged") }, pending = {} }).kind == "Applied")
-    for id = 1, 3 do assert(render.apply_body(replica, delivery(id)).kind == "Applied") end
+    for id = 1, 3 do
+      assert(render.apply_body(replica, delivery(id)).kind == "Applied")
+      assert(require("forge.buffer").set_expansion(replica, "file:" .. id, true))
+    end
     check_gutters("initial")
     assert(render.apply_update(replica, { document = replica.document, operation_id = 1, phase = "accepted", diagnostic = {}, body = {},
       delta = { document = replica.document, base = 0, next = 1, removed = {}, pending = { 1 },

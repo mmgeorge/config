@@ -17,7 +17,7 @@ local function snapshot(document)
   local blocks = {
     { id = "file", text = { "Modified source.rs" }, metadata = {
       node = { id = "file", kind = "file", lifecycle = "settled", generation = 1,
-        content_revision = revision, loaded_rows = loaded, loaded_bytes = 0,
+        content_revision = revision, loaded_rows = loaded, loaded_bytes = 0, order = 0, more = false,
         display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
       section = { { id = "file", revision = revision, open = expanded, more = false } },
       fold = { { id = "file", start = { row = 0, column = 0 },
@@ -90,12 +90,12 @@ local ok, failure = xpcall(function()
   }, function() end)
   assert(vim.wait(1000, function() return owner.ready end, 1), table.concat(notices, "\n"))
   assert(owner.toggle_heading(window))
-  assert(vim.wait(1000, function() return expanded and settled() and vim.fn.foldclosed(1) == -1 end, 1))
+  assert(vim.wait(1000, function() return expanded and settled() and owner.transcript.block.file.metadata.node.display == "full" end, 1))
   local initial = loaded
   assert(initial == 2 * vim.api.nvim_win_get_height(window))
   for _ = 1, 5 do owner.observe_sections() end
   assert(page_count() == 0, "visible heading fetched another page")
-  assert(vim.fn.foldclosed(2) == -1, "initial hunk was not opened with its file")
+  assert(owner.transcript.block.hunk ~= nil, "initial hunk was not opened with its file")
 
   hold = true
   vim.api.nvim_win_set_cursor(window, { math.floor(initial / 2) + 4, 0 })
@@ -132,11 +132,11 @@ local ok, failure = xpcall(function()
   -- A stale page response cannot reopen a fold the user has closed.
   delivery.callback({})
   assert(vim.wait(1000, settled, 1))
-  assert(vim.fn.foldclosed(1) == 1)
+  assert(owner.transcript.block.file.metadata.node.display == "heading")
   assert(#notices == 0, table.concat(notices, "\n"))
 
   assert(owner.toggle_heading(window))
-  assert(vim.wait(1000, function() return settled() and vim.fn.foldclosed(1) == -1 end, 1))
+  assert(vim.wait(1000, function() return settled() and owner.transcript.block.file.metadata.node.display == "full" end, 1))
   vim.api.nvim_win_set_cursor(window, { loaded - math.floor(initial / 2) + 4, 0 })
   vim.cmd("normal! zt")
   owner.observe_sections()

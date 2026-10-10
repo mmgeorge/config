@@ -33,7 +33,8 @@ local success, failure = xpcall(function()
     transcript_window = window, is_alive = function() return true end,
     notice = function(message) error(message) end,
   }, function(value, message) assert(value and not message) end)
-  assert(vim.wo[window].signcolumn == "no" and vim.wo[window].statuscolumn:find("forge.folds", 1, true),
+  assert(vim.wo[window].signcolumn == "yes:1" and vim.wo[window].statuscolumn:find("forge.nodes", 1, true)
+    and not vim.wo[window].foldenable and vim.wo[window].foldcolumn == "0",
     "initial transcript must use the shared fold marker column")
   local opening = take("open")
   opening.callback({ transcript = snapshot(opening.params.document, 0, 80),

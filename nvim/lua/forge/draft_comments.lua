@@ -330,6 +330,7 @@ local function build_projection(state, width)
   end
 
   for source_index, source_row in ipairs(source_row_list) do
+    if not source_row.hidden then
     local source_line = math.max(1, math.min(tonumber(source_row.source_line) or 1, source_count))
     local row = #projection.line_list
     if projection.source_row_by_line[source_line] == nil then projection.source_row_by_line[source_line] = row end
@@ -450,6 +451,7 @@ local function build_projection(state, width)
       end
       end
     end
+  end
   end
   return projection
 end

@@ -1,5 +1,5 @@
 local buffer = require("forge.buffer")
-local folds = require("forge.folds")
+local folds = require("forge.nodes")
 local controller = require("forge.views.harness.controller")
 local state = require("forge.session").harness
 local client = require("forge.client")

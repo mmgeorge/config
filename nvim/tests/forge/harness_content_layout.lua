@@ -23,7 +23,7 @@ local passed, failure = xpcall(function()
     local view = input.open(owner, 0, { margin = 0,
       columns = { signcolumn = "yes:1", statuscolumn = "%s" },
       conceal = { level = 3, cursor = "nvic" } })
-    assert(vim.fn.foldclosed(1) == -1, "running activity started folded")
+    assert(owner.row_count == 2, "running activity started folded")
     local closed = vim.deepcopy(heading)
     closed.fold[1].closed = true
     assert(replica.apply_patch(owner, { document = owner.document, base = 0, next = 1,
@@ -31,10 +31,8 @@ local passed, failure = xpcall(function()
       block_edit = {}, removed_block = {}, text_edit = {},
       metadata_edit = { { block = "summary", row_count = 1, metadata = closed } },
     }).kind == "Applied")
-    assert(vim.fn.foldclosed(1) == 1, "completed activity did not fold")
-    local prefix = indent == 2 and "" or string.rep(" ", indent - 4) .. "▸ "
-    assert(vim.fn.foldtextresult(1) == prefix .. "Thinking", "fold added another marker or indentation")
-    vim.cmd("normal! zR")
+    assert(owner.row_count == 1, "completed activity did not fold")
+    assert(require("forge.buffer").set_expansion(owner, "activity", true))
     assert(vim.api.nvim_buf_get_lines(owner.buffer, 1, 2, false)[1] == "Inspecting the implementation.",
       "fold transition changed commentary source")
     input.close(view)

@@ -45,22 +45,6 @@ local markdown_text = require("forge.render.harness.markdown_text")
 local task_tree = require("forge.render.harness.task_tree")
 local tool_render = require("forge.render.harness.tool")
 
---- Computes fold display text string or highlight chunk tuples for folded harness lines.
----@param line? string Line text under fold.
----@return string|table text Fold display string or chunk array.
-function M.foldtext(line)
-  local text = line or vim.fn.getline(vim.v.foldstart)
-  if text:match("^▸ Thought %d+s ") then return { { text, "ForgeHarnessThought" } } end
-  local fold_start = tonumber(vim.v.foldstart)
-  local state = require("forge.session").harness
-  local row = fold_start and state.render_rows and state.render_rows[fold_start] or nil
-  if row and (row.kind == "tool" or row.kind == "tool_continuation") then
-    return row.foldtext or tool_render.foldtext_chunks(row.tool, "  ", text)
-  end
-  if text:match("^  ▸ Ran %d+ tools?") then return { { text, "Normal" } } end
-  return text
-end
-
 --- Formats a numeric token count as an abbreviated string.
 ---@param value number Numeric token count.
 ---@return string formatted Formatted token count.

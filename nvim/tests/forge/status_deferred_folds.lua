@@ -32,7 +32,7 @@ for _, window in ipairs({ first_window, second_window }) do
 end
 assert(vim.wait(1000, function() return demand_callback ~= nil end, 5), "opening deferred folds did not demand their body")
 for _, window in ipairs({ first_window, second_window }) do
-  assert(vim.api.nvim_win_call(window, function() return vim.fn.foldclosed(4) end) == 4,
+  assert(state.replica.row_count == 4,
     "deferred placeholder became visible before its body arrived")
 end
 
@@ -41,7 +41,7 @@ assert(vim.wait(1000, function() return not state.pending and not state.fold_ope
 assert(vim.deep_equal(vim.api.nvim_buf_get_lines(state.replica.buffer, 0, -1, false),
   { "main abc", "", "Unstaged changes (1):", "Modified sample.txt", "@@ +1 -1" }))
 for _, window in ipairs({ first_window, second_window }) do
-  assert(vim.api.nvim_win_call(window, function() return vim.fn.foldclosed(4) end) == -1,
+  assert(state.replica.row_count == 5,
     "loaded fold did not open in every requesting window")
 end
 

@@ -39,11 +39,11 @@ local snapshot = { document = replica.document, revision = 0, view = { kind = "s
   section = { { kind = "unstaged", file = { 1, 2 } } }, file = { record(1, 1, "unstaged"), record(2, 1, "unstaged") }, pending = {} }
 assert(render.apply_snapshot(replica, snapshot).kind == "Applied")
 local view = input.open(replica, vim.api.nvim_get_current_win(), { margin = 0 })
-vim.cmd("4foldopen")
+assert(require("forge.nodes").set_open(replica, vim.api.nvim_get_current_win(), "file:1", true))
 assert(render.apply_body(replica, delivery(1, 1, { "A", "B" })).kind == "Applied")
 vim.api.nvim_win_set_cursor(0, { 7, 0 })
-vim.cmd("7foldclose")
-assert(vim.fn.foldclosed(7) == 7)
+assert(require("forge.nodes").set_open(replica, 0, "header:B", false))
+assert(require("forge.nodes").closed(replica, "header:B"))
 local writes = 0
 vim.api.nvim_buf_attach(replica.buffer, false, { on_lines = function() writes = writes + 1 end })
 local untouched = replica.file[2]
@@ -54,7 +54,7 @@ assert(render.apply_update(replica, accepted).kind == "Applied", table.concat(no
 assert(replica.file[2].record == untouched.record and replica.file[2].body == untouched.body)
 assert(replica.inventory.pending[1] == 0)
 local _, header_row = replica.sequence:position("header:B")
-assert(vim.fn.foldclosed(header_row + 1) == header_row + 1, "surviving hunk lost its closed fold")
+assert(require("forge.nodes").closed(replica, "header:B"), "surviving hunk lost its expansion state")
 assert(vim.api.nvim_win_get_cursor(0)[1] == header_row + 1, "cursor left its surviving hunk")
 local changedtick = vim.api.nvim_buf_get_changedtick(replica.buffer)
 local previous_writes = writes

@@ -102,7 +102,6 @@ local ok, failure = pcall(function()
   assert(summary():find("18/20 pass", 1, true), "running tools must not count as passed")
   calls.item["1"].status = "cancelled"
   assert(summary():find("18/20 pass", 1, true), "cancelled tools must not count as passed")
-  assert_equals(renderer.foldtext("▸ Thought 6s (3s)")[1][2], "ForgeHarnessThought")
 end)
 
 if not ok then

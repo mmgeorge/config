@@ -411,96 +411,6 @@ function M._compute_hunk_map(diff_text)
   return hunk_map
 end
 
---- Applies manual folds to staged or folded hunks in the diff buffer.
----@param buf integer Target buffer handle.
-function M._render_with_folds(buf)
-  local hunks = buf_hunks[buf]
-  if not hunks then return end
-
-  -- Find the window showing this buffer
-  local win = nil
-  for _, w in ipairs(vim.api.nvim_list_wins()) do
-    if vim.api.nvim_win_is_valid(w) and vim.api.nvim_win_get_buf(w) == buf then
-      win = w
-      break
-    end
-  end
-  if not win then return end
-
-  local line_count = vim.api.nvim_buf_line_count(buf)
-  -- Ensure fold settings are on the correct window
-  vim.wo[win].foldmethod = "manual"
-  vim.wo[win].foldenable = true
-  vim.api.nvim_win_call(win, function()
-    -- Save view to prevent jumping
-    local view = vim.fn.winsaveview()
-    pcall(vim.cmd, "normal! zE") -- delete all folds
-    for _, h in ipairs(hunks) do
-      if h.folded then
-        local fold_start = h.start_line + 1
-        local fold_end = math.min(h.end_line, line_count)
-        if fold_end >= fold_start and fold_start <= line_count then
-          pcall(vim.cmd, fold_start .. "," .. fold_end .. "fold")
-        end
-      end
-    end
-    vim.fn.winrestview(view)
-  end)
-end
-
---- Re-renders diff buffer content and applies hunk highlights and folds.
----@param buf integer Target buffer handle.
----@param filename string Associated file path string.
-function M._refresh_diff_buffer(buf, filename)
-  if require("forge.local_diff").owner(buf) then return end
-  -- Use cached diff data from M.get() instead of re-running git
-  local diff_text = session.file_diffs and session.file_diffs[filename]
-  local staged_flags = session.file_hunk_staged and session.file_hunk_staged[filename]
-
-  if diff_text and diff_text ~= "" then
-    -- Skip re-render if already rendered with the same data, but still
-    -- (re)apply folds: the initial pre-render happens off-screen, where
-    -- _render_with_folds is a no-op (no window shows the buffer yet), so the
-    -- staged-hunk folds must be applied once the buffer becomes visible.
-    if session.buf_last_rendered[buf] == diff_text and buf_hunks[buf] then
-      M._render_with_folds(buf)
-      return
-    end
-    session.buf_last_rendered[buf] = diff_text
-
-    diff_render.render_fancy_diff(buf, diff_text, staged_flags, filename)
-    local hunk_map = M._compute_hunk_map(diff_text)
-    -- Auto-fold staged hunks
-    if staged_flags then
-      for i, h in ipairs(hunk_map) do
-        if staged_flags[i] then
-          h.folded = true
-        end
-      end
-    end
-    buf_hunks[buf] = hunk_map
-    -- Highlight @@ header lines with subtle gray background
-    vim.api.nvim_buf_clear_namespace(buf, ui.hunk_header_ns, 0, -1)
-    for _, h in ipairs(hunk_map) do
-      pcall(vim.api.nvim_buf_set_extmark, buf, ui.hunk_header_ns, h.start_line - 1, 0, {
-        line_hl_group = "ForgeHunkHeader",
-        priority = ui.hunk_header_priority,
-      })
-    end
-    M._render_with_folds(buf)
-  else
-    vim.bo[buf].modifiable = true
-    local message = diff_text == false and "No textual diff" or "No changes"
-    vim.api.nvim_buf_set_lines(buf, 0, -1, false, { message })
-    vim.bo[buf].modifiable = false
-    buf_hunks[buf] = {}
-    if session.empty_diff_rows then session.empty_diff_rows[buf] = nil end
-    if session.diff_line_content_lengths then session.diff_line_content_lengths[buf] = nil end
-    vim.api.nvim_buf_clear_namespace(buf, ui.hunk_header_ns, 0, -1)
-    vim.api.nvim_buf_clear_namespace(buf, ui.active_hunk_header_ns, 0, -1)
-  end
-end
-
 --- Applies highlight decoration to the active diff hunk header.
 ---@param buf integer Target buffer handle.
 ---@param item_diff string? Optional diff hunk text to match.
@@ -581,7 +491,7 @@ function M.refresh_open_diff_buffer_from_cache(filename)
   if not (buf and vim.api.nvim_buf_is_valid(buf)) then return end
 
   session.buf_last_rendered[buf] = nil
-  M._refresh_diff_buffer(buf, filename)
+  require("forge.local_diff").refresh(filename)
 end
 
 --- Reloads one open per-file diff buffer from Git.

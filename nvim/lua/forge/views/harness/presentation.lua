@@ -13,6 +13,14 @@ local transcript_options = {
 }
 
 function M.open(options, callback)
+  local loading_namespace = vim.api.nvim_create_namespace("ForgeHarnessLoading" .. options.transcript_buffer)
+  local loading_mark = {}
+  local function clear_loading()
+    if vim.api.nvim_buf_is_valid(options.transcript_buffer) then
+      vim.api.nvim_buf_clear_namespace(options.transcript_buffer, loading_namespace, 0, -1)
+    end
+    loading_mark = {}
+  end
   local identity = "harness:" .. options.session_id .. ":" .. tostring(vim.uv.hrtime())
   local owner = { document = identity, submission_sequence = 0, closed = false, syncing = false, pending = false, output = {},
     session_id = options.session_id, host_generation = client.host_generation(), views = {},
@@ -30,6 +38,7 @@ function M.open(options, callback)
     owner.failure = tostring(message) .. ". Reopen Harness to retry."
     owner.pending, owner.syncing, owner.applying, owner.highlighting, owner.selecting = false, false, false, false, false
     owner.section_inflight = {}
+    clear_loading()
     if owner.transcript then owner.transcript.fold_loading = {} end
     if previous ~= owner.failure then notice(owner.failure) end
     if options.on_update then pcall(options.on_update) end
@@ -210,7 +219,7 @@ function M.open(options, callback)
     request({ operation = "close", document = identity }, function() end)
     callback(nil, message)
   end
-  owner.transcript = replica.open(identity, { buffer = options.transcript_buffer, generated = true, preserve_view = true,
+  owner.transcript = replica.open(identity, { buffer = options.transcript_buffer, generated = true, preserve_view = true, source_projected = true,
     expected_changedtick = transcript_tick, filetype = "ForgeHarness", notice = notice,
     before_commit = function()
       if not owner.save_timeline then return end
@@ -274,6 +283,10 @@ function M.open(options, callback)
     if opening then
       opening[id] = nil
       if not next(opening) then owner.transcript.fold_loading[window] = nil end
+    end
+    if loading_mark[id] then
+      vim.api.nvim_buf_del_extmark(options.transcript_buffer, loading_namespace, loading_mark[id])
+      loading_mark[id] = nil
     end
   end
 
@@ -497,6 +510,12 @@ function M.open(options, callback)
     opening = opening or {}
     loading[window] = opening
     opening[id] = { view = view.id, ready = false }
+    local header = owner.transcript.node_owner[id]
+    local _, row = owner.transcript.sequence:position(header)
+    if row then
+      loading_mark[id] = vim.api.nvim_buf_set_extmark(options.transcript_buffer, loading_namespace, row, 0,
+        { virt_text = { { " Loading…", "Comment" } }, virt_text_pos = "eol" })
+    end
     owner.set_section(id, true, false, view)
     return true
   end
@@ -520,7 +539,7 @@ function M.open(options, callback)
               }).all
               if distance > height + 1 then break end
             end
-            local closed = vim.fn.foldclosed(row)
+            local closed = -1
             local located = replica.locate(owner.transcript, row - 1, 0)
             local block = located and owner.transcript.block[located.block]
             if block and not visited[located.block] then
@@ -543,7 +562,7 @@ function M.open(options, callback)
                 end
               end
             end
-            row = closed ~= -1 and vim.fn.foldclosedend(row) + 1 or row + 1
+            row = row + 1
           end
         end)
       end
@@ -696,6 +715,7 @@ function M.open(options, callback)
     owner.section_inflight, owner.section_request, owner.section_intent = {}, {}, {}
     owner.section_failure, owner.section_page = {}, {}
     owner.section_error, owner.highlighting = nil, false
+    clear_loading()
     owner.transcript.fold_loading = {}
     owner.selecting = true
     request({ operation = "select_agent", document = identity, run_id = target ~= "main" and target or vim.NIL }, function(_, failure)
@@ -779,6 +799,7 @@ function M.open(options, callback)
     owner.epoch = owner.epoch + 1
     owner.applying = false
     owner.section_inflight = {}
+    clear_loading()
     owner.transcript.fold_loading = {}
     if owner.refresh_timer then
       owner.refresh_timer:stop()

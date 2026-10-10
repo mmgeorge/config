@@ -48,10 +48,6 @@ function M.attach(replica, comments, source)
     replica.prepare_source()
     return by_row[row]
   end
-  replica.fold_location = function(row)
-    local selected = preceding(row)
-    return selected and selected.canonical or 0, selected ~= nil and selected.row == row
-  end
   replica.locate = function(row, column)
     local selected = preceding(row)
     if not selected then return nil end

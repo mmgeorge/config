@@ -42,7 +42,6 @@ local fixture_dir = vim.fn.tempname()
 local ok, failure = pcall(function()
   require("forge").setup({ harness = { backend = "mock" } })
   local comment_view = require("forge.draft_comments")
-  local plan_fold = require("forge.views.plan_review.fold")
   local task_model = require("forge.views.plan_review.task_model")
   local task_tree = require("forge.render.task_tree")
 
@@ -179,32 +178,16 @@ local ok, failure = pcall(function()
   vim.api.nvim_win_set_buf(win, buf)
   vim.api.nvim_win_set_width(win, 58)
   vim.api.nvim_buf_set_lines(buf, 0, -1, false, source_lines)
-  local fold_controller = plan_fold.new()
   local annotation_list = {}
   comment_view.attach(buf, win, source_lines, annotation_list, {
     source_provider = function(width)
       return model:compose(task_tree.render(model:task_nodes(), width), width)
-    end,
-    before_render = function(render_buf, render_win)
-      fold_controller:capture(render_buf, render_win)
-    end,
-    after_render = function(render_buf, render_win, projection)
-      fold_controller:apply(render_buf, render_win, projection)
     end,
   })
 
   local task_row = find_row(buf, "1. Own task rendering.")
   assert_true(row_has_highlight(buf, task_row, "FirstOwner", "@type"),
     "task prose should highlight exact canonical entity references as types")
-  assert_true(vim.fn.foldclosed(task_row) == task_row, "tasks should start folded")
-  assert_equals(vim.wo[win].foldtext, "v:lua.forge_foldtext()",
-    "plan folds should use the shared status fold text")
-  assert_true(vim.wo[win].winhighlight:find("Folded:Normal", 1, true) ~= nil,
-    "plan folds should use status-style folded-row highlighting")
-  vim.api.nvim_win_set_cursor(win, { task_row, 0 })
-  fold_controller:toggle(buf, win)
-  assert_equals(vim.api.nvim_win_get_cursor(win)[1], task_row,
-    "toggling a wrapped heading should preserve its visible title row")
   local first_file_row = find_row(buf, "   file src/plan.rs")
   assert_true(first_file_row > task_row, "file groups should remain visible beneath their task")
   assert_true(row_has_highlight(buf, first_file_row, "file", "ForgeFileKeyword"),
@@ -225,16 +208,6 @@ local ok, failure = pcall(function()
   local wrapped_test_line = vim.api.nvim_buf_get_lines(buf, test_row, test_row + 1, false)[1]
   assert_true(wrapped_test_line:find("      ", 1, true) == 1,
     "wrapped file children should align beneath their tree marker")
-  assert_true(vim.fn.foldclosed(subtask_row) == -1,
-    "opening a task should recursively reveal its complete subtask tree")
-  vim.api.nvim_win_set_cursor(win, { subtask_row, 0 })
-  fold_controller:toggle(buf, win)
-  assert_true(vim.fn.foldclosed(subtask_row) == subtask_row,
-    "subtasks should remain independently collapsible")
-  fold_controller:toggle(buf, win)
-  assert_true(vim.fn.foldclosed(subtask_row) == -1,
-    "subtasks should reopen independently after a recursive task expansion")
-
   local first_owner_row = find_row(buf, "├─ Add Resource FirstOwner")
   local first_owner_line = vim.api.nvim_buf_get_lines(buf, first_owner_row - 1, first_owner_row, false)[1]
   assert_true(first_owner_line:find("      ├─ ", 1, true) == 1,

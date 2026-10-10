@@ -208,6 +208,16 @@ local function visible_demand(state)
   end
   for _, window in ipairs(vim.fn.win_findbuf(state.replica.buffer)) do
     local view = view_for(state, window)
+    for id, generation in pairs(state.pending_expansion or {}) do
+      local model = state.replica.file[id]
+      if not model or model.record.generation ~= generation then
+        state.pending_expansion[id] = nil
+      elseif not state.done[id] then
+        view.sequence = view.sequence + 1
+        return history.input(state.replica, { document = state.document, revision = state.replica.revision,
+          view = view.id, sequence = view.sequence, action = "demand", location = { kind = "file", id = id } })
+      end
+    end
     local bounds = vim.api.nvim_win_call(window, function()
       return { vim.fn.line("w0") - 1, vim.fn.line("w$") - 1, vim.api.nvim_win_get_height(window) }
     end)
@@ -215,7 +225,8 @@ local function visible_demand(state)
       or math.min(state.replica.row_count - 1, bounds[2] + bounds[3])
     local row = bounds[1]
     while row <= last do
-      local folded = vim.api.nvim_win_call(window, function() return vim.fn.foldclosedend(row + 1) end)
+      local record = require("forge.nodes").at(state.replica, row)
+      local folded = record and require("forge.nodes").closed(state.replica, record.fold.id) and row + 1 or -1
       local location = buffer.locate(state.replica, row, 0)
       local deferred_open = state.fold_open and location and location.block:match("^file:")
       local semantic = location and location.location
@@ -273,8 +284,8 @@ function M.demand(state)
       if fold_open then
         for window in pairs(fold_open.window) do
           if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == state.replica.buffer then
-            vim.api.nvim_win_call(window, function() vim.cmd("normal! " .. fold_open.command) end)
-            require("forge.folds").capture(state.replica, window)
+            local ids = vim.tbl_keys(state.replica.fold.record)
+            for _, id in ipairs(ids) do require("forge.buffer").set_expansion(state.replica, id, true) end
           end
         end
       end
@@ -315,6 +326,7 @@ function M.demand(state)
           if owner.document == demand.document then key = history.file_key(owner, key) break end
         end
         state.done[key] = true
+        if state.pending_expansion then state.pending_expansion[key] = nil end
         notice(failure or "Missing status body delivery")
         return
       end
@@ -328,6 +340,14 @@ function M.demand(state)
         return
       end
       local model = state.replica.file[result.file]
+      if state.pending_expansion and state.pending_expansion[result.file] == result.generation then
+        if model and model.body then
+          state.pending_expansion[result.file] = nil
+          require("forge.buffer").set_expansion(state.replica, "file:" .. tostring(result.file), true)
+        elseif result.state and result.state.state == "failed" then
+          state.pending_expansion[result.file] = nil
+        end
+      end
       if model and not model.body and result.state and result.state.state == "ready" then
         model.recovering = true
         state.replica.recover_body(result.file, result.generation)
@@ -716,6 +736,26 @@ function M.open(options)
     ignore = function(visual) M.action(state, "ignore", visual) end,
   }
   local function bind_commands()
+  state.replica.node_action = function(id, expanded)
+    local entry = state.replica.source_entry[id]
+    local location = entry and entry.location
+    local model = location and location.kind == "file" and state.replica.file[location.id]
+    if model then
+      state.pending_expansion = state.pending_expansion or {}
+      if expanded and not model.body then
+        if state.pending_expansion[location.id] then
+          state.pending_expansion[location.id] = nil
+        else
+          state.done[location.id] = nil
+          state.pending_expansion[location.id] = model.record.generation
+          M.demand(state)
+        end
+        return true
+      end
+      state.pending_expansion[location.id] = nil
+    end
+    return require("forge.buffer").set_expansion(state.replica, id, expanded)
+  end
   if state.commands then state.commands.close() end
   local comparison_title = options.comparison and (options.name or "ForgeBranchDiff") or "ForgeStatus"
   state.commands = require("forge.document_commands").attach(state.replica, {
@@ -726,12 +766,12 @@ function M.open(options)
       local cursor = vim.api.nvim_win_get_cursor(0)
       local located = buffer.locate(state.replica, cursor[1] - 1, cursor[2])
       local location = located and located.location
-      if location and location.kind == "context" and location.role:match("^recent:") and vim.fn.foldclosed(cursor[1]) == -1 then
+      if location and location.kind == "context" and location.role:match("^recent:") and not require("forge.nodes").closed(state.replica, located.block) then
         local oid = location.role:sub(8)
         local owner = state.replica.commit[oid]
         if owner and owner.failure then state.replica.commit[oid] = nil end
       end
-      if location and location.kind == "file" and not state.done[location.id] and vim.fn.foldclosed(cursor[1]) == -1 then
+      if location and location.kind == "file" and not state.done[location.id] and not require("forge.nodes").closed(state.replica, located.block) then
         state.body_started = state.body_started or {}
         state.body_started[location.id] = started
         require("forge.startup_log").write("status.body.requested", { document = state.document, file = location.id }, started)

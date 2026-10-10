@@ -21,7 +21,7 @@ function M.attach(replica, save)
   replica.issues_editor = editor
   local function row()
     if not replica.block[key] then return nil end
-    return select(2, replica.root:position(key))
+    return select(2, replica.sequence:position(key))
   end
   local function on_row()
     return vim.api.nvim_get_current_buf() == buffer and vim.api.nvim_win_get_cursor(0)[1] - 1 == row()
@@ -57,7 +57,9 @@ function M.attach(replica, save)
       for index = 0, replica.sequence:rows() - 1 do
         local node = replica.sequence:locate(index)
         local _, start = replica.sequence:position(node.id)
-        lines[#lines + 1] = node.entry.text[index - start + 1] or ""
+        local cached = replica.projection and replica.projection.cache[node.id]
+        local projected = cached and cached.block
+        lines[#lines + 1] = projected and projected.text[index - start + 1] or ""
       end
       replica.applying = true
       vim.bo[buffer].modifiable = true
@@ -75,11 +77,16 @@ function M.attach(replica, save)
     local text = first == target and last == target + 1 and next_last == last
       and vim.api.nvim_buf_get_lines(buffer, first, next_last, false)[1]
     if not text or #text > 65536 or text:find("%z") then reject_edit() return end
-    local value = vim.tbl_extend("force", replica.block[key], {
+    local value = vim.tbl_extend("force", replica.source_entry[key], {
       text = { text }, chunk = { { { text, "ForgeStatusPR" } } },
     })
-    replica.block[key] = value
+    replica.source_entry[key] = value
     replica.root:update(key, value)
+    if replica.projection then
+      replica.projection.source.block[key].text = value.text
+      local cached = replica.projection.cache[key]
+      if cached then cached.block.text = value.text end
+    end
     replica.changedtick = tick
     editor.text, editor.dirty, editor.sequence = text, true, editor.sequence + 1
     vim.schedule(editor.sync)

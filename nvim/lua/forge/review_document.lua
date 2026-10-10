@@ -218,7 +218,7 @@ end
 function M.attach_fold_window(state, window)
   if not state.active or not state.replica or not vim.api.nvim_win_is_valid(window)
     or vim.api.nvim_win_get_buf(window) ~= state.replica.buffer then return end
-  require("forge.folds").attach(state.replica, window)
+  require("forge.nodes").attach(state.replica, window)
   state.fold_initialized = state.fold_initialized or {}
   state.fold_initialized[window] = state.fold_initialized[window] or {}
   for identity in pairs(state.replica.fold and state.replica.fold.record or {}) do
@@ -226,25 +226,7 @@ function M.attach_fold_window(state, window)
   end
 end
 
-function M.apply_new_default_folds(state)
-  if not state.active or not state.replica or not state.replica.fold then return end
-  state.fold_initialized = state.fold_initialized or {}
-  for _, window in ipairs(vim.fn.win_findbuf(state.replica.buffer)) do
-    if vim.api.nvim_win_is_valid(window) then
-      local known = state.fold_initialized[window] or {}
-      state.fold_initialized[window] = known
-      vim.api.nvim_win_call(window, function()
-        for identity, record in pairs(state.replica.fold.record) do
-          if not known[identity] and record.fold.closed then
-            local _, start = state.replica.sequence:position(record.owner)
-            vim.cmd(tostring(start + record.fold.start.row + 1) .. "foldclose")
-          end
-          known[identity] = true
-        end
-      end)
-    end
-  end
-end
+
 
 ---@param state table
 ---@return string?
@@ -362,6 +344,7 @@ function M.refresh(state, callback)
       require("forge.review_comments").detach(state)
       state.snapshot_required = true
     end
+    state.replica.source_projected = delivery.comment ~= nil
     local applied
     if state.replica.revision == nil or state.snapshot_required then
       applied = buffer.apply_snapshot(state.replica, delivery.snapshot)
@@ -397,7 +380,7 @@ function M.refresh(state, callback)
       if state.on_open then state.on_open(state) end
     end
     if applied.kind == "Applied" and delivery.comment then require("forge.review_comments").attach(state, delivery) end
-    M.apply_new_default_folds(state)
+
     M.sync_editing(state)
     M.sync_dirty(state)
     log.write("pr.presentation.applied", { load_id = state.load_id, document = state.document,
@@ -815,7 +798,6 @@ function M.focus_comment(state, comment)
     local anchor = native and native.anchor and native.anchor[comment.region]
     if not anchor or not vim.api.nvim_win_is_valid(state.window) then return end
     vim.api.nvim_win_call(state.window, function()
-      if vim.fn.foldclosed(anchor.start.row + 1) ~= -1 then vim.cmd((anchor.start.row + 1) .. "foldopen") end
       vim.api.nvim_win_set_cursor(state.window, { anchor.start.row + 1, anchor.start.column })
     end)
   end)
@@ -1107,7 +1089,7 @@ function M.rebind(state, callback)
           if state.pending_operation and state.pending_operation.params then
             state.pending_operation.params.document = state.document
           end
-          state.replica = buffer.open(state.document, { buffer = retained_buffer, generated = true,
+          state.replica = buffer.open(state.document, { buffer = retained_buffer, generated = true, source_projected = delivery.comment ~= nil,
             expected_changedtick = vim.api.nvim_buf_get_changedtick(retained_buffer), editable = { notice = state.notice } })
           assert(buffer.apply_snapshot(state.replica, delivery.snapshot).kind == "Applied")
           vim.bo[retained_buffer].buftype = "acwrite"
@@ -1242,7 +1224,7 @@ function M.open(options)
       return
     end
     state.replica = buffer.open(state.document, {
-      filetype = "forge", notice = state.notice,
+      filetype = "forge", notice = state.notice, source_projected = true,
       recover = function() failed(state, "Review presentation requires explicit recovery") end,
       editable = { notice = state.notice },
     })
@@ -1308,7 +1290,7 @@ function M.open(options)
       changed = function()
         local cursor = vim.api.nvim_win_get_cursor(state.window)
         local location = buffer.locate(state.replica, cursor[1] - 1, cursor[2])
-        if vim.fn.foldclosed(".") < 0 and location and location.target then M.activate(state, "expand") end
+        if location and location.target then M.activate(state, "expand") end
       end,
       handler = {
         close = function() M.close(state) end,

@@ -23,7 +23,6 @@ end
 
 local fixture_directory = vim.fn.tempname()
 local ok, failure = pcall(function()
-  local plan_fold = require("forge.views.plan_review.fold")
   local task_model = require("forge.views.plan_review.task_model")
 
   vim.fn.mkdir(fixture_directory, "p")
@@ -128,25 +127,6 @@ local ok, failure = pcall(function()
   assert_equals(symbol.ancestor_ids[#symbol.ancestor_ids], file.fold_id, "symbols should descend from their file")
   assert_equals(rename.ancestor_ids[#rename.ancestor_ids], file.fold_id, "renamed symbols should descend from their file")
 
-  local buffer = vim.api.nvim_create_buf(false, true)
-  local window = vim.api.nvim_get_current_win()
-  vim.api.nvim_win_set_buf(window, buffer)
-  local line_list = vim.tbl_map(function(row) return row.text end, projection)
-  local fold_projection = { line_list = line_list, line_meta_list = projection }
-  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, line_list)
-  local controller = plan_fold.new()
-  controller:apply(buffer, window, fold_projection)
-  assert_equals(vim.fn.foldclosed(root_row), -1, "directory folds should start open")
-  assert_equals(vim.fn.foldclosed(file_row), file_row, "file symbol folds should start closed")
-
-  vim.api.nvim_win_set_cursor(window, { file_row, 0 })
-  controller:toggle(buffer, window)
-  assert_equals(vim.fn.foldclosed(file_row), -1, "toggling a file should reveal every symbol")
-
-  controller:capture(buffer, window)
-  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, line_list)
-  controller:apply(buffer, window, fold_projection)
-  assert_equals(vim.fn.foldclosed(file_row), -1, "file expansion should survive projection rerenders")
   assert_true(directory_row > root_row and symbol_row > file_row and rename_row > symbol_row,
     "file inventory rows should preserve tree order")
 end)

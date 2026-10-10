@@ -47,7 +47,7 @@ vim.notify = function(message, level, options)
   table.insert(forge_manual.notices, { message = tostring(message), level = level })
   original_notify(message, level, options)
 end
-require("forge").setup()
+require("forge").setup({ about_auto_generate = false })
 forge_manual.state = require("forge.views.commands").open()
 vim.api.nvim_create_user_command("ForgeFixtureCompare", function()
   require("forge.client").request_host("repository.generate", {

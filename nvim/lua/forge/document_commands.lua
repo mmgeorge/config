@@ -109,13 +109,11 @@ function M.attach(session, options)
   local normalize_gutter = options.view == "diff" or options.view == "status"
   local handler = vim.tbl_extend("force", {
     toggle = function()
-      if vim.fn.foldlevel(".") > 0 then vim.cmd("normal! za") end
-      require("forge.folds").capture(session, vim.api.nvim_get_current_win())
+      require("forge.nodes").toggle_heading(session, vim.api.nvim_get_current_win())
       if options.changed then options.changed() end
     end,
     collapse_parent = function()
-      if vim.fn.foldlevel(".") > 0 then vim.cmd("normal! zc") end
-      require("forge.folds").capture(session, vim.api.nvim_get_current_win())
+      require("forge.nodes").collapse_parent(session, vim.api.nvim_get_current_win())
       if options.changed then options.changed() end
     end,
   }, options.handler or {})

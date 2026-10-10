@@ -35,7 +35,7 @@ end
 
 local function expand(path, section)
   local file, row = select_file(path, section)
-  if vim.fn.foldclosed(row + 1) >= 0 then key("<Tab>") end
+  if require("forge.nodes").closed(state.replica, "file:" .. file.id) then key("<Tab>") end
   local context = "Source" .. tonumber(path:match("source_(%d+)")) .. ".render"
   await(function()
     local body = state.replica.file[file.id].body
@@ -63,7 +63,7 @@ local function audit(phase)
     local expected = {}
     for _, gutter in ipairs(block.metadata.gutter or {}) do
       local row = start + gutter.position.row
-      expected[row] = (expected[row] or 0) + 1
+      if gutter.placement ~= "sign" then expected[row] = (expected[row] or 0) + 1 end
     end
     for _, handle in ipairs(handles) do
       local mark = vim.api.nvim_buf_get_extmark_by_id(state.replica.buffer, state.replica.namespace, handle, { details = true })
@@ -113,9 +113,9 @@ local ok, failure = xpcall(function()
   key("U")
   index_is("", "unstage expanded file")
   local _, untouched_row = select_file("source_03.rs", "unstaged")
-  assert(vim.fn.foldclosed(untouched_row + 1) == untouched_row + 1, "unstaging opened an untouched file")
+  assert(require("forge.nodes").closed(state.replica, require("forge.buffer").locate(state.replica, untouched_row, 0).block), "unstaging opened an untouched file")
   local _, closed_row = select_file("source_02.rs", "unstaged")
-  assert(vim.fn.foldclosed(closed_row + 1) == closed_row + 1, "unstaging opened the adjacent file")
+  assert(require("forge.nodes").closed(state.replica, require("forge.buffer").locate(state.replica, closed_row, 0).block), "unstaging opened the adjacent file")
   expand("source_02.rs", "unstaged")
   select_file("source_01.rs", "unstaged")
   key("S")
@@ -124,7 +124,7 @@ local ok, failure = xpcall(function()
   key("U")
   index_is("", "unstage with adjacent file expanded")
   local _, expanded_row = select_file("source_02.rs", "unstaged")
-  assert(vim.fn.foldclosed(expanded_row + 1) < 0, "unstaging closed an untouched expanded file")
+  assert(not require("forge.nodes").closed(state.replica, require("forge.buffer").locate(state.replica, expanded_row, 0).block), "unstaging closed an untouched expanded file")
 
   local file = expand("source_01.rs", "unstaged")
   select_change(file, "let value_31 = 1031;")
@@ -139,7 +139,7 @@ local ok, failure = xpcall(function()
   index_is("", "unstage hunk")
 
   select_file("source_03.rs", "unstaged")
-  if vim.fn.foldclosed(".") < 0 then key("<Tab>") end
+  if not require("forge.nodes").closed(state.replica, require("forge.buffer").locate(state.replica, vim.api.nvim_win_get_cursor(0)[1]-1, 0).block) then key("<Tab>") end
   key("V")
   key("<Down><Down>")
   key("S")
@@ -169,7 +169,7 @@ local ok, failure = xpcall(function()
   key("U")
   index_is("", "unstage whole section")
   _, section = state.replica.sequence:position("section:unstaged")
-  assert(vim.fn.foldclosed(section + 2) < 0, "replacement section inherited a closed fold")
+  assert(not require("forge.nodes").closed(state.replica, "section:unstaged"), "replacement section inherited a closed fold")
   print("host flows: file, hunk, visual group, and section stage/unstage passed")
 end, debug.traceback)
 require("forge.status").close(state)

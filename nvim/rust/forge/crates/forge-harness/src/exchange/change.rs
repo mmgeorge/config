@@ -50,23 +50,40 @@ struct FileProjection {
     hunk_list: Vec<String>,
 }
 
-/// Builds one immutable provider-owned diff for a completed thought.
-pub struct ProviderDiffBuilder;
+#[derive(Default)]
+/// Accumulates reported edit operations without claiming a net workspace comparison.
+pub struct ProviderDiffBuilder {
+    projection: Vec<FileProjection>,
+}
 
 impl ProviderDiffBuilder {
     /// Build a unified operation diff from successful provider file-change tools.
     pub fn build(tool_list: &[ToolCall]) -> Option<String> {
-        let mut projection_list = Vec::<FileProjection>::new();
+        let mut builder = Self::default();
+        builder.record_tools(tool_list.iter());
+        builder.finish()
+    }
+
+    /// Include successful edits from each provider turn in an exchange.
+    pub fn record(&mut self, exchange: &Exchange) {
+        self.record_tools(exchange.turn.iter().flat_map(|turn| turn.tools()));
+    }
+
+    fn record_tools<'tool>(&mut self, tool_list: impl Iterator<Item = &'tool ToolCall>) {
         for tool in tool_list {
             if !successful_file_change(tool) {
                 continue;
             }
             for change in &tool.change.file {
-                merge_change(&mut projection_list, change);
+                merge_change(&mut self.projection, change);
             }
         }
+    }
+
+    /// Emit one file section per reported path, preserving successive edit hunks.
+    pub fn finish(self) -> Option<String> {
         let mut output = String::new();
-        for projection in projection_list {
+        for projection in self.projection {
             render_projection(&mut output, projection);
         }
         (!output.is_empty()).then_some(output)

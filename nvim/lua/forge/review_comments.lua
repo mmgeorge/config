@@ -96,6 +96,21 @@ function M.attach(state, delivery, recovery)
     end
     canonical = canonical + #block.text
   end
+  local projection = require("forge.node_projection")
+  local retained_source = require("forge.buffer").fragment(delivery.snapshot, true)
+  local node_owner = replica.projection or projection.new(retained_source)
+  node_owner.source = retained_source
+  replica.projection = node_owner
+  local function project_source()
+    local _, mapping = projection.render(node_owner)
+    node_owner.mapping = mapping
+    for _, row in ipairs(source) do row.hidden = not projection.contains(node_owner, row.block, row.position.row) end
+    if state.local_comment_view then comments.update(replica.buffer, {}) end
+    return true
+  end
+  state.local_comment_view = nil
+  replica.project_source = project_source
+  project_source()
   for region, comment in pairs(inline_region) do
     for _, row in ipairs(source) do
       local anchor = row.target and state.inline_anchor[row.target]
@@ -175,8 +190,20 @@ function M.attach(state, delivery, recovery)
           previous = row
         end
       end
+      local by_id, retained = {}, {}
+      for _, row in ipairs(replacement) do
+        by_id[row.id] = by_id[row.id] or {}
+        by_id[row.id][#by_id[row.id] + 1] = row
+      end
+      for _, row in ipairs(source) do
+        if row.hidden then retained[#retained + 1] = row
+        elseif by_id[row.id] then
+          vim.list_extend(retained, by_id[row.id])
+          by_id[row.id] = nil
+        end
+      end
       for index = #source, 1, -1 do source[index] = nil end
-      vim.list_extend(source, replacement)
+      vim.list_extend(source, retained)
     end
   end
   local function after_render(_, _, projection)
@@ -270,7 +297,7 @@ function M.detach(state)
   editable.applying(state.replica.editable, true)
   comments.detach(state.replica.buffer, false)
   editable.applying(state.replica.editable, false)
-  for _, name in ipairs({ "locate", "physical_row", "prepare_source", "decoration_location", "fold_location" }) do
+  for _, name in ipairs({ "locate", "physical_row", "prepare_source", "decoration_location", "fold_location", "project_source" }) do
     state.replica[name] = nil
   end
   state.local_comment_view = nil

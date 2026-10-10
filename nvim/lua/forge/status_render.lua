@@ -1,7 +1,7 @@
 local M = {}
 local buffer = require("forge.buffer")
 local Sequence = require("forge.block_sequence")
-local folds = require("forge.folds")
+local nodes = require("forge.nodes")
 local decorations = require("forge.decorations")
 local history = require("forge.status_history")
 local cooperative = require("forge.cooperative")
@@ -189,66 +189,6 @@ local function context_entries(session, context)
   return leading, recent
 end
 
-local function facade(session)
-  local sequence = {}
-  sequence.node = setmetatable({}, { __index = function(_, id)
-    local owner = session.body_owner[id]
-    return owner and session.file[owner].body.sequence.node[id] or session.root.node[id]
-  end })
-  function sequence:locate(row)
-    local node = session.root:locate(row)
-    if not node or node.entry.kind ~= "file" then return node end
-    local _, start = session.root:position(node.id)
-    local body = session.file[node.entry.file].body
-    if body and row > start and body.row_count > 0 then return body.sequence:locate(row - start - 1) end
-    return node
-  end
-  function sequence:position(id)
-    local owner = session.body_owner[id]
-    if not owner then return session.root:position(id) end
-    local index, start = session.root:position(file_key(owner))
-    local _, relative = session.file[owner].body.sequence:position(id)
-    return index, start + 1 + relative
-  end
-  function sequence:fold_level(row)
-    local level, starts = session.root:fold_level(row)
-    local node = session.root:locate(row)
-    if node and node.entry.kind == "file" then
-      local _, start = session.root:position(node.id)
-      local body = session.file[node.entry.file].body
-      if body and row > start then
-        local body_level, body_start = body.sequence:fold_level(row - start - 1)
-        return level + body_level, starts or body_start
-      end
-    end
-    return level, starts
-  end
-  function sequence:rows() return session.root:rows() end
-  function sequence:visit_range(first, last, visit)
-    session.root:visit_range(first, last, function(node, start)
-      visit(node, start)
-      if node.entry.kind == "file" then
-        local body = session.file[node.entry.file].body
-        if body then
-          body.sequence:visit_range(first - start - 1, last - start - 1, function(child, relative)
-            visit(child, start + 1 + relative)
-          end)
-        end
-      end
-    end)
-  end
-  return sequence
-end
-
-local function root_text(value, file)
-  if value.kind ~= "file" then return value.text end
-  local text = { value.text[1] }
-  local body = file[value.file].body
-  if not body or body.row_count == 0 then text[2] = "" return text end
-  for index = 0, body.sequence:count() - 1 do vim.list_extend(text, body.sequence:at(index).entry.text) end
-  return text
-end
-
 local function prepare(session, snapshot, checkpoint)
   assert(snapshot.document == session.document, "status document differs")
   counter(snapshot.revision)
@@ -355,157 +295,108 @@ local function prepare(session, snapshot, checkpoint)
     fold = { record = record, changed = changed }, inventory = snapshot, index_us = elapsed(built) }
 end
 
-local function edits_between(session, prepared)
-  if not session.revision or session.status == "Desynchronized" then
-    local text = {}
-    for _, value in ipairs(prepared.entries) do vim.list_extend(text, root_text(value.entry, prepared.file)) end
-    return { { start_row = 0, removed_rows = vim.api.nvim_buf_line_count(session.buffer), text = text } }
-  end
-  local previous, current = {}, {}
-  for index = 0, session.root:count() - 1 do previous[#previous + 1] = session.root:at(index).id end
-  for _, value in ipairs(prepared.entries) do current[#current + 1] = value.id end
-  local changes = vim.diff(table.concat(previous, "\n") .. "\n", table.concat(current, "\n") .. "\n", { result_type = "indices", algorithm = "histogram" })
-  local edits, replaced = {}, {}
-  for _, change in ipairs(changes) do
-    local first = change[2] == 0 and change[1] or change[1] - 1
-    local next_first = change[4] == 0 and change[3] or change[3] - 1
-    local start = first < #previous and select(2, session.root:position(previous[first + 1])) or session.row_count
-    local finish = first + change[2] < #previous and select(2, session.root:position(previous[first + change[2] + 1])) or session.row_count
-    local text = {}
-    for index = next_first + 1, next_first + change[4] do
-      local id = current[index]
-      replaced[id] = true
-      vim.list_extend(text, root_text(prepared.block[id], prepared.file))
-    end
-    edits[#edits + 1] = { start_row = start, removed_rows = finish - start, text = text }
-  end
-  for _, value in ipairs(prepared.entries) do
-    local id, next_entry = value.id, value.entry
-    local previous_entry = session.block[id]
-    if previous_entry and not replaced[id] then
-      local _, start = session.root:position(id)
-      local same_body = next_entry.kind == "file" and session.file[next_entry.file].body == prepared.file[next_entry.file].body
-      local old_text = same_body and previous_entry.text or root_text(previous_entry, session.file)
-      local new_text = same_body and next_entry.text or root_text(next_entry, prepared.file)
-      if not vim.deep_equal(old_text, new_text) then
-        for _, change in ipairs(vim.diff(table.concat(old_text, "\n") .. "\n", table.concat(new_text, "\n") .. "\n", { result_type = "indices", algorithm = "histogram" })) do
-          local offset = change[2] == 0 and change[1] or change[1] - 1
-          local next_offset = change[4] == 0 and change[3] or change[3] - 1
-          local text = {}
-          for index = next_offset + 1, next_offset + change[4] do text[#text + 1] = new_text[index] end
-          edits[#edits + 1] = { start_row = start + offset, removed_rows = change[2], text = text }
-        end
-      end
-    end
-  end
-  table.sort(edits, function(left, right) return left.start_row > right.start_row end)
-  return edits
-end
-
-local function write(session, edits)
-  local started = vim.uv.hrtime()
-  session.applying = true
-  vim.bo[session.buffer].modifiable = true
-  local ok, failure = pcall(function()
-    buffer.apply_text_edits(session.buffer, edits)
-  end)
-  vim.bo[session.buffer].modifiable = false
-  session.applying = nil
-  session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
-  assert(ok, failure)
-  if session.issues_editor then session.issues_editor.sync() end
-  return elapsed(started)
-end
-
 local function adopt(session, prepared)
-  local recovering = session.status == "Desynchronized"
-  assert(session.status == "Desynchronized" or vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "status buffer was changed externally")
-  local edits = edits_between(session, prepared)
-  local result = cooperative.atomic(function()
-    local fold_state = #edits > 0 and folds.capture(session) or {}
-    local selected = {}
-    for id, record in pairs(session.fold and session.fold.record or {}) do
-      local replacement = prepared.fold.record[id]
-      if not replacement or not vim.deep_equal(record.fold, replacement.fold) then selected[id] = true end
-    end
-    for id in pairs(folds.prepare_records(session, selected, edits)) do prepared.fold.changed[id] = true end
-    local metadata = { changed = {}, retired = {}, block = {}, position = {} }
-    for id in pairs(prepared.body_owner) do
-      local previous = session.block[id]
-      local reinstall = recovering or previous ~= prepared.block[id]
-      if previous and not reinstall then
-        local _, start = session.sequence:position(id)
-        local finish = start + #previous.text
-        for _, edit in ipairs(edits) do
-          if edit.start_row <= finish and edit.start_row + edit.removed_rows >= start then
-            reinstall = true
-            break
-          end
+  local source = { document = session.document, revision = prepared.inventory.revision, block = {} }
+  local starts, source_entry, rows = {}, {}, 0
+  local previous = session.source_block_cache or {}
+  local cache = {}
+  local function append(id, entry, text)
+    local retained = previous[id]
+    local metadata = retained and retained.entry == entry and retained.base or vim.deepcopy(entry.metadata)
+    metadata.fold = metadata.fold or {}
+    local column
+    for row, chunks in ipairs(not (retained and retained.entry == entry) and entry.chunk or {}) do
+      column = 0
+      for _, chunk in ipairs(chunks) do
+        if #chunk[1] > 0 then
+          metadata.decoration[#metadata.decoration + 1] = { range = {
+            start = { row = row - 1, column = column },
+            ["end"] = { row = row - 1, column = column + #chunk[1] } }, capture = chunk[2], priority = 110 }
+          column = column + #chunk[1]
         end
       end
-      if reinstall then
-        metadata.changed[id], metadata.block[id] = true, prepared.block[id]
+    end
+    local base = metadata
+    metadata = vim.tbl_extend("force", {}, base)
+    metadata.fold = vim.list_slice(base.fold or {})
+    starts[id], source_entry[id] = rows, entry
+    source.block[#source.block + 1] = { id = id, text = text, metadata = metadata }
+    cache[id] = { entry = entry, base = base }
+    rows = rows + #text
+  end
+  for index = 0, prepared.root:count() - 1 do
+    local node = prepared.root:at(index)
+    append(node.id, node.entry, node.entry.text)
+    if node.entry.kind == "file" then
+      local body = prepared.file[node.entry.file].body
+      if body and body.row_count > 0 then
+        for child = 0, body.sequence:count() - 1 do
+          local item = body.sequence:at(child)
+          append(item.id, item.entry, item.entry.text)
+        end
+      else
+        append(node.id .. ":placeholder", { metadata = {target={},decoration={},editable_region={}} }, {""})
       end
     end
-    if recovering then
-      vim.api.nvim_buf_clear_namespace(session.buffer, session.namespace, 0, -1)
-      session.sentinel, session.marks = nil, {}
+  end
+  local by_id = {}
+  for _, block in ipairs(source.block) do by_id[block.id] = block end
+  local function endpoint(row)
+    for index = #source.block, 1, -1 do
+      local block = source.block[index]
+      if starts[block.id] < row then return { block=block.id, position={row=row-starts[block.id],column=0} } end
     end
-    for id, mark in pairs(session.marks) do
-      if not prepared.block[id] then
-        for _, handle in ipairs(mark) do vim.api.nvim_buf_del_extmark(session.buffer, session.namespace, handle) end
-        session.marks[id] = nil
+    return {block=source.block[1].id,position={row=0,column=0}}
+  end
+  for id, record in pairs(prepared.fold.record) do
+    local owner = by_id[record.owner]
+    if owner then
+      local present = false
+      for _, fold in ipairs(owner.metadata.fold) do if fold.id == id then present = true break end end
+      if not present then
+        local fold = vim.deepcopy(record.fold)
+        local end_node = prepared.root.node[fold["end"].block]
+        if end_node then
+          local _, start = prepared.root:position(end_node.id)
+          fold["end"] = endpoint(start + fold["end"].position.row)
+        end
+        owner.metadata.fold[#owner.metadata.fold+1] = fold
+      end
+      if source_entry[owner.id].kind == "file" or source_entry[owner.id].kind == "section"
+        or source_entry[owner.id].kind == "label" or source_entry[owner.id].kind == "context" then
+        owner.metadata.node_marker = {row=record.fold.start.row,capture="Normal"}
       end
     end
-    session.root, session.file, session.block, session.body_owner = prepared.root, prepared.file, prepared.block, prepared.body_owner
-    session.fold, session.inventory = prepared.fold, prepared.inventory
-    session.context_width = session.width
-    session.revision, session.row_count = prepared.inventory.revision, prepared.root:rows()
-    local buffer_us = write(session, edits)
-    session.status = "Applied"
-    for id in pairs(metadata.changed) do
-      metadata.position[id] = select(2, session.sequence:position(id))
+  end
+  local started = vim.uv.hrtime()
+  for _, block in ipairs(source.block) do
+    local old = previous[block.id]
+    if old and old.block and old.block.text == block.text and vim.deep_equal(old.block.metadata, block.metadata) then
+      block.metadata = old.block.metadata
     end
-    buffer.install_fragment_metadata(session, metadata)
-    if not session.sentinel then session.sentinel = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace, 0, 0, {}) end
-    decorations.attach(session)
-    folds.register(session)
-    folds.refresh(session)
-    folds.restore(session, fold_state)
-    return { buffer_us = buffer_us, edits = edits }
-  end)
-  return result.buffer_us, result.edits
+    cache[block.id].block = block
+  end
+  session.root, session.file, session.body_owner = prepared.root, prepared.file, prepared.body_owner
+  session.source_fold = prepared.fold
+  session.source_entry, session.inventory = source_entry, prepared.inventory
+  session.context_width = session.width
+  local result = buffer.apply_snapshot(session, source)
+  assert(result.kind == "Applied", result.diagnostic or result.kind)
+  session.source_block_cache = cache
+  if session.issues_editor then session.issues_editor.sync() end
+  return elapsed(started), {}
 end
 
 ---@param document string
 ---@param options table
 ---@return ForgeStatusReplica
 function M.open(document, options)
-  local session = buffer.open(document, options)
+  local session = buffer.open(document, vim.tbl_extend("force", options or {}, { preserve_view = true }))
   session.file, session.body_owner, session.root, session.commit = {}, {}, Sequence.new(), {}
   session.presentation, session.width, session.generation = { pr = { state = "fetching" }, about = { state = "none" } }, 80, 0
-  session.sequence = facade(session)
   session.locate = function(row, column) return M.locate(session, row, column) end
   session.capture = function(view, action) return M.capture(session, view, action) end
-  session.header_text = function(row)
-    local node = session.root:locate(row)
-    if not node then return nil end
-    local _, start = session.root:position(node.id)
-    return session.block[node.id].chunk[row - start + 1]
-  end
-  session.draw_header = function(row, namespace)
-    local chunks = session.header_text(row)
-    if not chunks then return false end
-    local column = 0
-    for _, chunk in ipairs(chunks) do
-      if #chunk[1] > 0 then
-        vim.api.nvim_buf_set_extmark(session.buffer, namespace, row, column, { end_col = column + #chunk[1],
-          hl_group = chunk[2], priority = 110, ephemeral = true })
-        column = column + #chunk[1]
-      end
-    end
-    return true
-  end
+
   return session
 end
 
@@ -639,88 +530,31 @@ function M.apply_body(session, delivery)
   if delivery.document ~= session.document or session.status ~= "Applied" then return { kind = "Discarded" } end
   local model = session.file[delivery.file]
   if not model or model.record.generation ~= delivery.generation then return { kind = "Discarded" } end
-  if vim.api.nvim_buf_get_changedtick(session.buffer) ~= session.changedtick then
-    return buffer.fail_apply(session, "status buffer was changed externally")
-  end
-  local started, previous = vim.uv.hrtime(), model.body
-  local previous_fold = vim.tbl_extend("force", {}, previous and previous.fold.record or {})
-  local ok, result = pcall(function()
+  local ok, failure = pcall(function()
     assert(vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "status buffer was changed externally")
-    local key = file_key(delivery.file)
-    local _, start = session.root:position(key)
-    local prepared, body, edits
+    local body = model.body
     if optional(delivery.snapshot) then
       assert(delivery.snapshot.document == "body:" .. identity_text(delivery.file) .. ":" .. identity_text(delivery.generation), "status body identity differs")
-      assert(not previous or delivery.snapshot.revision >= previous.revision, "stale status body snapshot")
       body = buffer.fragment(delivery.snapshot)
-      prepared = { block = body.block, changed = {}, retired = {}, position = {} }
-      for id in pairs(body.block) do prepared.changed[id] = true end
-      for id in pairs(previous and previous.block or {}) do if not body.block[id] then prepared.retired[id] = true end end
-      local text = {}
-      for index = 0, body.sequence:count() - 1 do vim.list_extend(text, body.block[body.sequence:at(index).id].text) end
-      if #text == 0 then text[1] = "" end
-      edits = { { start_row = start + 1, removed_rows = previous and math.max(1, previous.row_count) or 1, text = text } }
     elseif optional(delivery.patch) then
-      body = assert(previous, "status body requires a snapshot")
-      prepared = buffer.prepare_fragment_patch(body, delivery.patch, function(row)
-        return assert(vim.api.nvim_buf_get_lines(session.buffer, start + 1 + row, start + 2 + row, true)[1], "body source row disappeared")
-      end)
-      edits = {}
-      for _, edit in ipairs(delivery.patch.text_edit) do
-        edits[#edits + 1] = { start_row = start + 1 + edit.start_row, removed_rows = edit.removed_rows, text = edit.text }
-      end
-    else return { kind = "Applied" } end
-    return cooperative.atomic(function()
-      local fold_state = folds.capture(session)
-      local selected = {}
-      for id, record in pairs(session.fold.record) do
-        if record.fold["end"].block == key or previous_fold[id] then selected[id] = true end
-      end
-      local affected = folds.prepare_records(session, selected, edits)
-      if optional(delivery.patch) then buffer.apply_fragment_patch(body, delivery.patch, prepared) end
-      model.body = body
-      model.header = file_header(model.record, body, delivery.file)
-      session.block[key] = model.header
-      session.root:update(key, model.header)
-      session.fold.changed = affected
-      for id, record in pairs(session.fold.record) do
-        if record.fold["end"].block == key then
-          record.fold["end"].position.row = model.header.row_count
-          session.root:fold_boundary(key, "end:" .. id, model.header.row_count, -1)
-          session.fold.changed[id] = true
-        end
-      end
-      for id in pairs(prepared.retired) do session.block[id], session.body_owner[id] = nil, nil end
-      for id, value in pairs(prepared.block) do
-        session.block[id], session.body_owner[id] = value, delivery.file
-        prepared.position[id] = start + 1 + select(2, body.sequence:position(id))
-      end
-      for id in pairs(previous_fold) do
-        if not body.fold.record[id] then session.fold.record[id] = nil end
-      end
-      for id, value in pairs(body.fold.record) do
-        if not session.fold.record[id] or (body.fold.changed and body.fold.changed[id]) then session.fold.changed[id] = true end
-        session.fold.record[id] = value
-      end
-      session.row_count = session.root:rows()
-      local buffer_us = write(session, edits)
-      buffer.install_fragment_metadata(session, prepared)
-      folds.refresh(session)
-      folds.restore(session, fold_state)
-      trace(session, "status.body.applied", { file = delivery.file, generation = delivery.generation,
-        rows = body.row_count, edits = #edits, buffer_us = buffer_us, elapsed_us = elapsed(started) })
-      return { kind = "Applied" }
-    end)
+      assert(body, "status body requires a snapshot")
+      local prepared = buffer.prepare_fragment_patch(body, delivery.patch)
+      buffer.apply_fragment_patch(body, delivery.patch, prepared)
+    else return end
+    model.body = body
+    model.header = file_header(model.record, body, delivery.file)
+    adopt(session, prepare(session, session.inventory))
   end)
   if not ok then
-    session.notice(tostring(result))
+    session.status = "Desynchronized"
+    session.notice(tostring(failure))
     if session.recover_body and not model.recovering then
       model.recovering = true
       session.recover_body(delivery.file, delivery.generation)
     end
-    return { kind = "Desynchronized" }
+    return { kind = "Desynchronized", diagnostic = tostring(failure) }
   end
-  return result
+  return { kind = "Applied" }
 end
 
 ---@param session ForgeStatusReplica
@@ -731,12 +565,13 @@ function M.locate(session, row, column)
   local node = session.sequence:locate(row)
   if not node then return nil end
   local _, start = session.sequence:position(node.id)
-  local relative = row - start
-  local semantic = node.entry.location
+  local relative = require("forge.node_projection").source_position(session, node.id, {row=row-start,column=column}).row
+  local source = session.source_entry[node.id] or node.entry
+  local semantic = source.location
   local owner = session.body_owner[node.id]
   local target
   if owner then
-    for _, value in ipairs(node.entry.metadata.target) do
+    for _, value in ipairs(source.metadata.target) do
       local first, last = value.range.start, value.range["end"]
       if (relative > first.row or relative == first.row and column >= first.column)
         and (relative < last.row or relative == last.row and column < last.column) then target = value.id break end
@@ -744,7 +579,7 @@ function M.locate(session, row, column)
     local model = session.file[owner]
     semantic = { kind = "body", file = owner, generation = model.record.generation, revision = model.body.revision,
       block = node.id, position = { row = relative, column = column }, target = target }
-  elseif node.entry.kind == "file" and relative > 0 or node.entry.kind == "section" and relative == 0 then
+  elseif source.kind == "file" and relative > 0 or source.kind == "section" and relative == 0 then
     semantic = nil
   elseif semantic then
     target = semantic.kind == "file" and file_key(semantic.id) or semantic.kind == "context" and ("status:context:" .. semantic.role)
@@ -767,7 +602,7 @@ function M.capture(session, view, action, selection)
   local located = M.locate(session, cursor[1] - 1, cursor[2])
   local location = selection and selection.target[1] or located and located.location
   if not location and located and action == "navigate" then
-    location = session.block[located.block].location
+    location = session.source_entry[located.block].location
       or { kind = "boundary", after_files = located.block == "status:context:recent-title" }
   end
   if not location then return nil, "status row has no target" end
@@ -818,74 +653,22 @@ end
 ---@param session ForgeStatusReplica
 ---@param presentation table
 function M.present_context(session, presentation)
-  local previous_presentation = session.presentation
   session.presentation = presentation
-  local context = session.inventory and optional(session.inventory.context)
-  if not context or session.status ~= "Applied" then return end
-  local started = vim.uv.hrtime()
-  local ok, failure = pcall(function()
-    assert(vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "status buffer was changed externally")
-    local remote_changed = not vim.deep_equal(presentation.remote_action, previous_presentation.remote_action)
-    if remote_changed then
-      for _, role in ipairs({ "upstream", "push" }) do
-        local remote = presentation.remote_action
-        local visible = optional(context[role]) ~= nil
-          or (remote ~= nil and role == (remote.action == "push" and "push" or "upstream"))
-        if (session.block["status:context:" .. role] ~= nil) ~= visible then
-          adopt(session, prepare(session, session.inventory))
-          return
-        end
+  if session.inventory and session.status == "Applied" then
+    local ok, failure = pcall(function()
+      local context = optional(session.inventory.context)
+      if not context then return end
+      local leading = context_entries(session, context)
+      local count = 0
+      while count < session.root:count() and session.root:at(count).entry.kind == "context" do
+        count = count + 1
       end
-    end
-    local replacement, edits = {}, {}
-    local leading, recent = {}, {}
-    local resized = session.context_width ~= session.width
-    if resized or remote_changed then
-      leading, recent = context_entries(session, context)
-      vim.list_extend(leading, recent)
-    else
-      for _, role in ipairs({ "pr", "about" }) do
-        local chunks = summary_chunks(presentation[role])
-        if not vim.deep_equal(chunks, summary_chunks(previous_presentation[role])) then
-          leading[#leading + 1] = { id = "status:context:" .. role,
-            entry = context_entry(role, role == "pr" and "PR" or "About", chunks) }
-        end
-      end
-    end
-    if #leading == 0 then return end
-    for _, candidate in ipairs(leading) do
-      local key, value = candidate.id, candidate.entry
-      local previous = assert(session.block[key], "missing status context row")
-      replacement[key] = value
-      if not vim.deep_equal(previous.text, value.text) then
-        local _, start = session.root:position(key)
-        edits[#edits + 1] = { start_row = start, removed_rows = previous.row_count, text = value.text }
-      end
-    end
-    cooperative.atomic(function()
-      local selected = { ["status:context:recent"] = resized and session.fold.record["status:context:recent"] and true or nil }
-      local affected = folds.prepare_records(session, selected, edits)
-      for key, value in pairs(replacement) do
-        session.block[key] = value
-        session.root:update(key, value)
-      end
-      session.fold.changed = affected
-      local recent = session.fold.record["status:context:recent"]
-      if recent and resized then
-        local endpoint = recent.fold["end"]
-        endpoint.position.row = session.block[endpoint.block].row_count
-        session.root:fold_boundary(endpoint.block, "end:status:context:recent", endpoint.position.row, -1)
-        session.fold.changed["status:context:recent"] = true
-      end
-      session.row_count = session.root:rows()
-      session.context_width = session.width
-      table.sort(edits, function(left, right) return left.start_row > right.start_row end)
-      local buffer_us = write(session, edits)
-      folds.refresh(session)
-      trace(session, "status.context.applied", { edits = #edits, buffer_us = buffer_us, elapsed_us = elapsed(started) })
+      session.root:splice(0, count, leading)
+      adopt(session, { root = session.root, file = session.file, body_owner = session.body_owner,
+        inventory = session.inventory, fold = session.source_fold })
     end)
-  end)
-  if not ok then buffer.fail_apply(session, failure) end
+    if not ok then buffer.fail_apply(session, failure) end
+  end
 end
 
 ---@param session ForgeStatusReplica

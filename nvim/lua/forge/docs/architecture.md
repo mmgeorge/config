@@ -146,46 +146,38 @@ viewport indexing and redraw. Lua resolves those groups through the active theme
 widths follow the complete display group's line ranges, so chunks of one hunk keep aligned
 columns without adding gutter bytes to the source text.
 
-`forge.folds` owns native manual fold ranges and renders collapsed labels from header text
-and semantic decorations. Each attached window retains its own open or closed preference.
-Ordinary patches remove and recreate only affected fold subtrees. Unchanged native ranges
-survive timer updates. One-line replacements use `nvim_buf_set_text` to preserve the line
-and its fold membership. `nvim_buf_set_lines` can shorten a manual fold when replacing its
-last line, even when the row count stays unchanged. Row insertions and deletions remove
-affected folds before the edit and recreate them afterward. Harness and Status share the
-text writer and `folds.prepare_records` invalidation path. Before either view changes its
-row index, the fold engine queries the old sequence for boundaries touching each edit,
-including an insertion exactly at an exclusive endpoint or a zero-row marker. This prevents
-the logical endpoint advancing while Neovim leaves the native range behind. Indexed range
-queries visit only intersecting blocks and the affected fold descendants, preserving
-unrelated native folds. Status delegates those queries through its file/body sequence.
-Body patch validation and text preparation finish before the synchronous commit removes
-old folds, adopts the fragment, writes text, and restores folds. Subtree deletion selects the
-complete native range before removing its descendants, including folds that share a header row. Creation temporarily opens
-containing folds so Neovim does not widen a child range to a closed ancestor. Both operations
-restore retained ancestor preferences within the atomic buffer update. Attaching a window
-or replacing an authoritative snapshot rebuilds the native ranges without replacing retained
-window preferences. Fold actions capture the
-affected window's choices immediately. Detaching retains those choices even after its buffer
-has changed, and a replacement window inherits the document's most recently detached view.
-An existing window restores its own choices. Native ranges are rebuilt once from those
-preferences, without a second fold-open/close replay. Closing a window drops its retained
-entry, while the last detached view remains available until the document closes.
-Native fold preparation and publication failures mark the replica desynchronized, report
-the diagnostic, and request an authoritative snapshot through the document's recovery path.
-Before native mutation, Rust and Lua validate node identity, parent existence, parent-before-child
-ordering, and containment within ancestor folds. Node-owner and direct-child indexes select the
-affected relationships when an edit changes a parent, child, or fold endpoint. Rejected updates
-retain the last published text and revision. This validation does not rebuild or scan the entire
-timeline for a streaming update.
-Fold views record native ownership only after creation succeeds. Deletion restores temporary
-window options even when an editor command fails.
-Status demand skips closed folds,
-and expanding a file admits its source through the existing bounded demand path.
+Forge documents keep collapsed descendants out of the Neovim buffer. `forge.nodes`
+indexes source ranges and resolves expansion actions. `forge.node_projection` retains
+source blocks and explicit expansion choices, then projects only visible rows for Status
+and review documents. It reuses unchanged visible blocks and skips complete hidden
+ranges. Expansion choices belong to the document, so windows displaying that document
+share the same visible rows. Ordinary source buffers retain their own folding settings.
+Forge disables native folding in generated views and does not create native fold ranges.
+
+Harness retains its Rust-owned node projection and incremental IPC patches. Lua applies
+that projection directly, without projecting or scanning the retained transcript again.
+The node's display state and the rows published in the same revision must agree. Expanding
+an unloaded node keeps its heading visible while the existing asynchronous content request
+runs. A successful response inserts content. Closing during loading cancels expansion
+intent, and a late response cannot reopen the node. Errors clear loading state and remain
+visible through the existing notification and recovery paths.
+
+Status retains file bodies independently of visible rows. Opening an unloaded file requests
+its body before expanding. The shared projector handles file, hunk, and section expansion,
+while the Git service remains responsible for paging and semantic actions. Review buffers
+retain canonical source rows and draft comments separately. A collapsed source row is
+omitted from presentation without deleting its comment or changing its source anchor.
+
+Updates validate source identities, ranges, and revisions before publication. The buffer
+writer captures every displayed window's cursor immediately before its synchronous commit.
+It restores surviving block identities afterward, or selects the enclosing heading when
+collapse removes the selected body. No cursor snapshot crosses asynchronous preparation.
+Text, decorations, visible indexes, and cursor restoration publish without yielding.
+Each changed span replaces its prior rows directly, without clearing the buffer first.
 
 `forge.cooperative` prepares Harness document updates in slices targeting four milliseconds
-or 1024 work units. Preparation retains the committed text, folds, and decorations. A completed
-update publishes text, metadata, folds, and view restoration in one non-yielding callback.
+or 1024 work units. Preparation retains the committed text, node ranges, and decorations. A completed
+update publishes text, metadata, node ranges, and view restoration in one non-yielding callback.
 Each text replacement uses one buffer API call without first deleting the live range.
 Document actions reject pending updates while cursor movement remains available during preparation.
 Each resume checks the document owner, host generation, buffer validity, and changedtick.
@@ -196,7 +188,7 @@ maximum non-yielding commit duration in `ui.document.slices`. Large initial snap
 the preparation time budget during their atomic commit, so commit timing is tracked separately.
 
 Each synchronous commit captures every attached window's current cursor identity and viewport
-after preparation, immediately before changing native text or folds. The same non-yielding
+after preparation, immediately before changing visible text and node metadata. The same non-yielding
 commit restores those anchors against the new document. Movement during preparation is therefore
 included in the capture and never suppresses restoration. Cursor snapshots do not cross
 asynchronous preparation boundaries.
@@ -211,7 +203,7 @@ Action-target snapshots remain separate and only validate whether a response sti
 one open Harness presentation. Emitted nodes identify exchanges, messages, tool groups,
 tools, changes, files, and hunks. Each node separates its source lifecycle, automatic display,
 explicit expansion override, and loaded extent. `NodeState` travels inside block metadata,
-so the same atomic publication changes the text, node state, and native fold range.
+so the same atomic publication changes the text, node state, and visible source ranges.
 Content blocks carry the owning node identity, allowing Tab on output rows to address the
 same node as its heading. The protocol version changes with this shared contract.
 
@@ -249,8 +241,8 @@ before projection. Subtree replacement and enclosing fold endpoint rebasing shar
 validated document edit. An enclosing fold ending at the replaced subtree's boundary moves
 to the replacement's last block, even when its former endpoint survives as a heading.
 Retaining that heading must not leave newly loaded children outside their parent fold.
-Native folds follow the published node display rather than keeping a
-second Harness expansion preference. After a body splice repairs fold endpoints, subsequent
+The visible row projection follows the published node display without a second
+Harness expansion preference. After a body splice repairs fold endpoints, subsequent
 heading updates preserve the current loaded ranges at application time. They cannot restore
 fold metadata captured before the splice.
 
@@ -323,8 +315,8 @@ claiming more content. Explicit retry first adopts the native snapshot before re
 page, recovering from responses that advanced the native cursor without reaching the buffer.
 Closed output views and replaced hosts cannot adopt late responses.
 
-Harness Markdown resolves visible message owners through the weighted sequence and skips closed
-native folds. The parser includes complete visible messages across all attached windows, retaining
+Harness Markdown resolves visible message owners through the weighted sequence. Collapsed
+descendants have no buffer rows and never enter Markdown parsing. The parser includes complete visible messages across all attached windows, retaining
 delimiter context without scanning off-screen history. Per-block versions suppress renders after
 unrelated tool and timer patches. Parsing uses a completion callback guarded by the render lifetime.
 Leaving all Markdown regions stops their highlighter. Cursor reveal checks use the cursor range,
@@ -620,7 +612,6 @@ forge/
 │       ├── ignored_path_store.lua Durable worktree-scoped virtual ignore markers and stage suppressions
 │       ├── status_sync.lua     Optimistic cache projection and path-scoped authoritative synchronization
 │       ├── section_builder.lua Build sections/files from diff text, attach review comments
-│       ├── fold_state.lua      Per-key fold map, native fold application, foldtext, resize refresh
 │       ├── size_gate.lua       Estimate render cost, decide which big files defer their body render
 │       ├── diff_source_state.lua  Per-file diff-source state bridging status entries to the render engine
 │       ├── entry_nav.lua       Cursor/entry navigation, action-target resolution, decoration prewarm
@@ -645,7 +636,6 @@ forge/
 │   ├── display_text.lua       Shared display-cell wrapping with semantic first/continuation prefixes
 │   ├── task_tree.lua          View-independent semantic task tree → wrapped rows + fold metadata
 │   ├── task_tree_style.lua    Shared task/action/kind/target highlight segments
-│   ├── fold_presentation.lua  Shared native-fold labels, filler, and folded-row window chrome
 │   ├── comment_box.lua        Pure compact comment-box wrapping and segmented row layout
 │   ├── comment_editor.lua     Shared full-width comment rules and editable-body line normalization
 │   ├── layout.lua             Fenwick (binary-indexed) tree mapping items → buffer rows in O(log n)
@@ -1367,20 +1357,14 @@ which prevents an Unstaged-to-Ignored flash without serializing the two reads.
 `status_keys.lua` assigns each section/file/hunk a **stable identity key** so fold state,
 caches, and actions all index the same canonical key across renders.
 
-**3. Render.** `status_render.lua` runs the full pass: `status_head.lua` builds the
-head/about lines, the sections render their files and hunks, and `status_buffer.lua`
-accumulates lines, highlights, extmarks, and folds. Buffer text reconciliation asks
-`vim.diff` for histogram indices, then applies disjoint edits from bottom to top so an
-unchanged prefix never gets rewritten. Extmarks and the decoration provider complete the
-pass. `render_orchestrator.lua` wraps the async git-root load and PR-specific render
-passes.
+**3. Render.** `status_render.lua` retains the inventory and loaded file bodies as canonical
+source. It translates changed records into source blocks for `node_projection.lua`, which reuses
+unchanged visible blocks. `buffer.lua` publishes changed spans and their decorations atomically.
 
-**4. Fold and gate.** `fold_state.lua` owns the per-key fold map, native fold ranges,
-foldtext, materialized-entry state, and resize refresh. Initially collapsed files omit
-their bodies. The first expansion materializes the file and hunk rows once, after which
-collapse and expansion use native folds without rebuilding the status buffer. `size_gate.lua`
-estimates how many rows a file's hunks and comments will occupy and **defers the body
-render of files over budget**, so opening a status with a 20,000-line diff stays responsive.
+**4. Expand and load.** Document-owned choices control section, file, and hunk visibility.
+Collapsed bodies remain outside Neovim. Opening an unloaded file requests its body and keeps
+the heading closed until delivery succeeds. Closing during loading revokes that opening intent.
+File bodies remain reusable across expansion changes and unchanged inventory generations.
 
 **5. Bridge to the engine.** `diff_source_state.lua` is the seam between status entries
 and the render engine: it owns the per-file diff-source registry, commit source handles,
@@ -1839,9 +1823,9 @@ which is why `query_runtime` must run before any consumer.
        ├─ git_data + section_map                       (cache + canonical section tree)
        ├─ operation_journal.reset                      (confirmed baseline)
        └─ status_render                                (head + sections → lines → extmarks)
-            ├─ size_gate defers oversized file bodies
-            ├─ fold_state applies native folds
-            ├─ vim.diff returns disjoint line indices applied bottom-up
+            ├─ file demand loads visible source bodies
+            ├─ node_projection retains only expanded source rows
+            ├─ buffer publishes changed spans and decorations atomically
             └─ diff_source_state + render/* paint expanded hunks
 ```
 
@@ -2155,26 +2139,27 @@ allows a provider rename. Removed tasks disappear unless a completed thought ref
 When one task is in progress at thought completion, the broker freezes that task ID onto the
 thought. Later checklist rewrites never reparent historical work.
 
-The live protocol publishes `ActiveThoughtUpdate` counters plus one replaceable latest-tool
-record while a thought remains mutable. The Harness tree shows `Running N tools`, the latest
-tool heading, and at most four wrapped output rows plus a hidden-count indicator. Native
-previews apply this limit after display-cell wrapping, including when one source line spans
-multiple rows. Explicit expansion retains the complete output. The live preview does not
-expose a fold whose contents could change while open. Each lifecycle event replaces that preview, so a newly started tool displaces the
-previous tool instead of accumulating mutable rows. When the next thought or turn boundary
-closes that thought, the broker merges successful completed provider file-change items in their
-first-seen order and publishes one immutable `CompletedThought`. The UI then changes
-`Running` to `Ran` atomically and enables semantic expansion nodes for that thought, its tool
-list, each tool result, and its changes. The final assistant message becomes the Markdown response instead of another thought
-when it contains no tools.
+The timeline projects ordered exchange items into separate message, tool-group, and change
+nodes. Consecutive ordinary tools share a group. Commentary, steering, or a file edit ends that
+group. While its owning exchange remains active, the latest tool can show a preview of its last
+four display rows. Explicit expansion loads the complete output through the existing paging
+path. A settled group defaults to collapsed tools without previews. Exchange completion also
+collapses the activity node and leaves its aggregate changes and final response outside it.
+
+Tool output deltas update the existing output cache. File edits have no generic tool-output
+cache, so their deltas reconcile the change node instead. Both paths retain the same provider
+item identity and saved output. A failed edit therefore exposes its diagnostic through its own
+change node without creating a generic tool row.
 
 Codex `fileChange` items carry path, operation kind, move destination, textual diff, and final
 status. The backend replaces provisional patch revisions by provider item ID, while the timeline
-retains first-seen tool order. Only completed successful file-change items contribute to a
-thought diff. Commands, formatters, generators, failed patches, and declined patches therefore
-remain visible as tools without being misattributed as authored edits. Backends that do not
-publish structured file changes omit the thought-level Changed node instead of inferring it from
-the filesystem or command output.
+retains first-seen order. Each successful edit operation renders a `Changed N files` node at its
+original position, outside generic tool groups. An edit ends the preceding tool group. Its node
+opens directly into files and hunks, without a generic tool heading or empty output preview.
+Running edits show `Changing N files`. Failed, cancelled, and interrupted edits retain their
+outcome and available diagnostic text but never contribute to the successful change summary.
+Commands, formatters, and generators remain ordinary tools. Their filesystem effects require a
+checkpoint comparison rather than inference from command output.
 
 Every Git interaction captures a baseline before its first provider turn and a terminal
 checkpoint when it completes, fails, or cancels. The first baseline is checkpoint zero,
@@ -2205,7 +2190,14 @@ path. Because both use the same baseline-to-terminal content comparison, repeate
 overlapping thoughts, and reversions resolve to one final canonical patch instead of summed
 provider hunks. Equal patches render one interaction-level `Changed … · checkpoint matched`
 node. Divergent patches render independent `Changed …` and `Checkpoint total: …` nodes. The
-per-thought provider trees remain available at their original timeline positions.
+per-operation provider trees remain available at their original timeline positions.
+
+Non-Git exchanges retain an aggregate of successful provider-reported edits at finalization,
+including edits from referenced child exchanges. That summary appears outside the activity node
+and is labeled `reported edits`. It groups repeated paths but preserves individual edit hunks,
+so its counts describe reported operations rather than a net workspace comparison. Reopened
+history without a saved aggregate derives the same summary from its retained edit records.
+No repository is initialized, and no checkpoint or rollback capability is implied.
 
 The checkpoint total remains the rollback and cancellation-divergence authority. It intentionally
 includes command, formatter, and external-process effects that do not belong to a structured
@@ -2239,14 +2231,10 @@ wrapped response continuations will regress to column zero.
 parser lookup resolves the same parser, then restricts that parser to the response ranges emitted
 by the timeline. A render with no response ranges clears the included regions and render-markdown
 namespace, preventing Markdown captures from leaking into prompts, tools, or shared diff rows.
-`transaction.lua` compares stable node blocks, applies changed blocks from bottom to top, and
-preserves semantic cursor identity, viewport position, expansion state, and settled prefix extmarks.
-It validates semantic row indexes against the post-mutation buffer before restoring the cursor, so
-switching between timelines with different lengths cannot address a row from the previous projection.
-It mutates a hidden transcript buffer without applying window-local cursor, view, or fold state when
-that window currently displays Permissions or another view. Returning to Harness then rebuilds folds.
-It rebuilds native folds only when fold topology changes, which prevents timer-driven streaming
-frames from repeatedly closing and reopening unchanged folds.
+`buffer.lua` applies validated node projections incrementally and preserves semantic cursor
+identity, viewport position, and unchanged prefix extmarks. The synchronous commit captures
+only windows displaying the affected buffer. Returning to Harness attaches the document's
+current projection without recreating editor folds. Timer updates retain existing node choices.
 Active thoughts never expose expansion keys. Completed nodes stay immutable, so an expanded
 command or diff never changes while the user reads it.
 Prompt submission does not create a Lua-owned interaction. Broker admission emits the first
