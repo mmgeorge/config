@@ -27,6 +27,7 @@ impl CopilotEventDecoder {
             "assistant.turn_start" | "assistant.turn_end" => {
                 publish(
                     BackendEvent {
+            received_at_ms: None,
                         address: None,
                         turn_boundary: Some(
                             if provider_event.event_type == "assistant.turn_start" {
@@ -106,6 +107,7 @@ impl CopilotEventDecoder {
                 if let Some(activity) = activity {
                     publish(
                         BackendEvent {
+            received_at_ms: None,
                             address: None,
                             turn_boundary: None,
                             kind: "tool".into(),
@@ -130,6 +132,7 @@ impl CopilotEventDecoder {
                     output.metrics.context_usage = Some(context_usage.clone());
                     publish(
                         BackendEvent {
+            received_at_ms: None,
                             address: None,
                             turn_boundary: None,
                             kind: "context_usage".into(),
@@ -160,6 +163,7 @@ impl CopilotEventDecoder {
                     cumulative_total: None,
                 };
                 let mut event = BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "usage".into(),
@@ -177,6 +181,7 @@ impl CopilotEventDecoder {
             "subagent.started" | "subagent.completed" | "subagent.failed" => {
                 publish(
                     BackendEvent {
+            received_at_ms: None,
                         address: None,
                         turn_boundary: None,
                         kind: "agent_lifecycle".into(),
@@ -219,6 +224,7 @@ impl CopilotEventDecoder {
         };
         publish(
             BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "plan".into(),
@@ -247,6 +253,7 @@ impl CopilotEventDecoder {
         };
         publish(
             BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: kind.into(),

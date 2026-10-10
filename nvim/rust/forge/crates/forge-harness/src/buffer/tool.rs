@@ -2,13 +2,14 @@ use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
 const MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
 const MAX_OUTPUT_ROWS: usize = 262_144;
+const INLINE_CHUNK_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Serialize)]
 pub struct ToolOutputPreview<'a> {
@@ -25,17 +26,96 @@ pub struct ToolOutputBatch {
     pub complete: bool,
 }
 
-#[derive(Clone)]
 pub struct ToolOutputView {
     call_id: String,
-    saved: Arc<str>,
+    saved: Arc<String>,
     display: Arc<String>,
     row: Arc<Vec<Range<usize>>>,
     loaded_rows: usize,
     expanded: bool,
+    parser: strip_ansi_escapes::Writer<OutputCollector>,
+    collected: Arc<Mutex<Vec<u8>>>,
+    total_rows: usize,
+    heading: Option<crate::turn::ToolCall>,
+    owner: String,
+}
+
+struct OutputCollector(Arc<Mutex<Vec<u8>>>);
+
+impl Write for OutputCollector {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().map_err(|_| std::io::Error::other("tool output collector poisoned"))?.extend_from_slice(bytes);
+        Ok(bytes.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+}
+
+impl Clone for ToolOutputView {
+    fn clone(&self) -> Self {
+        let mut view = Self::new(self.call_id.clone(), Arc::from(self.saved.as_str()))
+            .expect("validated tool output");
+        view.loaded_rows = self.loaded_rows;
+        view.expanded = self.expanded;
+        view.heading = self.heading.clone();
+        view.owner = self.owner.clone();
+        view
+    }
 }
 
 impl ToolOutputView {
+    /// Retains source heading fields without copying the saved output or change tree.
+    pub(super) fn heading(&mut self, call: &crate::turn::ToolCall) {
+        self.heading = Some(crate::turn::ToolCall {
+            started_at_ms:call.started_at_ms,completed_at_ms:call.completed_at_ms,task_id:None,
+            id:call.id.clone(),kind:call.kind.clone(),title:call.title.clone(),output:String::new(),
+            status:call.status.clone(),failed:call.failed,change:Default::default(),
+        });
+    }
+
+    /// Associates inline chunks with their containing projected entry.
+    pub(super) fn own(&mut self, owner: &str) { self.owner = owner.to_owned(); }
+
+    /// Resolves the indexed entry owner for inline activation.
+    pub(super) fn owner(&self) -> &str { &self.owner }
+
+    /// Renders activation headings from source metadata rather than truncated native text.
+    pub(super) fn header(&self) -> Option<&crate::turn::ToolCall> {
+        self.heading.as_ref()
+    }
+
+    /// Keeps the parser and saved bytes while adopting newly projected heading ownership.
+    pub(super) fn retain(&mut self, replacement: &Self) {
+        self.heading = replacement.heading.clone();
+        self.owner.clone_from(&replacement.owner);
+    }
+
+    /// Counts independent inline chunks without walking retained output rows.
+    pub(super) fn inline_chunks(&self) -> usize {
+        self.inline_bytes().div_ceil(INLINE_CHUNK_BYTES).max(1)
+    }
+
+    /// Returns the first chunk whose mutable tail can change after an append.
+    pub(super) fn inline_tail(&self) -> usize {
+        self.inline_bytes() / INLINE_CHUNK_BYTES
+    }
+
+    fn inline_bytes(&self) -> usize {
+        self.total_rows.checked_sub(1).map_or(0, |index| self.row[index].end)
+    }
+
+    /// Borrows at most one byte window with UTF-8 boundaries retained across appends.
+    pub(super) fn inline_chunk(&self, index: usize) -> Vec<&str> {
+        let bytes = self.inline_bytes();
+        let boundary = |offset: usize| {
+            let mut offset = offset.min(bytes);
+            while !self.display.is_char_boundary(offset) { offset += 1; }
+            offset
+        };
+        let start = boundary(index * INLINE_CHUNK_BYTES);
+        let end = boundary((index + 1) * INLINE_CHUNK_BYTES);
+        self.display[start..end].split_terminator('\n').collect()
+    }
+
     pub fn retained_bytes(&self) -> usize {
         self.saved.len()
             + self.display.capacity()
@@ -51,53 +131,61 @@ impl ToolOutputView {
             saved.len() <= MAX_OUTPUT_BYTES,
             "tool output exceeds the 32 MiB view limit"
         );
-        let display = strip_ansi_escapes::strip_str(&saved)
-            .replace("\r\n", "\n")
-            .replace('\r', "")
-            .replace('\0', "\\0");
-        ensure!(
-            display.len() <= MAX_OUTPUT_BYTES,
-            "tool display exceeds the 32 MiB view limit"
-        );
-        let mut row = Vec::new();
-        let mut start = 0;
-        for (offset, byte) in display.bytes().enumerate() {
+        let collected = Arc::new(Mutex::new(Vec::new()));
+        let mut view = Self {
+            call_id,
+            saved: Arc::new(String::new()),
+            display: Arc::new(String::new()),
+            row: Arc::new(Vec::new()),
+            loaded_rows: 0,
+            expanded: false,
+            parser: strip_ansi_escapes::Writer::new(OutputCollector(collected.clone())),
+            collected,
+            total_rows: 0,
+            heading: None,
+            owner: String::new(),
+        };
+        view.append(&saved)?;
+        Ok(view)
+    }
+
+    pub fn append(&mut self, delta: &str) -> Result<()> {
+        ensure!(self.saved.len() + delta.len() <= MAX_OUTPUT_BYTES, "tool output exceeds the 32 MiB view limit");
+        self.parser.write_all(delta.as_bytes())?;
+        self.parser.flush()?;
+        let normalized = String::from_utf8(std::mem::take(&mut *self.collected.lock()
+            .map_err(|_| anyhow::anyhow!("tool output collector poisoned"))?))?;
+        ensure!(self.display.len() + normalized.len() <= MAX_OUTPUT_BYTES, "tool display exceeds the 32 MiB view limit");
+        Arc::make_mut(&mut self.saved).push_str(delta);
+        let display = Arc::make_mut(&mut self.display);
+        let row = Arc::make_mut(&mut self.row);
+        let mut start = display.len();
+        if !display.ends_with('\n') && let Some(previous) = row.pop() { start = previous.start; }
+        let offset = display.len();
+        display.push_str(&normalized);
+        for (relative, byte) in normalized.bytes().enumerate() {
             if byte == b'\n' {
-                ensure!(
-                    row.len() < MAX_OUTPUT_ROWS,
-                    "tool output requires a complete file export beyond 262144 rows"
-                );
-                row.push(start..offset);
-                start = offset + 1;
+                let end = offset + relative;
+                row.push(start..end);
+                if end > start { self.total_rows = row.len(); }
+                start = end + 1;
             }
         }
         if start < display.len() {
-            ensure!(
-                row.len() < MAX_OUTPUT_ROWS,
-                "tool output requires a complete file export beyond 262144 rows"
-            );
             row.push(start..display.len());
+            self.total_rows = row.len();
         }
-        while row.last().is_some_and(|range| range.is_empty()) {
-            row.pop();
-        }
-        Ok(Self {
-            call_id,
-            saved,
-            display: Arc::new(display),
-            row: Arc::new(row),
-            loaded_rows: 0,
-            expanded: false,
-        })
+        ensure!(row.len() <= MAX_OUTPUT_ROWS, "tool output requires a complete file export beyond 262144 rows");
+        Ok(())
     }
 
     pub fn preview(&self, expanded: bool) -> ToolOutputPreview<'_> {
-        let visible = if expanded { self.row.len() } else { 4 };
+        let visible = if expanded { self.total_rows } else { 4 };
         ToolOutputPreview {
-            row: self.row.iter().take(visible)
+            row: self.row.iter().take(visible.min(self.total_rows))
                 .map(|range| &self.display[range.clone()]).collect(),
-            hidden_rows: self.row.len().saturating_sub(visible),
-            total_rows: self.row.len(),
+            hidden_rows: self.total_rows.saturating_sub(visible),
+            total_rows: self.total_rows,
         }
     }
 
@@ -119,12 +207,12 @@ impl ToolOutputView {
             (1..=256).contains(&row_limit) && (1..=65536).contains(&byte_limit),
             "invalid tool batch limits"
         );
-        if !self.expanded || self.loaded_rows == self.row.len() {
+        if !self.expanded || self.loaded_rows == self.total_rows {
             return Ok(None);
         }
         let mut row = Vec::new();
         let mut bytes = 0;
-        for range in self.row[self.loaded_rows..].iter().take(row_limit) {
+        for range in self.row[self.loaded_rows..self.total_rows].iter().take(row_limit) {
             let text = &self.display[range.clone()];
             if bytes + text.len() + 1 > byte_limit {
                 ensure!(
@@ -139,7 +227,7 @@ impl ToolOutputView {
         Ok(Some(ToolOutputBatch {
             call_id: self.call_id.clone(),
             start_row: self.loaded_rows,
-            complete: self.loaded_rows + row.len() == self.row.len(),
+            complete: self.loaded_rows + row.len() == self.total_rows,
             row,
         }))
     }
@@ -154,11 +242,11 @@ impl ToolOutputView {
             !batch.row.is_empty()
                 && batch.row.len() <= 256
                 && batch.row.iter().map(|row| row.len() + 1).sum::<usize>() <= 65536
-                && self.loaded_rows + batch.row.len() <= self.row.len(),
+                && self.loaded_rows + batch.row.len() <= self.total_rows,
             "tool batch exceeds source rows"
         );
         ensure!(
-            batch.complete == (self.loaded_rows + batch.row.len() == self.row.len()),
+            batch.complete == (self.loaded_rows + batch.row.len() == self.total_rows),
             "tool batch completion differs from saved output"
         );
         for (offset, text) in batch.row.iter().enumerate() {
@@ -245,6 +333,19 @@ impl Drop for OwnedToolExport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn append_preserves_fragmented_ansi_partial_rows_and_trailing_blanks() {
+        let mut output = ToolOutputView::new("call".into(), Arc::from("")).unwrap();
+        for chunk in ["\u{1b}[3", "1mλ", "\r", "\n\n", "tail", " continued\u{1b}[", "0m\n\n"] {
+            output.append(chunk).unwrap();
+        }
+        assert_eq!(output.preview(false).row,vec!["λ","","tail continued"]);
+        assert_eq!(output.preview(false).total_rows,3);
+        output.append("last").unwrap();
+        assert_eq!(output.preview(true).row,vec!["λ","","tail continued","","last"]);
+        assert_eq!(output.preview(false).hidden_rows,1);
+    }
 
     #[test]
     fn preview_keeps_first_four_lines_and_counts_only_remaining_lines() {

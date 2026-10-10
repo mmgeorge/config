@@ -1,4 +1,4 @@
-use super::{Message, MessageDelivery, MessageKind, ToolCall, ToolStore, TurnItem};
+use super::{Message, MessageDelivery, MessageKind, ToolCall, ToolState, ToolStore, TurnItem};
 use anyhow::{Result, ensure};
 use serde::{Deserialize, Serialize};
 
@@ -125,6 +125,19 @@ impl Turn {
         Ok(())
     }
 
+    pub(crate) fn record_tool_event(&mut self, event: &crate::backend::BackendEvent, now_ms: i64) -> Result<()> {
+        let activity = event.activity.as_ref().expect("tool event");
+        let timestamp = |path: &str| event.data.pointer(path).and_then(serde_json::Value::as_i64);
+        let observed = event.observed_at_ms(now_ms);
+        let settled = self.tool.get(&activity.id).is_some_and(|tool|tool.state() != ToolState::Running);
+        self.record_tool(activity, observed)?;
+        if !settled {
+            self.tool.timing(&activity.id, timestamp("/params/startedAtMs"),
+                timestamp("/params/completedAtMs"), timestamp("/params/item/durationMs"));
+        }
+        Ok(())
+    }
+
     /// Attach task provenance before execution settles, retaining the first attribution.
     pub(crate) fn attribute_tool(&mut self, id: &str, task_id: &str) -> Result<bool> {
         ensure!(
@@ -247,6 +260,21 @@ fn default_delivery(kind: MessageKind) -> MessageDelivery {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn provider_duration_excludes_delivery_delay_and_stays_frozen() {
+        let mut turn = Turn::new("turn".into(), ProviderAddress { thread_id:"thread".into(),turn_id:"turn".into() },1000);
+        let event = crate::backend::BackendEvent {
+            received_at_ms: None, address:Some(turn.provider().clone()),turn_boundary:None,
+            kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":1383,"params":{
+                "item":{"durationMs":383},"completedAtMs":1383 }}),activity:Some(activity("call")),summary:None,task_update:None };
+        turn.record_tool_event(&event,10000).unwrap();
+        assert_eq!(turn.tools().next().unwrap().elapsed_ms(20000),Some(383));
+        let mut late = event;
+        late.data = serde_json::json!({"params":{"startedAtMs":1,"completedAtMs":20000,"item":{"durationMs":19999}}});
+        turn.record_tool_event(&late,20000).unwrap();
+        assert_eq!(turn.tools().next().unwrap().elapsed_ms(30000),Some(383));
+    }
 
     fn activity(id: &str) -> crate::backend::ToolActivity {
         crate::backend::ToolActivity {

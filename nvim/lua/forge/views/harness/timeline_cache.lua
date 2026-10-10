@@ -1,4 +1,18 @@
 local M = {}
+local output_metatable = {
+  __index = function(tool, field)
+    if field ~= "output" then return nil end
+    local cached = rawget(tool, "output_materialized")
+    if cached then return cached end
+    local chunk, text = rawget(tool, "output_chunk"), {}
+    while chunk do text[#text + 1], chunk = chunk.text, chunk.previous end
+    local ordered = {}
+    for index = #text, 1, -1 do ordered[#ordered + 1] = text[index] end
+    cached = table.concat(ordered)
+    rawset(tool, "output_materialized", cached)
+    return cached
+  end,
+}
 
 ---@class ForgeHarnessTimelinePatch
 ---@field session_id string
@@ -7,10 +21,88 @@ local M = {}
 ---@field operation ForgeHarnessTimelineOperation[]
 
 ---@class ForgeHarnessTimelineOperation
----@field kind "insert"|"replace"|"remove"
+---@field kind "insert"|"replace"|"remove"|"tool_output"|"message"
 ---@field index integer
 ---@field id string?
 ---@field entry table?
+---@field entry_id string?
+---@field call_id string?
+---@field delta string?
+
+local function transform_entry(entry, transform)
+  if entry.kind == "exchange" then
+    local exchange = transform(entry.exchange)
+    if exchange then return vim.tbl_extend("force", {}, entry, { exchange = exchange }) end
+  elseif entry.kind == "agent_lifecycle" then
+    for index, exchange in ipairs(entry.exchange or {}) do
+      local replacement = transform(exchange)
+      if replacement then
+        local exchange_list = vim.list_extend({}, entry.exchange)
+        exchange_list[index] = replacement
+        return vim.tbl_extend("force", {}, entry, { exchange = exchange_list })
+      end
+    end
+  end
+  for _, field in ipairs({ "agent", "agent_by_id" }) do
+    for id, agent in pairs(entry[field] or {}) do
+      local replacement = transform_entry(agent, transform)
+      if replacement then
+        local agent_map = vim.tbl_extend("force", {}, entry[field])
+        agent_map[id] = replacement
+        return vim.tbl_extend("force", {}, entry, { [field] = agent_map })
+      end
+    end
+  end
+end
+
+local function transform_turn(exchange, transform)
+  for index, turn in ipairs(exchange.turn or {}) do
+    local replacement = transform(turn)
+    if replacement then
+      local next_exchange = vim.tbl_extend("force", {}, exchange)
+      next_exchange.turn = vim.list_extend({}, exchange.turn)
+      next_exchange.turn[index] = replacement
+      return next_exchange
+    end
+  end
+end
+
+local function append_output(entry, call_id, delta)
+  return transform_entry(entry, function(exchange)
+    return transform_turn(exchange, function(turn)
+      for id, tool in pairs(turn.tool and turn.tool.item or {}) do
+        if turn.id .. ":" .. id == call_id then
+          local next_turn = vim.tbl_extend("force", {}, turn)
+          next_turn.tool = vim.tbl_extend("force", {}, turn.tool)
+          next_turn.tool.item = vim.tbl_extend("force", {}, turn.tool.item)
+          local replacement = vim.tbl_extend("force", {}, tool)
+          local previous = rawget(tool, "output_chunk") or { text = rawget(tool, "output") or "" }
+          replacement.output, replacement.output_materialized = nil, nil
+          replacement.output_chunk = { text = delta, previous = previous }
+          next_turn.tool.item[id] = setmetatable(replacement, output_metatable)
+          return next_turn
+        end
+      end
+    end)
+  end)
+end
+
+local function replace_message(entry, operation)
+  return transform_entry(entry, function(exchange)
+    if exchange.id ~= operation.exchange_id then return end
+    return transform_turn(exchange, function(turn)
+      if turn.id ~= operation.turn_id then return end
+      for index, message in ipairs(turn.message or {}) do
+        if message.id == operation.message.id then
+          local replacement = vim.tbl_extend("force", {}, turn)
+          replacement.message = vim.list_extend({}, turn.message)
+          replacement.message[index] = vim.deepcopy(operation.message)
+          return replacement
+        end
+      end
+    end)
+  end)
+end
 
 local function trace(state, event, detail)
   local record = vim.tbl_extend("force", {
@@ -19,14 +111,7 @@ local function trace(state, event, detail)
     session_id = state.session and state.session.id or nil,
     revision = state.timeline_revision,
   }, detail or {})
-  local ok, line = pcall(vim.json.encode, record)
-  if not ok then return end
-  pcall(
-    vim.fn.writefile,
-    { line },
-    vim.fs.joinpath(vim.fn.stdpath("cache"), "diff-review-harness-timeline-debug.jsonl"),
-    "a"
-  )
+  require("forge.infra.perf").event("harness", "ui." .. event, record)
 end
 
 local function synchronize_status(state)
@@ -42,7 +127,7 @@ end
 ---@param entry_list table[]
 ---@param revision integer
 function M.replace(state, entry_list, revision)
-  state.timeline = vim.deepcopy(entry_list)
+  state.timeline = vim.list_extend({}, entry_list)
   state.timeline_revision = revision
   synchronize_status(state)
   trace(state, "timeline_snapshot_applied", {
@@ -68,10 +153,33 @@ function M.apply(state, patch)
       :format(tostring(state.timeline_revision), tostring(patch.base_revision))
   end
 
-  local next_timeline = vim.deepcopy(state.timeline or {})
+  local structural = false
+  for _, operation in ipairs(patch.operation or {}) do
+    if operation.kind == "insert" or operation.kind == "remove" then structural = true break end
+  end
+  local next_timeline = structural and vim.list_extend({}, state.timeline or {}) or state.timeline
+  local replacement_by_index = {}
   for _, operation in ipairs(patch.operation or {}) do
     local lua_index = operation.index + 1
-    if operation.kind == "insert" then
+    if operation.kind == "message" then
+      local existing = replacement_by_index[lua_index] or next_timeline[lua_index]
+      if not existing or existing.id ~= operation.entry_id or type(operation.message) ~= "table" then
+        return false, "invalid message operation"
+      end
+      local replacement = replace_message(existing, operation)
+      if not replacement then return false, "message identity is missing" end
+      if structural then next_timeline[lua_index] = replacement
+      else replacement_by_index[lua_index] = replacement end
+    elseif operation.kind == "tool_output" then
+      local existing = replacement_by_index[lua_index] or next_timeline[lua_index]
+      if not existing or existing.id ~= operation.entry_id or type(operation.delta) ~= "string" then
+        return false, "invalid tool output operation"
+      end
+      local replacement = append_output(existing, operation.call_id, operation.delta)
+      if not replacement then return false, "tool output identity is missing" end
+      if structural then next_timeline[lua_index] = replacement
+      else replacement_by_index[lua_index] = replacement end
+    elseif operation.kind == "insert" then
       if lua_index < 1 or lua_index > #next_timeline + 1 or not operation.entry then
         return false, "invalid timeline insert operation"
       end
@@ -80,7 +188,9 @@ function M.apply(state, patch)
       if lua_index < 1 or lua_index > #next_timeline or not operation.entry then
         return false, "invalid timeline replace operation"
       end
-      next_timeline[lua_index] = vim.deepcopy(operation.entry)
+      local replacement = vim.deepcopy(operation.entry)
+      if structural then next_timeline[lua_index] = replacement
+      else replacement_by_index[lua_index] = replacement end
     elseif operation.kind == "remove" then
       local existing = next_timeline[lua_index]
       if not existing or existing.id ~= operation.id then
@@ -92,6 +202,7 @@ function M.apply(state, patch)
     end
   end
 
+  for index, replacement in pairs(replacement_by_index) do next_timeline[index] = replacement end
   state.timeline = next_timeline
   state.timeline_revision = patch.revision
   synchronize_status(state)

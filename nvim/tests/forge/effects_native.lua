@@ -28,7 +28,7 @@ local ok, failure = xpcall(function()
   for _, window in ipairs(vim.api.nvim_list_wins()) do
     if vim.api.nvim_buf_get_name(vim.api.nvim_win_get_buf(window)) == filename then
       assert(vim.deep_equal(vim.api.nvim_win_get_cursor(window), { 2, 3 }))
-      assert(vim.wo[window].foldexpr ~= "v:lua.require'forge.folds'.expression()", "source inherited document fold ownership")
+      assert(vim.wo[window].foldtext ~= "v:lua.require'forge.folds'.text()", "source inherited document fold ownership")
       found = true
     end
   end

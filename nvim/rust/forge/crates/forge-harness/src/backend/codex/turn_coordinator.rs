@@ -753,6 +753,7 @@ impl<'a> CodexTurnCoordinator<'a> {
         if let Some(event_sink) = self.event_sink.as_ref() {
             let _ = event_sink
                 .send_wait(BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "parent_boundary".into(),

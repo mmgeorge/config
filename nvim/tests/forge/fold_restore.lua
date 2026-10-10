@@ -29,11 +29,10 @@ assert(vim.fn.foldclosed(3) == -1, "surviving fold lost its open state in the se
 assert(replica.status == "Applied")
 captured = folds.capture(replica)
 replica.editable.suspended = true
-vim.wo.foldexpr = vim.wo.foldexpr
-assert(vim.fn.foldlevel(3) == 0, "fixture still has a native fold")
+assert(vim.wo.foldmethod == "manual", "document uses expression folds")
+assert(vim.fn.foldlevel(3) > 0, "unsent edits invalidated native fold ranges")
 folds.restore(replica, captured)
 replica.editable.suspended = false
-vim.wo.foldexpr = vim.wo.foldexpr
 folds.restore(replica, captured)
 assert(vim.api.nvim_win_call(first_window, function() return vim.fn.foldclosed(3) end) == 3, "resumed fold lost its closed state")
 assert(vim.fn.foldclosed(3) == -1, "resumed fold lost its open state")

@@ -1,4 +1,5 @@
 vim.loader.enable(false)
+require("render-markdown").setup(require("plugins.markdown")[1].opts())
 
 local markdown = require("forge.render.harness.markdown")
 local buffer = vim.api.nvim_create_buf(false, true)
@@ -22,8 +23,13 @@ assert(#trees == 2, "separate responses require separate Markdown parse trees")
 assert(trees[2]:root():sexpr():find("atx_heading"), "an unfinished fence must not hide the next response heading")
 local ui = require("render-markdown.core.ui")
 vim.cmd("redraw")
-vim.wait(1000, function()
-  return #vim.api.nvim_buf_get_extmarks(buffer, ui.ns, 0, -1, {}) > 0
+vim.wait(3000, function()
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(buffer, ui.ns, 0, -1, { details = true })) do
+    for _, chunk in ipairs(mark[4].virt_text or {}) do
+      if chunk[1]:find("⌠", 1, true) then return true end
+    end
+  end
+  return false
 end, 10)
 local marks = vim.api.nvim_buf_get_extmarks(buffer, ui.ns, 0, -1, {})
 assert(#marks > 0, "render-markdown.nvim must decorate response rows")

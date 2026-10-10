@@ -1,6 +1,7 @@
 pub mod objects;
 mod ownership;
 mod recovery;
+mod tool_output;
 
 use crate::agent::Agent;
 use crate::checkpoint::CheckpointRecord;
@@ -149,7 +150,7 @@ impl SqliteStore {
         fs::create_dir_all(data_root)
             .with_context(|| format!("create Harness data directory {}", data_root.display()))?;
         let objects = objects::ObjectStore::open(data_root)?;
-        let connection = Connection::open(data_root.join("harness.sqlite3"))?;
+        let mut connection = Connection::open(data_root.join("harness.sqlite3"))?;
         connection.busy_timeout(Duration::from_secs(5))?;
         connection.pragma_update(None, "journal_mode", "WAL")?;
         connection.pragma_update(None, "synchronous", "FULL")?;
@@ -271,6 +272,7 @@ impl SqliteStore {
             );
             "#,
         )?;
+        tool_output::initialize(&mut connection)?;
         Ok(Self {
             connection,
             session_lock: Default::default(),
@@ -450,12 +452,13 @@ impl SqliteStore {
             "INSERT INTO exchange_record(id, session_id, agent_id, ordinal, payload) VALUES(?1, ?2, ?3, ?4, ?5)\
              ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal, payload=excluded.payload \
              WHERE exchange_record.session_id=excluded.session_id AND exchange_record.agent_id IS excluded.agent_id",
-            params![interaction.id, interaction.session_id, interaction.agent_id, interaction.ordinal as i64, encode(interaction)?],
+            params![interaction.id, interaction.session_id, interaction.agent_id, interaction.ordinal as i64, tool_output::encode(interaction)?],
         )?;
         anyhow::ensure!(
             written == 1,
             "an exchange cannot change its owning session or agent"
         );
+        tool_output::synchronize(&transaction, interaction)?;
         for node in &interaction.node_list {
             let crate::exchange::ExchangeNode::AgentReference { agent } = node else {
                 continue;
@@ -505,7 +508,7 @@ impl SqliteStore {
 
     /// Load interactions in their admitted user-action order.
     pub fn list_exchange(&self, session_id: &str) -> Result<Vec<Exchange>> {
-        self.list_payload(
+        self.list_exchange_payload(
             "SELECT payload FROM exchange_record WHERE session_id=?1 AND agent_id=?2 ORDER BY ordinal",
             params![session_id, HarnessSession::primary_agent_id(session_id)],
         )
@@ -803,12 +806,13 @@ impl SqliteStore {
             "INSERT INTO exchange_record(id, session_id, agent_id, ordinal, payload) VALUES(?1, ?2, ?3, ?4, ?5)\
              ON CONFLICT(id) DO UPDATE SET ordinal=excluded.ordinal, payload=excluded.payload \
              WHERE exchange_record.session_id=excluded.session_id AND exchange_record.agent_id IS excluded.agent_id",
-            params![exchange.id, exchange.session_id, exchange.agent_id, exchange.ordinal as i64, encode(exchange)?],
+            params![exchange.id, exchange.session_id, exchange.agent_id, exchange.ordinal as i64, tool_output::encode(exchange)?],
         )?;
         anyhow::ensure!(
             written == 1,
             "an exchange cannot change its owning session or agent"
         );
+        tool_output::synchronize(&transaction, exchange)?;
         transaction.commit()?;
         Ok(())
     }
@@ -865,7 +869,7 @@ impl SqliteStore {
 
     /// Load exchanges in admission order for one child agent.
     pub fn list_agent_exchange(&self, run_id: &str) -> Result<Vec<Exchange>> {
-        self.list_payload(
+        self.list_exchange_payload(
             "SELECT payload FROM exchange_record WHERE agent_id=?1 ORDER BY ordinal",
             [run_id],
         )
@@ -1046,6 +1050,61 @@ fn decode_current_session(value: &str) -> Result<Option<HarnessSession>> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn streamed_output_reopens_migrates_and_commits_completion_atomically() -> Result<()> {
+        use crate::backend::{BackendEvent,ProviderAddress,ToolActivity,ToolActivityKind};
+        let directory = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(directory.path())?;
+        store.save_session(&session("session","D:/work"))?;
+        let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id":"stream","session_id":"session","agent_id":"session:agent:primary",
+            "ordinal":1,"prompt":"read","kind":"chat","state":"running",
+            "disposition":"current","turn":[],"node_list":[],"created_at_ms":1,
+            "awaiting_input":false,"duration_ms":0,"metrics":{},"comment":[],
+            "attributed_matches_checkpoint":false
+        }))?;
+        let address = ProviderAddress { thread_id:"thread".into(),turn_id:"provider-turn".into() };
+        exchange.start_turn(address.clone(),1)?;
+        let mut event = BackendEvent {
+            received_at_ms: None, address:Some(address),turn_boundary:None,kind:"tool".into(),
+            text:None,data:serde_json::json!({}),summary:None,task_update:None,
+            activity:Some(ToolActivity { id:"call".into(),kind:ToolActivityKind::Command,
+                title:"read".into(),output:None,status:Some("inProgress".into()),
+                change:Default::default(),output_delta:false }) };
+        exchange.observe_turn(&event,2)?;
+        store.save_exchange(&exchange)?;
+        event.activity.as_mut().unwrap().output_delta = true;
+        for chunk in ["\u{1b}[31", "mλ\r\n", "tail"] {
+            event.activity.as_mut().unwrap().output = Some(chunk.into());
+            exchange.observe_turn(&event,3)?;
+            store.save_tool_output_delta(&exchange,&event)?;
+        }
+        let expected = "\u{1b}[31mλ\r\ntail";
+        assert_eq!(store.list_exchange("session")?[0].turn[0].tools().next().unwrap().output,expected);
+        let payload: String = store.connection.query_row("SELECT payload FROM exchange_record WHERE id='stream'",[],|row|row.get(0))?;
+        assert!(!payload.contains("tail"));
+        drop(store);
+        let store = SqliteStore::open(directory.path())?;
+        assert_eq!(store.list_exchange("session")?[0].turn[0].tools().next().unwrap().output,expected);
+        store.connection.execute("UPDATE exchange_record SET payload=?1 WHERE id='stream'",[encode(&exchange)?])?;
+        drop(store);
+        let mut store = SqliteStore::open(directory.path())?;
+        assert_eq!(store.list_exchange("session")?[0].turn[0].tools().next().unwrap().output,expected);
+        event.activity.as_mut().unwrap().output_delta = false;
+        event.activity.as_mut().unwrap().output = Some("authoritative λ\n".into());
+        event.activity.as_mut().unwrap().status = Some("completed".into());
+        exchange.observe_turn(&event,4)?;
+        store.connection.execute_batch("CREATE TRIGGER reject_chunk BEFORE INSERT ON tool_output_chunk BEGIN SELECT RAISE(ABORT,'storage failure'); END;")?;
+        assert!(store.save_exchange(&exchange).is_err());
+        let recovered = store.list_exchange("session")?;
+        assert_eq!(recovered[0].turn[0].tools().next().unwrap().output,expected);
+        assert_eq!(recovered[0].turn[0].tools().next().unwrap().state(),crate::turn::ToolState::Running);
+        store.connection.execute_batch("DROP TRIGGER reject_chunk")?;
+        store.save_exchange(&exchange)?;
+        assert_eq!(store.list_exchange("session")?[0].turn[0].tools().next().unwrap().output,"authoritative λ\n");
+        Ok(())
+    }
 
     #[test]
     fn outdated_plans_do_not_restore_execution_or_block_the_session() {

@@ -69,6 +69,63 @@ local ok, failure = pcall(function()
     operation = {},
   })
   assert_true(not applied, "one session must reject another session's patch stream")
+
+  state.timeline[1].exchange.turn = { { id = "turn-one", tool = { item = {
+    tool = { output = "first", status = "inProgress" }, untouched = { output = "settled" },
+  } } } }
+  local previous_entry, previous_tool = state.timeline[1], state.timeline[1].exchange.turn[1].tool.item.tool
+  local status_entry = state.timeline[2]
+  applied, patch_error = cache.apply(state, {
+    session_id = "session-one", base_revision = 5, revision = 6,
+    operation = { { kind = "tool_output", index = 0, entry_id = "interaction-one",
+      call_id = "turn-one:tool", delta = "\nλ" } },
+  })
+  assert_true(applied, patch_error)
+  assert_equals(state.timeline[1].exchange.turn[1].tool.item.tool.output, "first\nλ")
+  assert_true(state.timeline[2] == status_entry, "streaming replaced unrelated history")
+  assert_true(state.timeline[1].exchange.turn[1].tool.item.untouched
+    == previous_entry.exchange.turn[1].tool.item.untouched, "streaming copied an unrelated tool")
+  assert_equals(previous_tool.output, "first", "streaming mutated the prior canonical owner")
+  before = state.timeline[1]
+  applied = cache.apply(state, {
+    session_id = "session-one", base_revision = 6, revision = 7,
+    operation = {
+      { kind = "tool_output", index = 0, entry_id = "interaction-one", call_id = "turn-one:tool", delta = "discard" },
+      { kind = "tool_output", index = 0, entry_id = "interaction-one", call_id = "missing", delta = "bad" },
+    },
+  })
+  assert_true(not applied, "missing tool owner was admitted")
+  assert_true(state.timeline[1] == before and state.timeline_revision == 6,
+    "a rejected streaming batch partially changed history")
+  state.timeline[1].exchange.turn[1].message = { { id = "message-one", text = "before", kind = "assistant" } }
+  local retained_tool = state.timeline[1].exchange.turn[1].tool
+  applied, patch_error = cache.apply(state, {
+    session_id = "session-one", base_revision = 6, revision = 7,
+    operation = { { kind = "message", index = 0, entry_id = "interaction-one",
+      exchange_id = "interaction-one", turn_id = "turn-one",
+      message = { id = "message-one", text = "after", kind = "assistant" } } },
+  })
+  assert_true(applied, patch_error)
+  assert_equals(state.timeline[1].exchange.turn[1].message[1].text, "after")
+  assert_true(state.timeline[1].exchange.turn[1].tool == retained_tool,
+    "message streaming copied tool output")
+  local tool = state.timeline[1].exchange.turn[1].tool.item.tool
+  local previous_chunk = rawget(tool, "output_chunk")
+  local expected = tool.output
+  for revision = 8, 107 do
+    applied, patch_error = cache.apply(state, {
+      session_id = "session-one", base_revision = revision - 1, revision = revision,
+      operation = { { kind = "tool_output", index = 0, entry_id = "interaction-one", call_id = "turn-one:tool", delta = " 🦀" } },
+    })
+    assert_true(applied, patch_error)
+    tool = state.timeline[1].exchange.turn[1].tool.item.tool
+    assert_true(rawget(tool, "output") == nil and rawget(tool, "output_materialized") == nil,
+      "streaming eagerly rebuilt accumulated output")
+    assert_true(rawget(tool, "output_chunk").previous == previous_chunk,
+      "streaming copied retained output chunks")
+    previous_chunk = rawget(tool, "output_chunk")
+  end
+  assert_equals(tool.output, expected .. string.rep(" 🦀", 100))
 end)
 
 if not ok then

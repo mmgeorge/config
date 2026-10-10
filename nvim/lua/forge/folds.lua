@@ -1,6 +1,7 @@
 local M = {}
 local sessions = setmetatable({}, { __mode = "v" })
 local window_state = {}
+local cooperative = require("forge.cooperative")
 
 ---@alias ForgeFoldPreference 'auto'|'open'|'closed'
 ---@class ForgeFoldView
@@ -37,19 +38,26 @@ local function close_open_fold(row)
   end
 end
 
-local function capture_window(session, window)
-  return vim.api.nvim_win_call(window, function()
-    local view, state, opened = vim.fn.winsaveview(), {}, {}
+local function capture_window(session, window, selected)
+    local state = {}
     local record_list = {}
-    for id, record in pairs(session.fold and session.fold.record or {}) do
-      local finish = fold_end(session, record)
-      record_list[#record_list + 1] = { id = id, row = fold_start(session, record), finish = finish }
+    local records = session.fold and session.fold.record or {}
+    for id in pairs(selected or records) do
+      local record = records[id]
+      if record then
+        local finish = fold_end(session, record)
+        record_list[#record_list + 1] = { id = id, row = fold_start(session, record), finish = finish }
+      end
+      cooperative.checkpoint()
     end
     table.sort(record_list, function(left, right)
       if left.row == right.row then return left.finish > right.finish end
       return left.row < right.row
     end)
     for _, record in ipairs(record_list) do
+      if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= session.buffer then return state end
+      vim.api.nvim_win_call(window, function()
+      local view, opened = vim.fn.winsaveview(), {}
       local closed = vim.fn.foldclosed(record.row)
       while closed >= 0 and (closed < record.row or vim.fn.foldclosedend(record.row) > record.finish) do
         opened[#opened + 1] = closed
@@ -59,13 +67,14 @@ local function capture_window(session, window)
       if vim.fn.foldlevel(record.row) > 0 then
         state[record.id] = closed == record.row and vim.fn.foldclosedend(record.row) == record.finish
       end
+      for index = #opened, 1, -1 do
+        vim.cmd(tostring(opened[index]) .. "foldclose")
+      end
+      vim.fn.winrestview(view)
+      end)
+      cooperative.checkpoint()
     end
-    for index = #opened, 1, -1 do
-      vim.cmd(tostring(opened[index]) .. "foldclose")
-    end
-    vim.fn.winrestview(view)
     return state
-  end)
 end
 
 local function option_with_pair(option, name, value)
@@ -127,7 +136,8 @@ function M.validate(sequence, changed, retired, state, read_row)
   for owner in pairs(changed) do
     local list = sequence.node[owner].entry.metadata.fold or {}
     assert(type(list) == "table" and vim.tbl_count(list) == #list, "expected fold array")
-    for _, fold in ipairs(list) do validate(owner, fold) end
+    for _, fold in ipairs(list) do validate(owner, fold) cooperative.checkpoint() end
+    cooperative.checkpoint()
   end
   if state then
     for _, set in ipairs({ changed, retired }) do
@@ -169,6 +179,7 @@ function M.update(session, prepared, replace_all)
         retained[fold.id] = true
       end
     end
+    cooperative.checkpoint()
   end
   for _, changed in ipairs({ prepared.changed, prepared.retired }) do
     for owner in pairs(changed) do
@@ -218,21 +229,20 @@ function M.update(session, prepared, replace_all)
         affected[fold.id] = true
       end
     end
+    cooperative.checkpoint()
   end
   for id in pairs(affected) do
     if state.record[id] then add_boundary(session, state.record[id]) end
+    cooperative.checkpoint()
   end
+  for id in pairs(prepared.native_fold_changed or {}) do affected[id] = true end
   state.changed = affected
   if not session.fragment then sessions[session.buffer] = session end
 end
 
 local function apply_defaults(session, window, saved, changed)
-  local recompute = next(changed) ~= nil
-  if recompute then changed = session.fold.record end
   local opened, closed = {}, {}
-  for id in pairs(saved.fold) do
-    if not session.fold.record[id] then saved.fold[id] = nil end
-  end
+  local created = {}
   for id in pairs(changed) do
     local record = session.fold.record[id]
     if not record then
@@ -242,44 +252,167 @@ local function apply_defaults(session, window, saved, changed)
       local _, finish = session.sequence:position(record.fold["end"].block)
       start = start + record.fold.start.row
       finish = finish + record.fold["end"].position.row + (record.fold["end"].position.column > 0 and 1 or 0)
-      if finish > start + 1 then
+      if finish > start then
         local view = saved.fold[id] or { preference = "auto" }
         local target = view.preference == "closed"
           or view.preference == "auto" and record.fold.closed
-        if recompute or view.applied == nil or view.applied ~= target then
+        if not view.native then created[#created + 1] = { start = start + 1, finish = finish } end
+        view.native = true
+        if view.applied == nil or view.applied ~= target or changed[id] then
           if target then closed[start + 1] = true else opened[start + 1] = true end
         end
         view.applied = target
         saved.fold[id] = view
       end
     end
+    cooperative.checkpoint()
   end
   local opening = vim.tbl_keys(opened)
   table.sort(opening)
-  vim.api.nvim_win_call(window, function()
-    local view = vim.fn.winsaveview()
-    if recompute then
-      vim.cmd("normal! zX")
-    elseif next(opened) or next(closed) then
-      vim.wo[window].foldexpr = vim.wo[window].foldexpr
-    end
-    for _, row in ipairs(opening) do
+  table.sort(created, function(left, right)
+    if left.start == right.start then return left.finish > right.finish end
+    return left.start < right.start
+  end)
+  for _, range in ipairs(created) do
+    if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= session.buffer then return end
+    vim.api.nvim_win_call(window, function()
+      local view = vim.fn.winsaveview()
+      vim.cmd(("%d,%dfold"):format(range.start, range.finish))
+      vim.cmd(tostring(range.start) .. "foldopen!")
+      vim.fn.winrestview(view)
+    end)
+    cooperative.checkpoint()
+  end
+  for _, row in ipairs(opening) do
+    if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= session.buffer then return end
+    vim.api.nvim_win_call(window, function()
+      local view = vim.fn.winsaveview()
       local ancestor = vim.fn.foldclosed(row)
-      while ancestor >= 0 do
+      for _ = 1, vim.fn.foldlevel(row) do
+        if ancestor < 0 then break end
         if ancestor ~= row and not opened[ancestor] then closed[ancestor] = true end
         vim.cmd(tostring(row) .. "foldopen")
         local next_ancestor = vim.fn.foldclosed(row)
-        assert(next_ancestor ~= ancestor, "native fold did not open")
         ancestor = next_ancestor
       end
-    end
-    local closing = vim.tbl_keys(closed)
-    table.sort(closing, function(left, right) return left > right end)
-    for _, row in ipairs(closing) do
+      vim.fn.winrestview(view)
+    end)
+    cooperative.checkpoint()
+  end
+  local closing = vim.tbl_keys(closed)
+  table.sort(closing, function(left, right) return left > right end)
+  for _, row in ipairs(closing) do
+    if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= session.buffer then return end
+    vim.api.nvim_win_call(window, function()
+      local view = vim.fn.winsaveview()
       close_open_fold(row)
+      vim.fn.winrestview(view)
+    end)
+    cooperative.checkpoint()
+  end
+end
+
+function M.reset(session)
+  M.capture(session)
+  for window, saved in pairs(window_state) do
+    if saved.session == session and vim.api.nvim_win_is_valid(window)
+      and vim.api.nvim_win_get_buf(window) == session.buffer then
+      vim.api.nvim_win_call(window, function() vim.cmd("silent! normal! zE") end)
+      for _, fold in pairs(saved.fold) do fold.native = false end
     end
-    vim.fn.winrestview(view)
-  end)
+  end
+end
+
+---@param session table
+---@param prepared table
+local function remove_native(session, affected)
+  for window, saved in pairs(window_state) do
+    if saved.session == session and vim.api.nvim_win_is_valid(window)
+      and vim.api.nvim_win_get_buf(window) == session.buffer and next(affected) then
+      retain_preferences(saved, capture_window(session, window, affected))
+      for id in pairs(affected) do if saved.fold[id] then saved.fold[id].native = false end end
+      local removed = {}
+      for id in pairs(affected) do
+        local record = session.fold.record[id]
+        removed[#removed + 1] = { start = fold_start(session, record), finish = fold_end(session, record) }
+      end
+      table.sort(removed, function(left, right)
+        if left.start == right.start then return left.finish > right.finish end
+        return left.start < right.start
+      end)
+      local removed_end = -1
+      for _, range in ipairs(removed) do
+        if not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= session.buffer then break end
+        vim.api.nvim_win_call(window, function()
+          local view = vim.fn.winsaveview()
+          if range.finish > removed_end and range.finish >= range.start and vim.fn.foldlevel(range.start) > 0 then
+            while vim.fn.foldclosed(range.start) >= 0 and vim.fn.foldclosed(range.start) < range.start do
+              vim.cmd(range.start .. "foldopen")
+            end
+            vim.api.nvim_win_set_cursor(window, { range.start, 0 })
+            vim.cmd("silent! normal! zD")
+            removed_end = range.finish
+          end
+          vim.fn.winrestview(view)
+        end)
+        cooperative.checkpoint()
+      end
+    end
+  end
+end
+
+function M.prepare_records(session, selected)
+  if not session.fold or not next(selected) then return {} end
+  local affected = {}
+  local ranges = {}
+  for id in pairs(selected) do
+    local record = session.fold.record[id]
+    if record then
+      affected[id] = true
+      ranges[#ranges + 1] = { first = fold_start(session, record), last = fold_end(session, record) }
+    end
+  end
+  for id, record in pairs(session.fold.record) do
+    local first, last = fold_start(session, record), fold_end(session, record)
+    for _, range in ipairs(ranges) do
+      if first >= range.first and last <= range.last then affected[id] = true break end
+    end
+  end
+  remove_native(session, affected)
+  return affected
+end
+
+function M.prepare(session, prepared)
+  if not session.fold then return end
+  local affected = {}
+  for _, changed in ipairs({ prepared.changed, prepared.retired }) do
+    for owner in pairs(changed) do
+      for id in pairs(session.fold.owner[owner] or {}) do
+        local record = session.fold.record[id]
+        local retained = false
+        if prepared.retain_folds and not prepared.retired[owner] then
+          for _, fold in ipairs(prepared.block[owner].metadata.fold or {}) do
+            if fold.id == id and vim.deep_equal(record.fold, fold) then retained = true break end
+          end
+        end
+        if not retained then affected[id] = true end
+      end
+      if not prepared.retain_folds then
+        for id in pairs(session.fold.endpoint[owner] or {}) do affected[id] = true end
+      end
+    end
+  end
+  local root = vim.tbl_keys(affected)
+  for _, id in ipairs(root) do
+    local record = session.fold.record[id]
+    local first = session.sequence:position(record.owner)
+    local last = session.sequence:position(record.fold["end"].block)
+    for index = first, last do
+      for child in pairs(session.fold.owner[session.sequence:at(index).id] or {}) do affected[child] = true end
+    end
+  end
+  prepared.native_fold_changed = affected
+  remove_native(session, affected)
 end
 
 ---@param session table
@@ -297,7 +430,7 @@ end
 ---@param options? ForgeFoldToggleOptions
 ---@return boolean
 function M.toggle_heading(session, window, options)
-  if not session or session.status ~= "Applied" or not vim.api.nvim_win_is_valid(window)
+  if not session or session.status ~= "Applied" or session.update_pending or session.applying or not vim.api.nvim_win_is_valid(window)
     or vim.api.nvim_win_get_buf(window) ~= session.buffer then return false end
   local row = vim.api.nvim_win_get_cursor(window)[1]
   if options and options.on_projected then
@@ -390,7 +523,6 @@ function M.restore(session, captured)
       table.sort(closed, function(left, right) return left > right end)
       vim.api.nvim_win_call(window, function()
         local view = vim.fn.winsaveview()
-        vim.wo[window].foldexpr = vim.wo[window].foldexpr
         for _, row in ipairs(opened) do
           if vim.fn.foldclosed(row) >= 0 then vim.cmd("silent! " .. row .. "foldopen") end
         end
@@ -410,6 +542,7 @@ function M.refresh(session)
       apply_defaults(session, window, saved, session.fold.changed or {})
     end
   end
+  session.fold.changed = {}
 end
 
 ---@return string|table[]
@@ -523,31 +656,6 @@ function M.text()
   return chunks
 end
 
----@return integer|string
-function M.expression()
-  local session = sessions[vim.api.nvim_get_current_buf()]
-  if not session or (session.status ~= "Applied" and not session.applying) then return 0 end
-  if session.fold_location then
-    local source, boundary = session.fold_location(vim.v.lnum - 1)
-    local level, starts = session.sequence:fold_level(source)
-    return boundary and starts and level > 0 and (">" .. level) or level
-  end
-  if session.editable.suspended and not session.applying then return 0 end
-  local row, delta = vim.v.lnum - 1, 0
-  for index = #(session.fold_pending or {}), session.fold_pending_index or 1, -1 do
-    local edit = session.fold_pending[index]
-    if row >= edit.start_row + edit.removed_rows then
-      delta = delta + #edit.text - edit.removed_rows
-    elseif row >= edit.start_row then
-      if #edit.text == 0 then return 0 end
-      row = edit.start_row + math.min(row - edit.start_row, #edit.text - 1)
-      break
-    end
-  end
-  local level, starts = session.sequence:fold_level(row + delta)
-  return starts and level > 0 and (">" .. level) or level
-end
-
 ---@param session table
 ---@param window integer
 function M.attach(session, window)
@@ -558,14 +666,16 @@ function M.attach(session, window)
   local saved = { session = session, fold = retained and vim.deepcopy(retained.fold) or {} }
   for _, name in ipairs({ "foldmethod", "foldexpr", "foldenable", "foldlevel", "foldtext", "fillchars", "winhighlight" }) do saved[name] = vim.wo[window][name] end
   window_state[window] = saved
-  vim.wo[window].foldmethod = "expr"
-  vim.wo[window].foldexpr = "v:lua.require'forge.folds'.expression()"
+  vim.wo[window].foldmethod = "manual"
+  vim.wo[window].foldexpr = "0"
   vim.wo[window].foldenable = true
   vim.wo[window].foldlevel = 99
   vim.wo[window].foldtext = "v:lua.require'forge.folds'.text()"
   local fillchars = saved.fillchars:gsub("^fold:[^,]*,?", ""):gsub(",fold:[^,]*", "")
   vim.wo[window].fillchars = fillchars .. (fillchars == "" and "" or ",") .. "fold: "
   vim.wo[window].winhighlight = option_with_pair(saved.winhighlight, "Folded", "Normal")
+  vim.api.nvim_win_call(window, function() vim.cmd("silent! normal! zE") end)
+  for _, fold in pairs(saved.fold) do fold.native = false end
   if session.fold then apply_defaults(session, window, saved, session.fold.record) end
   if retained then M.restore(session, { [window] = retained.state }) end
 end
@@ -592,7 +702,7 @@ end
 function M.restore_inherited(origin, target)
   local saved = window_state[origin]
   if not saved then return end
-  if vim.wo[target].foldexpr == "v:lua.require'forge.folds'.expression()" then
+  if vim.wo[target].foldtext == "v:lua.require'forge.folds'.text()" then
     for _, name in ipairs({ "foldmethod", "foldexpr", "foldenable", "foldlevel", "foldtext", "fillchars" }) do
       vim.wo[target][name] = saved[name]
     end

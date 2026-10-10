@@ -27,6 +27,7 @@ pub struct SessionPresentation {
     session_id: String,
     timeline: TimelineStream,
     open: Option<OpenPresentation>,
+    activity_updated: std::time::Instant,
 }
 
 struct OpenPresentation {
@@ -171,6 +172,20 @@ pub enum PresentationRequest {
 }
 
 impl SessionPresentation {
+    pub(crate) fn append_tool_output(&mut self, exchange: &Exchange,
+        event: &crate::backend::BackendEvent) -> Result<Option<TimelinePatch>> {
+        let patch = self.timeline.append_tool_output(exchange,event)?;
+        if let Some(patch) = &patch { self.project_patch(patch); }
+        Ok(patch)
+    }
+
+    pub(crate) fn update_message(&mut self, exchange: &Exchange,
+        event: &crate::backend::BackendEvent) -> Result<Option<TimelinePatch>> {
+        let patch = self.timeline.update_message(exchange,event)?;
+        if let Some(patch) = &patch { self.project_patch(patch); }
+        Ok(patch)
+    }
+
     /// Capture visible context without acquiring the active prompt broker.
     pub(crate) fn conversation_history(&self) -> Result<String> {
         crate::backend::text_generation::history(self.timeline.entry_list())
@@ -244,9 +259,7 @@ impl SessionPresentation {
                 if expanded {
                     open.expanded_tool.insert(call_id.clone());
                 }
-                if let Err(error) =
-                    reflow(open, self.timeline.entry_list(), self.timeline.revision())
-                {
+                if let Err(error) = toggle_inline_output(open,&call_id,expanded) {
                     if expanded {
                         open.expanded_tool.remove(&call_id);
                     } else {
@@ -365,6 +378,7 @@ impl SessionPresentation {
             timeline: TimelineStream::new(session_id.clone()),
             session_id,
             open: None,
+            activity_updated: std::time::Instant::now(),
         }
     }
 
@@ -430,7 +444,8 @@ impl SessionPresentation {
         let mut syntax = HashMap::new();
         let mut tool = HashMap::new();
         let mut block = Vec::new();
-        for projected in projected {
+        for mut projected in projected {
+            for tool in projected.tool.values_mut() { tool.own(&projected.entry.id); }
             entry.insert(projected.entry.id.clone(), entry_presentation(&projected));
             block.push(projected.entry);
             action.extend(projected.action);
@@ -480,20 +495,14 @@ impl SessionPresentation {
         document: &DocumentId,
         revision: DocumentRevision,
     ) -> Result<PresentationSync> {
-        if self.timeline.entry_list().iter().any(|entry| {
-            matches!(
-                entry,
-                TimelineEntry::Status {
-                    status: SessionPhase::Working { .. } | SessionPhase::WaitingForAgent { .. },
-                    ..
-                }
-            )
-        }) {
+        if self.activity_updated.elapsed() >= std::time::Duration::from_secs(1)
+            && self.timeline.ticking_entries().next().is_some() {
             let open = self
                 .open
                 .as_mut()
                 .context("session presentation is not open")?;
-            refresh_activity(open, self.timeline.entry_list())?;
+            refresh_activity(open, self.timeline.ticking_entries())?;
+            self.activity_updated = std::time::Instant::now();
         }
         let open = self.document(document)?;
         if let Some(failure) = &open.failure {
@@ -884,7 +893,24 @@ impl SessionPresentation {
             return;
         }
         let applied = if open.agent_scope.is_some() {
-            reflow(open, self.timeline.entry_list(), self.timeline.revision())
+            if patch.operation.iter().all(|operation|matches!(operation,
+                TimelineOperation::ToolOutput { .. } | TimelineOperation::Message { .. })
+                || matches!(operation,TimelineOperation::Replace { entry:TimelineEntry::Status { .. },.. })) {
+                let filtered = TimelinePatch { operation:patch.operation.iter().filter(|operation|match operation {
+                    TimelineOperation::ToolOutput { call_id,.. } => open.tool.contains_key(call_id),
+                    TimelineOperation::Message { block_id,message,.. } => message.kind() != crate::turn::MessageKind::Assistant
+                        || open.transcript.document.block(&forge_buffer::identity::BlockId(block_id.clone())).is_some(),
+                    _ => false,
+                }).cloned().collect(),..patch.clone() };
+                apply_projection(open,&filtered)
+            } else { reflow(open, self.timeline.entry_list(), self.timeline.revision()) }
+        } else if patch.operation.iter().any(|operation|match operation {
+            TimelineOperation::ToolOutput { call_id,.. } => !open.tool.contains_key(call_id),
+            TimelineOperation::Message { block_id,message,.. } => message.kind() == crate::turn::MessageKind::Assistant
+                && open.transcript.document.block(&forge_buffer::identity::BlockId(block_id.clone())).is_none(),
+            _ => false,
+        }) {
+            reflow(open,self.timeline.entry_list(),self.timeline.revision())
         } else {
             apply_projection(open, patch)
         };
@@ -949,90 +975,90 @@ fn find_agent<'source>(
     None
 }
 
-fn refresh_activity(open: &mut OpenPresentation, source: &[TimelineEntry]) -> Result<()> {
-    let width = open.transcript.views.profile().unwrap_or(&open.last_width);
-    let mut projected = Vec::new();
-    if let Some(agent_id) = open.agent_scope.as_deref() {
-        if let Some(TimelineEntry::AgentLifecycle {
-            exchange: interaction,
-            ..
-        }) = find_agent(source, agent_id, 0)
-        {
-            for (index, exchange) in interaction.iter().enumerate() {
-                if exchange.completed_at_ms.is_none() && exchange.execution_started_at_ms.is_some()
-                {
-                    let entry = TimelineEntry::Exchange {
-                        id: exchange.id.clone(),
-                        created_at_ms: exchange.created_at_ms,
-                        exchange: exchange.clone(),
-                        agent_by_id: HashMap::new(),
-                    };
-                    projected.push((
-                        index,
-                        project(&entry, width, index > 0, &open.expanded_tool)?,
-                    ));
-                }
-            }
-        }
-    } else {
-        for (index, entry) in source.iter().enumerate() {
-            let ticking = match entry {
-                TimelineEntry::Exchange {
-                    exchange: interaction,
-                    ..
-                } => {
-                    interaction.completed_at_ms.is_none()
-                        && interaction.execution_started_at_ms.is_some()
-                }
-                TimelineEntry::Status {
-                    status: SessionPhase::Working { .. },
-                    ..
-                } => true,
-                TimelineEntry::AgentLifecycle { run, .. } => run.state.is_open(),
-                _ => false,
-            };
-            if ticking {
-                projected.push((
-                    index,
-                    project(entry, width, index > 0, &open.expanded_tool)?,
-                ));
-            }
+fn refresh_activity<'source>(open: &mut OpenPresentation,
+    source: impl IntoIterator<Item=&'source TimelineEntry>) -> Result<()> {
+    let width = open.transcript.views.profile().unwrap_or(&open.last_width).clone();
+    let mut blocks = Vec::new();
+    let mut retained = open.retained_bytes;
+    for entry in source {
+        for block in super::projection::timing_blocks(entry,&width,
+            &open.transcript.document,&open.expanded_tool)? {
+            let previous = open.transcript.document.block(&block.id)
+                .context("timing block is missing")?.retained_bytes();
+            retained = retained.saturating_sub(previous) + block.retained_bytes();
+            ensure!(retained <= MAX_PROJECTED_BYTES, "session projection exceeds 64 MiB");
+            blocks.push((entry.id(), previous, block));
         }
     }
-    let mut entries = Vec::new();
-    for (index, mut projection) in projected {
-        for block in &mut projection.entry.block {
-            if !open.syntax_done.iter().any(|target| {
-                block.id.0.starts_with(&format!("{}:file:", target.0))
-                    || open
-                        .syntax
-                        .get(target)
-                        .is_some_and(|job| job.block == block.id)
-            }) {
-                continue;
-            }
-            if let Some(current) = open.transcript.document.block(&block.id) {
-                if current.text == block.text {
-                    block.metadata.visible_decoration = current.metadata.visible_decoration.clone();
-                }
-            }
+    let mut patches = Vec::new();
+    for (entry_id, previous, block) in blocks {
+        let added = block.retained_bytes();
+        if let Some(patch) = open.transcript.append(block)? { patches.push(patch); }
+        if let Some(entry) = open.entry.get_mut(&entry_id) {
+            entry.bytes = entry.bytes.saturating_sub(previous) + added;
         }
-        let info = entry_presentation(&projection);
-        let previous = open
-            .entry
-            .get(&projection.entry.id)
-            .context("ticking entry is missing")?;
-        let retained = open.retained_bytes.saturating_sub(previous.bytes) + info.bytes;
-        ensure!(
-            retained <= MAX_PROJECTED_BYTES,
-            "session projection exceeds 64 MiB"
-        );
-        open.retained_bytes = retained;
-        open.entry.insert(projection.entry.id.clone(), info);
-        entries.push((index, projection.entry));
     }
-    let patches = open.transcript.refresh(entries)?;
-    retain_patches(open, patches)
+    open.retained_bytes = retained;
+    retain_patches(open,patches)
+}
+
+fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bool) -> Result<()> {
+    use forge_buffer::identity::BlockId;
+    let source = open.tool.get(call_id).context("inline tool source is missing")?;
+    let owner = source.owner().to_owned();
+    let call = source.header().context("inline tool heading source is missing")?;
+    let heading_id = BlockId(format!("{call_id}:tool"));
+    let previous_heading = open.transcript.document.block(&heading_id).context("inline heading is missing")?;
+    let layout = previous_heading.metadata.layout.clone();
+    let mut width = open.transcript.views.profile().unwrap_or(&open.last_width).clone();
+    width.columns = width.columns.saturating_sub(layout.as_ref().map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
+    let renderer = super::transcript::TranscriptRenderer::new(&width)?;
+    let now = std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+    let mut heading = renderer.tool_header(heading_id,previous_heading.metadata.target[0].id.clone(),
+        &call.kind,call.elapsed_ms(now),call.failed,&call.title,expanded)?;
+    heading.metadata.layout = layout.clone();
+    heading.metadata.fold = previous_heading.metadata.fold.clone();
+    let chunks = if expanded { source.inline_chunks() } else { 1 };
+    let removed_chunks = if expanded { 1 } else { source.inline_chunks() };
+    let identity = |chunk| BlockId(if chunk == 0 { format!("{call_id}:preview") } else { format!("{call_id}:output:{chunk}") });
+    let mut removed = previous_heading.retained_bytes();
+    let mut retired_target = HashSet::new();
+    for chunk in 0..removed_chunks {
+        let block = open.transcript.document.block(&identity(chunk)).context("inline body is missing")?;
+        removed += block.retained_bytes();
+        retired_target.extend(block.metadata.target.iter().map(|target|target.id.clone()));
+    }
+    let hidden_id = BlockId(format!("{call_id}:hidden"));
+    let previous_hidden = open.transcript.document.block(&hidden_id).context("inline hidden counter is missing")?;
+    removed += previous_hidden.retained_bytes();
+    retired_target.extend(previous_hidden.metadata.target.iter().map(|target|target.id.clone()));
+    let mut body = Vec::new();
+    for chunk in 0..chunks {
+        let mut block = renderer.tool_body(call_id,source,expanded,chunk)?;
+        block.metadata.layout = layout.clone();
+        body.push(block);
+    }
+    let mut hidden = renderer.tool_hidden(call_id,source,expanded)?;
+    hidden.metadata.layout = layout;
+    let added = heading.retained_bytes() + hidden.retained_bytes() + body.iter().map(forge_buffer::block::BufferBlock::retained_bytes).sum::<usize>();
+    let retained = open.retained_bytes.saturating_sub(removed) + added;
+    ensure!(retained <= MAX_PROJECTED_BYTES, "inline output exceeds projection capacity");
+    let target = body.iter().chain(std::iter::once(&hidden)).flat_map(|block|block.metadata.target.iter().map(|target|target.id.clone())).collect::<Vec<_>>();
+    let changes = vec![TranscriptChange::Block { block:heading },
+        TranscriptChange::ToolBody { owner:owner.clone(),anchor:identity(0),removed:removed_chunks,block:body },
+        TranscriptChange::Block { block:hidden }];
+    let patches = match open.transcript.tool_layout(changes) {
+        Ok(patches) => patches,
+        Err(failure) => { open.failure = Some(format!("{failure:#}")); return Err(failure); }
+    };
+    for target in &retired_target { open.action.remove(target); }
+    for target in &target { open.action.insert(target.clone(),TranscriptAction::Tool { call_id:call_id.to_owned() }); }
+    let entry = open.entry.get_mut(&owner).context("inline entry owner is missing")?;
+    entry.target.retain(|target|!retired_target.contains(target));
+    entry.target.extend(target);
+    entry.bytes = entry.bytes.saturating_sub(removed) + added;
+    open.retained_bytes = retained;
+    retain_patches(open,patches)
 }
 
 fn reflow(
@@ -1080,7 +1106,8 @@ fn reflow(
     let mut syntax = HashMap::new();
     let mut tool = HashMap::new();
     let mut blocks = Vec::new();
-    for projection in projected {
+    for mut projection in projected {
+        for tool in projection.tool.values_mut() { tool.own(&projection.entry.id); }
         entry.insert(projection.entry.id.clone(), entry_presentation(&projection));
         action.extend(projection.action);
         syntax.extend(projection.syntax);
@@ -1089,7 +1116,8 @@ fn reflow(
     }
     let patch = open.transcript.replace_scope(blocks, timeline_revision)?;
     for (id, output) in &mut tool {
-        if let Some(previous) = open.tool.remove(id) {
+        if let Some(mut previous) = open.tool.remove(id) {
+            previous.retain(output);
             *output = previous;
         }
     }
@@ -1110,6 +1138,104 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
     let mut retained = open.retained_bytes;
     for operation in &patch.operation {
         match operation {
+            TimelineOperation::Message { entry_id, exchange_id, block_id, message, .. } => {
+                if message.kind() != crate::turn::MessageKind::Assistant { continue; }
+                let block_id = forge_buffer::identity::BlockId(block_id.clone());
+                let previous = open.transcript.document.block(&block_id).context("streamed message block is missing")?;
+                let replacement = super::projection::message_block(previous,message,width)?;
+                let mut removed = previous.retained_bytes();
+                let previous_targets = previous.metadata.target.iter().map(|target|target.id.clone()).collect::<Vec<_>>();
+                for target in &previous_targets {
+                    if let Some(action) = open.action.remove(target) {
+                        removed += match action { TranscriptAction::Diff { text } => text.len(), _ => 512 };
+                    }
+                    open.syntax_done.remove(target);
+                }
+                let syntax_target = TargetId(format!("{}:markdown-syntax",block_id.0));
+                if let Some(syntax) = open.syntax.remove(&syntax_target) { removed += syntax.retained_bytes(); }
+                open.syntax_done.remove(&syntax_target);
+                let added = replacement.retained_bytes();
+                retained = retained.saturating_sub(removed) + added;
+                ensure!(retained <= MAX_PROJECTED_BYTES, "session projection exceeds 64 MiB");
+                let owner = if open.agent_scope.is_some() { exchange_id } else { entry_id };
+                if let Some(entry) = open.entry.get_mut(owner) {
+                    entry.bytes = entry.bytes.saturating_sub(removed) + added;
+                    entry.target.retain(|target|!previous_targets.contains(target));
+                    entry.target.extend(replacement.action.keys().cloned());
+                    entry.syntax.retain(|target|target != &syntax_target);
+                    entry.syntax.extend(replacement.syntax.keys().cloned());
+                }
+                open.action.extend(replacement.action);
+                open.syntax.extend(replacement.syntax);
+                changed.push(TranscriptChange::Block { block:replacement.entry.block.into_iter().next().expect("message block") });
+            }
+            TimelineOperation::ToolOutput { entry_id, exchange_id, call_id, delta, .. } => {
+                let source = open.tool.get_mut(call_id).context("streamed tool cache is missing")?;
+                let before = source.retained_bytes();
+                let expanded = open.expanded_tool.contains(call_id);
+                let old_chunks = if expanded { source.inline_chunks() } else { 1 };
+                let first_chunk = if expanded { source.inline_tail() } else { 0 };
+                source.append(delta)?;
+                let block_id = forge_buffer::identity::BlockId(format!("{call_id}:tool"));
+                let previous = open.transcript.document.block(&block_id).context("streamed tool block is missing")?;
+                let layout = previous.metadata.layout.clone();
+                let mut content_width = width.clone();
+                content_width.columns = content_width.columns.saturating_sub(
+                    previous.metadata.layout.as_ref().map_or(0, |layout| layout.indent.saturating_sub(2))
+                ).max(1);
+                let renderer = super::transcript::TranscriptRenderer::new(&content_width)?;
+                let owner = if open.agent_scope.is_some() { exchange_id } else { entry_id };
+                let chunks = if expanded { source.inline_chunks() } else { 1 };
+                let identity = |chunk| forge_buffer::identity::BlockId(if chunk == 0 { format!("{call_id}:preview") }
+                    else { format!("{call_id}:output:{chunk}") });
+                let mut removed = before;
+                let mut block = Vec::new();
+                for chunk in first_chunk..chunks {
+                    let mut replacement = renderer.tool_body(call_id,source,expanded,chunk)?;
+                    replacement.metadata.layout = layout.clone();
+                    if let Some(layout) = &mut replacement.metadata.layout { layout.source_indent = 0; }
+                    super::layout::materialize(&mut replacement)?;
+                    let previous = open.transcript.document.block(&replacement.id);
+                    let new_target = previous.is_none_or(|previous|previous.metadata.target.is_empty());
+                    if let Some(previous) = previous {
+                        removed += previous.retained_bytes();
+                        for target in &previous.metadata.target { open.action.remove(&target.id); }
+                    }
+                    for target in &replacement.metadata.target {
+                        open.action.insert(target.id.clone(),TranscriptAction::Tool { call_id:call_id.clone() });
+                        if let Some(entry) = open.entry.get_mut(owner) {
+                            if new_target { entry.target.push(target.id.clone()); }
+                        }
+                    }
+                    block.push(replacement);
+                }
+                let added_body = block.iter().map(forge_buffer::block::BufferBlock::retained_bytes).sum::<usize>();
+                let hidden_id = forge_buffer::identity::BlockId(format!("{call_id}:hidden"));
+                let mut hidden = renderer.tool_hidden(call_id,source,expanded)?;
+                hidden.metadata.layout = layout;
+                if let Some(layout) = &mut hidden.metadata.layout { layout.source_indent = 0; }
+                super::layout::materialize(&mut hidden)?;
+                let previous_hidden = open.transcript.document.block(&hidden_id).context("tool hidden counter is missing")?;
+                let new_hidden_target = previous_hidden.metadata.target.is_empty();
+                removed += previous_hidden.retained_bytes();
+                for target in &previous_hidden.metadata.target { open.action.remove(&target.id); }
+                for target in &hidden.metadata.target {
+                    open.action.insert(target.id.clone(),TranscriptAction::Tool { call_id:call_id.clone() });
+                    if let Some(entry) = open.entry.get_mut(owner) {
+                        if new_hidden_target { entry.target.push(target.id.clone()); }
+                    }
+                }
+                let added = source.retained_bytes() + added_body + hidden.retained_bytes();
+                retained = retained.saturating_sub(removed) + added;
+                ensure!(retained <= MAX_PROJECTED_BYTES, "session projection exceeds 64 MiB");
+                if let Some(entry) = open.entry.get_mut(owner) { entry.bytes = entry.bytes.saturating_sub(removed) + added; }
+                if first_chunk < chunks {
+                    changed.push(TranscriptChange::ToolBody { owner:owner.clone(),
+                        anchor:if first_chunk < old_chunks { identity(first_chunk) } else { hidden_id },
+                        removed:old_chunks.saturating_sub(first_chunk),block });
+                }
+                changed.push(TranscriptChange::Block { block:hidden });
+            }
             TimelineOperation::Insert { index, entry }
             | TimelineOperation::Replace { index, entry } => {
                 let entry = project(entry, width, *index > 0, &open.expanded_tool)?;
@@ -1160,6 +1286,7 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
     )?;
     for operation in &patch.operation {
         let id = match operation {
+            TimelineOperation::ToolOutput { .. } | TimelineOperation::Message { .. } => continue,
             TimelineOperation::Insert { entry, .. } | TimelineOperation::Replace { entry, .. } => {
                 entry.id()
             }
@@ -1179,7 +1306,8 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
             }
         }
     }
-    for (id, entry, action, tool, syntax) in projected {
+    for (id, entry, action, mut tool, syntax) in projected {
+        for tool in tool.values_mut() { tool.own(&id); }
         open.entry.insert(id, entry);
         open.action.extend(action);
         open.tool.extend(tool);
@@ -1213,6 +1341,143 @@ fn retain_patches(open: &mut OpenPresentation, patches: Vec<BufferPatch>) -> Res
 mod tests {
     use super::*;
 
+    #[test]
+    fn expanded_streaming_retains_settled_chunks_and_patches_only_the_mutable_tail() -> Result<()> {
+        use crate::backend::{BackendEvent,ProviderAddress,ToolActivity,ToolActivityKind};
+        use forge_buffer::identity::BlockId;
+        let output = (0..30000).map(|row|format!("row {row} λ\n")).collect::<String>();
+        let mut active = serde_json::to_value(interaction_entry("active"))?;
+        active["exchange"]["state"] = serde_json::json!("running");
+        active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
+        active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
+        active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(output);
+        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
+        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
+        let mut exchange:Exchange = serde_json::from_value(active["exchange"].take())?;
+        let entry = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,exchange:exchange.clone(),agent_by_id:HashMap::new() };
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![entry])?;
+        let document = DocumentId("expanded-stream".into());
+        owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
+        owner.open.as_mut().unwrap().expanded_tool.insert("active:turn:1:tool".into());
+        toggle_inline_output(owner.open.as_mut().unwrap(),"active:turn:1:tool",true)?;
+        let opened = owner.snapshot(&document)?;
+        assert!(opened.block.iter().map(|block|block.text.row_count()).sum::<usize>() >= 30000);
+        let heading = BlockId("active:turn:1:tool:tool".into());
+        let settled = BlockId("active:turn:1:tool:preview".into());
+        let pointer = |owner:&SessionPresentation,id:&BlockId|owner.open.as_ref().unwrap()
+            .transcript.document.block(id).unwrap().text.row(0).unwrap().as_ptr() as usize;
+        let heading_pointer = pointer(&owner,&heading);
+        let settled_pointer = pointer(&owner,&settled);
+        let mut revision = opened.revision;
+        for iteration in 0..100 {
+            let event = BackendEvent {
+            received_at_ms: None, address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
+                turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10+iteration}),
+                summary:None,task_update:None,activity:Some(ToolActivity { id:"tool".into(),kind:ToolActivityKind::Command,
+                    title:"Read output".into(),output:Some(format!("new {iteration} 🦀\n")),status:Some("inProgress".into()),
+                    output_delta:true,change:Default::default() }) };
+            exchange.observe_turn(&event,10+iteration)?;
+            owner.append_tool_output(&exchange,&event)?;
+            let sync = owner.sync(&document,revision)?;
+            assert!(sync.snapshot.is_none());
+            for patch in sync.patch {
+                assert!(patch.metadata_edit.iter().all(|edit|edit.block != heading && edit.block != settled));
+                assert!(patch.text_edit.iter().map(|edit|edit.text.byte_count()).sum::<usize>() < 20000);
+                revision = patch.next;
+            }
+            assert_eq!(pointer(&owner,&heading),heading_pointer);
+            assert_eq!(pointer(&owner,&settled),settled_pointer);
+        }
+        assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("new 99 🦀"))));
+        refresh_activity(owner.open.as_mut().unwrap(), &[TimelineEntry::Exchange {
+            id:"active".into(), created_at_ms:0, exchange, agent_by_id:HashMap::new(),
+        }])?;
+        let timed_heading = owner.open.as_ref().unwrap().transcript.document.block(&heading).unwrap().text.row(0).unwrap().to_owned();
+        assert_eq!(pointer(&owner,&settled),settled_pointer);
+        toggle_inline_output(owner.open.as_mut().unwrap(),"active:turn:1:tool",false)?;
+        let collapsed_heading = owner.open.as_ref().unwrap().transcript.document.block(&heading).unwrap().text.row(0).unwrap();
+        let column = |text: &str| WidthProfile::default().cells(&text[..text.find("Read output").unwrap()], 0).unwrap();
+        assert_eq!(column(&timed_heading), column(collapsed_heading),
+            "timer updates and activation must keep the command column fixed");
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_message_reparses_only_its_owned_block_and_retains_tools() -> Result<()> {
+        use crate::backend::{BackendEvent,ProviderAddress};
+        let mut active = serde_json::to_value(interaction_entry("active"))?;
+        active["exchange"]["state"] = serde_json::json!("running");
+        active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
+        active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
+        active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
+        let mut event = BackendEvent {
+            received_at_ms: None, address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
+            turn_boundary:None,kind:"assistant_message".into(),text:Some("First [link](https://example.com)".into()),
+            data:serde_json::json!({"provider_message_id":"message"}),summary:None,task_update:None,activity:None };
+        exchange.observe_turn(&event,2)?;
+        let entry = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,exchange:exchange.clone(),agent_by_id:HashMap::new() };
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![interaction_entry("settled"),entry])?;
+        let document = DocumentId("streamed-message".into());
+        let opened = owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
+        let tool = owner.open.as_ref().unwrap().tool["active:turn:1:tool"].preview(true).row.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        event.text = Some("\n\nMore **text** with λ.".into());
+        exchange.observe_turn(&event,3)?;
+        let patch = owner.update_message(&exchange,&event)?.expect("owned message");
+        assert!(matches!(&patch.operation[..],[TimelineOperation::Message { index:1,.. }]));
+        let sync = owner.sync(&document,opened.transcript.revision)?;
+        assert!(sync.snapshot.is_none() && !sync.patch.is_empty());
+        assert!(sync.patch.iter().all(|patch|patch.block_edit.is_empty()
+            && patch.metadata_edit.iter().all(|edit|!edit.block.0.contains("settled") && !edit.block.0.ends_with(":tool"))));
+        assert_eq!(owner.open.as_ref().unwrap().tool["active:turn:1:tool"].preview(true).row,tool);
+        assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("More **text**"))));
+        Ok(())
+    }
+
+    #[test]
+    fn streamed_output_changes_only_the_tool_and_its_fold_endpoints() -> Result<()> {
+        use crate::backend::{BackendEvent,ProviderAddress,ToolActivity,ToolActivityKind};
+        let mut active = serde_json::to_value(interaction_entry("active"))?;
+        active["exchange"]["state"] = serde_json::json!("running");
+        active["exchange"]["completed_at_ms"] = serde_json::Value::Null;
+        active["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
+        active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
+        active["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
+        let active = TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,
+            exchange:serde_json::from_value(active["exchange"].take())?,agent_by_id:HashMap::new() };
+        let TimelineEntry::Exchange { mut exchange, .. } = active.clone() else { unreachable!() };
+        let mut entries: Vec<_> = (0..3000).map(|index| interaction_entry(&format!("history-{index}"))).collect();
+        entries.push(active);
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(entries)?;
+        let document = DocumentId("streamed-output".into());
+        let opened = owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
+        assert!(opened.transcript.block.iter().map(|block|block.text.row_count()).sum::<usize>() >= 30000);
+        let event = BackendEvent {
+            received_at_ms: None, address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
+            turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10}),
+            summary:None,task_update:None,activity:Some(ToolActivity { id:"tool".into(),
+                kind:ToolActivityKind::Command,title:"Read output".into(),output:Some("\nseventh\n".into()),
+                status:Some("inProgress".into()),output_delta:true,change:Default::default() }) };
+        exchange.observe_turn(&event,10)?;
+        let patch = owner.append_tool_output(&exchange,&event)?.expect("incremental output");
+        assert!(matches!(&patch.operation[..],[TimelineOperation::ToolOutput { index:3000,.. }]));
+        let sync = owner.sync(&document,opened.transcript.revision)?;
+        assert!(sync.snapshot.is_none());
+        assert!(!sync.patch.is_empty());
+        for patch in &sync.patch {
+            assert!(patch.block_edit.is_empty());
+            assert!(patch.metadata_edit.iter().all(|metadata| !metadata.block.0.contains("history-")));
+            assert!(patch.text_edit.iter().all(|edit| edit.removed_rows <= 1));
+        }
+        assert!(owner.open.as_ref().unwrap().tool["active:turn:1:tool"].preview(true).row.contains(&"seventh"));
+        Ok(())
+    }
+
     #[tokio::test]
     async fn markdown_responses_keep_source_without_native_syntax_jobs() -> Result<()> {
         use crate::backend::{BackendEvent, ProviderAddress, TurnBoundary};
@@ -1227,6 +1492,7 @@ mod tests {
             exchange.completed_at_ms = None;
             exchange.execution_started_at_ms = Some(1);
             let mut event = BackendEvent {
+            received_at_ms: None,
                 address: Some(ProviderAddress {
                     thread_id: "thread".into(),
                     turn_id: "markdown".into(),
@@ -1411,6 +1677,7 @@ mod tests {
             task: None,
         };
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(address),
             turn_boundary: Some(TurnBoundary::Started),
             kind: "turn_started".into(),
@@ -1459,7 +1726,7 @@ mod tests {
         let document = DocumentId("transcript:toggle".into());
         let view = ViewId("view:toggle".into());
         let opened = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
-        let block = BlockId("first:turn:1:tool:tool".into());
+        let block = BlockId("first:turn:1:tool:preview".into());
         let mut input = DocumentInput {
             document: document.clone(),
             revision: opened.transcript.revision,
@@ -1467,8 +1734,8 @@ mod tests {
             sequence: InputSequence(1),
             action: "activate".into(),
             block: block.clone(),
-            position: TextPosition { row: 5, column: 6 },
-            target: Some(TargetId(block.0.clone())),
+            position: TextPosition { row: 0, column: 8 },
+            target: Some(TargetId(format!("{}:tool",block.0))),
         };
         assert_eq!(
             owner.dispatch(PresentationRequest::ToggleTool {
@@ -1510,7 +1777,8 @@ mod tests {
             .iter()
             .find(|candidate| candidate.id == block)
             .unwrap();
-        assert!(collapsed.text.wire_rows().contains(&"      …(2 hidden)"));
+        assert!(snapshot.block.iter().find(|block|block.id.0 == "first:turn:1:tool:hidden")
+            .unwrap().text.wire_rows().contains(&"      …(2 hidden)"));
         assert!(!collapsed.text.wire_rows().contains(&"      sixth"));
         Ok(())
     }
@@ -1627,6 +1895,7 @@ mod tests {
                 WidthProfile::default(),
             )?;
             let mut event = BackendEvent {
+            received_at_ms: None,
                 address: Some(ProviderAddress {
                     thread_id: "thread".into(),
                     turn_id: "second".into(),
@@ -1706,6 +1975,14 @@ mod tests {
         else {
             unreachable!()
         };
+        let mut raw = serde_json::to_value(interaction)?;
+        raw["state"] = serde_json::json!("running");
+        raw["completed_at_ms"] = serde_json::Value::Null;
+        raw["execution_started_at_ms"] = serde_json::json!(1);
+        raw["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+        raw["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
+        raw["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
+        let mut interaction: Exchange = serde_json::from_value(raw)?;
         let agent = TimelineEntry::AgentLifecycle {
             id: "agent:child".into(),
             created_at_ms: 0,
@@ -1719,7 +1996,7 @@ mod tests {
                 created_at_ms: 0,
                 updated_at_ms: 1,
             },
-            exchange: vec![interaction],
+            exchange: vec![interaction.clone()],
             agent: Vec::new(),
         };
         let mut owner = SessionPresentation::new("session".into());
@@ -1749,6 +2026,17 @@ mod tests {
                 .iter()
                 .any(|block| block.id.0 == "main:prompt")
         );
+        let event = crate::backend::BackendEvent {
+            received_at_ms: None, address:Some(interaction.turn[0].provider().clone()),
+            turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":2}),
+            activity:Some(crate::backend::ToolActivity { id:"tool".into(),kind:crate::backend::ToolActivityKind::Command,
+                title:"Read output".into(),output:Some("\nscoped output".into()),status:Some("inProgress".into()),
+                output_delta:true,change:Default::default() }),summary:None,task_update:None };
+        interaction.observe_turn(&event,2)?;
+        owner.append_tool_output(&interaction,&event)?.expect("scoped output");
+        let update = owner.sync(&document,selected.revision)?;
+        assert!(update.snapshot.is_none() && update.patch.iter().all(|patch|patch.block_edit.is_empty()));
+        assert!(owner.open.as_ref().unwrap().tool["child:turn:1:tool"].preview(true).row.contains(&"scoped output"));
         owner.reconcile(vec![interaction_entry("other-main"), agent])?;
         assert_eq!(owner.open.as_ref().unwrap().pending_submission, Some(1));
         owner.dispatch(PresentationRequest::SelectAgent {

@@ -5,6 +5,7 @@ local BlockSequence = require("forge.block_sequence")
 local folds = require("forge.folds")
 local decorations = require("forge.decorations")
 local buffer_view = require("forge.buffer_view")
+local cooperative = require("forge.cooperative")
 local MAX_COUNTER = 9007199254740991
 
 local function counter(value)
@@ -25,6 +26,7 @@ end
 local function rows(value)
   for _, row in ipairs(array(value)) do
     assert(type(row) == "string" and not row:find("[\n%z]"), "invalid text row")
+    cooperative.checkpoint()
   end
   return value
 end
@@ -130,6 +132,7 @@ local function validate_order(order, block, row_count, read_row)
     entry.start_row = start
     validate_metadata(entry, read_row, region_seen)
     start = start + entry.row_count
+    cooperative.checkpoint()
   end
   assert(start == row_count, "block row coverage differs")
   return region_seen
@@ -212,7 +215,7 @@ local function change_sequence(sequence, patch, entries)
   end
 end
 
-function M.preflight(session, patch)
+function M.preflight(session, patch, options)
   assert(session.status == "Applied", "document requires snapshot recovery")
   if not session.fragment then
   assert(vim.api.nvim_buf_is_valid(session.buffer), "native buffer is invalid")
@@ -262,7 +265,7 @@ function M.preflight(session, patch)
     identity(edit.block)
     assert(not changed[edit.block], "duplicate metadata identity")
     changed[edit.block] = true
-    entries[edit.block] = { row_count = counter(edit.row_count), metadata = vim.deepcopy(edit.metadata) }
+    entries[edit.block] = { row_count = counter(edit.row_count), metadata = vim.deepcopy(edit.metadata), version = patch.next }
   end
   for _, id in ipairs(array(patch.removed_block)) do
     assert(removed[id] and not inserted[id] and not retired[id], "invalid retired identity")
@@ -277,7 +280,7 @@ function M.preflight(session, patch)
     changed[id] = true
     if not entries[id] then
       local old = session.block[id]
-      entries[id] = { row_count = old.row_count, metadata = old.metadata }
+      entries[id] = { row_count = old.row_count, metadata = old.metadata, version = patch.next }
     end
   end
   for id in pairs(touched) do
@@ -285,11 +288,12 @@ function M.preflight(session, patch)
       changed[id] = true
       if not entries[id] then
         local old = session.block[id]
-        entries[id] = { row_count = old.row_count, metadata = old.metadata }
+        entries[id] = { row_count = old.row_count, metadata = old.metadata, version = patch.next }
       end
     end
   end
   local function read_row(row)
+    if options and options.read_row then return options.read_row(row) end
     local delta = 0
     for index = #patch.text_edit, 1, -1 do
       local edit = patch.text_edit[index]
@@ -313,25 +317,28 @@ function M.preflight(session, patch)
       end
     end
   end
-  session.sequence:begin()
-  local ok, failure = pcall(function()
-    change_sequence(session.sequence, patch, entries)
-    assert(session.sequence:rows() == patch.next_rows, "block row coverage differs")
-    for id in pairs(changed) do
-      local entry = assert(entries[id])
-      local _, start_row = session.sequence:position(id)
-      position[id] = start_row
-      validate_metadata({ row_count = entry.row_count, metadata = entry.metadata, start_row = start_row }, read_row, region)
-      decorations.prepare(entry)
-      for _, editable_region in ipairs(entry.metadata.editable_region) do
-        assert(not session.region_owner[editable_region.id] or released_region[editable_region.id], "duplicate editable region")
-        region_owner[editable_region.id] = id
+  local validation = cooperative.atomic(function()
+    session.sequence:begin()
+    local valid, failure = pcall(function()
+      change_sequence(session.sequence, patch, entries)
+      assert(session.sequence:rows() == patch.next_rows, "block row coverage differs")
+      for id in pairs(changed) do
+        local entry = assert(entries[id])
+        local _, start_row = session.sequence:position(id)
+        position[id] = start_row
+        validate_metadata({ row_count = entry.row_count, metadata = entry.metadata, start_row = start_row }, read_row, region)
+        decorations.prepare(entry)
+        for _, editable_region in ipairs(entry.metadata.editable_region) do
+          assert(not session.region_owner[editable_region.id] or released_region[editable_region.id], "duplicate editable region")
+          region_owner[editable_region.id] = id
+        end
       end
-    end
-    folds.validate(session.sequence, changed, retired, session.fold, read_row)
+      folds.validate(session.sequence, changed, retired, session.fold, read_row)
+    end)
+    session.sequence:rollback()
+    return { valid = valid, failure = failure }
   end)
-  session.sequence:rollback()
-  if not ok then error(failure) end
+  if not validation.valid then error(validation.failure) end
   return { block = entries, position = position, region = region, changed = changed, retired = retired,
     released_region = released_region, region_owner = region_owner }
 end
@@ -401,6 +408,7 @@ local function install_metadata(session, prepared, replace_all)
           })
       end
       session.marks[id] = mark
+      cooperative.checkpoint()
   end
 end
 
@@ -466,65 +474,73 @@ local function commit_patch(session, patch)
   local ok, prepared = pcall(M.preflight, session, patch)
   checkpoint("preflight")
   if not ok then finish("preflight_failed") return M.fail_apply(session, prepared) end
-  local retained_view = buffer_view.capture(session, function(id)
-    local entry = not prepared.retired[id] and (prepared.block[id] or session.block[id])
-    return entry ~= nil and entry ~= false and entry.row_count > 0
-  end)
-  checkpoint("view_capture")
-  prepared.retain_folds = true
-  for _, edit in ipairs(patch.text_edit) do
-    if edit.removed_rows ~= 1 or #edit.text ~= 1 then prepared.retain_folds = false break end
-  end
-  local readonly = vim.bo[session.buffer].readonly
-  folds.capture(session)
-  checkpoint("fold_capture")
-  ok, prepared.failure = pcall(function()
-    assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
-    session.applying = true
-    change_sequence(session.sequence, patch, prepared.block)
-    for id in pairs(prepared.retired) do session.block[id] = nil end
-    for id, entry in pairs(prepared.block) do session.block[id] = entry end
-    folds.update(session, prepared, false)
-    checkpoint("sequence_and_folds")
-    editable.applying(session.editable, true)
-    if not session.physical then
-      vim.bo[session.buffer].readonly = false
-      vim.bo[session.buffer].modifiable = true
+  return cooperative.atomic(function()
+    local retained_view = buffer_view.capture(session, function(id)
+      local entry = not prepared.retired[id] and (prepared.block[id] or session.block[id])
+      return entry ~= nil and entry ~= false and entry.row_count > 0
+    end)
+    checkpoint("view_capture")
+    prepared.retain_folds = true
+    for _, edit in ipairs(patch.text_edit) do
+      if edit.removed_rows ~= 1 or #edit.text ~= 1 then prepared.retain_folds = false break end
     end
-    session.fold_pending = patch.text_edit
-    for index, edit in ipairs(session.fold_pending) do
-      session.fold_pending_index = index + 1
-      local finish = edit.start_row + edit.removed_rows
-      if session.row_count == 0 then finish = 1 end
-      vim.api.nvim_buf_set_lines(session.buffer, edit.start_row, finish, true, edit.text)
-    end
-    checkpoint("text")
-    install_metadata(session, prepared, false)
-    checkpoint("metadata")
-    assert(vim.api.nvim_buf_line_count(session.buffer) == math.max(1, patch.next_rows), "native result row count differs")
-    if not session.physical then vim.bo[session.buffer].modifiable = false end
+    local readonly = vim.bo[session.buffer].readonly
+    folds.prepare(session, prepared)
+    checkpoint("fold_capture")
+    ok, prepared.failure = pcall(function()
+      assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
+      session.applying = true
+      change_sequence(session.sequence, patch, prepared.block)
+      for id in pairs(prepared.retired) do session.block[id] = nil end
+      for id, entry in pairs(prepared.block) do session.block[id] = entry end
+      folds.update(session, prepared, false)
+      checkpoint("sequence_and_folds")
+      editable.applying(session.editable, true)
+      if not session.physical then
+        vim.bo[session.buffer].readonly = false
+        vim.bo[session.buffer].modifiable = true
+      end
+      if session.editable.native then session.editable.native.update_ns, session.editable.native.update_count = 0, 0 end
+      local text_started = timing and perf.now()
+      for _, edit in ipairs(patch.text_edit) do
+        local finish = edit.start_row + edit.removed_rows
+        if session.row_count == 0 then finish = 1 end
+        vim.api.nvim_buf_set_lines(session.buffer, edit.start_row, finish, true, edit.text)
+      end
+      if timing then
+        timing.buffer_api_ms = perf.elapsed_ms(text_started)
+        timing.editable_callback_ms = (session.editable.native and session.editable.native.update_ns or 0) / 1e6
+        timing.editable_callback_count = session.editable.native and session.editable.native.update_count or 0
+      end
+      checkpoint("text")
+      if not session.physical then vim.bo[session.buffer].modifiable = false end
+      install_metadata(session, prepared, false)
+      checkpoint("metadata")
+      assert(vim.api.nvim_buf_line_count(session.buffer) == math.max(1, patch.next_rows), "native result row count differs")
+      if not session.physical then vim.bo[session.buffer].modifiable = false end
+    end)
+    session.applying = nil
+    pcall(function() vim.bo[session.buffer].readonly = readonly end)
+    editable.applying(session.editable, false)
+    if not ok then finish("mutation_failed") return M.fail_apply(session, prepared.failure) end
+    for id in pairs(prepared.released_region) do session.region_owner[id] = nil end
+    for id, owner in pairs(prepared.region_owner) do session.region_owner[id] = owner end
+    ok, prepared.failure = pcall(function()
+      attach_regions(session, prepared)
+    end)
+    checkpoint("regions")
+    if not ok then finish("regions_failed") return M.fail_apply(session, prepared.failure) end
+    session.row_count, session.revision = patch.next_rows, patch.next
+    session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
+    decorations.attach(session)
+    checkpoint("decorations")
+    folds.refresh(session)
+    checkpoint("fold_refresh")
+    buffer_view.restore(session, retained_view)
+    checkpoint("view_restore")
+    finish("ok")
+    return { kind = "Applied", revision = session.revision }
   end)
-  session.applying, session.fold_pending, session.fold_pending_index = nil, nil, nil
-  pcall(function() vim.bo[session.buffer].readonly = readonly end)
-  editable.applying(session.editable, false)
-  if not ok then finish("mutation_failed") return M.fail_apply(session, prepared.failure) end
-  for id in pairs(prepared.released_region) do session.region_owner[id] = nil end
-  for id, owner in pairs(prepared.region_owner) do session.region_owner[id] = owner end
-  ok, prepared.failure = pcall(function()
-    attach_regions(session, prepared)
-  end)
-  checkpoint("regions")
-  if not ok then finish("regions_failed") return M.fail_apply(session, prepared.failure) end
-  session.row_count, session.revision = patch.next_rows, patch.next
-  session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
-  decorations.attach(session)
-  checkpoint("decorations")
-  folds.refresh(session)
-  checkpoint("fold_refresh")
-  buffer_view.restore(session, retained_view)
-  checkpoint("view_restore")
-  finish("ok")
-  return { kind = "Applied", revision = session.revision }
 end
 
 function M.apply_patch(session, patch)
@@ -555,8 +571,9 @@ function M.apply_snapshot(session, snapshot)
       identity(entry.id)
       assert(not block[entry.id], "duplicate snapshot block")
       order[#order + 1] = entry.id
-      block[entry.id] = { row_count = #rows(entry.text), metadata = vim.deepcopy(entry.metadata) }
+      block[entry.id] = { row_count = #rows(entry.text), metadata = vim.deepcopy(entry.metadata), version = snapshot.revision }
       vim.list_extend(text, entry.text)
+      cooperative.checkpoint()
     end
     local region = validate_order(order, block, #text, function(row) return text[row + 1] end)
     if session.physical then
@@ -571,50 +588,132 @@ function M.apply_snapshot(session, snapshot)
       changed[id], position[id] = true, entry.start_row
       decorations.prepare(entry)
       for _, editable_region in ipairs(entry.metadata.editable_region) do region_owner[editable_region.id] = id end
+      cooperative.checkpoint()
     end
     folds.validate(sequence, changed, {}, nil, function(row) return text[row + 1] end)
     return { sequence = sequence, block = block, text = text, region = region, changed = changed,
       position = position, region_owner = region_owner, retired = {} }
   end)
   if not ok then return M.fail_apply(session, prepared) end
-  local retained_view = buffer_view.capture(session, function(id)
-    return prepared.block[id] ~= nil and prepared.block[id].row_count > 0
+  return cooperative.atomic(function()
+    local retained_view = buffer_view.capture(session, function(id)
+      return prepared.block[id] ~= nil and prepared.block[id].row_count > 0
+    end)
+    local readonly = vim.bo[session.buffer].readonly
+    folds.reset(session)
+    ok, prepared.failure = pcall(function()
+      assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
+      editable.detach(session.editable)
+      session.applying = true
+      if session.generated and not session.generated_owned then
+        vim.bo[session.buffer].buftype = "nofile"
+        vim.bo[session.buffer].bufhidden = "hide"
+        vim.bo[session.buffer].swapfile = false
+        vim.bo[session.buffer].filetype = session.generated_filetype
+        session.generated_owned = true
+      end
+      session.sequence, session.block, session.region_owner = prepared.sequence, prepared.block, prepared.region_owner
+      folds.update(session, prepared, true)
+      if not session.physical then
+        vim.bo[session.buffer].readonly = false
+        vim.bo[session.buffer].modifiable = true
+        vim.api.nvim_buf_set_lines(session.buffer, 0, -1, true, prepared.text)
+        vim.bo[session.buffer].modifiable = false
+      end
+      install_metadata(session, prepared, true)
+      if not session.physical then vim.bo[session.buffer].modifiable = false end
+      attach_regions(session, prepared)
+    end)
+    session.applying = nil
+    pcall(function() vim.bo[session.buffer].readonly = readonly end)
+    if not ok then return M.fail_apply(session, prepared.failure) end
+    session.row_count, session.revision = #prepared.text, snapshot.revision
+    session.markdown_generation = (session.markdown_generation or 0) + 1
+    session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
+    session.status, session.diagnostic = "Applied", nil
+    session.expected_changedtick = nil
+    decorations.attach(session)
+    folds.refresh(session)
+    buffer_view.restore(session, retained_view)
+    return { kind = "Applied", revision = session.revision }
   end)
+end
+
+--- Prepares a generated update in bounded slices and commits it in one editor callback.
+---@param session table
+---@param update table Snapshot or patch for this document.
+---@param alive fun(): boolean
+---@param done fun(result: table)
+function M.apply_async(session, update, alive, done)
+  if session.status == "Closed" or not vim.api.nvim_buf_is_valid(session.buffer) then done({ kind = "Closed" }) return end
+  if session.update_pending then done({ kind = "Deferred" }) return end
+  if type(update) ~= "table" then done(M.fail_apply(session, "Native update requires a snapshot or patch object")) return end
+  local token = {}
   local readonly = vim.bo[session.buffer].readonly
-  folds.capture(session)
-  ok, prepared.failure = pcall(function()
-    assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
-    editable.detach(session.editable)
-    session.applying = true
-    if session.generated and not session.generated_owned then
-      vim.bo[session.buffer].buftype = "nofile"
-      vim.bo[session.buffer].bufhidden = "hide"
-      vim.bo[session.buffer].swapfile = false
-      vim.bo[session.buffer].filetype = session.generated_filetype
-      session.generated_owned = true
+  local observed_tick = vim.api.nvim_buf_get_changedtick(session.buffer)
+  local observed_view = {}
+  local changed_view = {}
+  local function observe_views(compare)
+    if not session.preserve_view then return end
+    for _, window in ipairs(vim.fn.win_findbuf(session.buffer)) do
+      local view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
+      if compare and observed_view[window] and not vim.deep_equal(view, observed_view[window]) then
+        changed_view[window] = true
+      end
+      observed_view[window] = view
     end
-    session.sequence, session.block, session.region_owner = prepared.sequence, prepared.block, prepared.region_owner
-    folds.update(session, prepared, true)
-    if not session.physical then
-      vim.bo[session.buffer].readonly = false
-      vim.bo[session.buffer].modifiable = true
-      vim.api.nvim_buf_set_lines(session.buffer, 0, -1, true, prepared.text)
+  end
+  observe_views(false)
+  session.changed_view = changed_view
+  session.update_pending = token
+  cooperative.run(function()
+    if update.patch then
+      array(update.patch)
+      assert(#update.patch <= 64, "publication exceeds the native pending-patch limit")
+      return cooperative.atomic(function()
+        local result = { kind = "Applied", revision = session.revision }
+        for _, patch in ipairs(update.patch) do
+          result = M.apply_patch(session, patch)
+          if result.kind ~= "Applied" then return result end
+        end
+        return result
+      end)
     end
-    install_metadata(session, prepared, true)
-    if not session.physical then vim.bo[session.buffer].modifiable = false end
-    attach_regions(session, prepared)
+    if update.block then return M.apply_snapshot(session, update) end
+    return M.apply_patch(session, update)
+  end, function()
+    observe_views(true)
+    return session.update_pending == token and session.status ~= "Closed"
+      and vim.api.nvim_buf_is_valid(session.buffer)
+      and vim.api.nvim_buf_get_changedtick(session.buffer) == observed_tick and alive()
+  end, function(result, failure, timing)
+    if session.update_pending ~= token then return end
+    session.update_pending = nil
+    session.applying = nil
+    session.changed_view = nil
+    session.update_timing = { slices = timing.slices, maximum_ms = timing.maximum_ms,
+      maximum_prepare_ms = timing.maximum_prepare_ms, maximum_commit_ms = timing.maximum_commit_ms }
+    if failure then
+      session.applying = nil
+      if session.status ~= "Closed" and vim.api.nvim_buf_is_valid(session.buffer) then
+        vim.bo[session.buffer].modifiable = false
+        vim.bo[session.buffer].readonly = readonly
+        result = M.fail_apply(session, failure)
+      else result = { kind = "Closed" } end
+    end
+    require("forge.infra.perf").event("harness", "ui.document.slices", {
+      document = session.document, revision = update.revision or update.next,
+      slices = timing.slices, maximum_ms = timing.maximum_ms,
+      maximum_prepare_ms = timing.maximum_prepare_ms, maximum_commit_ms = timing.maximum_commit_ms,
+      status = result and result.kind or "Failed",
+    })
+    done(result)
+  end, function()
+    if vim.api.nvim_buf_is_valid(session.buffer) then
+      observed_tick = vim.api.nvim_buf_get_changedtick(session.buffer)
+      observe_views(false)
+    end
   end)
-  session.applying = nil
-  pcall(function() vim.bo[session.buffer].readonly = readonly end)
-  if not ok then return M.fail_apply(session, prepared.failure) end
-  session.row_count, session.revision = #prepared.text, snapshot.revision
-  session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
-  session.status, session.diagnostic = "Applied", nil
-  session.expected_changedtick = nil
-  decorations.attach(session)
-  folds.refresh(session)
-  buffer_view.restore(session, retained_view)
-  return { kind = "Applied", revision = session.revision }
 end
 
 local function release(session, preserve_buffer)
@@ -784,7 +883,7 @@ function M.patch_fragment(fragment, patch, read_original)
     end
     return read_original(row - delta)
   end
-  local prepared = M.preflight(fragment, patch, nil, { read_row = read_row })
+  local prepared = M.preflight(fragment, patch, { read_row = read_row })
   assert(next(prepared.region) == nil, "status bodies cannot contain editable regions")
   for id, entry in pairs(prepared.block) do
     entry.text = {}

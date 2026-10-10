@@ -65,6 +65,22 @@ pub enum TimelineEntry {
 }
 
 impl TimelineEntry {
+    fn exchange_mut(&mut self, id: &str) -> Option<&mut Exchange> {
+        match self {
+            Self::Exchange { exchange, agent_by_id, .. } => {
+                if exchange.id == id { return Some(exchange); }
+                agent_by_id.values_mut().find_map(|agent| agent.exchange_mut(id))
+            }
+            Self::AgentLifecycle { exchange, agent, .. } => {
+                if let Some(exchange) = exchange.iter_mut().find(|exchange| exchange.id == id) {
+                    return Some(exchange);
+                }
+                agent.iter_mut().find_map(|agent| agent.exchange_mut(id))
+            }
+            _ => None,
+        }
+    }
+
     /// Return the stable identity used by incremental timeline reconciliation.
     pub fn id(&self) -> String {
         match self {

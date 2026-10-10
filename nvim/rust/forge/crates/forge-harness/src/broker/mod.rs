@@ -1542,6 +1542,7 @@ impl HarnessBroker {
                     _ => { self.select_execution_mode(json!({"mode":permission}))?; },
                 }
                 self.emit_backend_event(BackendEvent {
+            received_at_ms: None,
                     address: None, turn_boundary: None, kind: "configuration_applied".into(),
                     text: None, data: json!({"session":self.session,"operation_id":self.active_operation_id,
                         "catalog":self.backend_catalog_request()}),
@@ -1851,6 +1852,7 @@ impl HarnessBroker {
                 self.store.save_exchange(&exchange)?;
                 self.emit_live(
                     BackendEvent {
+            received_at_ms: None,
                         address: None,
                         turn_boundary: None,
                         kind: "agent_timeline_updated".into(),
@@ -1992,6 +1994,7 @@ impl HarnessBroker {
             }
             self.emit_live(
                 BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "agent_updated".into(),
@@ -2065,9 +2068,25 @@ impl HarnessBroker {
         if canonical_event.address.is_some() {
             attribute_provider_tool(&mut runtime.exchange, &mut runtime.task, &canonical_event)?;
         }
-        self.store.save_exchange(&runtime.exchange)?;
+        if canonical_event.tool_output_delta().is_some() {
+            self.store.save_tool_output_delta(&runtime.exchange,&canonical_event)?;
+        } else { self.store.save_exchange(&runtime.exchange)?; }
+        let incremental = if canonical_event.tool_output_delta().is_some() {
+            self.presentation.lock().map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .append_tool_output(&runtime.exchange,&canonical_event)?
+        } else if canonical_event.message_delta().is_some() {
+            self.presentation.lock().map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .update_message(&runtime.exchange,&canonical_event)?
+        } else { None };
+        if let Some(patch) = incremental {
+            self.emit_backend_event(canonical_event,event).await?;
+            self.emit_timeline_patch(patch,event).await?;
+            self.child_exchange_runtime_by_agent.insert(run_id,runtime);
+            return Ok(true);
+        }
         self.emit_live(
             BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "agent_timeline_updated".into(),
@@ -2175,6 +2194,7 @@ impl HarnessBroker {
         }
         self.emit_live(
             BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "agent_updated".into(),
@@ -2281,6 +2301,7 @@ impl HarnessBroker {
                 if let Some(transition) = transition {
                     self.emit_backend_event(
                         BackendEvent {
+            received_at_ms: None,
                             address: None,
                             turn_boundary: None,
                             kind: "prompt_submission".into(),
@@ -2315,6 +2336,7 @@ impl HarnessBroker {
         if let Some(transition) = transition {
             self.emit_backend_event(
                 BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "prompt_submission".into(),
@@ -3413,6 +3435,7 @@ Planning continuation: turn {} of {}.",
         self.settle_prompt_admission(true, &mut event).await?;
         self.emit_live_interaction(
             BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "timeline_exchange_started".into(),
@@ -3439,6 +3462,7 @@ Planning continuation: turn {} of {}.",
         let goal_execution = self.store.list_plan_execution(&self.session.id)?
             .into_iter().rev().find(|execution| goal.as_ref().is_some_and(|goal| goal.id == execution.goal_id));
         self.emit_backend_event(BackendEvent {
+            received_at_ms: None,
             address: None, turn_boundary: None, kind: "execution_state".into(), text: None,
             data: json!({"session":self.session,"task":self.store.list_task(&self.session.id)?,"goal":goal,"goal_execution":goal_execution}),
             activity: None, summary: None, task_update: None,
@@ -3555,6 +3579,7 @@ Planning continuation: turn {} of {}.",
                             self.store.delete_exchange(&interaction.id)?;
                             self.emit_live(
                                 BackendEvent {
+            received_at_ms: None,
                                     address: None,
                                     turn_boundary: None,
                                     kind: "timeline_exchange_retracted".into(),
@@ -3578,6 +3603,7 @@ Planning continuation: turn {} of {}.",
                         Err(rollback_error) => {
                             self.emit_live(
                                 BackendEvent {
+            received_at_ms: None,
                                     address: None,
                                     turn_boundary: None,
                                     kind: "error".into(),
@@ -3619,6 +3645,7 @@ Planning continuation: turn {} of {}.",
                 if cancelled {
                     self.emit_live_interaction(
                         BackendEvent {
+            received_at_ms: None,
                             address: None,
                             turn_boundary: None,
                             kind: "timeline_exchange_cancelled".into(),
@@ -4077,6 +4104,7 @@ Planning continuation: turn {} of {}.",
         self.active_wait_projection = None;
         self.emit_live_interaction(
             BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "timeline_exchange_failed".into(),
@@ -4197,6 +4225,7 @@ Planning continuation: turn {} of {}.",
                                     let patch = self.reconcile_live_interaction(Some(interaction), None)?;
                                     self.emit_timeline_patch(patch, event).await?;
                                     self.emit_backend_event(BackendEvent {
+            received_at_ms: None,
                                     address: None, turn_boundary: None, kind: "plan_execution_progress".into(), text: None,
                                     data: progress, activity: None, summary: None, task_update: None,
                                 }, event).await?;
@@ -4458,6 +4487,15 @@ Planning continuation: turn {} of {}.",
         mut backend_event: BackendEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        if let Some(received) = backend_event.received_at_ms {
+            self.trace.record(&self.session.id,"broker.provider.dequeued",json!({
+                "event_type":backend_event.kind,
+                "tool_id":backend_event.activity.as_ref().map(|activity|activity.id.as_str()),
+                "received_at_ms":received,
+                "queue_delay_ms":self.clock.now_ms().saturating_sub(received).max(0),
+                "provider_at_ms":backend_event.observed_at_ms(received),
+            }));
+        }
         if backend_event.kind == "approval_requested" {
             let owner = if let Some(address) = backend_event.address.as_ref() {
                 if interaction
@@ -4627,6 +4665,7 @@ Planning continuation: turn {} of {}.",
                         self.store.save_exchange(interaction)?;
                         self.emit_live_interaction(
                             BackendEvent {
+            received_at_ms: None,
                                 address: None,
                                 turn_boundary: None,
                                 kind: "timeline_node_updated".into(),
@@ -4698,6 +4737,7 @@ Planning continuation: turn {} of {}.",
             self.store.save_exchange(interaction)?;
             self.emit_live_interaction(
                 BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "timeline_node_updated".into(),
@@ -4740,6 +4780,7 @@ Planning continuation: turn {} of {}.",
             self.store.save_exchange(interaction)?;
             self.emit_live_interaction(
                 BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "timeline_task_updated".into(),
@@ -4756,7 +4797,11 @@ Planning continuation: turn {} of {}.",
         }
         if backend_event.address.is_some() {
             attribute_provider_tool(interaction, &mut runtime.task, &backend_event)?;
-            self.store.save_exchange(interaction)?;
+            if backend_event.tool_output_delta().is_some() {
+                self.store.save_tool_output_delta(interaction, &backend_event)?;
+            } else {
+                self.store.save_exchange(interaction)?;
+            }
             self.emit_live_interaction(backend_event, interaction, event)
                 .await?;
             return Ok(());
@@ -4773,6 +4818,7 @@ Planning continuation: turn {} of {}.",
         self.active_wait_projection = runtime.active_wait.clone();
         self.emit_live_interaction(
             BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "timeline_wait_updated".into(),
@@ -4807,8 +4853,18 @@ Planning continuation: turn {} of {}.",
         interaction: &Exchange,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        let incremental = if backend_event.tool_output_delta().is_some() {
+            self.presentation.lock().map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .append_tool_output(interaction,&backend_event)?
+        } else if backend_event.message_delta().is_some() {
+            self.presentation.lock().map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .update_message(interaction,&backend_event)?
+        } else { None };
         self.emit_backend_event(backend_event, event).await?;
-        let timeline_patch = self.reconcile_live_interaction(Some(interaction), None)?;
+        let timeline_patch = match incremental {
+            Some(patch) => patch,
+            None => self.reconcile_live_interaction(Some(interaction), None)?,
+        };
         self.emit_timeline_patch(timeline_patch, event).await
     }
 
@@ -4850,6 +4906,7 @@ Planning continuation: turn {} of {}.",
         if let Some(event_sink) = self.event_sink.as_ref() {
             event_sink
                 .send_wait(BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "timeline_patch".into(),
@@ -5373,6 +5430,7 @@ Planning continuation: turn {} of {}.",
         let mut pre_execution_event = compact_event;
         self.emit_live(
             BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "timeline_plan_lifecycle".into(),
@@ -5428,6 +5486,7 @@ Planning continuation: turn {} of {}.",
                 execution_record.state = PlanExecutionState::Paused;
                 self.store.save_plan_execution(&execution_record)?;
                 let backend_event = BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "error".into(),
@@ -7408,7 +7467,8 @@ mod test {
                 std::fs::remove_file(Path::new(&request.workspace).join("unexpected.rs"))?;
             } else if phase == "verify" {
                 let id = format!("check-{turn}");
-                sink.as_ref().unwrap().send_wait(BackendEvent { address:None, turn_boundary:None, kind:"tool".into(), text:None, data:Value::Null,
+                sink.as_ref().unwrap().send_wait(BackendEvent {
+            received_at_ms: None, address:None, turn_boundary:None, kind:"tool".into(), text:None, data:Value::Null,
                     activity:Some(crate::backend::ToolActivity { id:id.clone(), kind:crate::backend::ToolActivityKind::Command, title:"cargo test".into(), output:Some(if turn == 1 { "round reset failed" } else { "all checks passed" }.into()), status:Some("completed".into()), change:Default::default(), output_delta:false }), summary:None, task_update:None }).await?;
                 arguments["verification"] = json!({"outcome":if turn == 1 { "failed" } else { "passed" },"evidence":[id],"findings":if turn == 1 { vec!["Round reset retains score"] } else { Vec::<&str>::new() }});
             }
@@ -7520,6 +7580,7 @@ mod test {
             let event_sink = event_sink.unwrap();
             for sequence in 0..384 {
                 let event = BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "assistant_message".into(),
@@ -7659,14 +7720,13 @@ mod test {
                 .is_pending()
             );
             let consume = async move {
-                let mut sequence = 0;
+                let mut delivered = String::new();
                 while let Some(event) = stream.recv().await.unwrap() {
                     if event.kind == "assistant_message" {
-                        assert_eq!(event.text, Some(sequence.to_string()));
-                        sequence += 1;
+                        delivered.push_str(event.text.as_deref().unwrap());
                     }
                 }
-                assert_eq!(sequence, 384);
+                assert_eq!(delivered,(0..384).map(|sequence|sequence.to_string()).collect::<String>());
             };
             let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 tokio::join!(dispatch, consume)
@@ -7710,6 +7770,7 @@ mod test {
         ) -> Result<crate::backend::BackendOutput> {
             let invocation = self.invocation.fetch_add(1, Ordering::SeqCst);
             let mut event = BackendEvent {
+            received_at_ms: None,
                 address: Some(crate::backend::ProviderAddress {
                     thread_id: "restart-thread".into(),
                     turn_id: format!("turn-{invocation}"),
@@ -8171,6 +8232,7 @@ mod test {
         ) -> Result<crate::backend::BackendOutput> {
             if let Some(event_sink) = event_sink {
                 let _ = event_sink.send(BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "assistant_message".into(),
@@ -8214,6 +8276,7 @@ mod test {
         ) -> Result<crate::backend::BackendOutput> {
             let event_list = vec![
                 BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "assistant_message".into(),
@@ -8224,6 +8287,7 @@ mod test {
                     task_update: None,
                 },
                 BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "parent_boundary".into(),
@@ -8234,6 +8298,7 @@ mod test {
                     task_update: None,
                 },
                 BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "parent_boundary".into(),
@@ -8244,6 +8309,7 @@ mod test {
                     task_update: None,
                 },
                 BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "assistant_message".into(),
@@ -8690,6 +8756,7 @@ mod test {
                 "The plan is ready for review."
             };
             let event = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "assistant_message".into(),
@@ -8762,6 +8829,7 @@ mod test {
             event_sink: Option<BackendEventSink>,
         ) -> Result<crate::backend::BackendOutput> {
             let commentary = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "assistant_message".into(),
@@ -8780,6 +8848,7 @@ mod test {
                 }],
             };
             let file_started = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "tool".into(),
@@ -8798,6 +8867,7 @@ mod test {
                 task_update: None,
             };
             let started = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "tool".into(),
@@ -8824,6 +8894,7 @@ mod test {
                 "provider edit\n",
             )?;
             let file_completed = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "tool".into(),
@@ -8852,6 +8923,7 @@ mod test {
             std::fs::create_dir_all(&ignored)?;
             std::fs::write(ignored.join("artifact.txt"), "ignored\n")?;
             let completed = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "tool".into(),
@@ -8870,6 +8942,7 @@ mod test {
                 task_update: None,
             };
             let response = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "assistant_message".into(),
@@ -8922,6 +8995,7 @@ mod test {
             event_sink: Option<BackendEventSink>,
         ) -> Result<crate::backend::BackendOutput> {
             let task_event = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "plan".into(),
@@ -8944,6 +9018,7 @@ mod test {
                 }),
             };
             let response = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "assistant_message".into(),
@@ -9202,6 +9277,7 @@ mod test {
         broker
             .apply_agent_lifecycle(
                 &BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "agent_lifecycle".into(),
@@ -9249,6 +9325,7 @@ mod test {
         broker
             .apply_agent_lifecycle(
                 &BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "agent_lifecycle".into(),
@@ -9297,6 +9374,7 @@ mod test {
             .route_agent_backend_event(
                 None,
                 &BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: "turn_completed".into(),
@@ -9345,6 +9423,7 @@ mod test {
             active_wait: None,
         };
         let mut provider = BackendEvent {
+            received_at_ms: None,
             address: Some(ProviderAddress {
                 thread_id: "parent".into(),
                 turn_id: "native".into(),
@@ -9552,6 +9631,7 @@ mod test {
         let mut parent = completed_interaction("parent", &broker.session.id, Vec::new());
         let parent_before = serde_json::to_value(&parent).unwrap();
         let event = BackendEvent {
+            received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
             kind: "usage".into(),
@@ -9652,6 +9732,7 @@ mod test {
         primary.state = ExchangeState::Running;
         primary.completed_at_ms = None;
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(ProviderAddress {
                 thread_id: "child-thread".into(),
                 turn_id: "child-turn".into(),
@@ -9797,6 +9878,7 @@ mod test {
                 .unwrap();
             broker.store.save_exchange(&parent).unwrap();
             let mut event = BackendEvent {
+            received_at_ms: None,
                 address: Some(ProviderAddress {
                     thread_id: "child-thread".into(),
                     turn_id: "first".into(),

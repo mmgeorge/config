@@ -118,6 +118,7 @@ impl PermissionCoordinator {
         if let Some(event_sink) = event_sink {
             event_sink
                 .send_wait(BackendEvent {
+                    received_at_ms: None,
                     address,
                     turn_boundary: None,
                     kind: "approval_requested".into(),
@@ -263,6 +264,7 @@ impl PermissionCoordinator {
         if let Some(event_sink) = event_sink {
             let _ = event_sink
                 .send_wait(BackendEvent {
+            received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: kind.into(),

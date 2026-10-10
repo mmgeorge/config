@@ -504,8 +504,6 @@ and declaration edits can share one atomic patch:
 @@
 -  "objective": "",
 +  "objective": "Support observable, cancellable texture requests.",
-@@
--  "usage": "",
 +  "usage": "Start a replacement, cancel it before publication, and confirm the existing texture remains visible.",
 *** End Patch
 ```

@@ -1327,6 +1327,7 @@ impl ControlToolStream {
     ) {
         self.next_activity_id += 1;
         let event = BackendEvent {
+            received_at_ms: None,
             address: None,
             turn_boundary: None,
             kind: "tool".into(),

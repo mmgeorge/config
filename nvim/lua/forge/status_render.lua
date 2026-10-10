@@ -61,8 +61,6 @@ local section_label = { unstaged = "Unstaged changes", staged = "Staged changes"
 ---@field notice fun(message: string)
 ---@field recover_body? fun(file: integer|string, generation: integer)
 ---@field applying? boolean
----@field fold_pending? table[]
----@field fold_pending_index? integer
 ---@field locate fun(row: integer, column: integer): table?
 ---@field capture fun(view: ForgeInputView, action: string): ForgeStatusInput?, string?
 ---@field header_text fun(row: integer): table?
@@ -392,16 +390,15 @@ end
 
 local function write(session, edits)
   local started = vim.uv.hrtime()
-  session.applying, session.fold_pending = true, edits
+  session.applying = true
   vim.bo[session.buffer].modifiable = true
   local ok, failure = pcall(function()
-    for index, edit in ipairs(edits) do
-      session.fold_pending_index = index + 1
+    for _, edit in ipairs(edits) do
       vim.api.nvim_buf_set_lines(session.buffer, edit.start_row, edit.start_row + edit.removed_rows, true, edit.text)
     end
   end)
   vim.bo[session.buffer].modifiable = false
-  session.applying, session.fold_pending, session.fold_pending_index = nil, nil, nil
+  session.applying = nil
   session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
   assert(ok, failure)
   if session.issues_editor then session.issues_editor.sync() end
@@ -413,6 +410,12 @@ local function adopt(session, prepared)
   assert(session.status == "Desynchronized" or vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "status buffer was changed externally")
   local edits = edits_between(session, prepared)
   local fold_state = #edits > 0 and folds.capture(session) or {}
+  local selected = {}
+  for id, record in pairs(session.fold and session.fold.record or {}) do
+    local replacement = prepared.fold.record[id]
+    if not replacement or not vim.deep_equal(record.fold, replacement.fold) then selected[id] = true end
+  end
+  for id in pairs(folds.prepare_records(session, selected)) do prepared.fold.changed[id] = true end
   local metadata = { changed = {}, retired = {}, block = {}, position = {} }
   for id in pairs(prepared.body_owner) do
     local previous = session.block[id]
@@ -653,11 +656,16 @@ function M.apply_body(session, delivery)
         edits[#edits + 1] = { start_row = start + 1 + edit.start_row, removed_rows = edit.removed_rows, text = edit.text }
       end
     else return { kind = "Applied" } end
+    local selected = {}
+    for id, record in pairs(session.fold.record) do
+      if record.fold["end"].block == key or previous_fold[id] then selected[id] = true end
+    end
+    local affected = folds.prepare_records(session, selected)
     model.body = body
     model.header = file_header(model.record, body, delivery.file)
     session.block[key] = model.header
     session.root:update(key, model.header)
-    session.fold.changed = {}
+    session.fold.changed = affected
     for id, record in pairs(session.fold.record) do
       if record.fold["end"].block == key then
         record.fold["end"].position.row = model.header.row_count
@@ -836,11 +844,12 @@ function M.present_context(session, presentation)
         edits[#edits + 1] = { start_row = start, removed_rows = previous.row_count, text = value.text }
       end
     end
+    local affected = resized and folds.prepare_records(session, { ["status:context:recent"] = session.fold.record["status:context:recent"] and true or nil }) or {}
     for key, value in pairs(replacement) do
       session.block[key] = value
       session.root:update(key, value)
     end
-    session.fold.changed = {}
+    session.fold.changed = affected
     local recent = session.fold.record["status:context:recent"]
     if recent and resized then
       local endpoint = recent.fold["end"]

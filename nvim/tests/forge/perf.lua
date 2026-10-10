@@ -66,6 +66,8 @@ local test_success, failure = pcall(function()
     error("expected callback failure")
   end)
   assert_true(not succeeded and callback_error:find("expected callback failure", 1, true), "tracing swallowed a callback failure")
+  perf.event("harness", "ui.document.slices", { slices = 3, maximum_ms = 54,
+    maximum_prepare_ms = 4, maximum_commit_ms = 53 })
   vim.uv.sleep(450)
   local records = {}
   assert_true(vim.wait(1500, function()
@@ -80,6 +82,8 @@ local test_success, failure = pcall(function()
   assert_true(finish.elapsed_ms >= 0 and finish.status == "ok")
   assert_equals(records["test.failure:end"].status, "error")
   assert_equals(begin.body, nil, "callback tracing retained private content")
+  assert_equals(records["ui.document.slices:nil"].maximum_prepare_ms, 4)
+  assert_equals(records["ui.document.slices:nil"].maximum_commit_ms, 53)
   assert_true(records["ui.loop_lag:nil"].elapsed_ms >= 100, "UI delay reported below its threshold")
   perf.setup({ harness = { enabled = false } })
   local called = false

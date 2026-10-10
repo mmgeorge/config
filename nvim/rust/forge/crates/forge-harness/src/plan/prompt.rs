@@ -189,12 +189,15 @@ mod test {
     #[test]
     fn planning_patch_example_applies_to_virtual_declarations() {
         let workspace = tempfile::tempdir().unwrap();
-        let examples = PLANNING_CONTRACT.split("```text\n").skip(1).map(|part| part.split_once("\n```").unwrap().0).collect::<Vec<_>>();
+        let contract = PLANNING_CONTRACT.replace("\r\n", "\n");
+        let examples = contract.split("```text\n").skip(1)
+            .map(|part| part.split_once("\n```").unwrap().0)
+            .filter(|example| example.starts_with("*** Begin Patch\n")).collect::<Vec<_>>();
         let example = examples.last().unwrap();
         let mut design = crate::plan::DeclarationDesign::default();
         design.proposed.insert("src/textures.rs".into(), "impl Texture {\n  pub fn request(texture: TextureId) -> TextureHandle;\n\n  pub fn status(request: RequestId) -> RequestStatus;\n}\n".into());
         let described = design.patch(workspace.path(), &Default::default(), examples[0]).unwrap();
-        assert!(!described.document.design.is_empty());
+        assert!(described.document.usage.as_deref().is_some_and(|usage| !usage.is_empty()));
         assert!(!described.document.objective.is_empty());
         let changed = described.patch(workspace.path(), &Default::default(), example).unwrap();
         assert!(changed.proposed["src/textures.rs"].contains("-> TextureRequest;"));

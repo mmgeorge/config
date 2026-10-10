@@ -8,14 +8,78 @@ use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 
 use super::markdown_math;
-use super::duration::duration_label;
-use super::tool::ToolOutputPreview;
+use super::duration::tool_duration;
+use super::tool::{ToolOutputPreview, ToolOutputView};
 
 pub struct TranscriptRenderer<'profile> {
     profile: &'profile WidthProfile,
 }
 
 impl<'profile> TranscriptRenderer<'profile> {
+    /// Builds the independent command heading without retaining an output body.
+    pub(super) fn tool_header(&self, id: BlockId, target: TargetId, kind: &str,
+        elapsed_ms: Option<u64>, failed: bool, title: &str, expanded: bool) -> Result<BufferBlock> {
+        let empty = ToolOutputPreview { row:Vec::new(), hidden_rows:0, total_rows:0 };
+        let mut block = self.tool_preview(id,target,kind,elapsed_ms,failed,title,&empty,expanded)?;
+        let rows = block.metadata.decoration.iter().find(|span|span.capture == "ForgeHarnessOutput")
+            .map_or(block.text.row_count(), |span|span.range.start.row);
+        block.text = BufferText::from_rows(block.text.slice(0..rows)?)?;
+        block.metadata.decoration.retain(|span|span.capture != "ForgeHarnessOutput");
+        block.metadata.target[0].range.end.row = rows;
+        Ok(block)
+    }
+
+    /// Projects one stable output chunk and an independent collapsed hidden-count block.
+    pub(super) fn tool_body(&self, call_id: &str, output: &ToolOutputView, expanded: bool,
+        chunk: usize) -> Result<BufferBlock> {
+        let id = if chunk == 0 { format!("{call_id}:preview") } else { format!("{call_id}:output:{chunk}") };
+        let rows = if expanded {
+            let source = output.inline_chunk(chunk);
+            if source.is_empty() && chunk == 0 { tool_body_rows(self.profile,"no output",true)? }
+            else {
+                let mut rows = Vec::new();
+                for (index,text) in source.into_iter().enumerate() {
+                    rows.extend(tool_body_rows(self.profile,text,chunk == 0 && index == 0)?);
+                }
+                rows
+            }
+        } else { preview_rows(self.profile,&output.preview(false))?.0 };
+        self.output_block(BlockId(id),rows)
+    }
+
+    /// Changes hidden output counts without replacing the heading or its preview.
+    pub(super) fn tool_hidden(&self, call_id: &str, output: &ToolOutputView, expanded: bool) -> Result<BufferBlock> {
+        let hidden = if expanded { 0 } else { preview_rows(self.profile,&output.preview(false))?.1 };
+        let rows = if hidden == 0 { Vec::new() }
+            else { tool_body_rows(self.profile,&format!("…({hidden} hidden)"),false)? };
+        self.output_block(BlockId(format!("{call_id}:hidden")),rows)
+    }
+
+    fn output_block(&self, id: BlockId, rows: Vec<String>) -> Result<BufferBlock> {
+        let text = BufferText::from_rows(rows)?;
+        let mut block = BufferBlock { id, text, metadata:BlockMetadata::default() };
+        if block.text.row_count() > 0 {
+            let range = TextRange { start:TextPosition { row:0,column:0 },
+                end:TextPosition { row:block.text.row_count(),column:0 } };
+            block.metadata.target.push(TargetRange { id:TargetId(format!("{}:tool",block.id.0)),range:range.clone() });
+            block.metadata.decoration.push(Decoration { range,capture:"ForgeHarnessOutput".into(),priority:100 });
+        }
+        Ok(block)
+    }
+    pub(super) fn refresh_tool_heading(&self, previous: &BufferBlock, kind: &str,
+        elapsed_ms: Option<u64>, failed: bool, title: &str, expanded: bool) -> Result<BufferBlock> {
+        let mut block = self.tool_header(previous.id.clone(),previous.metadata.target[0].id.clone(),
+            kind,elapsed_ms,failed,title,expanded)?;
+        block.metadata.layout = previous.metadata.layout.clone();
+        block.metadata.fold = previous.metadata.fold.clone();
+        for fold in &mut block.metadata.fold {
+            if fold.end.block == block.id && fold.end.position.row == previous.text.row_count() {
+                fold.end.position.row = block.text.row_count();
+            }
+        }
+        Ok(block)
+    }
+
     pub fn new(profile: &'profile WidthProfile) -> Result<Self> {
         profile.validate()?;
         Ok(Self { profile })
@@ -119,7 +183,6 @@ impl<'profile> TranscriptRenderer<'profile> {
         target: TargetId,
         kind: &str,
         elapsed_ms: Option<u64>,
-        duration_width: usize,
         failed: bool,
         title: &str,
         output: &ToolOutputPreview<'_>,
@@ -134,8 +197,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         let arguments = expanded.then(|| title.split_once('('))
             .flatten().filter(|_| kind == "tool_call")
             .and_then(|(name, arguments)| arguments.strip_suffix(')').map(|arguments| (name, arguments)));
-        let label = elapsed_ms.map(duration_label).unwrap_or_else(|| "—".into());
-        let duration = format!("{label:>duration_width$}");
+        let duration = tool_duration(elapsed_ms);
         let mut row = if let Some((name, arguments)) = arguments {
             let mut row = vec![tool_heading(self.profile, kind, name, &duration)?];
             row.extend(tool_body_rows(self.profile, arguments, true)?);
@@ -146,25 +208,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             vec![tool_heading(self.profile, kind, title, &duration)?]
         };
         let title_rows = row.len();
-        let mut hidden_rows = output.hidden_rows;
-        for (index, text) in output.row.iter().enumerate() {
-            let wrapped = tool_body_rows(self.profile, text, index == 0)?;
-            let remaining = 4_usize.saturating_sub(row.len() - title_rows);
-            if !expanded && wrapped.len() > remaining {
-                row.extend(wrapped.into_iter().take(remaining));
-                hidden_rows += output.row.len() - index;
-                break;
-            }
-            row.extend(wrapped);
-        }
-        if output.row.is_empty() {
-            row.extend(tool_body_rows(self.profile, "no output", true)?);
-        }
-        if hidden_rows > 0 {
-            row.extend(tool_body_rows(self.profile,
-                &format!("…({hidden_rows} hidden)"), false,
-            )?);
-        }
+        row.extend(tool_output_rows(self.profile, output, expanded)?);
         let text = BufferText::from_rows(row)?;
         let range = TextRange {
             start: TextPosition { row: 0, column: 0 },
@@ -212,6 +256,42 @@ impl<'profile> TranscriptRenderer<'profile> {
         Ok(block)
     }
 
+}
+
+fn preview_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>) -> Result<(Vec<String>,usize)> {
+    let mut row = Vec::new();
+    let mut hidden_rows = output.hidden_rows;
+    for (index, text) in output.row.iter().enumerate() {
+        let byte_limit = (profile.columns * 64).min(65536);
+        let truncated = text.len() > byte_limit;
+        let text = if truncated {
+            let mut end = byte_limit;
+            while !text.is_char_boundary(end) { end -= 1; }
+            &text[..end]
+        } else { text };
+        let wrapped = tool_body_rows(profile, text, index == 0)?;
+        let remaining = 4_usize.saturating_sub(row.len());
+        if wrapped.len() > remaining || truncated {
+            row.extend(wrapped.into_iter().take(remaining));
+            hidden_rows += output.row.len() - index;
+            break;
+        }
+        row.extend(wrapped);
+    }
+    if output.row.is_empty() { row.extend(tool_body_rows(profile, "no output", true)?); }
+    Ok((row,hidden_rows))
+}
+
+fn tool_output_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>, expanded: bool) -> Result<Vec<String>> {
+    if expanded {
+        let mut row = Vec::new();
+        for (index,text) in output.row.iter().enumerate() { row.extend(tool_body_rows(profile,text,index == 0)?); }
+        if row.is_empty() { row.extend(tool_body_rows(profile,"no output",true)?); }
+        return Ok(row);
+    }
+    let (mut row,hidden) = preview_rows(profile,output)?;
+    if hidden > 0 { row.extend(tool_body_rows(profile,&format!("…({hidden} hidden)"),false)?); }
+    Ok(row)
 }
 
 /// Wraps body content before adding its marker so long tokens cannot strand the marker.
@@ -484,12 +564,12 @@ mod test {
         let renderer = TranscriptRenderer::new(&profile)?;
         let arguments = r#"{"entity_name":"CosmosDbClient","file_path":"cosmos-db-client.ts","hops":1,"token_budget":3500}"#;
         let block = renderer.tool_preview(
-            BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), 0, false,
+            BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), false,
             &format!("sem.sem_context({arguments})"),
             &ToolOutputPreview { row: vec!["response"], hidden_rows: 0, total_rows: 1 }, true,
         )?;
         let rows = block.text.wire_rows();
-        assert_eq!(rows[0], "  • 2s sem.sem_context");
+        assert_eq!(rows[0], "  •     2s sem.sem_context");
         assert!(rows[1].starts_with("    └ {\"entity_name\""));
         assert_eq!(rows.last(), Some(&"    └ response"));
         let restored = rows[1..rows.len() - 1].iter().enumerate()
@@ -508,7 +588,7 @@ mod test {
             let renderer = TranscriptRenderer::new(&profile)?;
             for expanded in [false, true] {
                 let block = renderer.tool_preview(
-                    BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), 0, true,
+                    BlockId("tool".into()), TargetId("tool".into()), "tool_call", Some(2000), true,
                     "harness_plan_read", &ToolOutputPreview { row: vec![response], hidden_rows: 0, total_rows: 1 }, expanded,
                 )?;
                 let rows = block.text.wire_rows();
@@ -536,17 +616,18 @@ mod test {
         let profile = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&profile)?;
         for (elapsed_ms, label) in [(0, "0ms"), (2, "2ms"), (439, "439ms"),
-            (999, "999ms"), (1000, "1s"), (1050, "1.1s"), (2500, "2.5s")] {
+            (999, "999ms"), (1000, "1s"), (1050, "1.1s"), (2500, "2.5s"), (9_950, "10s"),
+            (100_050, "100.1s"), (1_000_050, "16.7m"), (u64::MAX, "2e11d")] {
             for expanded in [false, true] {
                 let block = renderer.tool_preview(
                     BlockId("tool:duration".into()), TargetId("expand:duration".into()),
-                    "command", Some(elapsed_ms), 5, false, "cargo test",
+                    "command", Some(elapsed_ms), false, "cargo test",
                     &ToolOutputPreview { row: vec![], hidden_rows: 0, total_rows: 0 }, expanded,
                 )?;
-                assert_eq!(block.text.row(0), Some(format!("  • {label:>5} cargo test").as_str()));
+                assert_eq!(block.text.row(0), Some(format!("  • {label:>6} cargo test").as_str()));
                 assert!(block.metadata.decoration.iter().any(|decoration| {
                     decoration.capture == "ForgeHarnessCommand"
-                        && decoration.range.start.column == format!("  • {label:>5} ").len()
+                        && decoration.range.start.column == format!("  • {label:>6} ").len()
                 }));
             }
         }
@@ -577,7 +658,6 @@ mod test {
             TargetId("expand:1".into()),
             "command",
             Some(2000),
-            0,
             false,
             "cargo test --lib parser",
             &ToolOutputPreview {
@@ -590,7 +670,7 @@ mod test {
         assert_eq!(
             block.text.wire_rows(),
             vec![
-                "  • 2s cargo test --lib parser",
+                "  •     2s cargo test --lib parser",
                 "    └ first",
                 "      second",
                 "      third",
@@ -601,7 +681,7 @@ mod test {
         assert_eq!(block.metadata.target[0].range.end.row, block.text.row_count());
         assert!(block.metadata.decoration.iter().any(|decoration| {
             decoration.capture == "ForgeHarnessCommand"
-                && decoration.range.start.column == "  • 2s ".len()
+                && decoration.range.start.column == "  •     2s ".len()
         }));
         assert!(
             block
@@ -622,7 +702,6 @@ mod test {
             TargetId("expand:empty".into()),
             "command",
             Some(2000),
-            0,
             false,
             "cargo check",
             &ToolOutputPreview {
@@ -635,7 +714,7 @@ mod test {
 
         assert_eq!(
             block.text.wire_rows(),
-            vec!["  • 2s cargo check", "    └ no output"]
+            vec!["  •     2s cargo check", "    └ no output"]
         );
         assert!(block.metadata.decoration.iter().any(|decoration| {
             decoration.capture == "ForgeHarnessOutput" && decoration.range.start.row == 1
@@ -653,7 +732,6 @@ mod test {
             TargetId("active:tool".into()),
             "tool_call",
             Some(2000),
-            0,
             true,
             "docs_lookup(crate, Item)",
             &output.preview(false),
@@ -663,7 +741,7 @@ mod test {
         assert_eq!(
             block.text.wire_rows(),
             vec![
-                "  • 2s docs_lookup(crate, Item)",
+                "  •     2s docs_lookup(crate, Item)",
                 "    └ one",
                 "      two",
                 "      three",
@@ -703,7 +781,7 @@ mod test {
         let output = super::super::tool::ToolOutputView::new("wrapped".into(), source.clone().into())?;
         let render = |expanded| renderer.tool_preview(
             BlockId("wrapped:tool".into()), TargetId("wrapped:tool".into()),
-            "command", Some(10), 0, false, "inspect",
+            "command", Some(10), false, "inspect",
             &output.preview(expanded), expanded,
         );
         let preview = render(false)?;
@@ -829,3 +907,14 @@ mod test {
         Ok(())
     }
 }
+    #[test]
+    fn single_large_output_line_has_a_bounded_preview() -> Result<()> {
+        let source = "λ".repeat(1024 * 1024);
+        let rows = tool_output_rows(&WidthProfile::default(),
+            &ToolOutputPreview { row:vec![&source],hidden_rows:0,total_rows:1 },false)?;
+        assert_eq!(rows.len(),5);
+        assert!(rows[4].contains("1 hidden"));
+        assert!(rows.iter().map(String::len).sum::<usize>() < 1024);
+        assert_eq!(source.len(),2 * 1024 * 1024);
+        Ok(())
+    }

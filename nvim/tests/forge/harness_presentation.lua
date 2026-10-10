@@ -6,6 +6,7 @@ client.host_accepting = function() return true end
 local requests = {}
 client.request_for = function(session, method, params, callback)
   assert(session == "test-session" and (method == "harness.document" or method == "prompt.submit"))
+  if params.operation == "background_terminals" then callback({ supported = false }) return end
   requests[#requests + 1] = { method = method, params = params, callback = callback }
 end
 local function snapshot(document, text, editable)
@@ -38,20 +39,20 @@ local ok, failure = xpcall(function()
   assert(#requests == 1, "plain transcript text dispatched an action without a target")
   owner.sync()
   owner.sync()
-  assert(#requests == 2, "transcript sync requests were concurrent")
+  assert(#requests == 1, "refresh bypassed the publication interval")
+  assert(vim.wait(500, function() return #requests == 2 end, 1))
   requests[2].callback({ snapshot = vim.NIL, patch = {} })
   assert(owner.transcript.status == "Applied", "null snapshot desynchronized incremental transcript updates")
-  assert(#requests == 3)
-  requests[3].callback({ patch = {} })
+  assert(#requests == 2, "one burst dispatched redundant refreshes")
   assert(vim.api.nvim_win_get_cursor(window)[1] == 1, "background sync moved a reader away from history")
   vim.api.nvim_buf_set_text(composer, 0, 0, 0, 5, { "first typed prompt" })
-  assert(#requests == 3, "typing sent a composer request")
+  assert(#requests == 2, "typing sent a composer request")
   owner.follow_tail()
   assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit agent action did not follow the tail")
   vim.api.nvim_win_set_cursor(window, { 1, 0 })
   owner.submit(function() end)
   assert(vim.api.nvim_win_get_cursor(window)[1] == 3, "explicit submission did not resume following the transcript tail")
-  local submission = requests[4]
+  local submission = requests[3]
   assert(submission.method == "prompt.submit" and submission.params.text == "first typed prompt")
   assert(submission.params.submission.document == opened.document and not submission.params.composer)
   local function transition(state, token)
@@ -137,16 +138,19 @@ local ok, failure = xpcall(function()
   }, function(value, error_message) assert(value and not error_message) end)
   local initial = requests[#requests]
   initial.callback({ transcript = snapshot(initial.params.document, "retained history") })
-  for _ = 1, 3 do
+  local function refresh()
+    local count = #requests
     owner.sync()
-    requests[#requests].callback(nil, "transcript projection requires reopening: duplicate block identity")
+    assert(vim.wait(500, function() return #requests > count end, 1))
+    return requests[#requests]
   end
-  assert(#notices == 1, "repeated refresh failure flooded notifications")
+  for _ = 1, 3 do
+    refresh().callback(nil, "transcript projection requires reopening: duplicate block identity")
+  end
+  assert(#notices == 1, "repeated refresh failure flooded notifications: " .. vim.inspect(notices))
   assert(vim.api.nvim_buf_get_lines(transcript, 0, -1, false)[1] == "retained history")
-  owner.sync()
-  requests[#requests].callback({ patch = {} })
-  owner.sync()
-  requests[#requests].callback(nil, "transcript projection requires reopening: duplicate block identity")
+  refresh().callback({ patch = {} })
+  refresh().callback(nil, "transcript projection requires reopening: duplicate block identity")
   assert(#notices == 2, "a failure after successful recovery was suppressed")
   assert(owner.close())
 end, debug.traceback)

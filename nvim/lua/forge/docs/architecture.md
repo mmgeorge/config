@@ -145,10 +145,53 @@ viewport indexing and redraw. Lua resolves those groups through the active theme
 widths follow the complete display group's line ranges, so chunks of one hunk keep aligned
 columns without adding gutter bytes to the source text.
 
-`forge.folds` renders collapsed labels from the header text and its semantic decorations.
-It applies default collapse only when a fold first becomes available in an attached window.
-Later body patches preserve native expansion intent. Status demand skips closed folds,
+`forge.folds` owns native manual fold ranges and renders collapsed labels from header text
+and semantic decorations. Each attached window retains its own open or closed preference.
+Ordinary patches remove and recreate only affected fold subtrees. Unchanged native ranges
+survive timer updates. Attaching a window or replacing an authoritative snapshot rebuilds
+the native ranges without replacing retained window preferences. Status demand skips closed folds,
 and expanding a file admits its source through the existing bounded demand path.
+
+`forge.cooperative` prepares Harness document updates in slices targeting four milliseconds
+or 1024 work units. Preparation retains the committed text, folds, and decorations. A completed
+update publishes text, metadata, folds, and view restoration in one non-yielding callback.
+Each text replacement uses one buffer API call without first deleting the live range.
+Document actions reject pending updates while cursor movement remains available during preparation.
+Each resume checks the document owner, host generation, buffer validity, and changedtick.
+Cancellation before publication preserves the prior frame and reports recovery through the
+existing document failure path. Once publication starts, cancellation takes effect afterward.
+Profiling records slice counts, maximum callback duration, maximum preparation duration, and
+maximum non-yielding commit duration in `ui.document.slices`. Large initial snapshots can exceed
+the preparation time budget during their atomic commit, so commit timing is tracked separately.
+
+Adoption records each window after its own slice. If the reader moves between slices, final
+publication preserves that newer view instead of restoring the earlier cursor and viewport.
+
+Each tool owns independent command-heading, preview, and hidden-count blocks. Expanding output
+replaces only that tool's body with stable 16 KiB source chunks. Subsequent deltas render only
+the last mutable chunk and newly appended chunks. UTF-8 boundaries remain stable across appends.
+Native actions map every output chunk to the same tool call, and collapse restores the four-row
+preview without rebuilding other timeline entries. Timer updates replace headings independently.
+
+Harness Markdown resolves visible message owners through the weighted sequence and skips closed
+native folds. The parser includes complete visible messages across all attached windows, retaining
+delimiter context without scanning off-screen history. Per-block versions suppress renders after
+unrelated tool and timer patches. Parsing uses a completion callback guarded by the render lifetime.
+Leaving all Markdown regions stops their highlighter. Cursor reveal checks use the cursor range,
+and display and inline math share asynchronous conversion with at most four active processes.
+Conversion failures retain source text and report the underlying error. A converter has a
+30-second process deadline, and completion only refreshes surviving buffer/window owners.
+
+Lua timeline replicas retain tool deltas as immutable append chunks. Consumers materialize the full
+string on demand, while ordinary output events copy only their ancestor records. Timeline tracing
+uses the buffered asynchronous performance logger rather than writing a file in the update callback.
+
+SQLite stores output append chunks separately from exchange metadata. The indexed tool-owner table
+validates delta admission without parsing exchange JSON. Initialization migrates legacy inline output
+and ownership in one transaction. Lifecycle barriers synchronize metadata and chunks atomically,
+and publication follows a successful commit. Adapters stamp the first receipt time on `BackendEvent`
+before waiting for output capacity, preserving provider timestamps and distinguishing broker delay
+from tool execution time.
 
 `StatusDocument` retains the displayed HEAD and each file's index state, worktree stamp,
 and rename-origin stamp. The private wire protocol is version 4. Status, local previews,
@@ -557,10 +600,45 @@ Code source and coordinate maps count toward the 64 MiB presentation limit. Each
 10-second deadline and a 16 MiB result limit, and each decorated block admits at most 8192 spans.
 
 Each Rust session controller owns one `TimelineStream`. The stream compares stable top-level entry identities, advances
-its own monotonic revision, and emits ordered `insert`, `replace`, and `remove` operations. Provider lifecycle events
+its own monotonic revision, and emits ordered `insert`, `replace`, `remove`, `tool_output`, and `message` operations. Provider lifecycle events
 remain transport evidence for approvals, context metadata, and diagnostics. They no longer mutate transcript records
 inside Lua. Initial load, explicit reconciliation, resume, and preview carry full snapshots. Normal streaming carries
-only the changed top-level entries.
+only the changed item. Tool-output batches append to the indexed canonical call without
+cloning or serializing its exchange. Existing message updates replace one message and parse
+only its Markdown block. Message creation, snapshots, and lifecycle changes reconcile the
+owning entry. Lua stages patches atomically and copies only the path to the changed call or
+message. A rejected owner or revision leaves the prior cache intact.
+
+Provider delivery coalesces adjacent deltas for the same owner, call or message, and phase
+for at most 16 milliseconds or 64 KiB. Lifecycle, snapshot, and owner changes end a batch.
+The bounded queue waits asynchronously for capacity. A cancelled receive retains its partial
+batch for the final drain. Tool timers prefer provider timestamps and reported duration,
+then adapter receipt time, so broker queue delay does not become tool runtime.
+The `broker.provider.dequeued` trace records receipt, provider time, and queue delay
+separately from execution duration. Forwarding retains the original receipt timestamp.
+
+SQLite stores tool bytes in ordered `tool_output_chunk` records keyed by exchange, turn,
+call, and byte offset. An append validates the last committed offset and commits before
+publication. Completion commits metadata and authoritative output in one transaction.
+Loading hydrates the committed chunks. Opening the store transactionally moves existing
+inline output into that table. A storage failure propagates through the broker's visible
+failure boundary rather than publishing uncommitted text. A crash preserves committed
+output, while lifecycle and metrics metadata retain their last committed barrier.
+
+`ToolOutputView` retains the ANSI parser across deltas and indexes new line boundaries.
+Collapsed previews render at most four wrapped output rows plus a hidden-row counter.
+Full output remains available through the output document. One-second sync ticks use an
+index of active entries and regenerate only timing headings, preserving message syntax
+and tool bodies. Stable block identities and indexed fold endpoints constrain a patch to
+the changed block and its owning fold metadata.
+
+`forge.editable_shadow` stores the editable callback's generated-text baseline in indexed
+64-row chunks. An ordinary splice replaces boundary chunks and inserted rows without
+shifting the remaining transcript. Full restoration materializes the shadow only at the
+recovery boundary. `ui.buffer.patch` records total buffer API time separately from
+`editable_callback_ms` and its callback count, alongside preflight, metadata, folds, and
+view restoration. `tests/forge/streaming_performance.lua` exercises 100 updates over
+30,006 rows and reports p95, maximum callback time, and sequence visits.
 
 Lua's `snapshot.lua` projects JSON nulls to absent Lua values before assigning Harness state.
 Startup, session activation, and state reconciliation share this boundary. Nested optional fields
@@ -1938,13 +2016,17 @@ native fork work, broker persistence, and snapshot projection. Neovim records th
 client-observed completion latency in the `forge/harness-perf.log` JSONL stream when
 `harness_logging` is enabled.
 
-Transcript synchronization keeps its request active until all received patches have been
-applied in revision order. Each editor callback applies at most eight patches and yields
-after four milliseconds between patches. Individual patches remain atomic on Neovim's
-main thread, so this scheduling budget does not bound one patch's duration. Queued document
-requests wait for application to finish. Closing the view or replacing the host cancels
-remaining application callbacks, and validation failures release the queue for snapshot
-recovery. Commands continue in the provider process throughout these editor updates.
+Transcript synchronization coalesces event bursts with a 67-millisecond timer, limiting normal
+refresh requests to 15 per second. Events arriving during an active update retain one trailing
+refresh. Each response publishes its ordered batch of at most 64 patches without yielding
+between revisions. Queued document requests wait until publication completes. Closing the view
+cancels its pending refresh timer, and host replacement cancels preparation before publication.
+Validation failures release the queue and report the recovery failure.
+
+Status hints read the last committed frame during preparation. They cache block-relative targets
+and resolve physical rows on each render, including after same-revision snapshot replacement.
+Invalid committed targets trigger diagnostic recovery instead of indexing a missing text row.
+Commands continue in the provider process throughout these editor updates.
 
 Row-preserving single-line edits and metadata-only updates retain identical fold definitions.
 Structural edits rebuild native folds and restore each window's fold preferences. With
@@ -2204,9 +2286,9 @@ settles any outstanding call at that boundary. Completed timestamps survive sess
 Calls first observed at completion have unavailable duration (`—`). Subsecond calls display their measured milliseconds, such as `439ms`.
 Longer calls display rounded tenths, such as `2.5s`. These labels do not round the stored
 timestamps or throughput operands.
-Each contiguous tool group right-aligns its duration labels to the widest current label,
-keeping command and MCP names in one column. Expanded headings use the same width, and
-the group recomputes its width when a running timer changes.
+Every tool heading reserves six display cells for its duration, keeping command and MCP names
+in one column across timer updates, tool groups, and expansion. Labels that exceed six cells
+use compact minutes, hours, or days. Timer updates do not scan peer tools to size this column.
 These durations measure Harness lifecycle observations rather than provider CPU execution time.
 
 `/plan` uses the same `Thinking` and `Thought` interaction summaries as every model turn. A

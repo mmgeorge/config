@@ -224,7 +224,7 @@ impl Exchange {
                 let item_count = turn.items().len();
                 if let Some(tool) = &event.activity {
                     let known = turn.tools().any(|existing| existing.id == tool.id);
-                    turn.record_tool(tool, now_ms)?;
+                    turn.record_tool_event(event, now_ms)?;
                     let running = turn
                         .tools()
                         .find(|existing| existing.id == tool.id)
@@ -235,7 +235,7 @@ impl Exchange {
                     let id = format!("tool:{}:{}:{}", address.thread_id, address.turn_id, tool.id);
                     let elapsed = self.duration_ms.saturating_add(
                         self.execution_started_at_ms
-                            .map_or(0, |started| now_ms.saturating_sub(started).max(0) as u64),
+                            .map_or(0, |started| event.observed_at_ms(now_ms).saturating_sub(started).max(0) as u64),
                     );
                     self.metrics.block(id, running, elapsed);
                 }
@@ -675,6 +675,7 @@ mod test {
         };
         exchange.start_turn(address.clone(), 1000).unwrap();
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
             kind: "tool".into(),
@@ -723,6 +724,7 @@ mod test {
         };
         exchange.start_turn(address.clone(), 10).unwrap();
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
             kind: "assistant_message".into(),
@@ -775,6 +777,7 @@ mod test {
         };
         exchange.start_turn(address.clone(), 10).unwrap();
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
             kind: "reasoning_summary".into(),
@@ -859,6 +862,7 @@ mod test {
             turn_id: "first".into(),
         };
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(address.clone()),
             turn_boundary: Some(TurnBoundary::Started),
             kind: "turn_started".into(),

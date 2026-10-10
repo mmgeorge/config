@@ -35,6 +35,9 @@ local METADATA_FIELD = {
   preflight_ms = true, view_capture_ms = true, fold_capture_ms = true,
   sequence_and_folds_ms = true, text_ms = true, metadata_ms = true,
   regions_ms = true, decorations_ms = true, fold_refresh_ms = true, view_restore_ms = true,
+  buffer_api_ms = true, editable_callback_ms = true, editable_callback_count = true,
+  slices = true, maximum_ms = true, maximum_prepare_ms = true, maximum_commit_ms = true,
+  base_revision = true, received_revision = true, entry_count = true, operation_count = true,
 }
 local writing = { diff = false, harness = false }
 local queue_bytes = { diff = 0, harness = 0 }

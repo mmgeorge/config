@@ -228,7 +228,7 @@ local function reject_edit(state, message, start, finish)
     local ok, failure = pcall(function()
       vim.bo[native.buffer].modifiable = true
       vim.api.nvim_buf_call(native.buffer, function() pcall(vim.cmd, "undojoin") end)
-      vim.api.nvim_buf_set_lines(native.buffer, 0, -1, false, native.shadow)
+      vim.api.nvim_buf_set_lines(native.buffer, 0, -1, false, native.shadow:text())
       for _, mark in ipairs(marks) do
         local details = mark[4]
         local namespace = details.ns_id
@@ -238,8 +238,8 @@ local function reject_edit(state, message, start, finish)
       end
       for window, position in pairs(cursor) do
         if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == native.buffer then
-          position[1] = math.min(position[1], #native.shadow)
-          position[2] = math.min(position[2], #native.shadow[position[1]])
+          position[1] = math.min(position[1], native.shadow:rows())
+          position[2] = math.min(position[2], #native.shadow:row(position[1] - 1))
           vim.api.nvim_win_set_cursor(window, position)
         end
       end
@@ -326,7 +326,8 @@ function M.attach(state, buffer, region_ranges, options)
   local native = {
     buffer = buffer, anchor = anchor, notice = options.notice, restored = options.restored,
     active = true, generation = 0,
-    shadow = vim.api.nvim_buf_get_lines(buffer, 0, -1, false), modified = vim.bo[buffer].modified,
+    shadow = require("forge.editable_shadow").new(vim.api.nvim_buf_get_lines(buffer, 0, -1, false)),
+    modified = vim.bo[buffer].modified,
   }
   state.native = native
   local attached = vim.api.nvim_buf_attach(buffer, false, {
@@ -340,16 +341,12 @@ function M.attach(state, buffer, region_ranges, options)
       end
       if native.rejecting then return end
       local function retain_rows()
+        local started = vim.uv.hrtime()
         local replacement = vim.api.nvim_buf_get_lines(buffer, row, row + new_rows + 1, false)
-        if #replacement == old_rows + 1 then
-          for index, text in ipairs(replacement) do native.shadow[row + index] = text end
-        else
-          for _ = 1, old_rows + 1 do
-            if row + 1 <= #native.shadow then table.remove(native.shadow, row + 1) end
-          end
-          for index = #replacement, 1, -1 do table.insert(native.shadow, row + 1, replacement[index]) end
-        end
+        native.shadow:splice(row, math.min(old_rows + 1, native.shadow:rows() - row), replacement)
         native.modified = vim.bo[buffer].modified
+        native.update_ns = (native.update_ns or 0) + vim.uv.hrtime() - started
+        native.update_count = (native.update_count or 0) + 1
       end
       if native.applying then retain_rows() return end
       if state.fault then
@@ -359,10 +356,10 @@ function M.attach(state, buffer, region_ranges, options)
       local finish = { row = row + old_rows, column = old_rows == 0 and column + old_column or old_column }
       local new_finish = { row = row + new_rows, column = new_rows == 0 and column + new_column or new_column }
       local owner, message = M.guard_region(state, start, finish)
-      if not owner and finish.row == #native.shadow and finish.column == 0
+      if not owner and finish.row == native.shadow:rows() and finish.column == 0
         and new_finish.row == vim.api.nvim_buf_line_count(buffer) and new_finish.column == 0 then
         local last_row = vim.api.nvim_buf_get_lines(buffer, -2, -1, false)[1]
-        local text_finish = { row = #native.shadow - 1, column = #native.shadow[#native.shadow] }
+        local text_finish = { row = native.shadow:rows() - 1, column = #native.shadow:row(native.shadow:rows() - 1) }
         local text_new_finish = { row = new_finish.row - 1, column = #last_row }
         owner, message = M.guard_region(state, start, text_finish)
         if owner then

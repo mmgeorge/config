@@ -53,21 +53,23 @@ end
 
 local function status_location(transcript)
   local cached = transcript.status_hint_location
-  if cached and cached.revision == transcript.revision then return cached.row, cached.target end
-  cached = { revision = transcript.revision }
-  transcript.status_hint_location = cached
-  for index = transcript.sequence:count() - 1, 0, -1 do
-    local node = transcript.sequence:at(index)
-    for _, target in ipairs(node.entry.metadata.target or {}) do
-      if target.id:match(":working$") or target.id:match(":question$") or target.id:match(":review%-plan$") then
-        local _, source_row = transcript.sequence:position(node.id)
-        cached.row = buffer.physical_row(transcript, source_row) + target.range.start.row
-        cached.target = target.id
-        return cached.row, cached.target
+  if not cached or cached.revision ~= transcript.revision or cached.sequence ~= transcript.sequence then
+    cached = { revision = transcript.revision, sequence = transcript.sequence }
+    transcript.status_hint_location = cached
+    for index = transcript.sequence:count() - 1, 0, -1 do
+      local node = transcript.sequence:at(index)
+      for _, target in ipairs(node.entry.metadata.target or {}) do
+        if target.id:match(":working$") or target.id:match(":question$") or target.id:match(":review%-plan$") then
+          cached.block, cached.offset, cached.target = node.id, target.range.start.row, target.id
+          break
+        end
       end
+      if cached.target or not node.id:find(":implementation:", 1, true) then break end
     end
-    if not node.id:find(":implementation:", 1, true) then return nil end
   end
+  if not cached.target then return nil end
+  local _, source_row = transcript.sequence:position(cached.block)
+  return buffer.physical_row(transcript, source_row + cached.offset), cached.target
 end
 
 local function hint_chunks(commands, context, width)
@@ -99,7 +101,17 @@ function M.render(transcript, commands, width)
   if not vim.api.nvim_buf_is_valid(target_buffer) then M.clear(target_buffer) return end
   vim.api.nvim_buf_clear_namespace(target_buffer, namespace, 0, -1)
   local last_row = vim.api.nvim_buf_line_count(target_buffer) - 1
-  local row, target = status_location(transcript)
+  local row, target
+  if transcript.status == "Applied" and not transcript.applying then
+    row, target = status_location(transcript)
+  else
+    M.clear(target_buffer)
+  end
+  if row and (row < 0 or row > last_row) then
+    M.clear(target_buffer)
+    buffer.fail_apply(transcript, "Harness status target is outside the committed buffer")
+    return
+  end
   local working = target and target:match(":working$")
   if transcript.execution_notice then
     M.clear(target_buffer)

@@ -105,7 +105,7 @@ end
 ---@overload fun(session: ForgeStatusReplica, view: ForgeInputView, action: string): ForgeStatusInput?, string?
 function M.capture(session, view, action)
   if session.capture then return session.capture(view, action) end
-  if session.status ~= "Applied" or session.applying or not view.active or view.document ~= session.document
+  if session.status ~= "Applied" or session.applying or session.update_pending or not view.active or view.document ~= session.document
     or not vim.api.nvim_win_is_valid(view.window) or vim.api.nvim_win_get_buf(view.window) ~= session.buffer
   then
     return nil, "input view is no longer current"

@@ -32,7 +32,7 @@ pub struct ToolCall {
 }
 
 impl ToolCall {
-    /// Get observed wall-clock runtime, frozen at completion or unavailable without a start.
+    /// Returns provider or adapter-observed runtime, frozen at completion and absent without a start.
     pub fn elapsed_ms(&self, now_ms: i64) -> Option<u64> {
         let start = self.started_at_ms?;
         let end = self
@@ -130,6 +130,7 @@ impl ToolStore {
         {
             tool.status.clone_from(status);
         }
+        let previous_bytes = tool.output.len();
         if let Some(output) = activity.output.as_ref() {
             if activity.output_delta {
                 tool.output.push_str(output);
@@ -140,7 +141,13 @@ impl ToolStore {
         if !activity.change.is_empty() {
             tool.change.clone_from(&activity.change);
         }
-        tool.failed = tool_failed(&tool.status, &tool.output);
+        if activity.output_delta {
+            let mut start = previous_bytes.saturating_sub(16);
+            while !tool.output.is_char_boundary(start) { start += 1; }
+            tool.failed = tool.failed || tool_failed(&tool.status, &tool.output[start..]);
+        } else {
+            tool.failed = tool_failed(&tool.status, &tool.output);
+        }
         if tool.state() != ToolState::Running && tool.completed_at_ms.is_none() {
             tool.completed_at_ms = Some(now_ms.max(tool.started_at_ms.unwrap_or(now_ms)));
         }
@@ -148,6 +155,17 @@ impl ToolStore {
 
     pub(crate) fn get(&self, id: &str) -> Option<&ToolCall> {
         self.item.get(id)
+    }
+
+    pub(crate) fn timing(&mut self, id: &str, started: Option<i64>, completed: Option<i64>, duration: Option<i64>) {
+        let Some(tool) = self.item.get_mut(id) else { return; };
+        if let Some(started) = started { tool.started_at_ms = Some(started); }
+        if let Some(completed) = completed { tool.completed_at_ms = Some(completed); }
+        if tool.state() != ToolState::Running && let Some(duration) = duration.filter(|duration| *duration >= 0) {
+            if let Some(completed) = tool.completed_at_ms {
+                tool.started_at_ms = Some(completed.saturating_sub(duration));
+            }
+        }
     }
 }
 

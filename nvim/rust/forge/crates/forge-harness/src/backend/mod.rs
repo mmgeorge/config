@@ -125,6 +125,9 @@ pub struct BackendRequest {
 /// Represents a streamed backend update normalized for the interaction reducer.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendEvent {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// First adapter receipt time, retained through queueing and forwarding.
+    pub received_at_ms: Option<i64>,
     #[serde(default)]
     /// Provider execution that owns this event, when exposed by the adapter.
     pub address: Option<ProviderAddress>,
@@ -143,6 +146,27 @@ pub struct BackendEvent {
 }
 
 impl BackendEvent {
+    pub(crate) fn tool_output_delta(&self) -> Option<&str> {
+        if self.turn_boundary.is_some() || self.summary.is_some() || self.task_update.is_some()
+            || self.text.is_some() { return None; }
+        self.activity.as_ref().filter(|activity|activity.output_delta && activity.change.is_empty()
+            && activity.status.as_deref().is_none_or(|status| status == "inProgress"))
+            .and_then(|activity|activity.output.as_deref())
+    }
+
+    pub(crate) fn message_delta(&self) -> Option<&str> {
+        if self.turn_boundary.is_some() || self.summary.is_some() || self.task_update.is_some()
+            || self.activity.is_some() || self.message_snapshot()
+            || !matches!(self.kind.as_str(),"assistant_message" | "reasoning" | "reasoning_summary") { return None; }
+        self.text.as_deref()
+    }
+
+    pub(crate) fn observed_at_ms(&self, fallback: i64) -> i64 {
+        ["/params/completedAtMs", "/params/startedAtMs", "/emittedAtMs", "/forge_received_at_ms"]
+            .into_iter().find_map(|path| self.data.pointer(path).and_then(Value::as_i64))
+            .or(self.received_at_ms).unwrap_or(fallback)
+    }
+
     /// Borrow the provider message identity shared by lifecycle and delta events.
     pub(crate) fn message_id(&self) -> Option<&str> {
         [
@@ -181,6 +205,7 @@ impl BackendEvent {
     /// Build the canonical event for provider-acknowledged active-turn input.
     pub(crate) fn steering_input(text: String) -> Self {
         Self {
+            received_at_ms: None,
             address: None,
             turn_boundary: None,
             kind: "steering_input".into(),
@@ -680,6 +705,7 @@ impl Backend for MockBackend {
         let mut active_steering = steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
         let event = BackendEvent {
+            received_at_ms: None,
             address: None,
             turn_boundary: None,
             kind: "assistant_message".into(),

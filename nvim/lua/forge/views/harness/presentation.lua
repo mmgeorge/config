@@ -26,19 +26,32 @@ function M.open(options, callback)
   local queued, active = {}, false
   local markdown = require("forge.render.harness.markdown")
   local function render_markdown(force)
-    if owner.transcript.status ~= "Applied" then return end
-    if not force and owner.markdown_revision == owner.transcript.revision then return end
-    local range_list = markdown.ranges(owner.transcript)
+    if not alive() or owner.transcript.status ~= "Applied" or owner.transcript.applying or owner.transcript.update_pending then return end
+    local range_list, retained, window_list = {}, {}, {}
     for window in pairs(owner.views) do
       if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
-        perf.trace("harness", "ui.markdown", { session_id = options.session_id,
-          revision = owner.transcript.revision, buf = options.transcript_buffer,
-          line_count = vim.api.nvim_buf_line_count(options.transcript_buffer), count = #range_list }, function()
-          markdown.render(options.transcript_buffer, window, range_list)
-        end)
+        window_list[#window_list + 1] = window
+        for _, range in ipairs(markdown.viewport(owner.transcript, window)) do
+          if not retained[range.id] then
+            retained[range.id] = true
+            range_list[#range_list + 1] = range
+          end
+        end
       end
     end
-    owner.markdown_revision = owner.transcript.revision
+    table.sort(range_list, function(left, right) return left.first0 < right.first0 end)
+    table.sort(window_list)
+    if not force and vim.deep_equal(owner.markdown_ranges, range_list)
+      and vim.deep_equal(owner.markdown_windows, window_list) then return end
+    owner.markdown_ranges, owner.markdown_windows = range_list, window_list
+    if #window_list == 0 then markdown.render(options.transcript_buffer, nil, {}) return end
+    for _, window in ipairs(window_list) do
+      perf.trace("harness", "ui.markdown", { session_id = options.session_id,
+        revision = owner.transcript.revision, buf = options.transcript_buffer,
+        line_count = vim.api.nvim_buf_line_count(options.transcript_buffer), count = #range_list }, function()
+        markdown.render(options.transcript_buffer, window, range_list)
+      end)
+    end
   end
   local function dispatch_next()
     if active or owner.applying or #queued == 0 then return end
@@ -97,17 +110,23 @@ function M.open(options, callback)
     request({ operation = "snapshot", document = document.document }, function(snapshot, failure)
       if not alive() then return end
       if failure then notice(failure) return end
-      local result = replica.apply_snapshot(document, snapshot)
-      if result.kind ~= "Applied" then
-        notice("Harness snapshot could not be adopted: " .. tostring(result.kind))
-      elseif vim.api.nvim_get_current_buf() ~= options.transcript_buffer then
-        owner.follow_tail()
-      end
+      owner.applying = true
+      replica.apply_async(document, snapshot, alive, function(result)
+        owner.applying = false
+        if not alive() then return end
+        if result.kind ~= "Applied" then
+          notice("Harness snapshot could not be adopted: " .. tostring(result.kind))
+        elseif vim.api.nvim_get_current_buf() ~= options.transcript_buffer then
+          owner.follow_tail()
+        end
+        dispatch_next()
+      end)
     end)
   end
   local transcript_tick = vim.api.nvim_buf_get_changedtick(options.transcript_buffer)
   local function reject_open(message)
     owner.closed = true
+    markdown.clear(options.transcript_buffer)
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     if owner.view then input.close(owner.view) end
     if owner.transcript and not owner.transcript.generated_owned then replica.close(owner.transcript) end
@@ -130,7 +149,10 @@ function M.open(options, callback)
       reject_open("Harness startup text changed before native adoption")
       return
     end
-    local transcript = replica.apply_snapshot(owner.transcript, opened.transcript)
+    owner.applying = true
+    replica.apply_async(owner.transcript, opened.transcript, alive, function(transcript)
+    owner.applying = false
+    if not alive() then return end
     if transcript.kind ~= "Applied" then
       reject_open("Harness native documents could not be adopted")
       return
@@ -148,6 +170,8 @@ function M.open(options, callback)
     callback(owner)
     if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
     if opened.syntax_pending then vim.schedule(function() owner.highlight() end) end
+    dispatch_next()
+    end)
   end)
 
   function owner.sync()
@@ -158,6 +182,18 @@ function M.open(options, callback)
       owner.select_agent(owner.next_timeline)
       return
     end
+    if not owner.refresh_ready then
+      if not owner.refresh_timer then
+        owner.refresh_timer = vim.defer_fn(function()
+          owner.refresh_timer = nil
+          if not alive() then return end
+          owner.refresh_ready = true
+          owner.sync()
+        end, 67)
+      end
+      return
+    end
+    owner.refresh_ready = nil
     owner.pending, owner.syncing = false, true
     request({ operation = "sync", document = identity, revision = owner.transcript.revision }, function(result, failure)
       if not alive() then owner.syncing = false return end
@@ -171,7 +207,6 @@ function M.open(options, callback)
       end
       owner.sync_failure = nil
       owner.applying = true
-      local patch_index = 1
       local function complete()
         owner.applying, owner.syncing = false, false
         local switched_timeline = owner.restore_timeline ~= nil
@@ -183,53 +218,27 @@ function M.open(options, callback)
           end
           owner.restore_timeline = nil
         end
+        if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
         render_markdown(switched_timeline)
         if options.on_update then options.on_update() end
-        if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
         if result.syntax_pending then owner.highlight() end
         if owner.pending then owner.sync() end
         dispatch_next()
       end
-      local advance
-      advance = function()
-        if not alive() then
-          owner.applying, owner.syncing = false, false
-          dispatch_next()
-          return
-        end
-        local succeeded, apply_error = pcall(function()
-          local started, first_patch = perf.now(), patch_index
-          repeat
-            local applied
-            perf.trace("harness", "ui.transcript.apply", { session_id = options.session_id,
-              revision = owner.transcript.revision, buf = options.transcript_buffer, count = 1,
-              source = type(result.snapshot) == "table" and "snapshot" or "patch" }, function()
-              if type(result.snapshot) == "table" then
-                applied = replica.apply_snapshot(owner.transcript, result.snapshot)
-              elseif result.patch and result.patch[patch_index] then
-                applied = replica.apply_patch(owner.transcript, result.patch[patch_index])
-              end
-            end)
-            if applied and applied.kind ~= "Applied" then
-              owner.applying, owner.syncing = false, false
-              dispatch_next()
-              return
-            end
-            patch_index = patch_index + 1
-            if type(result.snapshot) == "table" or patch_index > #(result.patch or {}) then
-              complete()
-              return
-            end
-          until patch_index - first_patch >= 8 or perf.elapsed_ms(started) >= 4
-          vim.defer_fn(advance, 1)
-        end)
-        if not succeeded then
-          owner.applying, owner.syncing = false, false
-          dispatch_next()
-          notice("Harness transcript update failed: " .. tostring(apply_error))
-        end
-      end
-      advance()
+      local snapshot = type(result.snapshot) == "table" and result.snapshot or nil
+      local update = snapshot or { patch = result.patch or {} }
+      if not snapshot and #update.patch == 0 then complete() return end
+      if not snapshot and #update.patch == 1 then update = update.patch[1] end
+      replica.apply_async(owner.transcript, update, alive, function(applied)
+          if not alive() then owner.applying, owner.syncing = false, false return end
+          if applied.kind ~= "Applied" then
+            owner.applying, owner.syncing = false, false
+            notice("Harness transcript update failed: " .. tostring(applied.diagnostic or applied.kind))
+            dispatch_next()
+            return
+          end
+          complete()
+      end)
     end)
   end
 
@@ -452,6 +461,11 @@ function M.open(options, callback)
     local collected = owner.host_generation ~= client.host_generation()
       or not vim.api.nvim_buf_is_valid(options.composer_buffer) or not vim.api.nvim_buf_is_valid(options.transcript_buffer)
     owner.closed = true
+    if owner.refresh_timer then
+      owner.refresh_timer:stop()
+      owner.refresh_timer:close()
+      owner.refresh_timer = nil
+    end
     if owner.terminals then owner.terminals.close() end
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     for _, output in ipairs(owner.output) do output.close() end
@@ -470,6 +484,14 @@ function M.open(options, callback)
   end
   owner.group = vim.api.nvim_create_augroup("ForgeHarnessPresentation" .. tostring(vim.uv.hrtime()), { clear = true })
   vim.api.nvim_create_autocmd({ "WinResized", "VimResized" }, { group = owner.group, callback = owner.resize })
+  local markdown_scheduled = false
+  vim.api.nvim_create_autocmd({ "WinScrolled", "CursorMoved", "CursorMovedI", "BufWinEnter", "WinClosed" }, {
+    group = owner.group, callback = function()
+      if markdown_scheduled then return end
+      markdown_scheduled = true
+      vim.schedule(function() markdown_scheduled = false render_markdown(false) end)
+    end,
+  })
   vim.api.nvim_create_autocmd({ "BufWinEnter", "BufWinLeave", "WinClosed" }, {
     group = owner.group, callback = function() vim.schedule(owner.refresh_views) end,
   })

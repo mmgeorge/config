@@ -1,7 +1,7 @@
 use anyhow::{Result, ensure};
 use serde::Serialize;
 use serde_json::Value;
-use std::collections::HashMap;
+use std::collections::{HashMap, BTreeSet};
 
 use super::TimelineEntry;
 
@@ -12,6 +12,9 @@ pub enum TimelineOperation {
     Insert { index: usize, entry: TimelineEntry },
     Replace { index: usize, entry: TimelineEntry },
     Remove { index: usize, id: String },
+    ToolOutput { index: usize, entry_id: String, exchange_id: String, call_id: String, delta: String },
+    Message { index: usize, entry_id: String, exchange_id: String,
+        turn_id: String, block_id: String, message: crate::turn::Message },
 }
 
 /// Represents one causally ordered timeline revision for a single session.
@@ -38,9 +41,74 @@ pub struct TimelineStream {
     value_list: Vec<Value>,
     entry_index: HashMap<String, usize>,
     exchange_owner: HashMap<String, usize>,
+    ticking: BTreeSet<usize>,
 }
 
 impl TimelineStream {
+    pub(crate) fn update_message(&mut self, exchange: &crate::exchange::Exchange,
+        event: &crate::backend::BackendEvent) -> Result<Option<TimelinePatch>> {
+        let Some(index) = self.exchange_owner.get(&exchange.id).copied() else { return Ok(None); };
+        let Some(address) = event.address.as_ref() else { return Ok(None); };
+        let Some(source) = exchange.turn.iter().find(|turn| turn.provider() == address) else { return Ok(None); };
+        let kind = match event.kind.as_str() {
+            "assistant_message" => crate::turn::MessageKind::Assistant,
+            "reasoning" => crate::turn::MessageKind::Reasoning,
+            "reasoning_summary" => crate::turn::MessageKind::ReasoningSummary,
+            _ => return Ok(None),
+        };
+        let Some(message) = source.messages().iter().rev().find(|message|
+            message.kind() == kind && event.message_id().is_none_or(|id|message.provider_id() == Some(id)))
+            else { return Ok(None); };
+        let entry_id = self.entry_list[index].id();
+        let main_exchange = matches!(&self.entry_list[index],TimelineEntry::Exchange { exchange:owner,.. } if owner.id == exchange.id);
+        let target = self.entry_list[index].exchange_mut(&exchange.id).expect("indexed exchange");
+        if !target.turn.iter().any(|turn| turn.provider() == address
+            && turn.messages().iter().any(|existing| existing.id() == message.id()
+                && existing.delivery() == message.delivery())) { return Ok(None); }
+        ensure!(self.revision < forge_buffer::MAX_COUNTER, "timeline revision exhausted");
+        target.observe_turn(event,exchange.created_at_ms)?;
+        target.metrics = exchange.metrics.clone();
+        let base_revision = self.revision;
+        self.revision += 1;
+        self.value_list[index] = Value::Null;
+        let mut operation = vec![TimelineOperation::Message { index,entry_id,exchange_id:exchange.id.clone(),
+                turn_id:source.id().to_owned(), block_id:format!("{}:content:{}",source.id(),message.id()),
+                message:message.clone() }];
+        if main_exchange && let Some(status_index) = self.entry_index.get(&format!("{}:status",self.session_id)).copied()
+            && let TimelineEntry::Status { status:crate::session::state_machine::SessionPhase::Working { reasoning_summary,.. },.. }
+                = &mut self.entry_list[status_index] {
+            let summary = exchange.latest_reasoning_summary().map(str::to_owned);
+            if *reasoning_summary != summary {
+                *reasoning_summary = summary;
+                self.value_list[status_index] = serde_json::to_value(&self.entry_list[status_index])?;
+                operation.push(TimelineOperation::Replace { index:status_index,entry:self.entry_list[status_index].clone() });
+            }
+        }
+        Ok(Some(TimelinePatch { session_id:self.session_id.clone(),base_revision,revision:self.revision,operation }))
+    }
+
+    pub(crate) fn append_tool_output(&mut self, exchange: &crate::exchange::Exchange,
+        event: &crate::backend::BackendEvent) -> Result<Option<TimelinePatch>> {
+        let Some(index) = self.exchange_owner.get(&exchange.id).copied() else { return Ok(None); };
+        let Some(address) = event.address.as_ref() else { return Ok(None); };
+        let Some(activity) = event.activity.as_ref() else { return Ok(None); };
+        let entry_id = self.entry_list[index].id();
+        let target = self.entry_list[index].exchange_mut(&exchange.id).expect("indexed exchange");
+        let Some(turn) = target.turn.iter_mut().find(|turn| turn.provider() == address) else { return Ok(None); };
+        if !turn.tools().any(|tool| tool.id == activity.id) { return Ok(None); }
+        let call_id = format!("{}:{}",turn.id(),activity.id);
+        turn.record_tool_event(event, exchange.created_at_ms)?;
+        target.metrics = exchange.metrics.clone();
+        let base_revision = self.revision;
+        ensure!(self.revision < forge_buffer::MAX_COUNTER, "timeline revision exhausted");
+        self.revision += 1;
+        self.value_list[index] = Value::Null;
+        Ok(Some(TimelinePatch { session_id: self.session_id.clone(), base_revision,
+            revision: self.revision, operation: vec![TimelineOperation::ToolOutput {
+                index, entry_id, exchange_id:exchange.id.clone(), call_id, delta: activity.output.clone().unwrap_or_default(),
+            }] }))
+    }
+
     /// Create an empty revision stream for one durable Harness session.
     pub fn new(session_id: String) -> Self {
         Self {
@@ -50,6 +118,7 @@ impl TimelineStream {
             value_list: Vec::new(),
             entry_index: HashMap::new(),
             exchange_owner: HashMap::new(),
+            ticking: BTreeSet::new(),
         }
     }
 
@@ -71,6 +140,10 @@ impl TimelineStream {
     /// Resolve the current canonical entry list for targeted Rust projections.
     pub fn entry_list(&self) -> &[TimelineEntry] {
         &self.entry_list
+    }
+
+    pub(crate) fn ticking_entries(&self) -> impl Iterator<Item=&TimelineEntry> {
+        self.ticking.iter().map(|index|&self.entry_list[*index])
     }
 
     /// Updates only the active interaction and transient status without copying settled history.
@@ -167,7 +240,9 @@ impl TimelineStream {
                 self.entry_list[index] = entry.clone();
                 self.value_list[index] = value;
                 operation.push(TimelineOperation::Replace { index, entry });
-                self.reindex();
+                self.exchange_owner.retain(|_, owner| *owner != index);
+                self.entry_list[index].index_exchanges(index, &mut self.exchange_owner);
+                if ticking(&self.entry_list[index]) { self.ticking.insert(index); } else { self.ticking.remove(&index); }
             }
         } else {
             self.entry_list.insert(insertion, entry.clone());
@@ -188,8 +263,10 @@ impl TimelineStream {
             .map(|(index, entry)| (entry.id(), index))
             .collect();
         self.exchange_owner.clear();
+        self.ticking.clear();
         for (index, entry) in self.entry_list.iter().enumerate() {
             entry.index_exchanges(index, &mut self.exchange_owner);
+            if ticking(entry) { self.ticking.insert(index); }
         }
     }
 
@@ -267,6 +344,19 @@ impl TimelineStream {
             revision: self.revision,
             operation,
         })
+    }
+}
+
+fn ticking(entry: &TimelineEntry) -> bool {
+    match entry {
+        TimelineEntry::Exchange { exchange,agent_by_id,.. } =>
+            exchange.completed_at_ms.is_none() && exchange.execution_started_at_ms.is_some()
+                || agent_by_id.values().any(ticking),
+        TimelineEntry::AgentLifecycle { run,.. } => run.state.is_open(),
+        TimelineEntry::Status { status,.. } => matches!(status,
+            crate::session::state_machine::SessionPhase::Working { .. }
+            | crate::session::state_machine::SessionPhase::WaitingForAgent { .. }),
+        _ => false,
     }
 }
 

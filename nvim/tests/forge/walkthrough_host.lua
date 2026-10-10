@@ -27,7 +27,7 @@ local ok, failure = xpcall(function()
   state = walkthrough.open({workspace=fixture,on_error=function(message) notices[#notices+1]=message end})
   assert(vim.wait(45000,function() return #notices>0 or state.replica.status=="Applied" and not state.pending and #state.queue==0 end,10), "Walkthrough did not settle")
   assert(#notices==0,table.concat(notices,"\n"))
-  assert(vim.bo[state.replica.buffer].readonly and vim.wo.foldmethod=="expr")
+  assert(vim.bo[state.replica.buffer].readonly and vim.wo.foldmethod=="manual")
   local row
   for index,line in ipairs(vim.api.nvim_buf_get_lines(state.replica.buffer,0,-1,true)) do if line:find("Modify Function: captured",1,true) then row=index break end end
   assert(row,"native change target missing")

@@ -27,6 +27,7 @@ return {
         render_modes = { 'n', 'c', 't', 'i' },
         custom_handlers = {
           markdown = require('markdown_math.display_handler'),
+          latex = require('markdown_math.display_handler').latex,
         },
         heading = {
           icons = { ' ', ' ', ' ', ' ', ' ', ' ' },

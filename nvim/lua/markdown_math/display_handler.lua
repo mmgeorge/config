@@ -15,6 +15,17 @@ local output_cache = {}
 ---@type table<string, boolean>
 local notified_error = {}
 local reveal_state = {}
+local conversion_count = 0
+local pending_input = {}
+local waiting_buffer = {}
+local render_lifetime = {}
+
+--- Revokes pending conversion effects when a generated document releases its buffer.
+---@param buffer integer
+function module.invalidate(buffer)
+  render_lifetime[buffer] = (render_lifetime[buffer] or 0) + 1
+  waiting_buffer[buffer] = nil
+end
 
 ---@param buffer integer
 ---@param config table
@@ -46,11 +57,7 @@ end
 ---@return string
 local function reveal_key(buffer, config)
   local first, last = reveal_range(buffer, config)
-  local selected = {}
-  for _, block in ipairs(block_store.get(buffer)) do
-    if revealed(block, first, last) then selected[#selected + 1] = tostring(block.start_row) end
-  end
-  return table.concat(selected, ",")
+  return first and (tostring(first) .. ":" .. tostring(last)) or ""
 end
 
 ---@param buffer integer
@@ -82,30 +89,55 @@ local function notify_once(message)
 end
 
 ---@param input string
+---@param buffer integer
 ---@return string[]?
-local function convert(input)
+local function convert(input, buffer)
   local cached = output_cache[input]
   if type(cached) == "table" then return cached end
   if cached == false then return nil end
-
-  local error_list = {}
+  waiting_buffer[buffer] = true
+  if pending_input[input] or conversion_count >= 4 then return nil end
   local command_list = environment.commands({ dependency.executable_path() })
-  for _, command in ipairs(command_list) do
-    local result = vim.system({ command }, { stdin = input, text = true, stdout = true, stderr = true }):wait()
+  local command = command_list[1]
+  if not command then
+    output_cache[input] = false
+    notify_once("Markdown math conversion failed: no executable converter is available")
+    return nil
+  end
+  pending_input[input], conversion_count = true, conversion_count + 1
+  local function complete(result)
+    pending_input[input], conversion_count = nil, conversion_count - 1
     local output = (result.stdout or ""):gsub("\r", ""):gsub("\n+$", "")
     if result.code == 0 and output:find("%S") then
-      local line_list = vim.split(output, "\n", { plain = true })
-      output_cache[input] = line_list
-      return line_list
+      output_cache[input] = vim.split(output, "\n", { plain = true })
+    else
+      output_cache[input] = false
+      local detail = vim.trim(result.stderr or "")
+      if detail == "" then detail = ("exited with code %d"):format(result.code) end
+      notify_once("Markdown math conversion failed: " .. command .. ": " .. detail)
     end
-    local detail = vim.trim(result.stderr or "")
-    if detail == "" then detail = ("exited with code %d"):format(result.code) end
-    error_list[#error_list + 1] = ("%s: %s"):format(command, detail)
+    local refresh = waiting_buffer
+    waiting_buffer = {}
+    for target in pairs(refresh) do
+      if vim.api.nvim_buf_is_valid(target) then
+        local window = vim.fn.win_findbuf(target)[1]
+        if window then
+          local lifetime = render_lifetime[target]
+          local delay = require("render-markdown.state").get(target).debounce + 1
+          vim.defer_fn(function()
+            if render_lifetime[target] == lifetime and vim.api.nvim_buf_is_valid(target) and vim.api.nvim_win_is_valid(window)
+              and vim.api.nvim_win_get_buf(window) == target then
+              require("render-markdown.core.ui").update(target, window, "MathConverted", true)
+            end
+          end, delay)
+        end
+      end
+    end
   end
-
-  output_cache[input] = false
-  local detail = #error_list > 0 and table.concat(error_list, "; ") or "no executable converter is available"
-  notify_once("Markdown math conversion failed: " .. detail)
+  local accepted, failure = pcall(vim.system, { command },
+    { stdin = input, text = true, stdout = true, stderr = true, timeout = 30000 },
+    function(result) vim.schedule(function() complete(result) end) end)
+  if not accepted then vim.schedule(function() complete({ code = -1, stderr = tostring(failure) }) end) end
   return nil
 end
 
@@ -161,12 +193,43 @@ function module.parse(context)
   local marks = Marks.new(request_context, false)
   for _, block in ipairs(block_list) do
     if not revealed(block, first, last) then
-      local output = convert(block.input)
+      local output = convert(block.input, context.buf)
       if output then add_marks(context.buf, block, output, request_context.config.latex, marks) end
     end
   end
   vim.list_extend(builtin, marks:get())
   return builtin
 end
+
+--- Renders injected math from the same asynchronous converter as physical display blocks.
+module.latex = {
+  ---@param context MarkdownMathHandlerContext
+  ---@return render.md.Mark[]
+  parse = function(context)
+    local request = RequestContext.get(context.buf)
+    if not request or not request.config.latex.enabled then return {} end
+    local first, _, after, column = context.root:range()
+    local enclosing = block_store.get(context.buf, math.max(0, first - 1),
+      math.min(vim.api.nvim_buf_line_count(context.buf), after + 2))
+    for _, block in ipairs(enclosing) do
+      if first >= block.start_row and after < block.end_row then return {} end
+    end
+    local input = vim.treesitter.get_node_text(context.root, context.buf)
+    input = vim.trim(input:match("^%$*(.-)%$*$") or input)
+    local output = convert(input, context.buf)
+    if not output then return {} end
+    local marks = Marks.new(request, false)
+    local virtual = {}
+    for index = 2, #output do virtual[#virtual + 1] = { { output[index], request.config.latex.highlight } } end
+    local start_row, start_column = context.root:range()
+    marks:add(request.config.latex, "latex", start_row, start_column, {
+      end_row = after, end_col = column, conceal = "",
+      virt_text = { { output[1], request.config.latex.highlight } }, virt_text_pos = "inline",
+      virt_lines = #virtual > 0 and virtual or nil,
+      virt_lines_above = request.config.latex.position == "above",
+    })
+    return marks:get()
+  end,
+}
 
 return module

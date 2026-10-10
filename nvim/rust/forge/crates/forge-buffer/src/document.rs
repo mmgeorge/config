@@ -120,6 +120,32 @@ impl BufferDocument {
         self.sequence.range(index..index + 1).ok()?.next()
     }
 
+    /// Replaces one stable block and adjusts folds anchored to its previous end.
+    pub fn replace_block(&mut self, block: BufferBlock) -> Result<Option<BufferPatch>, ContractError> {
+        let previous = self.block(&block.id).ok_or(ContractError("replacement block is missing"))?;
+        let previous_rows = previous.text.row_count();
+        let mut edits = Vec::new();
+        if previous_rows != block.text.row_count() {
+            for owner in self.sequence.fold_endpoint_owner(&block.id) {
+                if owner.id == block.id { continue; }
+                let mut replacement = owner.clone();
+                for fold in &mut replacement.metadata.fold {
+                    if fold.end.block == block.id && fold.end.position.row == previous_rows
+                        && fold.end.position.column == 0 {
+                        fold.end.position.row = block.text.row_count();
+                    }
+                }
+                if replacement.metadata != owner.metadata {
+                    let index = self.sequence.index(&owner.id).expect("indexed fold owner");
+                    edits.push(SequenceEdit { range: index..index + 1, block: vec![replacement] });
+                }
+            }
+        }
+        let index = self.sequence.index(&block.id).expect("indexed replacement block");
+        edits.push(SequenceEdit { range: index..index + 1, block: vec![block] });
+        self.edit_many(edits)
+    }
+
     pub fn blocks(
         &self,
         revision: DocumentRevision,

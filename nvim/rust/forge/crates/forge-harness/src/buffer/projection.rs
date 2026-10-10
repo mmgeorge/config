@@ -143,6 +143,117 @@ pub fn project(
     project_at_with_separator(entry, width, now_ms, leading_separator, expanded_tool)
 }
 
+pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
+    document: &forge_buffer::document::BufferDocument,
+    expanded: &std::collections::HashSet<String>) -> Result<Vec<BufferBlock>> {
+    fn exchanges<'source>(entry: &'source TimelineEntry, result: &mut Vec<&'source Exchange>,
+        headings: &mut Vec<(&'source str, &'source crate::agent::Agent, Option<&'source Exchange>)>) {
+        match entry {
+            TimelineEntry::Exchange { exchange,agent_by_id,.. } => {
+                result.push(exchange);
+                for node in &exchange.node_list {
+                    if let ExchangeNode::AgentReference { agent } = node
+                        && let Some(TimelineEntry::AgentLifecycle { run, exchange, .. }) = agent_by_id
+                            .get(&agent.id).or_else(|| agent_by_id.get(&agent.child_agent_id)) {
+                        headings.push((&agent.id, run, exchange.iter().find(|exchange|exchange.id == agent.child_exchange_id)));
+                    }
+                }
+                for agent in agent_by_id.values() { exchanges(agent,result,headings); }
+            }
+            TimelineEntry::AgentLifecycle { id,run,exchange,agent,.. } => {
+                headings.push((id, run, None));
+                result.extend(exchange);
+                for source in exchange {
+                    for node in &source.node_list {
+                        if let ExchangeNode::AgentReference { agent: reference } = node
+                            && let Some(TimelineEntry::AgentLifecycle { run,exchange,.. }) = agent.iter().find(|agent|
+                                agent.id() == reference.id || agent.id() == reference.child_agent_id) {
+                            headings.push((&reference.id,run,exchange.iter().find(|exchange|exchange.id == reference.child_exchange_id)));
+                        }
+                    }
+                }
+                for agent in agent { exchanges(agent,result,headings); }
+            }
+            _ => {}
+        }
+    }
+    if matches!(entry,TimelineEntry::Status { .. }) {
+        return Ok(project(entry,width,false,expanded)?.entry.block);
+    }
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    let mut source = Vec::new();
+    let mut headings = Vec::new();
+    exchanges(entry,&mut source,&mut headings);
+    let mut blocks = Vec::new();
+    let mut rendered = std::collections::HashSet::new();
+    for (id,run,exchange) in headings {
+        if !rendered.insert(id) { continue; }
+        let Some(previous) = document.block(&BlockId(id.into())) else { continue; };
+        let mut profile = width.clone();
+        profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
+            .map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
+        let mut block = TranscriptRenderer::new(&profile)?.literal(previous.id.clone(),
+            &agent_summary(run,exchange,now_ms),2)?;
+        block.metadata = previous.metadata.clone();
+        for span in &mut block.metadata.decoration {
+            if span.range.end.row == previous.text.row_count() { span.range.end.row = block.text.row_count(); }
+        }
+        blocks.push(block);
+    }
+    for exchange in source {
+        if exchange.completed_at_ms.is_some() || exchange.execution_started_at_ms.is_none() { continue; }
+        if let Some(previous) = document.block(&BlockId(format!("{}:summary",exchange.id))) {
+            let mut profile = width.clone();
+            profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
+                .map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
+            let mut block = TranscriptRenderer::new(&profile)?.literal(previous.id.clone(),
+                &exchange_activity_summary(exchange,now_ms),2)?;
+            block.metadata = previous.metadata.clone();
+            for span in &mut block.metadata.decoration {
+                if span.range.end.row == previous.text.row_count() { span.range.end.row = block.text.row_count(); }
+            }
+            blocks.push(block);
+        }
+        for turn in exchange.turn.iter().filter(|turn|turn.state() == crate::turn::TurnState::Running) {
+            for tool in turn.tools() {
+                let call_id = format!("{}:{}",turn.id(),tool.id);
+                let Some(previous) = document.block(&BlockId(format!("{call_id}:tool"))) else { continue; };
+                let mut profile = width.clone();
+                profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
+                    .map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
+                blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(previous,&tool.kind,
+                    tool.elapsed_ms(now_ms),tool.failed,&tool.title,expanded.contains(&call_id))?);
+            }
+        }
+    }
+    Ok(blocks)
+}
+
+pub(super) fn message_block(previous: &BufferBlock, message: &crate::turn::Message,
+    width: &WidthProfile) -> Result<ProjectedEntry> {
+    let indent = previous.metadata.layout.as_ref().map_or(2, |layout|layout.indent);
+    let mut content_width = width.clone();
+    content_width.columns = content_width.columns.saturating_sub(indent.saturating_sub(2)).max(1);
+    let mut renderer = TimelineRenderer { width:&content_width,margin:0,now_ms:0,block:Vec::new(),
+        prompt:Vec::new(),action:HashMap::new(),tool:HashMap::new(),syntax:HashMap::new(),bytes:0,
+        leading_separator:false,expanded_tool:&std::collections::HashSet::new() };
+    renderer.markdown(&previous.id.0,message.text(),
+        if message.delivery() == crate::turn::MessageDelivery::Final { MarkdownRole::Response }
+        else { MarkdownRole::Commentary })?;
+    let block = &mut renderer.block[0];
+    block.metadata.layout = previous.metadata.layout.clone();
+    if let Some(layout) = &mut block.metadata.layout { layout.source_indent = 0; }
+    super::layout::materialize(block)?;
+    block.metadata.fold = previous.metadata.fold.clone();
+    for fold in &mut block.metadata.fold {
+        if fold.end.block == block.id && fold.end.position.row == previous.text.row_count() {
+            fold.end.position.row = block.text.row_count();
+        }
+    }
+    Ok(ProjectedEntry { entry:TranscriptEntry { id:previous.id.0.clone(),block:renderer.block },
+        prompt:renderer.prompt,action:renderer.action,tool:renderer.tool,syntax:renderer.syntax })
+}
+
 #[cfg(test)]
 fn project_at(entry: &TimelineEntry, width: &WidthProfile, now_ms: i64) -> Result<ProjectedEntry> {
     project_at_with_separator(
@@ -789,10 +900,6 @@ impl TimelineRenderer<'_> {
                                 }
                             }
                             if calls.is_empty() { continue; }
-                            let duration_width = calls.iter().map(|(_, tool)| {
-                                tool.elapsed_ms(self.now_ms).map(super::duration::duration_label)
-                                    .map_or(1, |label| label.chars().count())
-                            }).max().unwrap_or(0);
                             let start = self.block.len();
                             let count = calls.len();
                             let last_tool_id = &calls.last().expect("nonempty tool group").1.id;
@@ -816,10 +923,10 @@ impl TimelineRenderer<'_> {
                             self.literal(&format!("{id}:tools"), &label, None)?;
                             for (index, (id, tool)) in calls.into_iter().enumerate() {
                                 if tool.state() == crate::turn::ToolState::Running {
-                                    self.tool(turn.id(), tool, duration_width)?;
+                                    self.tool(turn.id(), tool)?;
                                 } else {
                                     let tool_start = self.block.len();
-                                    self.tool(turn.id(), tool, duration_width)?;
+                                    self.tool(turn.id(), tool)?;
                                     if let Some(diff) = crate::exchange::ProviderDiffBuilder::build(
                                         std::slice::from_ref(tool),
                                     ) {
@@ -1034,7 +1141,7 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn tool(&mut self, interaction: &str, tool: &crate::exchange::ToolCall, duration_width: usize) -> Result<()> {
+    fn tool(&mut self, interaction: &str, tool: &crate::exchange::ToolCall) -> Result<()> {
         let call_id = format!("{interaction}:{}", tool.id);
         ensure!(
             !self.tool.contains_key(&call_id),
@@ -1048,20 +1155,22 @@ impl TimelineRenderer<'_> {
             self.bytes <= 32 * 1024 * 1024,
             "transcript entry exceeds 32 MiB"
         );
-        let output = ToolOutputView::new(call_id.clone(), Arc::from(tool.output.as_str()))?;
+        let mut output = ToolOutputView::new(call_id.clone(), Arc::from(tool.output.as_str()))?;
+        output.heading(tool);
         let id = format!("{call_id}:tool");
         let target = TargetId(id.clone());
         let label = tool.title.clone();
-        let block = TranscriptRenderer::new(&self.content_width())?.tool_preview(
+        let width = self.content_width();
+        let renderer = TranscriptRenderer::new(&width)?;
+        let expanded = self.expanded_tool.contains(&call_id);
+        let block = renderer.tool_header(
             BlockId(id),
             target.clone(),
             &tool.kind,
             tool.elapsed_ms(self.now_ms),
-            duration_width,
             tool.failed,
             &label,
-            &output.preview(self.expanded_tool.contains(&call_id)),
-            self.expanded_tool.contains(&call_id),
+            expanded,
         )?;
         self.action.insert(
             target,
@@ -1069,8 +1178,17 @@ impl TimelineRenderer<'_> {
                 call_id: call_id.clone(),
             },
         );
+        self.push(block)?;
+        for chunk in 0..if expanded { output.inline_chunks() } else { 1 } {
+            let block = renderer.tool_body(&call_id,&output,expanded,chunk)?;
+            for target in &block.metadata.target { self.action.insert(target.id.clone(),TranscriptAction::Tool { call_id:call_id.clone() }); }
+            self.push(block)?;
+        }
+        let hidden = renderer.tool_hidden(&call_id,&output,expanded)?;
+        for target in &hidden.metadata.target { self.action.insert(target.id.clone(),TranscriptAction::Tool { call_id:call_id.clone() }); }
+        self.push(hidden)?;
         self.tool.insert(call_id, output);
-        self.push(block)
+        Ok(())
     }
 
     fn diff(
@@ -1502,6 +1620,24 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn timer_updates_agent_lifecycle_without_replacing_its_task_body() -> anyhow::Result<()> {
+        let mut run = crate::agent::Agent::pending("session", "Worker", "Implement", 0);
+        run.state = crate::agent::AgentState::Ready;
+        let entry = crate::timeline::TimelineEntry::AgentLifecycle {
+            id: "worker-heading".into(), created_at_ms: 0, run,
+            exchange: vec![], agent: vec![],
+        };
+        let width = WidthProfile::default();
+        let projected = super::project_at(&entry, &width, 0)?;
+        let document = forge_buffer::document::BufferDocument::new(
+            forge_buffer::identity::DocumentId("timer-agent".into()), projected.entry.block)?;
+        let refreshed = super::timing_blocks(&entry, &width, &document, &Default::default())?;
+        assert_eq!(refreshed.len(), 1);
+        assert_eq!(refreshed[0].id.0, "worker-heading");
+        assert!(!refreshed[0].text.wire_rows().join("\n").contains("ready for 0s"));
+        Ok(())
+    }
     use super::{
         project_at, project_at_with_separator, session_event_text,
     };
@@ -1658,6 +1794,7 @@ mod tests {
             })).unwrap();
             exchange.resume(0).unwrap();
             let mut event = BackendEvent {
+            received_at_ms: None,
                 address: Some(ProviderAddress { thread_id:"thread".into(), turn_id:"initial".into() }),
                 turn_boundary: Some(TurnBoundary::Started), kind:"turn_started".into(), text:None,
                 data:serde_json::Value::Null, activity:None, summary:None, task_update:None,
@@ -1808,6 +1945,7 @@ mod tests {
                     set_id: "set".into(), question_id: Some(target.into()), answer:Vec::new(),
                 }, index as i64).unwrap();
                 let mut event = BackendEvent {
+            received_at_ms: None,
                     address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:format!("turn-{index}") }),
                     turn_boundary:Some(TurnBoundary::Started), kind:"turn_started".into(), text:None,
                     data:serde_json::Value::Null, activity:None,summary:None,task_update:None,
@@ -1881,6 +2019,7 @@ mod tests {
         })).unwrap();
         exchange.resume(0).unwrap();
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(ProviderAddress { thread_id: "thread".into(), turn_id: "question-turn".into() }),
             turn_boundary: Some(TurnBoundary::Started), kind: "turn_started".into(), text: None,
             data: serde_json::Value::Null, activity: None, summary: None, task_update: None,
@@ -1986,6 +2125,7 @@ mod tests {
         let address = ProviderAddress { thread_id: "thread".into(), turn_id: "turn".into() };
         exchange.start_turn(address.clone(), 0).unwrap();
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(address), turn_boundary: None, kind: "tool".into(), text: None,
             data: serde_json::Value::Null, activity: None, summary: None, task_update: None,
         };
@@ -2035,6 +2175,7 @@ mod tests {
         .unwrap();
         exchange.resume(0).unwrap();
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(ProviderAddress {
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
@@ -2460,6 +2601,7 @@ mod tests {
         .unwrap();
         exchange.resume(0).unwrap();
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(ProviderAddress {
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
@@ -2980,6 +3122,7 @@ mod tests {
         };
         exchange.start_turn(address.clone(), 1000).unwrap();
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(address),
             turn_boundary: None,
             kind: "tool".into(),
@@ -3005,7 +3148,7 @@ mod tests {
             };
             let rendered = project_at(&entry, &WidthProfile::default(), now_ms).unwrap();
             assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter()
-                .any(|row| row.contains(&format!("• {duration} cargo test")))));
+                .any(|row| row.contains(&format!("• {duration:>6} cargo test")))));
             assert!(super::exchange_activity_summary(&exchange, now_ms)
                 .contains(&format!("({duration} tools)")));
         }
@@ -3017,7 +3160,7 @@ mod tests {
         };
         let rendered = project_at(&entry, &WidthProfile::default(), 90_000).unwrap();
         assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter()
-            .any(|row| row.contains("• 3s cargo test"))));
+            .any(|row| row.contains("•     3s cargo test"))));
         event.kind = "turn_completed".into();
         event.activity = None;
         event.turn_boundary = Some(TurnBoundary::Finished {
@@ -3076,6 +3219,7 @@ mod tests {
         let address = ProviderAddress { thread_id: "parent".into(), turn_id: "turn".into() };
         exchange.start_turn(address.clone(), 1000).unwrap();
         let mut event = BackendEvent {
+            received_at_ms: None,
             address: Some(address), turn_boundary: None, kind: "usage".into(), text: None,
             data: json!({"id":"first", "usage":{"input":1000,"cached_input":900,"reasoning":40,"output":100},
                 "cumulative":null,"cumulative_total":null}),
@@ -3113,6 +3257,7 @@ mod tests {
         ] {
             let mut exchange = original.clone();
             let event = BackendEvent {
+            received_at_ms: None,
                 address: Some(address.clone()), turn_boundary: None, kind: "usage".into(), text: None,
                 data: json!({"id":"first", "usage":usage, "cumulative":null,"cumulative_total":null}),
                 activity: None, summary: None, task_update: None,

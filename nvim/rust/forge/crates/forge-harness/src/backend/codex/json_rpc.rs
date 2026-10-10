@@ -956,6 +956,7 @@ async fn normalize_event_in_workspace(
     {
         let event = BackendEvent {
             address,
+            received_at_ms: None,
             turn_boundary: Some(if method_lower == "turn/started" {
                 crate::backend::TurnBoundary::Started
             } else {
@@ -984,6 +985,7 @@ async fn normalize_event_in_workspace(
     if !agent_lifecycle_list.is_empty() {
         for lifecycle in agent_lifecycle_list {
             let event = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "agent_lifecycle".into(),
@@ -1009,6 +1011,7 @@ async fn normalize_event_in_workspace(
             && let Some(update) = usage_update(&params)
         {
             let event = BackendEvent {
+            received_at_ms: None,
                 address: address.clone(),
                 turn_boundary: None,
                 kind: "usage".into(),
@@ -1026,6 +1029,7 @@ async fn normalize_event_in_workspace(
         if let Some(context_usage) = context_usage(&params) {
             output.metrics.context_usage = Some(context_usage.clone());
             let event = BackendEvent {
+            received_at_ms: None,
                 address: None,
                 turn_boundary: None,
                 kind: "context_usage".into(),
@@ -1112,6 +1116,7 @@ async fn normalize_event_in_workspace(
         }
         let event = BackendEvent {
             address,
+            received_at_ms: None,
             turn_boundary: None,
             kind: kind.into(),
             text: activity.is_none().then_some(text).flatten(),
@@ -1146,6 +1151,7 @@ fn normalize_message(
     }
     let mut event = BackendEvent {
         address,
+        received_at_ms: None,
         turn_boundary: None,
         kind: "assistant_message".into(),
         text: if delta {
@@ -2776,8 +2782,7 @@ mod test {
         assert_eq!(
             delta,
             vec![
-                ("Checking ".into(), json!("commentary")),
-                ("files".into(), json!("commentary")),
+                ("Checking files".into(), json!("commentary")),
                 ("Done".into(), json!("final_answer")),
             ]
         );

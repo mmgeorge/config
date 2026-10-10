@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{HashSet, HashMap};
 use std::ops::Range;
 
 use anyhow::{Context, Result, ensure};
@@ -17,6 +17,8 @@ pub struct TranscriptEntry {
 }
 
 pub enum TranscriptChange {
+    Block { block: BufferBlock },
+    ToolBody { owner: String, anchor: BlockId, removed: usize, block: Vec<BufferBlock> },
     Insert {
         index: usize,
         entry: TranscriptEntry,
@@ -42,31 +44,12 @@ pub struct TranscriptDocument {
     timeline_revision: u64,
     pub(super) document: BufferDocument,
     entry: Vec<EntryPosition>,
+    entry_index: HashMap<String, usize>,
     synchronized: bool,
     pub views: DocumentViews,
 }
 
 impl TranscriptDocument {
-    /// Refresh time-dependent entries without advancing the durable timeline revision.
-    pub(super) fn refresh(
-        &mut self,
-        entry: Vec<(usize, TranscriptEntry)>,
-    ) -> Result<Vec<BufferPatch>> {
-        ensure!(self.synchronized, "transcript requires resynchronization");
-        let mut patches = Vec::new();
-        for (index, entry) in entry {
-            match self.apply_change(TranscriptChange::Replace { index, entry }) {
-                Ok(Some(patch)) => patches.push(patch),
-                Ok(None) => {}
-                Err(error) => {
-                    self.synchronized = false;
-                    return Err(error);
-                }
-            }
-        }
-        Ok(patches)
-    }
-
     pub fn initialize(
         document_id: DocumentId,
         session_id: String,
@@ -82,11 +65,13 @@ impl TranscriptDocument {
             "invalid timeline revision"
         );
         let (position, block) = prepare_entries(entry)?;
+        let entry_index = position.iter().enumerate().map(|(index,entry)|(entry.id.clone(),index)).collect();
         Ok(Self {
             document: BufferDocument::new(document_id, block)?,
             session_id,
             timeline_revision,
             entry: position,
+            entry_index,
             synchronized: true,
             views: DocumentViews::default(),
         })
@@ -147,6 +132,7 @@ impl TranscriptDocument {
             let (position, block) = prepare_entries(entry)?;
             let patch = self.document.edit(0..self.document.block_count(), block)?;
             self.entry = position;
+            self.entry_index = self.entry.iter().enumerate().map(|(index,entry)|(entry.id.clone(),index)).collect();
             patch.into_iter().collect()
         };
         self.timeline_revision = timeline_revision;
@@ -202,11 +188,41 @@ impl TranscriptDocument {
             .block_index(&block.id)
             .context("unknown active transcript block")?;
         self.check_capacity(index..index + 1, std::slice::from_ref(&block))?;
-        Ok(self.document.edit(index..index + 1, vec![block])?)
+        Ok(self.document.replace_block(block)?)
+    }
+
+    /// Changes tool layout without advancing the canonical timeline or scanning other entries.
+    pub(super) fn tool_layout(&mut self, changes: Vec<TranscriptChange>) -> Result<Vec<BufferPatch>> {
+        ensure!(self.synchronized, "transcript requires a new canonical snapshot");
+        let mut patches = Vec::new();
+        for change in changes {
+            match self.apply_change(change) {
+                Ok(Some(patch)) => patches.push(patch),
+                Ok(None) => {},
+                Err(failure) => { self.synchronized = false; return Err(failure); }
+            }
+        }
+        Ok(patches)
     }
 
     fn apply_change(&mut self, change: TranscriptChange) -> Result<Option<BufferPatch>> {
         match change {
+            TranscriptChange::ToolBody { owner,anchor,removed,block } => {
+                let index = *self.entry_index.get(&owner).context("tool body entry is missing")?;
+                let start = self.document.block_index(&anchor).context("tool body anchor is missing")?;
+                let entry = self.entry_range(index)?;
+                ensure!(start >= entry.start && start + removed <= entry.end, "tool body exceeds its owner");
+                self.check_capacity(start..start + removed,&block)?;
+                let inserted = block.len();
+                let patch = self.document.edit(start..start + removed,block)?;
+                self.entry[index].blocks = self.entry[index].blocks - removed + inserted;
+                Ok(patch)
+            }
+            TranscriptChange::Block { block } => {
+                let index = self.document.block_index(&block.id).context("unknown transcript block")?;
+                self.check_capacity(index..index + 1, std::slice::from_ref(&block))?;
+                Ok(self.document.replace_block(block)?)
+            }
             TranscriptChange::Insert { index, entry } => {
                 validate_entry(&entry)?;
                 ensure!(
@@ -227,6 +243,7 @@ impl TranscriptDocument {
                 };
                 let patch = self.document.edit(start..start, entry.block)?;
                 self.entry.insert(index, position);
+                for (index,entry) in self.entry.iter().enumerate().skip(index) { self.entry_index.insert(entry.id.clone(),index); }
                 Ok(patch)
             }
             TranscriptChange::Replace { index, entry } => {
@@ -284,6 +301,8 @@ impl TranscriptDocument {
                 let range = self.entry_range(index)?;
                 let patch = self.document.edit(range, Vec::new())?;
                 self.entry.remove(index);
+                self.entry_index.remove(&id);
+                for (index,entry) in self.entry.iter().enumerate().skip(index) { self.entry_index.insert(entry.id.clone(),index); }
                 Ok(patch)
             }
         }
