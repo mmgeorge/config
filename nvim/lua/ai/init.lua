@@ -57,7 +57,6 @@
 
 ---@class AIGenerateWithToolsOpts: AIGenerateOpts
 ---@field tools? (AITool|string)[] inline tool definitions and/or registry keys from ai/tools.lua
----@field mcps? string[] mcphub server names whose tools are offered to the model
 ---@field max_rounds? integer maximum model requests before aborting (default 8)
 
 ---@class AIGenerateResult
@@ -214,9 +213,8 @@ function M.generate(opts, cb)
   }, finish)
 end
 
---- Like generate, but lets the model call tools. Native tools come from
---- opts.tools; opts.mcps additionally offers the tools of the named mcphub
---- servers. The loop runs until the model answers with text, an error
+--- Like generate, but lets the model call tools supplied through opts.tools.
+--- The loop runs until the model answers with text, an error
 --- occurs, or max_rounds model requests have been made. Tool failures
 --- (unknown name, bad arguments, run errors) are fed back to the model as
 --- the tool output so it can recover.
@@ -285,21 +283,6 @@ function M.generate_with_tools(opts, cb)
       return
     end
   end
-  if opts.mcps and #opts.mcps > 0 then
-    local mcp_tools, mcp_err = require("ai.mcp").tools(opts.mcps)
-    if not mcp_tools then
-      finish({ ok = false, error = mcp_err })
-      return
-    end
-    for _, tool in ipairs(mcp_tools) do
-      local add_err = add_tool(tool)
-      if add_err then
-        finish({ ok = false, error = add_err })
-        return
-      end
-    end
-  end
-
   local ctx = request_context()
   local max_rounds = opts.max_rounds or 8
   local rounds = 0

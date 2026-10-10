@@ -17,13 +17,12 @@ commit generation).
 | Function | Purpose |
 | --- | --- |
 | `require("ai").generate(opts, cb)` | One-shot prompt -> text |
-| `require("ai").generate_with_tools(opts, cb)` | Prompt with tool calling (native tools, registry tools, MCP) |
+| `require("ai").generate_with_tools(opts, cb)` | Prompt with tool calling (inline tools and registry tools) |
 | `require("ai").resolve(token)` | Validate/resolve a model token without sending anything |
 | `require("ai").set_backend(backend)` / `reset_backend()` | Test seam (HTTP, file reads, clock) |
 | `require("ai.inline").inline(opts, on_done?)` | Prompt about a selection, splice the response into the buffer |
 | `require("ai.tools").get(name)` | Resolve a registry key to a callable tool |
 | `require("ai.tools").registry` | The named-tool registry table |
-| `require("ai.mcp").tools(server_names)` | mcphub servers -> AITool list (used by the `mcps` option) |
 
 All callbacks run on the main loop. All functions carry LuaLS annotations;
 the shared classes (`AITool`, `AIToolCall`, `AIGenerateWithToolsOpts`, ...)
@@ -61,7 +60,6 @@ require("ai").generate_with_tools({
       end,
     },
   },
-  mcps = { "docs-mcp" },       -- mcphub server names; their tools are offered too
   max_rounds = 8,              -- max model requests before aborting (default 8)
 }, function(result)
   -- same result shape as generate
@@ -74,7 +72,7 @@ Semantics:
   or an inline `AITool` table (`name`, `description`, `parameters` JSON
   Schema, `run(args, done)`). `run` is async and must call `done(text)`
   exactly once; extra calls are ignored. Tool names must match
-  `^[%w_-]+$` and be unique across tools and MCP servers.
+  `^[%w_-]+$` and be unique across the supplied tools.
 - The loop runs until the model answers with text, an error occurs, or
   `max_rounds` model requests have been made (then it fails with "tool
   rounds exhausted"). Tool failures - unknown tool name, undecodable
@@ -147,18 +145,6 @@ require("ai.tools").registry.my_tool = {
 Shipped entries: `git_log` (recent commit subjects), `git_diff_stat`
 (changed-file summary, staged or unstaged). Keep registry tools small,
 read-only, and fast - they run inside interactive flows.
-
-### MCP servers (mcps option)
-
-`mcps = { "<server>", ... }` offers every tool of the named mcphub servers
-to the model, namespaced `<server>__<tool>` (sanitized to provider-legal
-name characters). `ai/mcp.lua` adapts mcphub.nvim's API
-(`get_hub_instance`, `hub:get_servers`, `hub:call_tool`) and flattens MCP
-results to text. Requirements: the mcphub.nvim plugin must be set up
-(`nvim/lua/plugins/mcphub.lua`) and the servers defined in
-`mcphub/servers.json` at the repo root. Servers without `autoApprove` will
-prompt for confirmation on every call - fine interactively, wrong for
-unattended flows.
 
 ## Model Tokens
 
@@ -270,8 +256,7 @@ nvim --headless -i NONE --cmd "set shadafile=NONE" -u nvim/init.lua -c "lua vim.
 reasoning items), HTTP errors, and the copilot token exchange/cache/refresh
 flow. `tools.lua` covers the tool loop per provider (multi-turn request
 shapes, thoughtSignature echo, parallel calls), error feedback, max_rounds,
-tool validation, registry references, and the mcps option against a fake
-mcphub injected via `package.loaded`. `inline.lua` covers splicing for all
+tool validation, and registry references. `inline.lua` covers splicing for all
 three placements, fence stripping, extmark tracking across concurrent
 edits, prompt wrapping, and error paths (buffer untouched on failure). All
 against mock responses - tests must never need a network. New presets,

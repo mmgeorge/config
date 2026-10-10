@@ -425,88 +425,6 @@ local function test_registry_tools()
   assert_true(git_log ~= nil and git_log.name == "git_log" and type(git_log.run) == "function", "git_log registry entry")
 end
 
-local function test_mcp_tools()
-  local hub_calls = {}
-  local fake_hub = {
-    get_servers = function()
-      return {
-        {
-          name = "files",
-          capabilities = {
-            tools = {
-              {
-                name = "read file",
-                description = "Read a file",
-                inputSchema = { type = "object", properties = { path = { type = "string" } }, required = { "path" } },
-              },
-            },
-          },
-        },
-      }
-    end,
-    call_tool = function(_, server_name, tool_name, args, opts)
-      hub_calls[#hub_calls + 1] = { server = server_name, tool = tool_name, args = args }
-      opts.callback({ text = "contents of " .. tostring(args.path) }, nil)
-    end,
-  }
-  package.loaded["mcphub"] = { get_hub_instance = function() return fake_hub end }
-
-  requests = {}
-  local openai_round = 0
-  routes = {
-    ["api.openai.com/v1/responses"] = function()
-      openai_round = openai_round + 1
-      if openai_round == 1 then
-        return 200, {
-          status = "completed",
-          output = {
-            {
-              type = "function_call",
-              call_id = "call_mcp",
-              name = "files__read_file",
-              arguments = vim.json.encode({ path = "init.lua" }),
-            },
-          },
-        }
-      end
-      return 200, {
-        status = "completed",
-        output = {
-          { type = "message", content = { { type = "output_text", text = "done" } } },
-        },
-      }
-    end,
-  }
-
-  local result = generate_with_tools_sync({
-    model = "gpt-nano",
-    prompt = "read it",
-    mcps = { "files" },
-  })
-  assert_true(result.ok, "mcp tool flow failed: " .. tostring(result.error))
-
-  local first_body = decode_body(requests[1].body)
-  assert_eq(first_body.tools[1].name, "files__read_file", "mcp tool offered with namespaced, sanitized name")
-  assert_eq(first_body.tools[1].parameters.properties.path.type, "string", "mcp inputSchema passed through")
-
-  assert_eq(#hub_calls, 1, "hub call count")
-  assert_eq(hub_calls[1].server, "files", "hub called with the original server name")
-  assert_eq(hub_calls[1].tool, "read file", "hub called with the original tool name")
-  assert_eq(hub_calls[1].args.path, "init.lua", "hub received decoded arguments")
-
-  local second_body = decode_body(requests[2].body)
-  local output_item = second_body.input[#second_body.input]
-  assert_true(output_item.output:find("contents of init.lua", 1, true) ~= nil, "mcp result forwarded: " .. output_item.output)
-
-  -- Unknown server errors before any request.
-  requests = {}
-  result = generate_with_tools_sync({ model = "gpt-nano", prompt = "go", mcps = { "nope" } })
-  assert_true(not result.ok and result.error:find("not active", 1, true) ~= nil, "unknown mcp server: " .. tostring(result.error))
-  assert_eq(#requests, 0, "no request when mcp resolution fails")
-
-  package.loaded["mcphub"] = nil
-end
-
 local function run()
   ai.set_backend(backend)
 
@@ -517,12 +435,10 @@ local function run()
   test_max_rounds_exhausted()
   test_tool_validation()
   test_registry_tools()
-  test_mcp_tools()
 end
 
 local ok, err = xpcall(run, debug.traceback)
 ai.reset_backend()
-package.loaded["mcphub"] = nil
 vim.env.GEMINI_API_KEY = nil
 vim.env.OPENAI_API_KEY = nil
 if not ok then
