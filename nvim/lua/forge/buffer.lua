@@ -481,6 +481,22 @@ local function attach_regions(session, prepared)
   end
 end
 
+--- Applies descending edits while preserving native fold membership for unchanged rows.
+---@param buffer integer
+---@param edits {start_row: integer, removed_rows: integer, text: string[]}[]
+---@param empty? boolean Whether the old document consists only of Neovim's placeholder line.
+function M.apply_text_edits(buffer, edits, empty)
+  for _, edit in ipairs(edits) do
+    local finish = empty and 1 or edit.start_row + edit.removed_rows
+    if edit.removed_rows == 1 and #edit.text == 1 then
+      local previous = vim.api.nvim_buf_get_lines(buffer, edit.start_row, finish, true)[1]
+      vim.api.nvim_buf_set_text(buffer, edit.start_row, 0, edit.start_row, #previous, edit.text)
+    else
+      vim.api.nvim_buf_set_lines(buffer, edit.start_row, finish, true, edit.text)
+    end
+  end
+end
+
 local function commit_patch(session, patch)
   if editable.suspend_generated_text(session.editable) then
     return { kind = "Deferred", edit_sequence = session.editable.sequence }
@@ -518,7 +534,7 @@ local function commit_patch(session, patch)
       if edit.removed_rows ~= 1 or #edit.text ~= 1 then prepared.retain_folds = false break end
     end
     local readonly = vim.bo[session.buffer].readonly
-    ok, prepared.failure = pcall(folds.prepare, session, prepared)
+    ok, prepared.failure = pcall(folds.prepare, session, prepared, patch.text_edit)
     checkpoint("fold_capture")
     if not ok then finish("fold_capture_failed") return M.fail_apply(session, prepared.failure) end
     ok, prepared.failure = pcall(function()
@@ -536,17 +552,7 @@ local function commit_patch(session, patch)
       end
       if session.editable.native then session.editable.native.update_ns, session.editable.native.update_count = 0, 0 end
       local text_started = timing and perf.now()
-      for _, edit in ipairs(patch.text_edit) do
-        local finish = edit.start_row + edit.removed_rows
-        if session.row_count == 0 then finish = 1 end
-        if edit.removed_rows == 1 and #edit.text == 1 then
-          -- Replacing the line itself can shorten native folds ending on it.
-          local previous_text = vim.api.nvim_buf_get_lines(session.buffer, edit.start_row, finish, true)[1]
-          vim.api.nvim_buf_set_text(session.buffer, edit.start_row, 0, edit.start_row, #previous_text, edit.text)
-        else
-          vim.api.nvim_buf_set_lines(session.buffer, edit.start_row, finish, true, edit.text)
-        end
-      end
+      M.apply_text_edits(session.buffer, patch.text_edit, session.row_count == 0)
       if timing then
         timing.buffer_api_ms = perf.elapsed_ms(text_started)
         timing.editable_callback_ms = (session.editable.native and session.editable.native.update_ns or 0) / 1e6
@@ -902,7 +908,7 @@ end
 ---@param patch table
 ---@param read_original fun(row: integer): string
 ---@return table
-function M.patch_fragment(fragment, patch, read_original)
+function M.prepare_fragment_patch(fragment, patch, read_original)
   local function read_row(row)
     local delta = 0
     for index = #patch.text_edit, 1, -1 do
@@ -920,12 +926,19 @@ function M.patch_fragment(fragment, patch, read_original)
     entry.text = {}
     for row = 0, entry.row_count - 1 do entry.text[row + 1] = read_row(prepared.position[id] + row) end
   end
+  return prepared
+end
+
+--- Adopts a validated fragment patch after its owner has removed affected native folds.
+---@param fragment ForgeBufferFragment
+---@param patch table
+---@param prepared table
+function M.apply_fragment_patch(fragment, patch, prepared)
   change_sequence(fragment.sequence, patch, prepared.block)
   for id in pairs(prepared.retired) do fragment.block[id] = nil end
   for id, entry in pairs(prepared.block) do fragment.block[id] = entry end
   folds.update(fragment, prepared, false)
   fragment.revision, fragment.row_count = patch.next, patch.next_rows
-  return prepared
 end
 
 ---@param session table

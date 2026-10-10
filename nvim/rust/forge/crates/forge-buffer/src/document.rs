@@ -152,14 +152,17 @@ impl BufferDocument {
         let incoming: HashMap<_, _> = block.iter().map(|block| (&block.id, block)).collect();
         let last = block.last().ok_or(ContractError("subtree replacement requires an anchor"))?;
         let mut owners = HashMap::new();
-        for removed in self.sequence.range(range.clone())? {
+        for (offset, removed) in self.sequence.range(range.clone())?.enumerate() {
             for owner in self.sequence.fold_endpoint_owner(&removed.id) {
                 let index = self.sequence.index(&owner.id).ok_or(ContractError("fold owner is missing"))?;
                 if range.contains(&index) { continue; }
                 let replacement = owners.entry(index).or_insert_with(|| owner.clone());
                 for fold in &mut replacement.metadata.fold {
                     if fold.end.block != removed.id { continue; }
-                    if let Some(retained) = incoming.get(&removed.id) {
+                    let at_subtree_end = offset + 1 == range.len()
+                        && fold.end.position.row == removed.text.row_count()
+                        && fold.end.position.column == 0;
+                    if let Some(retained) = incoming.get(&removed.id).filter(|_| !at_subtree_end) {
                         if fold.end.position.row == removed.text.row_count() && fold.end.position.column == 0 {
                             fold.end.position.row = retained.text.row_count();
                         }

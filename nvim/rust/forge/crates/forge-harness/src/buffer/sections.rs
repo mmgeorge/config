@@ -1127,6 +1127,17 @@ mod tests {
         );
         visible.set(&mut source, view.clone(), 2, "tools", true, false, None)?;
         visible.refresh(&mut source)?;
+        let assert_parent_endpoint = |visible: &SectionProjection| -> Result<()> {
+            let snapshot = visible.document.snapshot()?;
+            let parent = snapshot.block.iter().find(|block| block.id.0 == "outer").unwrap();
+            let last = snapshot.block.last().unwrap();
+            assert_eq!(parent.metadata.fold[0].end, BlockAnchor {
+                block: last.id.clone(),
+                position: TextPosition { row: last.text.row_count(), column: 0 },
+            }, "expanding the final child must extend the enclosing exchange");
+            Ok(())
+        };
+        assert_parent_endpoint(&visible)?;
         let first = visible
             .document
             .document
@@ -1135,8 +1146,9 @@ mod tests {
             .text
             .byte_count();
         assert!(first <= PAGE_BYTES);
-        visible.set(&mut source, view, 3, "tools", true, true, None)?;
+        visible.set(&mut source, view.clone(), 3, "tools", true, true, None)?;
         visible.refresh(&mut source)?;
+        assert_parent_endpoint(&visible)?;
         let second = visible
             .document
             .document
@@ -1157,6 +1169,11 @@ mod tests {
                 .count(),
             40000
         );
+        for (sequence, expanded) in [(4, false), (5, true)] {
+            visible.set(&mut source, view.clone(), sequence, "tools", expanded, false, None)?;
+            visible.refresh(&mut source)?;
+            assert_parent_endpoint(&visible)?;
+        }
         Ok(())
     }
 

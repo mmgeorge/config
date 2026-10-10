@@ -152,7 +152,15 @@ Ordinary patches remove and recreate only affected fold subtrees. Unchanged nati
 survive timer updates. One-line replacements use `nvim_buf_set_text` to preserve the line
 and its fold membership. `nvim_buf_set_lines` can shorten a manual fold when replacing its
 last line, even when the row count stays unchanged. Row insertions and deletions remove
-affected folds before the edit and recreate them afterward. Subtree deletion selects the
+affected folds before the edit and recreate them afterward. Harness and Status share the
+text writer and `folds.prepare_records` invalidation path. Before either view changes its
+row index, the fold engine queries the old sequence for boundaries touching each edit,
+including an insertion exactly at an exclusive endpoint or a zero-row marker. This prevents
+the logical endpoint advancing while Neovim leaves the native range behind. Indexed range
+queries visit only intersecting blocks and the affected fold descendants, preserving
+unrelated native folds. Status delegates those queries through its file/body sequence.
+Body patch validation and text preparation finish before the synchronous commit removes
+old folds, adopts the fragment, writes text, and restores folds. Subtree deletion selects the
 complete native range before removing its descendants, including folds that share a header row. Creation temporarily opens
 containing folds so Neovim does not widen a child range to a closed ancestor. Both operations
 restore retained ancestor preferences within the atomic buffer update. Attaching a window
@@ -233,7 +241,10 @@ the containing exchange. Structural changes and partially loaded blocks use the 
 projection path. Expansion and paging project only the indexed node subtree. Pending parent
 and child actions coalesce at the outermost affected node and resolve the latest choices
 before projection. Subtree replacement and enclosing fold endpoint rebasing share one
-validated document edit. Native folds follow the published node display rather than keeping a
+validated document edit. An enclosing fold ending at the replaced subtree's boundary moves
+to the replacement's last block, even when its former endpoint survives as a heading.
+Retaining that heading must not leave newly loaded children outside their parent fold.
+Native folds follow the published node display rather than keeping a
 second Harness expansion preference. After a body splice repairs fold endpoints, subsequent
 heading updates preserve the current loaded ranges at application time. They cannot restore
 fold metadata captured before the splice.

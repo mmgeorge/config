@@ -409,28 +409,62 @@ local function remove_native(session, affected)
   end
 end
 
-function M.prepare_records(session, selected)
-  if not session.fold or not next(selected) then return {} end
+---@param session table
+---@param selected table<string, boolean>
+---@param edits? {start_row: integer, removed_rows: integer, text: string[]}[]
+---@return table<string, boolean>
+function M.prepare_records(session, selected, edits)
+  if not session.fold then return {} end
   local affected = {}
-  local ranges = {}
-  for id in pairs(selected) do
-    local record = session.fold.record[id]
-    if record then
-      affected[id] = true
-      ranges[#ranges + 1] = { first = fold_start(session, record), last = fold_end(session, record) }
+  for id in pairs(selected) do affected[id] = true end
+  for _, edit in ipairs(edits or {}) do
+    if edit.removed_rows ~= 1 or #edit.text ~= 1 then
+      local first, last = edit.start_row, edit.start_row + edit.removed_rows
+      session.sequence:visit_range(first, last, function(node, start)
+        for key, boundary in pairs(node.boundary or {}) do
+          if start + boundary.row >= first and start + boundary.row <= last then
+            affected[key:match("^[^:]+:(.*)$")] = true
+          end
+        end
+      end)
     end
   end
-  for id, record in pairs(session.fold.record) do
-    local first, last = fold_start(session, record), fold_end(session, record)
-    for _, range in ipairs(ranges) do
-      if first >= range.first and last <= range.last then affected[id] = true break end
+  local ranges = {}
+  for id in pairs(affected) do
+    local record = session.fold.record[id]
+    if record then
+      local _, first = session.sequence:position(record.owner)
+      local _, last = session.sequence:position(record.fold["end"].block)
+      ranges[#ranges + 1] = { first = first + record.fold.start.row,
+        last = last + record.fold["end"].position.row + (record.fold["end"].position.column > 0 and 1 or 0) }
+    end
+  end
+  table.sort(ranges, function(left, right)
+    if left.first == right.first then return left.last > right.last end
+    return left.first < right.first
+  end)
+  local covered = -1
+  for _, range in ipairs(ranges) do
+    if range.last > covered then
+      session.sequence:visit_range(range.first, range.last, function(node, start)
+        for key, boundary in pairs(node.boundary or {}) do
+          if boundary.delta > 0 and start + boundary.row >= range.first and start + boundary.row < range.last then
+            local id = key:sub(7)
+            local record = session.fold.record[id]
+            local _, last = session.sequence:position(record.fold["end"].block)
+            last = last + record.fold["end"].position.row + (record.fold["end"].position.column > 0 and 1 or 0)
+            if last <= range.last then affected[id] = true end
+          end
+        end
+      end)
+      covered = range.last
     end
   end
   remove_native(session, affected)
   return affected
 end
 
-function M.prepare(session, prepared)
+function M.prepare(session, prepared, edits)
   if not session.fold then return end
   local affected = {}
   for _, changed in ipairs({ prepared.changed, prepared.retired }) do
@@ -450,17 +484,7 @@ function M.prepare(session, prepared)
       end
     end
   end
-  local root = vim.tbl_keys(affected)
-  for _, id in ipairs(root) do
-    local record = session.fold.record[id]
-    local first = session.sequence:position(record.owner)
-    local last = session.sequence:position(record.fold["end"].block)
-    for index = first, last do
-      for child in pairs(session.fold.owner[session.sequence:at(index).id] or {}) do affected[child] = true end
-    end
-  end
-  prepared.native_fold_changed = affected
-  remove_native(session, affected)
+  prepared.native_fold_changed = M.prepare_records(session, affected, edits)
 end
 
 ---@param session table

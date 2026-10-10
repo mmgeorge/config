@@ -205,6 +205,22 @@ function Sequence:locate(row)
   end
 end
 
+--- Visits blocks touching an inclusive row span, including zero-row boundary blocks.
+---@param first integer
+---@param last integer
+---@param visit fun(node: ForgeSequenceNode, start_row: integer)
+function Sequence:visit_range(first, last, visit)
+  local function walk(node, start)
+    if not node or start > last or start + node.rows < first then return end
+    self.visits = self.visits + 1
+    local position = start + rows(node.left)
+    walk(node.left, start)
+    if position <= last and position + node.entry.row_count >= first then visit(node, position) end
+    walk(node.right, position + node.entry.row_count)
+  end
+  walk(self.root, 0)
+end
+
 ---@param position integer
 ---@param removed integer
 ---@param inserted {id: string, entry: ForgeSequenceEntry}[]

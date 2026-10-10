@@ -15,6 +15,56 @@ fn block(id: usize, rows: &[&str]) -> BufferBlock {
 }
 
 #[test]
+fn subtree_expansion_rebases_parent_past_retained_heading() {
+    use forge_buffer::block::{BlockAnchor, FoldRange};
+    use forge_buffer::identity::FoldId;
+
+    let fold = |id: &str, endpoint: &BufferBlock| FoldRange {
+        id: FoldId(id.into()),
+        start: TextPosition { row: 0, column: 0 },
+        end: BlockAnchor {
+            block: endpoint.id.clone(),
+            position: TextPosition { row: endpoint.text.row_count(), column: 0 },
+        },
+        closed: false,
+        heading_start: None,
+        collapsed_suffix: None,
+        collapse_children: false,
+        expand_children: false,
+    };
+    let heading = block(2, &["tools"]);
+    let mut parent = block(0, &["exchange"]);
+    parent.metadata.fold.push(fold("exchange", &heading));
+    let mut document = BufferDocument::new(DocumentId("subtree".into()), vec![
+        parent, block(1, &["thought"]), heading.clone(), block(4, &["next exchange"]),
+    ]).unwrap();
+
+    for _ in 0..3 {
+        let child = block(3, &["tool"]);
+        let mut expanded = heading.clone();
+        expanded.metadata.fold.push(fold("tools", &child));
+        let before = document.snapshot();
+        let patch = document.splice(2..3, vec![expanded, child.clone()]).unwrap().unwrap();
+        assert_eq!(apply_snapshot_reference(&before, &patch).unwrap(), document.snapshot());
+        assert_eq!(document.block(&BlockId("block-0".into())).unwrap().metadata.fold[0].end,
+            fold("exchange", &child).end);
+
+        let output = block(3, &["tool", "output", "more output"]);
+        document.replace_block(output.clone()).unwrap();
+        for owner in [0, 2] {
+            assert_eq!(document.block(&BlockId(format!("block-{owner}"))).unwrap().metadata.fold[0].end,
+                fold("expected", &output).end);
+        }
+        let before = document.snapshot();
+        let patch = document.splice(2..4, vec![heading.clone()]).unwrap().unwrap();
+        assert_eq!(apply_snapshot_reference(&before, &patch).unwrap(), document.snapshot());
+        assert_eq!(document.block(&BlockId("block-0".into())).unwrap().metadata.fold[0].end,
+            fold("exchange", &heading).end);
+        assert_eq!(document.snapshot().block.last().unwrap().id, BlockId("block-4".into()));
+    }
+}
+
+#[test]
 fn packed_text_roundtrips_empty_and_multibyte_rows_without_internal_offsets() {
     for rows in [vec![], vec![""], vec!["", ""], vec!["λ🙂", "", "last", ""]] {
         let text = BufferText::from_rows(&rows).unwrap();

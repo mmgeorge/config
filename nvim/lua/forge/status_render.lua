@@ -4,6 +4,7 @@ local Sequence = require("forge.block_sequence")
 local folds = require("forge.folds")
 local decorations = require("forge.decorations")
 local history = require("forge.status_history")
+local cooperative = require("forge.cooperative")
 local empty_metadata = { target = {}, decoration = {}, editable_region = {} }
 local empty_map = {}
 local maximum = 9007199254740991
@@ -223,6 +224,19 @@ local function facade(session)
     return level, starts
   end
   function sequence:rows() return session.root:rows() end
+  function sequence:visit_range(first, last, visit)
+    session.root:visit_range(first, last, function(node, start)
+      visit(node, start)
+      if node.entry.kind == "file" then
+        local body = session.file[node.entry.file].body
+        if body then
+          body.sequence:visit_range(first - start - 1, last - start - 1, function(child, relative)
+            visit(child, start + 1 + relative)
+          end)
+        end
+      end
+    end)
+  end
   return sequence
 end
 
@@ -393,9 +407,7 @@ local function write(session, edits)
   session.applying = true
   vim.bo[session.buffer].modifiable = true
   local ok, failure = pcall(function()
-    for _, edit in ipairs(edits) do
-      vim.api.nvim_buf_set_lines(session.buffer, edit.start_row, edit.start_row + edit.removed_rows, true, edit.text)
-    end
+    buffer.apply_text_edits(session.buffer, edits)
   end)
   vim.bo[session.buffer].modifiable = false
   session.applying = nil
@@ -409,57 +421,60 @@ local function adopt(session, prepared)
   local recovering = session.status == "Desynchronized"
   assert(session.status == "Desynchronized" or vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "status buffer was changed externally")
   local edits = edits_between(session, prepared)
-  local fold_state = #edits > 0 and folds.capture(session) or {}
-  local selected = {}
-  for id, record in pairs(session.fold and session.fold.record or {}) do
-    local replacement = prepared.fold.record[id]
-    if not replacement or not vim.deep_equal(record.fold, replacement.fold) then selected[id] = true end
-  end
-  for id in pairs(folds.prepare_records(session, selected)) do prepared.fold.changed[id] = true end
-  local metadata = { changed = {}, retired = {}, block = {}, position = {} }
-  for id in pairs(prepared.body_owner) do
-    local previous = session.block[id]
-    local reinstall = recovering or previous ~= prepared.block[id]
-    if previous and not reinstall then
-      local _, start = session.sequence:position(id)
-      local finish = start + #previous.text
-      for _, edit in ipairs(edits) do
-        if edit.start_row <= finish and edit.start_row + edit.removed_rows >= start then
-          reinstall = true
-          break
+  local result = cooperative.atomic(function()
+    local fold_state = #edits > 0 and folds.capture(session) or {}
+    local selected = {}
+    for id, record in pairs(session.fold and session.fold.record or {}) do
+      local replacement = prepared.fold.record[id]
+      if not replacement or not vim.deep_equal(record.fold, replacement.fold) then selected[id] = true end
+    end
+    for id in pairs(folds.prepare_records(session, selected, edits)) do prepared.fold.changed[id] = true end
+    local metadata = { changed = {}, retired = {}, block = {}, position = {} }
+    for id in pairs(prepared.body_owner) do
+      local previous = session.block[id]
+      local reinstall = recovering or previous ~= prepared.block[id]
+      if previous and not reinstall then
+        local _, start = session.sequence:position(id)
+        local finish = start + #previous.text
+        for _, edit in ipairs(edits) do
+          if edit.start_row <= finish and edit.start_row + edit.removed_rows >= start then
+            reinstall = true
+            break
+          end
         end
       end
+      if reinstall then
+        metadata.changed[id], metadata.block[id] = true, prepared.block[id]
+      end
     end
-    if reinstall then
-      metadata.changed[id], metadata.block[id] = true, prepared.block[id]
+    if recovering then
+      vim.api.nvim_buf_clear_namespace(session.buffer, session.namespace, 0, -1)
+      session.sentinel, session.marks = nil, {}
     end
-  end
-  if recovering then
-    vim.api.nvim_buf_clear_namespace(session.buffer, session.namespace, 0, -1)
-    session.sentinel, session.marks = nil, {}
-  end
-  for id, mark in pairs(session.marks) do
-    if not prepared.block[id] then
-      for _, handle in ipairs(mark) do vim.api.nvim_buf_del_extmark(session.buffer, session.namespace, handle) end
-      session.marks[id] = nil
+    for id, mark in pairs(session.marks) do
+      if not prepared.block[id] then
+        for _, handle in ipairs(mark) do vim.api.nvim_buf_del_extmark(session.buffer, session.namespace, handle) end
+        session.marks[id] = nil
+      end
     end
-  end
-  session.root, session.file, session.block, session.body_owner = prepared.root, prepared.file, prepared.block, prepared.body_owner
-  session.fold, session.inventory = prepared.fold, prepared.inventory
-  session.context_width = session.width
-  session.revision, session.row_count = prepared.inventory.revision, prepared.root:rows()
-  local buffer_us = write(session, edits)
-  session.status = "Applied"
-  for id in pairs(metadata.changed) do
-    metadata.position[id] = select(2, session.sequence:position(id))
-  end
-  buffer.install_fragment_metadata(session, metadata)
-  if not session.sentinel then session.sentinel = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace, 0, 0, {}) end
-  decorations.attach(session)
-  folds.register(session)
-  folds.refresh(session)
-  folds.restore(session, fold_state)
-  return buffer_us, edits
+    session.root, session.file, session.block, session.body_owner = prepared.root, prepared.file, prepared.block, prepared.body_owner
+    session.fold, session.inventory = prepared.fold, prepared.inventory
+    session.context_width = session.width
+    session.revision, session.row_count = prepared.inventory.revision, prepared.root:rows()
+    local buffer_us = write(session, edits)
+    session.status = "Applied"
+    for id in pairs(metadata.changed) do
+      metadata.position[id] = select(2, session.sequence:position(id))
+    end
+    buffer.install_fragment_metadata(session, metadata)
+    if not session.sentinel then session.sentinel = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace, 0, 0, {}) end
+    decorations.attach(session)
+    folds.register(session)
+    folds.refresh(session)
+    folds.restore(session, fold_state)
+    return { buffer_us = buffer_us, edits = edits }
+  end)
+  return result.buffer_us, result.edits
 end
 
 ---@param document string
@@ -628,7 +643,6 @@ function M.apply_body(session, delivery)
     return buffer.fail_apply(session, "status buffer was changed externally")
   end
   local started, previous = vim.uv.hrtime(), model.body
-  local fold_state = folds.capture(session)
   local previous_fold = vim.tbl_extend("force", {}, previous and previous.fold.record or {})
   local ok, result = pcall(function()
     assert(vim.api.nvim_buf_get_changedtick(session.buffer) == session.changedtick, "status buffer was changed externally")
@@ -648,7 +662,7 @@ function M.apply_body(session, delivery)
       edits = { { start_row = start + 1, removed_rows = previous and math.max(1, previous.row_count) or 1, text = text } }
     elseif optional(delivery.patch) then
       body = assert(previous, "status body requires a snapshot")
-      prepared = buffer.patch_fragment(body, delivery.patch, function(row)
+      prepared = buffer.prepare_fragment_patch(body, delivery.patch, function(row)
         return assert(vim.api.nvim_buf_get_lines(session.buffer, start + 1 + row, start + 2 + row, true)[1], "body source row disappeared")
       end)
       edits = {}
@@ -656,43 +670,47 @@ function M.apply_body(session, delivery)
         edits[#edits + 1] = { start_row = start + 1 + edit.start_row, removed_rows = edit.removed_rows, text = edit.text }
       end
     else return { kind = "Applied" } end
-    local selected = {}
-    for id, record in pairs(session.fold.record) do
-      if record.fold["end"].block == key or previous_fold[id] then selected[id] = true end
-    end
-    local affected = folds.prepare_records(session, selected)
-    model.body = body
-    model.header = file_header(model.record, body, delivery.file)
-    session.block[key] = model.header
-    session.root:update(key, model.header)
-    session.fold.changed = affected
-    for id, record in pairs(session.fold.record) do
-      if record.fold["end"].block == key then
-        record.fold["end"].position.row = model.header.row_count
-        session.root:fold_boundary(key, "end:" .. id, model.header.row_count, -1)
-        session.fold.changed[id] = true
+    return cooperative.atomic(function()
+      local fold_state = folds.capture(session)
+      local selected = {}
+      for id, record in pairs(session.fold.record) do
+        if record.fold["end"].block == key or previous_fold[id] then selected[id] = true end
       end
-    end
-    for id in pairs(prepared.retired) do session.block[id], session.body_owner[id] = nil, nil end
-    for id, value in pairs(prepared.block) do
-      session.block[id], session.body_owner[id] = value, delivery.file
-      prepared.position[id] = start + 1 + select(2, body.sequence:position(id))
-    end
-    for id in pairs(previous_fold) do
-      if not body.fold.record[id] then session.fold.record[id] = nil end
-    end
-    for id, value in pairs(body.fold.record) do
-      if not session.fold.record[id] or (body.fold.changed and body.fold.changed[id]) then session.fold.changed[id] = true end
-      session.fold.record[id] = value
-    end
-    session.row_count = session.root:rows()
-    local buffer_us = write(session, edits)
-    buffer.install_fragment_metadata(session, prepared)
-    folds.refresh(session)
-    folds.restore(session, fold_state)
-    trace(session, "status.body.applied", { file = delivery.file, generation = delivery.generation,
-      rows = body.row_count, edits = #edits, buffer_us = buffer_us, elapsed_us = elapsed(started) })
-    return { kind = "Applied" }
+      local affected = folds.prepare_records(session, selected, edits)
+      if optional(delivery.patch) then buffer.apply_fragment_patch(body, delivery.patch, prepared) end
+      model.body = body
+      model.header = file_header(model.record, body, delivery.file)
+      session.block[key] = model.header
+      session.root:update(key, model.header)
+      session.fold.changed = affected
+      for id, record in pairs(session.fold.record) do
+        if record.fold["end"].block == key then
+          record.fold["end"].position.row = model.header.row_count
+          session.root:fold_boundary(key, "end:" .. id, model.header.row_count, -1)
+          session.fold.changed[id] = true
+        end
+      end
+      for id in pairs(prepared.retired) do session.block[id], session.body_owner[id] = nil, nil end
+      for id, value in pairs(prepared.block) do
+        session.block[id], session.body_owner[id] = value, delivery.file
+        prepared.position[id] = start + 1 + select(2, body.sequence:position(id))
+      end
+      for id in pairs(previous_fold) do
+        if not body.fold.record[id] then session.fold.record[id] = nil end
+      end
+      for id, value in pairs(body.fold.record) do
+        if not session.fold.record[id] or (body.fold.changed and body.fold.changed[id]) then session.fold.changed[id] = true end
+        session.fold.record[id] = value
+      end
+      session.row_count = session.root:rows()
+      local buffer_us = write(session, edits)
+      buffer.install_fragment_metadata(session, prepared)
+      folds.refresh(session)
+      folds.restore(session, fold_state)
+      trace(session, "status.body.applied", { file = delivery.file, generation = delivery.generation,
+        rows = body.row_count, edits = #edits, buffer_us = buffer_us, elapsed_us = elapsed(started) })
+      return { kind = "Applied" }
+    end)
   end)
   if not ok then
     session.notice(tostring(result))
@@ -844,25 +862,28 @@ function M.present_context(session, presentation)
         edits[#edits + 1] = { start_row = start, removed_rows = previous.row_count, text = value.text }
       end
     end
-    local affected = resized and folds.prepare_records(session, { ["status:context:recent"] = session.fold.record["status:context:recent"] and true or nil }) or {}
-    for key, value in pairs(replacement) do
-      session.block[key] = value
-      session.root:update(key, value)
-    end
-    session.fold.changed = affected
-    local recent = session.fold.record["status:context:recent"]
-    if recent and resized then
-      local endpoint = recent.fold["end"]
-      endpoint.position.row = session.block[endpoint.block].row_count
-      session.root:fold_boundary(endpoint.block, "end:status:context:recent", endpoint.position.row, -1)
-      session.fold.changed["status:context:recent"] = true
-    end
-    session.row_count = session.root:rows()
-    session.context_width = session.width
-    table.sort(edits, function(left, right) return left.start_row > right.start_row end)
-    local buffer_us = write(session, edits)
-    folds.refresh(session)
-    trace(session, "status.context.applied", { edits = #edits, buffer_us = buffer_us, elapsed_us = elapsed(started) })
+    cooperative.atomic(function()
+      local selected = { ["status:context:recent"] = resized and session.fold.record["status:context:recent"] and true or nil }
+      local affected = folds.prepare_records(session, selected, edits)
+      for key, value in pairs(replacement) do
+        session.block[key] = value
+        session.root:update(key, value)
+      end
+      session.fold.changed = affected
+      local recent = session.fold.record["status:context:recent"]
+      if recent and resized then
+        local endpoint = recent.fold["end"]
+        endpoint.position.row = session.block[endpoint.block].row_count
+        session.root:fold_boundary(endpoint.block, "end:status:context:recent", endpoint.position.row, -1)
+        session.fold.changed["status:context:recent"] = true
+      end
+      session.row_count = session.root:rows()
+      session.context_width = session.width
+      table.sort(edits, function(left, right) return left.start_row > right.start_row end)
+      local buffer_us = write(session, edits)
+      folds.refresh(session)
+      trace(session, "status.context.applied", { edits = #edits, buffer_us = buffer_us, elapsed_us = elapsed(started) })
+    end)
   end)
   if not ok then buffer.fail_apply(session, failure) end
 end

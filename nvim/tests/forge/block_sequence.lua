@@ -30,6 +30,16 @@ local function verify()
     return node.height
   end
   check(sequence.root, nil)
+  local first, last = math.floor(start / 3), math.floor(start * 2 / 3)
+  local expected, actual, position = {}, {}, 0
+  for _, item in ipairs(reference) do
+    if position <= last and position + item.entry.row_count >= first then
+      expected[#expected + 1] = { item.id, position }
+    end
+    position = position + item.entry.row_count
+  end
+  sequence:visit_range(first, last, function(node, row) actual[#actual + 1] = { node.id, row } end)
+  assert(vim.deep_equal(actual, expected), "inclusive range traversal lost a block boundary")
 end
 
 local ok, failure = xpcall(function()
@@ -62,6 +72,11 @@ local ok, failure = xpcall(function()
   assert(sequence.visits < 64, "small update traversed unrelated blocks")
   sequence:rollback()
   assert(sequence:rows() == 10000)
+  sequence.visits = 0
+  local found = {}
+  sequence:visit_range(5000, 5000, function(node) found[#found + 1] = node.id end)
+  assert(vim.deep_equal(found, { "5000", "5001" }))
+  assert(sequence.visits < 64, "local range lookup traversed unrelated blocks")
 end, debug.traceback)
 
 if not ok then
