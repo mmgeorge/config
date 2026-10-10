@@ -131,7 +131,7 @@ mod tests {
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
         let output = ToolOutputView::new("call".into(), &source)?;
-        let mut document = OutputDocument::new(DocumentId("tool:test".into()), output.snapshot())?;
+        let mut document = OutputDocument::new(DocumentId("tool:test".into()), output.snapshot()?)?;
         assert!(document.demand(DocumentRevision(1), usize::MAX).is_err());
         let mut revision = DocumentRevision(0);
         loop {

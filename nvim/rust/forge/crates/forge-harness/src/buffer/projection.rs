@@ -9,6 +9,7 @@ use forge_buffer::block::{
 };
 use forge_buffer::identity::{BlockId, FoldId, TargetId};
 use forge_buffer::width::WidthProfile;
+use forge_buffer::node::{NodeState, NodeKind, NodeDisplay, NodeLifecycle};
 use serde::Serialize;
 
 use crate::exchange::{Exchange, ExchangeKind, ExchangeNode, ExchangeState};
@@ -110,7 +111,8 @@ struct TimelineRenderer<'profile> {
     syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
     bytes: usize,
     leading_separator: bool,
-    expanded_tool: &'profile std::collections::HashSet<String>,
+    expansion: &'profile HashMap<String, bool>,
+    tool_limit: &'profile HashMap<String, usize>,
 }
 
 #[derive(Clone, Copy)]
@@ -154,14 +156,15 @@ pub fn project<'source>(
     entry: impl Into<ProjectionSource<'source>>,
     width: &WidthProfile,
     leading_separator: bool,
-    expanded_tool: &std::collections::HashSet<String>,
+    expansion: &HashMap<String, bool>,
+    tool_limit: &HashMap<String, usize>,
 ) -> Result<ProjectedEntry> {
     let now_ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .map_or(0, |duration| {
             duration.as_millis().min(i64::MAX as u128) as i64
         });
-    project_at_with_separator(entry.into(), width, now_ms, leading_separator, expanded_tool)
+    project_at_with_separator(entry.into(), width, now_ms, leading_separator, expansion, tool_limit)
 }
 
 fn tool_group_label<'tool>(calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>,
@@ -185,7 +188,7 @@ fn tool_group_label<'tool>(calls: impl IntoIterator<Item = &'tool crate::turn::T
 
 pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
     document: &forge_buffer::document::BufferDocument,
-    expanded: &std::collections::HashSet<String>,
+    expanded: &HashMap<String, bool>,
     tools: &HashMap<String, ToolOutputView>) -> Result<Vec<BufferBlock>> {
     fn exchanges<'source>(entry: &'source TimelineEntry, result: &mut Vec<&'source Exchange>,
         headings: &mut Vec<(&'source str, &'source crate::agent::Agent, Option<&'source Exchange>)>) {
@@ -219,7 +222,7 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
         }
     }
     if matches!(entry,TimelineEntry::Status { .. }) {
-        return Ok(project(ProjectionSource::Entry(entry),width,false,expanded)?.entry.block);
+        return Ok(project(ProjectionSource::Entry(entry),width,false,expanded,&HashMap::new())?.entry.block);
     }
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     let mut source = Vec::new();
@@ -274,7 +277,7 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
                     profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
                         .map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
                     blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
-                        previous, &tool.kind, tool.elapsed_ms(now_ms), tool.failed, &tool.title, expanded.contains(&call_id))?);
+                        previous, &tool.kind, tool.elapsed_ms(now_ms), tool.failed, &tool.title, expanded.get(&format!("{call_id}:tool")) == Some(&true))?);
                 }
                 let Some(previous) = document.block(&BlockId(id.into())) else { continue; };
                 let mut profile = width.clone();
@@ -300,7 +303,7 @@ pub(super) fn message_block(previous: &BufferBlock, message: &crate::turn::Messa
     content_width.columns = content_width.columns.saturating_sub(indent.saturating_sub(2)).max(1);
     let mut renderer = TimelineRenderer { width:&content_width,margin:0,now_ms:0,block:Vec::new(),
         prompt:Vec::new(),action:HashMap::new(),tool:HashMap::new(),syntax:HashMap::new(),bytes:0,
-        leading_separator:false,expanded_tool:&std::collections::HashSet::new() };
+        leading_separator:false,expansion:&HashMap::new(),tool_limit:&HashMap::new() };
     renderer.markdown(&previous.id.0,message.text(),
         if message.delivery() == crate::turn::MessageDelivery::Final { MarkdownRole::Response }
         else { MarkdownRole::Commentary })?;
@@ -309,6 +312,7 @@ pub(super) fn message_block(previous: &BufferBlock, message: &crate::turn::Messa
     if let Some(layout) = &mut block.metadata.layout { layout.source_indent = 0; }
     super::layout::materialize(block)?;
     block.metadata.fold = previous.metadata.fold.clone();
+    block.metadata.node = previous.metadata.node.clone();
     for fold in &mut block.metadata.fold {
         if fold.end.block == block.id && fold.end.position.row == previous.text.row_count() {
             fold.end.position.row = block.text.row_count();
@@ -325,7 +329,8 @@ fn project_at(entry: &TimelineEntry, width: &WidthProfile, now_ms: i64) -> Resul
         width,
         now_ms,
         false,
-        &std::collections::HashSet::new(),
+        &HashMap::new(),
+        &HashMap::new(),
     )
 }
 
@@ -334,7 +339,8 @@ fn project_at_with_separator(
     width: &WidthProfile,
     now_ms: i64,
     leading_separator: bool,
-    expanded_tool: &std::collections::HashSet<String>,
+    expansion: &HashMap<String, bool>,
+    tool_limit: &HashMap<String, usize>,
 ) -> Result<ProjectedEntry> {
     let mut projection = TimelineRenderer {
         width,
@@ -347,12 +353,14 @@ fn project_at_with_separator(
         syntax: HashMap::new(),
         bytes: 0,
         leading_separator,
-        expanded_tool,
+        expansion,
+        tool_limit,
     };
     match entry {
         ProjectionSource::Entry(entry) => projection.entry(entry, 0)?,
         ProjectionSource::Exchange(exchange) => projection.interaction(exchange, &HashMap::new(), 0)?,
     }
+    super::nodes::link(&mut projection.block);
     for block in &mut projection.block {
         TranscriptRenderer::resolve_marker(block)?;
         super::layout::materialize(block)?;
@@ -868,11 +876,16 @@ impl TimelineRenderer<'_> {
         layout.activity.retain(inside);
         layout.continuation.retain(inside);
         self.content(interaction, agents, depth, &layout.activity, Some(&layout.questions), MarkdownRole::Response)?;
+        let exchange_start = section.start;
         self.finish_section(
             section,
             &format!("{}:exchange", interaction.id),
             interaction.completed_at_ms.is_some(),
         );
+        if let Some(node) = &mut self.block[exchange_start].metadata.node {
+            node.kind = NodeKind::Exchange;
+            node.lifecycle = if interaction.completed_at_ms.is_some() { NodeLifecycle::Settled } else { NodeLifecycle::Live };
+        }
         self.content(interaction, agents, depth, &layout.continuation, Some(&layout.questions), MarkdownRole::Response)?;
         if let Some(diff) = &interaction.attributed_diff_text {
             self.diff(
@@ -1013,7 +1026,7 @@ impl TimelineRenderer<'_> {
                             let followed_in_turn = turn.items().iter().rposition(|item| matches!(item,
                                 crate::turn::TurnItem::Tool { id } if id == last_tool_id
                             )).is_some_and(|position| position + 1 < turn.items().len());
-                            let settled = calls
+                            let settled = interaction.completed_at_ms.is_some() || calls
                                 .iter()
                                 .all(|(_, tool)| tool.state() != crate::turn::ToolState::Running)
                                 && (followed_in_turn
@@ -1022,29 +1035,29 @@ impl TimelineRenderer<'_> {
                             let label = tool_group_label(calls.iter().map(|(_, tool)| *tool), settled, self.now_ms);
                             self.literal(&group_id, &label, None)?;
                             for (index, (id, tool)) in calls.into_iter().enumerate() {
-                                if tool.state() == crate::turn::ToolState::Running {
-                                    self.tool(turn.id(), tool, &group_id)?;
-                                } else {
-                                    let tool_start = self.block.len();
-                                    self.tool(turn.id(), tool, &group_id)?;
-                                    if let Some(diff) = crate::exchange::ProviderDiffBuilder::build(
-                                        std::slice::from_ref(tool),
-                                    ) {
+                                let tool_start = self.block.len();
+                                self.tool(turn.id(), tool, &group_id, !settled && index + 1 == count)?;
+                                if tool.state() != crate::turn::ToolState::Running {
+                                    if let Some(diff) = crate::exchange::ProviderDiffBuilder::build(std::slice::from_ref(tool)) {
                                         let diff_start = self.block.len();
-                                        self.diff(
-                                            &format!("{id}:changes"),
-                                            "Changed",
-                                            &diff,
-                                            "",
-                                            None,
-                                            None,
-                                        )?;
+                                        self.diff(&format!("{id}:changes"), "Changed", &diff, "", None, None)?;
                                         self.offset_layout(diff_start, 2);
                                     }
-                                    self.fold(tool_start, id, index + 1 < count);
+                                }
+                                let node = format!("{}:{}:tool", turn.id(), tool.id);
+                                self.fold(tool_start, &node, settled || index + 1 < count, NodeKind::Tool);
+                                if let Some(node) = &mut self.block[tool_start].metadata.node {
+                                    node.lifecycle = if tool.state() == crate::turn::ToolState::Running { NodeLifecycle::Live } else { NodeLifecycle::Settled };
+                                    if !settled && index + 1 == count { node.default_display = NodeDisplay::Preview; }
+                                    if self.expansion.get(&node.id.0) == Some(&true) {
+                                        let output = &self.tool[&format!("{}:{}", turn.id(), tool.id)];
+                                        let limit = self.tool_limit.get(&node.id.0).copied().unwrap_or(super::tool::INITIAL_INLINE_BYTES);
+                                        node.more = output.inline_prefix_chunks(limit)? < output.inline_chunks()?;
+                                    }
+                                    node.resolve(self.expansion.get(&node.id.0).copied());
                                 }
                             }
-                            self.fold(start, &format!("{id}:tools"), settled);
+                            self.fold(start, &format!("{id}:tools"), settled, NodeKind::ToolGroup);
                             self.margin -= 2;
                             self.offset_layout(start, 1);
                         }
@@ -1240,7 +1253,7 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn tool(&mut self, interaction: &str, tool: &crate::exchange::ToolCall, group: &str) -> Result<()> {
+    fn tool(&mut self, interaction: &str, tool: &crate::exchange::ToolCall, group: &str, preview: bool) -> Result<()> {
         let call_id = format!("{interaction}:{}", tool.id);
         ensure!(
             !self.tool.contains_key(&call_id),
@@ -1262,7 +1275,9 @@ impl TimelineRenderer<'_> {
         let label = tool.title.clone();
         let width = self.content_width();
         let renderer = TranscriptRenderer::new(&width)?;
-        let expanded = self.expanded_tool.contains(&call_id);
+        let choice = self.expansion.get(&format!("{call_id}:tool")).copied();
+        let expanded = choice == Some(true);
+        let preview = preview && choice != Some(false);
         let block = renderer.tool_header(
             BlockId(id),
             target.clone(),
@@ -1279,14 +1294,23 @@ impl TimelineRenderer<'_> {
             },
         );
         self.push(block)?;
-        for chunk in 0..if expanded { output.inline_chunks() } else { 1 } {
-            let block = renderer.tool_body(&call_id,&output,expanded,chunk)?;
-            for target in &block.metadata.target { self.action.insert(target.id.clone(),TranscriptAction::Tool { call_id:call_id.clone() }); }
-            self.push(block)?;
+        if expanded || preview {
+            let limit = self.tool_limit.get(&format!("{call_id}:tool")).copied().unwrap_or(super::tool::INITIAL_INLINE_BYTES);
+            for chunk in 0..if expanded { output.inline_prefix_chunks(limit)? } else { 1 } {
+                let block = renderer.tool_body(&call_id, &output, expanded, chunk)?;
+                for target in &block.metadata.target { self.action.insert(target.id.clone(), TranscriptAction::Tool { call_id: call_id.clone() }); }
+                self.push(block)?;
+            }
+            let hidden = renderer.tool_hidden(&call_id, &output, expanded)?;
+            for target in &hidden.metadata.target { self.action.insert(target.id.clone(), TranscriptAction::Tool { call_id: call_id.clone() }); }
+            self.push(hidden)?;
+        } else {
+            for suffix in ["preview", "hidden"] {
+                self.push(BufferBlock {
+                    id: BlockId(format!("{call_id}:{suffix}")), text: Default::default(), metadata: Default::default(),
+                })?;
+            }
         }
-        let hidden = renderer.tool_hidden(&call_id,&output,expanded)?;
-        for target in &hidden.metadata.target { self.action.insert(target.id.clone(),TranscriptAction::Tool { call_id:call_id.clone() }); }
-        self.push(hidden)?;
         self.tool.insert(call_id, output);
         Ok(())
     }
@@ -1370,6 +1394,7 @@ impl TimelineRenderer<'_> {
                 },
             );
         }
+        rendered.block.metadata.node = Some(NodeState::new(FoldId(id.into()), NodeKind::Message, NodeDisplay::Full));
         for link in rendered.link {
             self.action.insert(
                 link.target,
@@ -1438,16 +1463,18 @@ impl TimelineRenderer<'_> {
     fn finish_section(&mut self, section: Section, identity: &str, closed: bool) {
         self.margin = section.margin;
         self.offset_layout(section.start + 1, section.child_indent / 2);
-        self.fold(section.start, identity, closed);
+        self.fold(section.start, identity, closed, NodeKind::Group);
     }
 
-    fn fold(&mut self, start: usize, identity: &str, closed: bool) {
+    fn fold(&mut self, start: usize, identity: &str, closed: bool, kind: NodeKind) {
+        self.block[start].metadata.node = Some(NodeState::new(
+            FoldId(identity.into()), kind, if closed { NodeDisplay::Heading } else { NodeDisplay::Full }));
         let selected = &self.block[start..];
         if selected
             .iter()
             .map(|block| block.text.row_count())
             .sum::<usize>()
-            < 2
+            < 2 && kind != NodeKind::Tool
         {
             return;
         }
@@ -2251,7 +2278,9 @@ mod tests {
         assert!(text.contains("▸ You asked: What do you mean?"));
         assert_eq!(text.matches("▸ Questions ·").count(), 1);
         assert!(!text.contains("Question set accepted"));
-        assert!(text.contains("Invalid options"));
+        assert!(!text.contains("Invalid options"), "settled tool output stays deferred");
+        assert!(projected.tool.values().any(|tool| tool.preview(true).is_ok_and(|preview|
+            preview.row.iter().any(|row| row.contains("Invalid options")))));
         assert_eq!(projected.tool.len(), 1, "successful question must not remain a raw tool");
         assert!(text.find("▸ Questions ·").unwrap() < text.find("You asked:").unwrap());
         assert!(text.find("You asked:").unwrap() < text.find("I mean a Rust CLI").unwrap());
@@ -3223,7 +3252,8 @@ mod tests {
             &WidthProfile::default(),
             1_000,
             true,
-            &std::collections::HashSet::new(),
+            &HashMap::new(),
+            &HashMap::new(),
         )
         .unwrap();
 

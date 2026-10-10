@@ -17,7 +17,6 @@ use crate::timeline::{
 use super::document::{TranscriptChange, TranscriptDocument};
 use super::output::OutputDocument;
 use super::projection::{ProjectedEntry, ProjectionSource, TranscriptAction, project};
-use super::tool::ToolOutputView;
 
 const MAX_PROJECTED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
@@ -31,7 +30,6 @@ pub struct SessionPresentation {
 }
 
 struct OpenPresentation {
-    expanded_tool: HashSet<String>,
     syntax_done: HashSet<TargetId>,
     syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
     agent_scope: Option<String>,
@@ -44,7 +42,6 @@ struct OpenPresentation {
     accepted_submission: Option<u64>,
     entry: HashMap<String, EntryPresentation>,
     action: HashMap<TargetId, TranscriptAction>,
-    tool: HashMap<String, ToolOutputView>,
     output: HashMap<DocumentId, OutputDocument>,
     pending: VecDeque<(BufferPatch, usize)>,
     pending_bytes: usize,
@@ -77,16 +74,9 @@ pub struct PresentationSync {
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PresentationRequest {
-    SectionExpansion {
-        document: DocumentId,
-        view: ViewId,
-        sequence: u64,
-        section: String,
-        expanded: bool,
-        #[serde(default)]
-        more: bool,
-        rows: usize,
-        width: WidthProfile,
+    Node {
+        #[serde(flatten)]
+        request: super::nodes::NodeRequest,
     },
     BackgroundTerminals,
     Recap {
@@ -171,9 +161,6 @@ pub enum PresentationRequest {
         input: DocumentInput,
         document: DocumentId,
     },
-    ToggleTool {
-        input: DocumentInput,
-    },
     ToolDemand {
         document: DocumentId,
         revision: DocumentRevision,
@@ -205,10 +192,32 @@ impl SessionPresentation {
     pub fn dispatch(&mut self, request: PresentationRequest) -> Result<serde_json::Value> {
         use serde_json::{json, to_value};
         match request {
-            PresentationRequest::SectionExpansion { document, view, sequence, section, expanded, more, rows, width } => {
-                self.document(&document)?;
+            PresentationRequest::Node { request } => {
+                use super::nodes::NodeAction;
+                self.document(&request.document)?;
                 let open = self.open.as_mut().expect("validated presentation");
-                open.sections.set(&mut open.transcript, view, sequence, &section, expanded, more, Some((rows, width)))?;
+                if !open.sections.admit(&request.view, request.sequence, &request.node, request.generation)? {
+                    return Ok(json!({}));
+                }
+                let (expanded, more) = match request.action {
+                    NodeAction::SetExpansion { expanded } => (expanded, false),
+                    NodeAction::LoadMore => (true, true),
+                    NodeAction::RetryLoading => (true, false),
+                };
+                ensure!((1..=8192).contains(&request.rows), "node row budget exceeds layout limits");
+                request.width.validate()?;
+                if let Some(call) = request.node.strip_suffix(":tool")
+                    && open.sections.nodes.tool.contains_key(call)
+                    && (more || open.sections.expansion(&request.node) != Some(expanded)) {
+                    let limit = if more {
+                        open.sections.nodes.tool_limit.get(&request.node).copied()
+                            .unwrap_or(super::tool::INITIAL_INLINE_BYTES)
+                            .saturating_add(super::tool::INITIAL_INLINE_BYTES).min(16 * 1024 * 1024)
+                    } else { super::tool::INITIAL_INLINE_BYTES };
+                    toggle_inline_output(open, call, expanded, limit)?;
+                }
+                open.sections.set(&mut open.transcript, request.view, request.sequence,
+                    &request.node, expanded, more, Some((request.rows, request.width)))?;
                 retain_patches(open, Vec::new())?;
                 Ok(json!({}))
             }
@@ -267,28 +276,6 @@ impl SessionPresentation {
             PresentationRequest::NavigatePrompt { input, previous } => {
                 self.navigate_prompt(input, previous)
             }
-            PresentationRequest::ToggleTool { input } => {
-                let TranscriptAction::Tool { call_id } = self.action(input)? else {
-                    anyhow::bail!("transcript target is not a tool output");
-                };
-                let open = self
-                    .open
-                    .as_mut()
-                    .context("session presentation is not open")?;
-                let expanded = !open.expanded_tool.remove(&call_id);
-                if expanded {
-                    open.expanded_tool.insert(call_id.clone());
-                }
-                if let Err(error) = toggle_inline_output(open,&call_id,expanded) {
-                    if expanded {
-                        open.expanded_tool.remove(&call_id);
-                    } else {
-                        open.expanded_tool.insert(call_id);
-                    }
-                    return Err(error);
-                }
-                Ok(json!({"expanded": expanded}))
-            }
             PresentationRequest::ToolOpen { input, document } => {
                 document.validate()?;
                 let TranscriptAction::Tool { call_id } = self.action(input)? else {
@@ -304,11 +291,13 @@ impl SessionPresentation {
                         && document != open.transcript_id,
                     "tool document admission is full or identity is already used"
                 );
-                let source = open
-                    .tool
-                    .get(&call_id)
-                    .context("saved tool output is unavailable")?
-                    .snapshot();
+                let tool = open.sections.nodes.tool.get(&call_id).context("saved tool output is unavailable")?;
+                let previous_bytes = tool.retained_bytes();
+                let source = tool.snapshot()?;
+                let added_bytes = tool.retained_bytes().saturating_sub(previous_bytes);
+                open.retained_bytes += added_bytes;
+                if let Some(entry) = open.entry.get_mut(tool.owner()) { entry.bytes += added_bytes; }
+                ensure!(open.retained_bytes <= MAX_PROJECTED_BYTES, "parsed output exceeds projection capacity");
                 let output = OutputDocument::new(document.clone(), source)?;
                 ensure!(
                     open.output
@@ -454,7 +443,7 @@ impl SessionPresentation {
         let mut projected = Vec::new();
         let mut retained_bytes = 0;
         for (index, entry) in self.timeline.entry_list().iter().enumerate() {
-            let entry = project(ProjectionSource::Entry(entry), &width, index > 0, &HashSet::new())?;
+            let entry = project(ProjectionSource::Entry(entry), &width, index > 0, &HashMap::new(), &HashMap::new())?;
             retained_bytes += entry.retained_bytes();
             ensure!(
                 retained_bytes <= MAX_PROJECTED_BYTES,
@@ -484,6 +473,7 @@ impl SessionPresentation {
         transcript.views.open(view.clone(), width.clone())?;
         let mut sections = super::sections::SectionProjection::new(&mut transcript, document.clone())?;
         sections.register(view.clone());
+        sections.nodes.tool = tool;
         let opened = PresentationOpen {
             syntax_pending: !syntax.is_empty()
                 || action
@@ -492,7 +482,6 @@ impl SessionPresentation {
             transcript: sections.document.snapshot()?,
         };
         self.open = Some(OpenPresentation {
-            expanded_tool: HashSet::new(),
             syntax_done: HashSet::new(),
             syntax,
             agent_scope: None,
@@ -505,7 +494,6 @@ impl SessionPresentation {
             accepted_submission: None,
             entry,
             action,
-            tool,
             output: HashMap::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
@@ -926,7 +914,7 @@ impl SessionPresentation {
                 TimelineOperation::ToolOutput { .. } | TimelineOperation::Message { .. })
                 || matches!(operation,TimelineOperation::Replace { entry:TimelineEntry::Status { .. },.. })) {
                 let filtered: Vec<_> = patch.operation.iter().filter(|operation|match operation {
-                    TimelineOperation::ToolOutput { call_id,.. } => open.tool.contains_key(call_id),
+                    TimelineOperation::ToolOutput { call_id,.. } => open.sections.nodes.tool.contains_key(call_id),
                     TimelineOperation::Message { block_id,message,.. } => message.kind() != crate::turn::MessageKind::Assistant
                         || open.transcript.document.block(&forge_buffer::identity::BlockId(block_id.clone())).is_some(),
                     _ => false,
@@ -934,7 +922,7 @@ impl SessionPresentation {
                 apply_projection(open,patch,filtered.iter().copied())
             } else { reflow(open, self.timeline.entry_list(), self.timeline.revision()) }
         } else if patch.operation.iter().any(|operation|match operation {
-            TimelineOperation::ToolOutput { call_id,.. } => !open.tool.contains_key(call_id),
+            TimelineOperation::ToolOutput { call_id,.. } => !open.sections.nodes.tool.contains_key(call_id),
             TimelineOperation::Message { block_id,message,.. } => message.kind() == crate::turn::MessageKind::Assistant
                 && open.transcript.document.block(&forge_buffer::identity::BlockId(block_id.clone())).is_none(),
             _ => false,
@@ -1011,7 +999,7 @@ fn refresh_activity<'source>(open: &mut OpenPresentation,
     let mut retained = open.retained_bytes;
     for entry in source {
         for block in super::projection::timing_blocks(entry,&width,
-            &open.transcript.document,&open.expanded_tool,&open.tool)? {
+            &open.transcript.document,&open.sections.nodes.choice,&open.sections.nodes.tool)? {
             let previous = open.transcript.document.block(&block.id)
                 .context("timing block is missing")?.retained_bytes();
             retained = retained.saturating_sub(previous) + block.retained_bytes();
@@ -1031,13 +1019,16 @@ fn refresh_activity<'source>(open: &mut OpenPresentation,
     retain_patches(open,patches)
 }
 
-fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bool) -> Result<()> {
+fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bool, limit: usize) -> Result<()> {
     use forge_buffer::identity::BlockId;
-    let source = open.tool.get(call_id).context("inline tool source is missing")?;
+    let source = open.sections.nodes.tool.get(call_id).context("inline tool source is missing")?;
+    let previous_source_bytes = source.retained_bytes();
     let owner = source.owner().to_owned();
     let call = source.header().context("inline tool heading source is missing")?;
     let heading_id = BlockId(format!("{call_id}:tool"));
     let previous_heading = open.transcript.document.block(&heading_id).context("inline heading is missing")?;
+    let was_expanded = previous_heading.metadata.node.as_ref()
+        .is_some_and(|node| node.expansion == Some(true));
     let layout = previous_heading.metadata.layout.clone();
     let mut width = open.transcript.views.profile().unwrap_or(&open.last_width).clone();
     width.columns = width.columns.saturating_sub(layout.as_ref().map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
@@ -1047,35 +1038,48 @@ fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bo
         &call.kind,call.elapsed_ms(now),call.failed,&call.title,expanded)?;
     heading.metadata.layout = layout.clone();
     heading.metadata.fold = previous_heading.metadata.fold.clone();
-    let chunks = if expanded { source.inline_chunks() } else { 1 };
-    let removed_chunks = if expanded { 1 } else { source.inline_chunks() };
+    heading.metadata.node = previous_heading.metadata.node.clone();
+    let chunks = if expanded { source.inline_prefix_chunks(limit)? } else { 1 };
+    if let Some(node) = &mut heading.metadata.node {
+        node.more = expanded && chunks < source.inline_chunks()?;
+        node.resolve(Some(expanded));
+    }
     let identity = |chunk| BlockId(if chunk == 0 { format!("{call_id}:preview") } else { format!("{call_id}:output:{chunk}") });
+    let hidden_id = BlockId(format!("{call_id}:hidden"));
+    let removed_chunks = open.transcript.document.block_index(&hidden_id).context("inline hidden anchor is missing")?
+        - open.transcript.document.block_index(&identity(0)).context("inline body anchor is missing")?;
+    let first_chunk = if expanded && was_expanded {
+        removed_chunks.min(chunks)
+    } else { 0 };
     let mut removed = previous_heading.retained_bytes();
     let mut retired_target = HashSet::new();
-    for chunk in 0..removed_chunks {
+    for chunk in first_chunk..removed_chunks {
         let block = open.transcript.document.block(&identity(chunk)).context("inline body is missing")?;
         removed += block.retained_bytes();
         retired_target.extend(block.metadata.target.iter().map(|target|target.id.clone()));
     }
-    let hidden_id = BlockId(format!("{call_id}:hidden"));
     let previous_hidden = open.transcript.document.block(&hidden_id).context("inline hidden counter is missing")?;
     removed += previous_hidden.retained_bytes();
     retired_target.extend(previous_hidden.metadata.target.iter().map(|target|target.id.clone()));
     let mut body = Vec::new();
-    for chunk in 0..chunks {
+    for chunk in first_chunk..chunks {
         let mut block = renderer.tool_body(call_id,source,expanded,chunk)?;
         block.metadata.layout = layout.clone();
         body.push(block);
     }
     let mut hidden = renderer.tool_hidden(call_id,source,expanded)?;
     hidden.metadata.layout = layout;
-    let added = heading.retained_bytes() + hidden.retained_bytes() + body.iter().map(forge_buffer::block::BufferBlock::retained_bytes).sum::<usize>();
+    let added = source.retained_bytes().saturating_sub(previous_source_bytes) + heading.retained_bytes() + hidden.retained_bytes() + body.iter().map(forge_buffer::block::BufferBlock::retained_bytes).sum::<usize>();
     let retained = open.retained_bytes.saturating_sub(removed) + added;
     ensure!(retained <= MAX_PROJECTED_BYTES, "inline output exceeds projection capacity");
     let target = body.iter().chain(std::iter::once(&hidden)).flat_map(|block|block.metadata.target.iter().map(|target|target.id.clone())).collect::<Vec<_>>();
-    let changes = vec![TranscriptChange::Block { block:heading },
-        TranscriptChange::ToolBody { owner:owner.clone(),anchor:identity(0),removed:removed_chunks,block:body },
-        TranscriptChange::Block { block:hidden }];
+    let mut changes = vec![TranscriptChange::Block { block:heading }];
+    if !body.is_empty() || first_chunk < removed_chunks {
+        changes.push(TranscriptChange::ToolBody { owner:owner.clone(),
+            anchor:if first_chunk < removed_chunks { identity(first_chunk) } else { hidden_id },
+            removed:removed_chunks - first_chunk,block:body });
+    }
+    changes.push(TranscriptChange::Block { block:hidden });
     let patches = match open.transcript.tool_layout(changes) {
         Ok(patches) => patches,
         Err(failure) => { open.failure = Some(format!("{failure:#}")); return Err(failure); }
@@ -1087,7 +1091,11 @@ fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bo
     entry.target.extend(target);
     entry.bytes = entry.bytes.saturating_sub(removed) + added;
     open.retained_bytes = retained;
-    retain_patches(open,patches)
+    let node = format!("{call_id}:tool");
+    if expanded { open.sections.nodes.tool_limit.insert(node, limit); }
+    else { open.sections.nodes.tool_limit.remove(&node); }
+    let _ = patches;
+    Ok(())
 }
 
 fn reflow(
@@ -1117,7 +1125,7 @@ fn reflow(
     let mut projected = Vec::new();
     let mut retained = 0;
     for (index, entry) in source.into_iter().enumerate() {
-        let entry = project(entry, &width, index > 0, &open.expanded_tool)?;
+        let entry = project(entry, &width, index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
         retained += entry.retained_bytes();
         ensure!(
             retained <= MAX_PROJECTED_BYTES,
@@ -1140,16 +1148,19 @@ fn reflow(
     }
     let patch = open.transcript.replace_scope(blocks, timeline_revision)?;
     for (id, output) in &mut tool {
-        if let Some(mut previous) = open.tool.remove(id) {
-            previous.retain(output);
-            *output = previous;
+        if let Some(mut previous) = open.sections.nodes.tool.remove(id) {
+            if previous.retain(output) {
+                retained += previous.retained_bytes().saturating_sub(output.retained_bytes());
+                *output = previous;
+            }
         }
     }
     open.syntax_done.clear();
     open.entry = entry;
     open.action = action;
     open.syntax = syntax;
-    open.tool = tool;
+    open.sections.nodes.tool = tool;
+    ensure!(retained <= MAX_PROJECTED_BYTES, "retained parser exceeds projection capacity");
     open.retained_bytes = retained;
     open.last_width = width;
     retain_patches(open, patch)
@@ -1195,11 +1206,13 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 changed.push(TranscriptChange::Block { block:replacement.entry.block.into_iter().next().expect("message block") });
             }
             TimelineOperation::ToolOutput { entry_id, exchange_id, call_id, delta, .. } => {
-                let source = open.tool.get_mut(call_id).context("streamed tool cache is missing")?;
+                let node_id = format!("{call_id}:tool");
+                let expanded = open.sections.expansion(&node_id) == Some(true);
+                let limit = open.sections.nodes.tool_limit.get(&node_id).copied().unwrap_or(super::tool::INITIAL_INLINE_BYTES);
+                let source = open.sections.nodes.tool.get_mut(call_id).context("streamed tool cache is missing")?;
                 let before = source.retained_bytes();
-                let expanded = open.expanded_tool.contains(call_id);
-                let old_chunks = if expanded { source.inline_chunks() } else { 1 };
-                let first_chunk = if expanded { source.inline_tail() } else { 0 };
+                let old_chunks = if expanded { source.inline_prefix_chunks(limit)? } else { 1 };
+                let first_chunk = if expanded { source.inline_tail()? } else { 0 };
                 source.append(delta)?;
                 let block_id = forge_buffer::identity::BlockId(format!("{call_id}:tool"));
                 let previous = open.transcript.document.block(&block_id).context("streamed tool block is missing")?;
@@ -1210,7 +1223,15 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 ).max(1);
                 let renderer = super::transcript::TranscriptRenderer::new(&content_width)?;
                 let owner = if open.agent_scope.is_some() { exchange_id } else { entry_id };
-                let chunks = if expanded { source.inline_chunks() } else { 1 };
+                let chunks = if expanded { source.inline_prefix_chunks(limit)? } else { 1 };
+                if expanded && let Some(node) = &previous.metadata.node {
+                    let more = chunks < source.inline_chunks()?;
+                    if node.more != more {
+                        let mut heading = previous.clone();
+                        heading.metadata.node.as_mut().expect("tool node").more = more;
+                        changed.push(TranscriptChange::Block { block:heading });
+                    }
+                }
                 let identity = |chunk| forge_buffer::identity::BlockId(if chunk == 0 { format!("{call_id}:preview") }
                     else { format!("{call_id}:output:{chunk}") });
                 let mut removed = before;
@@ -1263,7 +1284,7 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
             }
             TimelineOperation::Insert { index, entry }
             | TimelineOperation::Replace { index, entry } => {
-                let entry = project(ProjectionSource::Entry(entry), width, *index > 0, &open.expanded_tool)?;
+                let entry = project(ProjectionSource::Entry(entry), width, *index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
                 retained = retained.saturating_sub(
                     open.entry
                         .get(&entry.entry.id)
@@ -1309,13 +1330,14 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
         patch.revision,
         changed,
     )?;
+    let mut retained_tool = HashMap::new();
     for operation in operations {
         let id = match operation {
             TimelineOperation::ToolOutput { .. } | TimelineOperation::Message { .. } => continue,
             TimelineOperation::Insert { entry, .. } | TimelineOperation::Replace { entry, .. } => {
                 entry.id()
             }
-            TimelineOperation::Remove { id, .. } => id.clone(),
+            TimelineOperation::Remove { id, .. } => { open.sections.retire_entry(id); id.clone() },
         };
         if let Some(previous) = open.entry.remove(&id) {
             for target in previous.target {
@@ -1323,7 +1345,7 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 open.action.remove(&target);
             }
             for call in previous.tool {
-                open.tool.remove(&call);
+                if let Some(tool) = open.sections.nodes.tool.remove(&call) { retained_tool.insert(call, tool); }
             }
             for target in previous.syntax {
                 open.syntax_done.remove(&target);
@@ -1332,12 +1354,23 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
         }
     }
     for (id, entry, action, mut tool, syntax) in projected {
-        for tool in tool.values_mut() { tool.own(&id); }
+        for (call, output) in &mut tool {
+            output.own(&id);
+            if let Some(mut previous) = retained_tool.remove(call) {
+                if previous.retain(output) {
+                    let extra = previous.retained_bytes().saturating_sub(output.retained_bytes());
+                    retained += extra;
+                    if let Some(entry) = open.entry.get_mut(&id) { entry.bytes += extra; }
+                    *output = previous;
+                }
+            }
+        }
         open.entry.insert(id, entry);
         open.action.extend(action);
-        open.tool.extend(tool);
+        open.sections.nodes.tool.extend(tool);
         open.syntax.extend(syntax);
     }
+    ensure!(retained <= MAX_PROJECTED_BYTES, "retained parser exceeds projection capacity");
     open.retained_bytes = retained;
     retain_patches(open, patches)
 }
@@ -1379,6 +1412,7 @@ mod tests {
     fn expand_sections(owner: &mut SessionPresentation, view: &str) -> Result<()> {
         let open = owner.open.as_mut().unwrap();
         let ids: Vec<_> = open.transcript.snapshot()?.block.iter()
+            .filter(|block| block.metadata.node.as_ref().is_none_or(|node| node.kind != forge_buffer::node::NodeKind::Tool))
             .flat_map(|block| block.metadata.fold.iter().map(|fold| fold.id.0.clone())).collect();
         for (index, id) in ids.iter().enumerate() {
             open.sections.set(&mut open.transcript, ViewId(view.into()), index as u64 + 1, id, true, false, None)?;
@@ -1406,9 +1440,15 @@ mod tests {
         owner.initialize(vec![entry])?;
         let document = DocumentId("expanded-stream".into());
         owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
-        owner.open.as_mut().unwrap().expanded_tool.insert("active:turn:1:tool".into());
-        toggle_inline_output(owner.open.as_mut().unwrap(),"active:turn:1:tool",true)?;
+        owner.open.as_mut().unwrap().sections.nodes.choice.insert("active:turn:1:tool:tool".into(), true);
+        toggle_inline_output(owner.open.as_mut().unwrap(),"active:turn:1:tool",true, 16 * 1024 * 1024)?;
         expand_sections(&mut owner, "view")?;
+        {
+            let open = owner.open.as_mut().unwrap();
+            open.sections.quota_for_test("active:turn:1:tool:tool", 16 * 1024 * 1024);
+            open.transcript.dirty.insert("active".into());
+            retain_patches(open, Vec::new())?;
+        }
         let opened = owner.snapshot(&document)?;
         assert!(opened.block.iter().map(|block|block.text.row_count()).sum::<usize>() >= 30000);
         let heading = BlockId("active:turn:1:tool:tool".into());
@@ -1418,6 +1458,7 @@ mod tests {
         let heading_pointer = pointer(&owner,&heading);
         let settled_pointer = pointer(&owner,&settled);
         let mut revision = opened.revision;
+        let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
         for iteration in 0..100 {
             let event = BackendEvent {
             received_at_ms: None, address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
@@ -1430,12 +1471,14 @@ mod tests {
             let sync = owner.sync(&document,revision)?;
             assert!(sync.snapshot.is_none());
             for patch in sync.patch {
-                assert!(patch.metadata_edit.iter().all(|edit|edit.block != heading && edit.block != settled));
+                assert!(patch.metadata_edit.iter().all(|edit|edit.block != settled));
                 assert!(patch.text_edit.iter().map(|edit|edit.text.byte_count()).sum::<usize>() < 20000);
                 revision = patch.next;
             }
             assert_eq!(pointer(&owner,&heading),heading_pointer);
             assert_eq!(pointer(&owner,&settled),settled_pointer);
+            assert_eq!(owner.open.as_ref().unwrap().sections.projected_entries, projected_entries,
+                "a streamed tail rebuilt the containing exchange");
         }
         assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("new 99 🦀"))));
         refresh_activity(owner.open.as_mut().unwrap(), &[TimelineEntry::Exchange {
@@ -1443,7 +1486,7 @@ mod tests {
         }])?;
         let timed_heading = owner.open.as_ref().unwrap().transcript.document.block(&heading).unwrap().text.row(0).unwrap().to_owned();
         assert_eq!(pointer(&owner,&settled),settled_pointer);
-        toggle_inline_output(owner.open.as_mut().unwrap(),"active:turn:1:tool",false)?;
+        toggle_inline_output(owner.open.as_mut().unwrap(),"active:turn:1:tool",false, super::super::tool::INITIAL_INLINE_BYTES)?;
         let collapsed_heading = owner.open.as_ref().unwrap().transcript.document.block(&heading).unwrap().text.row(0).unwrap();
         let column = |text: &str| WidthProfile::default().cells(&text[..text.find("Read output").unwrap()], 0).unwrap();
         assert_eq!(column(&timed_heading), column(collapsed_heading),
@@ -1470,16 +1513,18 @@ mod tests {
         owner.initialize(vec![interaction_entry("settled"),entry])?;
         let document = DocumentId("streamed-message".into());
         let opened = owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
-        let tool = owner.open.as_ref().unwrap().tool["active:turn:1:tool"].preview(true).row.into_iter().map(str::to_owned).collect::<Vec<_>>();
+        let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
+        let tool = owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"].preview(true)?.row.into_iter().map(str::to_owned).collect::<Vec<_>>();
         event.text = Some("\n\nMore **text** with λ.".into());
         exchange.observe_turn(&event,3)?;
         let patch = owner.update_message(&exchange,&event)?.expect("owned message");
         assert!(matches!(&patch.operation[..],[TimelineOperation::Message { index:1,.. }]));
         let sync = owner.sync(&document,opened.transcript.revision)?;
         assert!(sync.snapshot.is_none() && !sync.patch.is_empty());
+        assert_eq!(owner.open.as_ref().unwrap().sections.projected_entries, projected_entries);
         assert!(sync.patch.iter().all(|patch|patch.block_edit.is_empty()
             && patch.metadata_edit.iter().all(|edit|!edit.block.0.contains("settled") && !edit.block.0.ends_with(":tool"))));
-        assert_eq!(owner.open.as_ref().unwrap().tool["active:turn:1:tool"].preview(true).row,tool);
+        assert_eq!(owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"].preview(true)?.row,tool);
         assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("More **text**"))));
         Ok(())
     }
@@ -1522,7 +1567,7 @@ mod tests {
             assert!(patch.metadata_edit.iter().all(|metadata| !metadata.block.0.contains("history-")));
             assert!(patch.text_edit.iter().all(|edit| edit.removed_rows <= 1));
         }
-        assert!(owner.open.as_ref().unwrap().tool["active:turn:1:tool"].preview(true).row.contains(&"seventh"));
+        assert!(owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"].preview(true)?.row.contains(&"seventh"));
         Ok(())
     }
 
@@ -1782,9 +1827,9 @@ mod tests {
             view: view.clone(),
             sequence: InputSequence(1),
             action: "activate".into(),
-            block: BlockId("first:turn:1:tool:preview".into()),
+            block: BlockId("first:turn:1:tool:tool".into()),
             position: TextPosition { row: 0, column: 8 },
-            target: Some(TargetId("first:turn:1:tool:preview:tool".into())),
+            target: Some(TargetId("first:turn:1:tool:tool".into())),
         };
         owner.dispatch(PresentationRequest::Resize {
             document: document.clone(),
@@ -1798,20 +1843,18 @@ mod tests {
             input: changed, previous: true,
         }).is_err());
         let mut changed = input.clone();
-        changed.target = Some(TargetId("second:turn:1:tool:preview:tool".into()));
-        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: changed }).is_err());
+        changed.target = Some(TargetId("second:turn:1:tool:tool".into()));
+        assert!(owner.action(changed).is_err());
         let mut changed = input.clone();
         changed.document = DocumentId("transcript:other".into());
-        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: changed }).is_err());
+        assert!(owner.action(changed).is_err());
         let mut changed = input.clone();
         changed.revision = forge_buffer::identity::DocumentRevision(
             owner.snapshot(&document)?.revision.0 + 1,
         );
-        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: changed }).is_err());
-        assert_eq!(owner.dispatch(PresentationRequest::ToggleTool {
-            input: input.clone(),
-        })?["expanded"], true);
-        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: input.clone() }).is_err());
+        assert!(owner.action(changed).is_err());
+        assert!(matches!(owner.action(input.clone())?, TranscriptAction::Tool { .. }));
+        assert!(owner.action(input.clone()).is_err());
         let mut next = input.clone();
         next.sequence = InputSequence(2);
         owner.dispatch(PresentationRequest::ToolOpen {
@@ -1819,74 +1862,151 @@ mod tests {
         })?;
         owner.reconcile(vec![interaction_entry("second")])?;
         next.sequence = InputSequence(3);
-        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: next }).is_err());
+        assert!(owner.action(next).is_err());
         Ok(())
     }
 
     #[test]
-    fn tool_preview_expands_from_output_and_survives_reflow() -> Result<()> {
-        use forge_buffer::{block::TextPosition, identity::BlockId};
+    fn streaming_pages_publish_continuations_without_exceeding_the_loaded_row_budget() -> Result<()> {
+        use crate::backend::{BackendEvent,ProviderAddress,ToolActivity,ToolActivityKind};
+        use super::super::nodes::{NodeAction,NodeRequest};
+        for (rows, initial, delta) in [
+            (4096, format!("{}\n", "x".repeat(1500)).repeat(40), format!("{}\n", "y".repeat(1500)).repeat(10)),
+            (8, "initial\n".repeat(6), "appended\n".repeat(40)),
+        ] {
+            let mut value = serde_json::to_value(interaction_entry("active"))?;
+            value["exchange"]["state"] = serde_json::json!("running");
+            value["exchange"]["completed_at_ms"] = serde_json::Value::Null;
+            value["exchange"]["execution_started_at_ms"] = serde_json::json!(1);
+            value["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(initial);
+            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
+            value["exchange"]["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
+            let mut exchange:Exchange = serde_json::from_value(value["exchange"].take())?;
+            let mut owner = SessionPresentation::new("session".into());
+            owner.initialize(vec![TimelineEntry::Exchange { id:"active".into(),created_at_ms:0,
+                exchange:exchange.clone(),agent_by_id:HashMap::new() }])?;
+            let document = DocumentId("stream-page".into());
+            let view = ViewId("view".into());
+            owner.open(document.clone(),view.clone(),WidthProfile::default())?;
+            expand_sections(&mut owner, "view")?;
+            let node = "active:turn:1:tool:tool";
+            let generation = owner.open.as_ref().unwrap().sections.nodes.generation(node).unwrap();
+            owner.dispatch(PresentationRequest::Node { request:NodeRequest { document:document.clone(),view,
+                sequence:100,node:node.into(),generation,action:NodeAction::SetExpansion { expanded:true },
+                rows,width:WidthProfile::default() } })?;
+            let projected = owner.open.as_ref().unwrap().sections.projected_entries;
+            let event = BackendEvent { received_at_ms:None,
+                address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
+                turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10}),
+                summary:None,task_update:None,activity:Some(ToolActivity { id:"tool".into(),
+                    kind:ToolActivityKind::Command,title:"Read output".into(),output:Some(delta),
+                    status:Some("inProgress".into()),output_delta:true,change:Default::default() }) };
+            exchange.observe_turn(&event,10)?;
+            owner.append_tool_output(&exchange,&event)?;
+            let snapshot = owner.snapshot(&document)?;
+            let state = snapshot.block.iter().filter_map(|block|block.metadata.node.as_ref())
+                .find(|state|state.id.0 == node).unwrap();
+            assert!(state.more, "stream growth lost its continuation");
+            assert!(state.loaded_rows <= rows + 1, "stream growth exceeded the page row budget");
+            assert_eq!(owner.open.as_ref().unwrap().sections.projected_entries,projected,
+                "stream growth rebuilt the exchange instead of the tool subtree");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn tool_pages_format_only_the_requested_prefix_and_retain_previous_chunks() -> Result<()> {
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use forge_buffer::identity::BlockId;
+        let output = (0..512).map(|row|format!("row {row:03} {}\n", "x".repeat(2000))).collect::<String>();
+        let mut entry = serde_json::to_value(interaction_entry("paged"))?;
+        entry["exchange"]["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(output);
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![TimelineEntry::Exchange { id:"paged".into(), created_at_ms:0,
+            exchange:serde_json::from_value(entry["exchange"].take())?, agent_by_id:HashMap::new() }])?;
+        let document = DocumentId("paged-tools".into());
+        let view = ViewId("view:paged".into());
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        expand_sections(&mut owner, "view:paged")?;
+        let node = "paged:turn:1:tool:tool";
+        let generation = owner.open.as_ref().unwrap().sections.nodes.generation(node).unwrap();
+        let request = |action, sequence| PresentationRequest::Node { request: NodeRequest {
+            document: document.clone(), view: view.clone(), sequence, node: node.into(), generation,
+            action, rows: 4096, width: WidthProfile { columns:256, ..WidthProfile::default() },
+        } };
+        owner.dispatch(request(NodeAction::SetExpansion { expanded:true }, 100))?;
+        let first = BlockId("paged:turn:1:tool:preview".into());
+        let later = BlockId("paged:turn:1:tool:output:4".into());
+        let pointer = |owner:&SessionPresentation| owner.open.as_ref().unwrap().transcript.document
+            .block(&first).unwrap().text.row(0).unwrap().as_ptr();
+        let retained = pointer(&owner);
+        assert!(owner.open.as_ref().unwrap().transcript.document.block(&later).is_none(),
+            "initial expansion formatted beyond its 64 KiB source prefix");
+        let mut sequence = 101;
+        while owner.snapshot(&document)?.block.iter().any(|block|block.metadata.node.as_ref()
+            .is_some_and(|state|state.id.0 == node && state.more)) {
+            assert!(sequence < 140, "tool paging made no progress");
+            owner.dispatch(request(NodeAction::LoadMore, sequence))?;
+            assert_eq!(pointer(&owner), retained, "paging reformatted the retained prefix");
+            sequence += 1;
+        }
+        assert!(owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter()
+            .any(|row|row.contains("row 511"))), "last tool row was lost during paging");
+        owner.dispatch(request(NodeAction::SetExpansion { expanded:false }, sequence))?;
+        owner.dispatch(request(NodeAction::SetExpansion { expanded:true }, sequence + 1))?;
+        assert!(owner.open.as_ref().unwrap().transcript.document.block(&later).is_none(),
+            "reopening retained obsolete source pages");
+        Ok(())
+    }
+
+    #[test]
+    fn node_expansion_owns_full_output_and_survives_reflow() -> Result<()> {
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use forge_buffer::identity::BlockId;
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![interaction_entry("first")])?;
-        let document = DocumentId("transcript:toggle".into());
-        let view = ViewId("view:toggle".into());
+        let document = DocumentId("transcript:nodes".into());
+        let view = ViewId("view:nodes".into());
         owner.open(document.clone(), view.clone(), WidthProfile::default())?;
-        expand_sections(&mut owner, "view:toggle")?;
-        let opened = PresentationOpen { syntax_pending: false, transcript: owner.snapshot(&document)? };
-        let block = BlockId("first:turn:1:tool:preview".into());
-        let mut input = DocumentInput {
-            document: document.clone(),
-            revision: opened.transcript.revision,
-            view: view.clone(),
-            sequence: InputSequence(1),
-            action: "activate".into(),
-            block: block.clone(),
-            position: TextPosition { row: 0, column: 8 },
-            target: Some(TargetId(format!("{}:tool",block.0))),
+        expand_sections(&mut owner, "view:nodes")?;
+        let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
+        let node = "first:turn:1:tool:tool";
+        let generation = owner.open.as_ref().unwrap().sections.nodes.generation(node).unwrap();
+        let request = |expanded, sequence, generation| PresentationRequest::Node { request: NodeRequest {
+            document: document.clone(), view: view.clone(), sequence, node: node.into(), generation,
+            action: NodeAction::SetExpansion { expanded }, rows: 48, width: WidthProfile::default(),
+        } };
+        owner.dispatch(request(true, 100, generation))?;
+        let text = |owner: &SessionPresentation| -> Result<Vec<String>> {
+            Ok(owner.snapshot(&document)?.block.into_iter().flat_map(|block| block.text.wire_rows()
+                .into_iter().map(str::to_owned).collect::<Vec<_>>()).collect())
         };
-        assert_eq!(
-            owner.dispatch(PresentationRequest::ToggleTool {
-                input: input.clone()
-            })?["expanded"],
-            true
-        );
-        assert!(
-            owner
-                .dispatch(PresentationRequest::ToggleTool {
-                    input: input.clone()
-                })
-                .is_err()
-        );
-        owner.dispatch(PresentationRequest::Resize {
-            document: document.clone(),
-            view,
-            width: WidthProfile {
-                columns: 65,
-                ..WidthProfile::default()
-            },
-        })?;
+        assert!(text(&owner)?.iter().any(|row| row.contains("sixth")));
+        let invalid = NodeRequest {
+            document: document.clone(), view: view.clone(), sequence: 101, node: node.into(), generation,
+            action: NodeAction::SetExpansion { expanded: false }, rows: 0, width: WidthProfile::default(),
+        };
+        assert!(owner.dispatch(PresentationRequest::Node { request: invalid }).is_err());
+        assert!(text(&owner)?.iter().any(|row| row.contains("sixth")), "invalid request changed the committed frame");
+        owner.dispatch(request(false, 99, generation))?;
+        assert!(text(&owner)?.iter().any(|row| row.contains("sixth")), "stale action changed expansion");
+        assert!(owner.dispatch(request(false, 101, generation + 1)).is_err());
+        owner.dispatch(PresentationRequest::Resize { document: document.clone(), view: view.clone(),
+            width: WidthProfile { columns: 65, ..WidthProfile::default() } })?;
+        assert!(text(&owner)?.iter().any(|row| row.contains("sixth")));
+        owner.dispatch(request(false, 102, generation))?;
         let snapshot = owner.snapshot(&document)?;
-        let expanded = snapshot
-            .block
-            .iter()
-            .find(|candidate| candidate.id == block)
-            .unwrap();
-        assert!(expanded.text.wire_rows().contains(&"    sixth"));
-        input.revision = snapshot.revision;
-        input.sequence = InputSequence(2);
-        assert_eq!(
-            owner.dispatch(PresentationRequest::ToggleTool { input })?["expanded"],
-            false
-        );
-        let snapshot = owner.snapshot(&document)?;
-        let collapsed = snapshot
-            .block
-            .iter()
-            .find(|candidate| candidate.id == block)
-            .unwrap();
-        assert!(snapshot.block.iter().find(|block|block.id.0 == "first:turn:1:tool:hidden")
-            .unwrap().text.wire_rows().contains(&"    …(2 hidden)"));
-        assert!(!collapsed.text.wire_rows().contains(&"    sixth"));
+        assert!(snapshot.block.iter().all(|block| block.id != BlockId("first:turn:1:tool:preview".into())));
+        assert!(!text(&owner)?.iter().any(|row| row.contains("hidden") || row.contains("sixth")));
+        owner.dispatch(request(true, 103, generation))?;
+        assert!(text(&owner)?.iter().any(|row| row.contains("sixth")));
+        // Resizing reflows once. Node toggles use only their indexed subtree.
+        assert_eq!(owner.open.as_ref().unwrap().sections.projected_entries, projected_entries + 1);
+        owner.reconcile(Vec::new())?;
+        owner.reconcile(vec![interaction_entry("first")])?;
+        assert!(owner.open.as_ref().unwrap().sections.nodes.generation(node).unwrap() > generation);
+        assert!(owner.dispatch(request(true, 104, generation)).is_err(), "retired node accepted an old action");
         Ok(())
     }
 
@@ -1906,7 +2026,7 @@ mod tests {
                 .transcript
                 .block
                 .iter()
-                .any(|block| !block.metadata.fold.is_empty())
+                .any(|block| block.metadata.node.is_some())
         );
         let mut input = DocumentInput {
             document: document.clone(),
@@ -2145,7 +2265,7 @@ mod tests {
         owner.append_tool_output(&interaction,&event)?.expect("scoped output");
         let update = owner.sync(&document,selected.revision)?;
         assert!(update.snapshot.is_none() && update.patch.iter().all(|patch|patch.block_edit.is_empty()));
-        assert!(owner.open.as_ref().unwrap().tool["child:turn:1:tool"].preview(true).row.contains(&"scoped output"));
+        assert!(owner.open.as_ref().unwrap().sections.nodes.tool["child:turn:1:tool"].preview(true)?.row.contains(&"scoped output"));
         owner.reconcile(vec![interaction_entry("other-main"), agent])?;
         assert_eq!(owner.open.as_ref().unwrap().pending_submission, Some(1));
         owner.dispatch(PresentationRequest::SelectAgent {

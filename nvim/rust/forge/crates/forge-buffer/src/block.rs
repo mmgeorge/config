@@ -143,6 +143,12 @@ pub struct DeferredSection {
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Node state is published atomically with this heading's materialized text.
+    pub node: Option<crate::node::NodeState>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Immediate node owning this content block, including non-heading output chunks.
+    pub content_node: Option<FoldId>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub section: Vec<DeferredSection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -180,7 +186,9 @@ impl BlockMetadata {
     /// Charge retained vector storage and nested strings without serializing metadata.
     fn allocated_bytes(&self) -> usize {
         use std::mem::size_of;
-        self.section.capacity() * size_of::<DeferredSection>()
+        self.content_node.as_ref().map_or(0, |node| node.0.capacity()) + self.node.as_ref().map_or(0, |node| node.id.0.capacity()
+            + node.parent.as_ref().map_or(0, |parent| parent.0.capacity()))
+            + self.section.capacity() * size_of::<DeferredSection>()
             + self.section.iter().map(|section| section.id.0.capacity()).sum::<usize>()
             + self.target.capacity() * size_of::<TargetRange>()
             + self.collapse.capacity() * size_of::<Collapse>()
@@ -285,6 +293,14 @@ impl BufferBlock {
             }
         }
         self.id.validate()?;
+        if let Some(node) = &self.metadata.content_node { node.validate()?; }
+        if let Some(node) = &self.metadata.node {
+            node.id.validate()?;
+            if let Some(parent) = &node.parent { parent.validate()?; }
+            if node.generation > crate::MAX_COUNTER || node.content_revision > crate::MAX_COUNTER {
+                return Err(ContractError("node revision exceeds the exact counter range"));
+            }
+        }
         for section in &self.metadata.section {
             section.id.validate()?;
             if section.revision > crate::MAX_COUNTER {

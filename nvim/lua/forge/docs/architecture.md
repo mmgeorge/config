@@ -194,11 +194,49 @@ expansion captures its viewport after the response, immediately before publicati
 editable-text changes capture cursors inside the scheduled rollback, not when queuing it.
 Action-target snapshots remain separate and only validate whether a response still applies.
 
-Each tool owns independent command-heading, preview, and hidden-count blocks. Expanding output
-replaces only that tool's body with stable 16 KiB source chunks. Subsequent deltas render only
-the last mutable chunk and newly appended chunks. UTF-8 boundaries remain stable across appends.
-Native actions map every output chunk to the same tool call, and collapse restores the four-row
-preview without rebuilding other timeline entries. Timer updates replace headings independently.
+`NodeMap` owns the shared expansion choices, node incarnations, and tool output sources for
+one open Harness presentation. Emitted nodes identify exchanges, messages, tool groups,
+tools, changes, files, and hunks. Each node separates its source lifecycle, automatic display,
+explicit expansion override, and loaded extent. `NodeState` travels inside block metadata,
+so the same atomic publication changes the text, node state, and native fold range.
+Content blocks carry the owning node identity, allowing Tab on output rows to address the
+same node as its heading. The protocol version changes with this shared contract.
+
+Lua sends `node` actions with a view sequence and node generation. `set_expansion` changes
+explicit intent, `load_more` extends a loaded page, and `retry_loading` retries after a
+reported failure. Rust rejects a retired generation before materializing content. All windows
+showing one presentation share the choice. Closing a parent preserves child choices, and
+closing a single window preserves the choices of the remaining windows. A per-node intent
+sequence also rejects an older request from another attached view. The last window
+releases the presentation's expansion state. Deleting a canonical entry retires its nodes,
+while scope switching retains their choices for a return to that scope.
+
+Each tool retains independent heading and output blocks. Explicit expansion materializes
+its output through stable 16 KiB source chunks and a bounded loaded page. The initial
+formatted source prefix is at most 64 KiB before wrapping. Later page requests extend that
+prefix without reformatting existing chunks. Raw output beyond the prefix stays retained
+without formatted blocks, including subsequent streamed tails. Reflow preserves the
+requested source extent. Closing and reopening the tool resets it to the initial prefix.
+Tool and file
+pages start at two viewport heights and extend when their boundary approaches the viewport. The latest tool in
+an active group receives the automatic four-row preview. Settled groups default to headings,
+and an explicit closure suppresses the preview. Closing a node removes its materialized body
+without inserting a blank placeholder. Parent closure also drops descendant page quotas
+while retaining their explicit choices. The heading's node metadata remains actionable even
+when no native fold exists. Both top-level and nested caret markers read that node state,
+so an unloaded body does not remove its expansion affordance.
+
+Ordinary message updates replace their indexed block. Streamed tool tails splice only the
+changed output chunks and update the owning node metadata. Hidden chunks produce no body
+patch. `SectionProjection` retains a complete-block index so these updates do not reproject
+the containing exchange. Structural changes and partially loaded blocks use the subtree
+projection path. Expansion and paging project only the indexed node subtree. Pending parent
+and child actions coalesce at the outermost affected node and resolve the latest choices
+before projection. Subtree replacement and enclosing fold endpoint rebasing share one
+validated document edit. Native folds follow the published node display rather than keeping a
+second Harness expansion preference. After a body splice repairs fold endpoints, subsequent
+heading updates preserve the current loaded ranges at application time. They cannot restore
+fold metadata captured before the splice.
 
 Tool activation binds to the captured document, view, block, and target identity. A later
 transcript revision can still activate that same retained tool target, so streaming output
@@ -210,8 +248,8 @@ Lazy section projection preserves zero-row blocks as empty anchors. An empty hid
 block consumes no page budget and cannot mark a tool group as truncated. This prevents
 spurious blank rows and repeated page requests after all source content has loaded.
 
-Section expansion prepares its next view intent, quota, and rendered prefix before committing
-them. A continuation requires an existing continuation marker and must advance the final
+Section expansion validates its next node choice, quota, and rendered prefix together.
+A failed preparation restores only that node's previous choice and quota. A continuation requires an existing continuation marker and must advance the final
 loaded block or finish the section. Failed preparation preserves the previous expansion state.
 Projection refresh retains dirty entries until publication succeeds. A publication failure
 invalidates the native presentation and requires reopening rather than serving a partial frame.
@@ -229,6 +267,11 @@ Admission accounting conservatively charges the full retained storage to each ow
 Serialization visits rows directly without allocating an intermediate row vector. Pending
 patch sizing uses a counting writer instead of retaining another encoded copy.
 
+Closed historical tool sources retain raw output without constructing a parser or row index.
+The first preview, expansion, or separate output view initializes the incremental parser.
+Subsequent deltas reuse it, including partial ANSI sequences. Heading replacements retain the
+parser when the saved source version is unchanged.
+
 `ToolOutputSnapshot` shares raw output, normalized display text, and row offsets with the live
 tool view. It owns an independent pagination cursor and cannot append. Creating an output
 window neither copies nor reparses the saved output. A subsequent live append copies shared
@@ -242,7 +285,7 @@ The timeline copy audit retains these ownership boundaries:
 | Canonical events and timeline state | Changed exchanges and deltas own their mutable strings independently. Patches own changed entries until delivery. Settled history is borrowed during reconciliation. |
 | Reconciliation comparison cache | Serialized values support exact content comparison. The working reconciliation uses references to those values and entries, preserving rollback without another history copy. |
 | Rendered text and Markdown jobs | Text and fenced-code maps share immutable storage. Metadata remains independently owned where projection rewrites coordinates or fold endpoints. |
-| Section preparation | Expansion intent and quota maps are copied before validation. They contain identifiers and layout values, not transcript bodies. Failed preparation leaves committed state intact. |
+| Node preparation | One previous expansion choice and page quota support rollback. Streaming splices retain block identities and share immutable text, without copying the complete choice map or exchange body. |
 | Native Lua adoption | Lua copies changed metadata tables because normalization and decoration preparation mutate them. Lua strings remain shared, and patch adoption does not deep-copy transcript text or the full block sequence. |
 | Transport | Encoding creates the wire payload. Decoding creates the receiving process's strings. These process-boundary copies remain necessary. |
 

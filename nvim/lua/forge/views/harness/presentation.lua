@@ -263,11 +263,10 @@ function M.open(options, callback)
   end)
 
   local function section_state(id)
-    local record = owner.transcript.fold and owner.transcript.fold.record[id]
-    local block = record and owner.transcript.block[record.owner]
-    for _, section in ipairs(block and block.metadata.section or {}) do
-      if section.id == id then return section end
-    end
+    local header = owner.transcript.node_owner[id]
+    local block = header and owner.transcript.block[header]
+    local node = block and block.metadata.node
+    if node and node ~= vim.NIL then return node end
   end
 
   local function clear_opening(window, id)
@@ -329,9 +328,8 @@ function M.open(options, callback)
         if not view or view.id ~= pending.view or not vim.api.nvim_win_is_valid(window)
           or vim.api.nvim_win_get_buf(window) ~= options.transcript_buffer or not section then
           clear_opening(window, id)
-        elseif pending.ready and section.open then
+        elseif pending.ready and section.display ~= "heading" then
           clear_opening(window, id)
-          require("forge.folds").set_open(owner.transcript, window, id, true)
         elseif pending.ready then
           clear_opening(window, id)
           section_failed(id, "The requested content was not published. Reopen the section to retry.")
@@ -433,7 +431,10 @@ function M.open(options, callback)
     if not alive() or not owner.ready or owner.failure then return end
     local view = selected_view or action_view()
     if not view then return end
+    local node = section_state(section)
+    if not node then return end
     owner.section_failure = owner.section_failure or {}
+    local retry = expanded and not more and owner.section_failure[section] ~= nil
     if expanded and not more then
       owner.section_failure[section] = nil
       if owner.section_page then owner.section_page[section] = nil end
@@ -455,8 +456,9 @@ function M.open(options, callback)
     owner.section_inflight[view.id] = pending
     pending[section] = { sequence = sequence, ready = false, view = view.id,
       more = more, boundary = more and page_boundary(section) or nil }
-    request({ operation = "section_expansion", document = identity, view = view.id,
-      sequence = sequence, section = section, expanded = expanded, more = more or false,
+    request({ operation = "node", document = identity, view = view.id,
+      sequence = sequence, node = section, generation = node.generation,
+      action = more and "load_more" or (retry and "retry_loading" or "set_expansion"), expanded = expanded,
       rows = 2 * vim.api.nvim_win_get_height(view.window),
       width = require("forge.width").capture(view.window) }, function(_, failure)
       if not alive() then return end
@@ -491,7 +493,7 @@ function M.open(options, callback)
       return true
     end
     local section = section_state(id)
-    if not section or section.open then return false end
+    if not section or section.display ~= "heading" then return false end
     opening = opening or {}
     loading[window] = opening
     opening[id] = { view = view.id, ready = false }
@@ -530,12 +532,8 @@ function M.open(options, callback)
                 local failed = owner.section_failure and owner.section_failure[section.id]
                 if not active and not (loading and loading[section.id]) then
                   local expanded = closed == -1
-                  local intent = owner.section_intent and owner.section_intent[view.id] or {}
-                  if not section.more and row <= last and ((intent[section.id] ~= nil and intent[section.id] ~= expanded)
-                    or (intent[section.id] == nil and expanded ~= section.open)) and (not expanded or not failed) then
-                    admitted = admitted + 1
-                    owner.set_section(section.id, expanded, false, view)
-                  elseif expanded and section.more and intent[section.id] ~= false
+                  local node = section_state(section.id)
+                  if expanded and section.more and node and node.display ~= "heading"
                     and not failed
                     and owner.section_page[section.id] ~= page_boundary(section.id) then
                     owner.section_page[section.id] = page_boundary(section.id)
@@ -553,13 +551,26 @@ function M.open(options, callback)
   end
 
   function owner.toggle_heading(window)
-    return require("forge.folds").toggle_heading(owner.transcript, window, {
-      before_toggle = function(section, opening)
-        if opening and owner.defer_open(window, section) then return false end
-        return true
-      end,
-      on_toggled = function(section, closed) owner.set_section(section, not closed, false, view_for(window)) end,
-    })
+    if not alive() or not owner.ready or owner.failure then return false end
+    local cursor = vim.api.nvim_win_get_cursor(window)
+    local location = replica.locate(owner.transcript, cursor[1] - 1, cursor[2])
+    local block = location and owner.transcript.block[location.block]
+    local node = block and block.metadata.node
+    if (not node or node == vim.NIL) and block and block.metadata.content_node then
+      node = section_state(block.metadata.content_node)
+    end
+    if not node or node == vim.NIL or node.kind == "message" then return false end
+    local view = view_for(window)
+    if not view then return false end
+    local desired = node.display ~= "full"
+    if section_pending(node.id) then
+      local intent = owner.section_intent and owner.section_intent[view.id]
+      if intent and intent[node.id] ~= nil then desired = not intent[node.id] end
+    end
+    if desired and owner.defer_open(window, node.id) then return true end
+    clear_opening(window, node.id)
+    owner.set_section(node.id, desired, false, view)
+    return true
   end
 
   function owner.highlight()
@@ -573,20 +584,6 @@ function M.open(options, callback)
     end)
   end
 
-  ---@return boolean
-  function owner.toggle_tool()
-    if not alive() or not owner.ready or owner.failure then return false end
-    local view = action_view()
-    if not view then return false end
-    local captured, failure = input.capture(owner.transcript, view, "activate")
-    if not captured then notice(failure) return true end
-    if not captured.target or not captured.target:match(":tool$") then return false end
-    request({ operation = "toggle_tool", input = captured }, function(_, action_error)
-      if not alive() then return end
-      if action_error then notice(action_error) else owner.sync() end
-    end)
-    return true
-  end
 
   function owner.activate(callback)
     if not alive() or not owner.ready or owner.failure then return end

@@ -34,7 +34,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         chunk: usize) -> Result<BufferBlock> {
         let id = if chunk == 0 { format!("{call_id}:preview") } else { format!("{call_id}:output:{chunk}") };
         let rows = if expanded {
-            let source = output.inline_chunk(chunk);
+            let source = output.inline_chunk(chunk)?;
             if source.is_empty() && chunk == 0 { tool_body_rows(self.profile,"no output",true)? }
             else {
                 let mut rows = Vec::new();
@@ -43,13 +43,13 @@ impl<'profile> TranscriptRenderer<'profile> {
                 }
                 rows
             }
-        } else { preview_rows(self.profile,&output.preview(false))?.0 };
+        } else { preview_rows(self.profile,&output.preview(false)?)?.0 };
         self.output_block(BlockId(id),rows)
     }
 
     /// Changes hidden output counts without replacing the heading or its preview.
     pub(super) fn tool_hidden(&self, call_id: &str, output: &ToolOutputView, expanded: bool) -> Result<BufferBlock> {
-        let hidden = if expanded { 0 } else { preview_rows(self.profile,&output.preview(false))?.1 };
+        let hidden = if expanded { 0 } else { preview_rows(self.profile,&output.preview(false)?)?.1 };
         let rows = if hidden == 0 { Vec::new() }
             else { tool_body_rows(self.profile,&format!("…({hidden} hidden)"),false)? };
         self.output_block(BlockId(format!("{call_id}:hidden")),rows)
@@ -57,7 +57,10 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     fn output_block(&self, id: BlockId, rows: Vec<String>) -> Result<BufferBlock> {
         let text = BufferText::from_rows(rows)?;
-        let mut block = BufferBlock { id, text, metadata:BlockMetadata::default() };
+        let call = id.0.strip_suffix(":preview").or_else(|| id.0.split_once(":output:").map(|(call, _)|call))
+            .or_else(||id.0.strip_suffix(":hidden"));
+        let content_node = call.map(|call| forge_buffer::identity::FoldId(format!("{call}:tool")));
+        let mut block = BufferBlock { id, text, metadata:BlockMetadata { content_node, ..Default::default() } };
         if block.text.row_count() > 0 {
             let range = TextRange { start:TextPosition { row:0,column:0 },
                 end:TextPosition { row:block.text.row_count(),column:0 } };
@@ -72,6 +75,8 @@ impl<'profile> TranscriptRenderer<'profile> {
             kind,elapsed_ms,failed,title,expanded)?;
         block.metadata.layout = previous.metadata.layout.clone();
         block.metadata.fold = previous.metadata.fold.clone();
+        block.metadata.node = previous.metadata.node.clone();
+        block.metadata.content_node = previous.metadata.content_node.clone();
         for fold in &mut block.metadata.fold {
             if fold.end.block == block.id && fold.end.position.row == previous.text.row_count() {
                 fold.end.position.row = block.text.row_count();
@@ -779,7 +784,7 @@ mod test {
             Some(2000),
             true,
             "docs_lookup(crate, Item)",
-            &output.preview(false),
+            &output.preview(false)?,
             false,
         )?;
 
@@ -827,7 +832,7 @@ mod test {
         let render = |expanded| renderer.tool_preview(
             BlockId("wrapped:tool".into()), TargetId("wrapped:tool".into()),
             "command", Some(10), false, "inspect",
-            &output.preview(expanded), expanded,
+            &output.preview(expanded)?, expanded,
         );
         let preview = render(false)?;
         let rows = preview.text.wire_rows();

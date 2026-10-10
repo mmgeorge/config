@@ -31,7 +31,7 @@ state.presentation = {
     if location and location.target == "presented" then callback({ kind = "question", question_set_id = "scope-set" }) end
   end,
   open_output = function() return false end,
-  toggle_tool = function() return false end,
+  toggle_heading = function(window) return folds.toggle_heading(transcript, window) end,
 }
 client.subscribe = function() return function() end end
 controller.render = function() end

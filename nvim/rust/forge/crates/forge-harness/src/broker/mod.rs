@@ -116,7 +116,7 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
     let width = forge_buffer::width::WidthProfile { columns: 100, ..Default::default() };
     let mut lines = Vec::new();
     for (index, entry) in timeline.iter().rev().take(20).rev().enumerate() {
-        let projected = crate::buffer::projection::project(entry, &width, index > 0, &Default::default())?;
+        let projected = crate::buffer::projection::project(entry, &width, index > 0, &Default::default(), &Default::default())?;
         for block in crate::buffer::sections::preview(projected.entry)?.block {
             for row in block.text.wire_rows() {
                 if lines.len() >= 200 { return Ok(lines); }
@@ -8028,7 +8028,7 @@ mod test {
     /// Render persisted timeline state through the native document projection.
     fn timeline_text(snapshot: &BrokerSnapshot) -> String {
         snapshot.timeline.iter().flat_map(|entry| {
-            let rendered = crate::buffer::projection::project(entry, &Default::default(), false, &Default::default()).unwrap();
+            let rendered = crate::buffer::projection::project(entry, &Default::default(), false, &Default::default(), &Default::default()).unwrap();
             rendered.entry.block.into_iter().flat_map(|block|
                 (0..block.text.row_count()).map(|row| block.text.row(row).unwrap().to_owned()).collect::<Vec<_>>()
             ).collect::<Vec<_>>()
@@ -10260,7 +10260,8 @@ mod test {
             },
             &forge_buffer::width::WidthProfile::default(),
             false,
-            &std::collections::HashSet::new(),
+            &std::collections::HashMap::new(),
+            &std::collections::HashMap::new(),
         )
         .unwrap();
         let summary = rendered

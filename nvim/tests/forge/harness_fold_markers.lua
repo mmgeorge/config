@@ -22,6 +22,13 @@ if vim.g.forge_fold_marker_child then
     id = "exchange-inner", start = { row = 0, column = 0 },
     ["end"] = { block = "tool", position = { row = 1, column = 0 } }, closed = false,
   }
+  local function deferred(id, text, marker, indent)
+    local item = block(id, text, marker, indent)
+    item.metadata.node = { id = id, kind = "tool_group", lifecycle = "settled", generation = 1,
+      content_revision = 0, loaded_rows = 0, loaded_bytes = 0, more = false,
+      order = 0, display = "heading", default_display = "heading" }
+    return item
+  end
   assert(replica.apply_snapshot(owner, { document = owner.document, revision = 0, block = {
     block("prompt", "● /execute last", "●"),
     block("event", "◇ Plan accepted", "◇"),
@@ -31,6 +38,9 @@ if vim.g.forge_fold_marker_child then
     block("file", "Modified game.rs", "▸", 4, "change"),
     block("hunk", "@@ +1 -1 restart", nil, 4, "change"),
     block("change", "+ reset_round();"),
+    deferred("lazy-exchange", "▸ Deferred exchange", "▸", 2),
+    deferred("lazy-group", "Deferred tools", "▸", 4),
+    deferred("lazy-tool", "Deferred command", "•", 6),
   } }).kind == "Applied")
   local options = { margin = 0, fold_markers = true, columns = { signcolumn = "yes:1", statuscolumn = "%s" },
     conceal = { level = 3, cursor = "nvic" } }
@@ -61,7 +71,7 @@ local ok, failure = xpcall(function()
         local window = marker_fixture[name]
         local position = vim.api.nvim_win_get_position(window)
         local rows = {}
-        for row = position[1] + 1, position[1] + 9 do
+        for row = position[1] + 1, position[1] + 14 do
           local cells = {}
           for column = position[2] + 1, position[2] + vim.api.nvim_win_get_width(window) do
             cells[#cells + 1] = vim.fn.screenstring(row, column)
@@ -81,6 +91,11 @@ local ok, failure = xpcall(function()
   assert(screen.opened:find("▾ Modified game.rs", 1, true), screen.opened)
   assert(screen.closed:find("▸ Modified game.rs", 1, true), screen.closed)
   assert(screen.opened:find("• 2s cargo build", 1, true), screen.opened)
+  for _, name in ipairs({ "opened", "closed" }) do
+    assert(screen[name]:find("▸ Deferred exchange", 1, true), screen[name])
+    assert(screen[name]:find("▸ Deferred tools", 1, true), screen[name])
+    assert(screen[name]:find("• Deferred command", 1, true), screen[name])
+  end
   assert(not screen.opened:find("▾▾", 1, true), "coincident fold starts displayed multiple arrows")
   assert(not screen.opened:find("▾ @@", 1, true) and not screen.opened:find("▸ @@", 1, true), screen.opened)
   run([[vim.api.nvim_set_current_win(marker_fixture.opened); vim.api.nvim_win_set_cursor(0, {3,0}); vim.cmd("normal! zc")]])

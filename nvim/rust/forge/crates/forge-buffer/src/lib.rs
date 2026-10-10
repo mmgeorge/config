@@ -11,6 +11,7 @@ pub mod editable;
 pub mod identity;
 pub mod input;
 pub mod markdown;
+pub mod node;
 pub mod patch;
 pub mod sequence;
 pub mod text;

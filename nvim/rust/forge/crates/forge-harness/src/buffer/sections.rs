@@ -38,6 +38,8 @@ impl PageQuota {
                         .rows
                         .saturating_sub(cells.div_ceil(width.columns).max(1));
                 }
+            } else {
+                self.rows = self.rows.saturating_sub(block.text.row_count());
             }
         }
         Ok(())
@@ -51,11 +53,16 @@ impl PageQuota {
 /// Owns the loaded projection independently of the complete Rust transcript.
 pub(super) struct SectionProjection {
     pub document: TranscriptDocument,
-    view: HashMap<ViewId, (u64, HashMap<String, bool>)>,
+    view: HashMap<ViewId, u64>,
+    pub(super) nodes: super::nodes::NodeMap,
+    complete: HashSet<BlockId>,
     owner: HashMap<String, String>,
     file: HashMap<String, Vec<String>>,
     quota: HashMap<String, PageQuota>,
     entry_sections: HashMap<String, Vec<String>>,
+    pending: HashSet<String>,
+    #[cfg(test)]
+    pub projected_entries: usize,
 }
 
 impl SectionProjection {
@@ -64,30 +71,122 @@ impl SectionProjection {
         let mut file = HashMap::new();
         let mut entry_sections = HashMap::new();
         let mut entry = Vec::new();
+        let mut nodes = super::nodes::NodeMap::default();
+        let mut complete = HashSet::new();
         for identity in source.entry_ids() {
             let original = source.source_entry(&identity)?;
             entry_sections.insert(identity, index(&original, &mut owner, &mut file));
-            entry.push(project(
-                original,
-                source.document.revision().0,
-                &HashMap::new(),
-                &HashMap::new(),
-            )?);
+            for block in &original.block {
+                nodes.register(block)?;
+            }
+            let mut rendered = project(original, source.document.revision().0, &HashMap::new(), &HashMap::new())?;
+            for block in &mut rendered.block {
+                if source.document.block(&block.id).is_some_and(|source| source.text == block.text) {
+                    complete.insert(block.id.clone());
+                }
+                nodes.project(block);
+            }
+            entry.push(rendered);
         }
         let projection = Self {
             document: TranscriptDocument::initialize(id, "loaded-transcript".into(), 0, entry)?,
             view: HashMap::new(),
+            nodes,
+            complete,
             owner,
             file,
             quota: HashMap::new(),
             entry_sections,
+            pending: HashSet::new(),
+            #[cfg(test)]
+            projected_entries: 0,
         };
         source.dirty.clear();
+        source.block_dirty.clear();
+        source.body_dirty.clear();
         source.structure_dirty = false;
         Ok(projection)
     }
 
     pub fn refresh(&mut self, source: &mut TranscriptDocument) -> Result<Vec<BufferPatch>> {
+        let mut splices = Vec::new();
+        let mut node_updates = Vec::new();
+        for change in std::mem::take(&mut source.body_dirty) {
+            if source.dirty.contains(&change.owner) { continue; }
+            let call = change.anchor.0.strip_suffix(":preview")
+                .or_else(|| change.anchor.0.split_once(":output:").map(|(call, _)| call))
+                .or_else(|| change.anchor.0.strip_suffix(":hidden"));
+            let node_id = call.map(|call| format!("{call}:tool"));
+            let mut heading = node_id.as_ref().and_then(|id|
+                self.document.document.block(&BlockId(id.clone())).cloned());
+            if let Some(id) = &node_id { self.nodes.advance(id)?; }
+            if self.document.document.block_index(&change.anchor).is_none() { continue; }
+            if change.removed.iter().any(|id| !self.complete.contains(id)) {
+                if let Some(id) = node_id { self.pending.insert(id); }
+                else { source.dirty.insert(change.owner); }
+                continue;
+            }
+            let blocks = change.inserted.iter().map(|id| {
+                source.document.block(id).cloned().context("streaming splice source is missing")
+            }).collect::<Result<Vec<_>>>()?;
+            let removed_bytes: usize = change.removed.iter().filter_map(|id| self.document.document.block(id))
+                .map(|block| block.text.byte_count()).sum();
+            let inserted_bytes: usize = blocks.iter().map(|block| block.text.byte_count()).sum();
+            if let Some(heading) = &mut heading {
+                let node = heading.metadata.node.as_mut().expect("tool heading node");
+                let next_bytes = node.loaded_bytes.saturating_sub(removed_bytes) + inserted_bytes;
+                let maximum = self.quota.get(&node.id.0).map_or(PAGE_BYTES, |quota|quota.bytes);
+                if next_bytes > maximum {
+                    self.pending.insert(node.id.0.clone());
+                    continue;
+                }
+                node.loaded_bytes = next_bytes;
+                let removed_rows: usize = change.removed.iter().filter_map(|id| self.document.document.block(id))
+                    .map(|block|block.text.row_count()).sum();
+                node.loaded_rows = node.loaded_rows.saturating_sub(removed_rows)
+                    + blocks.iter().map(|block|block.text.row_count()).sum::<usize>();
+                let maximum_rows = self.quota.get(&node.id.0).map_or(48, |quota|quota.rows);
+                if node.loaded_rows > maximum_rows {
+                    self.pending.insert(node.id.0.clone());
+                    continue;
+                }
+                self.nodes.project(heading);
+            }
+            for id in &change.removed { self.complete.remove(id); }
+            for id in &change.inserted { self.complete.insert(id.clone()); }
+            splices.push(TranscriptChange::ToolBody { owner: change.owner, anchor: change.anchor,
+                removed: change.removed.len(), block: blocks });
+            if let Some(heading) = heading { node_updates.push(heading); }
+        }
+        let changed_blocks = std::mem::take(&mut source.block_dirty);
+        let mut direct = node_updates;
+        for id in changed_blocks {
+            let Some(owner) = source.block_owner(&id) else { continue; };
+            if source.dirty.contains(owner) { continue; }
+            let Some(previous) = self.document.document.block(&id) else { continue; };
+            if !self.complete.contains(&id) {
+                source.dirty.insert(owner.to_owned());
+                continue;
+            }
+            let Some(current) = source.document.block(&id) else { continue; };
+            if let (Some(node), Some(prior)) = (&current.metadata.node, &previous.metadata.node)
+                && node.kind == forge_buffer::node::NodeKind::Tool && node.more && !prior.more {
+                self.nodes.register(current)?;
+                self.pending.insert(node.id.0.clone());
+                continue;
+            }
+            let mut block = current.clone();
+            block.metadata.fold.clone_from(&previous.metadata.fold);
+            block.metadata.section.clone_from(&previous.metadata.section);
+            if let (Some(node), Some(prior)) = (&mut block.metadata.node, &previous.metadata.node) {
+                node.loaded_rows = prior.loaded_rows;
+                node.loaded_bytes = prior.loaded_bytes;
+                node.more = prior.more;
+            }
+            self.nodes.register(&block)?;
+            self.nodes.project(&mut block);
+            direct.push(block);
+        }
         let dirty = source.dirty.clone();
         let structural = source.structure_dirty;
         let mut projected = HashMap::new();
@@ -99,14 +198,19 @@ impl SectionProjection {
             if source.entry_position(id).is_none() {
                 continue;
             }
+            #[cfg(test)]
+            { self.projected_entries += 1; }
             let original = source.source_entry(id)?;
+            for block in &original.block {
+                self.nodes.register(&block)?;
+            }
             prepared_sections.insert(
                 id.clone(),
                 index(&original, &mut prepared_owner, &mut prepared_file),
             );
             projected.insert(
                 id.clone(),
-                project(original, self.document.document.revision().0 + 1, &self.view, &self.quota)?,
+                project(original, self.document.document.revision().0 + 1, &self.nodes.choice, &self.quota)?,
             );
         }
         for id in &dirty {
@@ -126,10 +230,11 @@ impl SectionProjection {
         for section in retired_sections {
             if !self.owner.contains_key(&section) {
                 self.quota.remove(&section);
-                for (_, intent) in self.view.values_mut() {
-                    intent.remove(&section);
-                }
+
             }
+        }
+        for entry in projected.values_mut() {
+            for block in &mut entry.block { self.nodes.project(block); }
         }
         let displaced: HashSet<String> = projected
             .values()
@@ -143,6 +248,28 @@ impl SectionProjection {
             })
             .collect();
         let mut patch = Vec::new();
+        for change in splices {
+            let TranscriptChange::ToolBody { owner, .. } = &change else { unreachable!() };
+            if !dirty.contains(owner) { patch.extend(self.document.tool_layout(vec![change])?); }
+        }
+        for mut block in direct {
+            if source.block_owner(&block.id).is_some_and(|owner| !dirty.contains(owner)) {
+                if let Some(current) = self.document.document.block(&block.id) {
+                    block.metadata.fold.clone_from(&current.metadata.fold);
+                }
+                if let Some(update) = self.document.append(block)? { patch.push(update); }
+            }
+        }
+        for entry in projected.values() {
+            if let Ok(previous) = self.document.source_entry(&entry.id) {
+                for block in previous.block { self.complete.remove(&block.id); }
+            }
+            for block in &entry.block {
+                if source.document.block(&block.id).is_some_and(|source| source.text == block.text) {
+                    self.complete.insert(block.id.clone());
+                }
+            }
+        }
         if structural || !displaced.is_empty() {
             let desired = source.entry_ids();
             let retained: HashSet<_> = desired.iter().collect();
@@ -211,11 +338,60 @@ impl SectionProjection {
                 }])?);
             }
         }
+        let mut pending = std::mem::take(&mut self.pending).into_iter().filter_map(|id| {
+            let anchor = self.nodes.anchor(&id)?;
+            let start = source.document.block_index(anchor)?;
+            let end = source.document.block(anchor)?.metadata.fold.iter().find(|fold| fold.id.0 == id)
+                .and_then(|fold| source.document.block_index(&fold.end.block)).unwrap_or(start);
+            Some((start, end, id))
+        }).collect::<Vec<_>>();
+        pending.sort_by_key(|(start, end, _)| (*start, std::cmp::Reverse(*end)));
+        let mut covered = None;
+        for (source_start, source_end, id) in pending {
+            if covered.is_some_and(|end| source_start <= end) { continue; }
+            covered = Some(source_end);
+            let mut candidate = project(Self::subtree(&self.nodes, source, &id)?,
+                self.document.document.revision().0 + 1, &self.nodes.choice, &self.quota)?;
+            if dirty.contains(&candidate.id) { continue; }
+            let Some(anchor) = self.nodes.anchor(&id) else { continue; };
+            let Some(previous) = self.document.document.block(anchor) else { continue; };
+            let start = self.document.document.block_index(anchor).context("loaded node anchor disappeared")?;
+            let end = previous.metadata.fold.iter().find(|fold| fold.id.0 == id)
+                .and_then(|fold| self.document.document.block_index(&fold.end.block)).unwrap_or(start);
+            let removed = end + 1 - start;
+            for block in self.document.document.blocks(self.document.document.revision(), start..end + 1)? {
+                self.complete.remove(&block.id);
+            }
+            for block in &mut candidate.block {
+                self.nodes.project(block);
+                if source.document.block(&block.id).is_some_and(|original| original.text == block.text) {
+                    self.complete.insert(block.id.clone());
+                }
+            }
+            patch.extend(self.document.tool_layout(vec![TranscriptChange::ToolBody {
+                owner: candidate.id, anchor: anchor.clone(), removed, block: candidate.block,
+            }])?);
+        }
         for id in dirty {
             source.dirty.remove(&id);
         }
         source.structure_dirty = false;
+        self.document.dirty.clear();
+        self.document.block_dirty.clear();
+        self.document.body_dirty.clear();
         Ok(patch)
+    }
+
+    fn subtree<'source>(nodes: &super::nodes::NodeMap, document: &'source TranscriptDocument, id: &str) -> Result<TranscriptSource<'source>> {
+        let anchor = nodes.anchor(id).context("node anchor is unavailable")?;
+        let block = document.document.block(anchor).context("node source disappeared")?;
+        let start = document.document.block_index(anchor).context("node source position disappeared")?;
+        let end = block.metadata.fold.iter().find(|fold| fold.id.0 == id)
+            .and_then(|fold| document.document.block_index(&fold.end.block)).unwrap_or(start);
+        Ok(TranscriptSource {
+            id: document.block_owner(anchor).context("node owner disappeared")?,
+            block: document.document.blocks(document.document.revision(), start..end + 1)?.collect(),
+        })
     }
 
     #[cfg(test)]
@@ -223,19 +399,41 @@ impl SectionProjection {
         self.quota.insert(id.into(), PageQuota::bytes(bytes));
     }
 
+    /// Drops intent only when a canonical entry is deleted, not when the scope changes.
+    pub fn retire_entry(&mut self, id: &str) {
+        if let Some(nodes) = self.entry_sections.get(id) {
+            for node in nodes { self.nodes.retire(node); self.quota.remove(node); self.pending.remove(node); }
+        }
+    }
+
     pub fn register(&mut self, view: ViewId) {
         self.view.entry(view).or_default();
     }
 
     pub fn close(&mut self, source: &mut TranscriptDocument, view: &ViewId) {
-        if let Some((_, intent)) = self.view.remove(view) {
-            for id in intent.keys() {
-                if let Some(owner) = self.owner.get(id) {
-                    source.dirty.insert(owner.clone());
-                }
+        self.view.remove(view);
+        if self.view.is_empty() {
+            for id in self.nodes.choice.keys() {
+                if let Some(owner) = self.owner.get(id) { source.dirty.insert(owner.clone()); }
             }
+            self.nodes.choice.clear();
+            self.nodes.intent_sequence.clear();
+            self.quota.clear();
         }
     }
+
+    /// Shared explicit choices survive parent closure and scope switches.
+    pub fn expansion(&self, id: &str) -> Option<bool> { self.nodes.choice.get(id).copied() }
+
+    /// Rejects retired identities before any source materialization can occur.
+    pub fn admit(&self, view: &ViewId, sequence: u64, id: &str, generation: u64) -> Result<bool> {
+        let last = self.view.get(view).context("node view is closed")?;
+        ensure!(sequence <= forge_buffer::MAX_COUNTER, "node sequence exhausted");
+        if sequence <= *last || self.nodes.intent_sequence.get(id).is_some_and(|prior| sequence <= *prior) { return Ok(false); }
+        ensure!(self.nodes.generation(id) == Some(generation), "node belongs to a retired content generation");
+        Ok(true)
+    }
+
 
     pub fn set(
         &mut self,
@@ -247,23 +445,21 @@ impl SectionProjection {
         more: bool,
         page: Option<(usize, WidthProfile)>,
     ) -> Result<()> {
-        let (last, intent) = self.view.get(&view).context("section view is closed")?;
+        let last = self.view.get(&view).context("section view is closed")?;
         ensure!(sequence <= forge_buffer::MAX_COUNTER, "section sequence exhausted");
-        if sequence <= *last || (more && (!expanded || intent.get(id) == Some(&false))) {
+        if sequence <= *last || (more && (!expanded || self.nodes.choice.get(id) == Some(&false))) {
             return Ok(());
         }
-        let owner = self
-            .owner
-            .get(id)
-            .context("section is no longer available")?
-            .clone();
+        self.owner.get(id).context("section is no longer available")?;
         let children = self.file.get(id);
         let file = children.is_some();
-        let loaded = if more { Some(self.document.source_entry(&owner)?) } else { None };
+        let paged = file || self.nodes.kind(id) == Some(forge_buffer::node::NodeKind::Tool);
+        let affected = self.nodes.file_owner(id).to_owned();
+        let loaded = if more { Some(Self::subtree(&self.nodes, &self.document, &affected)?) } else { None };
         if let Some(loaded) = &loaded {
             if !loaded.block.iter().any(|block| block.metadata.section.iter()
                 .any(|section| section.id.0 == id && section.more)) {
-                self.view.get_mut(&view).expect("validated section view").0 = sequence;
+                *self.view.get_mut(&view).expect("validated section view") = sequence;
                 return Ok(());
             }
         }
@@ -277,9 +473,9 @@ impl SectionProjection {
         let resized = page.as_ref().is_some_and(|(_, width)| {
             self.quota.get(id).and_then(|quota| quota.width.as_ref()) != Some(width)
         });
-        let loaded_rows = if more && file && resized {
+        let loaded_rows = if more && paged && resized {
             if let Some((_, width)) = &page {
-                let loaded = self.document.source_entry(&owner)?;
+                let loaded = Self::subtree(&self.nodes, &self.document, &affected)?;
                 let start = loaded
                     .block
                     .iter()
@@ -320,21 +516,15 @@ impl SectionProjection {
         } else {
             0
         };
-        let mut next_view = self.view.clone();
-        let mut next_quota = self.quota.clone();
-        let (last, intent) = next_view.get_mut(&view).expect("validated section view");
-        *last = sequence;
-        if !more {
-            intent.insert(id.into(), expanded);
-            if expanded {
-                for child in children.into_iter().flatten() {
-                    intent.remove(child);
-                }
-            }
-        }
+        let previous_intent = self.nodes.choice.get(id).copied();
+        let previous_quota = self.quota.get(id).cloned();
+        if !more { self.nodes.choice.insert(id.into(), expanded); }
+        if !expanded { self.quota.remove(id); }
+        let prepared = (|| -> Result<TranscriptEntry> {
+        let next_quota = &mut self.quota;
         if expanded {
             let quota = next_quota.entry(id.into()).or_insert_with(|| {
-                if file {
+                if paged {
                     let (rows, width) = page.clone().unwrap_or((48, WidthProfile::default()));
                     PageQuota {
                         bytes: PAGE_BYTES,
@@ -346,7 +536,7 @@ impl SectionProjection {
                 }
             });
             if more {
-                if file && quota.width.is_some() {
+                if paged && quota.width.is_some() {
                     let (rows, width) = page.unwrap_or((48, WidthProfile::default()));
                     ensure!(quota.rows < 1_048_576, "section exceeds loaded-row limit");
                     ensure!(
@@ -365,20 +555,33 @@ impl SectionProjection {
                 }
             }
         }
-        let candidate = project(
-            source.source_entry(&owner)?,
-            self.document.document.revision().0 + 1,
-            &next_view,
-            &next_quota,
-        )?;
-        if let Some(loaded) = &loaded {
-            let before = page_boundary(&loaded.block, id);
-            let after = page_boundary(&candidate.block.iter().collect::<Vec<_>>(), id);
-            ensure!(after.is_none() || after != before, "section loading made no progress; reopen the section to retry");
+            let candidate = project(
+                Self::subtree(&self.nodes, source, &affected)?,
+                self.document.document.revision().0 + 1,
+                &self.nodes.choice,
+                &self.quota,
+            )?;
+            if let Some(loaded) = &loaded {
+                let before = page_boundary(&loaded.block, id);
+                let after = page_boundary(&candidate.block.iter().collect::<Vec<_>>(), id);
+                ensure!(after.is_none() || after != before, "section loading made no progress; reopen the section to retry");
+            }
+            Ok(candidate)
+        })();
+        match prepared {
+            Ok(_) => {},
+            Err(error) => {
+            match previous_intent { Some(value) => { self.nodes.choice.insert(id.into(), value); }, None => { self.nodes.choice.remove(id); } }
+            match previous_quota { Some(value) => { self.quota.insert(id.into(), value); }, None => { self.quota.remove(id); } }
+            return Err(error);
+            }
+        };
+        *self.view.get_mut(&view).expect("validated section view") = sequence;
+        if !expanded {
+            for child in self.nodes.descendants(id) { self.quota.remove(&child); }
         }
-        self.view = next_view;
-        self.quota = next_quota;
-        source.dirty.insert(owner);
+        self.nodes.intent_sequence.insert(id.into(), sequence);
+        self.pending.insert(affected);
         Ok(())
     }
 }
@@ -397,6 +600,12 @@ fn index(
 ) -> Vec<String> {
     let mut sections = Vec::new();
     for (start, block) in entry.block.iter().enumerate() {
+        if let Some(node) = &block.metadata.node
+            && node.kind != forge_buffer::node::NodeKind::Message
+            && !block.metadata.fold.iter().any(|fold| fold.id == node.id) {
+            owner.insert(node.id.0.clone(), entry.id.to_owned());
+            sections.push(node.id.0.clone());
+        }
         for fold in &block.metadata.fold {
             owner.insert(fold.id.0.clone(), entry.id.to_owned());
             sections.push(fold.id.0.clone());
@@ -427,7 +636,7 @@ pub(crate) fn preview(entry: TranscriptEntry) -> Result<TranscriptEntry> {
 fn project(
     entry: TranscriptSource<'_>,
     revision: u64,
-    view: &HashMap<ViewId, (u64, HashMap<String, bool>)>,
+    intent: &HashMap<String, bool>,
     quota: &HashMap<String, PageQuota>,
 ) -> Result<TranscriptEntry> {
     let position: HashMap<_, _> = entry
@@ -442,7 +651,7 @@ fn project(
         0,
         entry.block.len(),
         revision,
-        view,
+        intent,
         quota,
         &position,
         &mut output,
@@ -461,7 +670,7 @@ fn render(
     mut cursor: usize,
     end: usize,
     revision: u64,
-    view: &HashMap<ViewId, (u64, HashMap<String, bool>)>,
+    intent: &HashMap<String, bool>,
     quota: &HashMap<String, PageQuota>,
     position: &HashMap<&BlockId, usize>,
     output: &mut Vec<BufferBlock>,
@@ -489,17 +698,9 @@ fn render(
         if let Some((after, original)) = selected {
             let id = &original.id.0;
             let file = original.expand_children;
-            let expanded = if view.is_empty() {
-                !original.closed
-            } else {
-                view.values().any(|(_, intent)| {
-                    let inherited = parent_file.is_some_and(|file| intent.get(file) == Some(&true));
-                    intent
-                        .get(id)
-                        .copied()
-                        .unwrap_or(inherited || !original.closed)
-                })
-            };
+            let expanded = intent.get(id).copied().unwrap_or_else(|| {
+                parent_file.is_some_and(|file| intent.get(file) == Some(&true)) || !original.closed
+            });
             let heading = output.len();
             let mut block = source_block.clone();
             block.metadata.fold.clear();
@@ -512,22 +713,29 @@ fn render(
                 quota
                     .get(id)
                     .cloned()
-                    .unwrap_or_else(|| PageQuota::bytes(PAGE_BYTES))
+                    .unwrap_or_else(|| {
+                        let mut budget = PageQuota::bytes(PAGE_BYTES);
+                        if source_block.metadata.node.as_ref().is_some_and(|node|
+                            node.kind == forge_buffer::node::NodeKind::Tool) {
+                            budget.rows = 48;
+                        }
+                        budget
+                    })
             };
             let more = expanded
-                && render(
+                && (render(
                     source,
                     cursor + 1,
                     after,
                     revision,
-                    view,
+                    intent,
                     quota,
                     position,
                     output,
                     child_budget,
                     within_file || file,
                     if file { Some(id.as_str()) } else { parent_file },
-                )?;
+                )? || source_block.metadata.node.as_ref().is_some_and(|node| node.more));
             if file && more {
                 let bytes: usize = output[heading + 1..]
                     .iter()
@@ -539,7 +747,7 @@ fn render(
                 );
             }
             let boundary = more && !within_file;
-            if !expanded || boundary || output.len() == heading + 1 {
+            if boundary {
                 output.push(BufferBlock {
                     id: BlockId(format!("{id}:deferred-body")),
                     text: BufferText::from_rows([if boundary {
@@ -571,10 +779,17 @@ fn render(
                     column: 0,
                 },
             };
-            if within_file {
-                fold.closed = !expanded;
+            fold.closed = !expanded;
+            if output[heading + 1..].iter().any(|block| block.text.row_count() > 0) { output[heading].metadata.fold.push(fold); }
+            let loaded_rows = output[heading + 1..].iter().map(|block|block.text.row_count()).sum();
+            let loaded_bytes = output[heading + 1..].iter().map(|block|block.text.byte_count()).sum();
+            if let Some(node) = &mut output[heading].metadata.node {
+                node.resolve(intent.get(id).copied());
+                node.loaded_rows = loaded_rows;
+                node.loaded_bytes = loaded_bytes;
+                node.more = more;
+                node.content_revision = revision;
             }
-            output[heading].metadata.fold.push(fold);
             output[heading].metadata.section.push(DeferredSection {
                 id: original.id.clone(),
                 revision,
@@ -627,6 +842,8 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
         if let Some(width) = &budget.width {
             let cells = width.cells(&row[..end], 0)?;
             remaining_rows = remaining_rows.saturating_sub(cells.div_ceil(width.columns).max(1));
+        } else {
+            remaining_rows = remaining_rows.saturating_sub(1);
         }
         rows.push(&row[..end]);
         remaining = remaining.saturating_sub(end + 1);
@@ -657,6 +874,8 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
         id: source.id.clone(),
         text: BufferText::from_rows(&rows)?,
         metadata: BlockMetadata {
+            node: metadata.node.clone(),
+            content_node: metadata.content_node.clone(),
             section: metadata.section.clone(),
             collapse: metadata.collapse.clone(),
             layout: metadata.layout.clone(),
@@ -798,7 +1017,7 @@ mod tests {
     }
 
     #[test]
-    fn closed_content_is_absent_and_window_demand_is_a_union() -> Result<()> {
+    fn expansion_is_shared_and_closing_a_view_preserves_other_view_choices() -> Result<()> {
         let mut source = source()?;
         let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;
         let first = ViewId("first".into());
@@ -840,7 +1059,7 @@ mod tests {
                 .document
                 .document
                 .block(&BlockId("body".into()))
-                .is_some()
+                .is_none()
         );
         visible.close(&mut source, &second);
         visible.refresh(&mut source)?;
@@ -1023,7 +1242,7 @@ mod tests {
             second,
             1,
             "changes:file:0",
-            false,
+            true,
             false,
             Some((12, width.clone())),
         )?;
@@ -1105,20 +1324,11 @@ mod tests {
             Some((12, width)),
         )?;
         visible.refresh(&mut source)?;
-        assert_eq!(
-            visible
-                .document
-                .snapshot()?
-                .block
-                .iter()
-                .map(|block| (&block.id, &block.text))
-                .collect::<Vec<_>>(),
-            next.block
-                .iter()
-                .map(|block| (&block.id, &block.text))
-                .collect::<Vec<_>>(),
-            "reopening retains the loaded quota"
-        );
+        let reopened = visible.document.snapshot()?;
+        assert!(reopened.block.iter().all(|block| block.id.0 != "changes:file:0:hunk:0:rows:0"),
+            "reopening a parent discarded the child's explicit closure");
+        let reopened_count = reopened.block.iter().filter(|block| block.id.0.contains(":rows:")).count();
+        assert!(reopened_count > 0 && reopened_count < 8, "reopening should restore the first page only");
         Ok(())
     }
 

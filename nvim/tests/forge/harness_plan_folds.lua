@@ -34,7 +34,9 @@ local window = vim.api.nvim_get_current_win()
 vim.api.nvim_win_set_buf(window, replica.buffer)
 folds.attach(replica, window)
 state.transcript_buf, state.transcript_win = replica.buffer, window
-state.presentation = { transcript = replica, toggle_tool = function() return false end }
+state.presentation = { transcript = replica, toggle_heading = function(window)
+  return folds.toggle_heading(replica, window)
+end, open_output = function() return false end }
 local opened = 0
 state.presentation.activate = function() opened = opened + 1 end
 local function tab(row)

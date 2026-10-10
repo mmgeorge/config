@@ -1910,8 +1910,6 @@ function M.toggle_activity()
     if not (state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win)) then return end
     vim.api.nvim_set_current_win(state.transcript_win)
   end
-  if vim.fn.foldclosed(vim.fn.line(".")) == -1 and state.presentation
-      and state.presentation.toggle_tool() then return end
   if state.presentation and state.presentation.toggle_heading(vim.api.nvim_get_current_win()) then return end
 end
 

@@ -13,9 +13,12 @@ vim.api.nvim_win_set_buf(window, transcript)
 local function snapshot(document)
   local body = {}
   for row = 1, loaded do body[row] = ("source row %03d"):format(row) end
-  local last = expanded and "boundary" or "empty"
+  local last = expanded and "file:deferred-body" or "empty"
   local blocks = {
     { id = "file", text = { "Modified source.rs" }, metadata = {
+      node = { id = "file", kind = "file", lifecycle = "settled", generation = 1,
+        content_revision = revision, loaded_rows = loaded, loaded_bytes = 0,
+        display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
       section = { { id = "file", revision = revision, open = expanded, more = false } },
       fold = { { id = "file", start = { row = 0, column = 0 },
         ["end"] = { block = last, position = { row = 1, column = 0 } },
@@ -29,7 +32,7 @@ local function snapshot(document)
         ["end"] = { block = "rows", position = { row = #body, column = 0 } }, closed = false } },
     } }
     blocks[#blocks + 1] = { id = "rows", text = body, metadata = {} }
-    blocks[#blocks + 1] = { id = "boundary", text = { loaded < total and "More content available" or "End" }, metadata = {
+    blocks[#blocks + 1] = { id = "file:deferred-body", text = { loaded < total and "More content available" or "End" }, metadata = {
       section = loaded < total and { { id = "file", revision = revision, open = true, more = true } } or {},
     } }
   else
@@ -44,12 +47,12 @@ local function snapshot(document)
 end
 
 local function deliver(params, callback)
-  if params.operation == "section_expansion" then
-    assert(params.section == "file", "hunk body caused a separate request")
+  if params.operation == "node" then
+    assert(params.node == "file", "hunk body caused a separate request")
     assert(params.rows == 2 * vim.api.nvim_win_get_height(window))
     assert(params.width.columns > 0)
     expanded = params.expanded
-    if expanded then loaded = math.min(total, params.more and loaded + params.rows or math.max(loaded, params.rows)) end
+    if expanded then loaded = math.min(total, (params.action == "load_more") and loaded + params.rows or math.max(loaded, params.rows)) end
     revision = revision + 1
     callback({})
   elseif params.operation == "sync" then callback({ snapshot = snapshot(params.document) })
@@ -63,7 +66,7 @@ client.request_for = function(_, _, params, callback)
     vim.schedule(function() callback({ transcript = snapshot(params.document) }) end)
   else
     requests[#requests + 1] = params
-    if hold and params.operation == "section_expansion" and params.more then
+    if hold and params.operation == "node" and (params.action == "load_more") then
       pending[#pending + 1] = { params = params, callback = callback }
     else deliver(params, callback) end
   end
@@ -75,7 +78,7 @@ end
 local function page_count()
   local count = 0
   for _, request in ipairs(requests) do
-    if request.operation == "section_expansion" and request.more then count = count + 1 end
+    if request.operation == "node" and (request.action == "load_more") then count = count + 1 end
   end
   return count
 end
@@ -144,8 +147,8 @@ local ok, failure = xpcall(function()
   for _ = 1, 20 do owner.observe_sections() end
   assert(page_count() == failed_pages and #pending == 0, "failed page cascaded into automatic retries")
   assert(#notices == 1, table.concat(notices, "\n"))
-  owner.set_section("file", true, true)
-  assert(#pending == 1, "explicit retry was blocked")
+  owner.set_section("file", true, false)
+  assert(vim.wait(1000, settled, 1), "explicit retry was blocked")
 end, debug.traceback)
 if owner then owner.close() end
 assert(ok, failure)

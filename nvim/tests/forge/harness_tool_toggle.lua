@@ -21,7 +21,10 @@ local success, failure = xpcall(function()
   local opened = requests[1].params
   requests[1].callback({ transcript = { document = opened.document, revision = 0, block = {
     { id = "call:tool", text = { "tool()", "one", "two", "three", "four", "…(2 hidden)" },
-      metadata = { target = { { id = "call:tool", range = {
+      metadata = { node = { id = "call:tool", kind = "tool", lifecycle = "settled",
+        generation = 1, content_revision = 1, loaded_rows = 5, loaded_bytes = 20,
+        default_display = "heading", display = "full", expansion = true },
+        target = { { id = "call:tool", range = {
         start = { row = 0, column = 0 }, ["end"] = { row = 6, column = 0 },
       } } }, decoration = {}, editable_region = {} } },
   } }, composer = { document = opened.composer, revision = 0, block = {} } })
@@ -32,8 +35,10 @@ local success, failure = xpcall(function()
     vim.api.nvim_win_set_cursor(window, { row, 0 })
     local previous = #requests
     require("forge.views.harness.controller").toggle_activity()
-    assert(requests[previous + 1].params.operation == "toggle_tool", "Tab did not expand preview row " .. row)
-    assert(requests[previous + 1].params.input.position.row == row - 1)
+    assert(requests[previous + 1].params.operation == "node", "Tab did not target the owning node from row " .. row)
+    assert(requests[previous + 1].params.node == "call:tool")
+    assert(requests[previous + 1].params.action == "set_expansion")
+    assert(requests[previous + 1].params.expanded == false)
     requests[previous + 1].callback({ expanded = true })
     assert(vim.wait(1000, function() return requests[previous + 2] ~= nil end, 1))
     assert(requests[previous + 2].params.operation == "sync")

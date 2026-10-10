@@ -36,6 +36,18 @@ local function before_or_equal(left, right)
 end
 
 local function validate_metadata(entry, read_row, region_seen)
+  if entry.metadata.content_node and entry.metadata.content_node ~= vim.NIL then identity(entry.metadata.content_node) end
+  local node = entry.metadata.node
+  if node and node ~= vim.NIL then
+    identity(node.id)
+    if node.parent and node.parent ~= vim.NIL then identity(node.parent) end
+    counter(node.generation)
+    counter(node.content_revision)
+    counter(node.loaded_rows)
+    counter(node.loaded_bytes)
+    assert(node.display == "heading" or node.display == "preview" or node.display == "full", "invalid node display")
+    assert(node.expansion == nil or node.expansion == vim.NIL or type(node.expansion) == "boolean", "invalid node expansion")
+  end
   local function validate_range(range)
     assert(before_or_equal(range.start, range["end"]), "reversed metadata range")
     for _, position in ipairs({ range.start, range["end"] }) do
@@ -172,6 +184,7 @@ function M.open(document, options)
     generated_filetype = options.filetype or "forge",
     document = document, buffer = buffer, namespace = vim.api.nvim_create_namespace(""),
     revision = nil, row_count = 0, sequence = BlockSequence.new(), block = {}, marks = {}, region_owner = {},
+    node_owner = {}, block_node = {},
     changedtick = vim.api.nvim_buf_get_changedtick(buffer), status = "Desynchronized",
     editable = editable.new(document), recover = options.recover, notice = options.notice,
     edit_options = options.editable,
@@ -349,6 +362,20 @@ function M.preflight(session, patch, options)
 end
 
 local function install_metadata(session, prepared, replace_all)
+  if replace_all then session.node_owner, session.block_node = {}, {} end
+  for _, changed in ipairs({ prepared.changed, prepared.retired }) do
+    for id in pairs(changed) do
+      local node = session.block_node[id]
+      if node and session.node_owner[node] == id then session.node_owner[node] = nil end
+      session.block_node[id] = nil
+    end
+  end
+  for id in pairs(prepared.changed) do
+    local node = prepared.block[id].metadata.node
+    if node and node ~= vim.NIL then
+      session.node_owner[node.id], session.block_node[id] = id, node.id
+    end
+  end
   if replace_all then
     vim.api.nvim_buf_clear_namespace(session.buffer, session.namespace, 0, -1)
     session.marks = {}

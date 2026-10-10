@@ -14,7 +14,7 @@ local cooperative = require("forge.cooperative")
 local function retain_preferences(saved, state)
   for id, closed in pairs(state) do
     local view = saved.fold[id]
-    if view and closed ~= view.applied then
+    if view and not view.controlled and closed ~= view.applied then
       view.preference = closed and "closed" or "open"
       view.applied = closed
     end
@@ -261,8 +261,12 @@ local function apply_defaults(session, window, saved, changed)
       finish = finish + record.fold["end"].position.row + (record.fold["end"].position.column > 0 and 1 or 0)
       if finish > start then
         local view = saved.fold[id] or { preference = "auto" }
-        local target = view.preference == "closed"
-          or view.preference == "auto" and record.fold.closed
+        local source = session.block[record.owner]
+        local node = source and source.metadata.node
+        view.controlled = node and node ~= vim.NIL and node.id == id or false
+        local target
+        if view.controlled then target = node.display == "heading"
+        else target = view.preference == "closed" or view.preference == "auto" and record.fold.closed end
         if not view.native then created[#created + 1] = { id = id, start = start + 1, finish = finish } end
         if view.applied == nil or view.applied ~= target or changed[id] then
           if target then closed[start + 1] = true else opened[start + 1] = true end
@@ -575,8 +579,9 @@ function M.restore(session, captured)
           local saved = window_state[window]
           local view = saved and saved.fold[id]
           if view then
-            was_closed = view.preference == "closed"
-              or view.preference == "auto" and record.fold.closed
+            if view.controlled then was_closed = record.fold.closed
+            else was_closed = view.preference == "closed"
+              or view.preference == "auto" and record.fold.closed end
             view.applied = was_closed
           end
           local row = fold_start(session, record)
@@ -620,9 +625,12 @@ function M.sign()
   local layout = node and location.position.row == 0 and node.entry.metadata.layout
   local marker = layout and layout.marker
   if not marker or marker == vim.NIL or layout.indent ~= 2 then return "  " end
-  local icon = marker.text == "▸"
-    and "%{foldlevel(v:lnum) == 0 ? ' ' : (foldclosed(v:lnum) == v:lnum ? '▸' : '▾')}"
-    or marker.text
+  local icon = marker.text
+  if icon == "▸" then
+    local state = node.entry.metadata.node
+    icon = state and (state.display == "heading" and "▸" or "▾")
+      or "%{foldlevel(v:lnum) == 0 ? ' ' : (foldclosed(v:lnum) == v:lnum ? '▸' : '▾')}"
+  end
   return "%#" .. marker.capture .. "#" .. icon .. " %*"
 end
 

@@ -11,6 +11,9 @@ vim.api.nvim_win_set_buf(window, transcript)
 local function snapshot(document)
   return { document = document, revision = revision, block = {
     { id = "heading", text = { "Tools" }, metadata = {
+      node = { id = "tools", kind = "tool_group", lifecycle = "settled", generation = 1,
+        content_revision = revision, loaded_rows = expanded and 1 or 0, loaded_bytes = 0,
+        display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
       target = {}, decoration = {}, editable_region = {},
       section = { { id = "tools", revision = revision, open = expanded, more = false } },
       fold = { { id = "tools", start = { row = 0, column = 0 },
@@ -23,14 +26,14 @@ end
 client.host_accepting = function() return true end
 client.request_for = function(_, _, params, callback)
   requests[#requests + 1] = params
-  if deferred and (params.operation == "section_expansion" or params.operation == "sync") then
+  if deferred and (params.operation == "node" or params.operation == "sync") then
     held[#held + 1] = { params = params, callback = callback }
     return
   end
   if params.operation == "background_terminals" then callback({ supported = false })
   elseif params.operation == "open" then
     vim.schedule(function() callback({ transcript = snapshot(params.document) }) end)
-  elseif params.operation == "section_expansion" then
+  elseif params.operation == "node" then
     expanded = params.expanded
     revision = revision + 1
     callback({})
@@ -40,7 +43,7 @@ end
 local function respond(failure)
   local pending = assert(table.remove(held, 1), "no held request")
   if failure then pending.callback(nil, failure)
-  elseif pending.params.operation == "section_expansion" then
+  elseif pending.params.operation == "node" then
     expanded = pending.params.expanded
     revision = revision + 1
     pending.callback({})
@@ -65,7 +68,7 @@ local ok, failure = xpcall(function()
   assert(owner.transcript.fold_loading[window].tools, "opening did not publish loading state")
   assert(vim.fn.foldtextresult(1):find("Loading", 1, true), "closed heading omitted loading state")
   assert(not body_loaded())
-  assert(respond() == "section_expansion")
+  assert(respond() == "node")
   assert(vim.wait(1000, function() return #held > 0 end, 1))
   assert(vim.fn.foldclosed(1) == 1, "fold opened on acknowledgement before content")
   assert(not body_loaded())
@@ -84,8 +87,8 @@ local ok, failure = xpcall(function()
   assert(owner.toggle_heading(window))
   assert(owner.toggle_heading(window))
   assert(not owner.transcript.fold_loading[window], "second toggle did not cancel loading")
-  assert(respond() == "section_expansion")
-  assert(respond() == "section_expansion")
+  assert(respond() == "node")
+  assert(respond() == "node")
   assert(vim.wait(1000, function() return #held > 0 end, 1))
   assert(respond() == "sync")
   assert(vim.wait(1000, function() return not owner.syncing and not owner.applying end, 1))
@@ -101,7 +104,7 @@ local ok, failure = xpcall(function()
   assert(vim.wait(1000, function() return body_loaded() and vim.fn.foldclosed(1) == -1 end, 1), "failed opening was not retryable")
   local sequence = 0
   for _, request in ipairs(requests) do
-    if request.operation == "section_expansion" then
+    if request.operation == "node" then
       assert(request.sequence > sequence)
       sequence = request.sequence
     end

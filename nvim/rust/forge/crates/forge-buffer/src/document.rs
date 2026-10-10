@@ -146,6 +146,41 @@ impl BufferDocument {
         self.edit_many(edits)
     }
 
+    /// Replaces a materialized subtree and rebases enclosing fold endpoints atomically.
+    /// Owners outside the replacement retain their identity when the old endpoint disappears.
+    pub fn splice(&mut self, range: Range<usize>, block: Vec<BufferBlock>) -> Result<Option<BufferPatch>, ContractError> {
+        let incoming: HashMap<_, _> = block.iter().map(|block| (&block.id, block)).collect();
+        let last = block.last().ok_or(ContractError("subtree replacement requires an anchor"))?;
+        let mut owners = HashMap::new();
+        for removed in self.sequence.range(range.clone())? {
+            for owner in self.sequence.fold_endpoint_owner(&removed.id) {
+                let index = self.sequence.index(&owner.id).ok_or(ContractError("fold owner is missing"))?;
+                if range.contains(&index) { continue; }
+                let replacement = owners.entry(index).or_insert_with(|| owner.clone());
+                for fold in &mut replacement.metadata.fold {
+                    if fold.end.block != removed.id { continue; }
+                    if let Some(retained) = incoming.get(&removed.id) {
+                        if fold.end.position.row == removed.text.row_count() && fold.end.position.column == 0 {
+                            fold.end.position.row = retained.text.row_count();
+                        }
+                    } else {
+                        fold.end = crate::block::BlockAnchor {
+                            block: last.id.clone(), position: crate::block::TextPosition {
+                                row: last.text.row_count(), column: 0,
+                            },
+                        };
+                    }
+                }
+            }
+        }
+        let mut edits = owners.into_iter().filter_map(|(index, replacement)| {
+            (self.block(&replacement.id)?.metadata != replacement.metadata)
+                .then_some(SequenceEdit { range: index..index + 1, block: vec![replacement] })
+        }).collect::<Vec<_>>();
+        edits.push(SequenceEdit { range, block });
+        self.edit_many(edits)
+    }
+
     pub fn blocks(
         &self,
         revision: DocumentRevision,

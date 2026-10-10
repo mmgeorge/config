@@ -283,6 +283,10 @@ impl ChangeTree {
             start == 0,
         );
         self.block[start].metadata.fold[0].expand_children = expand_children;
+        self.block[start].metadata.node = Some(forge_buffer::node::NodeState::new(
+            FoldId(id.into()), if start == 0 { forge_buffer::node::NodeKind::Changes }
+            else if expand_children { forge_buffer::node::NodeKind::File }
+            else { forge_buffer::node::NodeKind::Hunk }, forge_buffer::node::NodeDisplay::Heading));
         if start == 0 || expand_children {
             TranscriptRenderer::fold_marker(&mut self.block[start]);
             if expand_children { self.block[start].metadata.layout.as_mut().unwrap().indent = 4; }

@@ -45,6 +45,14 @@ struct EntryPosition {
     blocks: usize,
 }
 
+/// Identifies a source splice without retaining another copy of its text.
+pub(super) struct BodyChange {
+    pub owner: String,
+    pub anchor: BlockId,
+    pub removed: Vec<BlockId>,
+    pub inserted: Vec<BlockId>,
+}
+
 pub struct TranscriptDocument {
     session_id: String,
     timeline_revision: u64,
@@ -53,6 +61,8 @@ pub struct TranscriptDocument {
     entry_index: HashMap<String, usize>,
     synchronized: bool,
     pub(super) dirty: HashSet<String>,
+    pub(super) block_dirty: HashSet<BlockId>,
+    pub(super) body_dirty: Vec<BodyChange>,
     pub(super) structure_dirty: bool,
     block_owner: HashMap<BlockId, String>,
     pub views: DocumentViews,
@@ -86,6 +96,8 @@ impl TranscriptDocument {
         Ok(Self {
             block_owner,
             dirty: position.iter().map(|entry|entry.id.clone()).collect(),
+            block_dirty: HashSet::new(),
+            body_dirty: Vec::new(),
             structure_dirty: true,
             document: BufferDocument::new(document_id, block)?,
             session_id,
@@ -98,7 +110,7 @@ impl TranscriptDocument {
     }
 
     pub(super) fn mark_block_dirty(&mut self, block: &BlockId) {
-        if let Some(owner) = self.block_owner.get(block) { self.dirty.insert(owner.clone()); }
+        if self.block_owner.contains_key(block) { self.block_dirty.insert(block.clone()); }
     }
 
     pub(super) fn entry_position(&self, id: &str) -> Option<usize> { self.entry_index.get(id).copied() }
@@ -131,16 +143,19 @@ impl TranscriptDocument {
     fn track(&mut self, change: &TranscriptChange) {
         match change {
             TranscriptChange::Block { block } => {
-                if let Some(owner) = self.block_owner.get(&block.id) { self.dirty.insert(owner.clone()); }
+                self.mark_block_dirty(&block.id);
             }
             TranscriptChange::ToolBody { owner, anchor, removed, block } => {
+                let mut removed_ids = Vec::new();
                 if let Some(start) = self.document.block_index(anchor) {
                     if let Ok(previous) = self.document.blocks(self.document.revision(), start..start + removed) {
                         let ids: Vec<_> = previous.map(|block| block.id.clone()).collect();
+                        removed_ids.clone_from(&ids);
                         for id in ids { self.block_owner.remove(&id); }
                     }
                 }
-                self.dirty.insert(owner.clone());
+                self.body_dirty.push(BodyChange { owner: owner.clone(), anchor: anchor.clone(),
+                    removed: removed_ids, inserted: block.iter().map(|block| block.id.clone()).collect() });
                 for block in block { self.block_owner.insert(block.id.clone(),owner.clone()); }
             }
             TranscriptChange::Insert { entry, .. } | TranscriptChange::Replace { entry, .. } => {
@@ -304,7 +319,7 @@ impl TranscriptDocument {
                 ensure!(start >= entry.start && start + removed <= entry.end, "tool body exceeds its owner");
                 self.check_capacity(start..start + removed,&block)?;
                 let inserted = block.len();
-                let patch = self.document.edit(start..start + removed,block)?;
+                let patch = self.document.splice(start..start + removed,block)?;
                 self.entry[index].blocks = self.entry[index].blocks - removed + inserted;
                 Ok(patch)
             }
