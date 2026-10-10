@@ -27,6 +27,24 @@ pub struct TimelinePatch {
 }
 
 impl TimelinePatch {
+    /// Describes changed presentation state without copying exchange contents.
+    pub fn notification(&self) -> Value {
+        let mut notification = serde_json::json!({"session_id":self.session_id,"revision":self.revision});
+        for operation in &self.operation {
+            match operation {
+                TimelineOperation::Insert { entry: TimelineEntry::Status { status, .. }, .. }
+                | TimelineOperation::Replace { entry: TimelineEntry::Status { status, .. }, .. } => {
+                    notification["status"] = serde_json::to_value(status).expect("serializable status");
+                }
+                TimelineOperation::Remove { id, .. } if id == &format!("{}:status", self.session_id) => {
+                    notification["status"] = serde_json::json!({"kind":"idle"});
+                }
+                _ => {}
+            }
+        }
+        notification
+    }
+
     /// Report whether this revision carries any visible timeline mutation.
     pub fn is_empty(&self) -> bool {
         self.operation.is_empty()

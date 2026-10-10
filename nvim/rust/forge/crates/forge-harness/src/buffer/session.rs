@@ -37,6 +37,7 @@ struct OpenPresentation {
     agent_scope: Option<String>,
     last_width: WidthProfile,
     transcript: TranscriptDocument,
+    sections: super::sections::SectionProjection,
     transcript_id: DocumentId,
     submission_sequence: u64,
     pending_submission: Option<u64>,
@@ -76,6 +77,17 @@ pub struct PresentationSync {
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case")]
 pub enum PresentationRequest {
+    SectionExpansion {
+        document: DocumentId,
+        view: ViewId,
+        sequence: u64,
+        section: String,
+        expanded: bool,
+        #[serde(default)]
+        more: bool,
+        rows: usize,
+        width: WidthProfile,
+    },
     BackgroundTerminals,
     Recap {
         model: String,
@@ -193,6 +205,13 @@ impl SessionPresentation {
     pub fn dispatch(&mut self, request: PresentationRequest) -> Result<serde_json::Value> {
         use serde_json::{json, to_value};
         match request {
+            PresentationRequest::SectionExpansion { document, view, sequence, section, expanded, more, rows, width } => {
+                self.document(&document)?;
+                let open = self.open.as_mut().expect("validated presentation");
+                open.sections.set(&mut open.transcript, view, sequence, &section, expanded, more, Some((rows, width)))?;
+                retain_patches(open, Vec::new())?;
+                Ok(json!({}))
+            }
             PresentationRequest::Highlight { .. } => {
                 anyhow::bail!("syntax requires the asynchronous service owner")
             }
@@ -213,6 +232,7 @@ impl SessionPresentation {
                 if open.transcript.views.open(view.clone(), width)? {
                     reflow(open, self.timeline.entry_list(), self.timeline.revision())?;
                 }
+                open.sections.register(view.clone());
                 open.input.entry(view).or_insert(InputSequence(0));
                 Ok(json!({}))
             }
@@ -366,6 +386,8 @@ impl SessionPresentation {
                 self.document(&document)?;
                 let open = self.open.as_mut().expect("validated open presentation");
                 open.input.remove(&view);
+                open.sections.close(&mut open.transcript, &view);
+                retain_patches(open, Vec::new())?;
                 if open.transcript.views.close(&view) && open.transcript.views.profile().is_some() {
                     reflow(open, self.timeline.entry_list(), self.timeline.revision())?;
                 }
@@ -422,10 +444,11 @@ impl SessionPresentation {
             if open.transcript.views.open(view.clone(), width)? {
                 reflow(open, self.timeline.entry_list(), self.timeline.revision())?;
             }
-            open.input.entry(view).or_insert(InputSequence(0));
+            open.sections.register(view.clone());
+                open.input.entry(view).or_insert(InputSequence(0));
             return Ok(PresentationOpen {
                 syntax_pending: syntax_pending(open),
-                transcript: open.transcript.snapshot()?,
+                transcript: open.sections.document.snapshot()?,
             });
         }
         let mut projected = Vec::new();
@@ -459,12 +482,14 @@ impl SessionPresentation {
             block,
         )?;
         transcript.views.open(view.clone(), width.clone())?;
+        let mut sections = super::sections::SectionProjection::new(&mut transcript, document.clone())?;
+        sections.register(view.clone());
         let opened = PresentationOpen {
             syntax_pending: !syntax.is_empty()
                 || action
                     .values()
                     .any(|action| matches!(action, TranscriptAction::Diff { .. })),
-            transcript: transcript.snapshot()?,
+            transcript: sections.document.snapshot()?,
         };
         self.open = Some(OpenPresentation {
             expanded_tool: HashSet::new(),
@@ -473,6 +498,7 @@ impl SessionPresentation {
             agent_scope: None,
             last_width: width,
             transcript,
+            sections,
             transcript_id: document,
             submission_sequence: 0,
             pending_submission: None,
@@ -508,7 +534,7 @@ impl SessionPresentation {
         if let Some(failure) = &open.failure {
             anyhow::bail!("transcript projection requires reopening: {failure}");
         }
-        let current = open.transcript.document.revision();
+        let current = open.sections.document.document.revision();
         ensure!(
             revision <= current,
             "transcript revision is ahead of its native owner"
@@ -535,7 +561,7 @@ impl SessionPresentation {
             Ok(PresentationSync {
                 syntax_pending: syntax_pending(open),
                 patch: Vec::new(),
-                snapshot: Some(open.transcript.snapshot()?),
+                snapshot: Some(open.sections.document.snapshot()?),
             })
         }
     }
@@ -632,6 +658,7 @@ impl SessionPresentation {
                 .document
                 .block_index(&syntax.id)
                 .expect("retained block");
+            open.transcript.mark_block_dirty(&syntax.id);
             edits.push(forge_buffer::sequence::SequenceEdit {
                 range: index..index + 1,
                 block: vec![replacement],
@@ -662,7 +689,7 @@ impl SessionPresentation {
         if let Some(output) = open.output.get(document) {
             Ok(output.snapshot())
         } else {
-            self.document(document)?.transcript.snapshot()
+            self.document(document)?.sections.document.snapshot()
         }
     }
 
@@ -687,7 +714,7 @@ impl SessionPresentation {
             .context("session presentation is not open")?;
         ensure!(
             input.document == open.transcript_id
-                && input.revision == open.transcript.document.revision(),
+                && input.revision == open.sections.document.document.revision(),
             "transcript input revision changed"
         );
         let sequence = open
@@ -699,7 +726,7 @@ impl SessionPresentation {
             "stale transcript input sequence"
         );
         let block = open
-            .transcript
+            .sections.document
             .document
             .block(&input.block)
             .context("transcript input block disappeared")?;
@@ -1317,8 +1344,8 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
     retain_patches(open, patches)
 }
 
-fn retain_patches(open: &mut OpenPresentation, patches: Vec<BufferPatch>) -> Result<()> {
-    for patch in patches {
+fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>) -> Result<()> {
+    for patch in open.sections.refresh(&mut open.transcript).context("loaded section projection")? {
         let bytes = serde_json::to_vec(&patch)?.len();
         while open.pending.len() >= 64 || open.pending_bytes + bytes > MAX_PENDING_BYTES {
             let Some((_, removed)) = open.pending.pop_front() else {
@@ -1341,6 +1368,17 @@ fn retain_patches(open: &mut OpenPresentation, patches: Vec<BufferPatch>) -> Res
 mod tests {
     use super::*;
 
+    fn expand_sections(owner: &mut SessionPresentation, view: &str) -> Result<()> {
+        let open = owner.open.as_mut().unwrap();
+        let ids: Vec<_> = open.transcript.snapshot()?.block.iter()
+            .flat_map(|block| block.metadata.fold.iter().map(|fold| fold.id.0.clone())).collect();
+        for (index, id) in ids.iter().enumerate() {
+            open.sections.set(&mut open.transcript, ViewId(view.into()), index as u64 + 1, id, true, false, None)?;
+            open.sections.quota_for_test(id, 16 * 1024 * 1024);
+        }
+        retain_patches(open, Vec::new())
+    }
+
     #[test]
     fn expanded_streaming_retains_settled_chunks_and_patches_only_the_mutable_tail() -> Result<()> {
         use crate::backend::{BackendEvent,ProviderAddress,ToolActivity,ToolActivityKind};
@@ -1362,6 +1400,7 @@ mod tests {
         owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
         owner.open.as_mut().unwrap().expanded_tool.insert("active:turn:1:tool".into());
         toggle_inline_output(owner.open.as_mut().unwrap(),"active:turn:1:tool",true)?;
+        expand_sections(&mut owner, "view")?;
         let opened = owner.snapshot(&document)?;
         assert!(opened.block.iter().map(|block|block.text.row_count()).sum::<usize>() >= 30000);
         let heading = BlockId("active:turn:1:tool:tool".into());
@@ -1456,7 +1495,8 @@ mod tests {
         owner.initialize(entries)?;
         let document = DocumentId("streamed-output".into());
         let opened = owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
-        assert!(opened.transcript.block.iter().map(|block|block.text.row_count()).sum::<usize>() >= 30000);
+        assert!(opened.transcript.block.iter().map(|block|block.text.row_count()).sum::<usize>() < 30000);
+        assert!(!opened.transcript.block.iter().any(|block| block.id.0 == "history-0:turn:1:tool:preview"));
         let event = BackendEvent {
             received_at_ms: None, address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
             turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10}),
@@ -1725,7 +1765,9 @@ mod tests {
         owner.initialize(vec![interaction_entry("first")])?;
         let document = DocumentId("transcript:toggle".into());
         let view = ViewId("view:toggle".into());
-        let opened = owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        expand_sections(&mut owner, "view:toggle")?;
+        let opened = PresentationOpen { syntax_pending: false, transcript: owner.snapshot(&document)? };
         let block = BlockId("first:turn:1:tool:preview".into());
         let mut input = DocumentInput {
             document: document.clone(),
@@ -1814,6 +1856,8 @@ mod tests {
         let moved = owner.navigate_prompt(input.clone(), false)?;
         assert_eq!(moved["anchor"]["block"], "second:prompt");
         assert!(owner.navigate_prompt(input.clone(), false).is_err());
+        expand_sections(&mut owner, "view:actions")?;
+        input.revision = owner.snapshot(&document)?.revision;
         input.sequence = InputSequence(2);
         input.block = BlockId("first:turn:1:tool:tool".into());
         input.target = Some(TargetId("first:turn:1:tool:tool".into()));

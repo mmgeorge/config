@@ -42,15 +42,13 @@ local success, failure = xpcall(function()
   await(function() return not state.busy and state.active_plan and state.active_plan.model_revision == 1 end, "initial plan missing")
   local source = vim.deepcopy(state.active_plan)
   submit("Why did you choose this design?")
-  local discussion
-  await(function()
-    for _, entry in ipairs(state.timeline or {}) do
-      if entry.exchange and entry.exchange.prompt == "Why did you choose this design?" then
-        discussion = entry.exchange
-      end
-    end
-    return not state.busy and discussion and discussion.state == "complete"
-  end, "discussion did not finish")
+  await(function() return not state.busy end, "discussion did not finish")
+  local history
+  client.request("exchange.list", {}, function(value, failure) assert(not failure, failure) history = value end)
+  await(function() return history ~= nil end, "discussion history missing")
+  local discussion = assert(vim.iter(history):find(function(exchange)
+    return exchange.prompt == "Why did you choose this design?" and exchange.state == "complete"
+  end))
   assert(require("forge.views.harness.task").current(state).kind == "plan", "discussion lost its planning task")
   assert(state.active_plan.id == source.id and state.active_plan.model_revision == source.model_revision,
     "discussion changed the submitted plan")

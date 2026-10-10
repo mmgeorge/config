@@ -10,3 +10,5 @@ mod question;
 pub mod session;
 pub mod tool;
 pub mod transcript;
+
+pub(crate) mod sections;

@@ -19,10 +19,10 @@ local controller = require("forge.views.harness.controller")
 local task = require("forge.views.harness.task")
 local function latest_exchange()
   local snapshot, failure
-  client.request("state.get", {}, function(result, problem) snapshot, failure = result, problem end)
+  client.request("exchange.list", {}, function(result, problem) snapshot, failure = result, problem end)
   assert(vim.wait(5000, function() return snapshot or failure end, 10), "snapshot stalled")
   assert(not failure, failure)
-  return snapshot.exchange[#snapshot.exchange]
+  return snapshot[#snapshot]
 end
 local function wait_settled()
   assert(vim.wait(15000, function() return #errors > 0 or (not state.busy and not state.task_operation and not state.state_sync_pending) end, 10), "task did not settle")

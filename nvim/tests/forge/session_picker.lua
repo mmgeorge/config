@@ -66,8 +66,8 @@ local function snapshot(entry)
   local record = interaction(entry.id, "Preview " .. (entry.name == "" and "unnamed" or entry.name))
   return {
     session = entry,
-    exchange = { record },
-    timeline = { { kind = "exchange", id = record.id, created_at_ms = 1, exchange = record } },
+    lines = { record.prompt, record.turn[1].message[1].text },
+    status = { kind = "idle" },
     artifact = {},
     approval = {},
     capability = {},

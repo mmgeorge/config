@@ -4,7 +4,6 @@ local agent_catalog = require("forge.views.harness.agent_catalog")
 local agent_summary = require("forge.render.harness.agent_summary")
 local config = require("forge.infra.config")
 local picker = require("forge.views.picker")
-local timeline_cache = require("forge.views.harness.timeline_cache")
 
 local active = nil
 
@@ -36,7 +35,7 @@ local function option_list(state, selected_run_id)
         label = agent_summary.label(run),
         detail = agent_summary.status_detail(
           run,
-          timeline_cache.agent_exchange_list(state, run.id),
+          (state.agent.summary or {})[run.id],
           now_ms
         ),
         section = group.title,

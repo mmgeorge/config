@@ -1,6 +1,5 @@
 local HarnessSnapshot = {}
 
-local timeline_cache = require("forge.views.harness.timeline_cache")
 local prompt_history = require("forge.views.harness.prompt_history")
 
 ---Convert nullable snapshot fields to absent Lua values without changing the wire response.
@@ -42,7 +41,8 @@ function HarnessSnapshot.apply(state, result)
     require("forge.views.harness.recap").clear(state)
   end
   state.capability = result.capability or {}
-  timeline_cache.replace(state, result.timeline or {}, result.timeline_revision or 0)
+  state.timeline_revision = result.timeline_revision or 0
+  state.status = result.status or { kind = "idle" }
   state.artifact = vim.deepcopy(result.artifact or {})
   state.no_checkpoint = result.no_checkpoint == true
   state.task = result.task or {}

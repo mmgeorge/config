@@ -100,6 +100,33 @@ pub struct InitializeRequest {
     pub lease_conflict_action: Option<String>,
 }
 
+fn agent_summaries(runs: &[Agent], exchanges: &[Exchange]) -> std::collections::HashMap<String, Value> {
+    runs.iter().map(|run| {
+        let owned: Vec<_> = exchanges.iter().filter(|exchange| exchange.agent_id == run.id).collect();
+        let tools: Vec<_> = owned.iter().flat_map(|exchange| exchange.turn.iter()).flat_map(|turn|turn.tools()).collect();
+        let latest = owned.last();
+        let target = latest.and_then(|exchange| exchange.turn.iter().rev().find(|turn| matches!(turn.state(),crate::turn::TurnState::Running)))
+            .map(|turn| serde_json::to_value(turn.provider()).expect("provider address"));
+        (run.id.clone(), json!({"state":latest.map(|exchange| serde_json::to_value(exchange.state).expect("exchange state")).unwrap_or_else(|| serde_json::to_value(run.state).expect("agent state")),
+            "tool_count":tools.len(),"failed_count":tools.iter().filter(|tool|tool.failed).count(),"target":target}))
+    }).collect()
+}
+
+fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
+    let width = forge_buffer::width::WidthProfile { columns: 100, ..Default::default() };
+    let mut lines = Vec::new();
+    for (index, entry) in timeline.iter().rev().take(20).rev().enumerate() {
+        let projected = crate::buffer::projection::project(entry, &width, index > 0, &Default::default())?;
+        for block in crate::buffer::sections::preview(projected.entry)?.block {
+            for row in block.text.wire_rows() {
+                if lines.len() >= 200 { return Ok(lines); }
+                lines.push(row.chars().take(1000).collect());
+            }
+        }
+    }
+    Ok(lines)
+}
+
 /// Represents the complete client-visible state for one active session.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
@@ -108,6 +135,7 @@ pub struct BrokerSnapshot {
     pub task_operation: Option<Value>,
     pub session: HarnessSession,
     pub task: Vec<crate::task::TaskRecord>,
+    #[serde(skip)]
     pub exchange: Vec<Exchange>,
     pub capability: BackendCapability,
     pub no_checkpoint: bool,
@@ -115,8 +143,10 @@ pub struct BrokerSnapshot {
     pub active_plan: Option<PlanRecord>,
     pub active_elicitation: Option<ActiveElicitation>,
     pub artifact: Vec<ArtifactSummary>,
+    #[serde(skip)]
     pub timeline: Vec<TimelineEntry>,
     pub timeline_revision: u64,
+    pub status: crate::session::state_machine::SessionPhase,
     pub goal_execution: Option<PlanExecutionRecord>,
     pub active_wait: Option<ActiveWait>,
     pub prompt_history: Vec<String>,
@@ -129,14 +159,19 @@ pub struct BrokerSnapshot {
 pub struct AgentSnapshot {
     pub definition: Vec<AgentDefinition>,
     pub run: Vec<Agent>,
+    pub summary: std::collections::HashMap<String, Value>,
+    #[serde(skip)]
     pub exchange: Vec<Exchange>,
 }
 
 /// Represents a stored session timeline projected without acquiring its lease.
 #[derive(Clone, Debug, Serialize)]
 pub struct SessionPreview {
+    pub lines: Vec<String>,
     pub session: HarnessSession,
+    #[serde(skip)]
     pub exchange: Vec<Exchange>,
+    #[serde(skip)]
     pub timeline: Vec<TimelineEntry>,
     pub agent: AgentSnapshot,
 }
@@ -910,6 +945,7 @@ impl HarnessBroker {
                 .map(ArtifactSummary::from)
                 .collect(),
             timeline,
+            status,
             timeline_revision: self
                 .presentation
                 .lock()
@@ -924,6 +960,7 @@ impl HarnessBroker {
                 } else {
                     Vec::new()
                 },
+                summary: agent_summaries(&agent_run_list, &agent_exchange_list),
                 run: agent_run_list,
                 exchange: agent_exchange_list,
             },
@@ -1016,9 +1053,7 @@ impl HarnessBroker {
                     }
                 };
                 if !timeline_patch.is_empty() {
-                    match serde_json::to_value(timeline_patch)
-                        .map_err(Into::into)
-                        .and_then(|payload| self.event("timeline_patch", payload))
+                    match self.event("document_changed", timeline_patch.notification())
                     {
                         Ok(timeline_event) => event.push(timeline_event),
                         Err(error) => {
@@ -1061,8 +1096,7 @@ impl HarnessBroker {
                 let mut event = Vec::new();
                 if let Ok(timeline_patch) = self.reconcile_after_dispatch()
                     && !timeline_patch.is_empty()
-                    && let Ok(payload) = serde_json::to_value(timeline_patch)
-                    && let Ok(timeline_event) = self.event("timeline_patch", payload)
+                    && let Ok(timeline_event) = self.event("document_changed", timeline_patch.notification())
                 {
                     event.push(timeline_event);
                 }
@@ -1245,8 +1279,10 @@ impl HarnessBroker {
                 Some(admission),
             ).await?;
             event.append(&mut update);
-            let exchange: Exchange = serde_json::from_value(result.get("exchange").cloned()
-                .context("plan question completed without its exchange")?)?;
+            let exchange_id = result.pointer("/exchange/id").and_then(Value::as_str)
+                .context("plan question completed without its exchange")?;
+            let exchange = self.store.load_exchange(exchange_id)?
+                .context("plan question exchange is no longer available")?;
             let answer = exchange.turn.iter().flat_map(|turn| turn.messages())
                 .filter(|message| message.kind() == crate::turn::MessageKind::Assistant
                     && message.delivery() == crate::turn::MessageDelivery::Final)
@@ -4065,10 +4101,10 @@ Planning continuation: turn {} of {}.",
             } else {
                 "exchange_complete"
             },
-            serde_json::to_value(&interaction)?,
+            json!({"id": interaction.id, "state": interaction.state}),
         )?);
         Ok((
-            json!({ "exchange": interaction, "session": self.session, "capability": self.capability }),
+            json!({ "exchange": {"id": interaction.id, "state": interaction.state}, "session": self.session, "capability": self.capability }),
             event,
         ))
     }
@@ -4363,7 +4399,7 @@ Planning continuation: turn {} of {}.",
         self.save_session()?;
         Ok((
             json!({"cancel_requested": true, "finalized_exchange_id": exchange.id}),
-            vec![self.event("exchange_complete", serde_json::to_value(&exchange)?)?],
+            vec![self.event("exchange_complete", json!({"id":exchange.id,"state":exchange.state}))?],
         ))
     }
 
@@ -4870,16 +4906,36 @@ Planning continuation: turn {} of {}.",
 
     async fn emit_backend_event(
         &mut self,
-        backend_event: BackendEvent,
+        mut backend_event: BackendEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        // Source payloads stay in Rust. The document service owns their visible projection.
+        if matches!(backend_event.kind.as_str(), "tool" | "tool-output" | "assistant_message"
+            | "reasoning" | "reasoning_summary" | "message" | "raw" | "agent_timeline_updated")
+            || (backend_event.kind.starts_with("timeline_") && !matches!(backend_event.kind.as_str(), "timeline_node_updated" | "timeline_wait_updated")) {
+            return Ok(());
+        }
+        if backend_event.kind == "timeline_node_updated" {
+            backend_event.data = json!({"node":{"prompt":backend_event.data.pointer("/node/prompt")}});
+        } else if !matches!(backend_event.kind.as_str(), "execution_state" | "prompt_submission"
+            | "approval_requested" | "approval_resolved" | "approval_cancelled" | "agent_updated"
+            | "context_usage" | "timeline_wait_updated" | "plan_execution_progress" | "configuration_applied" | "error") {
+            backend_event.data = Value::Null;
+            backend_event.text = None;
+            backend_event.activity = None;
+            backend_event.summary = None;
+            backend_event.task_update = None;
+        }
         self.trace.record(
             &self.session.id,
             "lua.event.emitted",
             serde_json::to_value(&backend_event)?,
         );
         if let Some(event_sink) = self.event_sink.as_ref() {
-            event_sink.send_wait(backend_event).await?;
+            if let Err(error) = event_sink.send_wait(backend_event).await {
+                self.trace.record(&self.session.id, "presentation.delivery_failed", json!({"error":error.to_string()}));
+                self.event_sink = None;
+            }
         } else {
             event.push(self.event("backend_event", serde_json::to_value(backend_event)?)?);
         }
@@ -4904,21 +4960,25 @@ Planning continuation: turn {} of {}.",
             }),
         );
         if let Some(event_sink) = self.event_sink.as_ref() {
-            event_sink
+            let delivery = event_sink
                 .send_wait(BackendEvent {
             received_at_ms: None,
                     address: None,
                     turn_boundary: None,
-                    kind: "timeline_patch".into(),
+                    kind: "document_changed".into(),
                     text: None,
-                    data: serde_json::to_value(timeline_patch)?,
+                    data: timeline_patch.notification(),
                     activity: None,
                     summary: None,
                     task_update: None,
                 })
-                .await?;
+                .await;
+            if let Err(error) = delivery {
+                self.trace.record(&self.session.id, "presentation.delivery_failed", json!({"error":error.to_string()}));
+                self.event_sink = None;
+            }
         } else {
-            event.push(self.event("timeline_patch", serde_json::to_value(timeline_patch)?)?);
+            event.push(self.event("document_changed", timeline_patch.notification())?);
         }
         Ok(())
     }
@@ -6025,7 +6085,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             if self.exchange_runtime.as_ref().is_some_and(|runtime| runtime.exchange_id == exchange.id) {
                 self.exchange_runtime = None;
             }
-            event.push(self.event("exchange_complete", serde_json::to_value(exchange)?)?);
+            event.push(self.event("exchange_complete", json!({"id":exchange.id,"state":exchange.state}))?);
         }
         self.sync_plan_execution(&goal)?;
         self.session.goal_id = None;
@@ -6363,11 +6423,13 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             plan_file: &self.plan_file,
         })?;
         let preview = SessionPreview {
+            lines: preview_lines(&timeline)?,
             session: preview_session,
             exchange: interaction,
             timeline,
             agent: AgentSnapshot {
                 definition: Vec::new(),
+                summary: agent_summaries(&agent_run_list, &agent_exchange_list),
                 run: agent_run_list,
                 exchange: agent_exchange_list,
             },
@@ -7720,13 +7782,12 @@ mod test {
                 .is_pending()
             );
             let consume = async move {
-                let mut delivered = String::new();
+                let mut notifications = 0;
                 while let Some(event) = stream.recv().await.unwrap() {
-                    if event.kind == "assistant_message" {
-                        delivered.push_str(event.text.as_deref().unwrap());
-                    }
+                    assert_ne!(event.kind, "assistant_message", "source content escaped its Rust owner");
+                    if event.kind == "document_changed" { notifications += 1; }
                 }
-                assert_eq!(delivered,(0..384).map(|sequence|sequence.to_string()).collect::<String>());
+                assert!(notifications > 0);
             };
             let (result, ()) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
                 tokio::join!(dispatch, consume)
@@ -10016,7 +10077,7 @@ mod test {
             })
             .await;
         assert!(continued.response.error().is_none());
-        assert!(continued.event.iter().filter(|event| event.event == "timeline_patch")
+        assert!(continued.event.iter().filter(|event| event.event == "document_changed")
             .any(|event| event.payload.to_string().contains("\"kind\":\"working\"")),
             "resuming a chat clarification must restore the Working footer in live patches");
         assert!(broker.snapshot().unwrap().active_elicitation.is_none());
@@ -10298,14 +10359,10 @@ mod test {
             snapshot["session"]["context_usage"]["remaining_percent"],
             75
         );
-        assert_eq!(snapshot["exchange"].as_array().map(Vec::len), Some(0));
-        assert_eq!(snapshot["timeline"].as_array().map(Vec::len), Some(1));
-        assert_eq!(snapshot["timeline"][0]["kind"], "session_event");
-        assert_eq!(snapshot["timeline"][0]["event"]["kind"], "forked");
-        assert_eq!(
-            snapshot["timeline"][0]["event"]["source_session_id"],
-            source_session_id
-        );
+        assert!(snapshot.get("exchange").is_none() && snapshot.get("timeline").is_none());
+        let timeline = child_controller.snapshot().unwrap().timeline;
+        assert_eq!(timeline.len(), 1);
+        assert!(matches!(&timeline[0], TimelineEntry::SessionEvent { .. }));
         let failed_preparation = prepare_provider_fork(
             data.path(),
             "fork-client",
@@ -10653,9 +10710,8 @@ mod test {
         assert!(preview.response.error().is_none());
         let result = preview.response.result().expect("session preview");
         assert_eq!(result["session"]["id"], source_session_id);
-        assert_eq!(result["exchange"].as_array().map(Vec::len), Some(1));
-        assert_eq!(result["exchange"][0]["prompt"], "preserve preview history");
-        assert_eq!(result["timeline"].as_array().map(Vec::len), Some(1));
+        assert!(result.get("exchange").is_none() && result.get("timeline").is_none());
+        assert!(result["lines"].as_array().unwrap().iter().any(|line| line.as_str().unwrap().contains("preserve preview history")));
         let persisted = broker
             .store
             .load_session(&source_session_id)
@@ -10879,7 +10935,7 @@ mod test {
                 .iter()
                 .any(|event| event.event == "plan_question_answered")
         );
-        assert!(completed.event.iter().filter(|event| event.event == "timeline_patch")
+        assert!(completed.event.iter().filter(|event| event.event == "document_changed")
             .any(|event| {
                 let payload = event.payload.to_string();
                 payload.contains("\"kind\":\"working\"")

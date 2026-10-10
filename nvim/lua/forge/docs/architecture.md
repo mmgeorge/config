@@ -646,10 +646,29 @@ receive the same conversion without mutating the transport response or other pro
 
 The projector consumes `QuestionAnswered` as transition evidence instead of publishing a second feedback row because
 the continuation interaction owns that visible user action. It also nests durable child-agent turns under their
-provider and spawning-interaction identities before serialization. Lua's `timeline_cache.lua` validates the session
-id and base revision, applies one patch atomically, extracts the final synthetic status, and requests `state.get` after
-a revision gap. It appends configured key hints and renders the resulting records without comparing answer text,
-joining agent tables, grouping interactions, or reconstructing workflow phase.
+provider and spawning-interaction identities before projection. Rust retains complete exchanges and
+source output. `state.get` carries compact status and agent summaries, while `document_changed`
+announces the current source revision without duplicating transcript content in Lua.
+
+The session presentation owns a separate loaded document. Closed folds retain their heading and
+an empty body anchor. A section request records expansion intent per view and publishes the union
+needed by attached windows. An unloaded fold stays closed with a loading label until its first
+page is installed. The same publication opens it, and a second toggle cancels that pending open.
+Failed requests leave the fold closed and retryable. Closing the last requesting view releases its body. Nested closed
+sections remain deferred. Expanded change files own their hunk bodies and start with two
+window heights of display rows. Each continuation adds two current window heights when its
+end boundary is within one screen below the viewport. File headings never request more pages.
+A page also has a 64 KiB byte budget to bound unusually long lines, and larger hunks continue
+in the next batch. Loaded rows remain stable across resizing, and each file admits one outstanding
+request until its response is published. Other section bodies grow in 64 KiB pages. All loaded
+bodies retain the 16 MiB safety limit. The viewport admits at most eight section requests per pass.
+A failed request produces a visible notice and remains retryable. Section sequences reject delayed requests, and document identities reject
+requests from a previous presentation lifetime. Neovim's native search covers loaded text.
+
+The existing 67 ms publication interval applies to demand responses and streaming changes. Each
+buffer commit installs text and metadata atomically. Internal events retain the 512 KiB frame limit
+and use ordered JSON parts for larger payloads, with a 16 MiB aggregate limit. Transport shutdown
+or an incomplete multipart event reports an explicit delivery failure.
 
 `Idle` remains a structural Rust phase but produces no status entry. `Working`, `RetryingPlanGeneration`,
 `AwaitingInput`, `AwaitingPlanReview`, `PlanningFailed`, and `WaitingForAgent` occupy the final timeline position.

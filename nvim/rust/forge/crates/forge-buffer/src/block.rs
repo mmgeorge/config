@@ -132,8 +132,19 @@ pub struct ContentLayout {
     pub source_indent: usize,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Describes a demand-loaded body attached to a native fold heading.
+pub struct DeferredSection {
+    pub id: FoldId,
+    pub revision: u64,
+    pub open: bool,
+    pub more: bool,
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMetadata {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub section: Vec<DeferredSection>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     /// Enclosing projected containers ordered from innermost to outermost.
     pub collapse: Vec<Collapse>,
@@ -169,7 +180,9 @@ impl BlockMetadata {
     /// Charge retained vector storage and nested strings without serializing metadata.
     fn allocated_bytes(&self) -> usize {
         use std::mem::size_of;
-        self.target.capacity() * size_of::<TargetRange>()
+        self.section.capacity() * size_of::<DeferredSection>()
+            + self.section.iter().map(|section| section.id.0.capacity()).sum::<usize>()
+            + self.target.capacity() * size_of::<TargetRange>()
             + self.collapse.capacity() * size_of::<Collapse>()
             + self.collapse.iter().map(|collapse| collapse.id.0.capacity() + collapse.opening.block.0.capacity()).sum::<usize>()
             + self.layout.as_ref().and_then(|layout| layout.marker.as_ref())
@@ -272,6 +285,12 @@ impl BufferBlock {
             }
         }
         self.id.validate()?;
+        for section in &self.metadata.section {
+            section.id.validate()?;
+            if section.revision > crate::MAX_COUNTER {
+                return Err(ContractError("section revision exceeds the exact counter range"));
+            }
+        }
         for collapse in &self.metadata.collapse {
             collapse.id.validate()?;
             collapse.opening.block.validate()?;

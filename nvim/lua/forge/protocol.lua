@@ -1,5 +1,5 @@
 local M = {}
-M.VERSION = 8
+M.VERSION = 10
 
 ---@param id integer
 ---@param method string

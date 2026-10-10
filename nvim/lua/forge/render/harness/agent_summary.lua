@@ -9,6 +9,9 @@ local active_status = {
 }
 
 local function execution_status(run, exchange_list)
+  if exchange_list and exchange_list.state then
+    return exchange_list.state == "complete" and "completed" or exchange_list.state
+  end
   local exchange = exchange_list and exchange_list[#exchange_list] or nil
   if exchange and active_status[exchange.state] then return exchange.state end
   if exchange and exchange.state then return exchange.state == "complete" and "completed" or exchange.state end
@@ -38,6 +41,9 @@ end
 ---@return integer tool_count Total count of tool invocations.
 ---@return integer failed_count Count of failed tool executions.
 function AgentSummary.tool_counts(interaction_list)
+  if interaction_list and interaction_list.tool_count then
+    return interaction_list.tool_count, interaction_list.failed_count or 0
+  end
   local tool_count, failed_count = 0, 0
   for _, exchange in ipairs(interaction_list or {}) do
     for _, turn in ipairs(exchange.turn or {}) do

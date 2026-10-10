@@ -5,6 +5,7 @@ local original_request, original_accepting = client.request_for, client.host_acc
 local requests = {}
 client.host_accepting = function() return true end
 client.request_for = function(_, _, params, callback)
+  if params.operation == "background_terminals" then callback({ supported = false }) return end
   requests[#requests + 1] = { params = params, callback = callback }
 end
 local owner
@@ -34,6 +35,7 @@ local success, failure = xpcall(function()
     assert(requests[previous + 1].params.operation == "toggle_tool", "Tab did not expand preview row " .. row)
     assert(requests[previous + 1].params.input.position.row == row - 1)
     requests[previous + 1].callback({ expanded = true })
+    assert(vim.wait(1000, function() return requests[previous + 2] ~= nil end, 1))
     assert(requests[previous + 2].params.operation == "sync")
     requests[previous + 2].callback({ patch = {} })
   end

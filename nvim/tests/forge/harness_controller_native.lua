@@ -197,6 +197,7 @@ local success, failure = xpcall(function()
   local child_exchange = { id = "child-exchange", agent_id = "child", state = "running",
     turn = { { state = { kind = "running" }, provider = { thread_id = "child-thread", turn_id = "child-turn" } } } }
   state.timeline = { { kind = "agent_lifecycle", run = state.agent.run[1], exchange = { child_exchange }, agent = {} } }
+  state.agent.summary = { child = { state = "running", target = { thread_id = "child-thread", turn_id = "child-turn" } } }
   controller.cancel_turn()
   assert(child_request[1].method == "turn.cancel" and child_request[1].params.target.thread_id == "child-thread")
   assert(not state.cancel_requested, "settled child cancellation retained the parent cancellation flag")
@@ -204,6 +205,7 @@ local success, failure = xpcall(function()
   assert(child_request[2].method == "turn.steer" and child_request[2].params.target.turn_id == "child-turn")
   state.cancel_requested = false
   child_exchange.state = "complete"
+  state.agent.summary.child = { state = "complete" }
   controller.cancel_turn()
   assert(#child_request == 2, "completed-child cancellation fell through to the parent")
   client.request = original_plain_request

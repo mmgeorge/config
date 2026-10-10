@@ -247,7 +247,8 @@ impl MessageSender {
         result
     }
 
-    fn record_failure(&self, error: &io::Error) {
+    /// Publish a terminal producer failure to waiting senders and the receiver.
+    pub fn record_failure(&self, error: &io::Error) {
         self.failure.send_if_modified(|failure| {
             if failure.is_some() {
                 return false;

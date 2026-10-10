@@ -848,8 +848,8 @@ async fn route_request(
     let routed_session_id = session_id.clone();
     let event_forwarder = tokio::spawn(async move {
         while let Some(event) = event_stream.recv().await? {
-            let (event_name, payload) = if event.kind == "timeline_patch" {
-                ("timeline_patch".to_owned(), event.data)
+            let (event_name, payload) = if event.kind == "document_changed" {
+                ("document_changed".to_owned(), event.data)
             } else {
                 (
                     "backend_event".to_owned(),
@@ -1074,7 +1074,7 @@ async fn dispatch_task_attempt(broker: &mut HarnessBroker, session_id: &str, req
                     event:"session_configured".into(), payload:event.data }).await?;
                 continue;
             }
-            let (name, payload) = if event.kind == "timeline_patch" { ("timeline_patch", event.data) }
+            let (name, payload) = if event.kind == "document_changed" { ("document_changed", event.data) }
                 else { ("backend_event", serde_json::to_value(event)?) };
             output.send_event(SessionEvent { session_id: routed_session.clone(), event: name.into(), payload }).await?;
         }

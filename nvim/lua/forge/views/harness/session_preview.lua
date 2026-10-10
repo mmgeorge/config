@@ -1,10 +1,6 @@
 local SessionPreview = {}
 
 local layout = require("forge.views.harness.layout")
-local timeline_cache = require("forge.views.harness.timeline_cache")
-local markdown = require("forge.render.harness.markdown")
-local render_transaction = require("forge.render.harness.transaction")
-local renderer = require("forge.render.harness.interaction_tree")
 
 local namespace = vim.api.nvim_create_namespace("ForgeHarnessSessionPreview")
 local active = nil
@@ -55,17 +51,9 @@ end
 ---@param snapshot table
 function SessionPreview.render(snapshot)
   if not active or not vim.api.nvim_buf_is_valid(active.preview_buf) then return end
-  local timeline = timeline_cache.history({ timeline = vim.deepcopy(snapshot.timeline or {}) })
-  local render = renderer.build(timeline, {
-    content_width = vim.api.nvim_win_is_valid(active.transcript_win)
-        and vim.api.nvim_win_get_width(active.transcript_win)
-      or nil,
-    cwd = snapshot.session and snapshot.session.workspace or vim.uv.cwd(),
-    expanded = {},
-    now_ms = os.time() * 1000,
-  })
-  render_transaction.apply(active.render_state, render, { reset = true })
-  markdown.render(active.preview_buf, active.transcript_win, render.markdown_ranges)
+  vim.bo[active.preview_buf].modifiable = true
+  vim.api.nvim_buf_set_lines(active.preview_buf, 0, -1, false, snapshot.lines or {})
+  vim.bo[active.preview_buf].modifiable = false
 end
 
 function SessionPreview.close()

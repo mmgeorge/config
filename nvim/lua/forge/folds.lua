@@ -424,6 +424,42 @@ end
 ---@field include_body? fun(id: string): boolean
 ---@field on_toggled? fun(id: string, closed: boolean)
 ---@field on_projected? fun()
+---@field before_toggle? fun(id: string, opening: boolean): boolean
+
+---Set a stable native fold without moving the cursor to its heading.
+---@param session table
+---@param window integer
+---@param id string
+---@param opening boolean
+---@return boolean
+function M.set_open(session, window, id, opening)
+  if not session or session.status ~= "Applied" or session.update_pending or session.applying
+    or not vim.api.nvim_win_is_valid(window) or vim.api.nvim_win_get_buf(window) ~= session.buffer then return false end
+  local record = session.fold and session.fold.record[id]
+  if not record then return false end
+  local start = fold_start(session, record)
+  vim.api.nvim_win_call(window, function()
+    local cursor = vim.api.nvim_win_get_cursor(window)
+    local closed = vim.fn.foldclosed(start) == start
+    if opening == closed then
+      vim.cmd(tostring(start) .. (opening and (record.fold.expand_children and "foldopen!" or "foldopen") or "foldclose"))
+    end
+    if not opening and cursor[1] > start then
+      local text = vim.api.nvim_buf_get_lines(session.buffer, start - 1, start, false)[1] or ""
+      vim.api.nvim_win_set_cursor(window, { start, math.min(cursor[2], math.max(0, #text - 1)) })
+    end
+    if opening and record.fold.collapse_children then
+      local finish, children = fold_end(session, record), {}
+      for _, child in pairs(session.fold.record) do
+        local child_start = fold_start(session, child)
+        if child_start > start and fold_end(session, child) <= finish then children[#children + 1] = child_start end
+      end
+      table.sort(children, function(left, right) return left > right end)
+      for _, child_start in ipairs(children) do close_open_fold(child_start) end
+    end
+  end)
+  return true
+end
 
 ---@param session table
 ---@param window integer
@@ -457,27 +493,10 @@ function M.toggle_heading(session, window, options)
   end
   if selected then
     local record, start = selected, selected_start
-    vim.api.nvim_win_call(window, function()
-      local cursor = vim.api.nvim_win_get_cursor(window)
-      local opening = vim.fn.foldclosed(start) == start
-      vim.cmd(tostring(start) .. (opening and (record.fold.expand_children and "foldopen!" or "foldopen") or "foldclose"))
-      if not opening and cursor[1] > start then
-        local text = vim.api.nvim_buf_get_lines(session.buffer, start - 1, start, false)[1] or ""
-        vim.api.nvim_win_set_cursor(window, { start, math.min(cursor[2], math.max(0, #text - 1)) })
-      end
-      if opening and record.fold.collapse_children then
-        local finish, children = fold_end(session, record), {}
-        for _, child in pairs(session.fold.record) do
-          local start = fold_start(session, child)
-          if start > fold_start(session, record) and fold_end(session, child) <= finish then children[#children + 1] = start end
-        end
-        table.sort(children, function(left, right) return left > right end)
-        for _, start in ipairs(children) do close_open_fold(start) end
-      end
-      if options and options.on_toggled then
-        options.on_toggled(record.fold.id, vim.fn.foldclosed(start) == start)
-      end
-    end)
+    local opening = vim.api.nvim_win_call(window, function() return vim.fn.foldclosed(start) == start end)
+    if options and options.before_toggle and options.before_toggle(record.fold.id, opening) == false then return true end
+    M.set_open(session, window, record.fold.id, opening)
+    if options and options.on_toggled then options.on_toggled(record.fold.id, not opening) end
     return true
   end
   return false
@@ -632,9 +651,11 @@ function M.text()
   end
   vim.list_extend(chunks, gutter[#text] or {})
   for _, record in pairs(session.fold and session.fold.record or {}) do
-    if record.fold.collapsed_suffix and fold_start(session, record) == vim.v.foldstart
+    if fold_start(session, record) == vim.v.foldstart
       and fold_end(session, record) == vim.v.foldend then
-      chunks[#chunks + 1] = { record.fold.collapsed_suffix, "Comment" }
+      local loading = session.fold_loading and session.fold_loading[vim.api.nvim_get_current_win()]
+      local suffix = loading and loading[record.fold.id] and " Loading…" or record.fold.collapsed_suffix
+      if suffix then chunks[#chunks + 1] = { suffix, "Comment" } end
       break
     end
   end

@@ -16,7 +16,6 @@ local model_picker = require("forge.views.harness.model_picker")
 local snapshot = require("forge.views.harness.snapshot")
 local picker = require("forge.views.picker")
 local timeline_status = require("forge.views.harness.timeline_status")
-local timeline_cache = require("forge.views.harness.timeline_cache")
 local question_presentation = require("forge.views.harness.question_presentation")
 local recap = require("forge.views.harness.recap")
 local session_navigation = require("forge.views.harness.session_navigation")
@@ -129,22 +128,8 @@ end
 local function selected_agent_target(state)
   local run = selected_agent_run(state)
   if not run then return nil end
-  local exchange_list = timeline_cache.agent_exchange_list(state, run.id)
-  for exchange_index = #exchange_list, 1, -1 do
-    local exchange = exchange_list[exchange_index]
-    if exchange.agent_id == run.id and exchange.state == "running" then
-      for turn_index = #(exchange.turn or {}), 1, -1 do
-        local turn = exchange.turn[turn_index]
-        if type(turn.state) == "table" and turn.state.kind == "running" and turn.provider then
-          return {
-            thread_id = turn.provider.thread_id,
-            turn_id = turn.provider.turn_id,
-          }
-        end
-      end
-    end
-  end
-  return nil
+  local summary = state.agent and state.agent.summary and state.agent.summary[run.id]
+  return summary and type(summary.target) == "table" and summary.target or nil
 end
 
 local function render_queue()
@@ -573,13 +558,12 @@ local function on_event(event, payload)
     return
   end
   if state.host_error then return end
-  if event == "timeline_patch" then
-    local applied, patch_error = timeline_cache.apply(state, payload)
-    if not applied then
-      notifications.error(patch_error or "Timeline patch failed", "ForgeHarness")
-      synchronize_state()
-      return
-    end
+  if event == "document_changed" then
+    if payload.session_id ~= (state.session and state.session.id) then return end
+    if payload.revision < (state.timeline_revision or 0) then return end
+    state.last_provider_progress, state.wait_notice = vim.uv.now(), nil
+    state.timeline_revision = payload.revision
+    if payload.status then state.status = payload.status end
     if state.status.kind ~= "awaiting_input" and state.plan_question_open then
       require("forge.views.harness.plan_question").close()
       state.plan_question_open = false
@@ -591,6 +575,7 @@ local function on_event(event, payload)
     schedule_render()
   elseif event == "backend_event" then
     state.last_provider_progress, state.wait_notice = vim.uv.now(), nil
+    if payload.kind == "document_changed" then on_event("document_changed", payload.data) return end
     if payload.kind == "turn_started" then recap.clear(state) end
     if payload.kind == "execution_state" then
       local execution = payload.data or {}
@@ -1141,7 +1126,7 @@ function M.open_timeline_entry()
       if elicitation and elicitation.question_set and elicitation.question_set.id == action.question_set_id then
         M.present_plan_question(true)
       else
-        require("forge.folds").toggle_heading(state.presentation.transcript, vim.api.nvim_get_current_win())
+        state.presentation.toggle_heading(vim.api.nvim_get_current_win())
       end
     elseif action.kind == "session" then session_navigation.open_parent(action.session_id)
     elseif action.kind == "agent" then M.select_agent(action.run_id)
@@ -1848,7 +1833,7 @@ function M.toggle_activity()
   end
   if vim.fn.foldclosed(vim.fn.line(".")) == -1 and state.presentation
       and state.presentation.toggle_tool() then return end
-  if state.presentation and require("forge.folds").toggle_heading(state.presentation.transcript, vim.api.nvim_get_current_win()) then return end
+  if state.presentation and state.presentation.toggle_heading(vim.api.nvim_get_current_win()) then return end
 end
 
 ---@param direction integer

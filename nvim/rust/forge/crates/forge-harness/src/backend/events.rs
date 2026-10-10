@@ -9,10 +9,12 @@ use super::BackendEvent;
 #[derive(Clone)]
 pub struct BackendEventSink {
     sender: MessageSender,
+    delivery: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
 
 pub struct BackendEventStream {
     receiver: MessageReceiver,
+    transfer: Option<(usize, usize, usize, String)>,
     pending: Option<BackendEvent>,
     queued: Option<BackendEvent>,
     deadline: tokio::time::Instant,
@@ -31,8 +33,9 @@ impl std::error::Error for EventDeliveryFailure {}
 
 pub fn channel() -> (BackendEventSink, BackendEventStream) {
     let (sender, receiver) = outbound::channel();
-    (BackendEventSink { sender }, BackendEventStream {
+    (BackendEventSink { sender, delivery: Default::default() }, BackendEventStream {
         receiver,
+        transfer: None,
         pending: None,
         queued: None,
         deadline: tokio::time::Instant::now(),
@@ -44,10 +47,19 @@ impl BackendEventSink {
     pub async fn send_wait(&self, mut event: BackendEvent) -> Result<(), EventDeliveryFailure> {
         event.received_at_ms.get_or_insert_with(|| std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64);
-        self.sender
-            .send_wait(event)
-            .await
-            .map_err(EventDeliveryFailure)
+        let _delivery = self.delivery.lock().await;
+        let transfer = forge_protocol::transfer::JsonTransfer::new(&event).map_err(|error| {
+            self.sender.record_failure(&error);
+            EventDeliveryFailure(error)
+        })?;
+        if transfer.total_bytes() < forge_protocol::MAX_FRAME_BYTES / 2 {
+            return self.sender.send_wait(event).await.map_err(EventDeliveryFailure);
+        }
+        for part in transfer {
+            self.sender.send_wait(serde_json::json!({"forge_event_part": part}))
+                .await.map_err(EventDeliveryFailure)?;
+        }
+        Ok(())
     }
 
     #[cfg(test)]
@@ -61,6 +73,50 @@ impl BackendEventSink {
 }
 
 impl BackendEventStream {
+    fn accept(&mut self, bytes: &[u8]) -> Result<Option<BackendEvent>, EventDeliveryFailure> {
+        let value: serde_json::Value = serde_json::from_slice(bytes)
+            .map_err(|error| EventDeliveryFailure(io::Error::other(error)))?;
+        let Some(part) = value.get("forge_event_part") else {
+            if self.transfer.is_some() { return Err(EventDeliveryFailure(io::Error::other("interrupted event transfer"))); }
+            return serde_json::from_value(value).map(Some).map_err(|error| EventDeliveryFailure(io::Error::other(error)));
+        };
+        let part: forge_protocol::transfer::JsonPart = serde_json::from_value(part.clone())
+            .map_err(|error| EventDeliveryFailure(io::Error::other(error)))?;
+        if part.total_bytes > forge_protocol::MAX_SNAPSHOT_BYTES || part.part_count == 0
+            || part.part_count > 512 || part.payload.is_empty()
+            || part.payload.len() > forge_protocol::MAX_SNAPSHOT_PART_BYTES {
+            return Err(EventDeliveryFailure(io::Error::other("event transfer exceeds its limit")));
+        }
+        let transfer = self.transfer.get_or_insert_with(|| (0, part.part_count, part.total_bytes, String::new()));
+        if part.sequence != transfer.0 || part.part_count != transfer.1 || part.total_bytes != transfer.2
+            || transfer.3.len() + part.payload.len() > transfer.2 {
+            return Err(EventDeliveryFailure(io::Error::other("invalid event transfer sequence")));
+        }
+        transfer.0 += 1;
+        transfer.3.push_str(&part.payload);
+        if transfer.0 != transfer.1 { return Ok(None); }
+        let (_, _, length, payload) = self.transfer.take().expect("active transfer");
+        if payload.len() != length { return Err(EventDeliveryFailure(io::Error::other("incomplete event transfer"))); }
+        decode(payload.as_bytes()).map(Some)
+    }
+
+    async fn receive(&mut self) -> Result<Option<BackendEvent>, EventDeliveryFailure> {
+        loop {
+            match self.receiver.recv().await.map_err(EventDeliveryFailure)? {
+                Some(frame) => if let Some(event) = self.accept(frame.bytes())? { return Ok(Some(event)); },
+                None if self.transfer.is_some() => return Err(EventDeliveryFailure(io::Error::other("event transfer ended early"))),
+                None => return Ok(None),
+            }
+        }
+    }
+
+    fn try_receive(&mut self) -> Result<BackendEvent, EventDeliveryFailure> {
+        loop {
+            let frame = self.receiver.try_recv().map_err(EventDeliveryFailure)?;
+            if let Some(event) = self.accept(frame.bytes())? { return Ok(event); }
+        }
+    }
+
     pub fn check(&self) -> Result<(), EventDeliveryFailure> {
         self.receiver.check().map_err(EventDeliveryFailure)
     }
@@ -69,8 +125,7 @@ impl BackendEventStream {
         if self.pending.is_none() {
             self.pending = match self.queued.take() {
                 Some(event) => Some(event),
-                None => self.receiver.recv().await.map_err(EventDeliveryFailure)?
-                    .map(|frame| decode(frame.bytes())).transpose()?,
+                None => self.receive().await?,
             };
             self.deadline = tokio::time::Instant::now() + Duration::from_millis(16);
         }
@@ -78,11 +133,11 @@ impl BackendEventStream {
             if output_bytes(self.pending.as_ref().unwrap()) >= 64 * 1024 {
                 break;
             }
-            let received = tokio::time::timeout_at(self.deadline, self.receiver.recv()).await;
+            let received = tokio::time::timeout_at(self.deadline, self.receive()).await;
             let event = match received {
                 Err(_) | Ok(Ok(None)) => break,
-                Ok(Err(error)) => return Err(EventDeliveryFailure(error)),
-                Ok(Ok(Some(frame))) => decode(frame.bytes())?,
+                Ok(Err(error)) => return Err(error),
+                Ok(Ok(Some(event))) => event,
             };
             if !merge_output(self.pending.as_mut().unwrap(), &event) {
                 self.queued = Some(event);
@@ -96,15 +151,14 @@ impl BackendEventStream {
         self.check()?;
         let mut event = match self.pending.take().or_else(|| self.queued.take()) {
             Some(event) => event,
-            None => decode(self.receiver.try_recv().map_err(EventDeliveryFailure)?.bytes())?,
+            None => self.try_receive()?,
         };
         while batchable(&event) && output_bytes(&event) < 64 * 1024 {
-            let frame = match self.receiver.try_recv() {
-                Ok(frame) => frame,
-                Err(error) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::UnexpectedEof) => break,
-                Err(error) => return Err(EventDeliveryFailure(error)),
+            let next = match self.try_receive() {
+                Ok(event) => event,
+                Err(EventDeliveryFailure(error)) if matches!(error.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::UnexpectedEof) => break,
+                Err(error) => return Err(error),
             };
-            let next = decode(frame.bytes())?;
             if !merge_output(&mut event, &next) {
                 self.queued = Some(next);
                 break;
@@ -311,12 +365,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_payload_fails_before_retention() {
+    async fn oversized_payload_is_transferred_without_poisoning_delivery() {
         let (sink, mut stream) = channel();
         let mut oversized = event(0);
         oversized.text = Some("x".repeat(forge_protocol::MAX_FRAME_BYTES));
-        assert!(sink.send_wait(oversized).await.is_err());
+        let expected = oversized.text.clone();
+        let producer = async { sink.send_wait(oversized).await.unwrap(); sink.send_wait(event(1)).await.unwrap(); };
+        let consumer = async {
+            assert_eq!(stream.recv().await.unwrap().unwrap().text, expected);
+            assert_eq!(stream.recv().await.unwrap().unwrap().data, json!(1));
+        };
+        tokio::join!(producer, consumer);
+    }
+
+    #[tokio::test]
+    async fn oversized_aggregate_reports_failure_even_when_the_producer_ignores_it() {
+        let (sink, mut stream) = channel();
+        let mut oversized = event(0);
+        oversized.text = Some("x".repeat(forge_protocol::MAX_SNAPSHOT_BYTES));
+        let _ = sink.send_wait(oversized).await;
         assert!(stream.recv().await.is_err());
+        assert!(tokio::time::timeout(Duration::from_secs(1), sink.failed()).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn cancelled_receive_preserves_an_incomplete_multipart_event() {
+        let (sink, mut stream) = channel();
+        let mut source = event(0);
+        source.text = Some("λ".repeat(200000));
+        let mut parts = forge_protocol::transfer::JsonTransfer::new(&source).unwrap();
+        sink.sender.send_wait(serde_json::json!({"forge_event_part":parts.next().unwrap()})).await.unwrap();
+        assert!(tokio::time::timeout(Duration::from_millis(1), stream.recv()).await.is_err());
+        let producer = async {
+            for part in parts { sink.sender.send_wait(serde_json::json!({"forge_event_part":part})).await.unwrap(); }
+        };
+        let consumer = async { assert_eq!(stream.recv().await.unwrap().unwrap().text, source.text); };
+        tokio::join!(producer, consumer);
     }
 
     #[tokio::test]

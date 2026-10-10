@@ -506,6 +506,11 @@ impl SqliteStore {
         Ok(())
     }
 
+    /// Load one exchange with its retained tool output.
+    pub fn load_exchange(&self, id: &str) -> Result<Option<Exchange>> {
+        Ok(self.list_exchange_payload("SELECT payload FROM exchange_record WHERE id=?1", [id])?.pop())
+    }
+
     /// Load interactions in their admitted user-action order.
     pub fn list_exchange(&self, session_id: &str) -> Result<Vec<Exchange>> {
         self.list_exchange_payload(

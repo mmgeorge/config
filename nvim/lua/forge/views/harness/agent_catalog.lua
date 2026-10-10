@@ -1,7 +1,6 @@
 local AgentCatalog = {}
 
 local agent_summary = require("forge.render.harness.agent_summary")
-local timeline_cache = require("forge.views.harness.timeline_cache")
 
 ---@param left table
 ---@param right table
@@ -23,7 +22,7 @@ function AgentCatalog.run_list(state, active)
   local result = {}
   local agent = state.agent
   for _, run in ipairs((agent and agent.run) or {}) do
-    local exchange_list = timeline_cache.agent_exchange_list(state, run.id)
+    local exchange_list = (state.agent.summary or {})[run.id]
     if agent_summary.is_active(agent_summary.status(run, exchange_list)) == active then
       result[#result + 1] = run
     end
