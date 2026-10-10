@@ -511,6 +511,21 @@ impl SqliteStore {
         Ok(self.list_exchange_payload("SELECT payload FROM exchange_record WHERE id=?1", [id])?.pop())
     }
 
+    /// Load the owner of a provider turn without hydrating unrelated exchange bodies.
+    pub(crate) fn load_provider_exchange(
+        &self,
+        session_id: &str,
+        address: &crate::backend::ProviderAddress,
+    ) -> Result<Option<Exchange>> {
+        Ok(self.list_exchange_payload(
+            "SELECT payload FROM exchange_record WHERE session_id=?1 AND EXISTS(\
+                SELECT 1 FROM json_each(exchange_record.payload, '$.turn') AS provider_turn \
+                WHERE json_extract(provider_turn.value, '$.provider.thread_id')=?2 \
+                AND json_extract(provider_turn.value, '$.provider.turn_id')=?3) LIMIT 1",
+            params![session_id, address.thread_id, address.turn_id],
+        )?.pop())
+    }
+
     /// Load interactions in their admitted user-action order.
     pub fn list_exchange(&self, session_id: &str) -> Result<Vec<Exchange>> {
         self.list_exchange_payload(

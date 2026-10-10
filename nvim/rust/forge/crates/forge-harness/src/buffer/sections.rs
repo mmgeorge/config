@@ -560,6 +560,9 @@ fn render(
 }
 
 fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
+    if source.text.row_count() == 0 {
+        return Ok(source.clone());
+    }
     let mut rows = Vec::new();
     let mut remaining = budget.bytes;
     let mut remaining_rows = budget.rows;
@@ -641,6 +644,83 @@ mod tests {
     use super::*;
     use forge_buffer::block::FoldRange;
     use forge_buffer::identity::FoldId;
+
+    #[test]
+    fn empty_tool_blocks_do_not_add_rows_or_truncate_following_tools() -> Result<()> {
+        let mut block = Vec::new();
+        for (id, rows) in [
+            ("group", vec!["Running 2 tools"]),
+            ("first", vec!["first tool"]),
+            ("first:output", vec!["first output", "", "more output"]),
+            ("first:hidden", Vec::new()),
+            ("second", vec!["second tool"]),
+            ("second:output", vec!["second output"]),
+            ("second:hidden", Vec::new()),
+        ] {
+            block.push(BufferBlock {
+                id: BlockId(id.into()),
+                text: BufferText::from_rows(rows)?,
+                metadata: Default::default(),
+            });
+        }
+        block[0].metadata.fold.push(FoldRange {
+            id: FoldId("tools".into()),
+            start: TextPosition { row: 0, column: 0 },
+            end: BlockAnchor {
+                block: BlockId("second:hidden".into()),
+                position: TextPosition { row: 0, column: 0 },
+            },
+            closed: true,
+            heading_start: None,
+            collapsed_suffix: None,
+            collapse_children: false,
+            expand_children: false,
+        });
+        let expected: Vec<_> = block.iter().map(|block| block.text.clone()).collect();
+        let mut source = TranscriptDocument::initialize(
+            DocumentId("source".into()),
+            "session".into(),
+            0,
+            vec![TranscriptEntry {
+                id: "entry".into(),
+                block,
+            }],
+        )?;
+        let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;
+        let view = ViewId("view".into());
+        visible.register(view.clone());
+        for (sequence, expanded) in [(1, true), (2, false), (3, true)] {
+            visible.set(
+                &mut source,
+                view.clone(),
+                sequence,
+                "tools",
+                expanded,
+                false,
+                None,
+            )?;
+            visible.refresh(&mut source)?;
+            let snapshot = visible.document.snapshot()?;
+            if expanded {
+                assert_eq!(
+                    snapshot
+                        .block
+                        .iter()
+                        .map(|block| block.text.clone())
+                        .collect::<Vec<_>>(),
+                    expected,
+                );
+                assert!(
+                    snapshot.block.iter().all(|block| block
+                        .metadata
+                        .section
+                        .iter()
+                        .all(|section| !section.more))
+                );
+            }
+        }
+        Ok(())
+    }
 
     fn source() -> Result<TranscriptDocument> {
         let mut heading = BufferBlock {

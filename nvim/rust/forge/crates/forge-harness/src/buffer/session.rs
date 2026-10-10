@@ -714,7 +714,7 @@ impl SessionPresentation {
             .context("session presentation is not open")?;
         ensure!(
             input.document == open.transcript_id
-                && input.revision == open.sections.document.document.revision(),
+                && input.revision <= open.sections.document.document.revision(),
             "transcript input revision changed"
         );
         let sequence = open
@@ -730,19 +730,28 @@ impl SessionPresentation {
             .document
             .block(&input.block)
             .context("transcript input block disappeared")?;
-        let row = block
-            .text
-            .row(input.position.row)
-            .context("transcript input row disappeared")?;
-        ensure!(
-            row.is_char_boundary(input.position.column),
-            "transcript input column changed"
-        );
-        let target = block.target_at(input.position);
-        ensure!(
-            input.target.as_ref() == target,
-            "transcript input target changed"
-        );
+        let stable_tool = input.action == "activate"
+            && input.target.as_ref().is_some_and(|target| {
+                matches!(open.action.get(target), Some(TranscriptAction::Tool { .. }))
+                    && block.metadata.target.iter().any(|candidate| &candidate.id == target)
+            });
+        if input.revision == open.sections.document.document.revision() {
+            let row = block
+                .text
+                .row(input.position.row)
+                .context("transcript input row disappeared")?;
+            ensure!(
+                row.is_char_boundary(input.position.column),
+                "transcript input column changed"
+            );
+            let target = block.target_at(input.position);
+            ensure!(
+                input.target.as_ref() == target,
+                "transcript input target changed"
+            );
+        } else {
+            ensure!(stable_tool, "transcript input revision changed");
+        }
         *sequence = input.sequence;
         Ok(open)
     }
@@ -1009,7 +1018,7 @@ fn refresh_activity<'source>(open: &mut OpenPresentation,
     let mut retained = open.retained_bytes;
     for entry in source {
         for block in super::projection::timing_blocks(entry,&width,
-            &open.transcript.document,&open.expanded_tool)? {
+            &open.transcript.document,&open.expanded_tool,&open.tool)? {
             let previous = open.transcript.document.block(&block.id)
                 .context("timing block is missing")?.retained_bytes();
             retained = retained.saturating_sub(previous) + block.retained_bytes();
@@ -1760,6 +1769,63 @@ mod tests {
     }
 
     #[test]
+    fn tool_actions_survive_unrelated_revisions_without_retargeting_or_replay() -> Result<()> {
+        use forge_buffer::{block::TextPosition, identity::BlockId};
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![interaction_entry("first"), interaction_entry("second")])?;
+        let document = DocumentId("transcript:stable-tool".into());
+        let view = ViewId("view:stable-tool".into());
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        expand_sections(&mut owner, "view:stable-tool")?;
+        let captured = owner.snapshot(&document)?;
+        let input = DocumentInput {
+            document: document.clone(),
+            revision: captured.revision,
+            view: view.clone(),
+            sequence: InputSequence(1),
+            action: "activate".into(),
+            block: BlockId("first:turn:1:tool:preview".into()),
+            position: TextPosition { row: 0, column: 8 },
+            target: Some(TargetId("first:turn:1:tool:preview:tool".into())),
+        };
+        owner.dispatch(PresentationRequest::Resize {
+            document: document.clone(),
+            view,
+            width: WidthProfile { columns: 65, ..WidthProfile::default() },
+        })?;
+        assert!(owner.snapshot(&document)?.revision > captured.revision);
+        let mut changed = input.clone();
+        changed.action = "navigate_prompt".into();
+        assert!(owner.dispatch(PresentationRequest::NavigatePrompt {
+            input: changed, previous: true,
+        }).is_err());
+        let mut changed = input.clone();
+        changed.target = Some(TargetId("second:turn:1:tool:preview:tool".into()));
+        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: changed }).is_err());
+        let mut changed = input.clone();
+        changed.document = DocumentId("transcript:other".into());
+        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: changed }).is_err());
+        let mut changed = input.clone();
+        changed.revision = forge_buffer::identity::DocumentRevision(
+            owner.snapshot(&document)?.revision.0 + 1,
+        );
+        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: changed }).is_err());
+        assert_eq!(owner.dispatch(PresentationRequest::ToggleTool {
+            input: input.clone(),
+        })?["expanded"], true);
+        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: input.clone() }).is_err());
+        let mut next = input.clone();
+        next.sequence = InputSequence(2);
+        owner.dispatch(PresentationRequest::ToolOpen {
+            input: next.clone(), document: DocumentId("output:stable-tool".into()),
+        })?;
+        owner.reconcile(vec![interaction_entry("second")])?;
+        next.sequence = InputSequence(3);
+        assert!(owner.dispatch(PresentationRequest::ToggleTool { input: next }).is_err());
+        Ok(())
+    }
+
+    #[test]
     fn tool_preview_expands_from_output_and_survives_reflow() -> Result<()> {
         use forge_buffer::{block::TextPosition, identity::BlockId};
         let mut owner = SessionPresentation::new("session".into());
@@ -1807,7 +1873,7 @@ mod tests {
             .iter()
             .find(|candidate| candidate.id == block)
             .unwrap();
-        assert!(expanded.text.wire_rows().contains(&"      sixth"));
+        assert!(expanded.text.wire_rows().contains(&"    sixth"));
         input.revision = snapshot.revision;
         input.sequence = InputSequence(2);
         assert_eq!(
@@ -1821,8 +1887,8 @@ mod tests {
             .find(|candidate| candidate.id == block)
             .unwrap();
         assert!(snapshot.block.iter().find(|block|block.id.0 == "first:turn:1:tool:hidden")
-            .unwrap().text.wire_rows().contains(&"      …(2 hidden)"));
-        assert!(!collapsed.text.wire_rows().contains(&"      sixth"));
+            .unwrap().text.wire_rows().contains(&"    …(2 hidden)"));
+        assert!(!collapsed.text.wire_rows().contains(&"    sixth"));
         Ok(())
     }
 

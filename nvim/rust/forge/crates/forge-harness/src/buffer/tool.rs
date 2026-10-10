@@ -38,6 +38,7 @@ pub struct ToolOutputView {
     total_rows: usize,
     heading: Option<crate::turn::ToolCall>,
     owner: String,
+    pub(super) group: String,
 }
 
 struct OutputCollector(Arc<Mutex<Vec<u8>>>);
@@ -58,6 +59,7 @@ impl Clone for ToolOutputView {
         view.expanded = self.expanded;
         view.heading = self.heading.clone();
         view.owner = self.owner.clone();
+        view.group = self.group.clone();
         view
     }
 }
@@ -87,6 +89,7 @@ impl ToolOutputView {
     pub(super) fn retain(&mut self, replacement: &Self) {
         self.heading = replacement.heading.clone();
         self.owner.clone_from(&replacement.owner);
+        self.group.clone_from(&replacement.group);
     }
 
     /// Counts independent inline chunks without walking retained output rows.
@@ -117,7 +120,7 @@ impl ToolOutputView {
     }
 
     pub fn retained_bytes(&self) -> usize {
-        self.saved.len()
+        self.group.len() + self.saved.len()
             + self.display.capacity()
             + self.row.capacity() * std::mem::size_of::<Range<usize>>()
     }
@@ -144,6 +147,7 @@ impl ToolOutputView {
             total_rows: 0,
             heading: None,
             owner: String::new(),
+            group: String::new(),
         };
         view.append(&saved)?;
         Ok(view)

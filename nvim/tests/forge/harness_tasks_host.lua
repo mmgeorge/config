@@ -17,12 +17,14 @@ require("forge.infra.notifications").error = function(message) errors[#errors + 
 local state = require("forge.session").harness
 local controller = require("forge.views.harness.controller")
 local task = require("forge.views.harness.task")
-local function latest_exchange()
+local function latest_exchange(matches)
   local snapshot, failure
   client.request("exchange.list", {}, function(result, problem) snapshot, failure = result, problem end)
   assert(vim.wait(5000, function() return snapshot or failure end, 10), "snapshot stalled")
   assert(not failure, failure)
-  return snapshot[#snapshot]
+  for index = #snapshot, 1, -1 do
+    if not matches or matches(snapshot[index]) then return snapshot[index] end
+  end
 end
 local function wait_settled()
   assert(vim.wait(15000, function() return #errors > 0 or (not state.busy and not state.task_operation and not state.state_sync_pending) end, 10), "task did not settle")
@@ -97,14 +99,18 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
   controller.task_transition({ action = "resume" })
   wait_settled()
-  local execution_resume = latest_exchange()
+  local execution_resume = latest_exchange(function(exchange) return exchange.lifecycle == "Execution resumed · implement" end)
   assert(task.current(state).id == executing_id)
   assert(execution_resume.prompt == "" and execution_resume.lifecycle == "Execution resumed · implement", vim.inspect(execution_resume))
   assert(execution_resume.execution_id ~= nil, "control resume lost execution identity")
+  local continuation = latest_exchange()
+  assert(continuation.id ~= execution_resume.id and continuation.lifecycle == "Implementation continued",
+    "automatic retry was not a separate labeled exchange")
   local lifecycle_tree = require("forge.render.harness.interaction_tree").build({
     { kind = "exchange", exchange = execution_resume },
   })
   assert(lifecycle_tree.lines[1]:find("Execution resumed · implement", 1, true))
+  assert(lifecycle_tree.lines[1]:sub(1, #"◇ ") == "◇ ", "lifecycle row lost its event marker")
   assert(#lifecycle_tree.prompt_lines == 0, "control resume entered user prompt navigation")
   controller.task_transition({ action = "pause" })
   wait_settled()
@@ -112,7 +118,7 @@ local success, failure = xpcall(function()
   controller.submit()
   wait_settled()
   assert(task.current(state).id == executing_id and task.current(state).phase == "implement")
-  local resumed = latest_exchange()
+  local resumed = latest_exchange(function(exchange) return exchange.prompt == "continue implementation using the accepted plan" end)
   assert(resumed.prompt == "continue implementation using the accepted plan")
   assert(resumed.lifecycle == nil or resumed.lifecycle == vim.NIL, "user message was replaced by a lifecycle label")
   assert(resumed.execution_id ~= nil, "resume became ordinary chat")
@@ -121,7 +127,7 @@ local success, failure = xpcall(function()
   local goal_task = task.current(state)
   controller.task_transition({ action = "resume" })
   wait_settled()
-  local goal_resume = latest_exchange()
+  local goal_resume = latest_exchange(function(exchange) return exchange.lifecycle == "Goal resumed" end)
   assert(goal_resume.prompt == "" and goal_resume.lifecycle == "Goal resumed", vim.inspect(goal_resume))
   assert(goal_resume.goal_id == goal_task.goal_id, "control resume lost goal identity")
   controller.task_transition({ action = "pause" })

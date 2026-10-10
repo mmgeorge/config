@@ -111,7 +111,9 @@ impl<'profile> TranscriptRenderer<'profile> {
         let mut rendered = MarkdownRenderer::file_link_labels(id, &source, self.profile)?;
         rendered.block.metadata.markdown = true;
         rendered.block.metadata.layout = Some(ContentLayout {
-            indent: 2, marker: None, source_indent: 0,
+            indent: 2,
+            marker: Some(TextChunk { text: "●".into(), capture: "ForgeHarnessResponse".into() }),
+            source_indent: 0,
         });
         Ok(rendered)
     }
@@ -130,7 +132,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             indent: 2,
             source_indent: 0,
             marker: Some(TextChunk {
-                text: "↳".into(),
+                text: "○".into(),
                 capture: "ForgeHarnessCommentary".into(),
             }),
         });
@@ -232,7 +234,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             row.extend(tool_body_rows(self.profile, arguments, true)?);
             row
         } else if expanded {
-            self.profile.wrap_plain(&format!("  • {duration} {title}"), 4.min(self.profile.columns - 1))?
+            self.profile.wrap_plain(&format!("• {duration} {title}"), 2.min(self.profile.columns - 1))?
         } else {
             vec![tool_heading(self.profile, kind, title, &duration)?]
         };
@@ -326,10 +328,10 @@ fn tool_output_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>, expa
 /// Wraps body content before adding its marker so long tokens cannot strand the marker.
 fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Vec<String>> {
     let mut content_profile = profile.clone();
-    let margin = 6.min(content_profile.columns - 1);
+    let margin = 4.min(content_profile.columns - 1);
     content_profile.columns -= margin;
     Ok(content_profile.wrap_plain(text, 0)?.into_iter().enumerate().map(|(index, text)| {
-        let prefix = if branch && index == 0 && margin == 6 { "    └ ".into() } else { " ".repeat(margin) };
+        let prefix = if branch && index == 0 && margin == 4 { "  └ ".into() } else { " ".repeat(margin) };
         format!("{prefix}{text}")
     }).collect())
 }
@@ -338,7 +340,7 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
 fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str) -> Result<String> {
     let title = if kind == "command" { shell_command(title) } else { title };
     let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let full = format!("  • {duration} {normalized}");
+    let full = format!("• {duration} {normalized}");
     if profile.cells(&full, 0)? <= profile.columns {
         return Ok(full);
     }
@@ -598,11 +600,11 @@ mod test {
             &ToolOutputPreview { row: vec!["response"], hidden_rows: 0, total_rows: 1 }, true,
         )?;
         let rows = block.text.wire_rows();
-        assert_eq!(rows[0], "  •     2s sem.sem_context");
-        assert!(rows[1].starts_with("    └ {\"entity_name\""));
-        assert_eq!(rows.last(), Some(&"    └ response"));
+        assert_eq!(rows[0], "•    2s sem.sem_context");
+        assert!(rows[1].starts_with("  └ {\"entity_name\""));
+        assert_eq!(rows.last(), Some(&"  └ response"));
         let restored = rows[1..rows.len() - 1].iter().enumerate()
-            .map(|(index, row)| if index == 0 { row.trim_start_matches("    └ ") } else { row.trim_start() })
+            .map(|(index, row)| if index == 0 { row.trim_start_matches("  └ ") } else { row.trim_start() })
             .collect::<String>();
         assert_eq!(restored, arguments);
         assert!(rows.iter().all(|row| profile.cells(row, 0).unwrap() <= profile.columns));
@@ -621,11 +623,11 @@ mod test {
                     "harness_plan_read", &ToolOutputPreview { row: vec![response], hidden_rows: 0, total_rows: 1 }, expanded,
                 )?;
                 let rows = block.text.wire_rows();
-                assert!(rows[1].starts_with("    └ {\"ok\":false"));
+                assert!(rows[1].starts_with("  └ {\"ok\":false"));
                 let truncated = rows.last().is_some_and(|row| row.contains("…(1 hidden)"));
                 let content_end = rows.len() - usize::from(truncated);
                 let restored = rows[1..content_end].iter().enumerate().map(|(index, row)| {
-                    if index == 0 { row.strip_prefix("    └ ").unwrap() } else { row.strip_prefix("      ").unwrap() }
+                    if index == 0 { row.strip_prefix("  └ ").unwrap() } else { row.strip_prefix("    ").unwrap() }
                 }).collect::<String>();
                 if truncated {
                     assert!(!expanded);
@@ -644,19 +646,20 @@ mod test {
     fn tool_runtime_precision_preserves_command_decoration_in_both_views() -> Result<()> {
         let profile = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&profile)?;
-        for (elapsed_ms, label) in [(0, "0ms"), (2, "2ms"), (439, "439ms"),
-            (999, "999ms"), (1000, "1s"), (1050, "1.1s"), (2500, "2.5s"), (9_950, "10s"),
-            (100_050, "100.1s"), (1_000_050, "16.7m"), (u64::MAX, "2e11d")] {
+        for (elapsed_ms, label) in [(0, "0s"), (2, "0s"), (49, "0s"), (50, "0.1s"),
+            (149, "0.1s"), (150, "0.2s"), (439, "0.4s"), (950, "1s"),
+            (999, "1s"), (1000, "1s"), (1050, "1.1s"), (2500, "2.5s"), (9_950, "10s"),
+            (99_949, "99.9s"), (99_950, "1.7m"), (100_050, "1.7m"), (1_000_050, "16.7m"), (u64::MAX, "2e11d")] {
             for expanded in [false, true] {
                 let block = renderer.tool_preview(
                     BlockId("tool:duration".into()), TargetId("expand:duration".into()),
                     "command", Some(elapsed_ms), false, "cargo test",
                     &ToolOutputPreview { row: vec![], hidden_rows: 0, total_rows: 0 }, expanded,
                 )?;
-                assert_eq!(block.text.row(0), Some(format!("  • {label:>6} cargo test").as_str()));
+                assert_eq!(block.text.row(0), Some(format!("• {label:>5} cargo test").as_str()));
                 assert!(block.metadata.decoration.iter().any(|decoration| {
                     decoration.capture == "ForgeHarnessCommand"
-                        && decoration.range.start.column == format!("  • {label:>6} ").len()
+                        && decoration.range.start.column == format!("• {label:>5} ").len()
                 }));
             }
         }
@@ -664,14 +667,27 @@ mod test {
     }
 
     #[test]
+    fn expanded_tool_keeps_its_group_duration_width() -> Result<()> {
+        let profile = WidthProfile::default();
+        let renderer = TranscriptRenderer::new(&profile)?;
+        let heading = renderer.tool_header(BlockId("tool".into()), TargetId("tool".into()),
+            "tool_call", Some(300), false, "inspect({})", false)?;
+        assert_eq!(heading.text.row(0), Some("•  0.3s inspect({})"));
+        let expanded = TranscriptRenderer::new(&profile)?
+            .refresh_tool_heading(&heading, "tool_call", Some(300), false, "inspect({})", true)?;
+        assert_eq!(expanded.text.row(0), Some("•  0.3s inspect"));
+        Ok(())
+    }
+
+    #[test]
     fn tool_titles_strip_launchers_and_close_truncated_arguments() -> Result<()> {
         let profile = WidthProfile { columns: 90, ..WidthProfile::default() };
-        assert_eq!(tool_heading(&profile, "command", r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#, "2s")?, "  • 2s git status --short");
-        assert_eq!(tool_heading(&profile, "command", "bash -lc 'cargo test'", "2s")?, "  • 2s cargo test");
+        assert_eq!(tool_heading(&profile, "command", r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#, "2s")?, "• 2s git status --short");
+        assert_eq!(tool_heading(&profile, "command", "bash -lc 'cargo test'", "2s")?, "• 2s cargo test");
         assert_eq!(shell_command("pwsh -File build.ps1"), "pwsh -File build.ps1");
         let call = r#"sem.sem_context({"entity_name":"ServiceBusSender","file_path":"service-bus-queue.ts","fresh":true})"#;
         let heading = tool_heading(&profile, "tool_call", call, "2s")?;
-        assert!(heading.starts_with("  • 2s sem.sem_context({"));
+        assert!(heading.starts_with("• 2s sem.sem_context({"));
         assert!(heading.ends_with("…\"})"), "{heading}");
         assert!(profile.cells(&heading, 0)? <= profile.columns);
         assert!(!heading.contains('\n'));
@@ -699,18 +715,18 @@ mod test {
         assert_eq!(
             block.text.wire_rows(),
             vec![
-                "  •     2s cargo test --lib parser",
-                "    └ first",
-                "      second",
-                "      third",
-                "      fourth",
-                "      …(96 hidden)"
+                "•    2s cargo test --lib parser",
+                "  └ first",
+                "    second",
+                "    third",
+                "    fourth",
+                "    …(96 hidden)"
             ]
         );
         assert_eq!(block.metadata.target[0].range.end.row, block.text.row_count());
         assert!(block.metadata.decoration.iter().any(|decoration| {
             decoration.capture == "ForgeHarnessCommand"
-                && decoration.range.start.column == "  •     2s ".len()
+                && decoration.range.start.column == "•    2s ".len()
         }));
         assert!(
             block
@@ -743,7 +759,7 @@ mod test {
 
         assert_eq!(
             block.text.wire_rows(),
-            vec!["  •     2s cargo check", "    └ no output"]
+            vec!["•    2s cargo check", "  └ no output"]
         );
         assert!(block.metadata.decoration.iter().any(|decoration| {
             decoration.capture == "ForgeHarnessOutput" && decoration.range.start.row == 1
@@ -770,12 +786,12 @@ mod test {
         assert_eq!(
             block.text.wire_rows(),
             vec![
-                "  •     2s docs_lookup(crate, Item)",
-                "    └ one",
-                "      two",
-                "      three",
-                "      four",
-                "      …(1 hidden)"
+                "•    2s docs_lookup(crate, Item)",
+                "  └ one",
+                "    two",
+                "    three",
+                "    four",
+                "    …(1 hidden)"
             ]
         );
         assert!(
@@ -816,11 +832,11 @@ mod test {
         let preview = render(false)?;
         let rows = preview.text.wire_rows();
         assert_eq!(rows.len(), 6, "preview must contain a heading, four output rows, and a hidden-count row");
-        assert_eq!(rows[5], "      …(3 hidden)");
+        assert_eq!(rows[5], "    …(3 hidden)");
         assert!(!rows.iter().any(|row| row.contains("second")));
         let expanded = render(true)?;
         let restored = expanded.text.wire_rows().iter().skip(1)
-            .map(|row| row.strip_prefix("    └ ").or_else(|| row.strip_prefix("      ")).unwrap())
+            .map(|row| row.strip_prefix("  └ ").or_else(|| row.strip_prefix("    ")).unwrap())
             .collect::<String>();
         assert_eq!(restored, source.replace('\n', ""));
         preview.validate()?;
@@ -870,7 +886,9 @@ mod test {
         )?;
         assert!(rendered.block.metadata.gutter.is_empty());
         assert_eq!(rendered.block.metadata.layout.as_ref().unwrap().indent, 2);
-        assert!(rendered.block.metadata.layout.as_ref().unwrap().marker.is_none());
+        let marker = rendered.block.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap();
+        assert_eq!(marker.text, "●");
+        assert_eq!(marker.capture, "ForgeHarnessResponse");
         assert!(rendered.block.metadata.markdown);
         assert_eq!(rendered.block.metadata.target[0].range.start.column, 2);
         assert_eq!(rendered.block.text.wire_rows(), vec![
@@ -931,7 +949,7 @@ mod test {
         )?;
         assert!(rendered.block.metadata.markdown);
         assert_eq!(rendered.block.text.wire_rows(), vec!["**Review** [details](https://example.test)", "", "Next paragraph."]);
-        assert_eq!(rendered.block.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "↳");
+        assert_eq!(rendered.block.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "○");
         assert_eq!(rendered.link[0].destination, "https://example.test");
         Ok(())
     }

@@ -21,7 +21,7 @@ local snapshot = { document = replica.document, revision = 0, block = {
   block("summary", { "▸ Planned for 21s, 4 tools called" }, 0, "last-tool"),
   block("plan", { "▸ Plan changes requested: Migrate cloud diagnostics to Rust · revision 1" }, 2, "comment"),
   block("comment", { "CloudServiceSettings rename to CloudServiceConfig" }, 4),
-  block("commentary", { "↳ Replacing the declaration and its owning task." }, 2),
+  block("commentary", { "○ Replacing the declaration and its owning task." }, 2),
   block("tools", { "▸ Ran 4 tools" }, 2, "last-tool"),
   block("first-tool", { "• harness_plan_read", "  └ Plan read accepted" }, 4),
   block("last-tool", { "• harness_plan_submit" }, 4),

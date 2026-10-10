@@ -113,19 +113,21 @@ function M.render(transcript, commands, width)
     return
   end
   local working = target and target:match(":working$")
-  if transcript.execution_notice then
+  local notice = transcript.execution_notice or transcript.wait_notice
+  if notice then
     M.clear(target_buffer)
-    local text = transcript.execution_notice:gsub("%s+", " ")
+    local text = notice:gsub("%s+", " ")
+    local capture = transcript.execution_notice and "ForgeHarnessToolFailure" or "ForgeStatusHint"
     if working then
       local rendered = vim.fn.strcharpart(text, 0, math.max(1, width - 1))
       rendered = rendered .. string.rep(" ", math.max(0, width - vim.fn.strdisplaywidth(rendered)))
       vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
-        id = 1, virt_text = { { rendered, "ForgeHarnessToolFailure" } },
+        id = 1, virt_text = { { rendered, capture } },
         virt_text_win_col = 0, priority = 200,
       })
     else
       vim.api.nvim_buf_set_extmark(target_buffer, namespace, last_row, 0, {
-        id = 1, virt_lines = { { { text, "ForgeHarnessToolFailure" } } },
+        id = 1, virt_lines = { { { text, capture } } },
       })
     end
     return

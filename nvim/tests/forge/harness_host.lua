@@ -42,6 +42,16 @@ local success, failure = xpcall(function()
     if line:match("^● Thought %d+s$") then summary_found = true end
   end
   assert(summary_found, "fresh host did not render the current metrics header")
+  local response_marker = false
+  for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(state.transcript_buf,
+    state.presentation.transcript.namespace, 0, -1, { details = true })) do
+    local decoration = mark[4]
+    if decoration.sign_hl_group == "ForgeHarnessResponse" then
+      assert(vim.trim(decoration.sign_text) == "●", "final response used a fold marker")
+      response_marker = true
+    end
+  end
+  assert(response_marker, "final response omitted its large dot marker")
   local log_status
   client.request("trace.status", {}, function(result, error)
     assert(not error, error)

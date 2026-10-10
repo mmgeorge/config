@@ -98,6 +98,20 @@ vim.wait(150, function() return false end, 25)
 assert(vim.deep_equal(stopped, vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })),
   "stopped host retained its animation timer")
 transcript.execution_notice = nil
+transcript.wait_notice = "Awaiting approval"
+for _ = 1, 3 do
+  hint.render(transcript, command_set, 120)
+  local waiting = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
+  assert(#waiting == 1 and not waiting[1][4].sign_text, "approval wait retained a working spinner")
+  assert(waiting[1][4].virt_text[1][1]:find("Awaiting approval", 1, true))
+  assert(waiting[1][4].virt_text[1][2] == "ForgeStatusHint", "approval wait used failure styling")
+end
+transcript.execution_notice = "Connection lost"
+hint.render(transcript, command_set, 120)
+local failed = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
+assert(failed[1][4].virt_text[1][1]:find("Connection lost", 1, true))
+assert(failed[1][4].virt_text[1][2] == "ForgeHarnessToolFailure", "approval hid a connection failure")
+transcript.execution_notice, transcript.wait_notice = nil, nil
 hint.render(transcript, command_set, 120)
 assert(vim.wait(500, function()
   local _, current = working_marks()

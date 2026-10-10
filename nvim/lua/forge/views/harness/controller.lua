@@ -307,15 +307,22 @@ local function working_seconds()
   return math.floor((vim.uv.hrtime() - state.working_started_ns) / 1000000000)
 end
 
-function M.render()
-  local state = harness_state()
+local function render_status_hint(state)
   if state.presentation and state.presentation.transcript then
-    state.presentation.transcript.execution_notice = state.execution_notice or state.connection_error or state.sync_error or state.wait_notice
+    state.presentation.transcript.recap = state.recap
+    state.presentation.transcript.rename_status = state.rename_status
+    state.presentation.transcript.execution_notice = state.execution_notice or state.connection_error or state.sync_error
+    state.presentation.transcript.wait_notice = require("forge.views.harness.health").wait_notice(state)
     if state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
       require("forge.views.harness.status_hint").render(state.presentation.transcript,
         M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
     end
   end
+end
+
+function M.render()
+  local state = harness_state()
+  render_status_hint(state)
   if state.host_error then M.refresh_winbar() return end
   if state.switching_backend then M.refresh_winbar() return end
   if not (state.transcript_buf and vim.api.nvim_buf_is_valid(state.transcript_buf)
@@ -350,13 +357,7 @@ function M.render()
     is_alive = function() return vim.api.nvim_buf_is_valid(state.transcript_buf) and vim.api.nvim_buf_is_valid(state.composer_buf) end,
     notice = function(message) if owns_presentation() then notifications.error(message, "ForgeHarness") end end,
     on_update = function()
-      if state.presentation and vim.api.nvim_win_is_valid(state.transcript_win) then
-        state.presentation.transcript.recap = state.recap
-        state.presentation.transcript.rename_status = state.rename_status
-        state.presentation.transcript.execution_notice = state.execution_notice
-        require("forge.views.harness.status_hint").render(state.presentation.transcript,
-          M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
-      end
+      render_status_hint(state)
       if render_observer_for_test then render_observer_for_test(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), { native = true }) end
     end,
   }, function(opened, failure)

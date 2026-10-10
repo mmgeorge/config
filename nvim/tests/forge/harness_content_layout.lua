@@ -14,7 +14,7 @@ local passed, failure = xpcall(function()
         ["end"] = { block = "commentary", position = { row = 1, column = 0 } }, closed = false } },
     }
     local commentary = { target = {}, decoration = {}, editable_region = {},
-      layout = { indent = indent, marker = { text = "↳", capture = "Normal" } },
+      layout = { indent = indent, marker = { text = "○", capture = "Normal" } },
     }
     assert(replica.apply_snapshot(owner, { document = owner.document, revision = 0, block = {
       { id = "summary", text = { "▸ Thinking" }, metadata = heading },

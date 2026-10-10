@@ -31,8 +31,8 @@ for _, plan in ipairs({ false, true }) do
   assert(text:find("Question presented: Scope", 1, true), text)
   assert(text:find("○ You asked: What do you mean?", 1, true), text)
   assert(text:find("○ You answered: Scope: Rust", 1, true), text)
-  assert(text:find("↳ Checking the scope", 1, true), text)
-  assert(not text:find("↳ I mean", 1, true), text)
+  assert(text:find("\n  ○ Checking the scope", 1, true), text)
+  assert(not text:find("○ I mean", 1, true), text)
   assert(not text:find("Question set accepted", 1, true), text)
 end
 exchange.state = "cancelled"

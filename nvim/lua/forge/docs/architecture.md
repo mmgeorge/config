@@ -173,6 +173,16 @@ the last mutable chunk and newly appended chunks. UTF-8 boundaries remain stable
 Native actions map every output chunk to the same tool call, and collapse restores the four-row
 preview without rebuilding other timeline entries. Timer updates replace headings independently.
 
+Tool activation binds to the captured document, view, block, and target identity. A later
+transcript revision can still activate that same retained tool target, so streaming output
+or timer updates cannot invalidate an unrelated click. Future revisions, removed targets,
+cross-block targets, and replayed input sequences remain invalid. Position-dependent
+navigation continues to require the captured revision and coordinates.
+
+Lazy section projection preserves zero-row blocks as empty anchors. An empty hidden-count
+block consumes no page budget and cannot mark a tool group as truncated. This prevents
+spurious blank rows and repeated page requests after all source content has loaded.
+
 Harness Markdown resolves visible message owners through the weighted sequence and skips closed
 native folds. The parser includes complete visible messages across all attached windows, retaining
 delimiter context without scanning off-screen history. Per-block versions suppress renders after
@@ -541,13 +551,25 @@ this document focused on architecture.
 
 ### Harness timeline ownership
 
-Timeline prompts use `●`, non-foldable response summaries use `●`, and lifecycle rows use `◇`. Only fold headings use
+Timeline prompts and final-response bodies use `●`, thoughts use `○`, non-foldable response summaries use `●`, and lifecycle rows use `◇`. Only fold headings use
 `▸` when closed and `▾` when open. Rust assigns markers from actual fold ownership, including
 file headings. Response summaries retain `●` until they own foldable content. Tool calls
 retain `•`, and hunk headers retain their ForgeStatus presentation without arrows.
 Neovim renders fold direction per window through its native fold column and visible-row
 decorations. Native fold commands and split windows update indicators without rewriting the
 shared buffer. Collapsed labels retain the same indentation and marker column as open headings.
+Tool groups inherit the same layout depth as commentary. Their rows start with the `•` marker
+without additional leading spaces. Output branches add two columns relative to that marker.
+Tool timings round to the nearest tenth in a fixed five-cell column, accommodating `99.9s`.
+Rounded values reaching 100 advance to the next unit, starting with minutes, so timer
+updates never shift command columns.
+Tool group headings sum the observed runtimes of their calls, including overlapping calls.
+An unavailable call duration suppresses the total. Each output view retains its group identity
+so timer updates can refresh the group heading without scanning or replacing output bodies.
+Pending approvals and user questions suspend provider-inactivity notices. Approval waits use
+informational styling and remain pending when their picker closes. Controller renders and
+presentation callbacks share status-hint selection so updates cannot alternate between a
+wait notice and the underlying activity. Connection and execution failures retain precedence.
 
 Transcript presentation follows the final row after updates whenever the current buffer is not
 the transcript. Focus, rather than the previous cursor row or row-count growth, controls automatic
@@ -579,6 +601,9 @@ The activity summary fold ends before the first outer final response. That respo
 messages, tools, and plan events retain their relative order outside the summary fold. The transcript renderer
 consumes those ordered ranges directly without deferring responses to the end of the exchange. Clarification
 responses remain inside their question branch folds. Streaming, completion, and reload use the same layout.
+Thoughts and tool groups nest one two-column level below their exchange summary, including
+continued activity after an intermediate final answer. Tool calls and output retain their
+additional nesting. Final answers stay at the response level in their original chronological position.
 `PlanStateMachine` validates question, feedback, submission, review, acceptance, cancellation, and failure
 transitions. `PlanQuestionLedger` records answers, skips, and withdrawals before generation resumes. It matches both
 the provider's logical id and a canonical digest of the user-visible content, so a resolved decision cannot become
@@ -592,6 +617,18 @@ centralizes the total-turn and consecutive-no-progress mechanics shared by goals
 `PlanGeneration` adds canonical document revision evidence, permits 20 total turns, and stops after two consecutive
 turns without canonical document progress. `/plan retry` resets only that budget while retaining the plan document
 and question ledger. Provider adapters stream one turn and never decide whether planning should continue.
+An automatic planning retry admits a new exchange with an empty user prompt and the persisted
+`Planning resumed` lifecycle label. The preceding exchange completes before the retry starts,
+so its answer, activity fold, duration, and usage remain separate after reload. Admission
+publishes the preceding exchange's terminal state before the new exchange appears. The task
+and canonical plan retain their identities across these exchange boundaries.
+Goal continuations and execution retries also admit new exchanges without synthetic user
+prompts. Their lifecycle rows identify `Goal continued` or the current execution phase as
+started or continued. These boundaries preserve the prior attempt's metrics and outcome even
+when the same task, goal, and provider thread continue.
+Native goal streams use the next parent turn's start as the exchange boundary without sending
+another prompt. Replayed boundaries cannot reopen old exchanges, and late usage stays attached
+to its original provider turn. Child turns retain their own delegation exchanges.
 
 `SessionPhase` projects exactly one visible workflow phase from that control state. Plan review and planning failure
 preempt retained transport activity. Active retries expose `RetryingPlanGeneration`, while exhausted or failed turns

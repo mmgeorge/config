@@ -3364,6 +3364,11 @@ Planning continuation: turn {} of {}.",
                 plan.generation.budget.turn_count + 1,
                 plan.generation.budget.max_turn_count
             );
+            let mut continuation = ExchangeAdmission::plan(
+                String::new(), Some(plan.id.clone()), plan.model_revision > 0,
+            );
+            continuation.lifecycle = Some("Planning resumed".into());
+            admission = Some(continuation);
         }
     }
 
@@ -3410,7 +3415,7 @@ Planning continuation: turn {} of {}.",
             .as_ref()
             .map(|value| value.prompt.as_str())
             .unwrap_or(&text);
-        let (mut interaction, new_interaction) = self
+        let (mut interaction, new_interaction, mut event) = self
             .interaction_for_turn(admitted_prompt, admission.is_some(), now_ms)
             .await?;
         interaction.mode = Some(self.session.execution_mode);
@@ -3448,7 +3453,6 @@ Planning continuation: turn {} of {}.",
                     .and_then(|previous| previous.task);
             }
         }
-        let mut event = Vec::new();
         if new_interaction {
             self.start_exchange_runtime(&mut interaction, now_ms)
                 .await?;
@@ -4747,6 +4751,10 @@ Planning continuation: turn {} of {}.",
             runtime.retraction_eligible = false;
             return Ok(());
         }
+        if self.route_settled_parent_event(interaction, &backend_event, event).await? {
+            return Ok(());
+        }
+        self.admit_native_goal_continuation(runtime, interaction, &backend_event, event).await?;
         admit_addressless_turn(
             interaction,
             &mut runtime.synthetic_turn,
@@ -4856,6 +4864,84 @@ Planning continuation: turn {} of {}.",
                 .await?;
             return Ok(());
         }
+        Ok(())
+    }
+
+    async fn route_settled_parent_event(
+        &mut self,
+        current: &Exchange,
+        backend_event: &BackendEvent,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<bool> {
+        let Some(address) = backend_event.address.as_ref() else { return Ok(false) };
+        if current.turn.iter().any(|turn| turn.provider() == address)
+            || (backend_event.kind != "usage" && backend_event.turn_boundary.is_none())
+        {
+            return Ok(false);
+        }
+        let Some(mut owner) = self.store.load_provider_exchange(&self.session.id, address)?
+        else { return Ok(false) };
+        if backend_event.kind == "usage" {
+            owner.observe_turn(backend_event, self.clock.now_ms())?;
+            self.store.save_exchange(&owner)?;
+            let status = self.live_interaction_status(Some(current))?;
+            let patch = self.presentation.lock()
+                .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+                .update_live(Some(&owner), None, status)?;
+            self.emit_backend_event(backend_event.clone(), event).await?;
+            self.emit_timeline_patch(patch, event).await?;
+        }
+        Ok(true)
+    }
+
+    async fn admit_native_goal_continuation(
+        &mut self,
+        runtime: &mut ExchangeRuntime,
+        interaction: &mut Exchange,
+        backend_event: &BackendEvent,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        if backend_event.turn_boundary != Some(crate::backend::TurnBoundary::Started) {
+            return Ok(());
+        }
+        let (Some(address), Some(goal_id), Some(previous)) = (
+            backend_event.address.as_ref(), interaction.goal_id.as_ref(), interaction.turn.last(),
+        ) else { return Ok(()) };
+        if previous.provider().thread_id != address.thread_id
+            || interaction.turn.iter().any(|turn| turn.provider() == address
+                || turn.state() == crate::turn::TurnState::Running)
+            || !self.store.load_goal(goal_id)?.is_some_and(|goal| goal.native
+                && goal.state == GoalState::Active)
+        {
+            return Ok(());
+        }
+        let outcome = match previous.state() {
+            crate::turn::TurnState::Running => unreachable!(),
+            crate::turn::TurnState::Finished { outcome } => match outcome {
+                crate::turn::TurnOutcome::Completed => ExchangeState::Complete,
+                crate::turn::TurnOutcome::Cancelled => ExchangeState::Cancelled,
+                crate::turn::TurnOutcome::Interrupted => ExchangeState::Interrupted,
+                crate::turn::TurnOutcome::Failed => ExchangeState::Failed,
+            },
+        };
+        self.capture_final_checkpoint(interaction, outcome).await?;
+        let (mut continuation, _, boundary_event) = self.interaction_for_turn("", true, self.clock.now_ms()).await?;
+        event.extend(boundary_event);
+        continuation.lifecycle = Some("Goal continued".into());
+        continuation.kind = interaction.kind;
+        continuation.goal_id.clone_from(&interaction.goal_id);
+        continuation.task.clone_from(&interaction.task);
+        self.start_exchange_runtime(&mut continuation, self.clock.now_ms()).await?;
+        *runtime = self.exchange_runtime.take().context("continuation runtime is missing")?;
+        runtime.retraction_eligible = false;
+        self.store.save_exchange(&continuation)?;
+        *interaction = continuation;
+        self.emit_live_interaction(BackendEvent {
+            received_at_ms: None, address: None, turn_boundary: None,
+            kind: "timeline_exchange_started".into(), text: None,
+            data: serde_json::to_value(&interaction)?, activity: None, summary: None,
+            task_update: None,
+        }, interaction, event).await?;
         Ok(())
     }
 
@@ -5033,6 +5119,17 @@ Planning continuation: turn {} of {}.",
         interaction: Option<&Exchange>,
         removed_exchange_id: Option<&str>,
     ) -> Result<TimelinePatch> {
+        let status = self.live_interaction_status(interaction)?;
+        self.presentation
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
+            .update_live(interaction, removed_exchange_id, status)
+    }
+
+    fn live_interaction_status(
+        &self,
+        interaction: Option<&Exchange>,
+    ) -> Result<crate::session::state_machine::SessionPhase> {
         let active_plan = self.session.active_plan_id.as_deref()
             .map(|id| self.store.load_plan(id)).transpose()?.flatten();
         let mut status = crate::session::state_machine::SessionPhase::resolve(
@@ -5044,25 +5141,22 @@ Planning continuation: turn {} of {}.",
             && let Some(execution) = self.store.load_plan_execution(execution_id)? {
             Self::execution_status(&mut status, &execution);
         }
-        self.presentation
-            .lock()
-            .map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-            .update_live(interaction, removed_exchange_id, status)
+        Ok(status)
     }
 
     async fn interaction_for_turn(
         &mut self,
         text: &str,
-        admit_user_action: bool,
+        admit_exchange: bool,
         now_ms: i64,
-    ) -> Result<(Exchange, bool)> {
+    ) -> Result<(Exchange, bool, Vec<SessionEvent>)> {
         let mut interaction_list = self.store.list_exchange(&self.session.id)?;
-        if !admit_user_action {
+        if !admit_exchange {
             let mut interaction = interaction_list
                 .pop()
-                .context("goal continuation has no originating user interaction")?;
+                .context("continuation has no originating exchange")?;
             interaction.resume(now_ms)?;
-            return Ok((interaction, false));
+            return Ok((interaction, false, Vec::new()));
         }
         if interaction_list.is_empty() && self.session.name.trim().is_empty() {
             let words = text.split_whitespace().collect::<Vec<_>>();
@@ -5089,6 +5183,15 @@ Planning continuation: turn {} of {}.",
             }
             previous.finish(outcome, now_ms)?;
             self.store.save_exchange(previous)?;
+        }
+        let mut event = Vec::new();
+        if let Some(previous) = interaction_list.last() {
+            self.emit_live_interaction(BackendEvent {
+                received_at_ms: None, address: None, turn_boundary: None,
+                kind: "timeline_exchange_complete".into(), text: None,
+                data: serde_json::to_value(previous)?, activity: None, summary: None,
+                task_update: None,
+            }, previous, &mut event).await?;
         }
         Ok((
             Exchange {
@@ -5126,6 +5229,7 @@ Planning continuation: turn {} of {}.",
                 task: None,
             },
             true,
+            event,
         ))
     }
 
@@ -6128,19 +6232,32 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                     format!("Continue working toward this goal: {}", goal.objective)
                 }
             });
-        let admission = if mode == PromptMode::ExecutePlan
-            && self.store.list_exchange(&self.session.id)?.last()
-                .is_some_and(|exchange| exchange.completed_at_ms.is_some())
+        let admission = if let Some(execution) = self.store.list_plan_execution(&self.session.id)?.into_iter()
+            .find(|execution| execution.goal_id == goal.id)
         {
-            self.store.list_plan_execution(&self.session.id)?.into_iter()
-                .find(|execution| execution.goal_id == goal.id)
-                .map(|execution| ExchangeAdmission::execution(
-                    String::new(), execution.plan_id,
-                    execution.id, goal.id.clone()))
+            let previous_phase = self.store.list_exchange(&self.session.id)?.last()
+                .and_then(|exchange| exchange.execution_phase.as_ref().map(|phase| phase.phase));
+            let phase = match execution.phase {
+                crate::plan::PlanPhase::Implement => "Implementation",
+                crate::plan::PlanPhase::Verify => "Verification",
+                crate::plan::PlanPhase::Resolve => "Resolution",
+            };
+            let action = if previous_phase == Some(execution.phase) { "continued" } else { "started" };
+            let mut admission = ExchangeAdmission::execution(
+                String::new(), execution.plan_id, execution.id, goal.id.clone());
+            admission.lifecycle = Some(format!("{phase} {action}"));
+            admission
         } else {
-            None
+            let mut admission = ExchangeAdmission::goal(String::new(), goal.id.clone());
+            admission.lifecycle = Some("Goal continued".into());
+            admission
         };
-        self.run_interaction(prompt, mode, admission).await
+        if let Some(mut previous) = self.store.list_exchange(&self.session.id)?.pop()
+            && previous.state == ExchangeState::Running
+        {
+            self.capture_final_checkpoint(&mut previous, ExchangeState::Complete).await?;
+        }
+        self.run_interaction(prompt, mode, Some(admission)).await
     }
 
     fn apply_goal_evidence(
@@ -7398,6 +7515,7 @@ mod test {
             vec![Some(20), Some(21), Some(22), Some(23)]);
         assert_eq!(exchanges.iter().map(|exchange| exchange.turn.iter().flat_map(|turn| turn.tools())
             .filter(|tool| tool.title == "cargo test").count()).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
+        assert_eq!(exchanges[3].lifecycle.as_deref(), Some("Verification started"));
         let text = timeline_text(&broker.snapshot().unwrap());
         for label in ["Plan accepted:", "Implemented plan", "Verification failed", "Resolved findings", "Verified plan", "Plan complete:"] {
             assert!(text.contains(label), "missing {label}: {text}");
@@ -7490,6 +7608,15 @@ mod test {
         assert_eq!(stalled.phase, crate::plan::PlanPhase::Implement);
         assert!(stalled.completed_at_ms.is_none());
         assert_eq!(broker.snapshot().unwrap().goal.unwrap().continuation.turn_count, 2);
+        let attempts = broker.store.list_exchange(&broker.session.id).unwrap().into_iter()
+            .filter(|exchange| exchange.execution_id.as_deref() == Some(&stalled.id))
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 2);
+        assert_ne!(attempts[0].id, attempts[1].id);
+        assert_eq!(attempts[0].state, ExchangeState::Complete);
+        assert_eq!(attempts[0].execution_phase.as_ref().unwrap().outcome, None);
+        assert_eq!(attempts[1].lifecycle.as_deref(), Some("Implementation continued"));
+        assert_eq!(attempts[0].goal_id, attempts[1].goal_id);
         broker.resume_goal(None, None).await.unwrap();
         let resumed = broker.snapshot().unwrap().goal_execution.unwrap();
         assert_eq!(resumed.id, stalled.id);
@@ -7602,7 +7729,8 @@ mod test {
                     broker.backend = Arc::new(NoProgressExecutionBackend);
                     broker.continue_goal().await.unwrap();
                     let continued = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
-                    assert_eq!(continued.id == previous.id, !decision.starts_with("recovered_"));
+                    assert_ne!(continued.id, previous.id);
+                    assert_eq!(continued.lifecycle.as_deref(), Some("Implementation continued"));
                     assert_eq!(continued.execution_id.as_deref(), Some(execution_id.as_str()));
                     assert_eq!(continued.kind, ExchangeKind::PlanExecution);
                 }
@@ -8308,7 +8436,7 @@ mod test {
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         let mut exchange_id = Vec::new();
         for content in ["first\n", "second\n"] {
-            let (mut exchange, _) = broker
+            let (mut exchange, _, _) = broker
                 .interaction_for_turn(content, true, 100)
                 .await
                 .unwrap();
@@ -8643,7 +8771,8 @@ mod test {
         assert_eq!(revised.model_revision, before.model_revision + 1);
         assert_eq!(revised.document_version, before.document_version + 1);
         let exchange = snapshot.exchange.last().unwrap();
-        assert_eq!(exchange.id, interaction.id);
+        assert_ne!(exchange.id, interaction.id);
+        assert_eq!(exchange.lifecycle.as_deref(), Some("Planning resumed"));
         assert_eq!(exchange.kind, ExchangeKind::PlanRevision);
         assert_eq!(exchange.state, ExchangeState::Complete);
         assert!(!exchange.awaiting_input);
@@ -10887,7 +11016,7 @@ mod test {
         let session_id = broker.session.id.clone();
         broker.session.name = "Persistent analysis".into();
         broker.store.save_session(&broker.session).unwrap();
-        let (mut exchange, _) = broker
+        let (mut exchange, _, _) = broker
             .interaction_for_turn("interrupted request", true, 100)
             .await
             .unwrap();
@@ -11192,9 +11321,10 @@ mod test {
         assert_eq!(plan.question_ledger.resolution.len(), 1);
         assert_eq!(
             snapshot.exchange.len(),
-            1,
-            "planning answers and automatic retries must reuse the original exchange"
+            2,
+            "automatic retries must follow the answered exchange as a separate attempt"
         );
+        assert_eq!(snapshot.exchange[1].lifecycle.as_deref(), Some("Planning resumed"));
         assert_eq!(
             broker
                 .store
@@ -11669,7 +11799,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn retries_an_unstructured_planning_response_until_submission() {
+    async fn planning_retries_start_separate_labeled_exchanges() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -11685,6 +11815,19 @@ mod test {
         let plan = broker.snapshot().unwrap().active_plan.unwrap();
         assert_eq!(plan.state, PlanState::AwaitingReview);
         assert!(plan.elicitation.is_none());
+        let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[0].prompt, "/plan migrate the event format");
+        assert!(exchanges[1].prompt.is_empty(), "internal continuation appeared as user input");
+        assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Planning resumed"));
+        assert_ne!(exchanges[0].id, exchanges[1].id);
+        assert!(exchanges.iter().all(|exchange| exchange.state == ExchangeState::Complete
+            && exchange.completed_at_ms.is_some() && exchange.turn.len() == 1
+            && exchange.plan_id.as_deref() == Some(plan.id.as_str())));
+        let restored: Vec<Exchange> = serde_json::from_value(serde_json::to_value(&exchanges).unwrap()).unwrap();
+        assert_eq!(restored[1].lifecycle.as_deref(), Some("Planning resumed"));
+        assert_eq!(restored[0].turn.len(), 1);
+        assert_eq!(restored[1].turn.len(), 1);
     }
 
 
@@ -11749,6 +11892,139 @@ mod test {
     struct NativeSettlementBackend {
         inner: Arc<dyn Backend>,
         state: GoalState,
+    }
+
+    struct NativeContinuationBackend {
+        cancel_continuation: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for NativeContinuationBackend {
+        async fn prompt_stream(&self, _request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+            use crate::backend::{ProviderAddress, TurnBoundary};
+            use crate::backend::usage::{TokenUsage, UsageUpdate};
+            let sink = sink.unwrap();
+            for ordinal in 1..=2 {
+                let address = ProviderAddress { thread_id: "native-goal-thread".into(), turn_id: format!("turn-{ordinal}") };
+                let mut event = BackendEvent {
+                    received_at_ms: None, address: Some(address.clone()),
+                    turn_boundary: Some(TurnBoundary::Started), kind: "turn_started".into(),
+                    text: None, data: Value::Null, activity: None, summary: None, task_update: None,
+                };
+                sink.send_wait(event.clone()).await?;
+                sink.send_wait(event.clone()).await?;
+                if ordinal == 2 && self.cancel_continuation {
+                    return Err(anyhow::Error::new(TurnCancelled));
+                }
+                event.turn_boundary = None;
+                event.kind = "assistant_message".into();
+                event.text = Some(format!("Attempt {ordinal}"));
+                sink.send_wait(event.clone()).await?;
+                event.kind = "usage".into();
+                event.text = None;
+                event.data = serde_json::to_value(UsageUpdate {
+                    id: format!("request-{ordinal}"), cumulative: None, cumulative_total: None,
+                    usage: TokenUsage { input: Some(100 * ordinal), cached_input: Some(0),
+                        reasoning: Some(10), output: Some(20) },
+                })?;
+                sink.send_wait(event.clone()).await?;
+                if ordinal == 2 {
+                    let mut late = event.clone();
+                    late.address.as_mut().unwrap().turn_id = "turn-1".into();
+                    late.data = serde_json::to_value(UsageUpdate {
+                        id: "late-request".into(), cumulative: None, cumulative_total: None,
+                        usage: TokenUsage { input: Some(50), cached_input: Some(0), reasoning: Some(0), output: Some(5) },
+                    })?;
+                    sink.send_wait(late.clone()).await?;
+                    sink.send_wait(late).await?;
+                    let mut replay = event.clone();
+                    replay.address.as_mut().unwrap().turn_id = "turn-1".into();
+                    replay.kind = "turn_started".into();
+                    replay.turn_boundary = Some(TurnBoundary::Started);
+                    sink.send_wait(replay).await?;
+                }
+                event.kind = "turn_completed".into();
+                event.data = Value::Null;
+                event.turn_boundary = Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Completed });
+                sink.send_wait(event).await?;
+            }
+            let mut output = crate::backend::BackendOutput::default();
+            output.evidence.native_state = Some(GoalState::Complete);
+            output.evidence.tool_called = true;
+            Ok(output)
+        }
+
+        async fn fork(&self, _request: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
+            anyhow::bail!("native continuation fixture does not fork")
+        }
+    }
+
+    #[tokio::test]
+    async fn native_goal_turns_start_separate_exchanges_and_route_late_usage() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.capability.native_goal = true;
+        broker.backend = Arc::new(NativeContinuationBackend { cancel_continuation: false });
+        broker.set_goal(json!({"objective":"complete two native turns"})).await.unwrap();
+        let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[0].prompt, "/goal complete two native turns");
+        assert_eq!(exchanges[1].prompt, "");
+        assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Goal continued"));
+        assert!(exchanges.iter().all(|exchange| exchange.state == ExchangeState::Complete && exchange.turn.len() == 1));
+        assert_eq!(exchanges[0].usage().input, Some(150));
+        assert_eq!(exchanges[1].usage().input, Some(200));
+        assert_eq!(exchanges[0].metrics.request_count, 2);
+        assert_eq!(exchanges[1].metrics.request_count, 1);
+        assert_eq!(broker.active_goal().unwrap().state, GoalState::Complete);
+        let retained = serde_json::to_value(&exchanges).unwrap();
+        let session_id = broker.session.id.clone();
+        drop(broker);
+        let store = SqliteStore::open(data.path()).unwrap();
+        assert_eq!(serde_json::to_value(store.list_exchange(&session_id).unwrap()).unwrap(), retained);
+    }
+
+    #[tokio::test]
+    async fn goal_continuations_start_separate_labeled_exchanges() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        broker.backend = Arc::new(NativeSettlementBackend { inner: broker.backend.clone(), state: GoalState::Active });
+        broker.set_goal(json!({"objective":"complete a continued goal"})).await.unwrap();
+        broker.continue_goal().await.unwrap();
+        broker.backend = Arc::new(NativeSettlementBackend { inner: broker.backend.clone(), state: GoalState::Complete });
+        broker.continue_goal().await.unwrap();
+        let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(exchanges.len(), 3);
+        assert!(exchanges.iter().all(|exchange| exchange.state == ExchangeState::Complete && exchange.turn.len() == 1));
+        assert!(exchanges[1..].iter().all(|exchange| exchange.prompt.is_empty()
+            && exchange.lifecycle.as_deref() == Some("Goal continued")
+            && exchange.goal_id == exchanges[0].goal_id));
+    }
+
+    #[tokio::test]
+    async fn cancelling_native_continuation_preserves_the_previous_attempt() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let backend = broker.backend.clone();
+        broker.capability.native_goal = true;
+        broker.backend = Arc::new(NativeContinuationBackend { cancel_continuation: true });
+        let error = broker.set_goal(json!({"objective":"interrupt the second native turn"})).await.unwrap_err();
+        assert!(error.downcast_ref::<TurnCancelled>().is_some());
+        let exchanges = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(exchanges.len(), 2);
+        assert_eq!(exchanges[0].state, ExchangeState::Complete);
+        assert_eq!(exchanges[1].state, ExchangeState::Cancelled);
+        assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Goal continued"));
+        assert_eq!(broker.active_goal().unwrap().state, GoalState::Paused);
+        broker.backend = Arc::new(NativeSettlementBackend { inner: backend, state: GoalState::Complete });
+        broker.resume_goal(None, None).await.unwrap();
+        let resumed = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(resumed.len(), 3);
+        assert_eq!(resumed[2].lifecycle.as_deref(), Some("Goal resumed"));
+        assert_eq!(serde_json::to_value(&resumed[..2]).unwrap(), serde_json::to_value(exchanges).unwrap());
     }
 
     #[async_trait::async_trait]
@@ -12154,7 +12430,7 @@ mod test {
         let occupied: Vec<_> = (0..4)
             .map(|_| broker.repositories.reads.submit(0, |_| Ok(())).unwrap())
             .collect();
-        let (mut rejected, _) = broker
+        let (mut rejected, _, _) = broker
             .interaction_for_turn("not started", true, 300)
             .await
             .unwrap();

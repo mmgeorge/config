@@ -27,7 +27,7 @@ end
 ---@param width integer Maximum column width.
 ---@param indent integer Indentation space count.
 local function append_interaction_detail(result, interaction, width, indent)
-  local thought_prefix = string.rep(" ", indent) .. "↳ "
+  local thought_prefix = string.rep(" ", indent) .. "○ "
   local continuation_prefix = string.rep(" ", indent + 2)
   local item_prefix = string.rep(" ", indent + 2)
   local turn_by_id = {}

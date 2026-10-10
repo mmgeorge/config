@@ -195,7 +195,7 @@ end
 ---@param result table Target render collection table.
 ---@param text string? Response content text string.
 local function append_timeline_response(result, text)
-  append_response(result, text, "▸ ", "ForgeHarnessResponse")
+  append_response(result, text, "● ", "ForgeHarnessResponse")
 end
 
 --- Appends lines, rows, highlights, extmarks, spans, and folds from a prebuilt diff tree.
@@ -251,21 +251,21 @@ end
 local function append_tool(result, tool, thought_key, tool_index, content_width, now_ms)
   local tool_key = ("%s:tool:%d"):format(thought_key, tool_index)
   local first = #result.lines + 1
-  local heading_line_list = tool_render.heading_lines(tool, content_width, "  ", now_ms)
+  local heading_line_list = tool_render.heading_lines(tool, content_width, "    ", now_ms)
   for heading_index, heading_line in ipairs(heading_line_list) do
     result.lines[#result.lines + 1] = heading_line.text
     heading_line.line = #result.lines
     result.rows[#result.lines] = {
       kind = heading_index == 1 and "tool" or "tool_continuation",
       tool = tool,
-      foldtext = tool_render.foldtext_chunks(tool, "  ", heading_line.text, now_ms),
+      foldtext = tool_render.foldtext_chunks(tool, "    ", heading_line.text, now_ms),
       expand_key = tool_key,
     }
   end
   result.highlights[#result.highlights + 1] = {
     line = first,
-    first = 2,
-    last = 2 + #"•",
+    first = 4,
+    last = 4 + #"•",
     group = tool_render.failed(tool) and "ForgeHarnessToolFailure" or "ForgeHarnessToolSuccess",
   }
   if tool.kind == "command" then
@@ -277,7 +277,7 @@ local function append_tool(result, tool, thought_key, tool_index, content_width,
   local output_line_list = tool_render.output_lines(tool.output)
   if #output_line_list == 0 then output_line_list = { "no output" } end
   for line_index, line in ipairs(output_line_list) do
-    result.lines[#result.lines + 1] = (line_index == 1 and "    └ " or "      ") .. line
+    result.lines[#result.lines + 1] = (line_index == 1 and "      └ " or "        ") .. line
     result.rows[#result.lines] = { kind = "tool_output", tool = tool }
     result.highlights[#result.highlights + 1] = {
       line = #result.lines,
@@ -300,7 +300,7 @@ local function active_tool_output_lines(output, content_width)
   for _, output_line in ipairs(output_line_list) do
     local remainder = output_line
     repeat
-      local prefix = #preview_line_list == 0 and "    └ " or "      "
+      local prefix = #preview_line_list == 0 and "      └ " or "        "
       local available_width = math.max(1, (content_width or math.huge) - vim.fn.strdisplaywidth(prefix))
       local split = display_text.take_prefix(remainder, available_width)
       preview_line_list[#preview_line_list + 1] = prefix .. split.prefix
@@ -320,7 +320,7 @@ end
 ---@param now_ms? number Current render timestamp in milliseconds.
 local function append_active_tool_preview(result, tool, content_width, now_ms)
   local first = #result.lines + 1
-  local heading_line_list = tool_render.heading_lines(tool, content_width, "  ", now_ms)
+  local heading_line_list = tool_render.heading_lines(tool, content_width, "    ", now_ms)
   for heading_index, heading_line in ipairs(heading_line_list) do
     result.lines[#result.lines + 1] = heading_line.text
     heading_line.line = #result.lines
@@ -331,8 +331,8 @@ local function append_active_tool_preview(result, tool, content_width, now_ms)
   end
   result.highlights[#result.highlights + 1] = {
     line = first,
-    first = 2,
-    last = 2 + #"•",
+    first = 4,
+    last = 4 + #"•",
     group = tool_render.failed(tool) and "ForgeHarnessToolFailure" or "ForgeHarnessToolSuccess",
   }
   if tool.kind == "command" then
@@ -457,7 +457,7 @@ end
 local function append_completed_thought(result, interaction, thought, thought_index, options)
   local thought_key = ("interaction:%s:thought:%s"):format(interaction.id or interaction.ordinal, thought.id or thought_index)
   local first = #result.lines + 1
-  append_wrapped(result, thought.text, "↳ ", "  ", "ForgeHarnessCommentary", options.content_width)
+  append_wrapped(result, thought.text, "  ○ ", "    ", "ForgeHarnessCommentary", options.content_width)
   local thought_last = #result.lines
   for line = first, thought_last do
     result.rows[line] = {
@@ -513,7 +513,7 @@ end
 ---@param options table Render options table.
 local function append_active_thought(result, interaction, active, options)
   local active_first = #result.lines + 1
-  append_wrapped(result, active.text, "↳ ", "  ", "ForgeHarnessCommentary", options.content_width)
+  append_wrapped(result, active.text, "  ○ ", "    ", "ForgeHarnessCommentary", options.content_width)
   for line = active_first, #result.lines do
     result.rows[line] = { kind = "active_thought", interaction = interaction }
   end
@@ -650,7 +650,7 @@ end
 local function append_interaction(result, interaction, options, agent_by_id)
   if #result.lines > 0 then result.lines[#result.lines + 1] = "" end
   if type(interaction.lifecycle) == "string" then
-    append_wrapped(result, interaction.lifecycle, "  ", "  ", "Comment", options.content_width)
+    append_wrapped(result, interaction.lifecycle, "◇ ", "  ", "Comment", options.content_width)
   elseif not interaction.hide_prompt and interaction.kind ~= "plan_execution" then
     local prompt_line = #result.lines + 1
     append_wrapped(result, interaction.prompt, "▸ ", "  ", "ForgeHarnessPrompt", options.content_width)
@@ -702,7 +702,7 @@ local function append_interaction(result, interaction, options, agent_by_id)
           append_response(result, content.text)
         else
           local first = #result.lines + 1
-          append_wrapped(result, content.text, "↳ ", "  ", "ForgeHarnessCommentary", options.content_width)
+          append_wrapped(result, content.text, "  ○ ", "    ", "ForgeHarnessCommentary", options.content_width)
           for line = first, #result.lines do
             result.rows[line] = { kind = "commentary", interaction = interaction, node_id = node.id }
           end

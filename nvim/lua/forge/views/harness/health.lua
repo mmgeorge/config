@@ -1,6 +1,18 @@
 local M = {}
 local client = require("forge.client")
 
+local function awaiting_user(state)
+  local kind = state.status and state.status.kind
+  return #(state.approval or {}) > 0 or type(state.active_elicitation) == "table"
+    or kind == "awaiting_input" or kind == "awaiting_plan_review"
+end
+
+function M.wait_notice(state)
+  if #(state.approval or {}) > 0 then return "Awaiting approval" end
+  if awaiting_user(state) or not state.busy then return nil end
+  return state.wait_notice
+end
+
 ---@param state table
 ---@param refresh fun()
 function M.watch(state, refresh)
@@ -11,6 +23,7 @@ function M.watch(state, refresh)
   state.health_owner = identity
   local last_response = vim.uv.now()
   local pending = false
+  local resumed_at = 0
   local function tick()
     if state.health_owner ~= identity or client.host_generation() ~= generation or state.host_error
       or not state.session or state.session.id ~= session_id then return end
@@ -18,9 +31,15 @@ function M.watch(state, refresh)
       state.connection_error = "Connection unresponsive — task status unknown"
       refresh()
     end
-    if state.busy and state.last_provider_progress and vim.uv.now() - state.last_provider_progress >= 30000 then
-      state.wait_notice = ("Waiting for provider or tool update (%ds)"):format(math.floor((vim.uv.now() - state.last_provider_progress) / 1000))
-      refresh()
+    if awaiting_user(state) or not state.busy then
+      resumed_at = vim.uv.now()
+      if state.wait_notice then state.wait_notice = nil refresh() end
+    elseif state.last_provider_progress then
+      local elapsed = vim.uv.now() - math.max(state.last_provider_progress, resumed_at)
+      if elapsed >= 30000 then
+        state.wait_notice = ("Waiting for provider or tool update (%ds)"):format(math.floor(elapsed / 1000))
+        refresh()
+      end
     end
     if not pending then
       pending = true

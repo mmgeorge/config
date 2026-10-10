@@ -3,10 +3,13 @@ vim.loader.enable(false)
 local ok, failure = pcall(function()
   local renderer = require("forge.render.harness.tool")
   local tool = { kind = "command", title = "cargo test --lib", status = "running", started_at_ms = 1000 }
-  for _, sample in ipairs({ { 1000, "0ms" }, { 1002, "2ms" }, { 1439, "439ms" }, { 1999, "999ms" }, { 2000, "1s" }, { 2050, "1.1s" }, { 3000, "2s" }, { 6500, "5.5s" }, { 100950, "100s" }, { 101050, "100.1s" }, { 1001050, "16.7m" } }) do
+  for _, sample in ipairs({ { 1000, "0s" }, { 1002, "0s" }, { 1049, "0s" }, { 1050, "0.1s" },
+    { 1149, "0.1s" }, { 1150, "0.2s" }, { 1439, "0.4s" }, { 1950, "1s" },
+    { 1999, "1s" }, { 2000, "1s" }, { 2050, "1.1s" }, { 3000, "2s" }, { 6500, "5.5s" },
+    { 100949, "99.9s" }, { 100950, "1.7m" }, { 101050, "1.7m" }, { 1001050, "16.7m" } }) do
     local heading = renderer.heading_lines(tool, 80, "  ", sample[1])[1]
-    assert(heading.text == ("  • %6s cargo test --lib"):format(sample[2]), heading.text)
-    assert(vim.fn.strdisplaywidth(heading.text:sub(1, heading.command_offset)) == 11)
+    assert(heading.text == ("  • %5s cargo test --lib"):format(sample[2]), heading.text)
+    assert(vim.fn.strdisplaywidth(heading.text:sub(1, heading.command_offset)) == 10)
     assert(heading.text:sub(heading.command_offset + 1) == "cargo test --lib")
     local chunks = renderer.foldtext_chunks(tool, "  ", heading.text, sample[1])
     local text = {}
@@ -15,13 +18,13 @@ local ok, failure = pcall(function()
   end
   tool.status = "completed"
   tool.completed_at_ms = 3500
-  assert(renderer.heading(tool, 90000) == "•   2.5s cargo test --lib")
+  assert(renderer.heading(tool, 90000) == "•  2.5s cargo test --lib")
   tool.started_at_ms = nil
-  assert(renderer.heading(tool, 90000) == "•      — cargo test --lib")
+  assert(renderer.heading(tool, 90000) == "•     — cargo test --lib")
   tool.kind = "tool_call"
   tool.title = "sem_entities({})"
   tool.started_at_ms = 1000
-  assert(renderer.heading_lines(tool, 80, "  ", 90000)[1].text == "  •   2.5s sem_entities({})")
+  assert(renderer.heading_lines(tool, 80, "  ", 90000)[1].text == "  •  2.5s sem_entities({})")
 end)
 
 if not ok then

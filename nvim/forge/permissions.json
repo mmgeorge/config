@@ -311,6 +311,7 @@
       "rg *": "allow",
       "route": "allow",
       "route *": "allow",
+      "rustup toolchain list": "allow",
       "scutil": "allow",
       "scutil *": "allow",
       "seq": "allow",

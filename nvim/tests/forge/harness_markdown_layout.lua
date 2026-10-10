@@ -67,7 +67,7 @@ if vim.g.forge_markdown_layout_child then
       markdown = true, target = {}, decoration = {}, editable_region = {},
       layout = { indent = vim.g.forge_markdown_layout_indent or 2,
         source_indent = source_indent,
-        marker = { text = "↳", capture = "Normal" } },
+        marker = { text = "○", capture = "Normal" } },
     } },
     { id = "response", text = lines, metadata = {
       markdown = true, target = {}, decoration = {}, editable_region = {},
@@ -116,7 +116,7 @@ local function verify_layout(width)
   assert(screen_lines[2]:find("▸ Thought for 3s", 1, true) == 1, "summary marker is indented:\n" .. screen)
   assert(screen_lines[3]:find("  It is Thursday.", 1, true) == 1, "response lost its blank gutter:\n" .. screen)
   local indent = vim.g.forge_markdown_layout_indent or 2
-  assert(screen_lines[4]:find("↳ Commentary", 1, true) == indent - 1, "commentary marker/content offset differs:\n" .. screen)
+  assert(screen_lines[4]:find("○ Commentary", 1, true) == indent - 1, "commentary marker/content offset differs:\n" .. screen)
   for _, line in ipairs(screen_lines) do
     if line:match("^%s*word") then
       assert(line:find("word", 1, true) == indent + 1, "wrapped commentary lost its content indent:\n" .. screen)

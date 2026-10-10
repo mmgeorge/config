@@ -30,7 +30,7 @@ controller.render = function()
   revision = revision + 1
   local text = {
     "▸ Plan out a new one",
-    explanation and "↳ Choose a Rust CLI replacement or a redesigned TypeScript demo." or "↳ The migration scope determines the implementation.",
+    explanation and "○ Choose a Rust CLI replacement or a redesigned TypeScript demo." or "○ The migration scope determines the implementation.",
     "", state.busy and "Working (1s)" or "Awaiting input",
   }
   assert(buffer.apply_snapshot(transcript, {
