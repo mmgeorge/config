@@ -102,7 +102,7 @@ local ok, failure = xpcall(function()
   assert(position[3] == 1 and position[4] == 0 and state.replica.gutter_selection,
     "cursor normalization disturbed active gutter selection")
   local prefix = {}
-  for _, entry in ipairs(bounds.gutter) do
+  for _, entry in ipairs(bounds.insertion) do
     for _, chunk in ipairs(entry.chunk) do prefix[#prefix + 1] = chunk.text end
   end
   mapping("<Space>l", "x").callback()

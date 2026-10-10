@@ -191,7 +191,7 @@ local success, failure = xpcall(function()
     "W did not select the plan diff gutter")
   local bounds = assert(require("forge.gutter").bounds(review.owner.replica, selection_row))
   local prefix = {}
-  for _, entry in ipairs(bounds.gutter) do for _, chunk in ipairs(entry.chunk) do prefix[#prefix + 1] = chunk.text end end
+  for _, entry in ipairs(bounds.insertion) do for _, chunk in ipairs(entry.chunk) do prefix[#prefix + 1] = chunk.text end end
   vim.fn.maparg("<Space>l", "x", false, true).callback()
   assert(clipboard and clipboard.kind == "V" and clipboard.lines[1]:sub(1, #table.concat(prefix)) == table.concat(prefix)
     and clipboard.lines[1]:find("pub second:", 1, true), "plan copy omitted the gutter or source")

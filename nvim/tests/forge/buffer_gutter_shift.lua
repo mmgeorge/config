@@ -30,10 +30,15 @@ for _, label in ipairs({ '▸ ', '      ▸ ', '      ↳ ', '  ', 'long marker'
     { id = 'nested', text = { 'answer' }, metadata = nested_metadata },
   } })
   assert(adopted.kind == 'Applied', 'sign marker rejected snapshot: ' .. label .. ' ' .. vim.inspect(adopted))
-  local details = vim.api.nvim_buf_get_extmark_by_id(nested.buffer, nested.namespace, nested.marks.nested[1], { details = true })[3]
   if label:match('^      ') then
-    assert(vim.trim(details.sign_text) == vim.trim(label), 'nested marker lost its sign')
-    assert(details.virt_text[1][1] == '      ', 'nested indentation was lost')
+    local marks = vim.api.nvim_buf_get_extmarks(nested.buffer, nested.namespace, 0, -1, { details = true })
+    local sign, prefix
+    for _, mark in ipairs(marks) do
+      if mark[4].sign_text then sign = mark[4].sign_text end
+      if mark[4].virt_text then prefix = mark[4].virt_text[1][1] end
+    end
+    assert(vim.trim(sign) == vim.trim(label), 'nested marker lost its sign')
+    assert(prefix == '      ', 'nested indentation was lost')
   end
   replica.close(nested)
 end

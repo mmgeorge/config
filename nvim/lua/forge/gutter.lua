@@ -1,20 +1,13 @@
 local M = {}
 
+---@param session table
+---@param row integer One-based buffer row.
+---@return ForgeRowLayout?
 function M.bounds(session, row)
   local node = session.sequence:locate(row - 1)
   if not node then return nil end
   local _, start = session.sequence:position(node.id)
-  local gutter = node.entry.gutter_row and node.entry.gutter_row[row - 1 - start]
-  if not gutter then return nil end
-  local column, width = nil, 0
-  for _, entry in ipairs(gutter) do
-    if column == nil or entry.position.column < column then column, width = entry.position.column, 0 end
-    if entry.position.column == column then
-      for _, chunk in ipairs(entry.chunk) do width = width + vim.fn.strdisplaywidth(chunk.text) end
-    end
-  end
-  if not column then return nil end
-  return { column = column, width = width, gutter = gutter }
+  return node.entry.row_layout and node.entry.row_layout[row - 1 - start]
 end
 
 function M.normalize(session, selection)
@@ -53,7 +46,7 @@ function M.highlight(session, window, row, namespace)
   local bounds = M.bounds(session, row + 1)
   if not bounds then return end
   local origin = vim.api.nvim_win_get_position(window)[2] + 1
-  for _, entry in ipairs(bounds.gutter) do
+  for _, entry in ipairs(bounds.insertion) do
     local chunks = {}
     for _, chunk in ipairs(entry.chunk) do
       chunks[#chunks + 1] = { chunk.text, "Visual" }

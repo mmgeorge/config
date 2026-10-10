@@ -5,50 +5,148 @@ local M = {}
 ---@field source_indent? integer
 ---@field marker? {text: string, capture: string}
 
----@param layout ForgeContentLayout
----@param first boolean
----@return table[]
-function M.prefix(layout, first)
-  local width = math.max(0, layout.indent - 2 - (layout.source_indent or 0))
-  local marker = first and layout.marker or nil
-  if marker == vim.NIL then marker = nil end
-  if marker and width > 0 then
-    local marker_width = vim.fn.strdisplaywidth(marker.text)
-    local gap = math.max(0, 2 - marker_width)
-    return { { string.rep(" ", math.max(0, width - marker_width - gap)), "Normal" },
-      { marker.text .. string.rep(" ", gap), marker.capture } }
+---@class ForgePrefixInsertion
+---@field position {row: integer, column: integer}
+---@field chunk {text: string, capture: string}[]
+---@field priority integer
+---@field width integer
+
+---@class ForgeRowLayout
+---@field column integer
+---@field width integer
+---@field insertion ForgePrefixInsertion[]
+
+---@class ForgePrefixSign
+---@field row integer
+---@field column integer
+---@field text string
+---@field capture string
+---@field priority integer
+
+---@class ForgeLayoutMetadata
+---@field layout? ForgeContentLayout
+---@field gutter? table[]
+---@field source_overlay? table[]
+
+---@class ForgeLayoutEntry
+---@field row_count integer
+---@field text? string[]
+---@field metadata ForgeLayoutMetadata
+---@field row_layout table<integer, ForgeRowLayout>
+---@field prefix_sign ForgePrefixSign[]
+
+---Prepare source-preserving insertions once for rendering, navigation, and copying.
+---@param entry ForgeLayoutEntry
+---@param read_row? fun(row: integer): string Zero-based row within the block.
+function M.prepare(entry, read_row)
+  ---@type table<integer, ForgeRowLayout>
+  entry.row_layout = {}
+  ---@type ForgePrefixSign[]
+  entry.prefix_sign = {}
+  local function append(row, column, chunks, priority)
+    local row_layout = entry.row_layout[row]
+    if not row_layout then
+      row_layout = { column = column, width = 0, insertion = {} }
+      entry.row_layout[row] = row_layout
+    end
+    local insertion = row_layout.insertion[#row_layout.insertion]
+    if not insertion or insertion.position.column ~= column then
+      insertion = { position = { row = row, column = column }, chunk = {}, priority = priority, width = 0 }
+      row_layout.insertion[#row_layout.insertion + 1] = insertion
+    end
+    insertion.priority = math.max(insertion.priority, priority)
+    for _, chunk in ipairs(chunks) do insertion.chunk[#insertion.chunk + 1] = chunk end
   end
-  return width > 0 and { { string.rep(" ", width), "Normal" } } or {}
+  local layout = entry.metadata.layout
+  if layout then
+    local width = math.max(0, layout.indent - 2 - (layout.source_indent or 0))
+    if width > 0 then
+      local chunks = { { text = string.rep(" ", width), capture = "Normal" } }
+      for row = 0, entry.row_count - 1 do append(row, 0, chunks, 200) end
+    end
+  end
+  local ordered, order = {}, {}
+  for index, gutter in ipairs(entry.metadata.gutter or {}) do
+    ordered[index], order[gutter] = gutter, index
+  end
+  table.sort(ordered, function(left, right)
+    if left.position.row ~= right.position.row then return left.position.row < right.position.row end
+    if left.position.column ~= right.position.column then return left.position.column < right.position.column end
+    if left.priority ~= right.priority then return left.priority < right.priority end
+    return order[left] < order[right]
+  end)
+  for _, gutter in ipairs(ordered) do
+    local chunks = gutter.chunk
+    if gutter.placement == "sign" then
+      local text = {}
+      for _, chunk in ipairs(chunks) do text[#text + 1] = chunk.text end
+      local label = table.concat(text)
+      local marker = vim.trim(label)
+      if marker == "" then
+        chunks = {}
+      elseif vim.fn.strdisplaywidth(marker) <= 2 then
+        entry.prefix_sign[#entry.prefix_sign + 1] = { row = gutter.position.row, column = gutter.position.column,
+          text = marker, capture = chunks[1].capture, priority = gutter.priority }
+        local indent = label:match("^ +")
+        chunks = indent and { { text = indent, capture = "Normal" } } or {}
+      end
+    end
+    if #chunks > 0 then append(gutter.position.row, gutter.position.column, chunks, gutter.priority) end
+  end
+  for row, row_layout in pairs(entry.row_layout) do
+    local preceding_width = 0
+    for _, insertion in ipairs(row_layout.insertion) do
+      local start = preceding_width
+      for _, chunk in ipairs(insertion.chunk) do
+        if chunk.text:find("\t", 1, true) then
+          local text = read_row and read_row(row) or assert(entry.text and entry.text[row + 1], "tabbed prefix requires source row")
+          start = start + vim.fn.strdisplaywidth(text:sub(1, insertion.position.column))
+          break
+        end
+      end
+      local width = 0
+      for _, chunk in ipairs(insertion.chunk) do width = width + vim.fn.strdisplaywidth(chunk.text, start + width) end
+      insertion.width = width
+      preceding_width = preceding_width + width
+    end
+    local first = row_layout.insertion[1]
+    row_layout.column, row_layout.width = first.position.column, first.width
+  end
 end
 
 ---@param buffer integer
 ---@param namespace integer
 ---@param start_row integer
----@param count integer
----@param layout ForgeContentLayout
+---@param entry ForgeLayoutEntry
 ---@return integer[]
-function M.install(buffer, namespace, start_row, count, layout)
+function M.install(buffer, namespace, start_row, entry)
   local marks = {}
-  for row = 0, count - 1 do
-    local options = { priority = 200, right_gravity = true, strict = true }
-    local marker = row == 0 and layout.marker or nil
-    if marker == vim.NIL then marker = nil end
-    if marker and marker.text ~= "▸" and layout.indent == 2 then
-      options.sign_text, options.sign_hl_group = marker.text, marker.capture
+  for row, row_layout in pairs(entry.row_layout) do
+    for _, insertion in ipairs(row_layout.insertion) do
+      local chunks = {}
+      for _, chunk in ipairs(insertion.chunk) do chunks[#chunks + 1] = { chunk.text, chunk.capture } end
+      marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row + row, insertion.position.column, {
+        virt_text = chunks, virt_text_pos = "inline", hl_mode = "combine", priority = insertion.priority,
+        right_gravity = true, strict = true,
+      })
     end
-    local prefix = M.prefix(layout, false)
-    if #prefix > 0 then
-      options.virt_text, options.virt_text_pos, options.hl_mode = prefix, "inline", "combine"
-      options.virt_text_repeat_linebreak = true
+  end
+  for _, sign in ipairs(entry.prefix_sign) do
+    marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row + sign.row, sign.column, {
+      sign_text = sign.text, sign_hl_group = sign.capture, priority = sign.priority, right_gravity = true, strict = true,
+    })
+  end
+  local layout = entry.metadata.layout
+  local marker = layout and layout.marker
+  if layout and marker and marker ~= vim.NIL and marker.text ~= "▸" then
+    local options = { priority = 201, right_gravity = true, strict = true }
+    if layout.indent == 2 then
+      options.sign_text, options.sign_hl_group = marker.text, marker.capture
+    elseif layout.indent > 2 then
+      options.virt_text, options.virt_text_win_col = { { marker.text, marker.capture } }, layout.indent - 4
     end
     if options.sign_text or options.virt_text then
-      marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row + row, 0, options)
-    end
-    if marker and marker.text ~= "▸" and layout.indent > 2 then
-      marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row + row, 0, {
-        virt_text = { { marker.text, marker.capture } }, virt_text_win_col = layout.indent - 4,
-        priority = 201, right_gravity = true, strict = true,
-      })
+      marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row, 0, options)
     end
   end
   return marks

@@ -86,7 +86,7 @@ end
 
 local function entry(text, chunk, location, kind)
   return { text = text, chunk = chunk, location = location, kind = kind, row_count = #text,
-    metadata = empty_metadata, gutter_row = empty_map, source_overlay_row = empty_map }
+    metadata = empty_metadata, row_layout = empty_map, source_overlay_row = empty_map }
 end
 
 local function file_header(record, body, key)

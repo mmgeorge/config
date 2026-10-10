@@ -15,23 +15,12 @@ local function selected_rows(session)
     - vim.api.nvim_buf_get_offset(session.buffer, first - 1)
   assert(source_bytes >= 0 and source_bytes <= 16 * 1024 * 1024, "selected source exceeds 16 MiB")
   local rows = vim.api.nvim_buf_get_lines(session.buffer, first - 1, last, true)
-  local metadata, bytes = {}, 0
+  local bytes = 0
   for index, text in ipairs(rows) do
-    local location = buffer.locate(session, first + index - 2, 0)
-    if location then
-      local gutter = metadata[location.block]
-      if not gutter then
-        gutter = {}
-        for _, entry in ipairs(session.block[location.block].metadata.gutter or {}) do
-          gutter[entry.position.row] = gutter[entry.position.row] or {}
-          gutter[entry.position.row][#gutter[entry.position.row] + 1] = entry
-        end
-        metadata[location.block] = gutter
-      end
+    local layout = gutter.bounds(session, first + index - 1)
+    if layout then
       local fragment, column = {}, 0
-      local row_gutter = vim.list_extend({}, gutter[location.position.row] or {})
-      table.sort(row_gutter, function(left, right) return left.position.column < right.position.column end)
-      for _, entry in ipairs(row_gutter) do
+      for _, entry in ipairs(layout.insertion) do
         fragment[#fragment + 1] = text:sub(column + 1, entry.position.column)
         for _, chunk in ipairs(entry.chunk) do fragment[#fragment + 1] = chunk.text end
         column = entry.position.column

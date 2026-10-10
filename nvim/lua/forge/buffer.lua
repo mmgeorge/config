@@ -356,7 +356,7 @@ function M.preflight(session, patch, options)
         local _, start_row = session.sequence:position(id)
         position[id] = start_row
         validate_metadata({ row_count = entry.row_count, metadata = entry.metadata, start_row = start_row }, read_row, region)
-        decorations.prepare(entry)
+        decorations.prepare(entry, function(row) return read_row(start_row + row) end)
         for _, editable_region in ipairs(entry.metadata.editable_region) do
           assert(not session.region_owner[editable_region.id] or released_region[editable_region.id], "duplicate editable region")
           region_owner[editable_region.id] = id
@@ -392,10 +392,8 @@ local function install_metadata(session, prepared, replace_all)
   for id in pairs(prepared.changed) do
       local entry, mark = prepared.block[id], {}
       local start_row = prepared.position[id]
-      if entry.metadata.layout then
-        vim.list_extend(mark, require("forge.content_layout").install(session.buffer, session.namespace,
-          start_row, entry.row_count, entry.metadata.layout))
-      end
+      vim.list_extend(mark, require("forge.content_layout").install(session.buffer, session.namespace,
+        start_row, entry))
       for _, decoration in ipairs(entry.metadata.decoration) do
         local range = decoration.range
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
@@ -404,30 +402,6 @@ local function install_metadata(session, prepared, replace_all)
             hl_group = decoration.capture, hl_eol = decorations.full_width(decoration.capture),
             priority = decoration.priority, strict = true,
           })
-      end
-      for _, gutter in ipairs(entry.metadata.gutter or {}) do
-        local text = {}
-        for _, chunk in ipairs(gutter.chunk) do text[#text + 1] = { chunk.text, chunk.capture } end
-        local options = { priority = gutter.priority, right_gravity = true, strict = true }
-        if gutter.placement == "sign" then
-          local label = table.concat(vim.tbl_map(function(chunk) return chunk[1] end, text))
-          local marker = vim.trim(label)
-          if marker ~= "" and vim.fn.strdisplaywidth(marker) <= 2 then
-            options.sign_text = marker
-            options.sign_hl_group = text[1] and text[1][2]
-            local indent = label:match("^ +")
-            if indent then
-              options.virt_text = { { indent, "Normal" } }
-              options.virt_text_pos, options.hl_mode = "inline", "combine"
-            end
-          elseif marker ~= "" then
-            options.virt_text, options.virt_text_pos, options.hl_mode = text, "inline", "combine"
-          end
-        else
-          options.virt_text, options.virt_text_pos, options.hl_mode = text, "inline", "combine"
-        end
-        mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
-          start_row + gutter.position.row, gutter.position.column, options)
       end
       for _, conceal in ipairs(entry.metadata.conceal or {}) do
         local range = conceal.range
@@ -629,7 +603,7 @@ function M.apply_projected_snapshot(session, snapshot)
       local entry = block[id]
       sequence:splice(sequence:count(), 0, { { id = id, entry = entry } })
       changed[id], position[id] = true, entry.start_row
-      decorations.prepare(entry)
+      decorations.prepare(entry, function(row) return text[entry.start_row + row + 1] end)
       for _, editable_region in ipairs(entry.metadata.editable_region) do region_owner[editable_region.id] = id end
       cooperative.checkpoint()
     end

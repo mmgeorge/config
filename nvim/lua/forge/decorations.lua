@@ -109,19 +109,21 @@ vim.api.nvim_set_decoration_provider(namespace, {
   end,
 })
 
-function M.prepare(entry)
+---@class ForgeDecoratedEntry: ForgeLayoutEntry
+---@field source_overlay_row table<integer, table[]>
+---@field visible_decoration? table
+---@field source_highlight? table
+
+---@param entry ForgeDecoratedEntry
+---@param read_row? fun(row: integer): string
+function M.prepare(entry, read_row)
   entry.source_overlay_row = {}
   for _, overlay in ipairs(entry.metadata.source_overlay or {}) do
     local row = overlay.range.start.row
     entry.source_overlay_row[row] = entry.source_overlay_row[row] or {}
     entry.source_overlay_row[row][#entry.source_overlay_row[row] + 1] = overlay
   end
-  entry.gutter_row = {}
-  for _, gutter in ipairs(entry.metadata.gutter or {}) do
-    local row = gutter.position.row
-    entry.gutter_row[row] = entry.gutter_row[row] or {}
-    entry.gutter_row[row][#entry.gutter_row[row] + 1] = gutter
-  end
+  require("forge.content_layout").prepare(entry, read_row)
   for _, kind in ipairs({ "visible_decoration", "source_highlight" }) do
     local values = vim.list_extend({}, entry.metadata[kind] or {})
     local order = {}
