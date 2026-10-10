@@ -39,8 +39,8 @@ impl HarnessBroker {
             return Ok(None);
         };
         let mut report = format!(
-            "## Execution: {:?} · {:?}\n\nOriginal approved revision: {}. Current accepted revision: {}.\n\n### Semantic comparison\n\n",
-            execution.state, execution.phase, execution.original_revision, execution.revision
+            "## {}: {:?}\n\nOriginal approved revision: {}. Current accepted revision: {}.\n\n### Semantic comparison\n\n",
+            execution.phase.label(), execution.state, execution.original_revision, execution.revision
         );
         for (label, paths) in [
             ("Matched", &execution.progress.matched),
@@ -462,10 +462,10 @@ impl HarnessBroker {
                 };
                 title = match (execution.state, execution.phase) {
                     (PlanExecutionState::Complete, _) => "Plan complete",
-                    (PlanExecutionState::Blocked, _) => "Verification blocked",
-                    (_, crate::plan::PlanPhase::Verify) => "Ready for verification",
-                    (_, crate::plan::PlanPhase::Resolve) => "Resolving verification findings",
-                    _ => "Implementing plan",
+                    (PlanExecutionState::Blocked, _) => "Plan verification blocked",
+                    (_, crate::plan::PlanPhase::Verify) => "Plan verification ready",
+                    (_, crate::plan::PlanPhase::Resolve) => "Plan resolution ready",
+                    _ => "Plan implementation",
                 };
             }
         }
@@ -664,19 +664,19 @@ impl HarnessBroker {
         if execution.state != state {
             execution.state = state;
             execution.generation += 1;
-            let title = match state {
-                PlanExecutionState::Active => "Execution resumed",
-                PlanExecutionState::Paused => "Execution paused",
-                PlanExecutionState::Cancelled => "Execution cancelled",
-                PlanExecutionState::Complete => "Execution completed",
-                PlanExecutionState::Blocked => "Execution blocked",
-                PlanExecutionState::Stalled => "Execution stopped at continuation limit",
+            let status = match state {
+                PlanExecutionState::Active => "resumed",
+                PlanExecutionState::Paused => "paused",
+                PlanExecutionState::Cancelled => "cancelled",
+                PlanExecutionState::Complete => "completed",
+                PlanExecutionState::Blocked => "blocked",
+                PlanExecutionState::Stalled => "stopped at continuation limit",
             };
             execution.append_lifecycle(
                 self.plan_exchange_anchor(&execution.plan_id)?,
                 goal.updated_at_ms,
                 PlanExecutionLifecycleEvent::Phase {
-                    title: title.into(),
+                    title: format!("{} {status}", execution.phase.label()),
                     phase: execution.phase,
                     revision: execution.revision,
                     state,

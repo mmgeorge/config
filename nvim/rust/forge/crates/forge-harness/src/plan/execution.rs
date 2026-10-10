@@ -15,6 +15,16 @@ pub enum PlanPhase {
     Resolve,
 }
 
+impl PlanPhase {
+    pub(crate) fn label(self) -> &'static str {
+        match self {
+            Self::Implement => "Plan implementation",
+            Self::Verify => "Plan verification",
+            Self::Resolve => "Plan resolution",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 /// Separates execution suspension from its preserved phase.

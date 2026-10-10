@@ -99,17 +99,17 @@ local success, failure = xpcall(function()
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "" })
   controller.task_transition({ action = "resume" })
   wait_settled()
-  local execution_resume = latest_exchange(function(exchange) return exchange.lifecycle == "Execution resumed · implement" end)
+  local execution_resume = latest_exchange(function(exchange) return exchange.lifecycle == "Plan implementation resumed · implement" end)
   assert(task.current(state).id == executing_id)
-  assert(execution_resume.prompt == "" and execution_resume.lifecycle == "Execution resumed · implement", vim.inspect(execution_resume))
+  assert(execution_resume.prompt == "" and execution_resume.lifecycle == "Plan implementation resumed · implement", vim.inspect(execution_resume))
   assert(execution_resume.execution_id ~= nil, "control resume lost execution identity")
   local continuation = latest_exchange()
-  assert(continuation.id ~= execution_resume.id and continuation.lifecycle == "Implementation continued",
+  assert(continuation.id ~= execution_resume.id and continuation.lifecycle == "Plan implementation continued",
     "automatic retry was not a separate labeled exchange")
   local lifecycle_tree = require("forge.render.harness.interaction_tree").build({
     { kind = "exchange", exchange = execution_resume },
   })
-  assert(lifecycle_tree.lines[1]:find("Execution resumed · implement", 1, true))
+  assert(lifecycle_tree.lines[1]:find("Plan implementation resumed · implement", 1, true))
   assert(lifecycle_tree.lines[1]:sub(1, #"◇ ") == "◇ ", "lifecycle row lost its event marker")
   assert(#lifecycle_tree.prompt_lines == 0, "control resume entered user prompt navigation")
   controller.task_transition({ action = "pause" })

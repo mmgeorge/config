@@ -1577,11 +1577,7 @@ fn working_status_text(
     execution: Option<&ExecutionStatus>,
 ) -> Result<String> {
     if let Some(execution) = execution {
-        let phase = match execution.phase {
-            crate::plan::PlanPhase::Implement => "Implementing",
-            crate::plan::PlanPhase::Verify => "Verifying",
-            crate::plan::PlanPhase::Resolve => "Resolving",
-        };
+        let phase = execution.phase.label();
         let progress = &execution.progress;
         let count = progress.missing.iter().chain(&progress.different).chain(&progress.unverified)
             .map(|finding| finding.split_once(": ").map_or(finding.as_str(), |(path, _)| path))
@@ -1664,21 +1660,21 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
                 use crate::plan::PlanPhase;
                 use crate::plan::execution::VerificationOutcome;
                 match interaction.execution_phase.as_ref().map(|phase| (phase.phase, phase.outcome)) {
-                    Some((PlanPhase::Verify, Some(VerificationOutcome::Failed))) => "Verification failed",
-                    Some((PlanPhase::Verify, Some(VerificationOutcome::Blocked))) => "Verification blocked",
-                    Some((PlanPhase::Implement, Some(_))) => "Implemented plan",
-                    Some((PlanPhase::Resolve, Some(_))) => "Resolved findings",
-                    Some((PlanPhase::Verify, Some(_))) => "Verified plan",
-                    Some((PlanPhase::Implement, None)) if complete => "Implementation turn complete",
-                    Some((PlanPhase::Verify, None)) if complete => "Verification turn complete",
-                    Some((PlanPhase::Resolve, None)) if complete => "Resolution turn complete",
-                    _ if complete => "Plan turn complete",
-                    Some((PlanPhase::Verify, None)) if paused => "Verification paused",
-                    Some((PlanPhase::Verify, None)) => "Verifying plan",
-                    Some((PlanPhase::Resolve, None)) if paused => "Resolving findings paused",
-                    Some((PlanPhase::Resolve, None)) => "Resolving findings",
-                    _ if paused => "Plan execution paused",
-                    _ => "Executing plan",
+                    Some((PlanPhase::Verify, Some(VerificationOutcome::Failed))) => "Plan verification failed",
+                    Some((PlanPhase::Verify, Some(VerificationOutcome::Blocked))) => "Plan verification blocked",
+                    Some((PlanPhase::Implement, Some(_))) => "Plan implemented",
+                    Some((PlanPhase::Resolve, Some(_))) => "Plan resolution complete",
+                    Some((PlanPhase::Verify, Some(_))) => "Plan verification complete",
+                    Some((PlanPhase::Implement, None)) if complete => "Plan implementation stopped",
+                    Some((PlanPhase::Verify, None)) if complete => "Plan verification stopped",
+                    Some((PlanPhase::Resolve, None)) if complete => "Plan resolution stopped",
+                    _ if complete => "Plan implementation stopped",
+                    Some((PlanPhase::Verify, None)) if paused => "Plan verification paused",
+                    Some((PlanPhase::Verify, None)) => "Plan verification",
+                    Some((PlanPhase::Resolve, None)) if paused => "Plan resolution paused",
+                    Some((PlanPhase::Resolve, None)) => "Plan resolution",
+                    _ if paused => "Plan implementation paused",
+                    _ => "Plan implementation",
                 }
             },
             ExchangeKind::Chat if complete => "Thought",
@@ -1770,7 +1766,7 @@ mod tests {
         let source = json!({
             "id":"phase", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"", "kind":"plan_execution", "state":"running", "created_at_ms":0,
-            "lifecycle":"Implementation started",
+            "lifecycle":"Plan implementation started",
             "execution_started_at_ms":0, "attributed_matches_checkpoint":false,
             "execution_phase":{"phase":"implement","outcome":null},
             "node_list":[
@@ -1783,17 +1779,17 @@ mod tests {
             ]
         });
         for (phase, outcome, state, expected) in [
-            ("implement", None, "running", "Executing plan"),
-            ("verify", None, "running", "Verifying plan"),
-            ("resolve", None, "running", "Resolving findings"),
-            ("implement", Some("passed"), "complete", "Implemented plan"),
-            ("verify", Some("failed"), "complete", "Verification failed"),
-            ("verify", Some("blocked"), "complete", "Verification blocked"),
-            ("resolve", Some("passed"), "complete", "Resolved findings"),
-            ("verify", Some("passed"), "complete", "Verified plan"),
-            ("implement", None, "complete", "Implementation turn complete"),
-            ("verify", None, "complete", "Verification turn complete"),
-            ("resolve", None, "complete", "Resolution turn complete"),
+            ("implement", None, "running", "Plan implementation"),
+            ("verify", None, "running", "Plan verification"),
+            ("resolve", None, "running", "Plan resolution"),
+            ("implement", Some("passed"), "complete", "Plan implemented"),
+            ("verify", Some("failed"), "complete", "Plan verification failed"),
+            ("verify", Some("blocked"), "complete", "Plan verification blocked"),
+            ("resolve", Some("passed"), "complete", "Plan resolution complete"),
+            ("verify", Some("passed"), "complete", "Plan verification complete"),
+            ("implement", None, "complete", "Plan implementation stopped"),
+            ("verify", None, "complete", "Plan verification stopped"),
+            ("resolve", None, "complete", "Plan resolution stopped"),
             ("implement", None, "cancelled", "Cancelled"),
             ("implement", None, "interrupted", "Interrupted"),
             ("implement", None, "failed", "Failed"),
@@ -1809,7 +1805,7 @@ mod tests {
             }, &WidthProfile::default(), 1000).unwrap();
             let blocks = &projected.entry.block;
             assert_eq!(blocks[0].id.0, "phase:lifecycle");
-            assert_eq!(blocks[0].text.wire_rows().join("\n"), "◇ Implementation started");
+            assert_eq!(blocks[0].text.wire_rows().join("\n"), "◇ Plan implementation started");
             let summary = blocks.iter().find(|block| block.id.0 == "phase:summary").unwrap();
             assert!(summary.text.wire_rows().join("\n").contains(expected));
             assert_eq!(blocks.last().unwrap().id.0, "done");
@@ -3061,7 +3057,7 @@ mod tests {
             },
         }, &WidthProfile::default(), 133_000).unwrap();
         let initial = render(execution.clone());
-        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Implementing · 133s · 2 files need attention"]);
+        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Plan implementation · 133s · 2 files need attention"]);
         assert!(initial.entry.block[0].metadata.target[0].id.0.ends_with(":working"));
         assert!(initial.entry.block[1].metadata.fold[0].closed);
         let file_id = format!("session:status:implementation:execution:{}", crate::plan::digest(b"src/player.rs"));
@@ -3077,7 +3073,7 @@ mod tests {
         execution.progress.unverified.clear();
         execution.progress.matched.extend(["src/player.rs".into(), "src/ui.rs".into()]);
         let matched = render(execution);
-        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Verifying · 133s · all files matched"]);
+        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Plan verification · 133s · all files matched"]);
         assert!(matched.entry.block.iter().any(|block| block.id.0 == file_id));
     }
 
@@ -3205,7 +3201,7 @@ mod tests {
     fn lifecycle_resumption_does_not_render_as_user_input() {
         let interaction: Exchange = serde_json::from_value(json!({
             "id":"interaction", "session_id":"session", "agent_id":"primary", "ordinal":1,
-            "prompt":"", "lifecycle":"Execution resumed · implement",
+            "prompt":"", "lifecycle":"Plan implementation resumed · implement",
             "kind":"plan_execution", "state":"running", "created_at_ms":1000,
             "attributed_matches_checkpoint":false, "node_list":[]
         })).unwrap();
@@ -3220,7 +3216,7 @@ mod tests {
             1_000,
         ).unwrap();
         assert_eq!(projected.entry.block[0].id.0, "interaction:lifecycle");
-        assert!(projected.entry.block[0].text.wire_rows().join("\n").contains("Execution resumed · implement"));
+        assert!(projected.entry.block[0].text.wire_rows().join("\n").contains("Plan implementation resumed · implement"));
         assert!(!projected.entry.block.iter().any(|block| block.id.0 == "interaction:prompt"));
     }
 
@@ -3300,8 +3296,8 @@ mod tests {
             ("plan_revision", "Planning paused", "Planning"),
             (
                 "plan_execution",
-                "Plan execution paused",
-                "Executing plan",
+                "Plan implementation paused",
+                "Plan implementation",
             ),
         ] {
             let mut exchange: Exchange = serde_json::from_value(json!({

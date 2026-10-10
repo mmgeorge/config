@@ -1561,13 +1561,16 @@ impl HarnessBroker {
             };
             task.reason = match goal.state {
                 GoalState::Blocked => Some("Provider reported that the task is blocked".into()),
-                GoalState::Stalled => Some("Execution stopped because no observable progress was recorded".into()),
+                GoalState::Stalled => Some("Task stopped because no observable progress was recorded".into()),
                 GoalState::UsageLimited => Some("Provider usage limit reached".into()),
                 GoalState::BudgetLimited => Some("Task budget limit reached".into()),
                 _ => None,
             };
             if let Some(execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|entry| entry.goal_id == goal.id) {
                 task.phase = format!("{:?}", execution.phase).to_lowercase();
+                if goal.state == GoalState::Stalled {
+                    task.reason = Some(format!("{} stopped because no observable progress was recorded", execution.phase.label()));
+                }
                 if execution.pending_revision_reason.is_some() { task.status = TaskStatus::Waiting; }
             }
         }
@@ -1660,7 +1663,11 @@ impl HarnessBroker {
                 }
                 let resumed = match task.kind {
                     TaskKind::Plan => "Planning resumed".to_owned(),
-                    TaskKind::Execute => format!("Execution resumed · {}", task.phase),
+                    TaskKind::Execute => format!("{} resumed", match task.phase.as_str() {
+                        "verify" => crate::plan::PlanPhase::Verify,
+                        "resolve" => crate::plan::PlanPhase::Resolve,
+                        _ => crate::plan::PlanPhase::Implement,
+                    }.label()),
                     TaskKind::Goal => "Goal resumed".to_owned(),
                 };
                 let lifecycle = action.get("reason").and_then(Value::as_str)
@@ -5744,7 +5751,7 @@ Planning continuation: turn {} of {}.",
         let mut admission = ExchangeAdmission::execution(
             String::new(), plan.id.clone(),
             execution_record.id.clone(), goal.id.clone());
-        admission.lifecycle = Some("Implementation started".into());
+        admission.lifecycle = Some("Plan implementation started".into());
         let execution = self.run_interaction(execution_prompt, PromptMode::ExecutePlan, Some(admission))
             .await;
         let execution_succeeded = execution.is_ok();
@@ -6252,12 +6259,14 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         let control_resume = message.is_none();
         let visible_prompt = message.unwrap_or_default();
+        let mut resumed_phase = None;
         let mut admission = self
             .store
             .list_plan_execution(&self.session.id)?
             .into_iter()
             .find(|execution| execution.goal_id == goal.id)
             .map(|execution| {
+                resumed_phase = Some(execution.phase);
                 ExchangeAdmission::execution(
                     visible_prompt.clone(),
                     execution.plan_id,
@@ -6267,9 +6276,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             })
             .unwrap_or_else(|| ExchangeAdmission::goal(visible_prompt, goal.id.clone()));
         if control_resume {
-            admission.lifecycle = Some(lifecycle.unwrap_or_else(|| if mode == PromptMode::ExecutePlan {
-                "Execution resumed".into()
-            } else { "Goal resumed".into() }));
+            admission.lifecycle = Some(lifecycle.unwrap_or_else(|| resumed_phase
+                .map(|phase| format!("{} resumed", phase.label()))
+                .unwrap_or_else(|| "Goal resumed".into())));
         }
         match self
             .run_interaction(prompt, mode, Some(admission))
@@ -6345,11 +6354,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         {
             let previous_phase = self.store.list_exchange(&self.session.id)?.last()
                 .and_then(|exchange| exchange.execution_phase.as_ref().map(|phase| phase.phase));
-            let phase = match execution.phase {
-                crate::plan::PlanPhase::Implement => "Implementation",
-                crate::plan::PlanPhase::Verify => "Verification",
-                crate::plan::PlanPhase::Resolve => "Resolution",
-            };
+            let phase = execution.phase.label();
             let action = if previous_phase == Some(execution.phase) { "continued" } else { "started" };
             let mut admission = ExchangeAdmission::execution(
                 String::new(), execution.plan_id, execution.id, goal.id.clone());
@@ -7785,8 +7790,8 @@ mod test {
             vec![Some(20), Some(21), Some(22), Some(23)]);
         assert_eq!(exchanges.iter().map(|exchange| exchange.turn.iter().flat_map(|turn| turn.tools())
             .filter(|tool| tool.title == "cargo test").count()).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
-        assert_eq!(exchanges[0].lifecycle.as_deref(), Some("Implementation started"));
-        assert_eq!(exchanges[3].lifecycle.as_deref(), Some("Verification started"));
+        assert_eq!(exchanges[0].lifecycle.as_deref(), Some("Plan implementation started"));
+        assert_eq!(exchanges[3].lifecycle.as_deref(), Some("Plan verification started"));
         let snapshot = broker.snapshot().unwrap();
         let acceptance_owner = snapshot.timeline.iter().filter_map(|entry| match entry {
             crate::timeline::TimelineEntry::Exchange { exchange, .. }
@@ -7797,8 +7802,8 @@ mod test {
         }).collect::<Vec<_>>();
         assert_eq!(acceptance_owner, vec![planning_exchange_id.as_str()]);
         let text = timeline_text(&snapshot);
-        assert!(text.find("Plan accepted:").unwrap() < text.find("Implementation started").unwrap());
-        for label in ["Plan accepted:", "Implemented plan", "Verification failed", "Resolved findings", "Verified plan", "Plan complete:"] {
+        assert!(text.find("Plan accepted:").unwrap() < text.find("Plan implementation started").unwrap());
+        for label in ["Plan accepted:", "Plan implemented", "Plan verification failed", "Plan resolution complete", "Plan verification complete", "Plan complete:"] {
             assert!(text.contains(label), "missing {label}: {text}");
         }
         assert_eq!(text.matches("Plan accepted:").count(), 1);
@@ -7896,7 +7901,7 @@ mod test {
         assert_ne!(attempts[0].id, attempts[1].id);
         assert_eq!(attempts[0].state, ExchangeState::Complete);
         assert_eq!(attempts[0].execution_phase.as_ref().unwrap().outcome, None);
-        assert_eq!(attempts[1].lifecycle.as_deref(), Some("Implementation continued"));
+        assert_eq!(attempts[1].lifecycle.as_deref(), Some("Plan implementation continued"));
         assert_eq!(attempts[0].goal_id, attempts[1].goal_id);
         broker.resume_goal(None, None).await.unwrap();
         let resumed = broker.snapshot().unwrap().goal_execution.unwrap();
@@ -8040,7 +8045,7 @@ mod test {
                     broker.continue_goal().await.unwrap();
                     let continued = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
                     assert_ne!(continued.id, previous.id);
-                    assert_eq!(continued.lifecycle.as_deref(), Some("Implementation continued"));
+                    assert_eq!(continued.lifecycle.as_deref(), Some("Plan implementation continued"));
                     assert_eq!(continued.execution_id.as_deref(), Some(execution_id.as_str()));
                     assert_eq!(continued.kind, ExchangeKind::PlanExecution);
                 }
@@ -8117,7 +8122,7 @@ mod test {
             assert_eq!(execution.revision, if decision == "accept" { 2 } else { 1 });
             let rendered = timeline_text(&broker.snapshot().unwrap());
             assert!(rendered.contains("Plan revision requested"), "{rendered}");
-            assert!(!rendered.contains("Implementation continued"), "{rendered}");
+            assert!(!rendered.contains("Plan implementation continued"), "{rendered}");
         }
     }
 

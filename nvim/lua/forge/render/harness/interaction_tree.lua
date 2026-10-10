@@ -594,7 +594,19 @@ local function append_exchange_summary(result, interaction, options)
   if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
     verb = (interaction.awaiting_input or paused) and "Planning paused" or complete and "Planned" or "Planning"
   elseif interaction.kind == "plan_execution" then
-    verb = complete and "Plan turn complete" or paused and "Plan execution paused" or "Executing plan"
+    local execution_phase = interaction.execution_phase or {}
+    local phase = execution_phase.phase or "implement"
+    local label = ({ implement = "Plan implementation", verify = "Plan verification", resolve = "Plan resolution" })[phase]
+      or "Plan implementation"
+    if phase == "verify" and execution_phase.outcome == "failed" then
+      verb = "Plan verification failed"
+    elseif phase == "verify" and execution_phase.outcome == "blocked" then
+      verb = "Plan verification blocked"
+    elseif execution_phase.outcome then
+      verb = phase == "implement" and "Plan implemented" or label .. " complete"
+    else
+      verb = label .. (complete and " stopped" or paused and " paused" or "")
+    end
   elseif paused then
     verb = "Paused"
   end

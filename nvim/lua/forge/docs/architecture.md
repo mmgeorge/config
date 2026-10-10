@@ -5413,10 +5413,10 @@ exchange while the provider is waiting. Cancellation drops the review channel an
 revision pending for recovery. Approval after interruption starts a new exchange through the existing
 resume path. Acceptance retains its
 anchor at the end of the planning exchange. The first execution exchange starts with
-`Implementation started` and never takes ownership of the acceptance event. Each subsequent
-exchange identifies the phase being started or continued. Completing an exchange without a
-phase result reports a completed implementation, verification, or resolution turn, independently
-of the task's completion gates. Only recorded phase results claim phase completion.
+`Plan implementation started` and never takes ownership of the acceptance event. Each subsequent
+exchange identifies the phase as `Plan implementation`, `Plan verification`, or `Plan resolution`,
+including when it starts, continues, pauses, or resumes. An exchange that ends without a phase
+result reports that phase as stopped. Only recorded phase results claim phase completion.
 
 Health requests use reserved admission and output scheduling independently of the broker
 execution lock. The UI sends at most one outstanding health request per conversation. Ten

@@ -12,7 +12,7 @@ end
 local function snapshot(revision, tool_rows)
   return { document = owner.document, revision = revision, block = {
     { id = "prompt", text = { "Accept plan" }, metadata = metadata() },
-    { id = "summary", text = { "Executing plan" }, metadata = metadata("exchange", "tools", #tool_rows) },
+    { id = "summary", text = { "Plan implementation" }, metadata = metadata("exchange", "tools", #tool_rows) },
     { id = "thought", text = { "Inspecting the workspace" }, metadata = metadata() },
     { id = "tools", text = tool_rows, metadata = metadata("tools", "tools", #tool_rows) },
     { id = "status", text = { "Implementing" }, metadata = metadata() },
@@ -57,7 +57,7 @@ for step = 1, 12 do
   folds.set_open(owner, second_window, "tools", step % 3 == 0)
   tool_rows[#tool_rows] = step % 2 == 0 and "" or ("output " .. step .. " λ")
   patch({ { start_row = 2 + #tool_rows, removed_rows = 1, text = { tool_rows[#tool_rows] } } })
-  patch({ { start_row = 1, removed_rows = 1, text = { "Executing plan " .. step .. "s" } } })
+  patch({ { start_row = 1, removed_rows = 1, text = { "Plan implementation " .. step .. "s" } } })
 end
 
 for _, count in ipairs({ 5, 2, 4, 3 }) do
