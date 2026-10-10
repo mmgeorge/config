@@ -62,6 +62,7 @@ fn apply(
         command.arg("--check");
     }
     command.arg("-");
+    intent.store.writes.command_started(intent.operation());
     progress_command(
         &mut command,
         CommandLimits {

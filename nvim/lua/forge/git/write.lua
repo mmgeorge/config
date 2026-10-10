@@ -3,6 +3,68 @@ local client = require("forge.client")
 local notifications = require("forge.infra.notifications")
 local perf = require("forge.infra.perf")
 
+---@class ForgeWriteTraceState
+---@field watchers integer
+---@field pending boolean
+---@field scheduled boolean
+---@field cursor? integer
+---@field host? string
+---@field final boolean
+---@field warned? boolean
+local trace = { watchers = 0, pending = false, scheduled = false, cursor = nil, host = nil, final = false }
+---@type fun(final?: boolean)
+local poll_trace
+
+poll_trace = function(final)
+  if not perf.enabled("diff") then return end
+  trace.final = trace.final or final == true
+  if trace.pending then return end
+  trace.pending = true
+  trace.final = false
+  local cursor = trace.cursor
+  client.request_host("repository.write", { operation = "trace", after = cursor }, function(result, failure)
+    trace.pending = false
+    if failure or type(result) ~= "table" or type(result.trace) ~= "table" then
+      perf.event("diff", "git.write.trace.unavailable", { status = "failed" })
+      if not trace.warned then
+        trace.warned = true
+        notifications.error("Git diagnostic logging unavailable: " .. tostring(failure or "invalid trace response"))
+      end
+      return
+    end
+    if trace.host and trace.host ~= result.host_id then
+      trace.host, trace.cursor = result.host_id, nil
+      poll_trace(true)
+      return
+    end
+    trace.host = result.host_id
+    local page = result.trace
+    if (page.dropped or 0) > 0 then
+      perf.event("diff", "git.write.trace.dropped", { host_id = trace.host, dropped = page.dropped })
+    end
+    for _, event in ipairs(page.events or {}) do
+      perf.event("diff", "git.write.native." .. event.phase, {
+        host_id = trace.host, native_sequence = event.sequence,
+        operation_id = event.operation_id, operation = event.operation,
+        elapsed_ms = event.elapsed_us / 1000, phase_ms = event.phase_us / 1000,
+        file_count = event.file_count, command_count = event.command_count,
+        blocker_id = event.blocker_id, blocker_operation = event.blocker_operation,
+        blocker_phase = event.blocker_phase,
+      })
+    end
+    trace.cursor = page.sequence
+    local more = #(page.events or {}) == 128
+    trace.final = trace.final or more
+    if (trace.final or trace.watchers > 0) and not trace.scheduled then
+      trace.scheduled = true
+      vim.defer_fn(function()
+        trace.scheduled = false
+        if trace.final or trace.watchers > 0 then poll_trace() end
+      end, trace.final and 25 or 250)
+    end
+  end)
+end
+
 ---@class ForgeGitWriteResult
 ---@field ok boolean
 ---@field code integer
@@ -18,6 +80,8 @@ local perf = require("forge.infra.perf")
 ---@param trace_id? string Correlates preparation and execution with the initiating action.
 ---@return fun()
 function M.execute(workspace, action, callback, progress, trace_id)
+  local tracing = perf.enabled("diff")
+  if tracing then trace.watchers = trace.watchers + 1 poll_trace() end
   local started = perf.now()
   trace_id = trace_id or ("git-write:%s:%s"):format(vim.fn.getpid(), started)
   local submitted
@@ -42,6 +106,7 @@ function M.execute(workspace, action, callback, progress, trace_id)
   local function finish(outcome, failure)
     if settled then return end
     settled = true
+    if tracing then trace.watchers = trace.watchers - 1 poll_trace(true) end
     local diagnostic, code, uncertain = {}, 0, false
     failure = failure or progress_failure
     if not failure and (type(outcome) ~= "table" or type(outcome.target) ~= "table" or #outcome.target == 0) then
@@ -75,6 +140,7 @@ function M.execute(workspace, action, callback, progress, trace_id)
       local acknowledgement_started = perf.now()
       record("acknowledge.start", { operation_id = operation_id })
       client.request_host("repository.write", { operation = "acknowledge", operation_id = operation_id }, function(_, acknowledgement_error)
+        if tracing then poll_trace(true) end
         record("acknowledge.complete", { operation_id = operation_id, ms = perf.elapsed_ms(acknowledgement_started),
           status = acknowledgement_error and "failed" or "ok" })
         if acknowledgement_error then notifications.error("Git receipt acknowledgement failed: " .. acknowledgement_error) end
@@ -91,6 +157,7 @@ function M.execute(workspace, action, callback, progress, trace_id)
     for _, phase in ipairs(vim.fn.sort(vim.tbl_keys(prepared.timing_us or {}))) do
       record("prepare.native." .. phase, { ms = prepared.timing_us[phase] / 1000 })
     end
+    record("prepared", { operation_id = prepared.operation_id })
     intent = prepared.intent
     if cancelled then cancel() finish(nil, "Git write cancelled before submission") return end
     submitted = perf.now()

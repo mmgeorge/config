@@ -1560,6 +1560,17 @@ branch-create action) behind a reader seam so tests never hit the filesystem.
   recovery snapshot, and patch application through refresh completion. These events
   use the bounded asynchronous `forge/diff-perf.log` writer and contain timing and
   identity metadata, never commit messages, paths, or command output.
+  The native mutation coordinator retains the latest 1,024 metadata-only lifecycle
+  records. During a logged Git write, Lua polls `repository.write` with the `trace`
+  operation every 250 ms, with one request in flight and at most 128 records per
+  response. It also drains completion and acknowledgement records. A host identity
+  and monotonic sequence distinguish restarts and report overwritten records.
+  `git.write.native.blocked` identifies the waiting operation and its blocker,
+  including the blocker's operation type and phase. Other native records separate
+  preparation, execution, affected-path settlement, consumer settlement, completion,
+  and acknowledgement. Each carries total age, elapsed time in the preceding phase,
+  selected file count, and actual Git command count. Queue ownership still extends
+  through settlement. Logging never releases or delays that ownership for I/O.
 - **`conventional_commit.lua`** — parses the `type(scope)!:` prefix of a subject into
   colored segments for consistent highlighting across commit rows.
 - **`datetime.lua`** — formats epochs/ISO timestamps into relative ("2 hours ago") or

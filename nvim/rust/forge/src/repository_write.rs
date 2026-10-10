@@ -20,6 +20,9 @@ use serde_json::{Value, json};
 #[derive(Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum WriteRequest {
+    Trace {
+        after: Option<u64>,
+    },
     Prepare {
         workspace: PathBuf,
         action: WriteAction,
@@ -117,6 +120,10 @@ impl RepositoryWriteGateway {
         sink: &MessageSender,
     ) -> Result<Value> {
         match request {
+            WriteRequest::Trace { after } => Ok(json!({
+                "host_id": self.epoch,
+                "trace": self.repository.writes.trace(after),
+            })),
             WriteRequest::Prepare { workspace, action } => {
                 {
                     let state = self.prepared.lock().expect("prepared Git intent lock");
@@ -148,8 +155,9 @@ impl RepositoryWriteGateway {
                 let token = format!("{}:{}", self.epoch, state.sequence);
                 let mut timing = intent.preparation_timing().clone();
                 timing.insert("repository_open", repository_open_us);
+                let operation_id = intent.operation().value();
                 state.intent.insert(token.clone(), intent);
-                Ok(json!({"intent": token, "timing_us": timing}))
+                Ok(json!({"intent": token, "operation_id": operation_id, "timing_us": timing}))
             }
             WriteRequest::Submit { intent } => {
                 let mut intent = self

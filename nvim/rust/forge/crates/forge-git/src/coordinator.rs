@@ -1,11 +1,38 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 use anyhow::{Context, Result, ensure};
 
 use crate::mutation::{MutationScope, OperationCompletion, OperationId};
 
 const MAX_OPERATION_SCOPES: usize = 64;
+const TRACE_CAPACITY: usize = 1024;
+const TRACE_PAGE: usize = 128;
+
+#[derive(Clone, serde::Serialize)]
+/// Metadata-only write lifecycle record. Identities are local to one host coordinator.
+pub struct MutationTrace {
+    sequence: u64,
+    operation_id: u64,
+    operation: &'static str,
+    phase: &'static str,
+    elapsed_us: u64,
+    phase_us: u64,
+    file_count: usize,
+    command_count: usize,
+    blocker_id: Option<u64>,
+    blocker_operation: Option<&'static str>,
+    blocker_phase: Option<&'static str>,
+}
+
+#[derive(serde::Serialize)]
+/// Bounded trace page. `dropped` counts records overwritten before the requested cursor.
+pub struct MutationTracePage {
+    sequence: u64,
+    dropped: u64,
+    events: Vec<MutationTrace>,
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum OperationState {
@@ -27,6 +54,13 @@ struct Operation {
     waiting: bool,
     input_bytes: usize,
     quarantined: bool,
+    admitted: Instant,
+    phase_started: Instant,
+    phase: &'static str,
+    kind: &'static str,
+    file_count: usize,
+    command_count: usize,
+    blocker: Option<OperationId>,
 }
 
 struct CoordinatorState {
@@ -34,6 +68,34 @@ struct CoordinatorState {
     next_id: u64,
     closed: bool,
     input_bytes: usize,
+    trace: VecDeque<MutationTrace>,
+    trace_sequence: u64,
+}
+
+impl CoordinatorState {
+    fn record(&mut self, id: OperationId, phase: &'static str, blocker: Option<OperationId>) {
+        let Some(operation) = self.operations.get(&id) else { return };
+        let now = Instant::now();
+        let blocked_by = blocker.and_then(|blocker| self.operations.get(&blocker));
+        self.trace_sequence = self.trace_sequence.saturating_add(1);
+        let event = MutationTrace {
+            sequence: self.trace_sequence,
+            operation_id: id.value(), operation: operation.kind, phase,
+            elapsed_us: now.duration_since(operation.admitted).as_micros() as u64,
+            phase_us: now.duration_since(operation.phase_started).as_micros() as u64,
+            file_count: operation.file_count, command_count: operation.command_count,
+            blocker_id: blocker.map(OperationId::value),
+            blocker_operation: blocked_by.map(|previous| previous.kind),
+            blocker_phase: blocked_by.map(|previous| previous.phase),
+        };
+        if self.trace.len() == TRACE_CAPACITY { self.trace.pop_front(); }
+        self.trace.push_back(event);
+        if blocker.is_none() {
+            let operation = self.operations.get_mut(&id).expect("recorded operation");
+            operation.phase = phase;
+            operation.phase_started = now;
+        }
+    }
 }
 
 /// Bounds admitted operations and retained receipts while preserving order on intersecting scopes.
@@ -72,6 +134,8 @@ impl MutationCoordinator {
                 next_id: 0,
                 closed: false,
                 input_bytes: 0,
+                trace: VecDeque::new(),
+                trace_sequence: 0,
             })),
             capacity,
             input_capacity,
@@ -113,10 +177,53 @@ impl MutationCoordinator {
                 waiting: false,
                 input_bytes,
                 quarantined: false,
+                admitted: Instant::now(),
+                phase_started: Instant::now(),
+                phase: "admitted",
+                kind: "unknown",
+                file_count: 0,
+                command_count: 0,
+                blocker: None,
             },
         );
         state.input_bytes += input_bytes;
         Ok(id)
+    }
+
+    /// Labels an admitted operation without retaining paths, commands, or message contents.
+    pub fn describe(&self, id: OperationId, kind: &'static str, file_count: usize) {
+        let mut state = self.state.lock().expect("mutation coordinator lock");
+        if let Some(operation) = state.operations.get_mut(&id) {
+            operation.kind = kind;
+            operation.file_count = file_count;
+            state.record(id, "admitted", None);
+        }
+    }
+
+    /// Records a lifecycle boundary without changing admission or queue ownership.
+    pub fn phase(&self, id: OperationId, phase: &'static str) {
+        self.state.lock().expect("mutation coordinator lock").record(id, phase, None);
+    }
+
+    /// Counts a command invocation independently of the number of selected files.
+    pub fn command_started(&self, id: OperationId) {
+        if let Some(operation) = self.state.lock().expect("mutation coordinator lock").operations.get_mut(&id) {
+            operation.command_count += 1;
+        }
+    }
+
+    /// Returns at most 128 records after a host-local cursor without consuming other readers' logs.
+    pub fn trace(&self, after: Option<u64>) -> MutationTracePage {
+        let state = self.state.lock().expect("mutation coordinator lock");
+        let initial = after.is_none();
+        let after = after.unwrap_or_else(|| state.trace_sequence.saturating_sub(TRACE_PAGE as u64));
+        let first = state.trace.front().map_or(state.trace_sequence + 1, |event| event.sequence);
+        let events: Vec<_> = state.trace.iter().filter(|event| event.sequence > after)
+            .take(TRACE_PAGE).cloned().collect();
+        MutationTracePage {
+            sequence: events.last().map_or(after, |event| event.sequence),
+            dropped: if initial { 0 } else { first.saturating_sub(after.saturating_add(1)) }, events,
+        }
     }
 
     pub fn usage(&self) -> AdmissionUsage {
@@ -141,14 +248,23 @@ impl MutationCoordinator {
     /// Waits for earlier writers before capturing disk preconditions without starting this write.
     pub async fn wait_ready(&self, id: OperationId) -> Result<()> {
         let mut changed = self.changed.subscribe();
+        let mut reported = Vec::new();
         loop {
             let blocked = {
-                let state = self.state.lock().expect("mutation coordinator lock");
+                let mut state = self.state.lock().expect("mutation coordinator lock");
                 let operation = state.operations.get(&id).context("unknown queued mutation")?;
                 ensure!(operation.state == OperationState::Queued, "mutation is no longer queued");
                 let earlier: Vec<_> = state.operations.range(..id).filter(|(_, previous)| previous.scopes.iter().any(|scope| operation.scopes.contains(scope))).collect();
                 ensure!(!earlier.iter().any(|(_, previous)| previous.quarantined), "repository writes require read-only reconciliation");
-                earlier.iter().any(|(_, previous)| !matches!(previous.state, OperationState::Finished(_)))
+                let blockers: Vec<_> = earlier.iter().filter(|(_, previous)| !matches!(previous.state, OperationState::Finished(_)))
+                    .map(|(id, _)| **id).collect();
+                for blocker in &blockers {
+                    if !reported.contains(blocker) {
+                        state.record(id, "blocked", Some(*blocker));
+                        reported.push(*blocker);
+                    }
+                }
+                !blockers.is_empty()
             };
             if !blocked { return Ok(()); }
             changed.changed().await.context("mutation coordinator closed during preparation")?;
@@ -209,19 +325,24 @@ impl MutationCoordinator {
             operation.waiting == waiting,
             "mutation has another queue owner"
         );
-        let blocked = state.operations.range(..id).any(|(_, previous)| {
+        let blocker = state.operations.range(..id).find(|(_, previous)| {
             (previous.quarantined || !matches!(previous.state, OperationState::Finished(_)))
                 && previous
                     .scopes
                     .iter()
                     .any(|scope| operation.scopes.contains(scope))
-        });
-        if blocked {
+        }).map(|(id, _)| *id);
+        if let Some(blocker) = blocker {
+            if operation.blocker != Some(blocker) {
+                state.record(id, "blocked", Some(blocker));
+                state.operations.get_mut(&id).expect("known mutation").blocker = Some(blocker);
+            }
             return Ok(None);
         }
         state.operations.get_mut(&id).expect("known mutation").state = OperationState::Running {
             cancellation_requested: false,
         };
+        state.record(id, "running", None);
         Ok(Some(AdmissionGuard {
             state: Arc::clone(&self.state),
             id,
@@ -244,8 +365,10 @@ impl MutationCoordinator {
         let mut state = self.state.lock().expect("mutation coordinator lock");
         let operation = state.operations.get_mut(&id).context("unknown mutation")?;
         request_cancellation(operation);
+        let outcome = operation.state;
+        state.record(id, "cancel_requested", None);
         self.changed.send_replace(());
-        Ok(operation.state)
+        Ok(outcome)
     }
 
     /// Removes only terminal receipts, allowing callers to acknowledge durable adoption explicitly.
@@ -255,6 +378,7 @@ impl MutationCoordinator {
         let OperationState::Finished(completion) = state.operations.get(&id)?.state else {
             return None;
         };
+        state.record(id, "acknowledged", None);
         let operation = state
             .operations
             .remove(&id)
@@ -299,6 +423,7 @@ impl AdmissionGuard {
         let operation = state.operations.get_mut(&self.id).context("unknown running mutation")?;
         operation.state = OperationState::Finished(completion);
         operation.quarantined = true;
+        state.record(self.id, "quarantined", None);
         self.finished = true;
         self.changed.send_replace(());
         Ok(())
@@ -341,6 +466,12 @@ impl AdmissionGuard {
             .get_mut(&self.id)
             .context("unknown running mutation")?
             .state = OperationState::Finished(completion);
+        state.record(self.id, match completion {
+            OperationCompletion::Completed => "completed",
+            OperationCompletion::Failed => "failed",
+            OperationCompletion::CancelledBeforeStart => "cancelled",
+            OperationCompletion::Uncertain => "uncertain",
+        }, None);
         self.finished = true;
         self.changed.send_replace(());
         Ok(())
@@ -353,6 +484,7 @@ impl Drop for AdmissionGuard {
             let mut state = self.state.lock().expect("mutation coordinator lock");
             if let Some(operation) = state.operations.get_mut(&self.id) {
                 operation.state = OperationState::Abandoned;
+                state.record(self.id, "abandoned", None);
                 self.changed.send_replace(());
             }
         }

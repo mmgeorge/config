@@ -38,6 +38,8 @@ local METADATA_FIELD = {
   buffer_api_ms = true, editable_callback_ms = true, editable_callback_count = true,
   slices = true, maximum_ms = true, maximum_prepare_ms = true, maximum_commit_ms = true,
   base_revision = true, received_revision = true, entry_count = true, operation_count = true,
+  host_id = true, native_sequence = true, phase_ms = true, command_count = true,
+  blocker_id = true, blocker_operation = true, blocker_phase = true, dropped = true,
 }
 local writing = { diff = false, harness = false }
 local queue_bytes = { diff = 0, harness = 0 }

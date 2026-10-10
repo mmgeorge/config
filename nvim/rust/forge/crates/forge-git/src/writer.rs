@@ -205,6 +205,7 @@ impl GitWriteService {
     pub fn reserve(&self, repository: Arc<RepositoryState>, action: GitWriteAction) -> Result<GitWriteIntent> {
         action.validate()?;
         let operation = self.store.writes.admit(action.scopes(&repository)?, action.retained_bytes()?)?;
+        self.store.writes.describe(operation, action.trace_kind(), action.paths().len());
         Ok(GitWriteIntent {
             store: Arc::clone(&self.store), repository, action, precondition: None,
             preparation_timing: BTreeMap::new(),
@@ -229,6 +230,7 @@ impl GitWriteService {
             .store
             .writes
             .admit(action.scopes(&repository)?, retained)?;
+        self.store.writes.describe(operation, action.trace_kind(), action.paths().len());
         let reservation = IntentReservation {
             store: Arc::clone(&self.store),
             operation,
@@ -237,8 +239,10 @@ impl GitWriteService {
         let worker = Arc::clone(&repository);
         timing.insert("admission", started.elapsed().as_micros());
         let waiting = Instant::now();
+        self.store.writes.phase(operation, "preparation_wait");
         self.store.writes.wait_ready(operation).await?;
         timing.insert("write_queue", waiting.elapsed().as_micros());
+        self.store.writes.phase(operation, "preparing");
         let dispatching = Instant::now();
         let prepared = self
             .store
@@ -264,6 +268,7 @@ impl GitWriteService {
             )
             .await?
             .value;
+        self.store.writes.phase(operation, "prepared");
         Ok(GitWriteIntent {
             store: Arc::clone(&self.store),
             repository,
@@ -287,6 +292,7 @@ impl GitWriteService {
         let runtime =
             tokio::runtime::Handle::try_current().context("writer requires Tokio runtime")?;
         let operation = intent.reservation.operation;
+        self.store.writes.phase(operation, "execution_wait");
         let (sender, completion) = oneshot::channel();
         let retained_outcome = Arc::clone(&self.outcome);
         intent.reservation.submitted = true;
@@ -496,6 +502,28 @@ impl GitWriteIntent {
 }
 
 impl GitWriteAction {
+    fn trace_kind(&self) -> &'static str {
+        match self {
+            Self::Batch { action } => {
+                let kind = action.first().map(Self::trace_kind).unwrap_or("batch");
+                if action.iter().all(|action| action.trace_kind() == kind) { kind } else { "batch" }
+            }
+            Self::Stage { .. } => "stage",
+            Self::Unstage { .. } => "unstage",
+            Self::Discard { .. } => "discard",
+            Self::Patch { .. } => "patch",
+            Self::DiscardCombined { .. } => "discard_combined",
+            Self::CreateBranch { .. } => "create_branch",
+            Self::Commit { .. } => "commit",
+            Self::CommitWithEditor { amend: true, .. } => "amend",
+            Self::CommitWithEditor { .. } => "commit_editor",
+            Self::UpdateRepositoryConfig { .. } => "repository_config",
+            Self::Push => "push",
+            Self::PublishBranch { .. } => "publish_branch",
+            Self::Pull => "pull",
+        }
+    }
+
     fn bulk_action(&self) -> Option<BulkAction> {
         match self {
             Self::Stage { .. } => Some(BulkAction::Stage),
@@ -736,6 +764,7 @@ impl GitWriteAction {
 }
 
 fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
+    intent.store.writes.phase(intent.operation(), "validating");
     let mut local = intent.repository.repository.to_thread_local();
     let started = Instant::now();
     let interactive = matches!(intent.action, GitWriteAction::CommitWithEditor { .. });
@@ -757,6 +786,7 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
         intent.precondition().validate(&mut local, &intent.repository, &intent.action, &mut check)
     })();
     if let Err(error) = prepared {
+        intent.store.writes.phase(intent.operation(), "rejected_settlement");
         let mut outcome = intent.failure(
             TargetCompletion::Rejected,
             format!("write precondition rejected: {error:#}"),
@@ -780,6 +810,7 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
         settled: None,
         settlement_diagnostic: None,
     };
+    intent.store.writes.phase(intent.operation(), "executing");
     let mut stopped = false;
     let targets = intent.action.targets();
     let mut bulk = intent.action.bulk_action();
@@ -883,6 +914,7 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
             }));
     }
 
+    intent.store.writes.phase(intent.operation(), "settling_paths");
     // Invalidate every possibly changed repository before releasing cooperative writer scopes.
     let invalidated = if intent.action.shared_refs() {
         intent
@@ -904,6 +936,7 @@ fn execute(mut intent: GitWriteIntent, guard: AdmissionGuard) -> WriteOutcome {
         }
     }
     if let Some(handler) = &intent.settlement {
+        intent.store.writes.phase(intent.operation(), "settling_consumer");
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handler(&outcome)));
         let failure = match result {
             Ok(Ok(())) => None,
@@ -1037,6 +1070,7 @@ fn run_path_chunk(
         input.extend_from_slice(path.raw());
         input.push(0);
     }
+    intent.store.writes.command_started(intent.operation());
     progress_command(
         &mut command,
         CommandLimits {
@@ -1200,6 +1234,7 @@ fn run_target(
     } else {
         progress_command
     };
+    intent.store.writes.command_started(intent.operation());
     run(
         &mut command,
         limits,
@@ -1236,6 +1271,7 @@ fn discard_staged_patch(
             command.arg("--check");
         }
         command.arg("-");
+        intent.store.writes.command_started(intent.operation());
         let output = progress_command(
             &mut command,
             CommandLimits {
