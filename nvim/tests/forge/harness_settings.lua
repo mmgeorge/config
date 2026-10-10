@@ -27,6 +27,7 @@ client.request_for = function(session_id, method, params, callback)
     return
   end
   if method == "session.configure" then
+    if params.shell then configured_session.shell = params.shell end
     if params.access then configured_session.access = params.access end
     if params.default_write_permission then configured_session.default_write_permission = params.default_write_permission end
     if params.plan_permission then configured_session.plan_permission = params.plan_permission end
@@ -58,35 +59,46 @@ local success, failure = xpcall(function()
   assert(not text:find("Plan Executor", 1, true) and not text:find("Plan Compact", 1, true), text)
   assert(text:find("Description", 1, true), text)
   assert(not text:find("[←", 1, true), text)
-  assert(instance.spec.page_list[1].option_list[3].label == "Auto-approve plan revisions")
-  local options = instance.spec.page_list[1].option_list
-  assert(options[1].id == "default-write-permission" and options[2].id == "plan-permission")
-  instance.spec.action_list[2].callback({ option = options[1] }, instance)
+  local options = {}
+  for _, option in ipairs(instance.spec.page_list[1].option_list) do options[option.id] = option end
+  local shell = options.shell
+  local executable = vim.fn.executable
+  vim.fn.executable = function(name) return name == "nu" and 0 or executable(name) end
+  instance.spec.action_list[2].callback({ option = shell })
+  assert(configured_session.shell == "system")
+  vim.fn.executable = function(name) return name == "nu" and 1 or executable(name) end
+  instance.spec.action_list[2].callback({ option = shell })
+  assert(configured_session.shell == "nushell")
+  instance.spec.action_list[2].callback({ option = shell })
+  assert(configured_session.shell == "system")
+  vim.fn.executable = executable
+  assert(options["default-write-permission"].id == "default-write-permission" and options["plan-permission"].id == "plan-permission")
+  instance.spec.action_list[2].callback({ option = options["default-write-permission"] }, instance)
   assert(configured_session.default_write_permission == "yolo")
-  instance.spec.action_list[1].callback({ option = options[1] }, instance)
+  instance.spec.action_list[1].callback({ option = options["default-write-permission"] }, instance)
   assert(configured_session.default_write_permission == "write")
-  instance.spec.action_list[2].callback({ option = options[2] }, instance)
+  instance.spec.action_list[2].callback({ option = options["plan-permission"] }, instance)
   assert(configured_session.plan_permission == "read")
-  instance.spec.action_list[1].callback({ option = options[2] })
+  instance.spec.action_list[1].callback({ option = options["plan-permission"] })
   assert(configured_session.plan_permission == vim.NIL)
-  instance.spec.action_list[2].callback({ option = options[3] })
+  instance.spec.action_list[2].callback({ option = options["plan-revisions"] })
   assert(configured_session.plan_auto_approve_revisions == false)
-  instance.spec.action_list[1].callback({ option = options[3] })
+  instance.spec.action_list[1].callback({ option = options["plan-revisions"] })
   assert(configured_session.plan_auto_approve_revisions == true)
-  local sandbox = instance.spec.page_list[1].option_list[4]
-  local scope = instance.spec.page_list[1].option_list[5]
+  local sandbox = options["sandbox"]
+  local scope = options["write-access"]
   instance.spec.action_list[2].callback({ option = sandbox })
   assert(configured_session.access.sandbox == false)
   instance.spec.action_list[2].callback({ option = scope })
   assert(configured_session.access.write_access == "full" and configured_session.access.sandbox == false)
   assert(configured_session.default_write_permission == "write", "access changed approval mode")
-  local logging = instance.spec.page_list[1].option_list[8]
+  local logging = options["logging"]
   instance.spec.action_list[1].callback({ option = logging })
   assert(enabled and require("forge.infra.perf").enabled("harness"))
   instance.spec.action_list[1].callback({ option = logging })
   assert(not enabled and not require("forge.infra.perf").enabled("harness"))
-  assert(#instance.spec.page_list[1].option_list == 9)
-  local provider = instance.spec.page_list[1].option_list[9]
+  assert(#instance.spec.page_list[1].option_list == 10)
+  local provider = options["provider"]
   assert(provider.id == "provider" and provider.columns[2] == "Codex CLI")
   instance.spec.action_list[1].callback({ option = provider })
   assert(not enabled and picker.is_open("harness-config"), "Left opened the provider picker")

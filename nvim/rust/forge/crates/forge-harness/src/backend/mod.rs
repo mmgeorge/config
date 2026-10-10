@@ -798,6 +798,7 @@ impl Backend for MockBackend {
                 revised_metadata.background = "The registry owns published handles used by its callers.".into();
                 revised_metadata.requirements = vec!["Preserve the registry ownership boundary.".into()];
                 revised_metadata.design = "Revise the registry interface while preserving its ownership boundary.".into();
+                revised_metadata.verification=vec!["Confirm the requested interface behaves as designed.".into()];
                 let added = serde_json::to_string_pretty(&revised_metadata)?.lines().map(|line| format!("+{line}\n")).collect::<String>();
                 let patch = patch.replace("*** End Patch", &format!("*** Update File: plan.json\n@@\n{metadata}{added}*** End Patch"));
                 let change = crate::plan::DesignPatchRequest { plan_id:document.plan_id.clone(),expected_version:document.version,patch,title:Some("Design the requested change".into()),source_digests };

@@ -24,8 +24,10 @@ pub struct DesignDocument {
     /// Traces operations between concrete objects independently of Design prose.
     #[serde(default)]
     pub flows: Vec<super::design_flows::DesignFlow>,
-    /// Records the checks required before execution can complete.
-    pub verification: DesignVerification,
+    /// Lists commands Harness executes locally in order before manual verification.
+    pub checks: Vec<String>,
+    /// Lists manual actions and expected results after automated checks pass.
+    pub verification: Vec<String>,
     /// Inventories changed and reused tests by file, independently of source language.
     pub tests: Vec<super::design_tests::DesignTestFile>,
 }
@@ -99,16 +101,16 @@ impl DesignDocument {
                 text: super::design_tests::text(&self.tests),
             },
             DesignSection {
-                path: "verification/automated",
-                title: "Verification/Automated",
+                path: "checks",
+                title: "Checks",
                 section: PlanSection::AutomatedVerification,
-                text: self.verification.automated.clone(),
+                text: self.checks.join("\n"),
             },
             DesignSection {
-                path: "verification/manual",
-                title: "Verification/Manual",
+                path: "verification",
+                title: "Verification",
                 section: PlanSection::ManualVerification,
-                text: self.verification.manual.clone(),
+                text: self.verification.iter().map(|item| format!("- {item}")).collect::<Vec<_>>().join("\n"),
             },
         ]
     }
@@ -117,6 +119,13 @@ impl DesignDocument {
     pub(crate) fn validate(&self) -> Result<()> {
         super::design_flows::validate(&self.flows)?;
         super::design_tests::validate(&self.tests)?;
+        for command in &self.checks {
+            ensure!(!command.trim().is_empty() && !command.contains(['\n', '\r', '\0']),
+                "each check must contain one nonempty command without line breaks");
+        }
+        for action in &self.verification {
+            ensure!(!action.trim().is_empty(), "manual verification actions cannot be empty");
+        }
         ensure!(
             self.requirements.len() <= 256,
             "plan requirements exceeds 256 entries"
@@ -177,16 +186,6 @@ pub struct DesignDecision {
     pub decision: String,
     /// Explains the constraints or tradeoffs that justify the choice.
     pub rationale: String,
-}
-
-#[derive(Clone, Debug, Default, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
-#[serde(deny_unknown_fields)]
-/// Stores executable commands and observable manual checks separately from their results.
-pub struct DesignVerification {
-    /// Contains one executable command per nonblank line, without Markdown wrappers.
-    pub automated: String,
-    /// Contains a Markdown list of actions and expected results.
-    pub manual: String,
 }
 
 /// Associates projected metadata with its canonical edit and navigation identity.

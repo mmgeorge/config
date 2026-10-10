@@ -14,6 +14,7 @@ pub enum WorkflowActivity {
     Planning,
     Revising,
     Implementing,
+    Checking,
     Verifying,
     Resolving,
     Goal,
@@ -27,6 +28,7 @@ impl WorkflowActivity {
             Self::Planning => "Planning",
             Self::Revising => "Revising plan",
             Self::Implementing => "Implementing",
+            Self::Checking => "Checking",
             Self::Verifying => "Verifying",
             Self::Resolving => "Resolving",
         }
@@ -38,6 +40,7 @@ impl WorkflowActivity {
             Self::Working | Self::Goal => "Thought",
             Self::Planning | Self::Revising => "Planned",
             Self::Implementing => "Implemented",
+            Self::Checking => "Checked",
             Self::Verifying => "Verified",
             Self::Resolving => "Resolved",
         }
@@ -50,6 +53,7 @@ impl WorkflowActivity {
             Self::Planning => "Planning",
             Self::Revising => "Plan revision",
             Self::Implementing => "Plan implementation",
+            Self::Checking => "Checks",
             Self::Verifying => "Plan verification",
             Self::Resolving => "Plan resolution",
             Self::Goal => "Goal",
@@ -78,6 +82,7 @@ impl From<PlanPhase> for WorkflowActivity {
     fn from(phase: PlanPhase) -> Self {
         match phase {
             PlanPhase::Implement => Self::Implementing,
+            PlanPhase::Checking => Self::Checking,
             PlanPhase::Verify => Self::Verifying,
             PlanPhase::Resolve => Self::Resolving,
         }

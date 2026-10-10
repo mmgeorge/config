@@ -5419,13 +5419,12 @@ result reports that phase as stopped. Only recorded phase results claim phase co
 
 Activity headings use `Implementing`, `Verifying`, and `Resolving` while a phase runs,
 then `Implemented`, `Verified`, and `Resolved` when its completion is recorded.
-Verification outcomes remain separate from the activity fold. Structured reports contain
-foldable Automated, Manual, and Declarations groups with no spacer rows between them. Each
-command or manual check owns its result summary and evidence links. The overall heading counts
-failed and blocked checks and declaration mismatches rather than selecting an arbitrary finding.
-The broker validates command identities against the accepted plan and tool references against
-completed execution evidence before saving the report on its exchange. Additional findings remain
-in a separate group. Older unstructured reports retain their findings without guessing categories.
+Checking results remain separate from model activity folds. Harness records each accepted command's
+exit status and saves stdout, stderr, and combined output. Fold expansion reads a bounded page from
+that saved file, without provider tool IDs or model-written command summaries. Checking also records
+workspace-wide declaration conformance before manual verification becomes eligible.
+Manual verification exchanges report each accepted action and link completed execution evidence.
+The broker validates manual action identities and evidence references before persisting the report.
 Declaration comparison captures readable accepted-to-observed patches for each changed symbol.
 The Declarations group nests files and symbol diffs using the existing diff projection, folds, and
 intraline highlighting. Captured patches never depend on later workspace contents, and their
@@ -5453,15 +5452,15 @@ automatic queue draining. Queued input retains task identity and is not retarget
 ## Plan implementation and conformance
 
 Implementation cannot be interrupted by declaration reconciliation. Implement writes the accepted
-behavior and tests, permits justified source deviations, and defers builds and checks to Verify.
+behavior and tests, permits justified source deviations, and defers builds and checks to Harness Checking.
 The tool catalog omits plan mutation controls in Implement and Verify. The control runtime and
 broker independently reject those mutations, including calls from stale provider sessions.
 
-Verify compares body-free declaration structure and configuration values against the current
+Checking compares body-free declaration structure and configuration values against the current
 accepted revision. Required declarations, signatures, ownership, and exposed API remain binding.
 Additional internal helpers are permitted. Calls and Accesses are descriptive evidence, never
-completion gates. Verify collects structural and behavioral findings together. Resolve fixes the
-workspace or submits a consolidated contract revision, then returns to Verify. Plan revisions
+completion gates. Checking collects declaration findings and executes accepted commands. Resolve fixes the
+workspace or submits a consolidated contract revision, then returns to Checking. Plan revisions
 retain the existing review-wait protocol and never replace the original accepted baseline.
 
 At completion or a blocked result, the broker records an implementation-differences report against
@@ -5506,3 +5505,14 @@ renderer owns one timer per transcript. Ticks update only the spinner extmark.
 They do not read history, clear other decorations, mutate buffer text, or capture
 or restore a cursor. A committed update, closure, or session replacement stops
 the old timer. New status metadata supplies the next animation policy.
+
+
+## Harness-owned checking gate
+
+Plan metadata separates `checks: string[]` from `verification: string[]`. Checks are exact automated commands. Verification contains manual actions and expected observations. Implement and Resolve produce code without executing validation. Their completion transitions persist Checking before any process starts.
+
+Checking does not admit a provider exchange or report tokens. Harness runs commands sequentially in the workspace, using `/config Shell` (System or installed Nushell), outside the provider sandbox. System resolves PowerShell 7 on Windows and the default shell on macOS. An unavailable selected shell blocks the gate without substitution. Each run captures interpreter, revision, environment digest, source digests, and Git checkpoint content identities. No environment values appear in the transcript.
+
+Each command owns state, timestamps, exit code, separate stdout and stderr files, and a combined output file. Timeline command nodes load saved output incrementally on expansion. Closed nodes retain headings only. Running previews retain at most four lines. Output never depends on provider tool IDs. Process ownership terminates descendants on interruption or host exit. Recovery marks unfinished commands interrupted and leaves the saved phase paused. Resume reuses completed results only when captured identities match and reruns the interrupted command.
+
+Recorded declaration or command failures enter Resolve. Missing prerequisites block Checking with a persisted reason. Source changes during the gate invalidate its result. Passing gates enter manual Verify only when manual actions exist, otherwise complete the plan. Manual defects return to Resolve and manual blockers preserve Verify. Preferences, permissions, prompt history, workspace files, and Git history survive the session format reset. Incompatible session records and their cascading timeline records are removed only after runtime ownership locks can be acquired.

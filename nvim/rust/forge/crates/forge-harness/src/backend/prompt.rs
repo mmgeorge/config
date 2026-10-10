@@ -43,8 +43,14 @@ impl BackendRequest {
         } else {
             "Use harness_question_answer only for an explicit answer to a currently pending question, and harness_question_withdraw only when that decision is no longer needed."
         };
+        let shell = self.control_context.as_ref().map_or(Default::default(), |context|context.check_shell);
+        let interpreter = match shell {
+            crate::session::CheckShell::Nushell => "Nushell",
+            crate::session::CheckShell::System if cfg!(windows) => "PowerShell 7 (pwsh)",
+            crate::session::CheckShell::System => "the system login shell",
+        };
         format!(
-            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\n{question}",
+            "Current Harness interaction\nEffective permission: {}.\nAccess configuration: {}.\nPurpose: {purpose}\nAccepted checks run in {interpreter}. Write exact check commands for that interpreter.\n{question}",
             self.execution_mode.label(), serde_json::to_string(&self.access).expect("access policy serializes")
         )
     }

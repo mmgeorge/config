@@ -228,6 +228,11 @@ function M.open(state, host)
         for index, value in ipairs(values) do if value == selected then position = index end end
         local next_value = values[(position - 1 + (direction or 1)) % #values + 1]
         configure({ [field] = next_value == "keep" and vim.NIL or next_value })
+      elseif id == "shell" then
+        local values = { "system" }
+        if vim.fn.executable("nu") == 1 then values[#values + 1] = "nushell" end
+        local position = active.shell == "nushell" and #values or 1
+        configure({ shell = values[(position - 1 + (direction or 1)) % #values + 1] })
       elseif id == "plan-revisions" then
         configure({ plan_auto_approve_revisions = active.plan_auto_approve_revisions == false })
       elseif id == "logging" then
@@ -250,6 +255,7 @@ function M.open(state, host)
           id = "config", title = "Configuration", subtitle = "CLI: " .. (cli or "Unknown"),
           column_headers = { "Setting", "Value", "Description" },
           option_list = {
+            { id = "shell", label = "Shell", columns = { "Shell", picker_field.render(active.shell == "nushell" and "Nushell" or "System", true), "Accepted checks run locally · Nushell available when installed" } },
             { id = "default-write-permission", label = "Default write permission", columns = { "Default write permission", picker_field.render(active.default_write_permission or "write", true), "Applied to new goals and accepted plans" } },
             { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },

@@ -406,7 +406,7 @@ impl DeclarationDesign {
                 let original = format!("{}\n", serde_json::to_string_pretty(&candidate.document)?);
                 let text = patch_file(&original, body)?;
                 candidate.document = serde_json::from_str(&text)
-                    .context("plan.json requires objective, requirements, background, decisions, design, verification with automated and manual strings, and tests; flows is an array of {title, description, root} objects and usage is optional")?;
+                    .context("plan.json requires objective, requirements, background, decisions, design, checks and manual verification arrays, and tests; flows is an array of {title, description, root} objects and usage is optional")?;
                 continue;
             }
             match kind {
@@ -787,60 +787,36 @@ mod tests {
 
     #[test]
     fn validation_requirements_survive_submission_and_revision_without_running_commands() {
-        let workspace = tempfile::tempdir().unwrap();
-        let store = crate::plan::PlanFileStore::new(workspace.path().join("data"), workspace.path());
-        let mut design = DeclarationDesign::default();
-        design.document.objective = "Verify score resets.".into();
-        design.document.background = "The fixture contains the declarations under review.".into();
-        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
-        design.document.design = "Reset score when a new round starts.".into();
-        let patch = r#"*** Begin Patch
-*** Update File: plan.json
-@@
--    "automated": "",
--    "manual": ""
-+    "automated": "echo test > should-not-exist.txt\nnvim --headless -l tests/score.lua",
-+    "manual": "- Start a new round and confirm the score is zero.\n- Confirm `Score` remains visible after resize."
-*** End Patch"#;
-        let changed = design.patch(workspace.path(), &Default::default(), patch).unwrap();
-        let mut document = crate::plan::document::test_fixture("validation", "Score validation");
-        document.design = Some(changed.clone());
-        store.write_working_document("session", "validation", &document).unwrap();
-        let (_, rendered, _) = store.submit_document_revision("session", "validation", 1, 1).unwrap();
-        let original = store.read_submitted_document("session", "validation", 1).unwrap();
-        assert_eq!(original.design.as_ref().unwrap().document, changed.document);
-        assert!(rendered.markdown.contains(" Verification \n  Automated:\n    echo test > should-not-exist.txt\n    nvim --headless -l tests/score.lua"));
-        assert!(rendered.markdown.contains("  Manual:\n  - Start a new round"));
+        let workspace=tempfile::tempdir().unwrap();
+        let store=crate::plan::PlanFileStore::new(workspace.path().join("data"),workspace.path());
+        let mut design=DeclarationDesign::default();
+        design.document.objective="Verify score resets".into();
+        design.document.background="Existing score fixture".into();
+        design.document.design="Reset score when a round starts".into();
+        design.document.checks=vec!["echo test > should-not-exist.txt".into(),"nvim --headless -l tests/score.lua".into()];
+        design.document.verification=vec!["Start a new round and confirm the score is zero.".into()];
+        let mut document=crate::plan::document::test_fixture("validation","Score validation");
+        document.design=Some(design.clone());
+        store.write_working_document("session","validation",&document).unwrap();
+        let (_,rendered,_)=store.submit_document_revision("session","validation",1,1).unwrap();
+        let original=store.read_submitted_document("session","validation",1).unwrap();
+        assert_eq!(original.design.as_ref().unwrap().document,design.document);
+        assert!(rendered.markdown.contains(" Checks "));
+        assert!(rendered.markdown.contains("echo test > should-not-exist.txt"));
+        assert!(rendered.markdown.contains(" Verification "));
         assert!(!workspace.path().join("should-not-exist.txt").exists());
-        let serialized = changed.read(Some("plan.json"), false).unwrap();
-        let metadata: serde_json::Value = serde_json::from_str(serialized["text"].as_str().unwrap()).unwrap();
-        assert_eq!(metadata["verification"]["automated"], changed.document.verification.automated);
-
-        let revised = changed.patch(workspace.path(), &Default::default(), r#"*** Begin Patch
-*** Update File: plan.json
-@@
--    "automated": "echo test > should-not-exist.txt\nnvim --headless -l tests/score.lua",
-+    "automated": "nvim --headless -l tests/score.lua",
-@@
--    "manual": "- Start a new round and confirm the score is zero.\n- Confirm `Score` remains visible after resize."
-+    "manual": ""
-*** End Patch"#).unwrap();
-        document.version += 1;
-        document.design = Some(revised);
-        store.write_working_document("session", "validation", &document).unwrap();
-        store.submit_document_revision("session", "validation", 2, document.version).unwrap();
-        let current = store.read_submitted_document("session", "validation", 2).unwrap();
-        let delta = crate::plan::revision::DeclarationDelta::between(Some(&original), &current).unwrap();
-        assert!(delta.files.is_empty());
-        assert!(delta.document.contains("a/Verification/Automated b/Verification/Automated"));
+        let mut revised=original.clone();revised.version+=1;
+        revised.design.as_mut().unwrap().document.checks.remove(0);
+        store.write_working_document("session","validation",&revised).unwrap();
+        store.submit_document_revision("session","validation",2,revised.version).unwrap();
+        let current=store.read_submitted_document("session","validation",2).unwrap();
+        let delta=crate::plan::revision::DeclarationDelta::between(Some(&original),&current).unwrap();
+        assert!(delta.document.contains("a/Checks b/Checks"));
         assert!(delta.document.contains("-echo test > should-not-exist.txt"));
-        assert!(delta.document.contains("-- Start a new round and confirm the score is zero."));
-        assert_eq!(store.read_submitted_document("session", "validation", 1).unwrap(), original);
-
-        for invalid in ["\\u0000".to_owned(), "x".repeat(16 * 1024 + 1)] {
-            let patch = format!("*** Begin Patch\n*** Update File: plan.json\n@@\n-    \"automated\": \"\",\n+    \"automated\": \"{invalid}\",\n*** Add File: unwanted.rs\n+pub struct Unwanted;\n*** End Patch");
-            assert!(design.patch(workspace.path(), &Default::default(), &patch).is_err());
-            assert!(design.document.verification.automated.is_empty() && design.proposed.is_empty());
+        assert_eq!(store.read_submitted_document("session","validation",1).unwrap(),original);
+        for invalid in ["line\nline","line\0line",""] {
+            let mut invalid_design=design.clone();invalid_design.document.checks=vec![invalid.into()];
+            assert!(invalid_design.document.validate().is_err());
         }
     }
 
@@ -857,7 +833,7 @@ mod tests {
             "decisions": [{"decision": "Publish at frame boundaries.", "rationale": "Each frame observes one consistent texture selection."}],
             "design": "`Request` retains cancellation state until pending work finishes.",
             "flows": [{"title":"Cancel request", "description":"Cancel before publication and retain the current texture.", "root":{"text":"Request.cancel", "children":[{"text":"TextureStreaming.discard", "via":"cancellation"}]}}],
-            "verification": {"automated": "cargo test --release cancellation", "manual": "- Cancel an upload and confirm the current texture remains visible."},
+            "checks": ["cargo test --release cancellation"], "verification": ["Cancel an upload and confirm the current texture remains visible."],
             "tests": [{"file":"src/request.rs", "cases":[{"name":"tests::cancellation", "change":"new", "description":"Cancel before publication and retain the current texture."}]}]
         });
         let replace = |design: &DeclarationDesign, metadata: &serde_json::Value| {
@@ -879,7 +855,7 @@ mod tests {
         assert!(positions.windows(2).all(|pair| pair[0] < pair[1]));
         assert!(rendered.markdown.contains("app cancel 42\nCancelled request 42"));
         assert!(rendered.markdown.contains("Request.cancel → cancellation → TextureStreaming.discard"));
-        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "flows", "verification/automated", "verification/manual", "tests"] {
+        for path in ["objective", "usage", "requirements", "background", "decisions", "design", "flows", "checks", "verification", "tests"] {
             assert!(rendered.navigation.anchor.iter().any(|anchor| anchor.json_path == format!("/design/document/{path}")));
         }
         for field in ["objective", "background", "design"] {

@@ -57,6 +57,11 @@ pub enum TimelineEntry {
         created_at_ms: i64,
         event: SessionEventRecord,
     },
+    Checks {
+        id: String,
+        created_at_ms: i64,
+        run: crate::plan::checks::CheckRun,
+    },
     Status {
         id: String,
         created_at_ms: i64,
@@ -87,6 +92,7 @@ impl TimelineEntry {
             Self::Exchange { id, .. }
             | Self::AgentLifecycle { id, .. }
             | Self::SessionEvent { id, .. }
+            | Self::Checks { id, .. }
             | Self::Status { id, .. } => id.clone(),
         }
     }
@@ -179,6 +185,7 @@ impl TimelineEntry {
             Self::Exchange { created_at_ms, .. }
             | Self::AgentLifecycle { created_at_ms, .. }
             | Self::SessionEvent { created_at_ms, .. }
+            | Self::Checks { created_at_ms, .. }
             | Self::Status { created_at_ms, .. } => *created_at_ms,
         }
     }
@@ -227,6 +234,7 @@ impl TimelineProjector {
                 }
             }
         }
+        let checks = execution_list.iter().flat_map(|execution| execution.check_runs.clone()).collect::<Vec<_>>();
         planning::attach(&mut interaction_list, plan_list, lifecycle_list, execution_list,
             resolution_list, &deviation_list, &audit_list);
         let mut result = interaction_list.into_iter().map(|exchange| TimelineEntry::Exchange {
@@ -242,6 +250,7 @@ impl TimelineProjector {
                 event,
             });
         }
+        for run in checks { result.push(TimelineEntry::Checks { id:run.id.clone(),created_at_ms:run.started_at_ms,run }); }
         result.sort_by_key(TimelineEntry::created_at_ms);
         Ok(result)
     }

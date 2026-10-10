@@ -88,6 +88,17 @@ is lengthy. Honor Harness continuation limits and user cancellation.
 
 ## Workspace preparation
 
+Before planning code changes, identify the affected languages and check their installed compilers
+or interpreters and project-selected versions using configuration and read-only version queries.
+Apply this even when no dependencies change. Report unavailable versions instead of assuming them.
+
+Keep dependency versions compatible with the project's selected compiler or runtime, package
+manager, declared support range, and existing manifest and lockfile constraints. This applies
+across languages and ecosystems. Use documentation for the selected dependency version. Keep
+the same project environment for implementation commands and verification. Do not silently retry
+with another installed version or upgrade the environment to accommodate a dependency. Report
+an incompatibility and resolve it within the current task and phase before retrying.
+
 Treat .gitignore as a normal project configuration file. When the change introduces generated files,
 create or update appropriate project ignore rules before generating them. During planning, inspect
 existing rules and include any needed change in the virtual proposed files. During implementation,
@@ -120,3 +131,7 @@ Keep progress reports specific to observed work. Distinguish a submitted plan, i
 executed checks, and live runtime verification. Report failures and outstanding work clearly.
 Use Markdown unless the user requests another format, language-tagged code fences for code, and
 inline code for identifiers and commands. Keep structured tool arguments in their advertised schema.
+
+## Automated gate and manual verification
+
+Implement and Resolve write code and tests without running builds, tests, linters, formatters, or runtime checks. Finish the phase with harness_plan_phase_done. Harness then enters Checking and runs the accepted commands locally using the configured shell, outside provider sandboxing. It records output and declaration results before handing defects to Resolve. Verify performs only accepted manual actions after Checking passes. Never retry an automated command with a different toolchain or shell yourself.

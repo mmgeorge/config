@@ -587,7 +587,7 @@ pub struct PlanTask {
 }
 
 pub const PROVISIONAL_PLAN_TITLE: &str = "Planning in progress";
-pub const PLAN_SCHEMA_VERSION: u32 = 8;
+pub const PLAN_SCHEMA_VERSION: u32 = 9;
 
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -732,12 +732,13 @@ impl PlanDocument {
         Ok(serde_json::to_string_pretty(&self.model_value()?)?)
     }
 
-    /// Omit deferred verification instructions from an Implement handoff.
+    /// Omit deferred verification instructions from code-writing handoffs.
     pub(crate) fn execution_json(&self, phase: super::PlanPhase) -> Result<String> {
         let mut value = self.model_value()?;
-        if phase == super::PlanPhase::Implement {
+        if matches!(phase, super::PlanPhase::Implement | super::PlanPhase::Resolve) {
             if let Some(document) = value.get_mut("document").and_then(serde_json::Value::as_object_mut) {
                 document.remove("verification");
+                document.remove("checks");
             }
         }
         Ok(serde_json::to_string_pretty(&value)?)

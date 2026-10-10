@@ -1,4 +1,5 @@
 mod execution;
+mod checks;
 mod fork;
 mod new_session;
 mod replanning;
@@ -645,6 +646,7 @@ impl HarnessBroker {
                             context_window: None,
                             service_tier: preference.as_ref().map(|value| value.service_tier).unwrap_or_default(),
                             access: preference.as_ref().map(|value| value.access.clone()).unwrap_or_default(),
+                            shell: preference.as_ref().map_or(Default::default(), |preference| preference.shell),
                             execution_mode: PermissionMode::Read,
                             current_task_id: None, default_write_permission: preference.as_ref().map_or(PermissionMode::Write, |value| value.default_write_permission), plan_permission: preference.as_ref().and_then(|value| value.plan_permission),
                             created_at_ms: now_ms,
@@ -786,6 +788,7 @@ impl HarnessBroker {
                 .ok()
         });
         Some(crate::control_tools::ControlTurnContext {
+            check_shell: self.session.shell,
             mode,
             planning_feedback: mode == PromptMode::Plan
                 && plan
@@ -5737,7 +5740,7 @@ Planning continuation: turn {} of {}.",
             revision: plan.model_revision, generation: 0, planning_backend_session_id,
             execution_backend_session_id: self.session.backend_session_id.clone(),
             lifecycle: Vec::new(), findings: Vec::new(), progress: Default::default(),
-            verification: Vec::new(), revision_history: Vec::new(), pending_revision_reason: None,
+            verification: Vec::new(), check_runs: Vec::new(), revision_history: Vec::new(), pending_revision_reason: None,
             review_paused: false, observed_source: Default::default(), observed_generation: 0,
             observed_check: Default::default(), created_at_ms: execution_created_at_ms, completed_at_ms: None,
         };
@@ -6254,6 +6257,13 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         goal.resume(self.clock.now_ms());
         self.store.save_goal(&goal)?;
         self.sync_plan_execution(&goal).await?;
+        if self.store.list_plan_execution(&self.session.id)?.iter().any(|record| record.goal_id == goal.id && record.phase == crate::plan::PlanPhase::Checking) {
+            finalization_event.extend(self.run_checks().await?);
+            goal = self.active_goal()?;
+            if goal.state != GoalState::Active {
+                return Ok((json!({"goal": goal}), finalization_event));
+            }
+        }
         let plan_prompt =
             self.plan_goal_prompt(&goal, PlanExecutionPromptKind::ResumeAfterInterruption)?;
         let mode = if plan_prompt.is_some() {
@@ -6354,6 +6364,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     async fn continue_goal(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         let goal = self.active_goal()?;
         anyhow::ensure!(goal.state == GoalState::Active, "goal is not active");
+        let mut check_events = Vec::new();
+        if self.store.list_plan_execution(&self.session.id)?.iter().any(|record| record.goal_id == goal.id && record.phase == crate::plan::PlanPhase::Checking) {
+            check_events = self.run_checks().await?;
+            if self.active_goal()?.state != GoalState::Active { return Ok((json!({"checks_finished":true}),check_events)); }
+        }
+        let goal = self.active_goal()?;
         let plan_prompt = self.plan_goal_prompt(&goal, PlanExecutionPromptKind::Continue)?;
         let mode = if plan_prompt.is_some() {
             PromptMode::ExecutePlan
@@ -6389,7 +6405,9 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         {
             self.capture_final_checkpoint(&mut previous, ExchangeState::Complete).await?;
         }
-        self.run_interaction(prompt, mode, Some(admission)).await
+        let (result, mut events) = self.run_interaction(prompt, mode, Some(admission)).await?;
+        check_events.append(&mut events);
+        Ok((result,check_events))
     }
 
     async fn apply_goal_evidence(
@@ -6957,6 +6975,10 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             anyhow::ensure!(self.session.backend == "codex" || self.session.backend == "mock",
                 "current backend does not support sandbox configuration");
         }
+        if let Some(value) = params.get("shell") {
+            configured.shell = serde_json::from_value(value.clone())?;
+            configured.shell.executable()?;
+        }
         if let Some(value) = params.get("default_write_permission") {
             let permission: PermissionMode = serde_json::from_value(value.clone())?;
             anyhow::ensure!(permission.is_write_default(), "default write permission must be Write or YOLO");
@@ -7399,6 +7421,7 @@ fn preference_for_session(
     );
     HarnessPreference {
         access: session.access.clone(),
+        shell: session.shell,
 
         default_write_permission: session.default_write_permission,
         plan_permission: session.plan_permission,
@@ -7621,6 +7644,160 @@ mod test {
 
     use super::*;
 
+    #[cfg(windows)]
+    fn check_fixture(repository: &Path, data: &Path, commands: Vec<String>, manual: bool) -> HarnessBroker {
+        let mut broker=planning_question_broker(repository,data,false);
+        let mut document=crate::plan::test_fixture("check-plan","Check fixture");
+        let mut design=crate::plan::DeclarationDesign::default();
+        design.document.objective="Check accepted commands".into();
+        design.document.background="A repository fixture".into();
+        design.document.design="Harness owns the command gate".into();
+        design.document.checks=commands;
+        design.document.verification=if manual { vec!["Observe manual result".into()] } else { Vec::new() };
+        design.proposed.insert(".gitignore".into(),"/target/\n".into());
+        document.design=Some(design);
+        broker.plan_file.write_working_document(&broker.session.id,"check-plan",&document).unwrap();
+        broker.plan_file.submit_document_revision(&broker.session.id,"check-plan",1,1).unwrap();
+        std::fs::write(repository.join(".gitignore"),"/target/\n").unwrap();
+        let goal=GoalRecord { id:"check-goal".into(),session_id:broker.session.id.clone(),objective:"Run checks".into(),
+            state:GoalState::Active,continuation:Default::default(),native:false,created_at_ms:1,updated_at_ms:1 };
+        broker.store.save_goal(&goal).unwrap();
+        broker.session.goal_id=Some(goal.id.clone());
+        broker.save_session().unwrap();
+        let execution:PlanExecutionRecord=serde_json::from_value(json!({
+            "id":"check-execution","session_id":broker.session.id,"plan_id":"check-plan","goal_id":goal.id,
+            "state":"active","phase":"checking","original_revision":1,"revision":1,"generation":0,
+            "lifecycle":[],"findings":[],"progress":crate::plan::execution::SemanticProgress::default(),
+            "verification":[],"check_runs":[],"revision_history":[],"review_paused":false,
+            "observed_source":{},"observed_generation":0,"observed_check":[],"created_at_ms":1
+        })).unwrap();
+        broker.store.save_plan_execution(&execution).unwrap();
+        broker
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn harness_checks_own_exit_codes_output_and_manual_gate_without_model_turns() {
+        let repository=repository(); let data=tempfile::tempdir().unwrap();
+        let mut broker=check_fixture(repository.path(),data.path(),vec![
+            "Write-Output 'accepted stdout'; [Console]::Error.WriteLine('accepted stderr')".into(),"exit 7".into(),"Write-Output 'last check'".into()
+        ],true);
+        broker.run_checks().await.unwrap();
+        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
+        assert_eq!(execution.phase,crate::plan::PlanPhase::Resolve);
+        let run=&execution.check_runs[0];
+        assert_eq!(run.commands[1].exit_code,Some(7));
+        assert_eq!(run.commands[2].state,crate::plan::checks::CheckState::Passed);
+        assert!(std::fs::read_to_string(&run.commands[0].stdout).unwrap().contains("accepted stdout"));
+        assert!(std::fs::read_to_string(&run.commands[0].stderr).unwrap().contains("accepted stderr"));
+        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+        assert!(execution.verification.is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn harness_checks_reject_unplanned_public_api_without_manual_verification() {
+        let repository=repository(); let data=tempfile::tempdir().unwrap();
+        let mut broker=check_fixture(repository.path(),data.path(),Vec::new(),false);
+        let baseline=crate::checkpoint::GitCheckpoint::new(&broker.session.workspace)
+            .capture(&broker.store.objects,&broker.repositories,&broker.session.id,1).await.unwrap();
+        broker.store.save_checkpoint(&baseline).unwrap();
+        let mut execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
+        execution.baseline_checkpoint=Some(baseline.id.clone());
+        broker.store.save_plan_execution(&execution).unwrap();
+        std::fs::write(repository.path().join("extra.rs"),"pub fn unplanned() {}\n").unwrap();
+        broker.run_checks().await.unwrap();
+        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
+        assert_eq!(execution.phase,crate::plan::PlanPhase::Resolve);
+        assert!(!execution.check_runs[0].progress.different.is_empty());
+        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn harness_checks_pass_before_manual_verification() {
+        let repository=repository(); let data=tempfile::tempdir().unwrap();
+        let mut broker=check_fixture(repository.path(),data.path(),vec!["Write-Output 'passed'".into()],true);
+        broker.run_checks().await.unwrap();
+        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
+        assert_eq!(execution.phase,crate::plan::PlanPhase::Verify);
+        assert_eq!(execution.check_runs[0].state,crate::plan::checks::CheckState::Passed);
+        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn detached_check_recovery_retains_saved_output_and_pauses_the_gate() {
+        let repository=repository(); let data=tempfile::tempdir().unwrap();
+        let mut broker=check_fixture(repository.path(),data.path(),vec!["Write-Output retained".into()],true);
+        broker.run_checks().await.unwrap();
+        let mut execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
+        execution.phase=crate::plan::PlanPhase::Checking;
+        let run=&mut execution.check_runs[0];
+        run.state=crate::plan::checks::CheckState::Running;
+        run.commands[0].state=crate::plan::checks::CheckState::Running;
+        run.commands[0].output_bytes=0;
+        let output=run.commands[0].output.clone();
+        broker.store.save_plan_execution(&execution).unwrap();
+        broker.store.interrupt_detached_execution(&broker.session.id).unwrap();
+        let recovered=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
+        assert_eq!(recovered.state,PlanExecutionState::Paused);
+        assert_eq!(recovered.phase,crate::plan::PlanPhase::Checking);
+        assert_eq!(recovered.check_runs[0].state,crate::plan::checks::CheckState::Interrupted);
+        assert_eq!(recovered.check_runs[0].commands[0].state,crate::plan::checks::CheckState::Interrupted);
+        assert_eq!(recovered.check_runs[0].commands[0].output_bytes,std::fs::metadata(&output).unwrap().len());
+        assert!(std::fs::read_to_string(output).unwrap().contains("retained"));
+        assert_eq!(broker.active_goal().unwrap().state,GoalState::Paused);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn harness_checks_complete_without_a_manual_exchange_when_no_actions_apply() {
+        let repository=repository(); let data=tempfile::tempdir().unwrap();
+        let mut broker=check_fixture(repository.path(),data.path(),vec!["Write-Output complete".into()],false);
+        broker.run_checks().await.unwrap();
+        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
+        assert_eq!(execution.state,PlanExecutionState::Complete);
+        assert_eq!(broker.active_goal().unwrap().state,GoalState::Complete);
+        assert!(execution.check_runs[0].completed_plan.is_some());
+        assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn harness_check_cancellation_preserves_results_and_resumes_interrupted_command() {
+        for changed in [false,true] {
+        let repository=repository(); let data=tempfile::tempdir().unwrap();
+        let mut broker=check_fixture(repository.path(),data.path(),vec!["New-Item target -ItemType Directory -Force | Out-Null; Add-Content target/completed.txt first".into(),
+            "Set-Content target/started.txt started; if (-not (Test-Path target/resume.txt)) { Start-Sleep 30 }; Write-Output resumed".into()],true);
+        let cancellation=broker.turn_cancellation();
+        let marker=repository.path().join("target/started.txt");
+        let cancel=tokio::spawn(async move {
+            tokio::time::timeout(std::time::Duration::from_secs(10),async {
+                while !marker.is_file() { tokio::time::sleep(std::time::Duration::from_millis(10)).await; }
+            }).await.unwrap();
+            cancellation.request(false);
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(15),broker.run_checks()).await.unwrap().unwrap();
+        cancel.await.unwrap();
+        let mut execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
+        assert_eq!(execution.state,PlanExecutionState::Paused);
+        assert_eq!(execution.check_runs[0].commands[1].state,crate::plan::checks::CheckState::Interrupted);
+        // Reuse is intentionally rejected when user changes workspace contents.
+        std::fs::write(repository.path().join("target/resume.txt"),"resume").unwrap();
+        if changed { std::fs::write(repository.path().join("extra.rs"),"fn helper() {}\n").unwrap(); }
+        broker.turn_cancellation.arm(false);
+        execution.state=PlanExecutionState::Active;
+        broker.store.save_plan_execution(&execution).unwrap();
+        let mut goal=broker.active_goal().unwrap(); goal.resume(100);broker.store.save_goal(&goal).unwrap();
+        broker.run_checks().await.unwrap();
+        let execution=broker.store.load_plan_execution("check-execution").unwrap().unwrap();
+        assert_eq!(execution.phase,crate::plan::PlanPhase::Verify);
+        assert_eq!(execution.check_runs.len(),if changed {2} else {1});
+        assert_eq!(std::fs::read_to_string(repository.path().join("target/completed.txt")).unwrap().lines().count(),if changed {2} else {1});
+        }
+    }
+
     #[tokio::test]
     async fn deleting_selected_plan_tests_preserves_other_cases_and_rejects_stale_confirmation() {
         let repository = repository();
@@ -7730,7 +7907,7 @@ mod test {
         assert!(source.rendered.markdown.contains("reviewed_change"));
         let overview = &source.document.design.as_ref().unwrap().document;
         for (path, expected) in [("Objective", &overview.objective), ("Design", &overview.design),
-            ("Verification/Automated", &overview.verification.automated), ("Verification/Manual", &overview.verification.manual)] {
+            ("Checks", &overview.checks.join("\n")), ("Verification", &overview.verification.iter().map(|action|format!("- {action}")).collect::<Vec<_>>().join("\n"))] {
             let (snapshot, _) = broker.read_plan_declaration(json!({"plan_id":revised.id,
                 "revision":2,"document":true,"path":path})).unwrap();
             assert_eq!(snapshot["text"].as_str().unwrap(), expected);
@@ -7756,10 +7933,10 @@ mod test {
             .into_iter().find(|event| event.kind == PlanLifecycleKind::Accepted).unwrap();
         assert_ne!(acceptance.anchor.as_ref().unwrap().exchange_id, planning_exchange_id);
         assert_eq!(snapshot.active_plan.unwrap().state, PlanState::Accepted);
-        assert_eq!(snapshot.goal_execution.as_ref().unwrap().phase, crate::plan::PlanPhase::Verify);
+        assert_eq!(snapshot.goal_execution.as_ref().unwrap().phase, crate::plan::PlanPhase::Checking);
         let execution_id = snapshot.goal_execution.unwrap().id;
         broker.pause_goal().await.unwrap();
-        assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Verify);
+        assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Checking);
         let mut resumed = InitializeRequest {
             data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
             workspace:repository.path().to_string_lossy().into_owned(), client_id:"design-test".into(),
@@ -7812,7 +7989,7 @@ mod test {
         assert_eq!(exchanges.iter().map(|exchange| exchange.usage().output).collect::<Vec<_>>(),
             vec![Some(20), Some(21), Some(22), Some(23)]);
         assert_eq!(exchanges.iter().map(|exchange| exchange.turn.iter().flat_map(|turn| turn.tools())
-            .filter(|tool| tool.title == "cargo test").count()).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
+            .filter(|tool| tool.title == "Observe fixture").count()).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
         assert_eq!(exchanges[0].lifecycle.as_deref(), Some("Plan implementation started"));
         assert_eq!(exchanges[3].lifecycle.as_deref(), Some("Plan verification started"));
         let snapshot = broker.snapshot().unwrap();
@@ -7835,7 +8012,7 @@ mod test {
         assert!(text.contains(&failed_phase.findings[0]));
         let passed_phase = exchanges[3].execution_phase.as_ref().unwrap();
         assert!(passed_phase.findings.is_empty());
-        assert!(passed_phase.summary.as_ref().is_some_and(|summary| text.contains(summary)));
+        assert!(passed_phase.summary.as_ref().is_some_and(|summary| !summary.is_empty()));
         assert_eq!(text.matches("Plan accepted:").count(), 1);
         assert!(!text.contains("Accept plan:") && !text.contains("Execution started") && !text.contains("Plan turn complete"));
         let review = broker.capture_plan_review(&revised.id, revised.review_digest.as_deref().unwrap()).unwrap();
@@ -8181,7 +8358,7 @@ mod test {
             let context = request.control_context.clone().context("missing control context")?;
             let document = context.plan_document.clone().unwrap();
             let handoff: Value = serde_json::from_str(&document.execution_json(context.execution.as_ref().unwrap().phase)?).unwrap();
-            if turn == 0 {
+            if turn == 0 || turn == 2 {
                 assert!(handoff["document"].get("verification").is_none());
                 assert!(handoff["document"].get("tests").is_some());
             } else {
@@ -8204,10 +8381,10 @@ mod test {
                 let id = format!("check-{turn}");
                 sink.as_ref().unwrap().send_wait(BackendEvent {
             received_at_ms: None, address:Some(address.clone()), turn_boundary:None, kind:"tool".into(), text:None, data:Value::Null,
-                    activity:Some(crate::backend::ToolActivity { id:id.clone(), kind:crate::backend::ToolActivityKind::Command, title:"cargo test".into(), output:Some(if turn == 1 { "round reset failed" } else { "all checks passed" }.into()), status:Some("completed".into()), change:Default::default(), output_delta:false }), summary:None, task_update:None }).await?;
-                let checks = document.design.as_ref().unwrap().document.verification.automated.lines()
+                    activity:Some(crate::backend::ToolActivity { id:id.clone(), kind:crate::backend::ToolActivityKind::Command, title:"Observe fixture".into(), output:Some(if turn == 1 { "round reset failed" } else { "all checks passed" }.into()), status:Some("completed".into()), change:Default::default(), output_delta:false }), summary:None, task_update:None }).await?;
+                let checks = document.design.as_ref().unwrap().document.verification.iter().map(String::as_str)
                     .map(str::trim).filter(|line| !line.is_empty()).map(|command| json!({
-                        "category":"automated", "label":command,
+                        "category":"manual", "label":command,
                         "outcome":if turn == 1 { "failed" } else { "passed" },
                         "summary":if turn == 1 { "Round reset retains score" } else { "All checks passed" },
                         "evidence":[id]
@@ -8221,7 +8398,7 @@ mod test {
                 let inspection: Value = serde_json::from_str(&read.message).unwrap();
                 let available = inspection["execution"]["verification_evidence"].as_array().unwrap();
                 let reference = available.iter().find(|evidence| evidence["id"] == format!("check-{turn}")).unwrap();
-                assert_eq!(reference["title"], "cargo test");
+                assert_eq!(reference["title"], "Observe fixture");
                 assert_eq!(inspection["execution"]["phase"], "verify");
                 let mut invalid = arguments.clone();
                 invalid["verification"]["evidence"] = json!(["unobserved-check"]);
@@ -9203,7 +9380,7 @@ mod test {
         assert_eq!(revised.document_version, before.document_version + 1);
         let exchange = snapshot.exchange.last().unwrap();
         assert_ne!(exchange.id, interaction.id);
-        assert_eq!(exchange.lifecycle.as_deref(), Some("Planning resumed"));
+        assert_eq!(exchange.lifecycle.as_deref(), Some("Plan revision continued"));
         assert_eq!(exchange.kind, ExchangeKind::PlanRevision);
         assert_eq!(exchange.state, ExchangeState::Complete);
         assert!(!exchange.awaiting_input);
@@ -9904,6 +10081,7 @@ mod test {
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: Default::default(),
+            shell: Default::default(),
             execution_mode: PermissionMode::Read,
             current_task_id: None, default_write_permission: PermissionMode::Write, plan_permission: None,
             created_at_ms: 0,
@@ -9932,6 +10110,7 @@ mod test {
             &session,
             Some(HarnessPreference {
                 access: Default::default(),
+                shell: Default::default(),
                 default_write_permission: PermissionMode::Write,
                 plan_permission: None,
                 model: "other-model".into(),
@@ -10505,7 +10684,7 @@ mod test {
             .unwrap();
         assert_eq!(
             summary.text.wire_rows().join("").split_whitespace().collect::<Vec<_>>().join(" "),
-            "● Thought 1s │ ~200 tok/s │ I 1.0k (90%) · R 100 · O 100 │ 1 req"
+            "● Thought 1s │ Tokens 1.0k (90%) -> 200 · 200 tps"
         );
     }
 

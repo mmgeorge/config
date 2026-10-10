@@ -10,6 +10,11 @@ modify project files.
 
 1. Inspect the request and affected source. Read implementation source to understand behavior,
    constraints, and ownership. Reuse existing interfaces unless the change requires a new boundary.
+   For every code-change plan, identify the affected languages and inspect their installed
+   compilers or interpreters and project-selected versions. Read version configuration and use
+   read-only version queries from the project directory. Base syntax, API, and dependency choices
+   on those observed versions, even when no dependencies change. Report a missing or unresolved
+   toolchain instead of assuming a version.
 2. Use the supplied plan identity, version, and feedback context. Call `harness_plan_read` when
    current text, version, or additional context is needed. Omit `path` for the inventory. Supply
    `path` and optional 1-based inclusive `start_line` and `end_line` for the affected range.
@@ -23,7 +28,7 @@ modify project files.
 4. Design complete declaration files and required configuration changes. Preserve unchanged declarations, private members, complete
    types, generics, visibility, documentation, and associations. Add only useful requested work.
    Give every declaration in each source overview you author or revise an attached explanatory code comment.
-   Record objective, requirements, background, decisions, design, flows, verification, and tests in virtual `plan.json`. Add usage examples only when useful.
+   Record objective, requirements, background, decisions, design, flows, checks, verification, and tests in virtual `plan.json`. Add usage examples only when useful.
    Do not author JSON entities, tasks, stages, prerequisites, or execution reports.
 5. Edit with `harness_design_apply_patch`, supplying `plan_id`, `expected_version`, and `patch`.
    An optional `title` names the design. Multiple files and chunks can change atomically. Use the
@@ -38,14 +43,27 @@ modify project files.
 
 ## Dependency selection
 
-For new projects, use the latest stable dependency version unless an explicit user requirement
-or verified compatibility constraint requires an older release. Record the concrete constraint
-when selecting an older release. Documentation retrieval failures alone do not justify downgrading.
+Inspect the project's selected compiler or runtime, package manager, declared support range,
+manifest constraints, and lockfile before choosing dependencies. Resolve the versions actually
+selected in the project directory. For example, check Rust toolchain files and rust-version,
+Node version files and package.json engines/packageManager, or Python requires-python and the
+project environment. Choose the newest stable release compatible with those constraints and
+the required features, including relevant peer and transitive dependency requirements.
+
+Another installed version does not change the project's compatibility target. Do not switch
+or upgrade compilers, runtimes, or package managers merely to use a newer dependency. If no
+compatible release meets the task, report the conflict and make any required environment change
+an explicit design decision.
+
+Use API documentation for the selected dependency version when designing declarations and
+examples. Record material compatibility constraints in Background. Documentation retrieval
+failures alone do not justify downgrading. Planning selects and proposes dependencies but does
+not install them or run compilation checks.
 
 ## Plan metadata
 
 Harness creates a virtual `plan.json` containing `objective`, optional `usage`, `requirements`,
-`background`, `decisions`, `design`, `flows`, `verification`, and `tests`. It is plan metadata, never a project file
+`background`, `decisions`, `design`, `flows`, `checks`, `verification`, and `tests`. It is plan metadata, never a project file
 or declaration overview. Read and update it through the same tools as declaration files. Do not
 move it, delete it, or add other fields. Drafts start with empty strings and lists, with `usage` absent.
 
@@ -470,10 +488,8 @@ A plan's metadata can use this shape:
       }
     }
   ],
-  "verification": {
-    "automated": "cargo test --release texture_replacement",
-    "manual": "- Cancel a pending replacement and confirm the current texture remains visible.\n- Replace a texture with frames in flight and confirm rendering remains valid."
-  },
+  "checks": ["cargo test --release texture_replacement"],
+  "verification": ["Cancel a pending replacement and confirm the current texture remains visible.", "Replace a texture with frames in flight and confirm rendering remains valid."],
   "tests": [
     {
       "file": "src/texture.rs",
@@ -508,21 +524,13 @@ and declaration edits can share one atomic patch:
 *** End Patch
 ```
 
-### Verification
+### Checks and verification
 
-Record the checks needed to demonstrate the requirements in `verification`, an object containing
-`automated` and `manual` strings. Write `automated` as newline-separated executable commands,
-one command per nonblank line. Use exact commands supported by the inspected project, in the order
-they should run from the project workspace. Include a directory change when another working
-directory is required. Do not add bullets, numbering, Markdown fences, prose, or multiline shell
-scripts to this field. Encode line breaks as `\n` inside the JSON string.
+Record automated checks in `checks`, an array of exact single-line executable commands in execution order. Use commands compatible with the inspected project and installed toolchain. Each command runs from the project workspace using the configured System or Nushell interpreter. Include a directory change inside a command only when needed. Leave the array empty when no automated checks apply.
 
-Write `manual` as a Markdown list of actions and expected results. Identify checks that require a
-person or unavailable hardware. These are requirements, not completed results. Leave either string
-empty when no checks of that kind apply. Planning records commands without running implementation
-verification. During execution, Verify runs the automated commands and performs or reports blockers
-for manual checks before completion. Execution state, milestones, progress, and results remain
-Harness-owned and must not be added to `plan.json`.
+Harness executes these commands locally, outside the model provider sandbox, after Implement and Resolve. Harness records exit status, duration, and saved stdout/stderr and checks declaration conformance. The model must not execute automated checks during Implement, Resolve, or manual Verify.
+
+Record manual actions in `verification`, an array of actions and expected observations. Identify actions requiring a person or unavailable hardware. Manual Verify starts only after declarations and automated checks pass. Planning records requirements, not results. Execution state and results remain Harness-owned.
 
 ## Overview syntax
 

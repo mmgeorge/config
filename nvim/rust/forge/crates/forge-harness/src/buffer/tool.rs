@@ -1,5 +1,5 @@
 use std::fs::{File, OpenOptions};
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, OnceLock};
@@ -29,6 +29,7 @@ pub struct ToolOutputBatch {
 
 pub struct ToolOutputView {
     call_id: String,
+    file: Option<(PathBuf, u64, u64)>,
     saved: Arc<String>,
     parsed: OnceLock<std::result::Result<ParsedOutput, String>>,
     heading: Option<crate::turn::ToolCall>,
@@ -124,6 +125,34 @@ impl Write for OutputCollector {
 }
 
 impl ToolOutputView {
+    pub(super) fn file(call_id: String, path: PathBuf, bytes: u64) -> Result<Self> {
+        let mut source = Self::new(call_id, "")?;
+        source.file = Some((path, bytes, 0));
+        Ok(source)
+    }
+
+    pub(super) fn has_unloaded_output(&self) -> bool {
+        self.file.as_ref().is_some_and(|(_, total, loaded)| loaded < total)
+    }
+
+    pub(super) fn load_prefix(&mut self, limit: usize) -> Result<()> {
+        let Some((path, total, loaded)) = self.file.clone() else { return Ok(()); };
+        let end = total.min(limit as u64);
+        if end <= loaded { return Ok(()); }
+        let mut file = File::open(&path).with_context(|| format!("open check output {}", path.display()))?;
+        file.seek(SeekFrom::Start(loaded))?;
+        let mut bytes = Vec::new();
+        file.take(end - loaded).read_to_end(&mut bytes)?;
+        let length = match std::str::from_utf8(&bytes) {
+            Ok(_) => bytes.len(),
+            Err(error) if error.error_len().is_none() && end < total => error.valid_up_to(),
+            Err(_) => bytes.len(),
+        };
+        self.append(&String::from_utf8_lossy(&bytes[..length]))?;
+        self.file = Some((path,total,loaded + length as u64));
+        Ok(())
+    }
+
     fn parsed(&self) -> Result<&ParsedOutput> {
         self.parsed.get_or_init(|| ParsedOutput::new(&self.saved).map_err(|error| format!("{error:#}")))
             .as_ref().map_err(|error| anyhow::anyhow!(error.clone()))
@@ -159,7 +188,10 @@ impl ToolOutputView {
 
     /// Keeps the parser and saved bytes while adopting newly projected heading ownership.
     pub(super) fn retain(&mut self, replacement: &Self) -> bool {
-        if self.saved != replacement.saved { return false; }
+        if let (Some((path,total,_)), Some((next_path,next_total,_))) = (&mut self.file,&replacement.file) {
+            if path != next_path || next_total < total { return false; }
+            *total = *next_total;
+        } else if self.saved != replacement.saved || self.file.is_some() != replacement.file.is_some() { return false; }
         self.heading = replacement.heading.clone();
         self.owner.clone_from(&replacement.owner);
         self.group.clone_from(&replacement.group);
@@ -203,7 +235,7 @@ impl ToolOutputView {
     pub fn new(call_id: String, saved: &str) -> Result<Self> {
         ensure!(!call_id.is_empty() && call_id.len() <= 256, "invalid tool call identity");
         Ok(Self {
-            call_id, saved: Arc::new(saved.to_owned()), parsed: OnceLock::new(),
+            call_id, file: None, saved: Arc::new(saved.to_owned()), parsed: OnceLock::new(),
             heading: None, owner: String::new(), group: String::new(),
         })
     }
@@ -362,6 +394,27 @@ impl Drop for OwnedToolExport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_output_loads_only_requested_prefix_and_retains_unicode_boundaries() -> Result<()> {
+        let directory=tempfile::tempdir()?;
+        let path=directory.path().join("check.output");
+        let saved="αβγ output\n".repeat(20_000);
+        std::fs::write(&path,&saved)?;
+        let mut source=ToolOutputView::file("check".into(),path,saved.len() as u64)?;
+        assert!(source.saved.is_empty());
+        assert!(source.has_unloaded_output());
+        source.load_prefix(1024)?;
+        assert!(source.saved.len()<=1024);
+        assert!(saved.starts_with(source.saved.as_str()));
+        source.load_prefix(2048)?;
+        assert!(source.saved.len()<=2048);
+        assert!(saved.starts_with(source.saved.as_str()));
+        source.load_prefix(saved.len())?;
+        assert_eq!(source.saved.as_str(),saved);
+        assert!(!source.has_unloaded_output());
+        Ok(())
+    }
 
     #[test]
     fn oversized_line_is_abbreviated_in_a_batch_without_losing_saved_output() -> Result<()> {

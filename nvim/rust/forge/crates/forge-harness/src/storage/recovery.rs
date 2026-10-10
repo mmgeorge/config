@@ -64,6 +64,27 @@ impl SqliteStore {
                 )?;
             }
         }
+        let executions = {
+            let mut statement=transaction.prepare("SELECT payload FROM plan_execution_record WHERE session_id=?1")?;
+            statement.query_map([session_id], |row| row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for payload in executions {
+            let mut execution:crate::plan::PlanExecutionRecord=serde_json::from_str(&payload)?;
+            let mut changed=false;
+            for run in &mut execution.check_runs {
+                if run.state == crate::plan::checks::CheckState::Running {
+                    run.state=crate::plan::checks::CheckState::Interrupted;
+                    for command in &mut run.commands {
+                        if command.state == crate::plan::checks::CheckState::Running {
+                            command.state=crate::plan::checks::CheckState::Interrupted;
+                            command.output_bytes=std::fs::metadata(&command.output).map_or(0,|metadata|metadata.len());
+                        }
+                    }
+                    changed=true;
+                }
+            }
+            if changed { transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.check_runs',json(?2)) WHERE id=?1", params![execution.id,serde_json::to_string(&execution.check_runs)?])?; }
+        }
         transaction.execute("UPDATE goal_record SET payload=json_set(payload,'$.state','paused') WHERE session_id=?1 AND json_extract(payload,'$.state')='active'", [session_id])?;
         transaction.execute("UPDATE plan_execution_record SET payload=json_set(payload,'$.state','paused','$.generation',json_extract(payload,'$.generation')+1) WHERE session_id=?1 AND json_extract(payload,'$.state')='active'", [session_id])?;
         let tasks = {

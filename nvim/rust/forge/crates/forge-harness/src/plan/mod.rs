@@ -45,6 +45,7 @@ mod review_projection;
 pub(crate) mod review_source;
 mod scheduler;
 pub(crate) mod execution;
+pub(crate) mod checks;
 pub use execution::{PlanExecutionState, PlanExecutionRecord, PlanExecutionLifecycleEvent, PlanExecutionLifecycleRecord, PlanPhase};
 pub mod state_machine;
 mod validation;
@@ -729,6 +730,12 @@ pub struct PlanFileStore {
 
 impl PlanFileStore {
     /// Build a plan file store beneath the Harness data directory.
+    pub(crate) fn check_output_directory(&self, session: &str, run: &str) -> Result<PathBuf> {
+        let path = self.root.join(session).join("checks").join(run);
+        fs::create_dir_all(&path)?;
+        Ok(path)
+    }
+
     pub fn new(root: impl Into<PathBuf>, workspace: impl Into<PathBuf>) -> Self {
         Self {
             root: root.into(),

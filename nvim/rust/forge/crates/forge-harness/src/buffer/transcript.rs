@@ -330,7 +330,7 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
 fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str) -> Result<String> {
     let title = if kind == "command" { shell_command(title) } else { title };
     let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
-    let full = format!("• {duration} {normalized}");
+    let full = if kind == "check" { format!("▸ {normalized} · {}",duration.trim()) } else { format!("• {duration} {normalized}") };
     if profile.cells(&full, 0)? <= profile.columns {
         return Ok(full);
     }

@@ -1,6 +1,7 @@
 use super::HarnessBroker;
 use crate::exchange::{Exchange, ExchangeNode};
 use crate::goal::{GoalRecord, GoalState};
+use crate::plan::execution::SemanticProgress;
 use crate::plan::{
     PlanExecutionLifecycleEvent, PlanExecutionPromptKind, PlanExecutionRecord, PlanExecutionState,
     PlanState,
@@ -14,15 +15,81 @@ const CHECKPOINT_WARNING: &str =
     "Workspace-wide deviation detection is unavailable without a repository checkpoint.";
 
 impl HarnessBroker {
+    pub(super) async fn scan_execution_conformance(&mut self, execution: &PlanExecutionRecord, design: &crate::plan::DeclarationDesign) -> Result<SemanticProgress> {
+                let workspace = PathBuf::from(&self.session.workspace);
+                let accepted_paths = design
+                    .baseline
+                    .keys()
+                    .chain(design.proposed.keys())
+                    .cloned()
+                    .collect::<std::collections::BTreeSet<_>>();
+                let inspected = design.clone();
+                let comparison_workspace = workspace.clone();
+                let mut progress = {
+                    tokio::task::spawn_blocking(move || SemanticProgress::scan(&inspected, &comparison_workspace)).await??
+                };
+                if let Some(checkpoint_id) = &execution.baseline_checkpoint {
+                    let initial = self
+                        .store
+                        .load_checkpoint(checkpoint_id)?
+                        .context("original execution checkpoint is missing")?;
+                    let current = crate::checkpoint::GitCheckpoint::new(&self.session.workspace)
+                        .capture(
+                            &self.store.objects,
+                            &self.repositories,
+                            &self.session.id,
+                            self.clock.now_ms(),
+                        )
+                        .await?;
+                    for path in initial.changed_paths(&current)? {
+                        let path = path.as_str();
+                        if forge_diff::syntax::DeclarationOverview::supports(path)
+                            && !accepted_paths.contains(path)
+                        {
+                            let expected = initial.read(&self.store.objects, path, usize::MAX)?;
+                            let source = crate::plan::workspace_source(Path::new(&self.session.workspace), path)?;
+                            progress.source_digest.insert(path.to_string(), source.as_deref().map_or_else(|| "absent".into(), |text| crate::plan::digest(text.as_bytes())));
+                            let expected = expected.map(String::from_utf8).transpose()?;
+                            match (expected, source) {
+                                (Some(expected), Some(source)) => {
+                                    let overview = forge_diff::syntax::DeclarationOverview::extract(path, &expected)
+                                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                                    match crate::plan::conformance::inspect_in_workspace(&workspace, path, &overview, &source) {
+                                        Ok((differences, changes)) => {
+                                            progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}")));
+                                            progress.declaration_changes.extend(changes);
+                                        }
+                                        Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
+                                    }
+                                }
+                                (None, Some(source)) if forge_diff::syntax::ConfigurationFormat::for_path(path).is_none() => {
+                                    match crate::plan::conformance::inspect_in_workspace(&workspace, path, "", &source) {
+                                        Ok((differences, changes)) => {
+                                            progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}")));
+                                            progress.declaration_changes.extend(changes);
+                                        }
+                                        Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
+                                    }
+                                }
+                                (Some(_), None) => progress.different.push(format!("{path}: unplanned deletion")),
+                                _ => progress.warning.push(format!("{path}: additional configuration artifact")),
+                            }
+                        }
+                    }
+                }
+        Ok(progress)
+    }
+
+
     fn verification_evidence(&self, execution_id: &str, interaction: &Exchange) -> Result<Vec<Value>> {
         let exchanges = self.store.list_exchange(&self.session.id)?;
         Ok(exchanges.iter()
             .filter(|exchange| exchange.id != interaction.id
                 && exchange.execution_id.as_deref() == Some(execution_id))
             .chain(std::iter::once(interaction))
-            .flat_map(|exchange| exchange.turn.iter().flat_map(move |turn| turn.tools().map(move |tool| (exchange, tool))))
+            .flat_map(|exchange| exchange.turn.iter().flat_map(move |turn| turn.tools().map(move |tool| (turn, tool))))
             .filter(|(_, tool)| matches!(tool.state(), crate::turn::ToolState::Completed | crate::turn::ToolState::Failed))
-            .map(|(exchange, tool)| json!({"id":tool.id,"call_id":format!("{}:{}", exchange.id, tool.id),"title":tool.title.chars().take(240).collect::<String>(),
+            .map(|(turn, tool)| json!({"id":tool.id,"call_id":format!("{}:{}", turn.id(), tool.id),"title":tool.title.chars().take(240).collect::<String>(),
                 "state":if tool.state() == crate::turn::ToolState::Failed { "failed" } else { "completed" },
                 "output_preview":tool.output.chars().take(512).collect::<String>()}))
             .collect())
@@ -108,6 +175,14 @@ impl HarnessBroker {
         status: &mut crate::session::state_machine::SessionPhase,
         execution: &PlanExecutionRecord,
     ) {
+        if execution.phase == crate::plan::PlanPhase::Checking && execution.state == crate::plan::PlanExecutionState::Active {
+            if let Some(run) = execution.check_runs.last().filter(|run| run.state == crate::plan::checks::CheckState::Running) {
+                *status = crate::session::state_machine::SessionPhase::Working {
+                    started_at_ms:run.started_at_ms,activity:crate::session::state_machine::WorkflowActivity::Checking,
+                    reasoning_summary:None,execution:None,
+                };
+            }
+        }
         if let crate::session::state_machine::SessionPhase::Working {
             execution: progress, ..
         } = status
@@ -173,7 +248,7 @@ impl HarnessBroker {
             .context("execution plan is missing")?;
         anyhow::ensure!(
             execution.generation == generation
-                && execution.state == PlanExecutionState::Active
+                && execution.state == crate::plan::PlanExecutionState::Active
                 && goal.state == GoalState::Active,
             "execution state changed: {}",
             execution.response()
@@ -356,69 +431,10 @@ impl HarnessBroker {
                     .design
                     .context("execution requires a semantic design")?;
                 if let Some(report) = &request.verification {
-                    report.validate_checks(&design.document.verification.automated)?;
+                    report.validate_checks(&design.document.verification)?;
                 }
-                let workspace = PathBuf::from(&self.session.workspace);
-                let accepted_paths = design
-                    .baseline
-                    .keys()
-                    .chain(design.proposed.keys())
-                    .cloned()
-                    .collect::<std::collections::BTreeSet<_>>();
                 let verifying = execution.phase == crate::plan::PlanPhase::Verify;
-                let comparison_workspace = workspace.clone();
-                let mut progress = if verifying {
-                    tokio::task::spawn_blocking(move || SemanticProgress::scan(&design, &comparison_workspace)).await??
-                } else { SemanticProgress::default() };
-                if verifying && let Some(checkpoint_id) = &execution.baseline_checkpoint {
-                    let initial = self
-                        .store
-                        .load_checkpoint(checkpoint_id)?
-                        .context("original execution checkpoint is missing")?;
-                    let current = crate::checkpoint::GitCheckpoint::new(&self.session.workspace)
-                        .capture(
-                            &self.store.objects,
-                            &self.repositories,
-                            &self.session.id,
-                            now_ms,
-                        )
-                        .await?;
-                    for path in initial.changed_paths(&current)? {
-                        let path = path.as_str();
-                        if forge_diff::syntax::DeclarationOverview::supports(path)
-                            && !accepted_paths.contains(path)
-                        {
-                            let expected = initial.read(&self.store.objects, path, usize::MAX)?;
-                            let source = crate::plan::workspace_source(Path::new(&self.session.workspace), path)?;
-                            progress.source_digest.insert(path.to_string(), source.as_deref().map_or_else(|| "absent".into(), |text| crate::plan::digest(text.as_bytes())));
-                            let expected = expected.map(String::from_utf8).transpose()?;
-                            match (expected, source) {
-                                (Some(expected), Some(source)) => {
-                                    let overview = forge_diff::syntax::DeclarationOverview::extract(path, &expected)
-                                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                                    match crate::plan::conformance::inspect_in_workspace(&workspace, path, &overview, &source) {
-                                        Ok((differences, changes)) => {
-                                            progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}")));
-                                            progress.declaration_changes.extend(changes);
-                                        }
-                                        Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
-                                    }
-                                }
-                                (None, Some(source)) if forge_diff::syntax::ConfigurationFormat::for_path(path).is_none() => {
-                                    match crate::plan::conformance::inspect_in_workspace(&workspace, path, "", &source) {
-                                        Ok((differences, changes)) => {
-                                            progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}")));
-                                            progress.declaration_changes.extend(changes);
-                                        }
-                                        Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
-                                    }
-                                }
-                                (Some(_), None) => progress.different.push(format!("{path}: unplanned deletion")),
-                                _ => progress.warning.push(format!("{path}: additional configuration artifact")),
-                            }
-                        }
-                    }
-                }
+                let mut progress = if verifying { self.scan_execution_conformance(&execution, &design).await? } else { SemanticProgress::default() };
                 for (path, digest) in &progress.source_digest {
                     let current =
                         crate::plan::workspace_source(Path::new(&self.session.workspace), path)?;
@@ -533,7 +549,7 @@ impl HarnessBroker {
         }
         self.store
             .save_execution_transition(&execution, &goal, Some(&plan), Some(interaction))?;
-        if !phase_completion && execution.state == PlanExecutionState::Active {
+        if !phase_completion && execution.state == crate::plan::PlanExecutionState::Active {
             return self.revision_review_response(execution_id);
         }
         let mut response = execution.response();
@@ -544,7 +560,7 @@ impl HarnessBroker {
         Ok(response)
     }
 
-    async fn capture_implementation_report(&mut self, execution: &mut PlanExecutionRecord, interaction: &mut Exchange, now_ms: i64) -> Result<()> {
+    pub(super) async fn capture_implementation_report(&mut self, execution: &mut PlanExecutionRecord, interaction: &mut Exchange, now_ms: i64) -> Result<()> {
         let original = self.plan_file.read_submitted_document(&self.session.id, &execution.plan_id, execution.original_revision)?;
         let original = original.design.context("original accepted design is missing")?;
         let initial = execution.baseline_checkpoint.as_ref().map(|id| self.store.load_checkpoint(id)).transpose()?.flatten();
@@ -710,7 +726,7 @@ impl HarnessBroker {
             return Ok(());
         };
         let state = match goal.state {
-            GoalState::Active => PlanExecutionState::Active,
+            GoalState::Active => crate::plan::PlanExecutionState::Active,
             GoalState::Paused | GoalState::UsageLimited | GoalState::BudgetLimited => {
                 PlanExecutionState::Paused
             }
@@ -729,7 +745,7 @@ impl HarnessBroker {
             execution.state = state;
             execution.generation += 1;
             let status = match state {
-                PlanExecutionState::Active => "resumed",
+                crate::plan::PlanExecutionState::Active => "resumed",
                 PlanExecutionState::Paused => "paused",
                 PlanExecutionState::Cancelled => "cancelled",
                 PlanExecutionState::Complete => "completed",

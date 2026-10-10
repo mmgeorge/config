@@ -374,6 +374,12 @@ impl SessionPresentation {
         self.timeline.revision()
     }
 
+    pub(crate) fn update_checks(&mut self, run: &crate::plan::checks::CheckRun) -> Result<TimelinePatch> {
+        let patch=self.timeline.update_checks(run)?;
+        self.project_patch(&patch);
+        Ok(patch)
+    }
+
     pub fn reconcile(&mut self, entry: Vec<TimelineEntry>) -> Result<TimelinePatch> {
         let patch = self.timeline.reconcile(entry)?;
         self.project_patch(&patch);
@@ -962,7 +968,8 @@ fn refresh_activity<'source>(open: &mut OpenPresentation,
 
 fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bool, limit: usize) -> Result<()> {
     use forge_buffer::identity::BlockId;
-    let source = open.sections.nodes.tool.get(call_id).context("inline tool source is missing")?;
+    let source = open.sections.nodes.tool.get_mut(call_id).context("inline tool source is missing")?;
+    if expanded { source.load_prefix(limit)?; }
     let owner = source.owner().to_owned();
     let call = source.header().context("inline tool heading source is missing")?;
     let heading_id = BlockId(format!("{call_id}:tool"));
@@ -981,7 +988,7 @@ fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bo
     heading.metadata.node = previous_heading.metadata.node.clone();
     let chunks = if expanded { source.inline_prefix_chunks(limit)? } else { 1 };
     if let Some(node) = &mut heading.metadata.node {
-        node.more = expanded && chunks < source.inline_chunks()?;
+        node.more = expanded && (chunks < source.inline_chunks()? || source.has_unloaded_output());
         node.resolve(Some(expanded));
     }
     let identity = |chunk| BlockId(if chunk == 0 { format!("{call_id}:preview") } else { format!("{call_id}:output:{chunk}") });
@@ -1000,11 +1007,15 @@ fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bo
     retired_target.extend(previous_hidden.metadata.target.iter().map(|target|target.id.clone()));
     let mut body = Vec::new();
     for chunk in first_chunk..chunks {
-        let mut block = renderer.tool_body(call_id,source,expanded,chunk)?;
+        let mut block = if !expanded && call.kind == "check" {
+            forge_buffer::block::BufferBlock { id:identity(chunk),text:Default::default(),metadata:Default::default() }
+        } else { renderer.tool_body(call_id,source,expanded,chunk)? };
         block.metadata.layout = layout.clone();
         body.push(block);
     }
-    let mut hidden = renderer.tool_hidden(call_id,source,expanded)?;
+    let mut hidden = if !expanded && call.kind == "check" {
+        forge_buffer::block::BufferBlock { id:BlockId(format!("{call_id}:hidden")),text:Default::default(),metadata:Default::default() }
+    } else { renderer.tool_hidden(call_id,source,expanded)? };
     hidden.metadata.layout = layout;
     let target = body.iter().chain(std::iter::once(&hidden)).flat_map(|block|block.metadata.target.iter().map(|target|target.id.clone())).collect::<Vec<_>>();
     let mut changes = vec![TranscriptChange::Block { block:heading }];
@@ -1298,6 +1309,45 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accepted_check_output_is_lazy_paged_and_collapses_without_a_preview() -> Result<()> {
+        let directory=tempfile::tempdir()?;
+        let output=directory.path().join("command.output");
+        let text="saved command output\n".repeat(15000);
+        std::fs::write(&output,&text)?;
+        let run:crate::plan::checks::CheckRun=serde_json::from_value(serde_json::json!({
+            "id":"gate","revision":1,"completed_plan":null,"shell":"system","executable":null,
+            "workspace":".","environment_digest":"environment","started_at_ms":1,"completed_at_ms":2,
+            "state":"passed","progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[{
+                "id":"gate:0","command":"accepted command","state":"passed","started_at_ms":1,
+                "completed_at_ms":2,"exit_code":0,"error":null,"stdout":output,"stderr":output,
+                "output":output,"output_bytes":text.len(),"preview":"must not render"
+            }]
+        }))?;
+        let mut owner=SessionPresentation::new("session".into());
+        owner.initialize(vec![TimelineEntry::Checks { id:"gate".into(),created_at_ms:1,run }])?;
+        let document=DocumentId("check-output".into());
+        owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
+        assert_eq!(owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"].snapshot()?.retained_bytes(),0);
+        expand_sections(&mut owner,"view")?;
+        let collapsed=owner.snapshot(&document)?;
+        assert!(!collapsed.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("saved command output") || row.contains("must not render"))));
+        for (sequence,action) in [(100,super::super::nodes::NodeAction::SetExpansion { expanded:true }),
+            (101,super::super::nodes::NodeAction::LoadMore),(102,super::super::nodes::NodeAction::SetExpansion { expanded:false })] {
+            let generation=owner.snapshot(&document)?.block.iter().find_map(|block|block.metadata.node.as_ref()
+                .filter(|node|node.id.0=="gate:0:tool").map(|node|node.generation)).unwrap();
+            owner.dispatch(PresentationRequest::Node { request:super::super::nodes::NodeRequest {
+                document:document.clone(),view:ViewId("view".into()),sequence,node:"gate:0:tool".into(),generation,
+                action,rows:100,width:WidthProfile::default()
+            } })?;
+            let retained=owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"].snapshot()?.retained_bytes();
+            assert!(retained>0 && owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"].has_unloaded_output(),"explicit opening must read a page, not the entire saved output");
+        }
+        assert!(!owner.snapshot(&document)?.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("saved command output"))));
+        Ok(())
+    }
 
     #[tokio::test]
     async fn large_history_retains_parsers_and_syntax_across_refreshes_without_an_aggregate_limit() -> Result<()> {

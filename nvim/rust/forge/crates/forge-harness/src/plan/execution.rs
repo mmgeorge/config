@@ -11,6 +11,7 @@ use tokio::sync::{mpsc, oneshot};
 /// Identifies the work required before the next execution gate.
 pub enum PlanPhase {
     Implement,
+    Checking,
     Verify,
     Resolve,
 }
@@ -81,28 +82,12 @@ pub struct VerificationCheck {
 
 impl VerificationReport {
     /// Validate check identities and evidence before a phase transition is committed.
-    pub(crate) fn validate_checks(&self, automated: &str) -> Result<()> {
-        let commands = automated.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
-        let mut seen = BTreeSet::new();
-        let mut previous_command = None;
-        for check in &self.checks {
-            ensure!(!check.label.trim().is_empty() && !check.summary.trim().is_empty(),
-                "verification checks require a label and result summary");
-            let automated = check.category == VerificationCategory::Automated;
-            ensure!(seen.insert((automated, check.label.as_str())), "duplicate verification check: {}", check.label);
-            if automated {
-                let position = commands.iter().position(|command| *command == check.label.trim())
-                    .with_context(|| format!("verification command is not in the accepted plan: {}", check.label))?;
-                ensure!(previous_command.is_none_or(|previous| previous < position),
-                    "report automated commands in accepted plan order");
-                previous_command = Some(position);
-                ensure!(check.outcome == VerificationOutcome::Blocked || !check.evidence.is_empty(),
-                    "executed command requires tool evidence: {}", check.label);
-            }
-        }
-        if !self.checks.is_empty() {
-            ensure!(commands.iter().all(|command| seen.contains(&(true, *command))),
-                "report every accepted automated command, including blocked commands");
+    pub(crate) fn validate_checks(&self, actions: &[String]) -> Result<()> {
+        ensure!(self.checks.len() == actions.len(), "report every accepted manual verification action");
+        for (check, action) in self.checks.iter().zip(actions) {
+            ensure!(check.category == VerificationCategory::Manual && check.label == *action,
+                "verification must contain only accepted manual actions in order");
+            ensure!(!check.summary.trim().is_empty(), "manual result requires observations");
         }
         Ok(())
     }
@@ -272,6 +257,8 @@ pub struct PlanExecutionRecord {
     pub findings: Vec<String>,
     pub progress: SemanticProgress,
     pub verification: Vec<VerificationEvidence>,
+    #[serde(default)]
+    pub check_runs: Vec<super::checks::CheckRun>,
     pub revision_history: Vec<ExecutionRevision>,
     pub pending_revision_reason: Option<String>,
     pub review_paused: bool,
@@ -309,12 +296,13 @@ impl PlanExecutionRecord {
             self.pending_revision_reason.is_none(),
             "a plan revision awaits review"
         );
+        ensure!(self.phase != PlanPhase::Checking, "Checking is owned by Harness, not the model");
         if self.phase != PlanPhase::Verify {
             ensure!(
                 request.verification.is_none(),
                 "verification assessment is only accepted in Verify"
             );
-            self.phase = PlanPhase::Verify;
+            self.phase = PlanPhase::Checking;
         } else {
             let report = request
                 .verification
@@ -397,17 +385,18 @@ impl PlanExecutionRecord {
         }
         let work = match self.phase {
             PlanPhase::Implement => {
-                "Implement the accepted design and tests. The accepted plan is frozen during Implement. Make justified implementation deviations when needed, including internal helpers, and explain them in your completion summary. Do not edit or submit the plan, reconcile declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Defer all validation and conformance assessment to Verify. When writing is finished, call harness_plan_phase_done. Declarations and call/access differences do not gate Implement completion."
+                "Implement the accepted design and tests. The accepted plan is frozen during Implement. Make justified implementation deviations when needed, including internal helpers, and explain them in your completion summary. Do not edit or submit the plan, reconcile declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Harness runs validation and conformance assessment in Checking. When writing is finished, call harness_plan_phase_done. Declarations and call/access differences do not gate Implement completion."
             }
             PlanPhase::Resolve => {
-                "Resolve the collected verification findings. Correct code defects in the workspace. If an intentional change affects the accepted contract, propose one consolidated plan revision with a concrete reason. Internal helpers and Calls/Accesses differences do not require revisions. After acceptance, continue with the returned revision. Finish with harness_plan_phase_done so Verify can reassess the workspace and run affected checks."
+                "Resolve the collected verification findings. Correct code defects in the workspace. If an intentional change affects the accepted contract, propose one consolidated plan revision with a concrete reason. Internal helpers and Calls/Accesses differences do not require revisions. After acceptance, continue with the returned revision. Finish with harness_plan_phase_done so Harness can run declarations and automated checks again. Do not run those checks yourself."
             }
+            PlanPhase::Checking => "Harness runs declarations and accepted checks locally. No model turn is admitted for this phase.",
             PlanPhase::Verify => {
-                "Assess the implementation against the accepted contract and collect all findings together. Harness checks required declaration shapes and public API, permits additional internal helpers, and reports Calls/Accesses separately without gating completion. Do not edit the plan in Verify. Send contract changes and code defects to Resolve. Read plan.json with harness_plan_read and verify its verification requirements and tests inventory. Confirm each new, modified, or reused test is covered by the executed checks, and confirm removed tests were intentionally removed. Do not treat a listed test as evidence that it ran. Run each nonblank line of verification.automated as a separate command in the project workspace, in listed order, using normal execution tools and permissions. Perform every verification.manual check and record the observed result. Report blocked when a required check cannot be performed, including checks requiring user action. Do not claim passed with outstanding checks. After running checks, call harness_plan_read with only plan_id to retrieve execution.verification_evidence. Use its exact tool IDs in verification.evidence, not command descriptions or output text. Select affected checks to rerun and justify any reused evidence. Report passed, failed, or blocked with evidence and concrete findings."
+                "Perform only the accepted plan's manual verification actions, in order. Harness has already passed declarations and automated checks. Do not rerun automated checks, edit source, or revise the plan. Report each manual action as passed, failed, or blocked with observations and tool evidence. Report blockers honestly. Send observed defects to Resolve. Retrieve exact evidence IDs with harness_plan_read before submitting results."
             }
         };
         let reporting = if self.phase == PlanPhase::Verify {
-            " Report verification.checks with one entry per accepted automated command and manual check, in plan order. Each entry contains category (automated or manual), the exact command or manual check label, outcome (passed, failed, or blocked), a concise result summary, and evidence tool IDs. Include checks that could not run as blocked with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI renders the structured report. Keep the final response brief instead of repeating the inventory."
+            " Report verification.checks with one entry per accepted manual verification action, in plan order. Each entry contains category (manual), the exact command or manual check label, outcome (passed, failed, or blocked), a concise result summary, and evidence tool IDs. Include checks that could not run as blocked with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI renders the structured report. Keep the final response brief instead of repeating the inventory."
         } else { "" };
         format!(
             "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Do not call harness_goal_complete for this execution.",
@@ -493,21 +482,17 @@ impl ExecutionControlSender {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn structured_checks_require_planned_commands_and_real_evidence() {
+    fn manual_results_match_the_accepted_inventory() {
         let mut report: VerificationReport = serde_json::from_value(json!({
-            "outcome":"failed", "checks":[
-                {"category":"automated","label":"cargo test","outcome":"passed","summary":"8 passed","evidence":["tool-test"]},
-                {"category":"automated","label":"cargo check","outcome":"failed","summary":"Compilation failed","evidence":["tool-check"]},
-                {"category":"manual","label":"Open window","outcome":"blocked","summary":"Build failed","evidence":[]}
+            "outcome":"blocked", "checks":[
+                {"category":"manual","label":"Open window","outcome":"blocked","summary":"No desktop interface","evidence":[]}
             ]
         })).unwrap();
-        assert!(report.validate_checks("cargo test\ncargo check").is_ok());
-        assert!(report.validate_checks("cargo check\ncargo test").is_err());
-        assert!(report.validate_checks("cargo test\ncargo check\ncargo fmt").is_err());
-        report.checks[0].evidence.clear();
-        assert!(report.validate_checks("cargo test\ncargo check").is_err());
-        report.checks[0].outcome = VerificationOutcome::Blocked;
-        assert!(report.validate_checks("cargo test\ncargo check").is_ok());
+        assert!(report.validate_checks(&["Open window".into()]).is_ok());
+        assert!(report.validate_checks(&["Resize window".into()]).is_err());
+        assert!(report.validate_checks(&[]).is_err());
+        report.checks[0].category=VerificationCategory::Automated;
+        assert!(report.validate_checks(&["Open window".into()]).is_err());
     }
 
     use super::*;
@@ -531,6 +516,7 @@ mod tests {
             findings: Vec::new(),
             progress: SemanticProgress::default(),
             verification: Vec::new(),
+            check_runs: Vec::new(),
             revision_history: Vec::new(),
             pending_revision_reason: None,
             review_paused: false,
@@ -563,9 +549,9 @@ mod tests {
                 assert!(prompt.ends_with("accepted document"));
                 if phase == PlanPhase::Implement {
                     assert!(prompt.contains("Do not edit or submit the plan, reconcile declaration metadata, or run builds"));
-                    assert!(prompt.contains("Defer all validation and conformance assessment to Verify"));
+                    assert!(prompt.contains("Harness runs validation and conformance assessment in Checking"));
                 } else if phase == PlanPhase::Verify {
-                    assert!(prompt.contains("Run each nonblank line of verification.automated"));
+                    assert!(prompt.contains("Perform only the accepted plan's manual verification actions"));
                     assert!(!prompt.contains("Do not run builds"));
                 }
                 if kind == PlanExecutionPromptKind::ResumeAfterInterruption {
@@ -604,12 +590,14 @@ mod tests {
         let mut execution = execution();
         let mismatch = SemanticProgress { missing: vec!["main.rs".into()], ..Default::default() };
         execution.finish_phase(done(PlanPhase::Implement, None), mismatch.clone(), 1).unwrap();
-        assert_eq!(execution.phase, PlanPhase::Verify);
+        assert_eq!(execution.phase, PlanPhase::Checking);
+        execution.phase=PlanPhase::Verify;
         execution.finish_phase(done(PlanPhase::Verify, Some(VerificationOutcome::Passed)), mismatch.clone(), 2).unwrap();
         assert_eq!(execution.phase, PlanPhase::Resolve);
         assert_eq!(execution.findings, ["main.rs: missing planned file"]);
         execution.finish_phase(done(PlanPhase::Resolve, None), mismatch, 3).unwrap();
-        assert_eq!(execution.phase, PlanPhase::Verify);
+        assert_eq!(execution.phase, PlanPhase::Checking);
+        execution.phase=PlanPhase::Verify;
         execution.finish_phase(done(PlanPhase::Verify, Some(VerificationOutcome::Passed)), SemanticProgress::default(), 4).unwrap();
         assert_eq!(execution.state, PlanExecutionState::Complete);
         assert_eq!(execution.completed_at_ms, Some(4));
@@ -651,6 +639,7 @@ mod tests {
                 )
                 .is_err()
         );
+        execution.phase=PlanPhase::Verify;
         execution
             .finish_phase(
                 done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
@@ -675,6 +664,7 @@ mod tests {
                 1,
             )
             .unwrap();
+        execution.phase=PlanPhase::Verify;
         execution
             .finish_phase(
                 done(PlanPhase::Verify, Some(VerificationOutcome::Blocked)),

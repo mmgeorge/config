@@ -386,6 +386,7 @@ impl TimelineRenderer<'_> {
                 let agents = agent_by_id.iter().map(|(id, entry)| (id.as_str(), entry)).collect();
                 self.interaction(interaction, &agents, depth)?;
             }
+            TimelineEntry::Checks { run, .. } => self.checks(run)?,
             TimelineEntry::SessionEvent { id, event, .. } => {
                 let text = format!("◇ {}", session_event_text(&event.detail));
                 let action = match &event.detail {
@@ -1411,6 +1412,64 @@ impl TimelineRenderer<'_> {
             self.markdown(&format!("{identity}:details"), &tool.output, MarkdownRole::Detail)?;
             self.finish_section(section, &identity, true);
         }
+        Ok(())
+    }
+
+    fn checks(&mut self, run: &crate::plan::checks::CheckRun) -> Result<()> {
+        let start = self.block.len();
+        self.literal(&format!("{}:checks", run.id), &format!("Checks · {:?}", run.state), None)?;
+        let declarations_start=self.block.len();
+        self.literal(&format!("{}:declarations", run.id),
+            &format!("Declarations · {}", if run.progress.conforms() { "match" } else { "differ" }), None)?;
+        for (index, finding) in run.progress.findings().iter().enumerate() {
+            self.literal(&format!("{}:finding:{index}",run.id), finding, None)?;
+        }
+        for (index,change) in run.progress.declaration_changes.iter().enumerate() {
+            self.diff(&format!("{}:declaration:{index}",run.id),&change.name,&change.diff,"",Some((&change.path,&change.name)),None)?;
+        }
+        self.fold(declarations_start,&format!("{}:declarations",run.id),true,NodeKind::Group);
+        for check in &run.commands {
+            let command_start = self.block.len();
+            let call_id = check.id.clone();
+            let heading = crate::turn::ToolCall {
+                id:call_id.clone(), kind:"check".into(), title:format!("{} · {:?}",check.command,check.state),
+                started_at_ms:check.started_at_ms, completed_at_ms:check.completed_at_ms,
+                task_id:None,output:String::new(),status:String::new(),failed:matches!(check.state,crate::plan::checks::CheckState::Failed),change:Default::default(),
+            };
+            let mut output = ToolOutputView::file(call_id.clone(),check.output.clone(),check.output_bytes)?;
+            output.heading(&heading);
+            output.group = format!("{}:checks", run.id);
+            let expanded = self.expansion.get(&format!("{call_id}:tool")).copied()==Some(true);
+            let limit=self.tool_limit.get(&format!("{call_id}:tool")).copied().unwrap_or(super::tool::INITIAL_INLINE_BYTES);
+            if expanded { output.load_prefix(limit)?; }
+            let width=self.content_width();
+            let renderer=TranscriptRenderer::new(&width)?;
+            self.push(renderer.tool_header(BlockId(format!("{call_id}:tool")),TargetId(format!("{call_id}:tool")),
+                "check",heading.elapsed_ms(self.now_ms),heading.failed,&heading.title,expanded)?)?;
+            if expanded {
+                for chunk in 0..output.inline_prefix_chunks(limit)? { self.push(renderer.tool_body(&call_id,&output,true,chunk)?)?; }
+                self.push(renderer.tool_hidden(&call_id,&output,true)?)?;
+            } else {
+                let preview=run.state==crate::plan::checks::CheckState::Running && check.state==crate::plan::checks::CheckState::Running
+                    && self.expansion.get(&format!("{call_id}:tool"))!=Some(&false);
+                if preview {
+                    let visible=ToolOutputView::new(call_id.clone(),&check.preview)?;
+                    self.push(renderer.tool_body(&call_id,&visible,false,0)?)?;
+                } else { self.push(BufferBlock { id:BlockId(format!("{call_id}:preview")),text:Default::default(),metadata:Default::default() })?; }
+                self.push(BufferBlock { id:BlockId(format!("{call_id}:hidden")),text:Default::default(),metadata:Default::default() })?;
+            }
+            if let Some(error)=&check.error { self.literal(&format!("{call_id}:error"),error,None)?; }
+            self.fold(command_start,&format!("{call_id}:tool"),true,NodeKind::Tool);
+            if let Some(node)=&mut self.block[command_start].metadata.node { node.more=expanded && output.has_unloaded_output();
+                if check.state==crate::plan::checks::CheckState::Running {
+                    node.lifecycle=NodeLifecycle::Live;
+                    node.default_display=NodeDisplay::Preview;
+                    node.resolve(self.expansion.get(&node.id.0).copied());
+                } }
+            self.tool.insert(call_id,output);
+        }
+        self.fold(start,&format!("{}:checks",run.id),run.state != crate::plan::checks::CheckState::Running,NodeKind::Group);
+        if let Some(title)=&run.completed_plan { self.literal(&format!("{}:complete",run.id), &format!("◇ Plan complete: {title}"),None)?; }
         Ok(())
     }
 

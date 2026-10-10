@@ -14,6 +14,7 @@ use std::sync::Arc;
 pub struct ControlTurnContext {
     pub mode: PromptMode,
     pub planning_feedback: bool,
+    pub check_shell: crate::session::CheckShell,
     pub plan_state: Option<PlanState>,
     pub plan_document: Option<PlanDocument>,
     pub resolved_question_digest_set: HashSet<String>,
@@ -54,6 +55,7 @@ impl ControlTurnContext {
         Self {
             mode,
             planning_feedback: false,
+            check_shell: Default::default(),
             plan_state: None,
             plan_document: None,
             resolved_question_digest_set: HashSet::new(),
@@ -468,6 +470,7 @@ mod test {
         ControlTurnContext {
             mode: PromptMode::Plan,
             planning_feedback: false,
+            check_shell: Default::default(),
             plan_state: Some(PlanState::Generating),
             plan_document: Some(crate::plan::test_fixture("plan", "Initial")),
             resolved_question_digest_set: HashSet::new(),

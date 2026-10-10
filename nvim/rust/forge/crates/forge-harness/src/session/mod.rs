@@ -2,6 +2,8 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 
 mod access;
+mod shell;
+pub use shell::CheckShell;
 pub use access::{AccessPolicy, WindowsSandbox, WriteAccess};
 pub mod continuation;
 pub mod state_machine;
@@ -139,6 +141,8 @@ pub struct HarnessSession {
     pub service_tier: crate::backend::ServiceTier,
     #[serde(default)]
     pub access: crate::session::AccessPolicy,
+    #[serde(default)]
+    pub shell: CheckShell,
     pub execution_mode: PermissionMode,
     #[serde(default)]
     pub current_task_id: Option<String>,
@@ -165,6 +169,8 @@ pub struct HarnessSession {
 pub struct HarnessPreference {
     #[serde(default)]
     pub access: crate::session::AccessPolicy,
+    #[serde(default)]
+    pub shell: CheckShell,
     #[serde(default = "default_write_permission")]
     pub default_write_permission: PermissionMode,
     #[serde(default)]

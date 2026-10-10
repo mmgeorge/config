@@ -299,6 +299,17 @@ impl TimelineStream {
     }
 
     /// Reconcile one canonical projection into ordered top-level operations.
+    pub(crate) fn update_checks(&mut self, run: &crate::plan::checks::CheckRun) -> Result<TimelinePatch> {
+        let base_revision=self.revision;
+        let mut operation=Vec::new();
+        let entry=TimelineEntry::Checks { id:run.id.clone(),created_at_ms:run.started_at_ms,run:run.clone() };
+        let insertion=self.entry_list.iter().position(|entry|matches!(entry,TimelineEntry::Status {..})).unwrap_or(self.entry_list.len());
+        let value=serde_json::to_value(&entry)?;
+        self.upsert(entry,value,insertion,&mut operation);
+        if !operation.is_empty() { self.revision+=1; }
+        Ok(TimelinePatch {session_id:self.session_id.clone(),base_revision,revision:self.revision,operation})
+    }
+
     pub fn reconcile(&mut self, next_entry_list: Vec<TimelineEntry>) -> Result<TimelinePatch> {
         ensure!(
             self.revision < forge_buffer::MAX_COUNTER,
