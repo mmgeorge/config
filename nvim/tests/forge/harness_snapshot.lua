@@ -38,4 +38,17 @@ response.runtime_epoch, response.snapshot_revision = "restarted-runtime", 1
 response.task_operation = { state = "outcome_unknown", error = "Interrupted before confirmation" }
 assert(snapshot.apply(state, response))
 assert(not state.busy and not state.task_operation and state.execution_notice == "Interrupted before confirmation")
+response.snapshot_revision = 2
+response.task_operation = nil
+response.status = { kind = "awaiting_plan_review", revision = 1 }
+assert(snapshot.apply(state, response))
+assert(state.execution_notice == nil, "settled operation failure survived the authoritative snapshot")
+response.snapshot_revision = 3
+response.task_operation = { id = "failed", state = "failed", error = "Provider failed" }
+snapshot.apply(state, response)
+state.execution_notice = "Connection lost"
+response.snapshot_revision = 4
+response.task_operation = nil
+snapshot.apply(state, response)
+assert(state.execution_notice == "Connection lost", "clearing an old operation hid a newer error")
 print("harness_snapshot: passed")

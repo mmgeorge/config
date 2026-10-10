@@ -547,8 +547,8 @@ impl SqliteStore {
         )
     }
 
-    /// Commit execution state, its goal, and an optional accepted revision together.
-    pub fn save_execution_transition(&mut self, execution: &PlanExecutionRecord, goal: &GoalRecord, plan: Option<&PlanRecord>) -> Result<()> {
+    /// Commit execution state with its goal, accepted revision, and owning phase result.
+    pub fn save_execution_transition(&mut self, execution: &PlanExecutionRecord, goal: &GoalRecord, plan: Option<&PlanRecord>, exchange: Option<&Exchange>) -> Result<()> {
         let mut execution_payload = serde_json::to_value(execution)?;
         execution_payload["schema_version"] = serde_json::json!(crate::plan::PLAN_SCHEMA_VERSION);
         let mut rows = vec![("plan_execution_record", execution.id.as_str(), execution_payload),
@@ -559,6 +559,14 @@ impl SqliteStore {
             rows.push(("plan_record", plan.id.as_str(), payload));
         }
         let transaction = self.connection.transaction()?;
+        if let Some(exchange) = exchange {
+            let written = transaction.execute(
+                "UPDATE exchange_record SET payload=?1 WHERE id=?2 AND session_id=?3 AND agent_id=?4",
+                params![tool_output::encode(exchange)?, exchange.id, execution.session_id, exchange.agent_id],
+            )?;
+            anyhow::ensure!(written == 1, "phase transition lost its owning exchange");
+            tool_output::synchronize(&transaction, exchange)?;
+        }
         for (table, id, payload) in rows {
             transaction.execute(&format!("INSERT INTO {table}(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload"), params![id,execution.session_id,encode(&payload)?])?;
         }
@@ -1228,6 +1236,7 @@ mod test {
             state: ExchangeState::Running,
             plan_id: None,
             execution_id: None,
+            execution_phase: None,
             goal_id: None,
             checkpoint_before: None,
             checkpoint_after: None,
@@ -1312,6 +1321,7 @@ mod test {
             state: crate::exchange::ExchangeState::Complete,
             plan_id: None,
             execution_id: None,
+            execution_phase: None,
             goal_id: None,
             checkpoint_before: None,
             checkpoint_after: None,

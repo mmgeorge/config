@@ -464,14 +464,10 @@ fn render(
             let child_budget = if within_file {
                 remaining
             } else {
-                let mut own = quota
+                quota
                     .get(id)
                     .cloned()
-                    .unwrap_or_else(|| PageQuota::bytes(PAGE_BYTES));
-                if !file {
-                    own.bytes = own.bytes.min(remaining.bytes);
-                }
-                own
+                    .unwrap_or_else(|| PageQuota::bytes(PAGE_BYTES))
             };
             let more = expanded
                 && render(
@@ -540,7 +536,7 @@ fn render(
                 open: expanded,
                 more: false,
             });
-            if file && !within_file {
+            if !within_file {
                 budget.consume(&output[heading..heading + 1])?;
             } else {
                 budget.consume(&output[heading..])?;
@@ -800,8 +796,7 @@ mod tests {
             .text
             .byte_count();
         assert!(first <= PAGE_BYTES);
-        visible.set(&mut source, view.clone(), 3, "outer-fold", true, true, None)?;
-        visible.set(&mut source, view, 4, "tools", true, true, None)?;
+        visible.set(&mut source, view, 3, "tools", true, true, None)?;
         visible.refresh(&mut source)?;
         let second = visible
             .document

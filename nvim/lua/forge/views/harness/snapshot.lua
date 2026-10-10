@@ -27,6 +27,10 @@ function HarnessSnapshot.apply(state, result)
   local operation = result.task_operation
   if operation and (operation.state == "failed" or operation.state == "outcome_unknown") then
     state.execution_notice = operation.error or "Task outcome unknown. Refresh before resuming."
+    state.execution_notice_operation = { id = operation.id, message = state.execution_notice }
+  elseif state.execution_notice_operation then
+    if state.execution_notice == state.execution_notice_operation.message then state.execution_notice = nil end
+    state.execution_notice_operation = nil
   end
   local previous_session_id = state.session and state.session.id or nil
   local previous_context_usage = state.session and state.session.context_usage or nil

@@ -387,7 +387,8 @@ impl TurnCancellation {
 }
 
 #[derive(Debug)]
-struct TurnCancelled;
+/// Identifies user cancellation across broker and task-coordinator error boundaries.
+pub(crate) struct TurnCancelled;
 
 impl std::fmt::Display for TurnCancelled {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -930,7 +931,10 @@ impl HarnessBroker {
         Ok(BrokerSnapshot {
             runtime_epoch: self.runtime_epoch.clone(),
             snapshot_revision: self.snapshot_revision.fetch_add(1, Ordering::Relaxed) + 1,
-            task_operation: self.store.latest_task_operation(&self.session.id)?.map(|operation| operation.view()),
+            task_operation: self.store.latest_task_operation(&self.session.id)?
+                .filter(|operation| !matches!(operation.state.as_str(), "failed" | "cancelled" | "completed" | "superseded")
+                    || operation.exchange_id.as_deref() == interaction.last().map(|exchange| exchange.id.as_str()))
+                .map(|operation| operation.view()),
             session: self.session.clone(),
             task: self.store.list_task(&self.session.id)?,
             exchange: interaction,
@@ -3415,6 +3419,14 @@ Planning continuation: turn {} of {}.",
             interaction.kind = admission.kind;
             interaction.plan_id.clone_from(&admission.plan_id);
             interaction.execution_id.clone_from(&admission.execution_id);
+            if let Some(execution_id) = &interaction.execution_id {
+                let execution = self.store.load_plan_execution(execution_id)?
+                    .context("phase exchange has no execution")?;
+                interaction.execution_phase = Some(crate::exchange::ExecutionPhase {
+                    phase: execution.phase,
+                    outcome: None,
+                });
+            }
             interaction.goal_id.clone_from(&admission.goal_id);
             if let Some(run_id) = admission.agent_run_id.as_deref()
                 && let Some(run) = self.agent_registry.get(run_id).cloned()
@@ -3457,11 +3469,6 @@ Planning continuation: turn {} of {}.",
             if let Some(execution_id) = interaction.execution_id.as_deref() {
                 if let Some(mut execution) = self.store.load_plan_execution(execution_id)? {
                     if execution.baseline_checkpoint.is_none() { execution.baseline_checkpoint = interaction.checkpoint_before.clone(); }
-                    for record in &mut execution.lifecycle {
-                        if admission.as_ref().is_some_and(|admission| admission.plan_event_id.is_some()) {
-                            record.anchor = Some(crate::plan::ExchangeAnchor::capture(&interaction));
-                        }
-                    }
                     self.store.save_plan_execution(&execution)?;
                 }
             }
@@ -3591,6 +3598,9 @@ Planning continuation: turn {} of {}.",
                 } else {
                     ExchangeState::Failed
                 };
+                if !cancelled {
+                    self.record_execution_failure(&interaction, format!("{error:#}"))?;
+                }
                 let final_checkpoint_id = self
                     .capture_final_checkpoint(&mut interaction, outcome)
                     .await?;
@@ -4062,7 +4072,10 @@ Planning continuation: turn {} of {}.",
             .map(|goal| goal.state);
         let goal_suspended = matches!(goal_state,
             Some(GoalState::Paused | GoalState::UsageLimited | GoalState::BudgetLimited));
-        let remains_open = continuing || goal_suspended || interaction.awaiting_input || planning_open;
+        let phase_finished = interaction.execution_phase.as_ref()
+            .is_some_and(|phase| phase.outcome.is_some());
+        let remains_open = !phase_finished
+            && (continuing || goal_suspended || interaction.awaiting_input || planning_open);
         if remains_open {
             self.exchange_runtime = Some(runtime);
         } else {
@@ -4125,6 +4138,7 @@ Planning continuation: turn {} of {}.",
 
         let now_ms = self.clock.now_ms();
         let mut event = Vec::new();
+        self.record_execution_failure(&interaction, "Failed while processing the provider response".into())?;
         finish_synthetic_turn(
             &mut interaction,
             runtime.synthetic_turn.as_ref(),
@@ -5065,11 +5079,15 @@ Planning continuation: turn {} of {}.",
         if let Some(previous) = interaction_list.last_mut()
             && previous.state == ExchangeState::Running
         {
+            let outcome = if previous.execution_phase.as_ref().is_some_and(|phase| phase.outcome.is_none()) {
+                ExchangeState::Interrupted
+            } else {
+                ExchangeState::Complete
+            };
             if previous.checkpoint_before.is_some() {
-                self.capture_final_checkpoint(previous, ExchangeState::Complete)
-                    .await?;
+                self.capture_final_checkpoint(previous, outcome).await?;
             }
-            previous.finish(ExchangeState::Complete, now_ms)?;
+            previous.finish(outcome, now_ms)?;
             self.store.save_exchange(previous)?;
         }
         Ok((
@@ -5086,6 +5104,7 @@ Planning continuation: turn {} of {}.",
                 mode: Some(self.session.execution_mode),
                 plan_id: None,
                 execution_id: None,
+                execution_phase: None,
                 goal_id: None,
                 state: ExchangeState::Running,
                 checkpoint_before: None,
@@ -5159,7 +5178,7 @@ Planning continuation: turn {} of {}.",
             if resume { execution.state = PlanExecutionState::Active; goal.resume(self.clock.now_ms()); }
             execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
                 PlanExecutionLifecycleEvent::Phase { title: "Plan revision accepted".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
-            self.store.save_execution_transition(&execution, &goal, Some(&plan))?;
+            self.store.save_execution_transition(&execution, &goal, Some(&plan), None)?;
             let mut events = vec![self.event("plan_accepted", json!({"plan":plan,"execution":execution}))?];
             if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
@@ -5484,8 +5503,6 @@ Planning continuation: turn {} of {}.",
         };
         execution_record.progress = crate::plan::execution::SemanticProgress::scan(accepted_document.design.as_ref().unwrap(), Path::new(&self.session.workspace))?;
         execution_record.observed_source = execution_record.progress.source_digest.clone();
-        execution_record.append_lifecycle(lifecycle.anchor.clone().context("plan acceptance has no owning exchange")?, execution_created_at_ms,
-            PlanExecutionLifecycleEvent::Phase { title: "Execution started".into(), phase: execution_record.phase, revision: execution_record.revision, state: execution_record.state });
         self.store.accept_task(&self.session, &task, &goal, &plan, &execution_record, &lifecycle, &self.client_id)?;
         let mut pre_execution_event = compact_event;
         self.emit_live(
@@ -5513,7 +5530,7 @@ Planning continuation: turn {} of {}.",
         .await?;
         let execution_prompt = PlanPrompt::execution(&execution_record, PlanExecutionPromptKind::Start, &accepted_document.model_json()?);
         let mut admission = ExchangeAdmission::execution(
-            format!("Accept plan: {}", plan.request), plan.id.clone(),
+            String::new(), plan.id.clone(),
             execution_record.id.clone(), goal.id.clone());
         admission.plan_event_id = Some(lifecycle.id.clone());
         let execution = self.run_interaction(execution_prompt, PromptMode::ExecutePlan, Some(admission))
@@ -5654,7 +5671,7 @@ Planning continuation: turn {} of {}.",
             execution.generation += 1;
             execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
                 PlanExecutionLifecycleEvent::Phase { title: "Plan revision changes requested".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
-            self.store.save_execution_transition(&execution, &goal, Some(&plan))?;
+            self.store.save_execution_transition(&execution, &goal, Some(&plan), None)?;
             let mut events = vec![self.event("plan_changes_requested", json!({"plan":plan,"execution":execution}))?];
             if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
@@ -5738,7 +5755,7 @@ Planning continuation: turn {} of {}.",
             execution.generation += 1;
             execution.append_lifecycle(self.plan_exchange_anchor(&plan.id)?, self.clock.now_ms(),
                 PlanExecutionLifecycleEvent::Phase { title: "Plan revision rejected".into(), phase: execution.phase, revision: execution.revision, state: execution.state });
-            self.store.save_execution_transition(&execution, &goal, Some(&plan))?;
+            self.store.save_execution_transition(&execution, &goal, Some(&plan), None)?;
             let mut events = vec![self.event("plan_revision_rejected", json!({"plan":plan,"execution":execution}))?];
             if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
@@ -6118,7 +6135,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             self.store.list_plan_execution(&self.session.id)?.into_iter()
                 .find(|execution| execution.goal_id == goal.id)
                 .map(|execution| ExchangeAdmission::execution(
-                    "Continue plan after review".into(), execution.plan_id,
+                    String::new(), execution.plan_id,
                     execution.id, goal.id.clone()))
         } else {
             None
@@ -7136,7 +7153,7 @@ mod test {
         broker.create_task(TaskKind::Plan, "Interrupted".into(), None, None).unwrap();
         let operation = TaskOperation {
             id: "clear-before-shutdown".into(), session_id: broker.session.id.clone(),
-            action: json!({"action":"clear"}), state: "accepted".into(), error: None,
+            action: json!({"action":"clear"}), state: "accepted".into(), error: None, exchange_id: None,
             created_at_ms: 1, resume_after_transition: false,
         };
         broker.store.admit_task_operation(&operation).unwrap();
@@ -7155,7 +7172,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.create_task(TaskKind::Plan, "Interrupted".into(), None, None).unwrap();
-        let mut operation = TaskOperation { id: "original".into(), session_id: broker.session.id.clone(), action: json!({"action":"plan","text":"Original"}), state: "running".into(), error: None, created_at_ms: 1, resume_after_transition: false };
+        let mut operation = TaskOperation { id: "original".into(), session_id: broker.session.id.clone(), action: json!({"action":"plan","text":"Original"}), state: "running".into(), error: None, exchange_id: None, created_at_ms: 1, resume_after_transition: false };
         assert!(broker.store.admit_task_operation(&operation).unwrap());
         assert!(!broker.store.admit_task_operation(&operation).unwrap());
         operation.action["text"] = json!("Changed");
@@ -7164,6 +7181,35 @@ mod test {
         assert_eq!(broker.current_task().unwrap().unwrap().status, TaskStatus::Paused);
         assert_eq!(broker.store.load_task_operation(&broker.session.id, "original").unwrap().unwrap().state, "outcome_unknown");
         assert!(broker.store.list_exchange(&broker.session.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn task_failure_remains_inspectable_without_following_a_new_exchange() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"failed-exchange", "session_id":broker.session.id, "agent_id":broker.session.primary_agent_id, "ordinal":1,
+            "prompt":"first", "state":"failed", "created_at_ms":1, "completed_at_ms":2,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        })).unwrap();
+        broker.store.save_exchange(&exchange).unwrap();
+        let operation = crate::task::TaskOperation {
+            id:"failed-operation".into(), session_id:broker.session.id.clone(),
+            action:json!({"action":"plan"}), state:"failed".into(), error:Some("provider failed".into()),
+            exchange_id:Some(exchange.id.clone()), created_at_ms:1, resume_after_transition:false,
+        };
+        broker.store.admit_task_operation(&operation).unwrap();
+        assert_eq!(broker.snapshot().unwrap().task_operation.unwrap()["error"], "provider failed");
+        exchange.id = "next-exchange".into();
+        exchange.ordinal = 2;
+        exchange.state = ExchangeState::Complete;
+        exchange.created_at_ms = 3;
+        exchange.completed_at_ms = Some(4);
+        broker.store.save_exchange(&exchange).unwrap();
+        assert!(broker.snapshot().unwrap().task_operation.is_none());
+        assert_eq!(broker.store.load_task_operation(&broker.session.id, &operation.id).unwrap().unwrap().error,
+            Some("provider failed".into()));
     }
 
 
@@ -7336,12 +7382,79 @@ mod test {
         assert_eq!(execution.verification.len(), 2);
         assert!(execution.baseline_checkpoint.is_some());
         assert_eq!(std::fs::read_to_string(repository.path().join("lib.rs")).unwrap(),"pub struct Existing;\n");
-        assert!(timeline_text(&broker.snapshot().unwrap()).contains("Execution completed"));
+        let exchanges = broker.store.list_exchange(&broker.session.id).unwrap().into_iter()
+            .filter(|exchange| exchange.execution_id.as_deref() == Some(&execution_id))
+            .collect::<Vec<_>>();
+        assert_eq!(exchanges.len(), 4);
+        assert_eq!(exchanges.iter().map(|exchange| exchange.execution_phase.as_ref().unwrap().phase)
+            .collect::<Vec<_>>(), vec![crate::plan::PlanPhase::Implement, crate::plan::PlanPhase::Verify,
+                crate::plan::PlanPhase::Resolve, crate::plan::PlanPhase::Verify]);
+        assert!(exchanges.iter().all(|exchange| exchange.state == ExchangeState::Complete));
+        assert_eq!(exchanges.iter().map(|exchange| &exchange.id).collect::<HashSet<_>>().len(), 4);
+        assert_eq!(exchanges.iter().map(|exchange| exchange.metrics.request_count).collect::<Vec<_>>(), vec![1, 1, 1, 1]);
+        assert_eq!(exchanges.iter().map(|exchange| exchange.usage().input).collect::<Vec<_>>(),
+            vec![Some(100), Some(101), Some(102), Some(103)]);
+        assert_eq!(exchanges.iter().map(|exchange| exchange.usage().output).collect::<Vec<_>>(),
+            vec![Some(20), Some(21), Some(22), Some(23)]);
+        assert_eq!(exchanges.iter().map(|exchange| exchange.turn.iter().flat_map(|turn| turn.tools())
+            .filter(|tool| tool.title == "cargo test").count()).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
+        let text = timeline_text(&broker.snapshot().unwrap());
+        for label in ["Plan accepted:", "Implemented plan", "Verification failed", "Resolved findings", "Verified plan", "Plan complete:"] {
+            assert!(text.contains(label), "missing {label}: {text}");
+        }
+        assert_eq!(text.matches("Plan accepted:").count(), 1);
+        assert!(!text.contains("Accept plan:") && !text.contains("Execution started") && !text.contains("Plan turn complete"));
         let review = broker.capture_plan_review(&revised.id, revised.review_digest.as_deref().unwrap()).unwrap();
         assert!(review.execution_review.unwrap().contains("Verification assessments"));
     }
 
     struct NoProgressExecutionBackend;
+
+    struct StoppedExecutionBackend { cancelled: bool }
+
+    #[async_trait::async_trait]
+    impl Backend for StoppedExecutionBackend {
+        async fn prompt_stream(&self, _: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+            if self.cancelled { return Err(anyhow::Error::new(TurnCancelled)) }
+            anyhow::bail!("provider connection lost")
+        }
+        async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
+            anyhow::bail!("test backend cannot fork")
+        }
+    }
+
+    #[tokio::test]
+    async fn execution_failure_and_cancellation_resume_the_phase_without_accepting_again() {
+        for cancelled in [false, true] {
+            let repository = repository();
+            let data = tempfile::tempdir().unwrap();
+            let mut broker = planning_question_broker(repository.path(), data.path(), false);
+            broker.backend = Arc::from(crate::backend::build(
+                BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+                Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace),
+            ).unwrap());
+            broker.submit_prompt(json!({"text":"/plan add a reusable API"})).await.unwrap();
+            let plan = broker.snapshot().unwrap().active_plan.unwrap();
+            broker.backend = Arc::new(StoppedExecutionBackend { cancelled });
+            let (result, _) = broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})).await.unwrap();
+            assert_eq!(result["execution_error"].as_str().is_some(), !cancelled);
+            let history = broker.store.list_exchange(&broker.session.id).unwrap();
+            let stopped = history.last().unwrap();
+            assert_eq!(stopped.state, if cancelled { ExchangeState::Cancelled } else { ExchangeState::Failed });
+            assert_eq!(stopped.execution_phase.as_ref().unwrap().phase, crate::plan::PlanPhase::Implement);
+            assert_eq!(broker.snapshot().unwrap().goal.unwrap().state, GoalState::Paused);
+            let text = timeline_text(&broker.snapshot().unwrap());
+            assert_eq!(text.contains("Plan failed:"), !cancelled, "{text}");
+            assert_eq!(text.matches("Plan accepted:").count(), 1);
+            let stopped_id = stopped.id.clone();
+            broker.backend = Arc::new(NoProgressExecutionBackend);
+            broker.resume_goal(None, None).await.unwrap();
+            let resumed = broker.store.list_exchange(&broker.session.id).unwrap();
+            assert_ne!(resumed.last().unwrap().id, stopped_id);
+            assert_eq!(resumed.last().unwrap().execution_phase.as_ref().unwrap().phase, crate::plan::PlanPhase::Implement);
+            assert_eq!(timeline_text(&broker.snapshot().unwrap()).matches("Plan accepted:").count(), 1);
+        }
+    }
 
     #[async_trait::async_trait]
     impl Backend for NoProgressExecutionBackend {
@@ -7510,6 +7623,15 @@ mod test {
         async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
+            let address = crate::backend::ProviderAddress {
+                thread_id: "semantic-execution".into(), turn_id: format!("phase-{turn}"),
+            };
+            sink.as_ref().unwrap().send_wait(BackendEvent {
+                received_at_ms: None, address: Some(address.clone()),
+                turn_boundary: Some(crate::backend::TurnBoundary::Started),
+                kind: "turn_started".into(), text: None, data: Value::Null,
+                activity: None, summary: None, task_update: None,
+            }).await?;
             let context = request.control_context.clone().context("missing control context")?;
             let document = context.plan_document.clone().unwrap();
             let mut runtime = ControlToolRuntime::new(context);
@@ -7530,7 +7652,7 @@ mod test {
             } else if phase == "verify" {
                 let id = format!("check-{turn}");
                 sink.as_ref().unwrap().send_wait(BackendEvent {
-            received_at_ms: None, address:None, turn_boundary:None, kind:"tool".into(), text:None, data:Value::Null,
+            received_at_ms: None, address:Some(address.clone()), turn_boundary:None, kind:"tool".into(), text:None, data:Value::Null,
                     activity:Some(crate::backend::ToolActivity { id:id.clone(), kind:crate::backend::ToolActivityKind::Command, title:"cargo test".into(), output:Some(if turn == 1 { "round reset failed" } else { "all checks passed" }.into()), status:Some("completed".into()), change:Default::default(), output_delta:false }), summary:None, task_update:None }).await?;
                 arguments["verification"] = json!({"outcome":if turn == 1 { "failed" } else { "passed" },"evidence":[id],"findings":if turn == 1 { vec!["Round reset retains score"] } else { Vec::<&str>::new() }});
             }
@@ -7557,6 +7679,22 @@ mod test {
             let repeated = runtime.invoke(invocation).await?;
             assert_eq!(first.message, repeated.message);
             assert!(runtime.invoke(ControlToolInvocation { name:"harness_goal_complete".into(), arguments:json!({"summary":"premature"}) }).await.is_err());
+            sink.as_ref().unwrap().send_wait(BackendEvent {
+                received_at_ms: None, address: Some(address.clone()), turn_boundary: None,
+                kind: "usage".into(), text: None,
+                data: json!({"id":format!("usage-{turn}"), "usage": {
+                    "input":100 + turn, "cached_input":10, "reasoning":2, "output":20 + turn
+                }, "cumulative": null, "cumulative_total": null}),
+                activity: None, summary: None, task_update: None,
+            }).await?;
+            sink.as_ref().unwrap().send_wait(BackendEvent {
+                received_at_ms: None, address: Some(address),
+                turn_boundary: Some(crate::backend::TurnBoundary::Finished {
+                    outcome: crate::turn::TurnOutcome::Completed,
+                }),
+                kind: "turn_completed".into(), text: None, data: Value::Null,
+                activity: None, summary: None, task_update: None,
+            }).await?;
             Ok(crate::backend::BackendOutput { backend_session_id:Some("semantic-execution".into()), ..Default::default() })
         }
         async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
@@ -7604,6 +7742,7 @@ mod test {
             kind: ExchangeKind::Chat,
             plan_id: None,
             execution_id: None,
+            execution_phase: None,
             goal_id: None,
             state: ExchangeState::Complete,
             checkpoint_before: None,
@@ -9765,7 +9904,7 @@ mod test {
             .unwrap();
         assert_eq!(
             summary.text.wire_rows().join("").split_whitespace().collect::<Vec<_>>().join(" "),
-            "▸ Thought 1s │ ~200 tok/s │ I 1.0k (90%) · R 100 · O 100 │ 1 req"
+            "● Thought 1s │ ~200 tok/s │ I 1.0k (90%) · R 100 · O 100 │ 1 req"
         );
     }
 

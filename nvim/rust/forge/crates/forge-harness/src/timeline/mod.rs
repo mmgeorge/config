@@ -398,6 +398,7 @@ mod test {
             mode: None,
             plan_id: None,
             execution_id: None,
+            execution_phase: None,
             goal_id: None,
             state: ExchangeState::Complete,
             checkpoint_before: None,

@@ -52,11 +52,12 @@ impl ChangeTree {
         let patch = match UnifiedPatch::parse(text) {
             Ok(patch) => patch,
             Err(error) => {
-                let block = renderer.literal(
+                let mut block = renderer.literal(
                     BlockId(id.into()),
-                    &format!("▸ {label}: preview unavailable ({error})"),
+                    &format!("◇ {label}: preview unavailable ({error})"),
                     2,
                 )?;
+                TranscriptRenderer::heading_marker(&mut block, "Normal");
                 tree.push_action(block, TranscriptAction::Diff { text: text.into() })?;
                 return Ok(tree);
             }
@@ -85,6 +86,7 @@ impl ChangeTree {
             if count == 1 { unit.into() } else { format!("{unit}s") }
         );
         let mut heading = renderer.literal(BlockId(id.into()), &summary, 2)?;
+        TranscriptRenderer::heading_marker(&mut heading, "Normal");
         decorate_counts(&mut heading, added, removed);
         tree.push_action(heading, TranscriptAction::Diff { text: text.into() })?;
         for (file_index, file) in patch.file.iter().enumerate() {
@@ -281,6 +283,10 @@ impl ChangeTree {
             start == 0,
         );
         self.block[start].metadata.fold[0].expand_children = expand_children;
+        if start == 0 || expand_children {
+            TranscriptRenderer::fold_marker(&mut self.block[start]);
+            if expand_children { self.block[start].metadata.layout.as_mut().unwrap().indent = 4; }
+        }
         Ok(())
     }
 }
@@ -402,6 +408,9 @@ mod tests {
         let file = &tree.block[1];
         let hunk = &tree.block[2];
         assert!(file.metadata.fold[0].expand_children);
+        assert_eq!(tree.block[0].metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "▸");
+        assert_eq!(file.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "▸");
+        assert!(hunk.metadata.layout.as_ref().is_none_or(|layout| layout.marker.is_none()));
         assert!(!hunk.metadata.fold[0].expand_children && !tree.block[0].metadata.fold[0].expand_children);
         assert_eq!(file.text.row(0), Some("Modified test.rs +1 -1"));
         assert_eq!(hunk.text.row(0), Some("@@ -10,2 +20,2 @@ fn test"));

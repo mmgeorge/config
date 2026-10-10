@@ -33,7 +33,7 @@ function M.install(buffer, namespace, start_row, count, layout)
     local options = { priority = 200, right_gravity = true, strict = true }
     local marker = row == 0 and layout.marker or nil
     if marker == vim.NIL then marker = nil end
-    if marker and layout.indent == 2 then
+    if marker and marker.text ~= "▸" and layout.indent == 2 then
       options.sign_text, options.sign_hl_group = marker.text, marker.capture
     end
     local prefix = M.prefix(layout, false)
@@ -44,7 +44,7 @@ function M.install(buffer, namespace, start_row, count, layout)
     if options.sign_text or options.virt_text then
       marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row + row, 0, options)
     end
-    if marker and layout.indent > 2 then
+    if marker and marker.text ~= "▸" and layout.indent > 2 then
       marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row + row, 0, {
         virt_text = { { marker.text, marker.capture } }, virt_text_win_col = layout.indent - 4,
         priority = 201, right_gravity = true, strict = true,
@@ -52,6 +52,19 @@ function M.install(buffer, namespace, start_row, count, layout)
     end
   end
   return marks
+end
+
+function M.draw_fold(window, buffer, namespace, row, layout)
+  local marker = layout and layout.marker
+  if not marker or marker == vim.NIL or marker.text ~= "▸" or layout.indent == 2 then return end
+  local closed = vim.api.nvim_eval_statusline("%{foldclosed(v:lnum)}", {
+    winid = window, use_statuscol_lnum = row + 1,
+  }).str
+  if closed ~= "-1" then return end
+  vim.api.nvim_buf_set_extmark(buffer, namespace, row, 0, {
+    ephemeral = true, priority = 201,
+    virt_text = { { "▾", marker.capture } }, virt_text_win_col = layout.indent - 4,
+  })
 end
 
 return M

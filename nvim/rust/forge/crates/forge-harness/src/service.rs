@@ -945,7 +945,7 @@ fn admit_task_intent(controller: &SessionController, session_id: &str, request: 
         else if matches!(action, "plan" | "execute" | "goal" | "fork" | "attach_plan" | "resume") { true }
         else { running_intent };
     let operation = crate::task::TaskOperation {
-        id, session_id: session_id.to_owned(), action: request.params.clone(), state: "admitted".into(), error: None,
+        id, session_id: session_id.to_owned(), action: request.params.clone(), state: "admitted".into(), error: None, exchange_id: None,
         created_at_ms: SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64,
         resume_after_transition,
     };
@@ -969,10 +969,15 @@ async fn route_task_transition(
         return Ok(());
     }
     operation.state = "accepted".into();
+    operation.exchange_id = store.list_exchange(&session_id)?.last().map(|exchange| exchange.id.clone());
     sink.send_control_wait(Message::Response(Response::success(request.id, json!({"id":operation.id,"state":operation.state}))?)).await?;
     let result = execute_task_transition(&registry, &controller, &mut operation, &mut store, sink).await;
     match result {
         Ok(()) => if operation.state != "superseded" { operation.state = "completed".into(); },
+        Err(error) if error.is::<crate::broker::TurnCancelled>() => {
+            operation.state = "cancelled".into();
+            operation.error = None;
+        }
         Err(error) => { operation.state = "failed".into(); operation.error = Some(format!("{error:#}")); }
     }
     if let Err(error) = store.save_task_operation(&operation) {
@@ -1025,6 +1030,7 @@ async fn execute_task_transition(
                 .await.context("previous execution did not finish finalization within 10s. Inspect task state before resuming")??
         }
     };
+    operation.exchange_id = store.list_exchange(&operation.session_id)?.last().map(|exchange| exchange.id.clone());
     if store.latest_task_operation(&operation.session_id)?.is_none_or(|latest| latest.id != operation.id) {
         operation.state = "superseded".into();
         return Ok(());
@@ -1056,6 +1062,7 @@ async fn execute_task_transition(
     drop(broker);
     let _ = stop.send(());
     heartbeat.await?;
+    operation.exchange_id = store.list_exchange(&operation.session_id)?.last().map(|exchange| exchange.id.clone());
     outcome?;
     drop(execution);
     let _ = registry;
@@ -1084,7 +1091,12 @@ async fn dispatch_task_attempt(broker: &mut HarnessBroker, session_id: &str, req
     forwarder.await??;
     let continuing = result.event.iter().any(|event| event.event == "goal_continue_requested");
     for event in result.event { sink.send_event(event).await?; }
-    if let Some(failure) = result.response.error() { anyhow::bail!("{}", failure.message); }
+    if let Some(failure) = result.response.error() {
+        if matches!(failure.code.as_str(), "turn_cancelled" | "turn_retracted") {
+            return Err(anyhow::Error::new(crate::broker::TurnCancelled));
+        }
+        anyhow::bail!("{}", failure.message);
+    }
     Ok(continuing)
 }
 

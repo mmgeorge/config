@@ -29,6 +29,7 @@ function M.transition(state, action, refresh, settled, admitted)
   local operation = { id = identity, action = action.action, config = action.config, state = "submitting" }
   state.task_operation = operation
   state.execution_notice = nil
+  state.execution_notice_operation = nil
   state.queue_suspended = true
   local function current()
     return state.session and state.session.id == session_id and state.task_operation == operation
@@ -68,12 +69,13 @@ function M.transition(state, action, refresh, settled, admitted)
       operation.admitted = true
       if admitted then admitted() end
     end
-    if result.state == "completed" or result.state == "failed" or result.state == "superseded" or result.state == "outcome_unknown" then
+    if result.state == "completed" or result.state == "cancelled" or result.state == "failed" or result.state == "superseded" or result.state == "outcome_unknown" then
       state.task_operation = nil
       local message = result.error ~= vim.NIL and result.error or nil
       if result.state == "failed" or result.state == "outcome_unknown" then
         message = message or "Task transition failed"
         state.execution_notice = message
+        state.execution_notice_operation = { id = operation.id, message = message }
         notifications.error(message, "Harness task")
       end
       settled(message)

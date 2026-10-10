@@ -97,6 +97,13 @@ local ok, failure = xpcall(function()
   hold = true
   vim.api.nvim_win_set_cursor(window, { math.floor(initial / 2) + 4, 0 })
   vim.cmd("normal! zt")
+  local picker = vim.api.nvim_open_win(composer, true, {
+    relative = "editor", row = 2, col = 2, width = 30, height = 4, style = "minimal",
+  })
+  owner.observe_sections()
+  assert(#pending == 0, "approval picker triggered background paging")
+  vim.api.nvim_win_close(picker, true)
+  vim.api.nvim_set_current_win(window)
   owner.observe_sections()
   assert(#pending == 1, "one-screen lead did not request the next page")
   for _ = 1, 8 do owner.observe_sections() end
@@ -124,6 +131,21 @@ local ok, failure = xpcall(function()
   assert(vim.wait(1000, settled, 1))
   assert(vim.fn.foldclosed(1) == 1)
   assert(#notices == 0, table.concat(notices, "\n"))
+
+  assert(owner.toggle_heading(window))
+  assert(vim.wait(1000, function() return settled() and vim.fn.foldclosed(1) == -1 end, 1))
+  vim.api.nvim_win_set_cursor(window, { loaded - math.floor(initial / 2) + 4, 0 })
+  vim.cmd("normal! zt")
+  owner.observe_sections()
+  assert(#pending == 1)
+  delivery = table.remove(pending, 1)
+  delivery.callback(nil, "section exceeds the 16 MiB loaded-body limit")
+  local failed_pages = page_count()
+  for _ = 1, 20 do owner.observe_sections() end
+  assert(page_count() == failed_pages and #pending == 0, "failed page cascaded into automatic retries")
+  assert(#notices == 1, table.concat(notices, "\n"))
+  owner.set_section("file", true, true)
+  assert(#pending == 1, "explicit retry was blocked")
 end, debug.traceback)
 if owner then owner.close() end
 assert(ok, failure)

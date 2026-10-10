@@ -564,6 +564,19 @@ function M.refresh(session)
   session.fold.changed = {}
 end
 
+function M.sign()
+  if vim.v.virtnum ~= 0 then return "  " end
+  local window = tonumber(vim.g.statusline_winid) or vim.api.nvim_get_current_win()
+  local session = sessions[vim.api.nvim_win_get_buf(window)]
+  if not session or session.status ~= "Applied" or session.applying then return "  " end
+  local location = require("forge.buffer").locate(session, vim.v.lnum - 1, 0)
+  local node = location and session.sequence.node[location.block]
+  local layout = node and location.position.row == 0 and node.entry.metadata.layout
+  local marker = layout and layout.marker
+  if not marker or marker == vim.NIL or layout.indent ~= 2 then return "  " end
+  return "%#" .. marker.capture .. "#" .. (marker.text == "▸" and "%C" or marker.text .. " ") .. "%*"
+end
+
 ---@return string|table[]
 function M.text()
   local buffer = vim.api.nvim_get_current_buf()

@@ -6,6 +6,7 @@ local perf = require("forge.infra.perf")
 local transcript_options = {
   margin = 0,
   scrolloff = 3,
+    fold_markers = true,
   conceal = { level = 3, cursor = "nvic" },
   columns = { signcolumn = "yes:1", statuscolumn = "%s" },
   wrapping = { indent = true, options = "shift:0" },
@@ -303,6 +304,8 @@ function M.open(options, callback)
     if not alive() or not owner.ready then return end
     local view = selected_view or action_view()
     if not view then return end
+    owner.section_failure = owner.section_failure or {}
+    owner.section_failure[section] = nil
     owner.section_intent = owner.section_intent or {}
     local intent = owner.section_intent[view.id] or {}
     owner.section_intent[view.id] = intent
@@ -328,6 +331,7 @@ function M.open(options, callback)
       if active and active.sequence ~= sequence then return end
       if failure then
         owner.section_inflight[section] = nil
+        owner.section_failure[section] = failure
         for window in pairs(owner.transcript.fold_loading) do clear_opening(window, section) end
         intent[section] = nil
         if owner.section_page then owner.section_page[section] = nil end
@@ -363,6 +367,7 @@ function M.open(options, callback)
 
   function owner.observe_sections()
     if not alive() or not owner.ready or owner.applying or owner.transcript.update_pending then return end
+    if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then return end
     owner.section_page = owner.section_page or {}
     local admitted = 0
     for window, view in pairs(owner.views) do
@@ -388,14 +393,16 @@ function M.open(options, callback)
                 if admitted >= 8 then return end
                 local loading = owner.transcript.fold_loading[window]
                 local active = owner.section_inflight and owner.section_inflight[section.id]
+                local failed = owner.section_failure and owner.section_failure[section.id]
                 if not active and not (loading and loading[section.id]) then
                   local expanded = closed == -1
                   local intent = owner.section_intent and owner.section_intent[view.id] or {}
                   if not section.more and row <= last and ((intent[section.id] ~= nil and intent[section.id] ~= expanded)
-                    or (intent[section.id] == nil and expanded ~= section.open)) then
+                    or (intent[section.id] == nil and expanded ~= section.open)) and (not expanded or not failed) then
                     admitted = admitted + 1
                     owner.set_section(section.id, expanded, false, view)
                   elseif expanded and section.more and intent[section.id] ~= false
+                    and not failed
                     and owner.section_page[section.id] ~= section.revision then
                     owner.section_page[section.id] = section.revision
                     admitted = admitted + 1

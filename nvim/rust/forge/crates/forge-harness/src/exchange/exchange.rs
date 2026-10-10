@@ -14,7 +14,14 @@ pub enum ExchangeKind {
     PlanExecution,
 }
 
-/// Represents one admitted user action and every backend turn it caused.
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Retains one phase attempt independently of later execution transitions.
+pub struct ExecutionPhase {
+    pub phase: crate::plan::PlanPhase,
+    pub outcome: Option<crate::plan::execution::VerificationOutcome>,
+}
+
+/// Owns one admitted action or plan phase and its backend turns.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Exchange {
     /// Durable failure that keeps cleanup retryable without replaying execution.
@@ -41,6 +48,8 @@ pub struct Exchange {
     pub plan_id: Option<String>,
     #[serde(default)]
     pub execution_id: Option<String>,
+    #[serde(default)]
+    pub execution_phase: Option<ExecutionPhase>,
     #[serde(default)]
     /// Goal whose lifecycle caused this exchange.
     pub goal_id: Option<String>,
@@ -100,6 +109,7 @@ impl Exchange {
             mode: None,
             plan_id: None,
             execution_id: None,
+            execution_phase: None,
             goal_id: None,
             state: ExchangeState::Queued,
             disposition: HistoryDisposition::Current,
@@ -642,6 +652,7 @@ mod test {
             mode: None,
             plan_id: None,
             execution_id: None,
+            execution_phase: None,
             goal_id: None,
             state: ExchangeState::Running,
             checkpoint_before: None,

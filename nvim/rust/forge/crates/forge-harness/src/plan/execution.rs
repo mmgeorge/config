@@ -249,6 +249,8 @@ pub struct ExecutionRevision {
 #[serde(tag = "kind", rename_all = "snake_case")]
 /// Describes a durable execution event for the native timeline.
 pub enum PlanExecutionLifecycleEvent {
+    Completed { title: String },
+    Failed { title: String, reason: String },
     Phase {
         title: String,
         phase: PlanPhase,

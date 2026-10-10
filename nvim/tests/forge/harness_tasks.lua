@@ -61,10 +61,19 @@ assert(state.execution_notice == nil, "a successful status read retained the tra
 task.receive(state, { id = polled.params.operation_id, state = "completed" })
 assert(settled == 4)
 
+begin({ action = "resume" })
+local cancelled = requests[#requests]
+task.receive(state, { id = cancelled.params.operation_id, state = "cancelled" })
+assert(settled == 5 and state.task_operation == nil and state.execution_notice == nil,
+  "user cancellation did not settle cleanly")
+local failure_count = #failures
+task.receive(state, { id = cancelled.params.operation_id, state = "cancelled" })
+assert(settled == 5 and #failures == failure_count, "duplicate cancellation caused an error")
+
 begin({ action = "execute", plan_id = "plan" })
 local old_conversation = requests[#requests]
 state.session = { id = "another-conversation" }
 old_conversation.reply({ state = "completed" })
-assert(settled == 4, "old conversation callback must not settle current state")
+assert(settled == 5, "old conversation callback must not settle current state")
 print("harness_tasks: passed")
 vim.cmd("qa!")

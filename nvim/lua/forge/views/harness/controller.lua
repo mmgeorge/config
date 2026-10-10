@@ -391,6 +391,7 @@ local function set_busy(busy)
   state.busy = busy
   if busy then
     state.execution_notice = nil
+    state.execution_notice_operation = nil
     if state.working_started_ns then return end
     state.working_started_ns = vim.uv.hrtime()
     state.working_timer = vim.uv.new_timer()

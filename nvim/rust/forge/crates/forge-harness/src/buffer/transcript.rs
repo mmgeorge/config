@@ -90,7 +90,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             source.len() <= 1024 * 1024,
             "prompt exceeds transcript capacity"
         );
-        let mut block = self.literal(id, &format!("▸ {source}"), 2)?;
+        let mut block = self.literal(id, &format!("● {source}"), 2)?;
         block.metadata.decoration.push(Decoration {
             range: TextRange {
                 start: TextPosition { row: 0, column: 0 },
@@ -162,11 +162,13 @@ impl<'profile> TranscriptRenderer<'profile> {
     }
 
     pub fn heading_marker(block: &mut BufferBlock, capture: &str) {
-        if block.text.row(0).is_some_and(|row| row.starts_with("▸ ")) {
+        if let Some(marker) = block.text.row(0).and_then(|row| {
+            ["▸", "◇", "●"].into_iter().find(|marker| row.starts_with(&format!("{marker} ")))
+        }) {
             block.metadata.layout = Some(ContentLayout {
                 indent: 2,
                 source_indent: 0,
-                marker: Some(TextChunk { text: "▸".into(), capture: capture.into() }),
+                marker: Some(TextChunk { text: marker.into(), capture: capture.into() }),
             });
             block.metadata.conceal.push(Conceal {
                 range: TextRange { start: TextPosition { row: 0, column: 0 },
@@ -174,6 +176,33 @@ impl<'profile> TranscriptRenderer<'profile> {
                 replacement: String::new(), line: false, priority: 100,
             });
         }
+    }
+
+    /// Assigns a fold affordance while preserving tool dots and diff hunk labels.
+    pub(super) fn fold_marker(block: &mut BufferBlock) {
+        let heading = block.text.row(0).unwrap_or("").trim_start();
+        if heading.starts_with('•') || heading.starts_with("@@") { return; }
+        let layout = block.metadata.layout.get_or_insert(ContentLayout {
+            indent: 2, source_indent: 0, marker: None,
+        });
+        let capture = layout.marker.as_ref().map_or("Normal", |marker| marker.capture.as_str()).to_owned();
+        layout.marker = Some(TextChunk { text: "▸".into(), capture });
+    }
+
+    /// Resolves bodyless headings to events without shifting their byte coordinates.
+    pub(super) fn resolve_marker(block: &mut BufferBlock) -> Result<()> {
+        let Some(marker) = block.metadata.layout.as_mut().and_then(|layout| layout.marker.as_mut()) else {
+            return Ok(());
+        };
+        if marker.text == "▸" && block.metadata.fold.is_empty() { marker.text = "◇".into(); }
+        let Some(first) = block.text.row(0) else { return Ok(()); };
+        if ["▸ ", "◇ ", "● "].iter().any(|prefix| first.starts_with(prefix))
+            && !first.starts_with(&marker.text) {
+            let mut rows = block.text.wire_rows().iter().map(|row| (*row).to_owned()).collect::<Vec<_>>();
+            rows[0].replace_range(.."▸".len(), &marker.text);
+            block.text = BufferText::from_rows(rows)?;
+        }
+        Ok(())
     }
 
     /// Render a call's observed runtime and output without changing its saved title or output.
@@ -550,7 +579,7 @@ mod test {
         let profile = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&profile)?;
         let block = renderer.prompt(BlockId("prompt:1".into()), "**literal** [name](url)")?;
-        assert_eq!(block.text.row(0), Some("▸ **literal** [name](url)"));
+        assert_eq!(block.text.row(0), Some("● **literal** [name](url)"));
         assert!(block.metadata.editable_region.is_empty());
         assert!(block.metadata.target.is_empty());
         assert_eq!(block.metadata.decoration[0].capture, "ForgeHarnessPrompt");
@@ -806,7 +835,7 @@ mod test {
             ..WidthProfile::default()
         };
         let block = TranscriptRenderer::new(&profile)?.prompt(BlockId("prompt:1".into()), "abc")?;
-        assert_eq!(block.text.wire_rows().concat(), "▸ abc");
+        assert_eq!(block.text.wire_rows().concat(), "● abc");
         assert_eq!(
             block.metadata.decoration[0].range.end.row,
             block.text.row_count()
@@ -823,7 +852,7 @@ mod test {
         let block = TranscriptRenderer::new(&profile)?
             .prompt(BlockId("prompt:wrapped".into()), "alpha beta gamma")?;
 
-        assert_eq!(block.text.wire_rows(), vec!["▸ alpha ", "  beta gamma"]);
+        assert_eq!(block.text.wire_rows(), vec!["● alpha ", "  beta gamma"]);
         assert_eq!(block.metadata.decoration[0].range.end.row, 2);
         block.validate()?;
         Ok(())

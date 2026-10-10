@@ -1696,6 +1696,7 @@ mod tests {
             mode: None,
             plan_id: None,
             execution_id: None,
+            execution_phase: None,
             goal_id: None,
             state: ExchangeState::Running,
             checkpoint_before: None,

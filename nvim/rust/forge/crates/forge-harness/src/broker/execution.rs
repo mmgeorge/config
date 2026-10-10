@@ -190,6 +190,7 @@ impl HarnessBroker {
         );
         let now_ms = self.clock.now_ms();
         let title;
+        let phase_completion = matches!(&operation, ExecutionOperation::Phase(_));
         match operation {
             ExecutionOperation::Inspect => {
                 let mut response = execution.response();
@@ -269,7 +270,7 @@ impl HarnessBroker {
                 plan.document_version = document.version;
                 plan.updated_at_ms = now_ms;
                 self.store
-                    .save_execution_transition(&execution, &goal, Some(&plan))?;
+                    .save_execution_transition(&execution, &goal, Some(&plan), None)?;
                 return Ok(
                     json!({"result":"draft_saved","version":document.version,"document":document,"execution":execution.response()}),
                 );
@@ -450,13 +451,21 @@ impl HarnessBroker {
                 execution.progress = progress.clone();
                 self.store.save_plan_execution(&execution)?;
                 execution.finish_phase(request, progress, now_ms)?;
+                if let Some(phase) = &mut interaction.execution_phase {
+                    use crate::plan::execution::VerificationOutcome;
+                    phase.outcome = Some(match (execution.state, execution.phase) {
+                        (PlanExecutionState::Blocked, _) => VerificationOutcome::Blocked,
+                        (_, crate::plan::PlanPhase::Resolve) => VerificationOutcome::Failed,
+                        _ => VerificationOutcome::Passed,
+                    });
+                }
                 goal.state = match execution.state {
                     PlanExecutionState::Complete => GoalState::Complete,
                     PlanExecutionState::Blocked => GoalState::Blocked,
                     _ => GoalState::Active,
                 };
                 title = match (execution.state, execution.phase) {
-                    (PlanExecutionState::Complete, _) => "Execution completed",
+                    (PlanExecutionState::Complete, _) => "Plan complete",
                     (PlanExecutionState::Blocked, _) => "Verification blocked",
                     (_, crate::plan::PlanPhase::Verify) => "Ready for verification",
                     (_, crate::plan::PlanPhase::Resolve) => "Resolving verification findings",
@@ -494,30 +503,48 @@ impl HarnessBroker {
         }
         goal.updated_at_ms = now_ms;
         plan.updated_at_ms = now_ms;
-        execution.append_lifecycle(
-            crate::plan::ExchangeAnchor::capture(interaction),
-            now_ms,
-            PlanExecutionLifecycleEvent::Phase {
-                title: title.into(),
-                phase: execution.phase,
-                revision: if plan.state == PlanState::AwaitingReview {
-                    plan.model_revision
+        if !phase_completion || execution.state == PlanExecutionState::Complete {
+            execution.append_lifecycle(
+                crate::plan::ExchangeAnchor::capture(interaction),
+                now_ms,
+                if phase_completion {
+                    PlanExecutionLifecycleEvent::Completed { title: plan.title.clone() }
                 } else {
-                    execution.revision
+                    PlanExecutionLifecycleEvent::Phase {
+                        title: title.into(), phase: execution.phase,
+                        revision: if plan.state == PlanState::AwaitingReview {
+                            plan.model_revision
+                        } else {
+                            execution.revision
+                        },
+                        state: execution.state,
+                    }
                 },
-                state: execution.state,
-            },
-        );
-        self.store.save_exchange(interaction)?;
+            );
+        }
         self.store
-            .save_execution_transition(&execution, &goal, Some(&plan))?;
+            .save_execution_transition(&execution, &goal, Some(&plan), Some(interaction))?;
         let mut response = execution.response();
         response["result"] = json!("transitioned");
-        response["instructions"] = json!(format!(
+        response["instructions"] = if phase_completion { json!(
+            "End this turn now. Do not start the next phase. Forge will start a separate exchange with its instructions."
+        ) } else { json!(format!(
             "End this turn. Forge will continue with the persisted state. {}",
             execution.instructions()
-        ));
+        )) };
         Ok(response)
+    }
+
+    pub(super) fn record_execution_failure(&mut self, interaction: &Exchange, reason: String) -> Result<()> {
+        let Some(execution_id) = &interaction.execution_id else { return Ok(()) };
+        let mut execution = self.store.load_plan_execution(execution_id)?.context("execution is missing")?;
+        if execution.state == PlanExecutionState::Complete { return Ok(()) }
+        let plan = self.store.load_plan(&execution.plan_id)?.context("execution plan is missing")?;
+        execution.append_lifecycle(
+            crate::plan::ExchangeAnchor::capture(interaction), self.clock.now_ms(),
+            PlanExecutionLifecycleEvent::Failed { title: plan.title, reason },
+        );
+        self.store.save_plan_execution(&execution)
     }
 
     pub(super) fn observe_plan_progress(&mut self, interaction: &Exchange) -> Result<bool> {
@@ -659,7 +686,7 @@ impl HarnessBroker {
             execution.completed_at_ms = None;
         }
         self.store
-            .save_execution_transition(&execution, goal, None)?;
+            .save_execution_transition(&execution, goal, None, None)?;
         Ok(())
     }
 }

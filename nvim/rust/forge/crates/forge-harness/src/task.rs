@@ -147,6 +147,9 @@ pub struct TaskOperation {
     pub state: String,
     /// Failure detail retained for reconnect and inspection.
     pub error: Option<String>,
+    #[serde(default)]
+    /// Exchange current when the operation settled, bounding its status to that attempt.
+    pub exchange_id: Option<String>,
     /// Admission time in Unix milliseconds.
     pub created_at_ms: i64,
     #[serde(default)]

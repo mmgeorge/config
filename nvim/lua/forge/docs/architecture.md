@@ -541,6 +541,14 @@ this document focused on architecture.
 
 ### Harness timeline ownership
 
+Timeline prompts use `●`, non-foldable response summaries use `●`, and lifecycle rows use `◇`. Only fold headings use
+`▸` when closed and `▾` when open. Rust assigns markers from actual fold ownership, including
+file headings. Response summaries retain `●` until they own foldable content. Tool calls
+retain `•`, and hunk headers retain their ForgeStatus presentation without arrows.
+Neovim renders fold direction per window through its native fold column and visible-row
+decorations. Native fold commands and split windows update indicators without rewriting the
+shared buffer. Collapsed labels retain the same indentation and marker column as open headings.
+
 Transcript presentation follows the final row after updates whenever the current buffer is not
 the transcript. Focus, rather than the previous cursor row or row-count growth, controls automatic
 following. Leaving the transcript resumes following immediately. Focused transcript readers retain
@@ -661,7 +669,11 @@ end boundary is within one screen below the viewport. File headings never reques
 A page also has a 64 KiB byte budget to bound unusually long lines, and larger hunks continue
 in the next batch. Loaded rows remain stable across resizing, and each file admits one outstanding
 request until its response is published. Other section bodies grow in 64 KiB pages. All loaded
-bodies retain the 16 MiB safety limit. The viewport admits at most eight section requests per pass.
+bodies retain the 16 MiB safety limit. Nested sections outside a file own independent page
+budgets, so an expanded parent cannot prevent a child page from making progress. The viewport
+admits at most eight section requests per pass and suspends prefetch while another buffer has
+focus. A failed section reports its error once and stops automatic requests until the user
+explicitly retries or closes and reopens it.
 A failed request produces a visible notice and remains retryable. Section sequences reject delayed requests, and document identities reject
 requests from a previous presentation lifetime. Neovim's native search covers loaded text.
 
@@ -1687,6 +1699,15 @@ press the commit key
 **Design and review through Harness**
 
 Planning captures an immutable declaration baseline. Approval records the reviewed design, creates its execution goal, and starts the Implement phase.
+
+Each Implement, Verify, and Resolve attempt owns a persisted exchange and independent metrics.
+Acceptance appears once before the first implementation heading, without a synthetic user prompt.
+Phase completion commits the exchange's phase outcome together with the execution and goal state.
+The broker finishes that exchange after the provider turn settles and admits the next phase into a
+new exchange. Failed verification enters Resolve. Only successful verification emits Plan complete,
+outside the final phase fold. A provider failure emits Plan failed with its reason, while cancellation
+and blocked verification retain their distinct outcomes. Pauses and interruptions retain the execution phase. Recovery resumes
+that saved phase without repeating acceptance or adding tokens and tools to a completed phase.
 
 ```
 :ForgeHarness -> multiline composer -> /plan <request>
@@ -5107,6 +5128,11 @@ cleanup. Catalog and snapshot readers cannot cause an idle permission change to 
 provider. Cleanup after the steering receiver has settled is a no-op, while steering input still
 requires an active receiver. The execution permit remains held through finalization and delivery.
 `task.operation` queries the original ID after uncertain acknowledgement and never replays it.
+User cancellation remains a cancelled operation across broker and service error boundaries.
+The coordinator associates each settled operation with its exchange while holding execution
+admission. Snapshots show terminal operation status only while that exchange is current,
+while direct operation queries retain the historical outcome. Lua clears a superseded
+operation notice without clearing a newer unrelated diagnostic.
 Failed status reads preserve the admitted operation state and retry with a visible diagnostic.
 Resuming an execution with a pending plan revision restores its review wait without starting
 the provider or treating the unmet review prerequisite as an execution failure.
