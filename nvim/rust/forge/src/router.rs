@@ -1286,7 +1286,7 @@ async fn send_status_update(
         sink.send_wait(message).await?;
         return Ok(());
     }
-    let _permit = sink.begin_transfer()?;
+    let _permit = sink.begin_transfer().await?;
     let transfer = forge_protocol::transfer::JsonTransfer::new(&message)?;
     let complete =
         json!({"part_count": transfer.part_count(), "total_bytes": transfer.total_bytes()});

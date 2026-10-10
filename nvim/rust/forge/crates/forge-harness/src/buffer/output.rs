@@ -17,7 +17,6 @@ pub struct OutputDocument {
     output: ToolOutputSnapshot,
     export: Option<OwnedToolExport>,
     complete: bool,
-    retained: usize,
 }
 
 #[derive(Serialize)]
@@ -34,7 +33,6 @@ impl OutputDocument {
             output,
             export: None,
             complete: false,
-            retained: 0,
         })
     }
 
@@ -42,14 +40,9 @@ impl OutputDocument {
         self.document.snapshot()
     }
 
-    pub fn retained_bytes(&self) -> usize {
-        self.output.retained_bytes() + self.retained
-    }
-
     pub fn demand(
         &mut self,
         revision: DocumentRevision,
-        available: usize,
     ) -> Result<OutputDelivery> {
         ensure!(
             self.document.revision() == revision,
@@ -69,15 +62,6 @@ impl OutputDocument {
             });
         };
         let text = BufferText::from_rows(&batch.row)?;
-        let retained = text.byte_count() + batch.row.len() * 32;
-        ensure!(
-            retained <= available,
-            "tool view capacity is full, complete export remains available"
-        );
-        ensure!(
-            self.retained + retained <= 48 * 1024 * 1024,
-            "expanded output exceeds 48 MiB, complete export remains available"
-        );
         let block = BufferBlock {
             id: BlockId(format!("tool:output:{}", batch.start_row)),
             text,
@@ -87,7 +71,6 @@ impl OutputDocument {
         let patch = self.document.edit(end..end, vec![block])?;
         self.output.accept_batch(&batch)?;
         self.complete = batch.complete;
-        self.retained += retained;
         Ok(OutputDelivery {
             patch,
             more: !self.complete,
@@ -132,10 +115,10 @@ mod tests {
             .collect::<String>();
         let output = ToolOutputView::new("call".into(), &source)?;
         let mut document = OutputDocument::new(DocumentId("tool:test".into()), output.snapshot()?)?;
-        assert!(document.demand(DocumentRevision(1), usize::MAX).is_err());
+        assert!(document.demand(DocumentRevision(1)).is_err());
         let mut revision = DocumentRevision(0);
         loop {
-            let delivery = document.demand(revision, usize::MAX)?;
+            let delivery = document.demand(revision)?;
             if let Some(patch) = delivery.patch {
                 assert!(patch.next_rows - patch.base_rows <= 256);
                 revision = patch.next;

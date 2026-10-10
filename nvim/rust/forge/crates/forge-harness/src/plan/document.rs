@@ -729,17 +729,30 @@ impl PlanDocument {
 
     /// Serialize the semantic planning surface without Harness-derived state.
     pub fn model_json(&self) -> Result<String> {
-        if let Some(design) = &self.design {
-            return Ok(serde_json::to_string_pretty(&serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"document":design.document,"declaration_files":design.read(None,false)?}))?);
+        Ok(serde_json::to_string_pretty(&self.model_value()?)?)
+    }
+
+    /// Omit deferred verification instructions from an Implement handoff.
+    pub(crate) fn execution_json(&self, phase: super::PlanPhase) -> Result<String> {
+        let mut value = self.model_value()?;
+        if phase == super::PlanPhase::Implement {
+            if let Some(document) = value.get_mut("document").and_then(serde_json::Value::as_object_mut) {
+                document.remove("verification");
+            }
         }
-        let mut value = serde_json::to_value(self)?;
-        value
-            .as_object_mut()
-            .expect("PlanDocument serializes as an object")
-            .remove("prompt");
-        hide_derived_state(&mut value);
         Ok(serde_json::to_string_pretty(&value)?)
     }
+
+    fn model_value(&self) -> Result<serde_json::Value> {
+        if let Some(design) = &self.design {
+            return Ok(serde_json::json!({"plan_id":self.plan_id,"version":self.version,"title":self.title,"request":self.prompt,"document":design.document,"declaration_files":design.read(None,false)?}));
+        }
+        let mut value = serde_json::to_value(self)?;
+        value.as_object_mut().expect("PlanDocument serializes as an object").remove("prompt");
+        hide_derived_state(&mut value);
+        Ok(value)
+    }
+
 }
 
 fn hide_derived_state(value: &mut serde_json::Value) {

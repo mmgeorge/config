@@ -8,9 +8,6 @@ use forge_buffer::identity::{BlockId, DocumentId};
 use forge_buffer::patch::{BufferPatch, BufferSnapshot};
 use forge_buffer::view::DocumentViews;
 
-const MAX_DOCUMENT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_DOCUMENT_BLOCKS: usize = 65_536;
-
 pub struct TranscriptEntry {
     pub id: String,
     pub block: Vec<BufferBlock>,
@@ -287,11 +284,6 @@ impl TranscriptDocument {
             "transcript requires a new canonical snapshot"
         );
         self.mark_block_dirty(&block.id);
-        let index = self
-            .document
-            .block_index(&block.id)
-            .context("unknown active transcript block")?;
-        self.check_capacity(index..index + 1, std::slice::from_ref(&block))?;
         Ok(self.document.replace_block(block)?)
     }
 
@@ -317,15 +309,12 @@ impl TranscriptDocument {
                 let start = self.document.block_index(&anchor).context("tool body anchor is missing")?;
                 let entry = self.entry_range(index)?;
                 ensure!(start >= entry.start && start + removed <= entry.end, "tool body exceeds its owner");
-                self.check_capacity(start..start + removed,&block)?;
                 let inserted = block.len();
                 let patch = self.document.splice(start..start + removed,block)?;
                 self.entry[index].blocks = self.entry[index].blocks - removed + inserted;
                 Ok(patch)
             }
             TranscriptChange::Block { block } => {
-                let index = self.document.block_index(&block.id).context("unknown transcript block")?;
-                self.check_capacity(index..index + 1, std::slice::from_ref(&block))?;
                 Ok(self.document.replace_block(block)?)
             }
             TranscriptChange::Insert { index, entry } => {
@@ -340,7 +329,6 @@ impl TranscriptDocument {
                 } else {
                     self.entry_range(index)?.start
                 };
-                self.check_capacity(start..start, &entry.block)?;
                 let position = EntryPosition {
                     id: entry.id,
                     first: entry.block[0].id.clone(),
@@ -360,7 +348,6 @@ impl TranscriptDocument {
                     "transcript replacement identity differs"
                 );
                 let range = self.entry_range(index)?;
-                self.check_capacity(range.clone(), &entry.block)?;
                 let mut prefix = 0;
                 let mut suffix = 0;
                 {
@@ -421,45 +408,17 @@ impl TranscriptDocument {
             .context("transcript entry lost its first block")?;
         Ok(start..start + entry.blocks)
     }
-
-    fn check_capacity(&self, range: Range<usize>, block: &[BufferBlock]) -> Result<()> {
-        let removed = self
-            .document
-            .blocks(self.document.revision(), range.clone())?
-            .map(|block| block.text.byte_count())
-            .sum::<usize>();
-        let inserted = block
-            .iter()
-            .map(|block| block.text.byte_count())
-            .sum::<usize>();
-        ensure!(
-            self.document.text_bytes() - removed + inserted <= MAX_DOCUMENT_BYTES
-                && self.document.block_count() - range.len() + block.len() <= MAX_DOCUMENT_BLOCKS,
-            "transcript exceeds native document capacity"
-        );
-        Ok(())
-    }
 }
 
 fn prepare_entries(entry: Vec<TranscriptEntry>) -> Result<(Vec<EntryPosition>, Vec<BufferBlock>)> {
     let mut identities = HashSet::new();
     let mut position = Vec::new();
     let mut block = Vec::new();
-    let mut bytes = 0;
     for entry in entry {
         validate_entry(&entry)?;
         ensure!(
             identities.insert(entry.id.clone()),
             "duplicate transcript entry identity"
-        );
-        bytes += entry
-            .block
-            .iter()
-            .map(|block| block.text.byte_count())
-            .sum::<usize>();
-        ensure!(
-            bytes <= MAX_DOCUMENT_BYTES && block.len() + entry.block.len() <= MAX_DOCUMENT_BLOCKS,
-            "transcript exceeds native document capacity"
         );
         position.push(EntryPosition {
             id: entry.id,
@@ -494,6 +453,43 @@ mod tests {
             text: BufferText::from_rows([text]).unwrap(),
             metadata: BlockMetadata::default(),
         }
+    }
+
+    #[test]
+    fn large_transcript_accepts_incremental_edits_without_an_aggregate_limit() -> Result<()> {
+        let text = BufferText::from_rows(["x".repeat(512)])?;
+        let blocks = (0..65_537)
+            .map(|index| BufferBlock {
+                id: BlockId(format!("block-{index}")),
+                text: text.clone(),
+                metadata: BlockMetadata::default(),
+            })
+            .collect();
+        let mut document = TranscriptDocument::initialize(
+            DocumentId("large-transcript".into()),
+            "session".into(),
+            1,
+            vec![TranscriptEntry { id: "history".into(), block: blocks }],
+        )?;
+        assert!(document.document.text_bytes() > 32 * 1024 * 1024);
+        assert!(document.document.block_count() > 65_536);
+        let patch = document.append(BufferBlock {
+            id: BlockId("block-65536".into()),
+            text: BufferText::from_rows(["updated"])?,
+            metadata: BlockMetadata::default(),
+        })?.expect("changed tail");
+        assert_eq!(patch.text_edit.len(), 1);
+        assert_eq!(patch.text_edit[0].start_row, 65_536);
+        document.apply_event("session", 1, 2, vec![TranscriptChange::Insert {
+            index: 1,
+            entry: TranscriptEntry {
+                id: "next".into(),
+                block: vec![block("next-prompt", "next prompt")],
+            },
+        }])?;
+        assert_eq!(document.document.block_count(), 65_538);
+        assert_eq!(document.snapshot()?.block.last().unwrap().id.0, "next-prompt");
+        Ok(())
     }
 
     #[test]

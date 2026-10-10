@@ -797,9 +797,15 @@ code languages, literal rows, and their rendered byte positions alongside the Ma
 jobs analyze saved diffs and Markdown code through the shared syntax engine outside the presentation
 lock. Completion must match the open document and retained source before adding viewport decorations.
 Replacement, reflow, and close invalidate obsolete work. Unknown fence languages retain plain text.
-Code source and coordinate maps count toward the 64 MiB presentation limit. Each syntax job has a
-10-second deadline and uses the shared source-line cutoff. Syntax results have no separate
-byte or span-count rejection. Document and transport admission remain independent of syntax eligibility.
+The timeline has no aggregate byte, row, or block-count limit. Retained tool parsers and syntax
+metadata do not consume a session-wide admission budget. Each syntax job has a 10-second deadline
+and uses the shared 10,000-line source cutoff. Syntax results have no separate byte or span-count
+rejection. Content loading has no total byte-size admission limit. Pages and transport parts stay
+bounded, and their consumers request subsequent batches. Tool display stops after 262,144 source
+rows with an explicit truncation notice, while export retains the complete original response.
+A tool row longer than one output-page budget is abbreviated in that page with an export hint.
+Shared Markdown projection and literal wrapping also accept content without byte, row, or
+decoration-count admission limits. They retain source and navigation metadata for later paging.
 
 Each Rust session controller owns one `TimelineStream`. The stream compares stable top-level entry identities, advances
 its own monotonic revision, and emits ordered `insert`, `replace`, `remove`, `tool_output`, and `message` operations. Provider lifecycle events
@@ -862,8 +868,8 @@ window heights of display rows. Each continuation adds two current window height
 end boundary is within one screen below the viewport. File headings never request more pages.
 A page also has a 64 KiB byte budget to bound unusually long lines, and larger hunks continue
 in the next batch. Loaded rows remain stable across resizing, and each file admits one outstanding
-request until its response is published. Other section bodies grow in 64 KiB pages. All loaded
-bodies retain the 16 MiB safety limit. Nested sections outside a file own independent page
+request until its response is published. Other section bodies grow in 64 KiB pages without a
+total loaded-body byte limit. Nested sections outside a file own independent page
 budgets, so an expanded parent cannot prevent a child page from making progress. The viewport
 admits at most eight section requests per pass and suspends prefetch while another buffer has
 focus. A failed section reports its error once and stops automatic requests until the user
@@ -873,7 +879,7 @@ requests from a previous presentation lifetime. Neovim's native search covers lo
 
 The existing 67 ms publication interval applies to demand responses and streaming changes. Each
 buffer commit installs text and metadata atomically. Internal events retain the 512 KiB frame limit
-and use ordered JSON parts for larger payloads, with a 16 MiB aggregate limit. Transport shutdown
+and use ordered JSON parts for larger payloads without an aggregate byte limit. Transport shutdown
 or an incomplete multipart event reports an explicit delivery failure.
 
 `Idle` remains a structural Rust phase but produces no status entry. `Working`, `RetryingPlanGeneration`,
@@ -2101,8 +2107,8 @@ Reopening Harness explicitly reconnects the presentation.
 
 Session events above the 512 KiB frame limit use session-scoped, transfer-identified parts and a
 completion record. Lua validates and assembles the complete event before delivering it to any
-subscriber. Event transfers share the two-transfer, 16 MiB-per-transfer bound with response transfers.
-Oversized-event rejection leaves the output connection available to report the request failure.
+subscriber. Event transfers share two concurrent transfer slots with response transfers. Additional
+senders wait for a slot. Aggregate content size does not reject a transfer.
 
 `forge/protocol_contract.json` defines the versioned event vocabulary, routing policy, required
 payload fields, and node enum spellings. Rust embeds it at compile time and Lua loads it from the
@@ -3080,8 +3086,8 @@ and late predecessor parts are ignored. Invalid metadata discards partial assemb
 
 Only a completely assembled and decoded snapshot reaches `apply_snapshot`. Partial delivery does
 not mutate the physical buffer or advance its revision. Existing snapshot validation and local-edit
-suspension still apply after assembly. Encoded transfer size is capped at 16 MiB. Lua concatenation
-and decoded structures add transient memory beyond that encoded-payload cap and remain part of
+suspension still apply after assembly. Encoded transfers have no aggregate byte cap. Lua concatenation
+and decoded structures add transient memory beyond the encoded payload and remain part of
 the performance acceptance work. The live host and client transport do not route these records yet.
 
 
@@ -4708,9 +4714,9 @@ termination, and the broader Forge migration gates remain unfinished.
 
 The github.detail and github.issues routes deliver responses above 512 KiB through request-correlated
 result.part events followed by one result.complete event. Each transfer retains one encoded response
-bounded to 16 MiB. Two permits shared by all sender clones bound concurrent retained encodings to
-32 MiB. This bound excludes source values, JSON decoding, and the separately bounded output queue.
-It does not establish the plan's global allocation gate.
+without a total byte cap. Two permits shared by all sender clones bound concurrent encodings by
+count, with additional senders waiting for capacity. This does not bound source values, encoded
+response sizes, or JSON decoding allocations. The output queue remains separately bounded.
 
 JsonTransfer splits the encoded response at UTF-8 boundaries into payloads of at most 128 KiB.
 SnapshotTransfer uses the same splitter while retaining its document and revision identity. The
@@ -4727,16 +4733,16 @@ transfers fail the connection, and shutdown clears retained parts and declared b
 An explicit error response can terminate a partial transfer. An ordinary success cannot replace it.
 Late events for requests that already completed are ignored.
 
-Failure to acquire an encoding permit returns result_transfer_busy. Encoding above 16 MiB returns
-result_too_large. Both retain operation_completed true because storage has already finished. Neither
-error claims that a committed operation was rolled back. The caller can retry a read or reconcile
-completed work. Disconnect during delivery does not undo service persistence.
+Waiting for an encoding permit ends when capacity becomes available or the connection closes.
+Serialization failure returns result_encoding_failed with operation_completed true because storage
+has already finished. That error does not claim that a committed operation was rolled back.
+Disconnect during delivery does not undo service persistence.
 
 Protocol tests exercise FIFO capacity waits, retained writer reservations, receiver closure, and
 shared transfer admission. Client fixtures cover large Unicode and escaped content, delayed
 completion, malformed sequences and totals, invalid JSON and identity, three-transfer overflow,
 explicit failure, and disconnect cleanup. Native host tests deliver a 9 MiB cached detail under
-credit control and reject an encoding above 16 MiB while keeping the host usable. The Neovim native
+credit control and deliver an encoding above 16 MiB while keeping the host usable. The Neovim native
 fixture verifies full remote and persisted detail bodies above the single-frame limit.
 
 ## 79. Repository user metadata ownership
@@ -5433,3 +5439,32 @@ Failed state
 refreshes remain visible and retry after one, two, and four seconds. `/task refresh` requests a
 new authoritative snapshot. Failure, disconnect, and unknown operation outcomes suppress
 automatic queue draining. Queued input retains task identity and is not retargeted by a switch.
+
+
+## Plan implementation and conformance
+
+Implementation cannot be interrupted by declaration reconciliation. Implement writes the accepted
+behavior and tests, permits justified source deviations, and defers builds and checks to Verify.
+The tool catalog omits plan mutation controls in Implement and Verify. The control runtime and
+broker independently reject those mutations, including calls from stale provider sessions.
+
+Verify compares body-free declaration structure and configuration values against the current
+accepted revision. Required declarations, signatures, ownership, and exposed API remain binding.
+Additional internal helpers are permitted. Calls and Accesses are descriptive evidence, never
+completion gates. Verify collects structural and behavioral findings together. Resolve fixes the
+workspace or submits a consolidated contract revision, then returns to Verify. Plan revisions
+retain the existing review-wait protocol and never replace the original accepted baseline.
+
+At completion or a blocked result, the broker records an implementation-differences report against
+the original accepted revision. Failure, cancellation, and continuation exhaustion retain an
+incomplete report. Reports compare accepted paths and checkpoint changes, including removed files.
+They distinguish unspecified reference categories from explicitly empty Calls or Accesses and show
+internal additions, contract differences, approved revisions, and unavailable evidence.
+
+The report is an immutable content-addressed object. The execution record and timeline node retain
+its identity and counts, not its full text. The timeline shares cached report data and exposes its
+file details through the existing collapsed-section loader. Reopening a session preserves the same
+report. A missing report object shows unavailable content rather than silently dropping the summary.
+Report publication checks source identities before committing a successful phase result. A changed
+workspace rejects that result for a fresh verification attempt, rather than pairing stale evidence
+with a newer report.

@@ -46,7 +46,12 @@ use tokio::sync::{Mutex, mpsc};
 const SYSTEM_MESSAGE: &str = super::HARNESS_SYSTEM_MESSAGE;
 
 type SharedCopilotSession = Arc<github_copilot_sdk::session::Session>;
-type CopilotSessionSlot = Arc<Mutex<Option<SharedCopilotSession>>>;
+type CopilotSessionSlot = Arc<Mutex<Option<CopilotSessionBinding>>>;
+
+struct CopilotSessionBinding {
+    session: SharedCopilotSession,
+    revision_tools: bool,
+}
 
 /// Retains terminal observations after the prompt event subscription ends.
 struct CopilotTerminalMonitor {
@@ -193,7 +198,10 @@ impl CopilotBackend {
     async fn session(&self, request: &BackendRequest) -> Result<SharedCopilotSession> {
         let session_slot = self.session_slot(&request.harness_session_id).await;
         let mut active_session = session_slot.lock().await;
-        if let Some(session) = active_session.as_ref() {
+        let phase = request.control_context.as_ref().and_then(|context| context.execution.as_ref()).map(|execution| execution.phase);
+        let revision_tools = phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve);
+        if let Some(binding) = active_session.as_ref().filter(|binding| binding.revision_tools == revision_tools) {
+            let session = &binding.session;
             if request.model != "default" {
                 let client = self.client(&request.workspace).await?;
                 let reasoning_effort = Self::reasoning_effort(&client, request).await?;
@@ -210,14 +218,15 @@ impl CopilotBackend {
         let client = self.client(&request.workspace).await?;
         let reasoning_effort = Self::reasoning_effort(&client, request).await?;
         let tool_list =
-            self.control_tool_list(self.control_router(&request.harness_session_id).await);
+            self.control_tool_list(self.control_router(&request.harness_session_id).await, phase);
         let system_message = SystemMessageConfig::new()
             .with_mode("append")
             .with_content(SYSTEM_MESSAGE);
         let permission_handler: Arc<dyn PermissionHandler> = Arc::new(CopilotPermissionHandler {
             context: self.permission_context(&request.harness_session_id).await,
         });
-        let session = if let Some(session_id) = request.backend_session_id.as_deref() {
+        let retained_session_id = active_session.as_ref().map(|binding| binding.session.id().to_string());
+        let session = if let Some(session_id) = retained_session_id.as_deref().or(request.backend_session_id.as_deref()) {
             let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
             config.model = (request.model != "default").then(|| request.model.clone());
             config.reasoning_effort = reasoning_effort.clone();
@@ -261,7 +270,7 @@ impl CopilotBackend {
                 .context("create Copilot session")?
         };
         let session = Arc::new(session);
-        *active_session = Some(Arc::clone(&session));
+        *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), revision_tools });
         Ok(session)
     }
 
@@ -281,7 +290,7 @@ impl CopilotBackend {
             .await
             .get(harness_session_id)
             .cloned()?;
-        session_slot.lock().await.clone()
+        session_slot.lock().await.as_ref().map(|binding| Arc::clone(&binding.session))
     }
 
     fn catalog_backend_request(request: &BackendCatalogRequest) -> BackendRequest {
@@ -339,10 +348,10 @@ impl CopilotBackend {
         )
     }
 
-    fn control_tool_list(&self, router: Arc<ControlToolRouter>) -> Vec<Tool> {
+    fn control_tool_list(&self, router: Arc<ControlToolRouter>, phase: Option<crate::plan::PlanPhase>) -> Vec<Tool> {
         let handler: Arc<dyn ToolHandler> = Arc::new(CopilotControlToolHandler { router });
         ControlToolRegistry
-            .definition_list()
+            .definition_list_for(phase)
             .into_iter()
             .map(|definition| {
                 Tool::new(definition.name)

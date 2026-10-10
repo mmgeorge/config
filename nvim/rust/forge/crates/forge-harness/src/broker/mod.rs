@@ -3625,7 +3625,7 @@ Planning continuation: turn {} of {}.",
                     ExchangeState::Failed
                 };
                 if !cancelled {
-                    self.record_execution_failure(&interaction, format!("{error:#}"))?;
+                    self.record_execution_failure(&mut interaction, format!("{error:#}")).await?;
                 }
                 let final_checkpoint_id = self
                     .capture_final_checkpoint(&mut interaction, outcome)
@@ -4074,7 +4074,7 @@ Planning continuation: turn {} of {}.",
         let continuing = if execution_paused {
             false
         } else {
-            self.apply_goal_evidence(output.evidence, &mut event)?
+            self.apply_goal_evidence(output.evidence, &mut event).await?
         };
         let mut runtime = self
             .exchange_runtime
@@ -4170,7 +4170,7 @@ Planning continuation: turn {} of {}.",
 
         let now_ms = self.clock.now_ms();
         let mut event = Vec::new();
-        self.record_execution_failure(&interaction, "Failed while processing the provider response".into())?;
+        self.record_execution_failure(&mut interaction, "Failed while processing the provider response".into()).await?;
         finish_synthetic_turn(
             &mut interaction,
             runtime.synthetic_turn.as_ref(),
@@ -4270,7 +4270,7 @@ Planning continuation: turn {} of {}.",
         let execution = self.store.list_plan_execution(&self.session.id)?.into_iter()
             .find(|execution| Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref() && execution.state == PlanExecutionState::Active);
         if request.mode == PromptMode::ExecutePlan && let (Some(context), Some(execution)) = (&mut request.control_context, execution.as_ref()) {
-            context.execution = Some(crate::plan::execution::ExecutionControlSender { execution_id: execution.id.clone(), generation: execution.generation, sender: execution_sender.clone() });
+            context.execution = Some(crate::plan::execution::ExecutionControlSender { phase: execution.phase, execution_id: execution.id.clone(), generation: execution.generation, sender: execution_sender.clone() });
         }
         let mut scan_interval = tokio::time::interval(std::time::Duration::from_secs(5));
         scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -5712,7 +5712,7 @@ Planning continuation: turn {} of {}.",
         let mut execution_record = PlanExecutionRecord {
             id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(),
             plan_id: plan.id.clone(), goal_id: goal.id.clone(), baseline_checkpoint: None, state: PlanExecutionState::Active,
-            phase: crate::plan::PlanPhase::Implement, original_revision: plan.model_revision,
+            implementation_report: None, phase: crate::plan::PlanPhase::Implement, original_revision: plan.model_revision,
             revision: plan.model_revision, generation: 0, planning_backend_session_id,
             execution_backend_session_id: self.session.backend_session_id.clone(),
             lifecycle: Vec::new(), findings: Vec::new(), progress: Default::default(),
@@ -5720,7 +5720,7 @@ Planning continuation: turn {} of {}.",
             review_paused: false, observed_source: Default::default(), observed_generation: 0,
             observed_check: Default::default(), created_at_ms: execution_created_at_ms, completed_at_ms: None,
         };
-        execution_record.progress = crate::plan::execution::SemanticProgress::scan(accepted_document.design.as_ref().unwrap(), Path::new(&self.session.workspace))?;
+        execution_record.progress = Default::default();
         execution_record.observed_source = execution_record.progress.source_digest.clone();
         self.store.accept_task(&self.session, &task, &goal, &plan, &execution_record, &lifecycle, &self.client_id)?;
         let mut pre_execution_event = compact_event;
@@ -5747,7 +5747,7 @@ Planning continuation: turn {} of {}.",
             &mut pre_execution_event,
         )
         .await?;
-        let execution_prompt = PlanPrompt::execution(&execution_record, PlanExecutionPromptKind::Start, &accepted_document.model_json()?);
+        let execution_prompt = PlanPrompt::execution(&execution_record, PlanExecutionPromptKind::Start, &accepted_document.execution_json(execution_record.phase)?);
         let mut admission = ExchangeAdmission::execution(
             String::new(), plan.id.clone(),
             execution_record.id.clone(), goal.id.clone());
@@ -6203,7 +6203,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         goal.state = GoalState::Paused;
         goal.updated_at_ms = self.clock.now_ms();
         self.store.save_goal(&goal)?;
-        self.sync_plan_execution(&goal)?;
+        self.sync_plan_execution(&goal).await?;
         Ok((
             serde_json::to_value(&goal)?,
             vec![self.event("goal_changed", serde_json::to_value(goal)?)?],
@@ -6234,7 +6234,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         goal.resume(self.clock.now_ms());
         self.store.save_goal(&goal)?;
-        self.sync_plan_execution(&goal)?;
+        self.sync_plan_execution(&goal).await?;
         let plan_prompt =
             self.plan_goal_prompt(&goal, PlanExecutionPromptKind::ResumeAfterInterruption)?;
         let mode = if plan_prompt.is_some() {
@@ -6298,7 +6298,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
                 goal.state = GoalState::Paused;
                 goal.updated_at_ms = self.clock.now_ms();
                 self.store.save_goal(&goal)?;
-                self.sync_plan_execution(&goal)?;
+                self.sync_plan_execution(&goal).await?;
                 let _ = self.sync_native_goal(&goal, "paused").await;
                 Err(error).context("resume Harness goal")
             }
@@ -6325,7 +6325,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             }
             event.push(self.event("exchange_complete", json!({"id":exchange.id,"state":exchange.state}))?);
         }
-        self.sync_plan_execution(&goal)?;
+        self.sync_plan_execution(&goal).await?;
         self.session.goal_id = None;
         self.save_session()?;
         event.push(self.event("goal_changed", serde_json::to_value(&goal)?)?);
@@ -6373,7 +6373,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         self.run_interaction(prompt, mode, Some(admission)).await
     }
 
-    fn apply_goal_evidence(
+    async fn apply_goal_evidence(
         &mut self,
         mut evidence: crate::goal::TurnEvidence,
         event: &mut Vec<SessionEvent>,
@@ -6403,7 +6403,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             ContinuationDecision::Stop => return Ok(false),
         };
         self.store.save_goal(&goal)?;
-        self.sync_plan_execution(&goal)?;
+        self.sync_plan_execution(&goal).await?;
         Ok(continuing)
     }
 
@@ -6435,7 +6435,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         goal.state = GoalState::Paused;
         goal.updated_at_ms = self.clock.now_ms();
         self.store.save_goal(&goal)?;
-        self.sync_plan_execution(&goal)
+        self.sync_plan_execution(&goal).await
     }
 
     async fn sync_native_goal(&mut self, goal: &GoalRecord, status: &str) -> Result<()> {
@@ -7772,6 +7772,10 @@ mod test {
         assert_eq!(execution.id, execution_id);
         assert_eq!(execution.state, PlanExecutionState::Complete);
         assert_eq!(execution.verification.len(), 2);
+        let report = broker.plan_file.implementation_report(execution.implementation_report.as_ref().unwrap()).unwrap();
+        assert_eq!(report.original_revision, 2);
+        assert_eq!(report.accepted_revision, 2);
+        assert!(report.file.iter().any(|file| file.path == "unexpected.rs" && !file.internal.is_empty()));
         assert!(execution.baseline_checkpoint.is_some());
         assert_eq!(std::fs::read_to_string(repository.path().join("lib.rs")).unwrap(),"pub struct Existing;\n");
         let exchanges = broker.store.list_exchange(&broker.session.id).unwrap().into_iter()
@@ -7968,6 +7972,9 @@ mod test {
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
             let original = broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 1).unwrap();
             broker.session.plan_auto_approve_revisions = decision == "automatic";
+            broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: 1 });
+            broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})).await.unwrap();
+            broker.continue_goal().await.unwrap();
             broker.backend = Arc::new(RevisionExecutionBackend);
             let review = Arc::clone(&broker.revision_review);
             let cancellation = broker.turn_cancellation();
@@ -7980,13 +7987,13 @@ mod test {
                 }
             };
             let (accepted, ()) = tokio::join!(
-                broker.dispatch(Request { id:2, method:"plan.accept".into(), params:json!({"plan_id":plan.id,"digest":plan.review_digest,"execution_mode":"write"}) }),
+                broker.dispatch(Request { id:2, method:"goal.continue".into(), params:json!({}) }),
                 stop_pending,
             );
-            assert!(accepted.response.error().is_none(), "{decision}: {:?}", accepted.response.error());
+            assert!(accepted.response.error().is_none() || (decision != "automatic" && accepted.response.error().is_some_and(|error| error.code == "turn_cancelled")), "{decision}: {:?}", accepted.response.error());
             let execution = broker.snapshot().unwrap().goal_execution.unwrap();
             assert_eq!(execution.original_revision, 1);
-            assert_eq!(execution.phase, crate::plan::PlanPhase::Implement);
+            assert_eq!(execution.phase, crate::plan::PlanPhase::Resolve);
             let execution_id = execution.id.clone();
             if decision == "automatic" {
                 assert_eq!(execution.revision, 2);
@@ -8045,7 +8052,7 @@ mod test {
                     broker.continue_goal().await.unwrap();
                     let continued = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
                     assert_ne!(continued.id, previous.id);
-                    assert_eq!(continued.lifecycle.as_deref(), Some("Plan implementation continued"));
+                    assert_eq!(continued.lifecycle.as_deref(), Some("Plan resolution continued"));
                     assert_eq!(continued.execution_id.as_deref(), Some(execution_id.as_str()));
                     assert_eq!(continued.kind, ExchangeKind::PlanExecution);
                 }
@@ -8091,6 +8098,9 @@ mod test {
             broker.submit_prompt(json!({"text":"/plan add a reusable API"})).await.unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
             broker.session.plan_auto_approve_revisions = false;
+            broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: 1 });
+            broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})).await.unwrap();
+            broker.continue_goal().await.unwrap();
             broker.backend = Arc::new(RevisionExecutionBackend);
             let review = Arc::clone(&broker.revision_review);
             let files = PlanFileStore::new(data.path(), repository.path());
@@ -8111,7 +8121,7 @@ mod test {
                 assert!(events.iter().all(|event| event.event != "goal_continue_requested"));
             };
             let (accepted, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
-                tokio::join!(broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})), decide)
+                tokio::join!(broker.continue_goal(), decide)
             }).await.expect("a live review must resume its waiting provider");
             accepted.unwrap();
             let exchanges = broker.store.list_exchange(&session_id).unwrap();
@@ -8144,21 +8154,26 @@ mod test {
             }).await?;
             let context = request.control_context.clone().context("missing control context")?;
             let document = context.plan_document.clone().unwrap();
+            let handoff: Value = serde_json::from_str(&document.execution_json(context.execution.as_ref().unwrap().phase)?).unwrap();
+            if turn == 0 {
+                assert!(handoff["document"].get("verification").is_none());
+                assert!(handoff["document"].get("tests").is_some());
+            } else {
+                assert!(handoff["document"].get("verification").is_some());
+            }
             let mut runtime = ControlToolRuntime::new(context);
             let phase = match turn { 0 => "implement", 2 => "resolve", _ => "verify" };
             let mut arguments = json!({"phase":phase,"revision":self.revision,"summary":"Checked planned behavior"});
             if turn == 0 {
-                let mismatch = runtime.invoke(ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments:arguments.clone() }).await.unwrap_err();
-                assert!(mismatch.to_string().contains("Semantic comparison failed"), "{mismatch:#}");
+                let rejected = runtime.invoke(ControlToolInvocation { name: "harness_design_apply_patch".into(), arguments: json!({
+                    "plan_id":document.plan_id, "expected_version":document.version, "patch":"*** Begin Patch\n*** End Patch"}) }).await.unwrap_err();
+                assert!(rejected.to_string().contains("Resolve"));
                 for (path, overview) in &document.design.as_ref().unwrap().proposed {
                     let path = Path::new(&request.workspace).join(path);
                     std::fs::create_dir_all(path.parent().unwrap())?;
                     std::fs::write(path, overview.replace("();", "() {}"))?;
                 }
                 std::fs::write(Path::new(&request.workspace).join("unexpected.rs"), "fn unexpected() {}")?;
-                let outside = runtime.invoke(ControlToolInvocation { name:"harness_plan_phase_done".into(), arguments:arguments.clone() }).await.unwrap_err();
-                assert!(outside.to_string().contains("outside the accepted plan"), "{outside:#}");
-                std::fs::remove_file(Path::new(&request.workspace).join("unexpected.rs"))?;
             } else if phase == "verify" {
                 let id = format!("check-{turn}");
                 sink.as_ref().unwrap().send_wait(BackendEvent {
@@ -8205,7 +8220,7 @@ mod test {
                 kind: "turn_completed".into(), text: None, data: Value::Null,
                 activity: None, summary: None, task_update: None,
             }).await?;
-            Ok(crate::backend::BackendOutput { backend_session_id:Some("semantic-execution".into()), ..Default::default() })
+            Ok(crate::backend::BackendOutput { backend_session_id:Some("semantic-execution".into()), capability: crate::backend::BackendCapability { execution_mode_list: vec![PermissionMode::Write], ..Default::default() }, ..Default::default() })
         }
         async fn fork(&self, _: BackendForkRequest) -> Result<crate::backend::BackendForkResult> { anyhow::bail!("test backend cannot fork") }
     }

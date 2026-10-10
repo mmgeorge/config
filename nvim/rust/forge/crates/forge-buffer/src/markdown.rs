@@ -75,7 +75,6 @@ struct RenderState<'profile> {
     quote_depth: usize,
     code: bool,
     code_block: Vec<MarkdownCode>,
-    bytes: usize,
     source_row: Range<usize>,
     source_output: Vec<Option<Range<usize>>>,
     pending_source: Option<MarkdownSourceRange>,
@@ -112,15 +111,10 @@ impl MarkdownRenderer {
     ) -> Result<RenderedMarkdown, ContractError> {
         id.validate()?;
         profile.validate()?;
-        if source.len() > 8 * 1024 * 1024 || source.contains('\0') {
-            return Err(ContractError(
-                "Markdown source exceeds document admission limits",
-            ));
+        if source.contains('\0') {
+            return Err(ContractError("Markdown source contains NUL"));
         }
         let row: Vec<_> = source.split('\n').collect();
-        if row.len() > 65_536 {
-            return Err(ContractError("Markdown source row budget exceeded"));
-        }
         let mut offset = 0;
         let start: Vec<_> = row
             .iter()
@@ -219,9 +213,6 @@ impl MarkdownRenderer {
                     });
                 }
             }
-            if metadata.decoration.len() > 262_144 {
-                return Err(ContractError("Markdown decoration budget exceeded"));
-            }
         }
         let text = if omission.is_empty() {
             BufferText::from_rows(&row)?
@@ -256,10 +247,8 @@ impl MarkdownRenderer {
     ) -> Result<RenderedMarkdown, ContractError> {
         id.validate()?;
         profile.validate()?;
-        if source.len() > 8 * 1024 * 1024 || source.contains('\0') {
-            return Err(ContractError(
-                "Markdown source exceeds document admission limits",
-            ));
+        if source.contains('\0') {
+            return Err(ContractError("Markdown source contains NUL"));
         }
         let mut source_start = vec![0usize];
         source_start.extend(
@@ -268,9 +257,6 @@ impl MarkdownRenderer {
                 .enumerate()
                 .filter_map(|(offset, byte)| (byte == b'\n').then_some(offset + 1)),
         );
-        if source_start.len() > 65_536 {
-            return Err(ContractError("Markdown source row budget exceeded"));
-        }
         let mut state = RenderState {
             profile,
             row: vec![String::new()],
@@ -282,7 +268,6 @@ impl MarkdownRenderer {
             quote_depth: 0,
             code: false,
             code_block: Vec::new(),
-            bytes: 0,
             source_row: 0..1,
             source_output: vec![None; source_start.len()],
             pending_source: None,
@@ -543,9 +528,6 @@ fn project_file_labels(
 impl RenderState<'_> {
     fn break_row(&mut self, force: bool) -> Result<(), ContractError> {
         if force || !self.row.last().unwrap().is_empty() {
-            if self.row.len() >= 65_536 {
-                return Err(ContractError("Markdown row budget exceeded"));
-            }
             self.row.push(String::new());
         }
         Ok(())
@@ -690,16 +672,6 @@ impl RenderState<'_> {
         } else {
             String::new()
         };
-        self.bytes = self
-            .bytes
-            .checked_add(prefix.len())
-            .and_then(|bytes| bytes.checked_add(text.len()))
-            .ok_or(ContractError("Markdown size overflow"))?;
-        if self.bytes > 16 * 1024 * 1024
-            || self.metadata.decoration.len() + self.metadata.target.len() >= 65_536
-        {
-            return Err(ContractError("Markdown presentation budget exceeded"));
-        }
         let row = self.row.len() - 1;
         let output = self.row.last_mut().unwrap();
         if !prefix.is_empty() {
@@ -759,6 +731,32 @@ impl RenderState<'_> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn large_markdown_preserves_source_and_rendered_code_without_size_admission() {
+        use super::*;
+        let line = "x".repeat(257);
+        let source = format!("```text\n{}```", format!("{line}\n").repeat(65_537));
+        assert!(source.len() > 16 * 1024 * 1024);
+        let profile = WidthProfile::default();
+        let preserved = MarkdownRenderer::source(BlockId("source".into()), &source, &profile).unwrap();
+        assert_eq!(preserved.block.text.wire_rows(), source.split('\n').collect::<Vec<_>>());
+        let rendered = MarkdownRenderer::render(BlockId("rendered".into()), &source, &profile).unwrap();
+        assert_eq!(rendered.code.len(), 1);
+        assert_eq!(rendered.code[0].row.len(), 65_537);
+        assert!(rendered.code[0].row.iter().all(|row| row.text == line));
+    }
+
+    #[test]
+    fn many_markdown_spans_preserve_decorations_without_admission_failure() {
+        use super::*;
+        let source = "**bold** *italic* ~~strike~~ `code`\n".repeat(65_537);
+        let rendered = MarkdownRenderer::source(
+            BlockId("spans".into()), &source, &WidthProfile::default(),
+        ).unwrap();
+        assert!(rendered.block.metadata.decoration.len() > 262_144);
+        assert_eq!(rendered.block.text.row_count(), 65_538);
+    }
+
     #[test]
     fn source_projection_preserves_task_rows_fences_and_unicode_at_every_width() {
         use super::*;

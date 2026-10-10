@@ -1,4 +1,4 @@
-//! Snapshot framing retains one bounded encoding and produces parts on demand.
+//! Snapshot framing retains one encoding and produces bounded parts on demand.
 
 use std::io;
 
@@ -75,7 +75,7 @@ impl Iterator for SnapshotTransfer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_PART_BYTES, outbound};
+    use crate::{MAX_SNAPSHOT_PART_BYTES, outbound};
 
     #[test]
     fn escaped_multibyte_payload_roundtrips_with_bounded_frames() {
@@ -101,11 +101,15 @@ mod tests {
     }
 
     #[test]
-    fn rejects_transfer_over_total_byte_limit() {
-        assert!(
-            SnapshotTransfer::new("document".into(), 0, 1, &"x".repeat(MAX_SNAPSHOT_BYTES))
-                .is_err()
-        );
+    fn large_transfer_remains_bounded_per_part_without_a_total_byte_limit() {
+        let source = "x".repeat(16 * 1024 * 1024 + 1);
+        let transfer = SnapshotTransfer::new("document".into(), 0, 1, &source).unwrap();
+        let mut encoded = String::new();
+        for part in transfer {
+            assert!(outbound::encode(&part, crate::MAX_FRAME_BYTES).is_ok());
+            encoded.push_str(&part.payload);
+        }
+        assert_eq!(serde_json::from_str::<String>(&encoded).unwrap(), source);
         assert!(SnapshotTransfer::new("document".into(), 0, 0, &()).is_err());
     }
 }

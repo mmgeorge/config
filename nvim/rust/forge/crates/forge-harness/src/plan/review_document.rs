@@ -2467,7 +2467,7 @@ mod tests {
         design.document.design = "Expose sender relationships for review.".into();
         design.proposed.insert("client.ts".into(), "/// Sends a request.\nexport function send(): void;\n".into());
         design.proposed.insert("run.ts".into(), "import { send } from './client';\n/// Dispatches work.\nclass Runner { private run(): void; }\n".into());
-        design.proposed_calls.insert("run.ts".into(), vec![crate::plan::FunctionBody { change: None, owner: "Runner.run".into(), call: Some(vec![crate::plan::CallSite { kind: crate::plan::CallKind::Call, name: "send".into(), source: None, unresolved: false }]) }]);
+        design.proposed_calls.insert("run.ts".into(), vec![crate::plan::FunctionBody { evidence: None, change: None, owner: "Runner.run".into(), call: Some(vec![crate::plan::CallSite { kind: crate::plan::CallKind::Call, name: "send".into(), source: None, unresolved: false }]) }]);
         design.baseline.insert("run.ts".into(), crate::plan::DeclarationFile { text: design.proposed["run.ts"].clone(), source_digest: String::new() });
         design.baseline_calls.insert("run.ts".into(), design.proposed_calls["run.ts"].clone());
         canonical.design = Some(design);

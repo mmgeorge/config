@@ -115,107 +115,13 @@ impl SemanticProgress {
                     .different
                     .push(format!("{path}: planned deletion still exists")),
                 (Some(_), None) => progress.missing.push(path),
-                (Some(expected), Some(_)) => match design.source(workspace, &path) {
-                    Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
-                    Ok((actual, calls)) => {
-                        if progress.source_digest.get(&path) != Some(&actual.source_digest) {
-                            progress
-                                .unverified
-                                .push(format!("{path}: source changed during comparison"));
-                            continue;
-                        }
-                        let expected_text = expected.replace("\r\n", "\n");
-                        let actual_text = actual.text.replace("\r\n", "\n");
-                        let declarations_match = expected_text.trim() == actual_text.trim();
-                        let mut calls_match = true;
-                        let mut call_difference = None;
-                        for planned in design.proposed_calls.get(&path).into_iter().flatten() {
-                            let Some(expected_calls) = &planned.call else {
-                                progress.warning.push(format!(
-                                    "{path}: {} has no planned call evidence",
-                                    planned.owner
-                                ));
-                                continue;
-                            };
-                            let actual_calls = calls
-                                .iter()
-                                .find(|body| body.owner == planned.owner)
-                                .and_then(|body| body.call.as_ref());
-                            let owner_matches = actual_calls.is_some_and(|actual_calls| {
-                                [
-                                    super::calls::CallKind::Call,
-                                    super::calls::CallKind::Property,
-                                ]
-                                .into_iter()
-                                .all(|category| {
-                                    expected_calls
-                                        .iter()
-                                        .filter(|call| call.kind.category() == category)
-                                        .map(|call| call.name.as_str())
-                                        .eq(actual_calls
-                                            .iter()
-                                            .filter(|call| call.kind.category() == category)
-                                            .map(|call| call.name.as_str()))
-                                })
-                            });
-                            calls_match &= owner_matches;
-                            if !owner_matches && call_difference.is_none() {
-                                let observed = actual_calls.map(Vec::as_slice).unwrap_or_default();
-                                let preview = |references: &[super::calls::CallSite]| {
-                                    [("Calls", super::calls::CallKind::Call),
-                                     ("Accesses", super::calls::CallKind::Property)]
-                                        .into_iter()
-                                        .map(|(label, category)| {
-                                            let names = references.iter()
-                                                .filter(|reference| reference.kind.category() == category)
-                                                .map(|reference| reference.name.as_str())
-                                                .collect::<Vec<_>>();
-                                            format!("{label} {} [{}]", names.len(),
-                                                names.into_iter().take(32).collect::<Vec<_>>().join(", "))
-                                        })
-                                        .collect::<Vec<_>>().join(", ")
-                                };
-                                let expected_preview = preview(expected_calls);
-                                let observed_preview = preview(observed);
-                                call_difference = Some(format!(
-                                    "planned call relationships differ for {}: expected {}; observed {}. Compare each group separately and author one block per group. Cross-group interleaving is not required.",
-                                    planned.owner,
-                                    expected_preview,
-                                    observed_preview
-                                ));
-                            }
-                        }
-                        for call in calls
-                            .iter()
-                            .flat_map(|body| body.call.iter().flatten())
-                            .filter(|call| call.unresolved)
-                        {
-                            progress
-                                .warning
-                                .push(format!("{path}: unresolved reference {}", call.name));
-                        }
-                        if declarations_match && calls_match {
-                            progress.matched.push(path);
-                        } else {
-                            let difference = if !declarations_match {
-                                let expected_line = expected_text.trim().lines().collect::<Vec<_>>();
-                                let actual_line = actual_text.trim().lines().collect::<Vec<_>>();
-                                let row = (0..expected_line.len().max(actual_line.len()))
-                                    .find(|row| expected_line.get(*row) != actual_line.get(*row))
-                                    .expect("different declarations have a differing line");
-                                let preview = |line: Option<&&str>| line.map_or_else(
-                                    || "<end of file>".into(),
-                                    |line| line.chars().take(240).collect::<String>(),
-                                );
-                                format!("declarations or configuration differ at overview line {}: expected {:?}; observed {:?}. Correct the source to match the accepted overview before considering a design revision.",
-                                    row + 1, preview(expected_line.get(row)), preview(actual_line.get(row)))
-                            } else {
-                                call_difference.unwrap_or_else(|| "planned call relationships differ".into())
-                            };
-                            progress.different.push(format!("{path}: {difference}"));
-                        }
+                (Some(expected), Some(source)) => {
+                    match super::conformance::compare_in_workspace(workspace, &path, expected, &source) {
+                        Ok(differences) if differences.is_empty() => progress.matched.push(path),
+                        Ok(differences) => progress.different.extend(differences.into_iter().map(|difference| format!("{path}: {difference}"))),
+                        Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
                     }
-                },
+                }
             }
         }
         Ok(progress)
@@ -293,6 +199,8 @@ pub struct PlanExecutionRecord {
     pub original_revision: u32,
     pub revision: u32,
     pub generation: u64,
+    #[serde(default)]
+    pub implementation_report: Option<super::implementation_report::ImplementationReportRef>,
     pub planning_backend_session_id: Option<String>,
     pub execution_backend_session_id: Option<String>,
     pub lifecycle: Vec<PlanExecutionLifecycleRecord>,
@@ -341,13 +249,6 @@ impl PlanExecutionRecord {
                 request.verification.is_none(),
                 "verification assessment is only accepted in Verify"
             );
-            ensure!(
-                progress.conforms(),
-                "Semantic comparison failed. Stay in {:?}. Prefer correcting implementation to accepted revision {}. Otherwise submit a justified plan revision. Differences: {}",
-                self.phase,
-                self.revision,
-                progress.findings().join("\n")
-            );
             self.phase = PlanPhase::Verify;
         } else {
             let report = request
@@ -394,6 +295,7 @@ impl PlanExecutionRecord {
                     );
                     self.state = PlanExecutionState::Blocked;
                     self.findings = vec![report.reason.clone().unwrap()];
+                    self.findings.extend(progress.findings());
                 }
             }
             self.verification.push(VerificationEvidence {
@@ -424,17 +326,17 @@ impl PlanExecutionRecord {
         }
         let work = match self.phase {
             PlanPhase::Implement => {
-                "Implement the entire accepted semantic design in your chosen order, including the new, modified, and removed tests listed in plan.json tests. Preserve reused tests. Keep the inventory synchronized through a plan revision if test names, locations, or intended coverage change. Do not run builds, compiler checks, tests, linters, format checks, or manual/runtime verification in Implement, including targeted or preliminary checks. Defer all such checks to Verify even when commands appear in the accepted plan or earlier conversation. Use source inspection and Harness semantic comparison to complete Implement, then call harness_plan_phase_done so Harness can advance to Verify."
+                "Implement the accepted design and tests. The accepted plan is frozen during Implement. Make justified implementation deviations when needed, including internal helpers, and explain them in your completion summary. Do not edit or submit the plan, reconcile declaration metadata, or run builds, compiler checks, tests, linters, formatters, or runtime checks. Defer all validation and conformance assessment to Verify. When writing is finished, call harness_plan_phase_done. Declarations and call/access differences do not gate Implement completion."
             }
             PlanPhase::Resolve => {
-                "Correct the recorded findings while matching the accepted design."
+                "Resolve the collected verification findings. Correct code defects in the workspace. If an intentional change affects the accepted contract, propose one consolidated plan revision with a concrete reason. Internal helpers and Calls/Accesses differences do not require revisions. After acceptance, continue with the returned revision. Finish with harness_plan_phase_done so Verify can reassess the workspace and run affected checks."
             }
             PlanPhase::Verify => {
-                "Read plan.json with harness_plan_read and verify its verification requirements and tests inventory. Confirm each new, modified, or reused test is covered by the executed checks, and confirm removed tests were intentionally removed. Do not treat a listed test as evidence that it ran. Run each nonblank line of verification.automated as a separate command in the project workspace, in listed order, using normal execution tools and permissions. Perform every verification.manual check and record the observed result. Report blocked when a required check cannot be performed, including checks requiring user action. Do not claim passed with outstanding checks. After running checks, call harness_plan_read with only plan_id to retrieve execution.verification_evidence. Use its exact tool IDs in verification.evidence, not command descriptions or output text. Select affected checks to rerun and justify any reused evidence. Report passed, failed, or blocked with evidence and concrete findings."
+                "Assess the implementation against the accepted contract and collect all findings together. Harness checks required declaration shapes and public API, permits additional internal helpers, and reports Calls/Accesses separately without gating completion. Do not edit the plan in Verify. Send contract changes and code defects to Resolve. Read plan.json with harness_plan_read and verify its verification requirements and tests inventory. Confirm each new, modified, or reused test is covered by the executed checks, and confirm removed tests were intentionally removed. Do not treat a listed test as evidence that it ran. Run each nonblank line of verification.automated as a separate command in the project workspace, in listed order, using normal execution tools and permissions. Perform every verification.manual check and record the observed result. Report blocked when a required check cannot be performed, including checks requiring user action. Do not claim passed with outstanding checks. After running checks, call harness_plan_read with only plan_id to retrieve execution.verification_evidence. Use its exact tool IDs in verification.evidence, not command descriptions or output text. Select affected checks to rerun and justify any reused evidence. Report passed, failed, or blocked with evidence and concrete findings."
             }
         };
         format!(
-            "{work} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Prefer matching the plan. If a design change is necessary, use harness_design_apply_patch and harness_plan_submit with a revision reason. Submission waits for automatic acceptance or the user's review decision. Continue in this same turn using the returned revision and feedback. Do not call harness_goal_complete for this execution.",
+            "{work} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Do not call harness_goal_complete for this execution.",
             self.phase, self.revision
         )
     }
@@ -482,14 +384,22 @@ pub struct ExecutionControl {
 #[derive(Clone, Debug)]
 /// Restricts provider execution controls to their admitted broker turn.
 pub struct ExecutionControlSender {
+    pub phase: PlanPhase,
     pub execution_id: String,
     pub generation: u64,
     pub sender: mpsc::Sender<ExecutionControl>,
 }
 
 impl ExecutionControlSender {
+    /// Reject plan mutations outside Resolve before draft parsing or side effects.
+    pub fn require_revision_phase(&self) -> Result<()> {
+        ensure!(self.phase == PlanPhase::Resolve, "plan revisions are only allowed in Resolve; finish {} and let Verify collect deviations", self.phase.label());
+        Ok(())
+    }
+
     /// Await a committed broker result before acknowledging the provider's request.
     pub async fn send(&self, operation: ExecutionOperation) -> Result<Value> {
+        if matches!(&operation, ExecutionOperation::Draft(_) | ExecutionOperation::Submit { .. }) { self.require_revision_phase()?; }
         let (response, receive) = oneshot::channel();
         self.sender
             .send(ExecutionControl {
@@ -519,6 +429,7 @@ mod tests {
             baseline_checkpoint: None,
             state: PlanExecutionState::Active,
             phase: PlanPhase::Implement,
+            implementation_report: None,
             original_revision: 1,
             revision: 1,
             generation: 0,
@@ -559,8 +470,8 @@ mod tests {
                 assert!(prompt.contains("Reset still retains score"));
                 assert!(prompt.ends_with("accepted document"));
                 if phase == PlanPhase::Implement {
-                    assert!(prompt.contains("Do not run builds, compiler checks, tests, linters, format checks, or manual/runtime verification in Implement, including targeted or preliminary checks."));
-                    assert!(prompt.contains("Defer all such checks to Verify even when commands appear in the accepted plan or earlier conversation."));
+                    assert!(prompt.contains("Do not edit or submit the plan, reconcile declaration metadata, or run builds"));
+                    assert!(prompt.contains("Defer all validation and conformance assessment to Verify"));
                 } else if phase == PlanPhase::Verify {
                     assert!(prompt.contains("Run each nonblank line of verification.automated"));
                     assert!(!prompt.contains("Do not run builds"));
@@ -596,68 +507,20 @@ mod tests {
     }
 
     #[test]
-    fn semantic_rejection_preserves_phase_then_resolution_returns_to_verification() {
+    fn implementation_defers_all_conformance_to_verification() {
         let mut execution = execution();
-        let mismatch = SemanticProgress {
-            missing: vec!["main.rs".into()],
-            ..Default::default()
-        };
-        assert!(
-            execution
-                .finish_phase(done(PlanPhase::Implement, None), mismatch.clone(), 1)
-                .unwrap_err()
-                .to_string()
-                .contains("Prefer correcting")
-        );
-        assert_eq!(execution.phase, PlanPhase::Implement);
-        assert_eq!(execution.generation, 0);
-        execution
-            .finish_phase(
-                done(PlanPhase::Implement, None),
-                SemanticProgress::default(),
-                2,
-            )
-            .unwrap();
-        execution
-            .finish_phase(
-                done(PlanPhase::Verify, Some(VerificationOutcome::Failed)),
-                SemanticProgress::default(),
-                3,
-            )
-            .unwrap();
-        assert_eq!(execution.phase, PlanPhase::Resolve);
-        assert_eq!(execution.findings, ["Round reset retains score"]);
-        assert!(
-            execution
-                .finish_phase(done(PlanPhase::Resolve, None), mismatch, 4)
-                .is_err()
-        );
-        execution
-            .finish_phase(
-                done(PlanPhase::Resolve, None),
-                SemanticProgress::default(),
-                5,
-            )
-            .unwrap();
+        let mismatch = SemanticProgress { missing: vec!["main.rs".into()], ..Default::default() };
+        execution.finish_phase(done(PlanPhase::Implement, None), mismatch.clone(), 1).unwrap();
         assert_eq!(execution.phase, PlanPhase::Verify);
-        execution
-            .finish_phase(
-                done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
-                SemanticProgress::default(),
-                6,
-            )
-            .unwrap();
+        execution.finish_phase(done(PlanPhase::Verify, Some(VerificationOutcome::Passed)), mismatch.clone(), 2).unwrap();
+        assert_eq!(execution.phase, PlanPhase::Resolve);
+        assert_eq!(execution.findings, ["main.rs: missing planned file"]);
+        execution.finish_phase(done(PlanPhase::Resolve, None), mismatch, 3).unwrap();
+        assert_eq!(execution.phase, PlanPhase::Verify);
+        execution.finish_phase(done(PlanPhase::Verify, Some(VerificationOutcome::Passed)), SemanticProgress::default(), 4).unwrap();
         assert_eq!(execution.state, PlanExecutionState::Complete);
-        assert_eq!(execution.completed_at_ms, Some(6));
-        assert!(
-            execution
-                .finish_phase(
-                    done(PlanPhase::Verify, Some(VerificationOutcome::Passed)),
-                    SemanticProgress::default(),
-                    7
-                )
-                .is_err()
-        );
+        assert_eq!(execution.completed_at_ms, Some(4));
+        assert!(execution.finish_phase(done(PlanPhase::Verify, Some(VerificationOutcome::Passed)), SemanticProgress::default(), 5).is_err());
     }
 
     #[test]
@@ -733,19 +596,18 @@ mod tests {
     }
 
     #[test]
-    fn semantic_scan_reports_the_first_expected_and_observed_declaration() {
+    fn semantic_scan_ignores_comments_and_collects_all_shape_differences() {
         let workspace = tempfile::tempdir().unwrap();
         let path = workspace.path().join("counter.rs");
-        std::fs::write(&path, "/// Accepted documentation.\npub struct Counter { pub value: i32 }\n").unwrap();
+        std::fs::write(&path, "/// Accepted documentation.\npub struct Counter { pub value: i32 }\npub fn run(count: i32) {}\n").unwrap();
         let mut design = DeclarationDesign::default();
         let (file, _) = design.source(workspace.path(), "counter.rs").unwrap();
         design.proposed.insert("counter.rs".into(), file.text);
-        std::fs::write(&path, "/// Changed documentation.\npub struct Counter { pub value: i32 }\n").unwrap();
+        std::fs::write(&path, "/// Changed documentation.\npub struct Counter { pub value: i32 }\npub fn run(count: i32) {}\n").unwrap();
+        assert!(SemanticProgress::scan(&design, workspace.path()).unwrap().conforms());
+        std::fs::write(&path, "pub struct Counter { pub value: bool }\npub fn run(count: bool) {}\n").unwrap();
         let progress = SemanticProgress::scan(&design, workspace.path()).unwrap();
-        assert!(!progress.conforms());
-        assert!(progress.different[0].contains("overview line 1"));
-        assert!(progress.different[0].contains("expected \"/// Accepted documentation.\""));
-        assert!(progress.different[0].contains("observed \"/// Changed documentation.\""));
+        assert_eq!(progress.different.len(), 2);
     }
 
     #[test]
@@ -765,19 +627,14 @@ mod tests {
         );
         std::fs::write(&path, "fn register() {}\nfn run() {}\n").unwrap();
         let progress = SemanticProgress::scan(&design, workspace.path()).unwrap();
-        assert_eq!(
-            progress.different,
-            [
-                "main.rs: planned call relationships differ for run: expected Calls 1 [register], Accesses 0 []; observed Calls 0 [], Accesses 0 []. Compare each group separately and author one block per group. Cross-group interleaving is not required."
-            ]
-        );
+        assert!(progress.conforms());
         design.proposed_calls.clear();
         std::fs::write(&path, "fn register() {}\nfn run() {}\nfn extra() {}\n").unwrap();
         assert!(
-            !SemanticProgress::scan(&design, workspace.path())
+            SemanticProgress::scan(&design, workspace.path())
                 .unwrap()
                 .conforms(),
-            "reverting a target to baseline must still validate the file"
+            "additional internal helpers must not require a plan revision"
         );
     }
 
@@ -807,7 +664,7 @@ mod tests {
             "function run(state)\n  check(state)\n  state.points = add(state.points)\n  check(state)\nend\n".into(),
         ] {
             std::fs::write(&path, changed).unwrap();
-            assert!(!SemanticProgress::scan(&design, workspace.path()).unwrap().conforms());
+            assert!(SemanticProgress::scan(&design, workspace.path()).unwrap().conforms());
         }
     }
 
@@ -855,5 +712,22 @@ mod tests {
                 .len(),
             1
         );
+    }
+}
+
+#[cfg(test)]
+mod revision_policy_tests {
+    use super::*;
+    #[test]
+    fn stale_tools_cannot_revise_outside_resolve() {
+        let (sender, _receiver) = mpsc::channel(1);
+        for phase in [PlanPhase::Implement, PlanPhase::Verify, PlanPhase::Resolve] {
+            let control = ExecutionControlSender { phase, execution_id: "e".into(), generation: 1, sender: sender.clone() };
+            assert_eq!(control.require_revision_phase().is_ok(), phase == PlanPhase::Resolve);
+            let tools = crate::control_tools::ControlToolRegistry.definition_list_for(Some(phase));
+            for name in ["harness_design_apply_patch", "harness_plan_submit"] {
+                assert_eq!(tools.iter().any(|tool| tool.name == name), phase == PlanPhase::Resolve);
+            }
+        }
     }
 }

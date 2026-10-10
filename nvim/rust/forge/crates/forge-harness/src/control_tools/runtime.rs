@@ -119,6 +119,8 @@ impl ControlToolRuntime {
             !self.terminal,
             "this provider turn already reached a terminal control action"
         );
+        if matches!(invocation.name.as_str(), "harness_design_apply_patch" | "harness_plan_submit")
+            && let Some(execution) = &self.context.execution { execution.require_revision_phase()?; }
         match invocation.name.as_str() {
             "harness_plan_phase_done" => {
                 let execution = self.context.execution.as_ref().context("phase completion requires an active execution")?;

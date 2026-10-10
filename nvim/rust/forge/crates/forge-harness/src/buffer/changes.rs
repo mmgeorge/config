@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use forge_buffer::block::{
     BlockAnchor, BlockMetadata, BufferBlock, Decoration, TargetRange, TextChunk,
     TextPosition, TextRange,
@@ -18,7 +18,6 @@ use super::transcript::TranscriptRenderer;
 pub(super) struct ChangeTree {
     pub block: Vec<BufferBlock>,
     pub action: HashMap<TargetId, TranscriptAction>,
-    pub bytes: usize,
 }
 
 fn file_action(path: &str, line: usize, previous: bool, declaration: Option<(&crate::exchange::DeclarationRevision, bool)>) -> TranscriptAction {
@@ -47,7 +46,6 @@ impl ChangeTree {
         let mut tree = Self {
             block: Vec::new(),
             action: HashMap::new(),
-            bytes: 0,
         };
         let patch = match UnifiedPatch::parse(text) {
             Ok(patch) => patch,
@@ -140,7 +138,7 @@ impl ChangeTree {
             } else if declaration.is_some() {
                 tree.push_action(heading, file_action(path, 1, true, declaration))?;
             } else {
-                tree.push(heading)?;
+                tree.block.push(heading);
             }
             if file.hunk.is_empty() {
                 let label = if file.binary {
@@ -148,14 +146,14 @@ impl ChangeTree {
                 } else {
                     "No textual diff"
                 };
-                tree.push(forge_diff::projection::header(
+                tree.block.push(forge_diff::projection::header(
                     BlockId(format!("{file_id}:empty")),
                     vec![TextChunk {
                         text: label.into(),
                         capture: "Comment".into(),
                     }],
                     0,
-                )?)?;
+                )?);
             }
             for (hunk_index, hunk) in file.hunk.iter().enumerate() {
                 let hunk_start = tree.block.len();
@@ -168,7 +166,7 @@ impl ChangeTree {
                     }],
                     0,
                 )?;
-                tree.push(heading)?;
+                tree.block.push(heading);
                 let emphasis = forge_diff::intraline::patch_emphasis(
                     forge_diff::intraline::IntralinePolicy::default(),
                     &hunk.row,
@@ -212,13 +210,13 @@ impl ChangeTree {
                                     },
                                 },
                             });
-                            tree.add_action(
+                            tree.action.insert(
                                 target,
                                 file_action(path, line + 1, baseline, declaration),
-                            )?;
+                            );
                         }
                     }
-                    tree.push(block)?;
+                    tree.block.push(block);
                 }
                 tree.fold(hunk_start, &hunk_id, false)?;
             }
@@ -234,39 +232,12 @@ impl ChangeTree {
             id: target.clone(),
             range: whole_block(&block),
         });
-        self.add_action(target, action)?;
-        self.push(block)
-    }
-
-    fn add_action(&mut self, target: TargetId, action: TranscriptAction) -> Result<()> {
-        let bytes = match &action {
-            TranscriptAction::Diff { text } => text.len(),
-            TranscriptAction::File { path, .. } => path.len(),
-            TranscriptAction::Declaration { path, plan_id, .. } => path.len() + plan_id.len(),
-            _ => 512,
-        };
-        self.reserve(bytes + target.0.len() + 128)?;
         self.action.insert(target, action);
-        Ok(())
-    }
-
-    fn push(&mut self, block: BufferBlock) -> Result<()> {
-        self.reserve(block.retained_bytes())?;
         self.block.push(block);
         Ok(())
     }
 
-    fn reserve(&mut self, bytes: usize) -> Result<()> {
-        ensure!(
-            self.bytes.saturating_add(bytes) <= 24 * 1024 * 1024,
-            "saved change tree exceeds 24 MiB"
-        );
-        self.bytes += bytes;
-        Ok(())
-    }
-
     fn fold(&mut self, start: usize, id: &str, expand_children: bool) -> Result<()> {
-        self.reserve(id.len() + 512)?;
         let last = self.block.last().expect("change heading exists");
         let end = BlockAnchor {
             block: last.id.clone(),
@@ -553,23 +524,15 @@ mod tests {
     }
 }
 #[test]
-fn metadata_capacity_cannot_bypass_saved_change_tree_admission() {
-    let mut tree = ChangeTree {
-        block: Vec::new(),
-        action: HashMap::new(),
-        bytes: 0,
-    };
-    let mut block = BufferBlock {
-        id: BlockId("metadata-heavy".into()),
-        text: BufferText::from_rows(["x"]).unwrap(),
-        metadata: BlockMetadata::default(),
-    };
-    block.metadata.visible_decoration =
-        Vec::with_capacity(24 * 1024 * 1024 / std::mem::size_of::<Decoration>() + 1);
-    block.validate().unwrap();
-    assert!(tree.push(block).unwrap_err().to_string().contains("24 MiB"));
-    assert!(tree.block.is_empty());
-    assert_eq!(tree.bytes, 0);
+fn large_diff_retains_source_and_navigation_without_byte_admission() -> Result<()> {
+    let width = forge_buffer::width::WidthProfile::default();
+    let renderer = TranscriptRenderer::new(&width)?;
+    let line = "x".repeat(8 * 1024 * 1024 + 1);
+    let source = format!("--- /dev/null\n+++ b/large.txt\n@@ -0,0 +1 @@\n+{line}\n");
+    let tree = ChangeTree::render(&renderer, "large", "Changes", "", &source, None, None)?;
+    assert!(tree.block.iter().any(|block| block.text.row(0) == Some(line.as_str())));
+    assert!(tree.action.values().any(|action| matches!(action, TranscriptAction::Diff { text } if text == &source)));
+    Ok(())
 }
 
 #[test]

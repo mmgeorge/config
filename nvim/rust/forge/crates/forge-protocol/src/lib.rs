@@ -20,4 +20,3 @@ pub const MAX_QUEUED_BYTES: usize = 8 * 1024 * 1024;
 pub const MAX_PENDING_FRAMES: usize = 128;
 pub const RESERVED_CONTROL_RECORDS: usize = 32;
 pub const MAX_SNAPSHOT_PART_BYTES: usize = 256 * 1024;
-pub const MAX_SNAPSHOT_BYTES: usize = 16 * 1024 * 1024;

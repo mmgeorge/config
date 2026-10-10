@@ -1,8 +1,7 @@
 local M = {}
 
-M.MAX_BYTES = 16 * 1024 * 1024
 local MAX_PART_BYTES = 256 * 1024
-local MAX_PARTS = 256
+local MAX_COUNTER = 9007199254740991
 
 ---@class ForgeJsonTransfer
 ---@field sequence integer
@@ -19,8 +18,8 @@ end
 ---@param part unknown
 ---@return boolean
 function M.valid(part)
-  return type(part) == "table" and counter(part.part_count, 1, MAX_PARTS)
-    and counter(part.sequence, 0, part.part_count - 1) and counter(part.total_bytes, 1, M.MAX_BYTES)
+  return type(part) == "table" and counter(part.part_count, 1, MAX_COUNTER)
+    and counter(part.sequence, 0, part.part_count - 1) and counter(part.total_bytes, part.part_count, MAX_COUNTER)
     and type(part.payload) == "string" and #part.payload > 0 and #part.payload <= MAX_PART_BYTES
 end
 

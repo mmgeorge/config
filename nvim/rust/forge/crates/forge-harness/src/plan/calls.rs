@@ -76,6 +76,9 @@ pub struct CallPosition {
 /// Saved behavioral intent and ordered references belonging to one callable.
 #[derive(Clone, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
 pub struct FunctionBody {
+    /// Presence of each authored category. None retains unknown historical evidence.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evidence: Option<ReferenceEvidence>,
     /// Callable identity within its saved declaration file.
     pub owner: String,
     /// Intended behavior change, absent until authored through the declaration patch tool.
@@ -84,6 +87,13 @@ pub struct FunctionBody {
     /// Ordered occurrences, including repeated targets. Absence means references are unavailable.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub call: Option<Vec<CallSite>>,
+}
+
+/// Distinguishes omitted reference categories from explicitly empty blocks.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, JsonSchema, PartialEq, Serialize)]
+pub struct ReferenceEvidence {
+    pub calls: bool,
+    pub accesses: bool,
 }
 
 /// Maps display rows to saved declarations and call identities.
@@ -126,7 +136,7 @@ pub(crate) fn from_extracted(
 ) -> Vec<FunctionBody> {
     functions
         .into_iter()
-        .map(|function| FunctionBody {
+        .map(|function| FunctionBody { evidence: Some(ReferenceEvidence { calls: true, accesses: true }),
             owner: function.owner,
             change: None,
             call: Some(function
@@ -276,6 +286,9 @@ pub(crate) fn insert(
                     }
                 }
                 for kind in [CallKind::Call, CallKind::Property] {
+                    if calls.evidence.is_some_and(|evidence| if kind == CallKind::Call { !evidence.calls } else { !evidence.accesses }) {
+                        continue;
+                    }
                     let Some(occurrences) = &calls.call else { continue };
                     let mut targets = calls
                         .call
@@ -284,7 +297,7 @@ pub(crate) fn insert(
                         .filter(|call| call.kind.category() == kind)
                         .map(|call| (call.name.as_str(), call.kind))
                         .collect::<Vec<_>>();
-                    if targets.is_empty() && !(kind == CallKind::Call && occurrences.is_empty()) {
+                    if targets.is_empty() && calls.evidence.is_none() && !(kind == CallKind::Call && occurrences.is_empty()) {
                         continue;
                     }
                     if review {
@@ -565,6 +578,10 @@ pub(crate) fn parse(
     for (line, sections) in sections {
         let function = by_line[&line];
         let references_available = !sections.reference.is_empty();
+        let evidence = references_available.then_some(ReferenceEvidence {
+            calls: sections.reference.contains_key(&CallKind::Call),
+            accesses: sections.reference.contains_key(&CallKind::Property),
+        });
         let mut category = sections.reference
             .into_iter()
             .map(|(kind, names)| (kind, std::collections::VecDeque::from(names)))
@@ -617,7 +634,7 @@ pub(crate) fn parse(
                 call
             })
             .collect();
-        output.push(FunctionBody {
+        output.push(FunctionBody { evidence,
             owner: function.owner.clone(),
             change: sections.change,
             call: references_available.then_some(call),
@@ -635,6 +652,17 @@ pub(crate) fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reference_evidence_distinguishes_omitted_and_empty_categories() {
+        for (text, calls, accesses) in [("Calls\n", true, false), ("Accesses\n", false, true), ("Calls\nAccesses\n", true, true)] {
+            let (declarations, body) = parse("lib.rs", &format!("pub fn run();\n{text}"), &[]).unwrap();
+            assert_eq!(body[0].evidence, Some(ReferenceEvidence { calls, accesses }));
+            let saved = serde_json::to_string(&body).unwrap();
+            let loaded: Vec<FunctionBody> = serde_json::from_str(&saved).unwrap();
+            assert_eq!(parse("lib.rs", &combined("lib.rs", &declarations, &loaded).unwrap(), &[]).unwrap().1, body);
+        }
+    }
 
     #[test]
     fn change_sections_round_trip_without_inventing_references() {
@@ -878,7 +906,7 @@ mod tests {
         )
         .unwrap();
         assert!(calls[0].call.as_ref().unwrap()[0].unresolved);
-        let previous = vec![FunctionBody { change: None,
+        let previous = vec![FunctionBody { evidence: None, change: None,
             owner: "run".into(),
             call: Some(vec![CallSite {
                 kind: crate::plan::CallKind::Call,

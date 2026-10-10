@@ -51,6 +51,14 @@ pub(super) struct ResolvedFile {
 }
 
 impl CheckpointRecord {
+    /// Select changed paths using content identities without loading whole file contents.
+    pub fn changed_paths(&self, other: &Self) -> Result<Vec<String>> {
+        let before = self.resolved()?;
+        let after = other.resolved()?;
+        Ok(before.keys().chain(after.keys()).collect::<std::collections::BTreeSet<_>>()
+            .into_iter().filter(|path| before.get(*path) != after.get(*path)).cloned().collect())
+    }
+
     /// Resolves metadata without loading any file contents.
     pub(super) fn resolved(&self) -> Result<BTreeMap<String, ResolvedFile>> {
         let mut files =

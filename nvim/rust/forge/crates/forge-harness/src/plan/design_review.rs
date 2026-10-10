@@ -915,7 +915,7 @@ mod tests {
         let declaration = "pub fn run();\n";
         design.baseline.insert("main.rs".into(), super::super::DeclarationFile { text: declaration.into(), source_digest: String::new() });
         design.proposed.insert("main.rs".into(), declaration.into());
-        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { owner: "run".into(), call: None, change: Some("Stop retrying authentication failures.\nRecord the final attempt.".into()) }]);
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { evidence: None, owner: "run".into(), call: None, change: Some("Stop retrying authentication failures.\nRecord the final attempt.".into()) }]);
         document.design = Some(design);
         let original = document.clone();
         let rendered = render(&document).unwrap();
@@ -944,7 +944,7 @@ mod tests {
         let after = before.replace("old", "shared");
         design.baseline.insert("arena.rs".into(), super::super::DeclarationFile { text: before.into(), source_digest: String::new() });
         design.proposed.insert("arena.rs".into(), after.clone());
-        let calls = vec![super::super::FunctionBody { change: None, owner: "ArenaPlugin::new".into(), call: Some(vec![
+        let calls = vec![super::super::FunctionBody { evidence: None, change: None, owner: "ArenaPlugin::new".into(), call: Some(vec![
             super::super::CallSite { kind: super::super::CallKind::Call, name: "ArenaConfig::validate".into(), source: None, unresolved: false },
             super::super::CallSite { kind: super::super::CallKind::Property, name: "ArenaConfig::enabled".into(), source: None, unresolved: false },
         ]) }];
@@ -1010,7 +1010,7 @@ mod tests {
             ("État::更新", super::super::CallKind::Call, vec![("État", "@type"), ("更新", "@function.method.call")]),
             ("Client::count", super::super::CallKind::Property, vec![("Client", "@type"), ("count", "@variable.member")]),
         ];
-        design.proposed_calls.insert("lib.rs".into(), vec![super::super::FunctionBody {
+        design.proposed_calls.insert("lib.rs".into(), vec![super::super::FunctionBody { evidence: None,
             owner: "main".into(),
             change: None,
             call: Some(cases.iter().map(|(name, kind, _)| super::super::CallSite {

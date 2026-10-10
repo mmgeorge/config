@@ -51,18 +51,14 @@ impl WidthProfile {
         continuation_indent_cells: usize,
     ) -> Result<Vec<String>, ContractError> {
         self.validate()?;
-        if continuation_indent_cells >= self.columns
-            || text.len() > 8 * 1024 * 1024
-            || text.contains('\0')
-        {
-            return Err(ContractError("plain text exceeds wrapping limits"));
+        if continuation_indent_cells >= self.columns || text.contains('\0') {
+            return Err(ContractError("invalid plain text indentation or NUL"));
         }
         let indentation = " ".repeat(continuation_indent_cells);
         let mut rows = vec![String::new()];
-        let mut output_bytes = text.len();
         for (line, physical) in text.split('\n').enumerate() {
             if line > 0 {
-                push_continuation(&mut rows, &indentation, &mut output_bytes)?;
+                rows.push(indentation.clone());
             }
             for part in physical.split_inclusive(char::is_whitespace) {
                 let current = rows.last().unwrap();
@@ -74,7 +70,7 @@ impl WidthProfile {
                 if current.len() > prefix
                     && self.cells(&format!("{current}{part}"), 0)? > self.columns
                 {
-                    push_continuation(&mut rows, &indentation, &mut output_bytes)?;
+                    rows.push(indentation.clone());
                 }
                 if self.cells(&format!("{}{part}", rows.last().unwrap()), 0)? <= self.columns {
                     rows.last_mut().unwrap().push_str(part);
@@ -90,7 +86,7 @@ impl WidthProfile {
                     if current.len() > prefix
                         && self.cells(&format!("{current}{cluster}"), 0)? > self.columns
                     {
-                        push_continuation(&mut rows, &indentation, &mut output_bytes)?;
+                        rows.push(indentation.clone());
                     }
                     rows.last_mut().unwrap().push_str(cluster);
                 }
@@ -192,24 +188,21 @@ impl WidthProfile {
     }
 }
 
-fn push_continuation(
-    rows: &mut Vec<String>,
-    indentation: &str,
-    output_bytes: &mut usize,
-) -> Result<(), ContractError> {
-    if rows.len() >= 65_536 {
-        return Err(ContractError("plain text row budget exceeded"));
-    }
-    *output_bytes += indentation.len();
-    if *output_bytes > 16 * 1024 * 1024 {
-        return Err(ContractError("plain text presentation budget exceeded"));
-    }
-    rows.push(indentation.to_owned());
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn large_plain_text_preserves_rows_without_size_admission() {
+        let line = "x".repeat(257);
+        let source = format!("{line}\n").repeat(65_537);
+        assert!(source.len() > 16 * 1024 * 1024);
+        let profile = super::WidthProfile { columns: 512, ..Default::default() };
+        let rows = profile.wrap_plain(&source, 2).unwrap();
+        assert_eq!(rows.len(), 65_538);
+        assert_eq!(rows[0], line);
+        assert_eq!(rows[65_536], format!("  {line}"));
+        assert_eq!(rows[65_537], "  ");
+    }
+
     use super::*;
 
     #[test]

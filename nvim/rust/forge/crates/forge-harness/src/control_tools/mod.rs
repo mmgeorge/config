@@ -79,7 +79,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "harness_plan_submit",
-                description: "Format and submit the exact canonical declaration design for user review. Automatically validate Rust and TypeScript imports and signature references against the proposed declarations and available sources. Proven invalid references return actionable errors and remain editable. Unavailable or unsupported evidence remains in saved diagnostics and permits submission. Success confirms submission and the current version. Submission is not implementation approval. No implementation build or second model review runs. In Plan, end the turn after successful submission. During execution, reason is required and explains the necessary deviation. Forge accepts the new revision automatically unless the user disabled Auto-approve plan revisions in /config. The execution tool call waits for the review decision. Continue the same turn using its returned revision and feedback.",
+                description: "Format and submit the exact canonical declaration design for user review. Automatically validate Rust and TypeScript imports and signature references against the proposed declarations and available sources. Proven invalid references return actionable errors and remain editable. Unavailable or unsupported evidence remains in saved diagnostics and permits submission. Success confirms submission and the current version. Submission is not implementation approval. No implementation build or second model review runs. In Plan, end the turn after successful submission. During execution, revisions are allowed only in Resolve. Submit one consolidated contract change with a concrete reason. Internal helpers and Calls/Accesses differences do not require a revision. Forge accepts the new revision automatically unless the user disabled Auto-approve plan revisions in /config. The execution tool call waits for the review decision. Continue the same turn using its returned revision and feedback.",
                 input_schema: strict_object_input_schema(
                     vec![
                         ("plan_id", string_schema()),
@@ -94,7 +94,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name: "harness_plan_phase_done",
-                description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. Forge validates the expected phase and revision, runs semantic gates, commits the transition, and returns the next instructions. End the turn after success. Semantic mismatches return errors: prefer correcting the implementation, or submit a justified revision. Verify requires an agent assessment and exact completed tool-call IDs in verification.evidence. After running checks, call harness_plan_read with only plan_id to obtain execution.verification_evidence IDs and output previews. Passed cannot bypass semantic conformance. Failed enters Resolve. Blocked preserves Verify.",
+                description: "Finish the current Implement, Verify, or Resolve phase of the active accepted semantic plan. Forge validates the expected phase and revision, commits the transition, and returns the next instructions. Implement and Resolve finish without conformance checks. Verify collects required declaration and public API differences together. Extra internal helpers and Calls/Accesses never gate completion. End the turn after success. Verification findings enter Resolve, where code defects can be fixed and intentional contract changes can be submitted together. Verify requires an agent assessment and exact completed tool-call IDs in verification.evidence. After running checks, call harness_plan_read with only plan_id to obtain execution.verification_evidence IDs and output previews. Passed cannot bypass semantic conformance. Failed enters Resolve. Blocked preserves Verify.",
                 input_schema: strict_object_input_schema(vec![
                     ("phase", json!({"type":"string","enum":["implement","verify","resolve"]})),
                     ("revision", json!({"type":"integer","minimum":1})),
@@ -147,6 +147,14 @@ impl ControlToolRegistry {
                 ),
             },
         ]
+    }
+
+    /// Expose plan mutation only while authoring a plan or resolving an execution.
+    pub fn definition_list_for(&self, phase: Option<crate::plan::PlanPhase>) -> Vec<ControlToolDefinition> {
+        self.definition_list().into_iter().filter(|definition| {
+            !matches!(definition.name, "harness_design_apply_patch" | "harness_plan_submit")
+                || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve)
+        }).collect()
     }
 
     /// Convert the canonical definitions into the MCP tool-list shape.

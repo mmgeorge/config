@@ -220,7 +220,7 @@ local function receive_result(client, message)
     if not transfer then
       local active = 0
       for _ in pairs(client.transfer) do active = active + 1 end
-      if part.sequence ~= 0 or active >= 2 or client.transfer_bytes + part.total_bytes > 2 * json_transfer.MAX_BYTES then
+      if part.sequence ~= 0 or active >= 2 then
         return nil, "result transfer admission or starting sequence is invalid"
       end
       transfer = json_transfer.new()

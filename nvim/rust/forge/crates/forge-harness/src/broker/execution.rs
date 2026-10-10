@@ -135,10 +135,9 @@ impl HarnessBroker {
             .design
             .context("execution requires a semantic design")?;
         let workspace = PathBuf::from(&self.session.workspace);
-        let progress = tokio::task::spawn_blocking(move || {
-            crate::plan::execution::SemanticProgress::scan(&design, &workspace)
-        })
-        .await??;
+        let progress = if execution.phase == crate::plan::PlanPhase::Verify {
+            tokio::task::spawn_blocking(move || crate::plan::execution::SemanticProgress::scan(&design, &workspace)).await??
+        } else { crate::plan::execution::SemanticProgress::default() };
         anyhow::ensure!(
             !self.turn_cancellation.requested.load(Ordering::Acquire),
             "execution interrupted during semantic comparison"
@@ -188,6 +187,10 @@ impl HarnessBroker {
             interaction.execution_id.as_deref() == Some(execution_id),
             "control belongs to another interaction"
         );
+        if matches!(&operation, ExecutionOperation::Draft(_) | ExecutionOperation::Submit { .. }) {
+            anyhow::ensure!(execution.phase == crate::plan::PlanPhase::Resolve,
+                "plan revisions are only allowed in Resolve");
+        }
         let now_ms = self.clock.now_ms();
         let title;
         let phase_completion = matches!(&operation, ExecutionOperation::Phase(_));
@@ -360,11 +363,12 @@ impl HarnessBroker {
                     .chain(design.proposed.keys())
                     .cloned()
                     .collect::<std::collections::BTreeSet<_>>();
-                let mut progress = tokio::task::spawn_blocking(move || {
-                    SemanticProgress::scan(&design, &workspace)
-                })
-                .await??;
-                if let Some(checkpoint_id) = &execution.baseline_checkpoint {
+                let verifying = execution.phase == crate::plan::PlanPhase::Verify;
+                let comparison_workspace = workspace.clone();
+                let mut progress = if verifying {
+                    tokio::task::spawn_blocking(move || SemanticProgress::scan(&design, &comparison_workspace)).await??
+                } else { SemanticProgress::default() };
+                if verifying && let Some(checkpoint_id) = &execution.baseline_checkpoint {
                     let initial = self
                         .store
                         .load_checkpoint(checkpoint_id)?
@@ -377,27 +381,33 @@ impl HarnessBroker {
                             now_ms,
                         )
                         .await?;
-                    let before = initial
-                        .file
-                        .iter()
-                        .map(|file| (&file.path, &file.object_id))
-                        .collect::<std::collections::BTreeMap<_, _>>();
-                    let after = current
-                        .file
-                        .iter()
-                        .map(|file| (&file.path, &file.object_id))
-                        .collect::<std::collections::BTreeMap<_, _>>();
-                    for path in before
-                        .keys()
-                        .chain(after.keys())
-                        .copied()
-                        .collect::<std::collections::BTreeSet<_>>()
-                    {
+                    for path in initial.changed_paths(&current)? {
+                        let path = path.as_str();
                         if forge_diff::syntax::DeclarationOverview::supports(path)
                             && !accepted_paths.contains(path)
-                            && before.get(path) != after.get(path)
                         {
-                            progress.different.push(format!("{path}: source changed outside the accepted plan. Restore it or submit a justified revision."));
+                            let expected = initial.read(&self.store.objects, path, usize::MAX)?;
+                            let source = crate::plan::workspace_source(Path::new(&self.session.workspace), path)?;
+                            progress.source_digest.insert(path.to_string(), source.as_deref().map_or_else(|| "absent".into(), |text| crate::plan::digest(text.as_bytes())));
+                            let expected = expected.map(String::from_utf8).transpose()?;
+                            match (expected, source) {
+                                (Some(expected), Some(source)) => {
+                                    let overview = forge_diff::syntax::DeclarationOverview::extract(path, &expected)
+                                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                                    match crate::plan::conformance::compare_in_workspace(&workspace, path, &overview, &source) {
+                                        Ok(differences) => progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}"))),
+                                        Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
+                                    }
+                                }
+                                (None, Some(source)) if forge_diff::syntax::ConfigurationFormat::for_path(path).is_none() => {
+                                    match crate::plan::conformance::compare_in_workspace(&workspace, path, "", &source) {
+                                        Ok(differences) => progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}"))),
+                                        Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
+                                    }
+                                }
+                                (Some(_), None) => progress.different.push(format!("{path}: unplanned deletion")),
+                                _ => progress.warning.push(format!("{path}: additional configuration artifact")),
+                            }
                         }
                     }
                 }
@@ -469,33 +479,8 @@ impl HarnessBroker {
                 };
             }
         }
-        if execution.state == PlanExecutionState::Complete
-            && execution.revision != execution.original_revision
-        {
-            let original = self.plan_file.read_submitted_document(
-                &self.session.id,
-                &plan.id,
-                execution.original_revision,
-            )?;
-            let implemented = self.plan_file.read_submitted_document(
-                &self.session.id,
-                &plan.id,
-                execution.revision,
-            )?;
-            let delta =
-                crate::plan::revision::DeclarationDelta::between(Some(&original), &implemented)?;
-            interaction.node_list.push(ExchangeNode::ArtifactChange {
-                change: crate::exchange::ArtifactChange {
-                    id: format!("{}:implemented-plan-comparison", interaction.id),
-                    path: format!(
-                        "Original revision {} → implemented revision {}",
-                        execution.original_revision, execution.revision
-                    ),
-                    diff_text: format!("{}{}", delta.document, delta.files),
-                    declaration: None,
-                    created_at_ms: now_ms,
-                },
-            });
+        if phase_completion && matches!(execution.state, PlanExecutionState::Complete | PlanExecutionState::Blocked) {
+            self.capture_implementation_report(&mut execution, interaction, now_ms).await?;
         }
         goal.updated_at_ms = now_ms;
         plan.updated_at_ms = now_ms;
@@ -531,6 +516,37 @@ impl HarnessBroker {
         Ok(response)
     }
 
+    async fn capture_implementation_report(&mut self, execution: &mut PlanExecutionRecord, interaction: &mut Exchange, now_ms: i64) -> Result<()> {
+        let original = self.plan_file.read_submitted_document(&self.session.id, &execution.plan_id, execution.original_revision)?;
+        let original = original.design.context("original accepted design is missing")?;
+        let initial = execution.baseline_checkpoint.as_ref().map(|id| self.store.load_checkpoint(id)).transpose()?.flatten();
+        let current = if initial.is_some() {
+            Some(crate::checkpoint::GitCheckpoint::new(&self.session.workspace)
+                .capture(&self.store.objects, &self.repositories, &self.session.id, now_ms).await?)
+        } else { None };
+        let workspace = PathBuf::from(&self.session.workspace);
+        let objects = self.store.objects.clone();
+        let report = crate::plan::implementation_report::ImplementationReport::new(execution);
+        let (report, digests) = tokio::task::spawn_blocking(move ||
+            report.capture(&original,
+                initial.as_ref(), current.as_ref(), &objects, &workspace)).await??;
+        for (path, digest) in &digests {
+            let source = crate::plan::workspace_source(Path::new(&self.session.workspace), path)?;
+            let actual = source.as_deref().map_or_else(|| "absent".into(), |source| crate::plan::digest(source.as_bytes()));
+            anyhow::ensure!(&actual == digest, "{path}: workspace changed while capturing implementation report; retry phase completion");
+            if execution.state == PlanExecutionState::Complete && let Some(verified) = execution.progress.source_digest.get(path) {
+                anyhow::ensure!(verified == digest, "{path}: implementation report differs from verification source; retry phase completion");
+            }
+        }
+        anyhow::ensure!(execution.state != PlanExecutionState::Complete || !self.turn_cancellation.requested.load(Ordering::Acquire), "execution interrupted while capturing implementation report");
+        let reference = report.save(&self.store.objects, execution.state != PlanExecutionState::Complete)?;
+        execution.implementation_report = Some(reference.clone());
+        let id = format!("{}:implementation-report", interaction.id);
+        interaction.node_list.retain(|node| node.id() != id);
+        interaction.node_list.push(ExchangeNode::ImplementationReport { id, reference, report: Some(std::sync::Arc::new(report)) });
+        Ok(())
+    }
+
     pub(super) fn revision_review_response(&self, execution_id: &str) -> Result<Value> {
         let execution = self.store.load_plan_execution(execution_id)?.context("review execution is missing")?;
         let plan = self.store.load_plan(&execution.plan_id)?.context("review plan is missing")?;
@@ -541,7 +557,7 @@ impl HarnessBroker {
         Ok(response)
     }
 
-    pub(super) fn record_execution_failure(&mut self, interaction: &Exchange, reason: String) -> Result<()> {
+    pub(super) async fn record_execution_failure(&mut self, interaction: &mut Exchange, reason: String) -> Result<()> {
         let Some(execution_id) = &interaction.execution_id else { return Ok(()) };
         let mut execution = self.store.load_plan_execution(execution_id)?.context("execution is missing")?;
         if execution.state == PlanExecutionState::Complete { return Ok(()) }
@@ -550,7 +566,22 @@ impl HarnessBroker {
             crate::plan::ExchangeAnchor::capture(interaction), self.clock.now_ms(),
             PlanExecutionLifecycleEvent::Failed { title: plan.title, reason },
         );
+        self.capture_partial_report(&mut execution, interaction).await;
         self.store.save_plan_execution(&execution)
+    }
+
+    async fn capture_partial_report(&mut self, execution: &mut PlanExecutionRecord, interaction: &mut Exchange) {
+        if let Err(error) = self.capture_implementation_report(execution, interaction, self.clock.now_ms()).await {
+            let mut report = crate::plan::implementation_report::ImplementationReport::new(execution);
+            report.unavailable.push(format!("Implementation comparison unavailable: {error:#}"));
+            if let Ok(reference) = report.save(&self.store.objects, true) {
+                execution.implementation_report = Some(reference.clone());
+                interaction.node_list.push(ExchangeNode::ImplementationReport {
+                    id: format!("{}:implementation-report-unavailable", interaction.id), reference,
+                    report: Some(std::sync::Arc::new(report)),
+                });
+            }
+        }
     }
 
     pub(super) fn observe_plan_progress(&mut self, interaction: &Exchange) -> Result<bool> {
@@ -566,13 +597,18 @@ impl HarnessBroker {
             &execution.plan_id,
             execution.revision,
         )?;
-        let progress = crate::plan::execution::SemanticProgress::scan(
-            document
-                .design
-                .as_ref()
-                .context("execution requires a semantic design")?,
-            Path::new(&self.session.workspace),
-        )?;
+        let design = document.design.as_ref().context("execution requires a semantic design")?;
+        let progress = if execution.phase == crate::plan::PlanPhase::Verify {
+            crate::plan::execution::SemanticProgress::scan(design, Path::new(&self.session.workspace))?
+        } else {
+            let mut progress = crate::plan::execution::SemanticProgress::default();
+            for path in design.proposed.keys() {
+                if let Some(source) = crate::plan::workspace_source(Path::new(&self.session.workspace), path)? {
+                    progress.source_digest.insert(path.clone(), crate::plan::digest(source.as_bytes()));
+                }
+            }
+            progress
+        };
         let mut changed = progress.source_digest != execution.observed_source
             || execution.generation != execution.observed_generation;
         if execution.phase == crate::plan::PlanPhase::Verify {
@@ -633,10 +669,10 @@ impl HarnessBroker {
             &plan.id,
             accepted_revision,
         )?;
-        Ok(Some(super::PlanPrompt::execution(&execution, kind, &accepted.model_json()?)))
+        Ok(Some(super::PlanPrompt::execution(&execution, kind, &accepted.execution_json(execution.phase)?)))
     }
 
-    pub(super) fn sync_plan_execution(&mut self, goal: &GoalRecord) -> Result<()> {
+    pub(super) async fn sync_plan_execution(&mut self, goal: &GoalRecord) -> Result<()> {
         let Some(mut execution) = self
             .store
             .list_plan_execution(&self.session.id)?
@@ -691,8 +727,14 @@ impl HarnessBroker {
         } else {
             execution.completed_at_ms = None;
         }
-        self.store
-            .save_execution_transition(&execution, goal, None, None)?;
+        let mut report_exchange = None;
+        if matches!(state, PlanExecutionState::Cancelled | PlanExecutionState::Stalled) {
+            if let Some(mut interaction) = self.store.latest_execution_exchange(&self.session.id, &execution.id)? {
+                self.capture_partial_report(&mut execution, &mut interaction).await;
+                report_exchange = Some(interaction);
+            }
+        }
+        self.store.save_execution_transition(&execution, goal, None, report_exchange.as_ref())?;
         Ok(())
     }
 }

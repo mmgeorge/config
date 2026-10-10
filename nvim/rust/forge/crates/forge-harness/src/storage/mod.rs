@@ -533,6 +533,14 @@ impl SqliteStore {
         )?.pop())
     }
 
+    /// Load only the last exchange owned by an execution, leaving unrelated output unloaded.
+    pub(crate) fn latest_execution_exchange(&self, session_id: &str, execution_id: &str) -> Result<Option<Exchange>> {
+        Ok(self.list_exchange_payload(
+            "SELECT payload FROM exchange_record WHERE session_id=?1 AND json_extract(payload, '$.execution_id')=?2 ORDER BY ordinal DESC LIMIT 1",
+            params![session_id, execution_id],
+        )?.pop())
+    }
+
     /// Load interactions in their admitted user-action order.
     pub fn list_exchange(&self, session_id: &str) -> Result<Vec<Exchange>> {
         self.list_exchange_payload(

@@ -6,6 +6,12 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExchangeNode {
+    ImplementationReport {
+        id: String,
+        reference: crate::plan::implementation_report::ImplementationReportRef,
+        #[serde(skip)]
+        report: Option<std::sync::Arc<crate::plan::implementation_report::ImplementationReport>>,
+    },
     QuestionPresented {
         id: String,
         question: crate::plan::PlanQuestionSet,
@@ -34,6 +40,7 @@ pub enum ExchangeNode {
 impl ExchangeNode {
     pub fn id(&self) -> &str {
         match self {
+            Self::ImplementationReport { id, .. } => id,
             Self::QuestionPresented { id, .. } => id,
             Self::PlanEvent { event } => &event.id,
             Self::TurnContent { id, .. } => id,

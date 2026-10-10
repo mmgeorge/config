@@ -160,7 +160,7 @@ mod tests {
         let mut previous = super::super::document::test_fixture("change", "Behavior change");
         let mut design = DeclarationDesign::default();
         design.proposed.insert("main.rs".into(), "pub fn run();\n".into());
-        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { owner: "run".into(), call: None, change: Some("Stop retrying authentication failures.".into()) }]);
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { evidence: None, owner: "run".into(), call: None, change: Some("Stop retrying authentication failures.".into()) }]);
         previous.design = Some(design);
         let mut current = previous.clone();
         current.design.as_mut().unwrap().proposed_calls.get_mut("main.rs").unwrap()[0].change = Some("Limit transient retries to three attempts.".into());
@@ -175,7 +175,7 @@ mod tests {
         let mut previous = super::super::document::test_fixture("calls", "Calls");
         let mut design = DeclarationDesign::default();
         design.proposed.insert("main.rs".into(), "fn run();\n".into());
-        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { change: None, owner: "run".into(), call: Some(vec![super::super::CallSite { kind: crate::plan::CallKind::Call, name: "before".into(), source: None, unresolved: false }]) }]);
+        design.proposed_calls.insert("main.rs".into(), vec![super::super::FunctionBody { evidence: None, change: None, owner: "run".into(), call: Some(vec![super::super::CallSite { kind: crate::plan::CallKind::Call, name: "before".into(), source: None, unresolved: false }]) }]);
         previous.design = Some(design);
         let mut current = previous.clone();
         current.design.as_mut().unwrap().proposed_calls.get_mut("main.rs").unwrap()[0].call.as_mut().unwrap()[0].name = "after".into();

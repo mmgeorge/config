@@ -1,10 +1,10 @@
-//! Bounded JSON encodings split at UTF-8 boundaries and produced one part at a time.
+//! JSON encodings split into bounded UTF-8 parts and produced one part at a time.
 
 use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use crate::{MAX_SNAPSHOT_BYTES, MAX_SNAPSHOT_PART_BYTES, outbound};
+use crate::MAX_SNAPSHOT_PART_BYTES;
 
 const PAYLOAD_BYTES: usize = MAX_SNAPSHOT_PART_BYTES / 2;
 
@@ -25,8 +25,8 @@ pub struct JsonTransfer {
 
 impl JsonTransfer {
     pub fn new(value: &impl Serialize) -> io::Result<Self> {
-        let encoded = String::from_utf8(outbound::encode(value, MAX_SNAPSHOT_BYTES)?)
-            .map_err(io::Error::other)?;
+        let mut encoded = serde_json::to_string(value).map_err(io::Error::other)?;
+        encoded.push('\n');
         let mut boundary = vec![0];
         let mut start = 0;
         while start < encoded.len() {

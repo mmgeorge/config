@@ -94,7 +94,7 @@ impl MessageSender {
         if encode(&message, MAX_FRAME_BYTES).is_ok() {
             return self.send_wait(message).await;
         }
-        let _permit = self.begin_transfer()?;
+        let _permit = self.begin_transfer().await?;
         let transfer = crate::transfer::JsonTransfer::new(&message)?;
         let transfer_id = self
             .event_sequence
@@ -126,7 +126,7 @@ impl MessageSender {
             self.send_wait(response).await?;
             return Ok(());
         }
-        let prepared = self.begin_transfer().and_then(|permit| {
+        let prepared = self.begin_transfer().await.and_then(|permit| {
             crate::transfer::JsonTransfer::new(&response).map(|transfer| (permit, transfer))
         });
         let (_permit, transfer) =
@@ -135,11 +135,7 @@ impl MessageSender {
                 Err(error) => {
                     self.send_wait(Message::Response(Response::failure_with_data(
                 request_id,
-                if error.kind() == std::io::ErrorKind::WouldBlock {
-                    "result_transfer_busy"
-                } else {
-                    "result_too_large"
-                },
+                "result_encoding_failed",
                 format!("Forge operation completed, but its result cannot be transferred: {error}"),
                 json!({"operation_completed": true}),
             )))
@@ -167,14 +163,15 @@ impl MessageSender {
         Ok(())
     }
 
-    /// Reserves one of two encoded transfers before retaining up to 16 MiB of JSON.
-    pub fn begin_transfer(&self) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
-        self.transfer.clone().try_acquire_owned().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::WouldBlock,
-                "result transfer admission is full",
-            )
-        })
+    /// Waits for an encoding slot while preserving transport shutdown handling.
+    pub async fn begin_transfer(&self) -> io::Result<tokio::sync::OwnedSemaphorePermit> {
+        tokio::select! {
+            permit = self.transfer.clone().acquire_owned() => permit.map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "result transfer admission closed")
+            }),
+            _ = self.sender.closed() => Err(io::Error::new(io::ErrorKind::BrokenPipe, "output receiver closed")),
+            error = self.failed() => Err(error),
+        }
     }
 
     /// Waits for output capacity while the caller retains ownership of the source value.
@@ -480,17 +477,19 @@ mod tests {
         assert_eq!(waiting.await.unwrap_err().kind(), io::ErrorKind::BrokenPipe);
     }
 
-    #[test]
-    fn encoded_transfer_admission_is_shared_by_sender_clones() {
+    #[tokio::test]
+    async fn encoded_transfer_admission_waits_across_sender_clones() {
         let (sender, _receiver) = channel();
-        let first = sender.begin_transfer().unwrap();
-        let _second = sender.clone().begin_transfer().unwrap();
-        assert_eq!(
-            sender.begin_transfer().unwrap_err().kind(),
-            io::ErrorKind::WouldBlock
-        );
+        let first = sender.begin_transfer().await.unwrap();
+        let _second = sender.clone().begin_transfer().await.unwrap();
+        let mut waiting = Box::pin(sender.begin_transfer());
+        tokio::select! {
+            biased;
+            _ = &mut waiting => panic!("occupied transfer slot did not wait"),
+            _ = tokio::task::yield_now() => {},
+        }
         drop(first);
-        let _permit = sender.begin_transfer().unwrap();
+        let _permit = waiting.await.unwrap();
     }
 
     #[tokio::test]
@@ -564,7 +563,7 @@ mod tests {
                 .send_event(SessionEvent {
                     session_id: "session".into(),
                     event: "exchange_updated".into(),
-                    payload: json!("x".repeat(crate::MAX_SNAPSHOT_BYTES)),
+                    payload: json!("invalid session event payload"),
                 })
                 .await
                 .is_err()

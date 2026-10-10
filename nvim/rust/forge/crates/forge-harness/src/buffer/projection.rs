@@ -67,39 +67,6 @@ pub struct ProjectedEntry {
     pub(crate) syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
 }
 
-impl ProjectedEntry {
-    pub fn retained_bytes(&self) -> usize {
-        self.entry
-            .block
-            .iter()
-            .map(BufferBlock::retained_bytes)
-            .sum::<usize>()
-            + self
-                .syntax
-                .values()
-                .map(super::syntax::MarkdownSyntax::retained_bytes)
-                .sum::<usize>()
-            + self
-                .prompt
-                .iter()
-                .map(|identity| identity.0.len() + 32)
-                .sum::<usize>()
-            + self
-                .tool
-                .values()
-                .map(ToolOutputView::retained_bytes)
-                .sum::<usize>()
-            + self
-                .action
-                .values()
-                .map(|action| match action {
-                    TranscriptAction::Diff { text } => text.len(),
-                    _ => 512,
-                })
-                .sum::<usize>()
-    }
-}
-
 struct TimelineRenderer<'profile> {
     width: &'profile WidthProfile,
     margin: usize,
@@ -109,7 +76,6 @@ struct TimelineRenderer<'profile> {
     action: HashMap<TargetId, TranscriptAction>,
     tool: HashMap<String, ToolOutputView>,
     syntax: HashMap<TargetId, super::syntax::MarkdownSyntax>,
-    bytes: usize,
     leading_separator: bool,
     expansion: &'profile HashMap<String, bool>,
     tool_limit: &'profile HashMap<String, usize>,
@@ -302,7 +268,7 @@ pub(super) fn message_block(previous: &BufferBlock, message: &crate::turn::Messa
     let mut content_width = width.clone();
     content_width.columns = content_width.columns.saturating_sub(indent.saturating_sub(2)).max(1);
     let mut renderer = TimelineRenderer { width:&content_width,margin:0,now_ms:0,block:Vec::new(),
-        prompt:Vec::new(),action:HashMap::new(),tool:HashMap::new(),syntax:HashMap::new(),bytes:0,
+        prompt:Vec::new(),action:HashMap::new(),tool:HashMap::new(),syntax:HashMap::new(),
         leading_separator:false,expansion:&HashMap::new(),tool_limit:&HashMap::new() };
     renderer.markdown(&previous.id.0,message.text(),
         if message.delivery() == crate::turn::MessageDelivery::Final { MarkdownRole::Response }
@@ -351,7 +317,6 @@ fn project_at_with_separator(
         action: HashMap::new(),
         tool: HashMap::new(),
         syntax: HashMap::new(),
-        bytes: 0,
         leading_separator,
         expansion,
         tool_limit,
@@ -365,8 +330,6 @@ fn project_at_with_separator(
         TranscriptRenderer::resolve_marker(block)?;
         super::layout::materialize(block)?;
     }
-    ensure!(projection.block.iter().map(|block| block.text.byte_count()).sum::<usize>() <= 32 * 1024 * 1024,
-        "materialized transcript exceeds native capacity");
     ensure!(projection.margin == 0, "timeline section was not finished");
     if projection.block.is_empty() {
         projection.literal(&format!("{}:empty", entry.id()), "", None)?;
@@ -1127,6 +1090,37 @@ impl TimelineRenderer<'_> {
                         self.finish_section(section, &identity, true);
                     }
                 }
+                ExchangeNode::ImplementationReport { id, reference, report } => {
+                    self.literal(id, &format!("▸ {}", reference.summary()), None)?;
+                    let section = self.begin_section(2);
+                    if let Some(report) = report {
+                        self.markdown(&format!("{id}:revisions"), &format!("Original revision {} · accepted revision {}\n{}",
+                            report.original_revision, report.accepted_revision,
+                            report.revisions.iter().map(|revision| format!("- Revision {} ({}): {}", revision.revision, revision.approval, revision.reason)).collect::<Vec<_>>().join("\n")), MarkdownRole::Detail)?;
+                        for (index, file) in report.file.iter().enumerate() {
+                            let file_id = format!("{id}:file:{index}");
+                            self.literal(&file_id, &format!("▸ {}", file.path), None)?;
+                            let file_section = self.begin_section(2);
+                            let mut lines = Vec::new();
+                            for detail in &file.contract { lines.push(format!("- Contract: {detail}")); }
+                            for helper in &file.internal { lines.push(format!("- Internal addition: `{helper}`")); }
+                            for difference in &file.references {
+                                lines.push(format!("- `{}` — {}{}", difference.owner, difference.category,
+                                    if difference.expected.is_none() { " (unspecified in plan)" } else { "" }));
+                                if let Some(expected) = &difference.expected { lines.push(format!("  Planned: {}", expected.join(", "))); }
+                                lines.push(format!("  Observed: {}", difference.observed.join(", ")));
+                            }
+                            self.markdown(&format!("{file_id}:details"), &lines.join("\n"), MarkdownRole::Detail)?;
+                            self.finish_section(file_section, &file_id, true);
+                        }
+                        for (index, unavailable) in report.unavailable.iter().enumerate() {
+                            self.markdown(&format!("{id}:unavailable:{index}"), &format!("Unavailable: {unavailable}"), MarkdownRole::Detail)?;
+                        }
+                    } else {
+                        self.markdown(&format!("{id}:unavailable"), "Report content is unavailable. The saved summary is retained.", MarkdownRole::Detail)?;
+                    }
+                    self.finish_section(section, id, true);
+                }
                 ExchangeNode::ArtifactChange { change } => {
                     if let Some(declaration) = &change.declaration {
                         let revision_request = interaction.kind == ExchangeKind::PlanExecution;
@@ -1256,14 +1250,6 @@ impl TimelineRenderer<'_> {
             !self.tool.contains_key(&call_id),
             "duplicate tool identity in interaction"
         );
-        self.bytes = self
-            .bytes
-            .checked_add(tool.output.len())
-            .context("transcript output capacity overflow")?;
-        ensure!(
-            self.bytes <= 32 * 1024 * 1024,
-            "transcript entry exceeds 32 MiB"
-        );
         let mut output = ToolOutputView::new(call_id.clone(), &tool.output)?;
         output.heading(tool);
         output.group = group.to_owned();
@@ -1324,11 +1310,6 @@ impl TimelineRenderer<'_> {
         if text.is_empty() {
             return Ok(());
         }
-        ensure!(
-            text.len() <= 8 * 1024 * 1024,
-            "transcript diff exceeds 8 MiB"
-        );
-        self.bytes += text.len();
         let tree = super::changes::ChangeTree::render(
             &TranscriptRenderer::new(&self.content_width())?,
             id,
@@ -1338,7 +1319,6 @@ impl TimelineRenderer<'_> {
             file_label,
             declaration,
         )?;
-        self.bytes += tree.bytes;
         self.action.extend(tree.action);
         for block in tree.block {
             self.push(block)?;
@@ -1426,11 +1406,6 @@ impl TimelineRenderer<'_> {
 
     fn push(&mut self, mut block: BufferBlock) -> Result<()> {
         block.metadata.layout.get_or_insert(ContentLayout { indent: 2, marker: None, source_indent: 0 });
-        self.bytes += block.text.byte_count();
-        ensure!(
-            self.bytes <= 32 * 1024 * 1024 && self.block.len() < 65536,
-            "transcript entry exceeds native capacity"
-        );
         self.block.push(block);
         Ok(())
     }
@@ -3579,4 +3554,35 @@ mod tests {
             "● Thought 4s │ I 1.0k (90%) · R 200 · O 80"
         );
     }
+    #[test]
+    fn implementation_report_has_closed_file_sections_and_visible_missing_evidence() {
+        use crate::plan::implementation_report::{ImplementationReport, ImplementationReportRef, ImplementationFile};
+        let mut exchange: Exchange = serde_json::from_value(json!({
+            "id":"report-exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Implement", "kind":"plan_execution", "state":"complete", "created_at_ms":0,
+            "attributed_matches_checkpoint":false,"node_list":[]
+        })).unwrap();
+        let report = ImplementationReport { original_revision:1, accepted_revision:2, revisions:Vec::new(),
+            file:vec![ImplementationFile { path:"src/lib.rs".into(), internal:vec!["function helper".into()],
+                contract:Vec::new(), references:Vec::new() }], unavailable:Vec::new() };
+        exchange.node_list.push(crate::exchange::ExchangeNode::ImplementationReport {
+            id:"report".into(), reference:ImplementationReportRef { object_id:"saved".into(), files:1,helpers:1,relationships:0,incomplete:false },
+            report:Some(std::sync::Arc::new(report)),
+        });
+        let render = |exchange| project_at(&TimelineEntry::Exchange {
+            id:"report-exchange".into(), created_at_ms:0, exchange, agent_by_id:HashMap::new(),
+        }, &WidthProfile::default(), 1).unwrap();
+        let projected = render(exchange.clone());
+        for identity in ["report", "report:file:0"] {
+            let block = projected.entry.block.iter().find(|block| block.id.0 == identity).unwrap();
+            assert!(block.metadata.fold[0].closed);
+        }
+        let crate::exchange::ExchangeNode::ImplementationReport { report, .. } = &mut exchange.node_list[0] else { unreachable!() };
+        *report = None;
+        let projected = render(exchange);
+        let text = projected.entry.block.iter().flat_map(|block| (0..block.text.row_count()).map(|row| block.text.row(row).unwrap())).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Report content is unavailable"));
+        assert!(text.contains("Implementation differences"));
+    }
+
 }

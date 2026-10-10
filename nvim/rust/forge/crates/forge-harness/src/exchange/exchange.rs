@@ -858,6 +858,7 @@ mod test {
                 ExchangeNode::ArtifactChange { .. } => "artifact",
                 ExchangeNode::QuestionPresented { .. } => "question",
                 ExchangeNode::PlanEvent { .. } => "plan",
+                ExchangeNode::ImplementationReport { .. } => "implementation-report",
             })
             .collect::<Vec<_>>();
         assert_eq!(kind_list, ["agent", "steering"]);

@@ -67,9 +67,13 @@ in Design, and exact checks in Verification. Tests inventory is planned coverage
 
 In Plan, a successful harness_plan_submit requests review. End the turn after success. Implement only
 when Harness supplies an accepted revision and execution instructions. During Execute, follow the
-accepted design or submit a necessary revision with a concrete reason. The submission tool waits for
-automatic acceptance or the user's review decision. Continue the same turn using the returned revision
-and feedback.
+accepted design with these phase boundaries: Implement writes code and tests, permits justified
+implementation deviations, and never revises the plan or runs checks. Verify collects structural and
+behavioral findings together and does not revise the plan. Resolve corrects findings and, when needed,
+submits one consolidated contract revision with a reason. Additional internal helpers and Calls/Accesses
+differences do not require revision or block completion. Harness reports those differences from source
+at the end. Revision submission in Resolve waits for automatic acceptance or the user's review decision.
+Continue the same turn using the returned revision and feedback.
 
 Call harness_plan_phase_done for the supplied phase and revision only when its work is finished.
 End the turn after success. The returned state determines what happens next. Do not use
@@ -93,8 +97,8 @@ Harness does not create the file automatically or require an empty file when no 
 Preserve existing comments, negations, and unrelated rules. Keep source and required lockfiles
 tracked. Use paths appropriate to the project, such as /target/ for a root Rust package, and do not
 generate placeholder lockfiles. On resumption, recheck current contents before editing rather than
-overwriting from a stale planning snapshot. Use the revision flow if current workspace changes
-conflict with the accepted design. Keep this workflow guidance out of plan prose.
+overwriting from a stale planning snapshot. Record necessary deviations during Implement and let Verify assess them. Use the Resolve revision
+flow for an intentional change to the accepted contract. Keep this workflow guidance out of plan prose.
 
 ## Questions, failures, and responses
 

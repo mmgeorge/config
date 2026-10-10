@@ -51,20 +51,6 @@ pub(crate) struct MarkdownSyntax {
 }
 
 impl MarkdownSyntax {
-    /// Charge retained source and coordinate maps even when jobs share their storage.
-    pub fn retained_bytes(&self) -> usize {
-        std::mem::size_of::<Self>()
-            + self.target.0.capacity() * 2
-            + self.block.0.capacity()
-            + self.text.allocated_bytes()
-            + self.code.capacity() * std::mem::size_of::<MarkdownCode>()
-            + self
-                .code
-                .iter()
-                .map(MarkdownCode::retained_bytes)
-                .sum::<usize>()
-    }
-
     /// Map code-language captures onto literal rows without altering displayed Markdown.
     pub async fn analyze(&self, engine: &Arc<SyntaxEngine>) -> Result<Vec<BufferBlock>> {
         let deadline = Instant::now() + Duration::from_secs(10);

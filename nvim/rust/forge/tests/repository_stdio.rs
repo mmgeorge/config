@@ -147,7 +147,6 @@ impl Host {
                     assert_eq!(part["part_count"], part_count);
                     assert_eq!(part["total_bytes"], total_bytes);
                     assembled.push_str(part["payload"].as_str().unwrap());
-                    assert!(assembled.len() <= forge_protocol::MAX_SNAPSHOT_BYTES);
                     sequence += 1;
                     continue;
                 }
@@ -187,7 +186,7 @@ impl Host {
 }
 
 #[tokio::test]
-async fn reopening_large_harness_history_transfers_initialize_without_poisoning_host() {
+async fn reopening_large_harness_history_transfers_document_without_poisoning_host() {
     let workspace = tempfile::tempdir().unwrap();
     let data = tempfile::tempdir().unwrap();
     let params = json!({
@@ -219,11 +218,21 @@ async fn reopening_large_harness_history_transfers_initialize_without_poisoning_
     params["session_id"] = session_id.clone();
     let reopened = host.request(2, "harness.initialize", params).await;
     assert_eq!(reopened["result"]["session"]["id"], session_id);
-    assert_eq!(reopened["result"]["exchange"][0]["prompt"], prompt);
-    assert!(serde_json::to_vec(&reopened).unwrap().len() > forge_protocol::MAX_FRAME_BYTES);
+    let document = host.request(3, "harness.document", json!({
+        "operation":"open", "document":"large-history", "view":"history-view",
+        "width":forge_buffer::width::WidthProfile::default(),
+    })).await;
+    let snapshot: forge_buffer::patch::BufferSnapshot = serde_json::from_value(
+        document["result"]["transcript"].clone(),
+    ).expect("history document response");
+    let displayed = snapshot.block.iter().find(|block| block.id.0 == "large-history:prompt")
+        .expect("reopened prompt block").text.wire_rows().join("\n");
+    assert!(displayed.split_whitespace().filter(|word| *word != "●").eq(prompt.split_whitespace()),
+        "reopened transcript must preserve every saved prompt word");
+    assert!(serde_json::to_vec(&document).unwrap().len() > forge_protocol::MAX_FRAME_BYTES);
     let subsequent = host
         .request(
-            3,
+            4,
             "repository.revisions",
             json!({"workspace":workspace.path()}),
         )
@@ -1260,13 +1269,12 @@ async fn large_cached_detail_transfers_with_credit_and_preserves_the_host() {
                 repo: "owner/repo".into(),
                 number: 7,
                 fetched_at: 123,
-                item: json!({"body":"x".repeat(forge_protocol::MAX_SNAPSHOT_BYTES)}),
+                item: json!({"body":"x".repeat(16 * 1024 * 1024 + 1)}),
             },
         )
         .unwrap();
-    let refused = host.request(4, "github.issues", json!({"database":database,"repo":"owner/repo","request":{"operation":"detail","number":7}})).await;
-    assert_eq!(refused["error"]["code"], "result_too_large");
-    assert_eq!(refused["error"]["data"]["operation_completed"], true);
+    let large = host.request(4, "github.issues", json!({"database":database,"repo":"owner/repo","request":{"operation":"detail","number":7}})).await;
+    assert_eq!(large["result"]["item"]["body"].as_str().unwrap().len(), 16 * 1024 * 1024 + 1);
     host.stop().await;
 }
 

@@ -61,12 +61,17 @@ end
 
 local ok, failure = xpcall(function()
   start("review.open_pr")
-  local body = string.rep('日本語 "quote" \\ newline\n', 30000)
+  local body = string.rep('日本語 "quote" \\ newline\n', 900000)
   local encoded = vim.json.encode({ id = request_id, result = { body = body } })
   local chunk = 100000
   local count = math.ceil(#encoded / chunk)
+  assert(#encoded > 16 * 1024 * 1024 and count > 256)
   for sequence = 0, count - 1 do
     part(sequence, count, #encoded, encoded:sub(sequence * chunk + 1, (sequence + 1) * chunk))
+    assert(vim.wait(1000, function()
+      local transfer = client._client.transfer[request_id]
+      return transfer and transfer.sequence == sequence + 1
+    end, 1))
   end
   assert(vim.wait(1000, function()
     local transfer = client._client.transfer[request_id]
@@ -102,8 +107,8 @@ local ok, failure = xpcall(function()
     function() part(0, 1, 1, "{}"); complete(1, 1) end,
     function() part(0, 1, 2, "xx"); complete(1, 2) end,
     function() complete(1, 2) end,
-    function() part(0, 1, 16 * 1024 * 1024 + 1, "{}") end,
-    function() part(0, 257, 257, "x") end,
+    function() part(0, 1, -1, "{}") end,
+    function() part(0, 257, 256, "x") end,
     function()
       local foreign = vim.json.encode({ id = request_id + 1, result = {} })
       part(0, 1, #foreign, foreign)

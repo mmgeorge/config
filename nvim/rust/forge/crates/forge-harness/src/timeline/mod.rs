@@ -216,9 +216,17 @@ impl TimelineProjector {
             agent_run_list,
             agent_exchange_list,
             session_event_list,
-            plan_file: _,
+            plan_file,
         } = projection;
         let mut interaction_list = interaction_list;
+        for exchange in &mut interaction_list {
+            for node in &mut exchange.node_list {
+                if let crate::exchange::ExchangeNode::ImplementationReport { reference, report, .. } = node {
+                    // The reference remains renderable if historical report storage is unavailable.
+                    *report = plan_file.implementation_report(reference).ok();
+                }
+            }
+        }
         planning::attach(&mut interaction_list, plan_list, lifecycle_list, execution_list,
             resolution_list, &deviation_list, &audit_list);
         let mut result = interaction_list.into_iter().map(|exchange| TimelineEntry::Exchange {

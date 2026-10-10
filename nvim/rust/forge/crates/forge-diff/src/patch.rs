@@ -7,12 +7,8 @@ use std::str::SplitTerminator;
 
 use crate::display::RowKind;
 
-const MAX_PATCH_BYTES: usize = 8 * 1024 * 1024;
-const MAX_PATCH_ROWS: usize = 262_144;
-const MAX_PATCH_FILES: usize = 4096;
-
 #[derive(Debug, PartialEq, Eq)]
-/// Rejects malformed or oversized input without returning a partial patch.
+/// Rejects malformed input without returning a partial patch.
 pub struct PatchParseError(pub &'static str);
 
 impl fmt::Display for PatchParseError {
@@ -31,37 +27,33 @@ pub struct UnifiedPatch<'source> {
 }
 
 impl<'source> UnifiedPatch<'source> {
-    /// Parse up to 8 MiB, 262144 body rows, and 4096 files with exact hunk coordinates.
+    /// Parses saved patches with exact hunk coordinates and borrowed source rows.
     ///
     /// Accepts Git extended patches and ordinary unified file headers. Invalid counts, paths,
-    /// truncated hunks, combined diffs, and exceeded limits return an error atomically.
+    /// truncated hunks, and combined diffs return an error atomically.
     pub fn parse(source: &'source str) -> Result<Self, PatchParseError> {
-        if source.len() > MAX_PATCH_BYTES {
-            return Err(PatchParseError("saved patch exceeds 8 MiB"));
-        }
         let mut result = Self { file: Vec::new() };
         let mut lines = source.split_terminator('\n').peekable();
-        let mut row_count = 0;
         let mut source_header = false;
         while let Some(raw) = lines.next() {
             let line = raw.trim_end_matches('\r');
             if let Some(paths) = line.strip_prefix("diff --git ") {
                 let (old, new) = git_paths(paths)?;
-                result.push(PatchFile {
+                result.file.push(PatchFile {
                     old_path: Some(old),
                     new_path: Some(new),
                     binary: false,
                     hunk: Vec::new(),
-                })?;
+                });
                 source_header = false;
             } else if let Some(path) = line.strip_prefix("--- ") {
                 if source_header || result.file.is_empty() {
-                    result.push(PatchFile {
+                    result.file.push(PatchFile {
                         old_path: None,
                         new_path: None,
                         binary: false,
                         hunk: Vec::new(),
-                    })?;
+                    });
                 }
                 let file = result.file.last_mut().unwrap();
                 file.old_path = source_path(path, "a/")?;
@@ -79,7 +71,7 @@ impl<'source> UnifiedPatch<'source> {
                     .last_mut()
                     .ok_or(PatchParseError("saved patch hunk has no file"))?;
                 file.hunk
-                    .push(PatchHunk::parse(line, &mut lines, &mut row_count)?);
+                    .push(PatchHunk::parse(line, &mut lines)?);
             } else if line.starts_with("diff --cc ")
                 || line.starts_with("diff --combined ")
                 || line.starts_with("@@@")
@@ -128,13 +120,6 @@ impl<'source> UnifiedPatch<'source> {
         Ok(result)
     }
 
-    fn push(&mut self, file: PatchFile<'source>) -> Result<(), PatchParseError> {
-        if self.file.len() == MAX_PATCH_FILES {
-            return Err(PatchParseError("saved patch exceeds 4096 files"));
-        }
-        self.file.push(file);
-        Ok(())
-    }
 }
 
 #[derive(Debug)]
@@ -167,7 +152,6 @@ impl<'source> PatchHunk<'source> {
     fn parse(
         header: &'source str,
         lines: &mut Peekable<SplitTerminator<'source, char>>,
-        total: &mut usize,
     ) -> Result<Self, PatchParseError> {
         let (ranges, _) = header
             .strip_prefix("@@ ")
@@ -182,9 +166,6 @@ impl<'source> PatchHunk<'source> {
         let mut new = new_lines.start;
         let mut row = Vec::new();
         while old < old_lines.end || new < new_lines.end {
-            if *total == MAX_PATCH_ROWS {
-                return Err(PatchParseError("saved patch exceeds 262144 body rows"));
-            }
             let line = lines
                 .next()
                 .ok_or(PatchParseError("truncated saved patch hunk"))?;
@@ -216,7 +197,6 @@ impl<'source> PatchHunk<'source> {
                 new_line,
                 no_newline,
             });
-            *total += 1;
         }
         if row.is_empty() {
             return Err(PatchParseError("saved patch hunk has no source rows"));
@@ -456,7 +436,7 @@ mod tests {
     }
 
     #[test]
-    fn malformed_counts_and_limits_fail_without_partial_results_or_panics() {
+    fn malformed_counts_fail_without_partial_results_or_panics() {
         let prefix = "--- a/file\n+++ b/file\n";
         for body in [
             "@@ -1,2 +1,2 @@\n one\n",
@@ -471,15 +451,21 @@ mod tests {
                 "{body}"
             );
         }
-        assert!(UnifiedPatch::parse(&"x".repeat(MAX_PATCH_BYTES + 1)).is_err());
-        assert!(
-            UnifiedPatch::parse(&"diff --git a/file b/file\n".repeat(MAX_PATCH_FILES + 1)).is_err()
-        );
+    }
+
+    #[test]
+    fn large_patches_retain_all_source_rows_and_files() {
+        let line = "x".repeat(8 * 1024 * 1024 + 1);
+        let source = format!("--- a/file\n+++ b/file\n@@ -0,0 +1 @@\n+{line}\n");
+        let patch = UnifiedPatch::parse(&source).unwrap();
+        assert_eq!(patch.file[0].hunk[0].row[0].text, line);
+        let files = "diff --git a/file b/file\n".repeat(4097);
+        assert_eq!(UnifiedPatch::parse(&files).unwrap().file.len(), 4097);
         let rows = format!(
-            "{prefix}@@ -0,0 +1,{} @@\n{}",
-            MAX_PATCH_ROWS + 1,
-            "+x\n".repeat(MAX_PATCH_ROWS + 1)
+            "--- a/file\n+++ b/file\n@@ -0,0 +1,{} @@\n{}",
+            262_145,
+            "+x\n".repeat(262_145)
         );
-        assert!(UnifiedPatch::parse(&rows).is_err());
+        assert_eq!(UnifiedPatch::parse(&rows).unwrap().file[0].hunk[0].row.len(), 262_145);
     }
 }

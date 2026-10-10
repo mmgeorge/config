@@ -10,7 +10,6 @@ use forge_buffer::width::WidthProfile;
 use super::document::{TranscriptChange, TranscriptDocument, TranscriptEntry, TranscriptSource};
 
 const PAGE_BYTES: usize = 64 * 1024;
-const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Clone)]
 struct PageQuota {
@@ -538,20 +537,11 @@ impl SectionProjection {
             if more {
                 if paged && quota.width.is_some() {
                     let (rows, width) = page.unwrap_or((48, WidthProfile::default()));
-                    ensure!(quota.rows < 1_048_576, "section exceeds loaded-row limit");
-                    ensure!(
-                        quota.bytes < MAX_BODY_BYTES,
-                        "section exceeds the 16 MiB loaded-body limit"
-                    );
-                    quota.rows = quota.rows.max(loaded_rows).saturating_add(rows).min(1_048_576);
-                    quota.bytes = (quota.bytes + PAGE_BYTES).min(MAX_BODY_BYTES);
+                    quota.rows = quota.rows.max(loaded_rows).saturating_add(rows);
+                    quota.bytes = quota.bytes.saturating_add(PAGE_BYTES);
                     quota.width = Some(width);
                 } else {
-                    ensure!(
-                        quota.bytes < MAX_BODY_BYTES,
-                        "section exceeds the 16 MiB loaded-body limit"
-                    );
-                    quota.bytes = (quota.bytes + PAGE_BYTES).min(MAX_BODY_BYTES);
+                    quota.bytes = quota.bytes.saturating_add(PAGE_BYTES);
                 }
             }
         }
@@ -736,16 +726,6 @@ fn render(
                     within_file || file,
                     if file { Some(id.as_str()) } else { parent_file },
                 )? || source_block.metadata.node.as_ref().is_some_and(|node| node.more));
-            if file && more {
-                let bytes: usize = output[heading + 1..]
-                    .iter()
-                    .map(|block| block.text.byte_count())
-                    .sum();
-                ensure!(
-                    bytes < MAX_BODY_BYTES - 4,
-                    "section exceeds the 16 MiB loaded-body limit"
-                );
-            }
             let boundary = more && !within_file;
             if boundary {
                 output.push(BufferBlock {
@@ -1014,6 +994,30 @@ mod tests {
                 block: vec![heading, body],
             }],
         )
+    }
+
+    #[test]
+    fn section_continues_loading_past_previous_body_limit() -> Result<()> {
+        let mut blocks = source()?.snapshot()?.block;
+        blocks[1].text = BufferText::from_rows(["x".repeat(16 * 1024 * 1024 + 2 * PAGE_BYTES)])?;
+        let mut source = TranscriptDocument::initialize(
+            DocumentId("large-source".into()), "session".into(), 0,
+            vec![TranscriptEntry { id: "entry".into(), block: blocks }],
+        )?;
+        let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;
+        let view = ViewId("view".into());
+        visible.register(view.clone());
+        visible.quota_for_test("tools", 16 * 1024 * 1024);
+        visible.set(&mut source, view.clone(), 1, "tools", true, false, None)?;
+        visible.refresh(&mut source)?;
+        let before = visible.document.document.block(&BlockId("body".into())).unwrap().text.byte_count();
+        visible.set(&mut source, view, 2, "tools", true, true, None)?;
+        visible.refresh(&mut source)?;
+        let after = visible.document.document.block(&BlockId("body".into())).unwrap().text.byte_count();
+        assert!(after > before && after > 16 * 1024 * 1024);
+        assert!(visible.document.snapshot()?.block.iter().any(|block|
+            block.metadata.section.iter().any(|section| section.id.0 == "tools" && section.more)));
+        Ok(())
     }
 
     #[test]

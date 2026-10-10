@@ -18,9 +18,7 @@ use super::document::{TranscriptChange, TranscriptDocument};
 use super::output::OutputDocument;
 use super::projection::{ProjectedEntry, ProjectionSource, TranscriptAction, project};
 
-const MAX_PROJECTED_BYTES: usize = 64 * 1024 * 1024;
 const MAX_PENDING_BYTES: usize = 2 * 1024 * 1024;
-const MAX_OUTPUT_VIEW_BYTES: usize = 96 * 1024 * 1024;
 
 pub struct SessionPresentation {
     session_id: String,
@@ -45,7 +43,6 @@ struct OpenPresentation {
     output: HashMap<DocumentId, OutputDocument>,
     pending: VecDeque<(BufferPatch, usize)>,
     pending_bytes: usize,
-    retained_bytes: usize,
     input: HashMap<ViewId, InputSequence>,
     failure: Option<String>,
 }
@@ -55,7 +52,6 @@ struct EntryPresentation {
     target: Vec<TargetId>,
     syntax: Vec<TargetId>,
     tool: Vec<String>,
-    bytes: usize,
 }
 
 #[derive(Serialize)]
@@ -212,7 +208,7 @@ impl SessionPresentation {
                     let limit = if more {
                         open.sections.nodes.tool_limit.get(&request.node).copied()
                             .unwrap_or(super::tool::INITIAL_INLINE_BYTES)
-                            .saturating_add(super::tool::INITIAL_INLINE_BYTES).min(16 * 1024 * 1024)
+                            .saturating_add(super::tool::INITIAL_INLINE_BYTES)
                     } else { super::tool::INITIAL_INLINE_BYTES };
                     toggle_inline_output(open, call, expanded, limit)?;
                 }
@@ -286,28 +282,13 @@ impl SessionPresentation {
                     .as_mut()
                     .context("session presentation is not open")?;
                 ensure!(
-                    open.output.len() < 8
-                        && !open.output.contains_key(&document)
+                    !open.output.contains_key(&document)
                         && document != open.transcript_id,
-                    "tool document admission is full or identity is already used"
+                    "tool document identity is already used"
                 );
                 let tool = open.sections.nodes.tool.get(&call_id).context("saved tool output is unavailable")?;
-                let previous_bytes = tool.retained_bytes();
                 let source = tool.snapshot()?;
-                let added_bytes = tool.retained_bytes().saturating_sub(previous_bytes);
-                open.retained_bytes += added_bytes;
-                if let Some(entry) = open.entry.get_mut(tool.owner()) { entry.bytes += added_bytes; }
-                ensure!(open.retained_bytes <= MAX_PROJECTED_BYTES, "parsed output exceeds projection capacity");
                 let output = OutputDocument::new(document.clone(), source)?;
-                ensure!(
-                    open.output
-                        .values()
-                        .map(OutputDocument::retained_bytes)
-                        .sum::<usize>()
-                        + output.retained_bytes()
-                        <= MAX_OUTPUT_VIEW_BYTES,
-                    "tool source admission exceeds 96 MiB"
-                );
                 let snapshot = output.snapshot();
                 open.output.insert(document, output);
                 Ok(
@@ -319,19 +300,11 @@ impl SessionPresentation {
                     .open
                     .as_mut()
                     .context("session presentation is not open")?;
-                let retained = open
-                    .output
-                    .values()
-                    .map(OutputDocument::retained_bytes)
-                    .sum::<usize>();
                 let output = open
                     .output
                     .get_mut(&document)
                     .context("unknown tool output document")?;
-                Ok(to_value(output.demand(
-                    revision,
-                    MAX_OUTPUT_VIEW_BYTES.saturating_sub(retained),
-                )?)?)
+                Ok(to_value(output.demand(revision)?)?)
             }
             PresentationRequest::ToolExport { .. } => {
                 anyhow::bail!("tool export requires the initialized storage owner")
@@ -441,14 +414,8 @@ impl SessionPresentation {
             });
         }
         let mut projected = Vec::new();
-        let mut retained_bytes = 0;
         for (index, entry) in self.timeline.entry_list().iter().enumerate() {
             let entry = project(ProjectionSource::Entry(entry), &width, index > 0, &HashMap::new(), &HashMap::new())?;
-            retained_bytes += entry.retained_bytes();
-            ensure!(
-                retained_bytes <= MAX_PROJECTED_BYTES,
-                "session projection exceeds 64 MiB"
-            );
             projected.push(entry);
         }
         let mut entry = HashMap::new();
@@ -497,7 +464,6 @@ impl SessionPresentation {
             output: HashMap::new(),
             pending: VecDeque::new(),
             pending_bytes: 0,
-            retained_bytes,
             input: HashMap::from([(view, InputSequence(0))]),
             failure: None,
         });
@@ -611,7 +577,6 @@ impl SessionPresentation {
             return Ok(());
         }
         let mut edits = Vec::new();
-        let mut additional = 0;
         for syntax in highlighted {
             let Some(current) = open.transcript.document.block(&syntax.id) else {
                 return Ok(());
@@ -631,9 +596,6 @@ impl SessionPresentation {
                 span.range.end.column += prefix.len();
                 replacement.metadata.visible_decoration.push(span);
             }
-            additional += replacement
-                .retained_bytes()
-                .saturating_sub(current.retained_bytes());
             let index = open
                 .transcript
                 .document
@@ -645,17 +607,7 @@ impl SessionPresentation {
                 block: vec![replacement],
             });
         }
-        ensure!(
-            open.retained_bytes + additional <= MAX_PROJECTED_BYTES,
-            "session syntax projection exceeds 64 MiB"
-        );
         if let Some(patch) = open.transcript.document.edit_many(edits)? {
-            open.retained_bytes += additional;
-            if let Some(entry) = open.entry.values_mut().find(|entry| {
-                entry.target.contains(job.target()) || entry.syntax.contains(job.target())
-            }) {
-                entry.bytes += additional;
-            }
             retain_patches(open, vec![patch])?;
         }
         open.syntax_done.insert(job.target().clone());
@@ -955,7 +907,6 @@ fn entry_presentation(projected: &ProjectedEntry) -> EntryPresentation {
         target: projected.action.keys().cloned().collect(),
         syntax: projected.syntax.keys().cloned().collect(),
         tool: projected.tool.keys().cloned().collect(),
-        bytes: projected.retained_bytes(),
     }
 }
 
@@ -996,33 +947,22 @@ fn refresh_activity<'source>(open: &mut OpenPresentation,
     source: impl IntoIterator<Item=&'source TimelineEntry>) -> Result<()> {
     let width = open.transcript.views.profile().unwrap_or(&open.last_width).clone();
     let mut blocks = Vec::new();
-    let mut retained = open.retained_bytes;
     for entry in source {
         for block in super::projection::timing_blocks(entry,&width,
             &open.transcript.document,&open.sections.nodes.choice,&open.sections.nodes.tool)? {
-            let previous = open.transcript.document.block(&block.id)
-                .context("timing block is missing")?.retained_bytes();
-            retained = retained.saturating_sub(previous) + block.retained_bytes();
-            ensure!(retained <= MAX_PROJECTED_BYTES, "session projection exceeds 64 MiB");
-            blocks.push((entry.id(), previous, block));
+            blocks.push(block);
         }
     }
     let mut patches = Vec::new();
-    for (entry_id, previous, block) in blocks {
-        let added = block.retained_bytes();
+    for block in blocks {
         if let Some(patch) = open.transcript.append(block)? { patches.push(patch); }
-        if let Some(entry) = open.entry.get_mut(&entry_id) {
-            entry.bytes = entry.bytes.saturating_sub(previous) + added;
-        }
     }
-    open.retained_bytes = retained;
     retain_patches(open,patches)
 }
 
 fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bool, limit: usize) -> Result<()> {
     use forge_buffer::identity::BlockId;
     let source = open.sections.nodes.tool.get(call_id).context("inline tool source is missing")?;
-    let previous_source_bytes = source.retained_bytes();
     let owner = source.owner().to_owned();
     let call = source.header().context("inline tool heading source is missing")?;
     let heading_id = BlockId(format!("{call_id}:tool"));
@@ -1051,15 +991,12 @@ fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bo
     let first_chunk = if expanded && was_expanded {
         removed_chunks.min(chunks)
     } else { 0 };
-    let mut removed = previous_heading.retained_bytes();
     let mut retired_target = HashSet::new();
     for chunk in first_chunk..removed_chunks {
         let block = open.transcript.document.block(&identity(chunk)).context("inline body is missing")?;
-        removed += block.retained_bytes();
         retired_target.extend(block.metadata.target.iter().map(|target|target.id.clone()));
     }
     let previous_hidden = open.transcript.document.block(&hidden_id).context("inline hidden counter is missing")?;
-    removed += previous_hidden.retained_bytes();
     retired_target.extend(previous_hidden.metadata.target.iter().map(|target|target.id.clone()));
     let mut body = Vec::new();
     for chunk in first_chunk..chunks {
@@ -1069,9 +1006,6 @@ fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bo
     }
     let mut hidden = renderer.tool_hidden(call_id,source,expanded)?;
     hidden.metadata.layout = layout;
-    let added = source.retained_bytes().saturating_sub(previous_source_bytes) + heading.retained_bytes() + hidden.retained_bytes() + body.iter().map(forge_buffer::block::BufferBlock::retained_bytes).sum::<usize>();
-    let retained = open.retained_bytes.saturating_sub(removed) + added;
-    ensure!(retained <= MAX_PROJECTED_BYTES, "inline output exceeds projection capacity");
     let target = body.iter().chain(std::iter::once(&hidden)).flat_map(|block|block.metadata.target.iter().map(|target|target.id.clone())).collect::<Vec<_>>();
     let mut changes = vec![TranscriptChange::Block { block:heading }];
     if !body.is_empty() || first_chunk < removed_chunks {
@@ -1089,8 +1023,6 @@ fn toggle_inline_output(open: &mut OpenPresentation, call_id: &str, expanded: bo
     let entry = open.entry.get_mut(&owner).context("inline entry owner is missing")?;
     entry.target.retain(|target|!retired_target.contains(target));
     entry.target.extend(target);
-    entry.bytes = entry.bytes.saturating_sub(removed) + added;
-    open.retained_bytes = retained;
     let node = format!("{call_id}:tool");
     if expanded { open.sections.nodes.tool_limit.insert(node, limit); }
     else { open.sections.nodes.tool_limit.remove(&node); }
@@ -1123,14 +1055,8 @@ fn reflow(
         .unwrap_or(&open.last_width)
         .clone();
     let mut projected = Vec::new();
-    let mut retained = 0;
     for (index, entry) in source.into_iter().enumerate() {
         let entry = project(entry, &width, index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
-        retained += entry.retained_bytes();
-        ensure!(
-            retained <= MAX_PROJECTED_BYTES,
-            "session projection exceeds 64 MiB"
-        );
         projected.push(entry);
     }
     let mut entry = HashMap::new();
@@ -1150,7 +1076,6 @@ fn reflow(
     for (id, output) in &mut tool {
         if let Some(mut previous) = open.sections.nodes.tool.remove(id) {
             if previous.retain(output) {
-                retained += previous.retained_bytes().saturating_sub(output.retained_bytes());
                 *output = previous;
             }
         }
@@ -1160,8 +1085,6 @@ fn reflow(
     open.action = action;
     open.syntax = syntax;
     open.sections.nodes.tool = tool;
-    ensure!(retained <= MAX_PROJECTED_BYTES, "retained parser exceeds projection capacity");
-    open.retained_bytes = retained;
     open.last_width = width;
     retain_patches(open, patch)
 }
@@ -1171,7 +1094,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
     let width = open.transcript.views.profile().unwrap_or(&open.last_width);
     let mut projected = Vec::new();
     let mut changed = Vec::new();
-    let mut retained = open.retained_bytes;
     for operation in operations.clone() {
         match operation {
             TimelineOperation::Message { entry_id, exchange_id, block_id, message, .. } => {
@@ -1179,23 +1101,16 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 let block_id = forge_buffer::identity::BlockId(block_id.clone());
                 let previous = open.transcript.document.block(&block_id).context("streamed message block is missing")?;
                 let replacement = super::projection::message_block(previous,message,width)?;
-                let mut removed = previous.retained_bytes();
                 let previous_targets = previous.metadata.target.iter().map(|target|target.id.clone()).collect::<Vec<_>>();
                 for target in &previous_targets {
-                    if let Some(action) = open.action.remove(target) {
-                        removed += match action { TranscriptAction::Diff { text } => text.len(), _ => 512 };
-                    }
+                    open.action.remove(target);
                     open.syntax_done.remove(target);
                 }
                 let syntax_target = TargetId(format!("{}:markdown-syntax",block_id.0));
-                if let Some(syntax) = open.syntax.remove(&syntax_target) { removed += syntax.retained_bytes(); }
+                open.syntax.remove(&syntax_target);
                 open.syntax_done.remove(&syntax_target);
-                let added = replacement.retained_bytes();
-                retained = retained.saturating_sub(removed) + added;
-                ensure!(retained <= MAX_PROJECTED_BYTES, "session projection exceeds 64 MiB");
                 let owner = if open.agent_scope.is_some() { exchange_id } else { entry_id };
                 if let Some(entry) = open.entry.get_mut(owner) {
-                    entry.bytes = entry.bytes.saturating_sub(removed) + added;
                     entry.target.retain(|target|!previous_targets.contains(target));
                     entry.target.extend(replacement.action.keys().cloned());
                     entry.syntax.retain(|target|target != &syntax_target);
@@ -1210,7 +1125,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 let expanded = open.sections.expansion(&node_id) == Some(true);
                 let limit = open.sections.nodes.tool_limit.get(&node_id).copied().unwrap_or(super::tool::INITIAL_INLINE_BYTES);
                 let source = open.sections.nodes.tool.get_mut(call_id).context("streamed tool cache is missing")?;
-                let before = source.retained_bytes();
                 let old_chunks = if expanded { source.inline_prefix_chunks(limit)? } else { 1 };
                 let first_chunk = if expanded { source.inline_tail()? } else { 0 };
                 source.append(delta)?;
@@ -1234,7 +1148,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 }
                 let identity = |chunk| forge_buffer::identity::BlockId(if chunk == 0 { format!("{call_id}:preview") }
                     else { format!("{call_id}:output:{chunk}") });
-                let mut removed = before;
                 let mut block = Vec::new();
                 for chunk in first_chunk..chunks {
                     let mut replacement = renderer.tool_body(call_id,source,expanded,chunk)?;
@@ -1244,7 +1157,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                     let previous = open.transcript.document.block(&replacement.id);
                     let new_target = previous.is_none_or(|previous|previous.metadata.target.is_empty());
                     if let Some(previous) = previous {
-                        removed += previous.retained_bytes();
                         for target in &previous.metadata.target { open.action.remove(&target.id); }
                     }
                     for target in &replacement.metadata.target {
@@ -1255,7 +1167,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                     }
                     block.push(replacement);
                 }
-                let added_body = block.iter().map(forge_buffer::block::BufferBlock::retained_bytes).sum::<usize>();
                 let hidden_id = forge_buffer::identity::BlockId(format!("{call_id}:hidden"));
                 let mut hidden = renderer.tool_hidden(call_id,source,expanded)?;
                 hidden.metadata.layout = layout;
@@ -1263,7 +1174,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 super::layout::materialize(&mut hidden)?;
                 let previous_hidden = open.transcript.document.block(&hidden_id).context("tool hidden counter is missing")?;
                 let new_hidden_target = previous_hidden.metadata.target.is_empty();
-                removed += previous_hidden.retained_bytes();
                 for target in &previous_hidden.metadata.target { open.action.remove(&target.id); }
                 for target in &hidden.metadata.target {
                     open.action.insert(target.id.clone(),TranscriptAction::Tool { call_id:call_id.clone() });
@@ -1271,10 +1181,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                         if new_hidden_target { entry.target.push(target.id.clone()); }
                     }
                 }
-                let added = source.retained_bytes() + added_body + hidden.retained_bytes();
-                retained = retained.saturating_sub(removed) + added;
-                ensure!(retained <= MAX_PROJECTED_BYTES, "session projection exceeds 64 MiB");
-                if let Some(entry) = open.entry.get_mut(owner) { entry.bytes = entry.bytes.saturating_sub(removed) + added; }
                 if first_chunk < chunks {
                     changed.push(TranscriptChange::ToolBody { owner:owner.clone(),
                         anchor:if first_chunk < old_chunks { identity(first_chunk) } else { hidden_id },
@@ -1285,15 +1191,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
             TimelineOperation::Insert { index, entry }
             | TimelineOperation::Replace { index, entry } => {
                 let entry = project(ProjectionSource::Entry(entry), width, *index > 0, &open.sections.nodes.choice, &open.sections.nodes.tool_limit)?;
-                retained = retained.saturating_sub(
-                    open.entry
-                        .get(&entry.entry.id)
-                        .map_or(0, |entry| entry.bytes),
-                ) + entry.retained_bytes();
-                ensure!(
-                    retained <= MAX_PROJECTED_BYTES,
-                    "session projection exceeds 64 MiB"
-                );
                 let info = entry_presentation(&entry);
                 projected.push((
                     entry.entry.id.clone(),
@@ -1315,8 +1212,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 });
             }
             TimelineOperation::Remove { index, id } => {
-                retained =
-                    retained.saturating_sub(open.entry.get(id).map_or(0, |entry| entry.bytes));
                 changed.push(TranscriptChange::Remove {
                     index: *index,
                     id: id.clone(),
@@ -1358,9 +1253,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
             output.own(&id);
             if let Some(mut previous) = retained_tool.remove(call) {
                 if previous.retain(output) {
-                    let extra = previous.retained_bytes().saturating_sub(output.retained_bytes());
-                    retained += extra;
-                    if let Some(entry) = open.entry.get_mut(&id) { entry.bytes += extra; }
                     *output = previous;
                 }
             }
@@ -1370,8 +1262,6 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
         open.sections.nodes.tool.extend(tool);
         open.syntax.extend(syntax);
     }
-    ensure!(retained <= MAX_PROJECTED_BYTES, "retained parser exceeds projection capacity");
-    open.retained_bytes = retained;
     retain_patches(open, patches)
 }
 
@@ -1408,6 +1298,57 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn large_history_retains_parsers_and_syntax_across_refreshes_without_an_aggregate_limit() -> Result<()> {
+        use forge_diff::syntax::SyntaxEngine;
+        use forge_diff::workers::{AnalysisPool, PoolLimits};
+        use std::sync::Arc;
+
+        let output = format!("{}\n", "x".repeat(511)).repeat(16_384);
+        let mut entries = (0..9).map(|index| {
+            let mut entry = interaction_entry(&format!("large-{index}"));
+            let TimelineEntry::Exchange { exchange, .. } = &mut entry else { unreachable!() };
+            let mut value = serde_json::to_value(&*exchange)?;
+            value["turn"][0]["tool"]["item"]["tool"]["output"] = serde_json::json!(output);
+            *exchange = serde_json::from_value(value)?;
+            Ok(entry)
+        }).collect::<Result<Vec<TimelineEntry>>>()?;
+        let TimelineEntry::Exchange { exchange, .. } = entries.last_mut().unwrap() else { unreachable!() };
+        exchange.attributed_diff_text = Some(
+            "--- a/test.mjs\n+++ b/test.mjs\n@@ -1 +1 @@\n-const old = 1;\n+const next = 2;\n".into(),
+        );
+        assert!(output.len() * entries.len() > 64 * 1024 * 1024);
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(entries.clone())?;
+        let document = DocumentId("large-history".into());
+        let view = ViewId("large-history-view".into());
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let snapshots = owner.open.as_ref().unwrap().sections.nodes.tool.values()
+            .map(|tool| tool.snapshot()).collect::<Result<Vec<_>>>()?;
+        assert!(snapshots.iter().map(|output| output.retained_bytes()).sum::<usize>() > 128 * 1024 * 1024);
+
+        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits {
+            workers: 1, jobs: 2, input_bytes: 1024 * 1024,
+        })));
+        let job = owner.capture_syntax(&document)?.expect("saved diff syntax");
+        owner.apply_syntax(&document, &job, job.analyze(&engine).await?)?;
+        for iteration in 0..3 {
+            let TimelineEntry::Exchange { exchange, .. } = entries.last_mut().unwrap() else { unreachable!() };
+            exchange.prompt = format!("Updated prompt {iteration}");
+            owner.reconcile(entries.clone())?;
+            refresh_activity(owner.open.as_mut().unwrap(), &entries)?;
+            owner.dispatch(PresentationRequest::Resize {
+                document: document.clone(), view: view.clone(),
+                width: WidthProfile { columns: 70 + iteration, ..WidthProfile::default() },
+            })?;
+            let snapshot = owner.snapshot(&document)?;
+            assert!(snapshot.block.iter().map(|block| block.text.byte_count()).sum::<usize>() < 1024 * 1024,
+                "collapsed history materialized tool output");
+            owner.sync(&document, snapshot.revision)?;
+        }
+        Ok(())
+    }
 
     fn expand_sections(owner: &mut SessionPresentation, view: &str) -> Result<()> {
         let open = owner.open.as_mut().unwrap();

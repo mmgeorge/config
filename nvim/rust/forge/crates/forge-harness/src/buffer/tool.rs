@@ -7,8 +7,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use anyhow::{Context, Result, ensure};
 use serde::Serialize;
 
-const MAX_OUTPUT_BYTES: usize = 32 * 1024 * 1024;
-const MAX_OUTPUT_ROWS: usize = 262_144;
+const DISPLAY_ROW_LIMIT: usize = 262_144;
 const INLINE_CHUNK_BYTES: usize = 16 * 1024;
 pub(super) const INITIAL_INLINE_BYTES: usize = 64 * 1024;
 
@@ -19,12 +18,13 @@ pub struct ToolOutputPreview<'a> {
     pub total_rows: usize,
 }
 
-#[derive(Debug, Serialize)]
+#[derive(Debug, PartialEq, Eq, Serialize)]
 pub struct ToolOutputBatch {
     pub call_id: String,
     pub start_row: usize,
     pub row: Vec<String>,
     pub complete: bool,
+    byte_limit: usize,
 }
 
 pub struct ToolOutputView {
@@ -43,6 +43,7 @@ struct ParsedOutput {
     parser: strip_ansi_escapes::Writer<OutputCollector>,
     collected: Arc<Mutex<Vec<u8>>>,
     total_rows: usize,
+    truncated: bool,
 }
 
 impl ParsedOutput {
@@ -51,18 +52,18 @@ impl ParsedOutput {
         let mut output = Self {
             display: Arc::new(String::new()), row: Arc::new(Vec::new()),
             parser: strip_ansi_escapes::Writer::new(OutputCollector(collected.clone())),
-            collected, total_rows: 0,
+            collected, total_rows: 0, truncated: false,
         };
         output.append(saved)?;
         Ok(output)
     }
 
     fn append(&mut self, delta: &str) -> Result<()> {
+        if self.truncated { return Ok(()); }
         self.parser.write_all(delta.as_bytes())?;
         self.parser.flush()?;
         let normalized = String::from_utf8(std::mem::take(&mut *self.collected.lock()
             .map_err(|_| anyhow::anyhow!("tool output collector poisoned"))?))?;
-        ensure!(self.display.len() + normalized.len() <= MAX_OUTPUT_BYTES, "tool display exceeds the 32 MiB view limit");
         let display = Arc::make_mut(&mut self.display);
         let row = Arc::make_mut(&mut self.row);
         let mut start = display.len();
@@ -75,13 +76,24 @@ impl ParsedOutput {
                 row.push(start..end);
                 if end > start { self.total_rows = row.len(); }
                 start = end + 1;
+                if row.len() > DISPLAY_ROW_LIMIT { break; }
             }
         }
-        if start < display.len() {
+        if row.len() <= DISPLAY_ROW_LIMIT && start < display.len() {
             row.push(start..display.len());
             self.total_rows = row.len();
         }
-        ensure!(row.len() <= MAX_OUTPUT_ROWS, "tool output requires a complete file export beyond 262144 rows");
+        if row.len() > DISPLAY_ROW_LIMIT {
+            display.truncate(row[DISPLAY_ROW_LIMIT - 1].end);
+            row.truncate(DISPLAY_ROW_LIMIT);
+            display.push('\n');
+            let start = display.len();
+            display.push_str("… Display truncated; export output for the complete response.");
+            row.push(start..display.len());
+            display.push('\n');
+            self.total_rows = row.len();
+            self.truncated = true;
+        }
         Ok(())
     }
 
@@ -169,6 +181,10 @@ impl ToolOutputView {
         Ok(self.parsed()?.inline_bytes() / INLINE_CHUNK_BYTES)
     }
 
+    pub(super) fn truncated(&self) -> Result<bool> {
+        Ok(self.parsed()?.truncated)
+    }
+
     /// Borrows at most one byte window with UTF-8 boundaries retained across appends.
     pub(super) fn inline_chunk(&self, index: usize) -> Result<Vec<&str>> {
         let parsed = self.parsed()?;
@@ -183,15 +199,9 @@ impl ToolOutputView {
         Ok(parsed.display[start..end].split_terminator('\n').collect())
     }
 
-    pub fn retained_bytes(&self) -> usize {
-        self.group.len() + self.saved.len() + self.parsed.get().and_then(|parsed| parsed.as_ref().ok())
-            .map_or(0, |parsed| parsed.display.capacity() + parsed.row.capacity() * std::mem::size_of::<Range<usize>>())
-    }
-
     /// Retains raw output without parsing until a preview, expansion, or output view needs it.
     pub fn new(call_id: String, saved: &str) -> Result<Self> {
         ensure!(!call_id.is_empty() && call_id.len() <= 256, "invalid tool call identity");
-        ensure!(saved.len() <= MAX_OUTPUT_BYTES, "tool output exceeds the 32 MiB view limit");
         Ok(Self {
             call_id, saved: Arc::new(saved.to_owned()), parsed: OnceLock::new(),
             heading: None, owner: String::new(), group: String::new(),
@@ -199,7 +209,6 @@ impl ToolOutputView {
     }
 
     pub fn append(&mut self, delta: &str) -> Result<()> {
-        ensure!(self.saved.len() + delta.len() <= MAX_OUTPUT_BYTES, "tool output exceeds the 32 MiB view limit");
         if self.parsed.get().is_none() {
             Arc::make_mut(&mut self.saved).push_str(delta);
             return Ok(());
@@ -224,6 +233,7 @@ impl ToolOutputView {
 }
 
 impl ToolOutputSnapshot {
+    #[cfg(test)]
     pub fn retained_bytes(&self) -> usize {
         self.saved.len() + self.display.capacity()
             + self.row.capacity() * std::mem::size_of::<Range<usize>>()
@@ -243,10 +253,8 @@ impl ToolOutputSnapshot {
         row_limit: usize,
         byte_limit: usize,
     ) -> Result<Option<ToolOutputBatch>> {
-        ensure!(
-            (1..=256).contains(&row_limit) && (1..=65536).contains(&byte_limit),
-            "invalid tool batch limits"
-        );
+        let row_limit = row_limit.clamp(1, 256);
+        let byte_limit = byte_limit.clamp(128, 65536);
         if !self.expanded || self.loaded_rows == self.total_rows {
             return Ok(None);
         }
@@ -255,10 +263,12 @@ impl ToolOutputSnapshot {
         for range in self.row[self.loaded_rows..self.total_rows].iter().take(row_limit) {
             let text = &self.display[range.clone()];
             if bytes + text.len() + 1 > byte_limit {
-                ensure!(
-                    !row.is_empty(),
-                    "tool output row exceeds delivery capacity and requires complete file export"
-                );
+                if row.is_empty() {
+                    let notice = "… [line truncated; export for full output]";
+                    let mut end = byte_limit - notice.len() - 1;
+                    while !text.is_char_boundary(end) { end -= 1; }
+                    row.push(format!("{}{notice}", &text[..end]));
+                }
                 break;
             }
             bytes += text.len() + 1;
@@ -268,33 +278,15 @@ impl ToolOutputSnapshot {
             call_id: self.call_id.clone(),
             start_row: self.loaded_rows,
             complete: self.loaded_rows + row.len() == self.total_rows,
+            byte_limit,
             row,
         }))
     }
 
     /// Advances only after the owning native document accepts this exact batch.
     pub fn accept_batch(&mut self, batch: &ToolOutputBatch) -> Result<()> {
-        ensure!(
-            batch.call_id == self.call_id && batch.start_row == self.loaded_rows,
-            "tool batch belongs to another cursor"
-        );
-        ensure!(
-            !batch.row.is_empty()
-                && batch.row.len() <= 256
-                && batch.row.iter().map(|row| row.len() + 1).sum::<usize>() <= 65536
-                && self.loaded_rows + batch.row.len() <= self.total_rows,
-            "tool batch exceeds source rows"
-        );
-        ensure!(
-            batch.complete == (self.loaded_rows + batch.row.len() == self.total_rows),
-            "tool batch completion differs from saved output"
-        );
-        for (offset, text) in batch.row.iter().enumerate() {
-            ensure!(
-                text == &self.display[self.row[self.loaded_rows + offset].clone()],
-                "tool batch differs from saved output"
-            );
-        }
+        let expected = self.next_batch(batch.row.len(), batch.byte_limit)?;
+        ensure!(expected.as_ref() == Some(batch), "tool batch differs from saved output or cursor");
         self.loaded_rows += batch.row.len();
         Ok(())
     }
@@ -311,10 +303,6 @@ pub struct OwnedToolExport {
 
 impl OwnedToolExport {
     pub fn create(directory: &Path, saved: &str) -> Result<Self> {
-        ensure!(
-            saved.len() <= MAX_OUTPUT_BYTES,
-            "tool export exceeds the 32 MiB artifact limit"
-        );
         std::fs::create_dir_all(directory).context("create tool export directory")?;
         let directory = directory
             .canonicalize()
@@ -373,6 +361,45 @@ impl Drop for OwnedToolExport {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn oversized_line_is_abbreviated_in_a_batch_without_losing_saved_output() -> Result<()> {
+        let saved = format!("{}\nlast\n", "λ".repeat(80_000));
+        let source = ToolOutputView::new("call".into(), &saved)?;
+        let mut output = source.snapshot()?;
+        output.expand();
+        let batch = output.next_batch(256, 65536)?.unwrap();
+        assert!(batch.row[0].ends_with("[line truncated; export for full output]"));
+        assert!(batch.row.iter().map(|row| row.len() + 1).sum::<usize>() <= 65536);
+        output.accept_batch(&batch)?;
+        let last = output.next_batch(256, 65536)?.unwrap();
+        assert_eq!(last.row, ["last"]);
+        output.accept_batch(&last)?;
+        assert!(output.next_batch(256, 65536)?.is_none());
+        let directory = tempfile::tempdir()?;
+        let export = output.export_saved_output(directory.path())?;
+        assert_eq!(std::fs::read_to_string(export.path().unwrap())?, saved);
+        Ok(())
+    }
+
+    #[test]
+    fn large_output_truncates_display_rows_and_preserves_complete_export() -> Result<()> {
+        let saved = format!("{}\n", "x".repeat(128)).repeat(DISPLAY_ROW_LIMIT + 1);
+        assert!(saved.len() > 32 * 1024 * 1024);
+        let mut source = ToolOutputView::new("call".into(), &saved)?;
+        assert!(source.truncated()?);
+        source.append("last output after truncation\n")?;
+        let preview = source.preview(true)?;
+        assert_eq!(preview.total_rows, DISPLAY_ROW_LIMIT + 1);
+        assert!(preview.row.last().unwrap().contains("Display truncated"));
+        let directory = tempfile::tempdir()?;
+        let snapshot = source.snapshot()?;
+        let export = snapshot.export_saved_output(directory.path())?;
+        let complete = std::fs::read_to_string(export.path().unwrap())?;
+        assert!(complete.starts_with(&saved));
+        assert!(complete.ends_with("last output after truncation\n"));
+        Ok(())
+    }
 
     #[test]
     fn deferred_output_parses_once_on_demand_and_retains_incremental_state() {

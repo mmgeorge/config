@@ -82,8 +82,7 @@ impl BackendEventStream {
         };
         let part: forge_protocol::transfer::JsonPart = serde_json::from_value(part.clone())
             .map_err(|error| EventDeliveryFailure(io::Error::other(error)))?;
-        if part.total_bytes > forge_protocol::MAX_SNAPSHOT_BYTES || part.part_count == 0
-            || part.part_count > 512 || part.payload.is_empty()
+        if part.part_count == 0 || part.part_count > part.total_bytes || part.payload.is_empty()
             || part.payload.len() > forge_protocol::MAX_SNAPSHOT_PART_BYTES {
             return Err(EventDeliveryFailure(io::Error::other("event transfer exceeds its limit")));
         }
@@ -379,13 +378,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn oversized_aggregate_reports_failure_even_when_the_producer_ignores_it() {
+    async fn large_aggregate_transfers_without_a_total_byte_limit() {
         let (sink, mut stream) = channel();
         let mut oversized = event(0);
-        oversized.text = Some("x".repeat(forge_protocol::MAX_SNAPSHOT_BYTES));
-        let _ = sink.send_wait(oversized).await;
-        assert!(stream.recv().await.is_err());
-        assert!(tokio::time::timeout(Duration::from_secs(1), sink.failed()).await.is_ok());
+        oversized.text = Some("x".repeat(16 * 1024 * 1024 + 1));
+        let expected = oversized.text.clone();
+        let producer = async { sink.send_wait(oversized).await.unwrap(); };
+        let consumer = async { assert_eq!(stream.recv().await.unwrap().unwrap().text, expected); };
+        tokio::join!(producer, consumer);
     }
 
     #[tokio::test]

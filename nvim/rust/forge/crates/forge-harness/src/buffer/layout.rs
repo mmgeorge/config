@@ -73,10 +73,6 @@ pub(super) fn materialize(block: &mut BufferBlock) -> Result<()> {
         layout.source_indent == 0,
         "content layout was materialized before resolution completed"
     );
-    ensure!(
-        block.text.byte_count() + padding * block.text.row_count() <= 32 * 1024 * 1024,
-        "materialized Markdown exceeds native capacity"
-    );
     let prefix = " ".repeat(padding);
     let count = block.text.row_count();
     block.text = BufferText::from_rows(

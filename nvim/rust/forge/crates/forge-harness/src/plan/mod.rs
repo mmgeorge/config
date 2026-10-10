@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use crate::session::{PermissionMode, continuation::ContinuationBudget};
 
 mod audit;
+pub(crate) mod conformance;
+pub(crate) mod implementation_report;
 mod comment_lint;
 mod usage;
 pub(crate) use design::workspace_source;
@@ -720,6 +722,7 @@ pub struct PlanAnnotation {
 
 /// Owns physical plan files and immutable revision history.
 pub struct PlanFileStore {
+    implementation_report_cache: std::sync::Mutex<std::collections::HashMap<String, std::sync::Arc<implementation_report::ImplementationReport>>>,
     root: PathBuf,
     workspace: PathBuf,
 }
@@ -730,10 +733,21 @@ impl PlanFileStore {
         Self {
             root: root.into(),
             workspace: workspace.into(),
+            implementation_report_cache: Default::default(),
         }
     }
 
-    /// Write the structurally valid working draft without rendering it.
+    /// Share immutable report contents without copying them into durable exchanges.
+    pub(crate) fn implementation_report(&self, reference: &implementation_report::ImplementationReportRef)
+        -> Result<std::sync::Arc<implementation_report::ImplementationReport>> {
+        let mut cache = self.implementation_report_cache.lock().map_err(|_| anyhow::anyhow!("report cache lock poisoned"))?;
+        if let Some(report) = cache.get(&reference.object_id) { return Ok(report.clone()); }
+        let objects = crate::storage::objects::ObjectStore::open(&self.root)?;
+        let report = std::sync::Arc::new(implementation_report::ImplementationReport::load(&objects, reference)?);
+        cache.insert(reference.object_id.clone(), report.clone());
+        Ok(report)
+    }
+
     /// Restore the accepted working view without overwriting any submitted revision.
     pub(crate) fn restore_revision(&self, session_id: &str, plan_id: &str, revision: u32) -> Result<PlanDocument> {
         let document = self.read_submitted_document(session_id, plan_id, revision)?;
@@ -1136,7 +1150,7 @@ mod test {
         );
         design.proposed_calls.insert(
             "src/lib.rs".into(),
-            vec![FunctionBody { change: None,
+            vec![FunctionBody { evidence: None, change: None,
                 owner: "introduced".into(),
                 call: Some(vec![
                     CallSite {

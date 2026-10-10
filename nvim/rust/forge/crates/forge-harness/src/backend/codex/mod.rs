@@ -1005,6 +1005,7 @@ impl Backend for CodexBackend {
                 .then(|| super::mock_plan_document_from_prompt(&request_text))
                 .flatten();
         }
+        let execution_phase = control_context.execution.as_ref().map(|execution| execution.phase);
         process.set_control_context(control_context);
         let resolved_model = self.resolve_model(&request, process, &mut output).await?;
         output.runtime.provider = "Codex CLI".into();
@@ -1016,7 +1017,7 @@ impl Backend for CodexBackend {
             output.event.push(runtime_event);
         }
         let dynamic_tool_list = ControlToolRegistry
-            .definition_list()
+            .definition_list_for(execution_phase)
             .into_iter()
             .map(|definition| {
                 json!({

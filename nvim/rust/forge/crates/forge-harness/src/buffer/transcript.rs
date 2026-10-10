@@ -1,4 +1,4 @@
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use forge_buffer::block::{
     BlockMetadata, BufferBlock, Conceal, ContentLayout, Decoration, TargetRange, TextChunk, TextPosition, TextRange,
 };
@@ -50,8 +50,11 @@ impl<'profile> TranscriptRenderer<'profile> {
     /// Changes hidden output counts without replacing the heading or its preview.
     pub(super) fn tool_hidden(&self, call_id: &str, output: &ToolOutputView, expanded: bool) -> Result<BufferBlock> {
         let hidden = if expanded { 0 } else { preview_rows(self.profile,&output.preview(false)?)?.1 };
-        let rows = if hidden == 0 { Vec::new() }
+        let mut rows = if hidden == 0 { Vec::new() }
             else { tool_body_rows(self.profile,&format!("…({hidden} hidden)"),false)? };
+        if output.truncated()? {
+            rows.extend(tool_body_rows(self.profile,"Display truncated; export output for the complete response.",false)?);
+        }
         self.output_block(BlockId(format!("{call_id}:hidden")),rows)
     }
 
@@ -91,10 +94,6 @@ impl<'profile> TranscriptRenderer<'profile> {
     }
 
     pub fn prompt(&self, id: BlockId, source: &str) -> Result<BufferBlock> {
-        ensure!(
-            source.len() <= 1024 * 1024,
-            "prompt exceeds transcript capacity"
-        );
         let mut block = self.literal(id, &format!("● {source}"), 2)?;
         block.metadata.decoration.push(Decoration {
             range: TextRange {
@@ -226,10 +225,6 @@ impl<'profile> TranscriptRenderer<'profile> {
     ) -> Result<BufferBlock> {
         id.validate()?;
         target.validate()?;
-        ensure!(
-            title.len() <= 4096,
-            "tool title exceeds transcript capacity"
-        );
         let arguments = expanded.then(|| title.split_once('('))
             .flatten().filter(|_| kind == "tool_call")
             .and_then(|(name, arguments)| arguments.strip_suffix(')').map(|arguments| (name, arguments)));

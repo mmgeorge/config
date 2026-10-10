@@ -383,7 +383,7 @@ mod test {
     #[test]
     fn change_feedback_uses_saved_summary_rows_and_rejects_missing_offsets() {
         let mut document = document("pub fn run();\n", "pub fn run();\n");
-        document.design.as_mut().unwrap().proposed_calls.insert("src/controls.rs".into(), vec![crate::plan::FunctionBody {
+        document.design.as_mut().unwrap().proposed_calls.insert("src/controls.rs".into(), vec![crate::plan::FunctionBody { evidence: None,
             owner: "run".into(), call: None, change: Some("Stop retrying authentication failures.\nRecord the final attempt.".into()),
         }]);
         let mut annotation = comment("src/controls.rs", "proposed", &[1], "Specify the retry limit.");
