@@ -173,6 +173,11 @@ preferences, without a second fold-open/close replay. Closing a window drops its
 entry, while the last detached view remains available until the document closes.
 Native fold preparation and publication failures mark the replica desynchronized, report
 the diagnostic, and request an authoritative snapshot through the document's recovery path.
+Before native mutation, Rust and Lua validate node identity, parent existence, parent-before-child
+ordering, and containment within ancestor folds. Node-owner and direct-child indexes select the
+affected relationships when an edit changes a parent, child, or fold endpoint. Rejected updates
+retain the last published text and revision. This validation does not rebuild or scan the entire
+timeline for a streaming update.
 Fold views record native ownership only after creation succeeds. Deletion restores temporary
 window options even when an editor command fails.
 Status demand skips closed folds,
@@ -2098,6 +2103,19 @@ Session events above the 512 KiB frame limit use session-scoped, transfer-identi
 completion record. Lua validates and assembles the complete event before delivering it to any
 subscriber. Event transfers share the two-transfer, 16 MiB-per-transfer bound with response transfers.
 Oversized-event rejection leaves the output connection available to report the request failure.
+
+`forge/protocol_contract.json` defines the versioned event vocabulary, routing policy, required
+payload fields, and node enum spellings. Rust embeds it at compile time and Lua loads it from the
+runtime directory. The broker forwards only the normalized backend events declared there. Raw
+provider events remain in Rust, where document projection consumes them. Serialization rejects
+undeclared UI events or missing required fields before transmission.
+
+Direct frames and reassembled messages use the same Lua envelope and event validator. Responses
+carry exactly one result or structured error. Unknown variants, conflicting identities, and invalid
+counters terminate the faulty connection through the existing visible host-stop path. Null object
+fields become absent Lua fields, while null array entries retain their position. Snapshot transfers
+use the same null policy. Explicit null response results remain successful responses. Contract
+changes require a wire-version change and rebuilding the host before reconnecting.
 
 `turn.steer` uses the same out-of-band broker lane without creating another interaction. Ctrl-q
 clears HarnessInput only after admitting the text into a pending steering record, then the backend

@@ -89,6 +89,7 @@ pub fn encode(message: &impl Serialize, limit: usize) -> io::Result<Vec<u8>> {
 impl MessageSender {
     /// Transfers a session event atomically through bounded frames without discarding its payload.
     pub async fn send_event(&self, event: SessionEvent) -> io::Result<()> {
+        crate::contract::validate("session", &event.event, &event.payload).map_err(io::Error::other)?;
         let message = Message::Event(event.clone());
         if encode(&message, MAX_FRAME_BYTES).is_ok() {
             return self.send_wait(message).await;

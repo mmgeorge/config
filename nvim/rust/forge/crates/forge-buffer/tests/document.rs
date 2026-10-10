@@ -15,6 +15,65 @@ fn block(id: usize, rows: &[&str]) -> BufferBlock {
 }
 
 #[test]
+fn node_enum_spelling_matches_the_editor_contract() {
+    use forge_buffer::node::{NodeDisplay, NodeKind, NodeLifecycle};
+    let contract: serde_json::Value = serde_json::from_str(include_str!("../../../../../lua/forge/protocol_contract.json")).unwrap();
+    let mut kind = serde_json::json!([NodeKind::Exchange, NodeKind::Message, NodeKind::ToolGroup, NodeKind::Tool,
+        NodeKind::Changes, NodeKind::File, NodeKind::Hunk, NodeKind::Group]);
+    let mut lifecycle = serde_json::json!([NodeLifecycle::Live, NodeLifecycle::Settled]);
+    let mut display = serde_json::json!([NodeDisplay::Heading, NodeDisplay::Preview, NodeDisplay::Full]);
+    for (name, actual) in [("kind", &mut kind), ("lifecycle", &mut lifecycle), ("display", &mut display)] {
+        let mut expected: Vec<_> = contract["node"][name].as_array().unwrap().iter().map(|value| value.as_str().unwrap()).collect();
+        let mut actual: Vec<_> = actual.as_array_mut().unwrap().iter().map(|value| value.as_str().unwrap()).collect();
+        expected.sort_unstable();
+        actual.sort_unstable();
+        assert_eq!(actual, expected, "{name}");
+    }
+}
+
+#[test]
+fn node_relationship_changes_are_rejected_before_committing() {
+    use forge_buffer::block::{BlockAnchor, FoldRange};
+    use forge_buffer::identity::FoldId;
+    use forge_buffer::node::{NodeDisplay, NodeKind, NodeState};
+
+    let mut parent = block(0, &["Exchange"]);
+    parent.metadata.node = Some(NodeState::new(FoldId("exchange".into()), NodeKind::Exchange, NodeDisplay::Full));
+    let mut child = block(1, &["Tools"]);
+    let mut child_state = NodeState::new(FoldId("tools".into()), NodeKind::ToolGroup, NodeDisplay::Full);
+    child_state.parent = Some(FoldId("exchange".into()));
+    child.metadata.node = Some(child_state);
+    let output = block(2, &["Output"]);
+    parent.metadata.fold.push(FoldRange {
+        id: FoldId("exchange".into()), start: TextPosition { row:0, column:0 },
+        end: BlockAnchor { block:output.id.clone(), position:TextPosition { row:1, column:0 } },
+        heading_start:None, closed:false, collapsed_suffix:None, collapse_children:false, expand_children:false,
+    });
+    child.metadata.fold.push(FoldRange { id:FoldId("tools".into()), ..parent.metadata.fold[0].clone() });
+    let mut sequence = BlockSequence::new(vec![parent.clone(), child.clone(), output.clone()]).unwrap();
+    let before: Vec<_> = sequence.blocks().cloned().collect();
+
+    let mut shortened = parent.clone();
+    shortened.metadata.fold[0].end = BlockAnchor { block:child.id.clone(), position:TextPosition { row:1, column:0 } };
+    assert!(sequence.splice(0..1, vec![shortened]).unwrap_err().to_string().contains("beyond parent"));
+    let mut orphan = child.clone();
+    orphan.metadata.node.as_mut().unwrap().parent = Some(FoldId("missing".into()));
+    assert!(sequence.splice(1..2, vec![orphan]).is_err());
+    let mut cycle = parent.clone();
+    cycle.metadata.node.as_mut().unwrap().parent = Some(FoldId("tools".into()));
+    assert!(sequence.splice(0..1, vec![cycle]).is_err());
+    let mut duplicate = child.clone();
+    duplicate.metadata.node.as_mut().unwrap().id = FoldId("exchange".into());
+    assert!(sequence.splice(1..2, vec![duplicate]).is_err());
+    assert_eq!(sequence.blocks().cloned().collect::<Vec<_>>(), before);
+
+    child.metadata.node.as_mut().unwrap().parent = None;
+    sequence.apply_edits(vec![SequenceEdit { range:1..2, block:vec![child] }, SequenceEdit { range:0..1, block:vec![] }]).unwrap();
+    assert_eq!(sequence.len(), 2);
+    assert_eq!(sequence.blocks().last().unwrap(), &output);
+}
+
+#[test]
 fn subtree_expansion_rebases_parent_past_retained_heading() {
     use forge_buffer::block::{BlockAnchor, FoldRange};
     use forge_buffer::identity::FoldId;

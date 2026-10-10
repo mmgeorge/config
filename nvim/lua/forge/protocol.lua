@@ -1,5 +1,6 @@
 local M = {}
-M.VERSION = 11
+local contract = require("forge.event_contract")
+M.VERSION = contract.version
 
 ---@param id integer
 ---@param method string
@@ -14,33 +15,48 @@ end
 ---@return table?
 ---@return string?
 function M.decode_message(line)
-  local ok, message = pcall(vim.json.decode, line, { luanil = { object = true, array = true } })
-  if not ok or type(message) ~= "table" then
-    return nil, "Invalid Forge host JSON: " .. tostring(message)
-  end
-  if message.request_id ~= nil then
-    if type(message.request_id) ~= "number" or message.request_id < 1 or message.request_id > 9007199254740991
-      or message.request_id % 1 ~= 0 or type(message.event) ~= "string" or type(message.payload) ~= "table"
-    then
-      return nil, "Invalid Forge request progress event"
-    end
-    for key in pairs(message) do
-      if key ~= "request_id" and key ~= "event" and key ~= "payload" then
-        return nil, "Unexpected field in Forge request progress event: " .. tostring(key)
+  local ok, message = pcall(function()
+    local value = vim.json.decode(line)
+    assert(type(value) == "table", "expected a message object")
+    local identity_key, channel
+    for key, name in pairs({ id = "response", request_id = "request", document = "document", session_id = "session" }) do
+      if value[key] ~= nil then
+        assert(not identity_key, "ambiguous message identity")
+        identity_key, channel = key, name
       end
     end
-  end
-  if message.document ~= nil then
-    if type(message.document) ~= "string" or type(message.event) ~= "string" or type(message.payload) ~= "table" then
-      return nil, "Invalid Forge document event"
+    assert(identity_key, "missing message identity")
+    local allowed = channel == "response" and { id = true, result = true, error = true }
+      or { [identity_key] = true, event = true, payload = true }
+    for key in pairs(value) do assert(allowed[key], "unexpected message field: " .. tostring(key)) end
+    if channel == "response" or channel == "request" then
+      local id = value[identity_key]
+      assert(type(id) == "number" and id >= (channel == "request" and 1 or 0)
+        and id <= 9007199254740991 and id == math.floor(id), "invalid message counter")
+    else
+      assert(type(value[identity_key]) == "string" and (channel == "document" or #value[identity_key] > 0), "invalid message identity")
     end
-    for key in pairs(message) do
-      if key ~= "document" and key ~= "event" and key ~= "payload" then
-        return nil, "Unexpected field in Forge document event: " .. tostring(key)
+    if channel == "response" then
+      assert((value.result ~= nil) ~= (value.error ~= nil), "response requires exactly one outcome")
+      if value.error ~= nil then
+        assert(type(value.error) == "table" and type(value.error.code) == "string"
+          and type(value.error.message) == "string", "invalid response error")
+      end
+    else
+      contract.validate(channel, value.event, value.payload)
+    end
+    local function normalize(object)
+      for key, item in pairs(object) do
+        if item == vim.NIL and type(key) ~= "number" then
+          object[key] = nil
+        elseif type(item) == "table" then normalize(item) end
       end
     end
-  end
-  return message, nil
+    normalize(value)
+    return value
+  end)
+  if not ok then return nil, "Invalid Forge host message: " .. tostring(message) end
+  return message
 end
 
 return M

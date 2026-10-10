@@ -3,6 +3,7 @@
 //! Framing bounds apply before JSON deserialization. A framing failure poisons
 //! the connection so a discarded prefix can never become a second request.
 
+pub mod contract;
 pub mod credit;
 pub mod frame;
 pub mod input;
@@ -11,7 +12,7 @@ pub mod outbound;
 pub mod snapshot;
 pub mod transfer;
 
-pub const WIRE_VERSION: u32 = 11;
+pub const WIRE_VERSION: u32 = 12;
 
 pub const MAX_FRAME_BYTES: usize = 512 * 1024;
 pub const MAX_ACTIVE_REQUESTS: usize = 64;

@@ -34,6 +34,8 @@ pub struct BlockSequence {
     region_owner: HashMap<RegionId, BlockId>,
     fold_owner: HashMap<FoldId, BlockId>,
     fold_endpoint: HashMap<BlockId, HashSet<BlockId>>,
+    node_owner: HashMap<FoldId, BlockId>,
+    node_child: HashMap<FoldId, HashSet<BlockId>>,
 }
 
 #[derive(Debug, Clone)]
@@ -208,6 +210,7 @@ impl BlockSequence {
         let mut incoming = HashSet::new();
         let mut incoming_region = HashSet::new();
         let mut incoming_fold = HashSet::new();
+        let mut incoming_node = HashSet::new();
         for block in edits.iter().flat_map(|edit| &edit.block) {
             block.validate()?;
             if !incoming.insert(&block.id)
@@ -233,6 +236,13 @@ impl BlockSequence {
                         .is_some_and(|owner| !removed.contains(owner))
                 {
                     return Err(ContractError("duplicate document fold identity"));
+                }
+            }
+            if let Some(node) = &block.metadata.node {
+                if !incoming_node.insert(&node.id)
+                    || self.node_owner.get(&node.id).is_some_and(|owner| !removed.contains(owner))
+                {
+                    return Err(ContractError("duplicate document node identity"));
                 }
             }
             next_rows = next_rows
@@ -299,7 +309,22 @@ impl BlockSequence {
             if let Some(owners) = self.fold_endpoint.get(*endpoint) {
                 affected.extend(owners.iter().filter(|owner| !removed.contains(owner)));
             }
+            if let Some(node) = &self.entry(self.locator[*endpoint]).block.metadata.node {
+                if let Some(children) = self.node_child.get(&node.id) {
+                    affected.extend(children.iter().filter(|owner| !removed.contains(owner)));
+                }
+            }
         }
+        // A retained parent can shrink when only its endpoint changes.
+        for owner in affected.clone() {
+            if let Some(node) = resolve(owner).and_then(|block| block.metadata.node.as_ref()) {
+                if let Some(children) = self.node_child.get(&node.id) {
+                    affected.extend(children.iter().filter(|owner| !removed.contains(owner)));
+                }
+            }
+        }
+        let incoming_node: HashMap<_, _> = incoming.values().filter_map(|block|
+            block.metadata.node.as_ref().map(|node| (&node.id, *block))).collect();
         for owner in affected {
             let block = resolve(owner).ok_or(ContractError("fold owner is absent"))?;
             let start_index = position(owner).ok_or(ContractError("fold owner has no position"))?;
@@ -333,6 +358,35 @@ impl BlockSequence {
                     || (start_index == end_index && fold.start >= fold.end.position)
                 {
                     return Err(ContractError("fold range is empty or reversed"));
+                }
+            }
+            if let Some(node) = &block.metadata.node {
+                let mut ancestor = node.parent.as_ref();
+                let mut visited = HashSet::from([&node.id]);
+                while let Some(parent_id) = ancestor {
+                    if !visited.insert(parent_id) {
+                        return Err(ContractError("document node parent cycle"));
+                    }
+                    let parent = incoming_node.get(parent_id).copied().or_else(||
+                        self.node_owner.get(parent_id).and_then(&resolve))
+                        .filter(|parent| parent.metadata.node.as_ref().is_some_and(|node| &node.id == parent_id))
+                        .ok_or(ContractError("document node parent is absent"))?;
+                    let parent_position = position(&parent.id).ok_or(ContractError("node parent has no position"))?;
+                    if parent_position >= start_index {
+                        return Err(ContractError("document node parent must precede child"));
+                    }
+                    if let Some(parent_fold) = parent.metadata.fold.iter().find(|fold| &fold.id == parent_id) {
+                        let parent_end = (position(&parent_fold.end.block).ok_or(ContractError("node parent endpoint is absent"))?, parent_fold.end.position);
+                        let child_end = if let Some(fold) = block.metadata.fold.iter().find(|fold| fold.id == node.id) {
+                            (position(&fold.end.block).ok_or(ContractError("node endpoint is absent"))?, fold.end.position)
+                        } else {
+                            (start_index, crate::block::TextPosition { row: block.text.row_count(), column: 0 })
+                        };
+                        if child_end > parent_end {
+                            return Err(ContractError("document node extends beyond parent fold"));
+                        }
+                    }
+                    ancestor = parent.metadata.node.as_ref().and_then(|node| node.parent.as_ref());
                 }
             }
         }
@@ -498,6 +552,12 @@ impl BlockSequence {
             self.node.len() - 1
         };
         self.locator.insert(block.id.clone(), index);
+        if let Some(node) = &block.metadata.node {
+            self.node_owner.insert(node.id.clone(), block.id.clone());
+            if let Some(parent) = &node.parent {
+                self.node_child.entry(parent.clone()).or_default().insert(block.id.clone());
+            }
+        }
         for region in &block.metadata.editable_region {
             self.region_owner
                 .insert(region.id.clone(), block.id.clone());
@@ -536,6 +596,15 @@ impl BlockSequence {
             self.release(node.left);
             self.release(node.right);
             self.locator.remove(&node.block.id);
+            if let Some(state) = &node.block.metadata.node {
+                self.node_owner.remove(&state.id);
+                if let Some(parent) = &state.parent {
+                    if let Some(children) = self.node_child.get_mut(parent) {
+                        children.remove(&node.block.id);
+                        if children.is_empty() { self.node_child.remove(parent); }
+                    }
+                }
+            }
             for region in node.block.metadata.editable_region {
                 self.region_owner.remove(&region.id);
             }

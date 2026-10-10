@@ -297,7 +297,9 @@ impl BufferBlock {
         if let Some(node) = &self.metadata.node {
             node.id.validate()?;
             if let Some(parent) = &node.parent { parent.validate()?; }
-            if node.generation > crate::MAX_COUNTER || node.content_revision > crate::MAX_COUNTER {
+            if node.generation > crate::MAX_COUNTER || node.content_revision > crate::MAX_COUNTER
+                || node.order as u64 > crate::MAX_COUNTER || node.loaded_rows as u64 > crate::MAX_COUNTER
+                || node.loaded_bytes as u64 > crate::MAX_COUNTER {
                 return Err(ContractError("node revision exceeds the exact counter range"));
             }
         }

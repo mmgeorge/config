@@ -11,7 +11,7 @@ vim.api.nvim_win_set_buf(window, transcript)
 local function snapshot(document)
   return { document = document, revision = revision, block = {
     { id = "heading", text = { "Tools" }, metadata = {
-      node = { id = "tools", kind = "tool_group", lifecycle = "settled", generation = 1,
+      node = { id = "tools", kind = "tool_group", lifecycle = "settled", generation = 1, order = 0, more = false,
         content_revision = revision, loaded_rows = expanded and 1 or 0, loaded_bytes = 0,
         display = expanded and "full" or "heading", default_display = "heading", expansion = expanded },
       target = {}, decoration = {}, editable_region = {},

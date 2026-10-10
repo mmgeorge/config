@@ -1,0 +1,318 @@
+{
+  "version": 12,
+  "node": {
+    "kind": ["exchange", "message", "tool_group", "tool", "changes", "file", "hunk", "group"],
+    "lifecycle": ["live", "settled"],
+    "display": ["heading", "preview", "full"]
+  },
+  "session": {
+    "task_operation": {
+      "route": "handle",
+      "required": {
+        "id": "string",
+        "state": "string"
+      }
+    },
+    "document_changed": {
+      "route": "handle",
+      "required": {
+        "session_id": "string",
+        "revision": "integer"
+      }
+    },
+    "backend_event": {
+      "route": "handle",
+      "required": {
+        "kind": "string"
+      }
+    },
+    "question": {
+      "route": "handle",
+      "required": {}
+    },
+    "question_updated": {
+      "route": "handle",
+      "required": {}
+    },
+    "question_answered": {
+      "route": "handle",
+      "required": {}
+    },
+    "question_withdrawn": {
+      "route": "handle",
+      "required": {}
+    },
+    "plan_question": {
+      "route": "handle",
+      "required": {}
+    },
+    "plan_question_updated": {
+      "route": "handle",
+      "required": {}
+    },
+    "plan_deviation_review": {
+      "route": "handle",
+      "required": {}
+    },
+    "goal_changed": {
+      "route": "handle",
+      "required": {}
+    },
+    "goal_continue_requested": {
+      "route": "handle",
+      "required": {}
+    },
+    "context_compacted": {
+      "route": "handle",
+      "required": {}
+    },
+    "session_fork_ready": {
+      "route": "handle",
+      "required": {}
+    },
+    "session_fork_failed": {
+      "route": "handle",
+      "required": {}
+    },
+    "session_changed": {
+      "route": "handle",
+      "required": {}
+    },
+    "session_configured": {
+      "route": "handle",
+      "required": {}
+    },
+    "mode_changed": {
+      "route": "handle",
+      "required": {}
+    },
+    "execution_mode_changed": {
+      "route": "handle",
+      "required": {}
+    },
+    "agent_updated": {
+      "route": "handle",
+      "required": {}
+    },
+    "plan_created": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_revision_created": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_entity_renamed": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_tests_deleted": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_changes_requested": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_acceptance_started": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_acceptance_updated": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_acceptance_cancelled": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_question_answered": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_question_withdrawn": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_accepted": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_cancelled": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_activated": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_deviation_recorded": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_deviation_resolved": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_task_updated": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_resolution": {
+      "route": "refresh",
+      "required": {}
+    },
+    "interaction_rolled_back": {
+      "route": "refresh",
+      "required": {}
+    },
+    "exchange_complete": {
+      "route": "refresh",
+      "required": {}
+    },
+    "exchange_updated": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_generation_failed": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_generation_retry": {
+      "route": "refresh",
+      "required": {}
+    },
+    "plan_revision_rejected": {
+      "route": "refresh",
+      "required": {}
+    },
+    "session_created": {
+      "route": "ignore",
+      "required": {}
+    },
+    "event.part": {
+      "route": "transport",
+      "required": {
+        "transfer_id": "string",
+        "part": "object"
+      }
+    },
+    "event.complete": {
+      "route": "transport",
+      "required": {
+        "transfer_id": "string",
+        "part": "object"
+      }
+    }
+  },
+  "backend": {
+    "turn_started": {
+      "route": "handle",
+      "required": {}
+    },
+    "execution_state": {
+      "route": "handle",
+      "required": {
+        "data.session.id": "string"
+      }
+    },
+    "prompt_submission": {
+      "route": "handle",
+      "required": {
+        "data.document": "string",
+        "data.token": "integer",
+        "data.state": "string"
+      }
+    },
+    "approval_requested": {
+      "route": "handle",
+      "required": {
+        "data.id": "string"
+      }
+    },
+    "approval_resolved": {
+      "route": "handle",
+      "required": {
+        "data.id": "string"
+      }
+    },
+    "approval_cancelled": {
+      "route": "handle",
+      "required": {
+        "data.id": "string"
+      }
+    },
+    "agent_updated": {
+      "route": "handle",
+      "required": {}
+    },
+    "runtime_resolved": {
+      "route": "handle",
+      "required": {
+        "data.session_id": "string",
+        "data.provider": "string",
+        "data.model": "nullable_string"
+      }
+    },
+    "context_usage": {
+      "route": "handle",
+      "required": {}
+    },
+    "timeline_node_updated": {
+      "route": "handle",
+      "required": {}
+    },
+    "timeline_wait_updated": {
+      "route": "ignore",
+      "required": {}
+    },
+    "plan_execution_progress": {
+      "route": "ignore",
+      "required": {}
+    },
+    "error": {
+      "route": "handle",
+      "required": {}
+    }
+  },
+  "request": {
+    "result.part": {
+      "route": "transport",
+      "required": {}
+    },
+    "result.complete": {
+      "route": "transport",
+      "required": {}
+    },
+    "status.progress": {
+      "route": "progress",
+      "required": {}
+    },
+    "github.sync.progress": {
+      "route": "progress",
+      "required": {}
+    },
+    "repository.write.progress": {
+      "route": "progress",
+      "required": {}
+    }
+  },
+  "document": {
+    "document.part": {
+      "route": "transport",
+      "required": {}
+    },
+    "document.complete": {
+      "route": "transport",
+      "required": {}
+    },
+    "status.update": {
+      "route": "handle",
+      "required": {}
+    },
+    "status.resync": {
+      "route": "handle",
+      "required": {}
+    }
+  }
+}

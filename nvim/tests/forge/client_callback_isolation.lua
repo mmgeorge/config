@@ -18,6 +18,7 @@ client._set_launcher_for_test(function(_, options, on_exit)
       if request.method == "initialize" then emit({ id = request.id, result = { protocol_version = response_version } }) end
       if request.method == "harness.initialize" then emit({ id = request.id, result = { session = { id = "fixture" } } }) end
       if request.method == "plan.scope_deviation_review" then emit({ id = request.id, result = {} }) end
+      if request.method == "trace.configure" then emit({ id = request.id, result = { enabled = false } }) end
       if request.method == "shutdown" then vim.schedule(function() on_exit({ code = 0 }) end) end
     end,
     kill = function() end,

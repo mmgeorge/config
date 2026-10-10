@@ -32,7 +32,9 @@ local function start(method)
       kill = function() end,
     }
   end)
-  client.subscribe(function() events = events + 1 end)
+  client.subscribe(function(event)
+    if event ~= "host_stopped" then events = events + 1 end
+  end)
   client.request_host(method, {}, function(result, failure)
     calls = calls + 1
     if failure then errors = errors + 1 else received = result end
@@ -77,6 +79,20 @@ local ok, failure = xpcall(function()
   complete(count, #encoded)
   vim.wait(10, function() return false end, 1)
   assert(calls == 1, "late completion duplicated a callback")
+
+  start()
+  local nullable = vim.json.encode({ id = request_id, result = { optional = vim.NIL, list = { vim.NIL, "second" } } })
+  part(0, 1, #nullable, nullable)
+  complete(1, #nullable)
+  settled()
+  assert(errors == 0 and received.optional == nil and received.list[1] == vim.NIL)
+
+  start()
+  local empty = vim.json.encode({ id = request_id, result = vim.NIL })
+  part(0, 1, #empty, empty)
+  complete(1, #empty)
+  settled()
+  assert(errors == 0 and received == nil)
 
   local corrupt = {
     function() part(1, 2, 4, "{}") end,

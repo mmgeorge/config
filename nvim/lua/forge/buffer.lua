@@ -3,6 +3,7 @@ local editable = require("forge.editable")
 local snapshot_transfer = require("forge.snapshot")
 local BlockSequence = require("forge.block_sequence")
 local folds = require("forge.folds")
+local node_contract = require("forge.node_contract")
 local decorations = require("forge.decorations")
 local buffer_view = require("forge.buffer_view")
 local cooperative = require("forge.cooperative")
@@ -45,6 +46,8 @@ local function validate_metadata(entry, read_row, region_seen)
     counter(node.content_revision)
     counter(node.loaded_rows)
     counter(node.loaded_bytes)
+    counter(node.order)
+    require("forge.event_contract").validate_node(node)
     assert(node.display == "heading" or node.display == "preview" or node.display == "full", "invalid node display")
     assert(node.expansion == nil or node.expansion == vim.NIL or type(node.expansion) == "boolean", "invalid node expansion")
   end
@@ -352,6 +355,7 @@ function M.preflight(session, patch, options)
         end
       end
       folds.validate(session.sequence, changed, retired, session.fold, read_row)
+      node_contract.validate(session.sequence, changed, retired, session)
     end)
     session.sequence:rollback()
     return { valid = valid, failure = failure }
@@ -362,20 +366,7 @@ function M.preflight(session, patch, options)
 end
 
 local function install_metadata(session, prepared, replace_all)
-  if replace_all then session.node_owner, session.block_node = {}, {} end
-  for _, changed in ipairs({ prepared.changed, prepared.retired }) do
-    for id in pairs(changed) do
-      local node = session.block_node[id]
-      if node and session.node_owner[node] == id then session.node_owner[node] = nil end
-      session.block_node[id] = nil
-    end
-  end
-  for id in pairs(prepared.changed) do
-    local node = prepared.block[id].metadata.node
-    if node and node ~= vim.NIL then
-      session.node_owner[node.id], session.block_node[id] = id, node.id
-    end
-  end
+  node_contract.update(session, prepared, replace_all)
   if replace_all then
     vim.api.nvim_buf_clear_namespace(session.buffer, session.namespace, 0, -1)
     session.marks = {}
@@ -640,6 +631,7 @@ function M.apply_snapshot(session, snapshot)
       cooperative.checkpoint()
     end
     folds.validate(sequence, changed, {}, nil, function(row) return text[row + 1] end)
+    node_contract.validate(sequence, changed, {})
     return { sequence = sequence, block = block, text = text, region = region, changed = changed,
       position = position, region_owner = region_owner, retired = {} }
   end)
@@ -900,6 +892,8 @@ function M.fragment(snapshot)
   assert(next(region) == nil, "status bodies cannot contain editable regions")
   fragment.sequence, fragment.row_count = BlockSequence.from(entries), #text
   folds.validate(fragment.sequence, changed, {}, nil, function(row) return text[row + 1] end)
+  node_contract.validate(fragment.sequence, changed, {})
+  node_contract.update(fragment, { block = fragment.block, changed = changed, retired = {} }, true)
   folds.update(fragment, { block = fragment.block, changed = changed, retired = {} }, true)
   return fragment
 end
@@ -937,6 +931,7 @@ function M.apply_fragment_patch(fragment, patch, prepared)
   change_sequence(fragment.sequence, patch, prepared.block)
   for id in pairs(prepared.retired) do fragment.block[id] = nil end
   for id, entry in pairs(prepared.block) do fragment.block[id] = entry end
+  node_contract.update(fragment, prepared, false)
   folds.update(fragment, prepared, false)
   fragment.revision, fragment.row_count = patch.next, patch.next_rows
 end

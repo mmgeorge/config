@@ -5049,22 +5049,13 @@ Planning continuation: turn {} of {}.",
         mut backend_event: BackendEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
-        // Source payloads stay in Rust. The document service owns their visible projection.
-        if matches!(backend_event.kind.as_str(), "tool" | "tool-output" | "assistant_message"
-            | "reasoning" | "reasoning_summary" | "message" | "raw" | "agent_timeline_updated")
-            || (backend_event.kind.starts_with("timeline_") && !matches!(backend_event.kind.as_str(), "timeline_node_updated" | "timeline_wait_updated")) {
+        // Configuration completion belongs to the Rust service. Other forwarded events follow the UI contract.
+        if backend_event.kind != "configuration_applied"
+            && !forge_protocol::contract::backend_visible(&backend_event.kind) {
             return Ok(());
         }
         if backend_event.kind == "timeline_node_updated" {
             backend_event.data = json!({"node":{"prompt":backend_event.data.pointer("/node/prompt")}});
-        } else if !matches!(backend_event.kind.as_str(), "execution_state" | "prompt_submission"
-            | "approval_requested" | "approval_resolved" | "approval_cancelled" | "agent_updated"
-            | "context_usage" | "runtime_resolved" | "timeline_wait_updated" | "plan_execution_progress" | "configuration_applied" | "error") {
-            backend_event.data = Value::Null;
-            backend_event.text = None;
-            backend_event.activity = None;
-            backend_event.summary = None;
-            backend_event.task_update = None;
         }
         self.trace.record(
             &self.session.id,

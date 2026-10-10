@@ -562,6 +562,11 @@ local function on_event(event, payload)
     return
   end
   if state.host_error then return end
+  if event ~= "state_invalidated" then
+    local route = require("forge.event_contract").route("session", event)
+    if route == "ignore" then return end
+    if route == "refresh" then synchronize_state() return end
+  end
   if event == "document_changed" then
     if payload.session_id ~= (state.session and state.session.id) then return end
     if payload.revision < (state.timeline_revision or 0) then return end
@@ -578,10 +583,11 @@ local function on_event(event, payload)
     end
     schedule_render()
   elseif event == "backend_event" then
+    if require("forge.event_contract").route("backend", payload.kind) == "ignore" then return end
     state.last_provider_progress, state.wait_notice = vim.uv.now(), nil
-    if payload.kind == "document_changed" then on_event("document_changed", payload.data) return end
-    if payload.kind == "turn_started" then recap.clear(state) end
-    if payload.kind == "execution_state" then
+    if payload.kind == "turn_started" then
+      recap.clear(state)
+    elseif payload.kind == "execution_state" then
       local execution = payload.data or {}
       if type(execution.session) ~= "table" or not state.session or execution.session.id ~= state.session.id then return end
       state.session = execution.session
@@ -627,8 +633,10 @@ local function on_event(event, payload)
         end
       end
       M.refresh_winbar()
-    elseif payload.kind == "error" and type(payload.text) == "string" then
-      notifications.warn(payload.text, "ForgeHarness")
+    elseif payload.kind == "error" then
+      if type(payload.text) == "string" then notifications.warn(payload.text, "ForgeHarness") end
+    else
+      error("Unhandled Harness backend event: " .. tostring(payload.kind))
     end
   elseif event == "question" then
     state.active_elicitation = payload
@@ -662,22 +670,9 @@ local function on_event(event, payload)
   elseif event == "plan_question_updated" then
     state.active_plan = payload.plan or state.active_plan
     M.refresh_winbar()
-  elseif event == "plan_created" or event == "plan_revision_created" or event == "plan_entity_renamed" or event == "plan_tests_deleted"
-    or event == "plan_changes_requested"
-    or event == "plan_acceptance_started" or event == "plan_acceptance_updated"
-    or event == "plan_acceptance_cancelled"
-    or event == "plan_question_answered" or event == "plan_question_withdrawn"
-    or event == "plan_accepted" or event == "plan_cancelled"
-    or event == "plan_activated"
-  then
-    synchronize_state()
   elseif event == "plan_deviation_review" then
     vim.schedule(function() present_scope_deviation(payload) end)
     schedule_render()
-  elseif event == "plan_deviation_recorded" or event == "plan_deviation_resolved"
-    or event == "plan_task_updated" or event == "plan_resolution"
-  then
-    synchronize_state()
   elseif event == "goal_changed" or event == "goal_continue_requested" then
     state.goal = payload.state ~= "cleared" and payload or nil
     if event == "goal_continue_requested" then
@@ -726,16 +721,14 @@ local function on_event(event, payload)
       state.pending_mode = nil
     end
     M.refresh_winbar()
-  elseif event == "interaction_rolled_back" then
-    synchronize_state()
   elseif event == "agent_updated" then
     state.agent = vim.deepcopy(payload)
     require("forge.views.harness.agent_picker").refresh()
     schedule_render()
-  elseif event == "exchange_complete" or event == "exchange_updated" then
-    synchronize_state()
   elseif event == "state_invalidated" then
     synchronize_state()
+  else
+    error("Unhandled Harness session event: " .. tostring(event))
   end
 end
 

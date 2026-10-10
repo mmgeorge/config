@@ -247,35 +247,25 @@ local function receive_result(client, message)
   client.transfer[request_id] = nil
   client.transfer_bytes = client.transfer_bytes - transfer.total_bytes
   local decode_started = vim.uv.hrtime()
-  local decoded, response = pcall(vim.json.decode, encoded)
+  local response, decode_failure = protocol.decode_message(encoded)
   require("forge.startup_log").write("host.result.decoded", { id = request_id, bytes = #encoded,
     parts = transfer.part_count, accept_us = transfer.accept_us, assembly_us = assembly_us,
     decode_us = math.floor((vim.uv.hrtime() - decode_started) / 1000),
     transfer_elapsed_us = math.floor((vim.uv.hrtime() - transfer.started_at) / 1000) })
+  if not response then return nil, decode_failure end
   if document then
-    if not decoded or type(response) ~= "table" or response.document ~= document or response.event ~= "status.update" or type(response.payload) ~= "table" then
-      return nil, "invalid assembled document update"
+    if not response or response.document ~= document or response.event ~= "status.update" then
+      return nil, decode_failure or "invalid assembled document update"
     end
     return response, nil
   end
   if session_id then
-    if not decoded or type(response) ~= "table" or response.session_id ~= session_id
+    if not response or response.session_id ~= session_id
       or type(response.event) ~= "string" or response.event == "event.part" or response.event == "event.complete"
       or response.payload == nil then return nil, "invalid assembled session event" end
-    for key in pairs(response) do
-      if key ~= "session_id" and key ~= "event" and key ~= "payload" then return nil, "unexpected assembled event field" end
-    end
     return response, nil
   end
-  if not decoded or type(response) ~= "table" or response.id ~= request_id
-    or ((response.result ~= nil) == (response.error ~= nil)) then return nil, "invalid assembled result identity or JSON" end
-  for key in pairs(response) do
-    if key ~= "id" and key ~= "result" and key ~= "error" then return nil, "unexpected assembled response field" end
-  end
-  if response.error ~= nil and (type(response.error) ~= "table"
-    or type(response.error.code) ~= "string" or type(response.error.message) ~= "string") then
-    return nil, "invalid assembled response error"
-  end
+  if not response or response.id ~= request_id then return nil, decode_failure or "invalid assembled result identity" end
   return response, nil
 end
 

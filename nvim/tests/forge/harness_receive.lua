@@ -37,7 +37,7 @@ local ok, error_message = xpcall(function()
           emit({ id = request.id, result = { enabled = request.params.enabled } })
         elseif request.method == "receive.test" then
           for sequence = 1, 40 do
-            emit({ session_id = "receive-test", event = "receive_test", payload = { sequence = sequence } })
+            emit({ session_id = "receive-test", event = "exchange_updated", payload = { sequence = sequence } })
           end
           emit({ id = request.id, result = { complete = true } })
           options.stderr(nil, string.rep("x", 100000))
@@ -53,7 +53,7 @@ local ok, error_message = xpcall(function()
   assert(vim.wait(1000, function() return started end, 1))
   event_count = 0
   client.subscribe(function(event, payload)
-    if event == "receive_test" then
+    if event == "exchange_updated" then
       event_count = event_count + 1
       assert(payload.sequence == event_count)
     end

@@ -41,7 +41,7 @@ function M.accept(state, part)
   state.active = nil
   local encoded, incomplete = json_transfer.finish(active.assembly)
   if not encoded then return nil, incomplete end
-  local ok, snapshot = pcall(vim.json.decode, encoded)
+  local ok, snapshot = pcall(vim.json.decode, encoded, { luanil = { object = true } })
   if not ok or type(snapshot) ~= "table" or snapshot.document ~= state.document or snapshot.revision ~= active.revision then
     return nil, "snapshot payload identity or JSON differs"
   end
