@@ -222,9 +222,10 @@ impl ToolOutputView {
 
     pub fn preview(&self, expanded: bool) -> Result<ToolOutputPreview<'_>> {
         let parsed = self.parsed()?;
-        let visible = if expanded { parsed.total_rows } else { 4 };
+        let visible = if expanded { parsed.total_rows } else { 4.min(parsed.total_rows) };
+        let start = parsed.total_rows - visible;
         Ok(ToolOutputPreview {
-            row: parsed.row.iter().take(visible.min(parsed.total_rows))
+            row: parsed.row[start..parsed.total_rows].iter()
                 .map(|range| &parsed.display[range.clone()]).collect(),
             hidden_rows: parsed.total_rows.saturating_sub(visible), total_rows: parsed.total_rows,
         })
@@ -439,14 +440,28 @@ mod tests {
     }
 
     #[test]
-    fn preview_keeps_first_four_lines_and_counts_only_remaining_lines() {
+    fn preview_keeps_latest_four_lines_and_counts_earlier_lines() {
         for count in 0usize..=6 {
             let saved = (0..count).map(|index| format!("line {index}\n")).collect::<String>();
             let view = ToolOutputView::new("call".into(), &saved).unwrap();
             let preview = view.preview(false).unwrap();
-            assert_eq!(preview.row, (0..count.min(4)).map(|index| format!("line {index}")).collect::<Vec<_>>());
+            assert_eq!(preview.row, (count.saturating_sub(4)..count).map(|index| format!("line {index}")).collect::<Vec<_>>());
             assert_eq!(preview.hidden_rows, count.saturating_sub(4));
         }
+    }
+
+    #[test]
+    fn preview_advances_with_fragmented_output_without_reparsing_history() -> Result<()> {
+        let mut output = ToolOutputView::new("call".into(), "one\ntwo\nthree\nfour\nfive")?;
+        assert_eq!(output.preview(false)?.row, ["two", "three", "four", "five"]);
+        let parser = output.parsed()? as *const ParsedOutput;
+        output.append(" continued\n\u{1b}[3")?;
+        output.append("2msix\u{1b}[0m\n")?;
+        assert_eq!(output.parsed()? as *const ParsedOutput, parser);
+        assert_eq!(output.preview(false)?.row, ["three", "four", "five continued", "six"]);
+        assert_eq!(output.preview(false)?.hidden_rows, 2);
+        assert_eq!(output.preview(true)?.row, ["one", "two", "three", "four", "five continued", "six"]);
+        Ok(())
     }
 
     #[test]

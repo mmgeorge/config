@@ -646,6 +646,8 @@ function M.sign()
   if not session or session.status ~= "Applied" or session.applying then return "  " end
   local location = require("forge.buffer").locate(session, vim.v.lnum - 1, 0)
   local node = location and session.sequence.node[location.block]
+  local status = node and node.entry.metadata.status
+  if status and status ~= vim.NIL and location.position.row == status.row then return "%s" end
   local layout = node and location.position.row == 0 and node.entry.metadata.layout
   local marker = layout and layout.marker
   if not marker or marker == vim.NIL or layout.indent ~= 2 then return "  " end

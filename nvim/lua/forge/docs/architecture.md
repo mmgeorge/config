@@ -760,7 +760,7 @@ before its lifecycle heading, prompt, and metrics. Rejection without revision re
 Question clarifications retain their branch ownership. Legacy activity following an intermediate final
 answer retains its relative order. Streaming, completion, and reload use the same layout and node IDs.
 Thoughts and tool groups nest one two-column level below their exchange summary. Tool calls and output
-retain their additional nesting. Final answers remain outside the activity fold. Tool invocation headings retain one display row in both collapsed and expanded states. The shared width-bounded title formatting preserves the duration column and truncates the displayed command or arguments. Full provider titles remain in durable tool state.
+retain their additional nesting. Final answers remain outside the activity fold. Tool invocation headings retain one display row in both collapsed and expanded states. The shared width-bounded title formatting preserves the duration column and truncates the displayed command or arguments. Full provider titles remain in durable tool state. Active tool previews display the latest four wrapped rows from the incremental output index. New output replaces only the preview body and earlier-line count at the existing presentation cadence. Explicit expansion still reads the full output from its beginning, and settled exchanges remove the automatic preview.
 `PlanStateMachine` validates question, feedback, submission, review, acceptance, cancellation, and failure
 transitions. `PlanQuestionLedger` records answers, skips, and withdrawals before generation resumes. It matches both
 the provider's logical id and a canonical digest of the user-visible content, so a resolved decision cannot become
@@ -5509,7 +5509,10 @@ Resolving, and Saving exchange. Completed headings retain Planned, Implemented,
 Verified, and Resolved. Idle has no status row.
 
 `health.notice` resolves local failures before user approval waits and provider
-inactivity. Failures and user decisions do not animate. Provider/tool waits,
+inactivity. User decisions display a static `◷` sign for review, approval, and
+answer waits. Failures and pauses do not animate. The timeline has one marker column. It selects native status signs only on the
+committed status row and window-local timeline markers on other rows. The sign
+column stays enabled without rendering a second copy of prompt or event markers. Provider/tool waits,
 agent waits, planning retries, saving, and ordinary work animate. The status hint
 renderer owns one timer per transcript. Ticks update only the spinner extmark.
 They do not read history, clear other decorations, mutate buffer text, or capture

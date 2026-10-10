@@ -7,6 +7,12 @@ local commands = require("forge.shared.view_command_set").new()
 local namespace = vim.api.nvim_create_namespace("ForgeHarnessStatusHint")
 local transcript = buffer.open("timeline-status-transitions", {})
 vim.api.nvim_set_current_buf(transcript.buffer)
+local view = require("forge.input").open(transcript, vim.api.nvim_get_current_win(), {
+  fold_markers = true, columns = { signcolumn = "yes:1", statuscolumn = "%s" },
+})
+assert(vim.wo.signcolumn == "yes:1", "fold markers hid the status sign column")
+assert(vim.wo.statuscolumn == "%{%v:lua.require'forge.folds'.sign()%}",
+  "timeline must use one marker column")
 local revision = 0
 local function publish(text, animated, context)
   revision = revision + 1
@@ -31,12 +37,16 @@ for _, activity in ipairs({ "Paused", "Waiting for your answer", "Waiting for pl
   publish(activity, false)
   assert(#mark() == 0, activity .. " retained a spinner")
 end
+for _, context in ipairs({ "question", "review" }) do
+  publish("Waiting", false, context)
+  assert(vim.trim(mark()[3].sign_text) == "◷", "user wait omitted its static icon")
+end
 publish("Planning", true, "working")
 local state = { busy = true, status = { kind = "working" }, approval = { {} } }
 transcript.status_notice = health.notice(state)
 hint.render(transcript, commands, 100)
 assert(mark()[3].virt_text[1][1]:find("Waiting for your approval", 1, true))
-assert(not mark()[3].sign_text)
+assert(vim.trim(mark()[3].sign_text) == "◷")
 state.approval = {}
 state.wait_notice = "Waiting for provider or tool · 30s without update"
 transcript.status_notice = health.notice(state)
@@ -87,6 +97,7 @@ local outcome = buffer.apply_snapshot(transcript, {
 assert(outcome.kind ~= "Applied")
 assert(vim.api.nvim_buf_get_lines(transcript.buffer, 0, 1, false)[1] == "Idle")
 hint.clear(transcript.buffer)
+require("forge.input").close(view)
 buffer.close(transcript)
 print("timeline_status: passed")
 vim.cmd("qa!")

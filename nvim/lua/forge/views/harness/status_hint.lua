@@ -160,11 +160,12 @@ function M.render(transcript, commands, width)
       rendered = rendered .. string.rep(" ", math.max(0, width - vim.fn.strdisplaywidth(rendered)))
       local options = { id = 1, virt_text = { { rendered, capture } },
         virt_text_win_col = 0, priority = 200, sign_hl_group = capture }
+      if notice.waiting then options.sign_text = "◷" end
       if notice.animated then animate(transcript, row, options)
       else vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, options) end
     else
       vim.api.nvim_buf_set_extmark(target_buffer, namespace, last_row, 0, {
-        id = 1, virt_lines = { { { text, capture } } },
+        id = 1, virt_lines = { { { (notice.waiting and "◷ " or "") .. text, capture } } },
       })
     end
     return
@@ -183,6 +184,11 @@ function M.render(transcript, commands, width)
     animate(transcript, row, {
       id = 1, sign_hl_group = capture,
       end_row = row, end_col = #text, hl_group = capture, priority = 110,
+    })
+  end
+  if row and not status.animated and (context == "question" or context == "review") then
+    vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
+      id = 1, sign_text = "◷", sign_hl_group = "ForgeStatusHint", priority = 110,
     })
   end
   if context then

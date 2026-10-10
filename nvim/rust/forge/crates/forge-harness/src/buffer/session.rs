@@ -1506,9 +1506,14 @@ mod tests {
         for patch in &sync.patch {
             assert!(patch.block_edit.is_empty());
             assert!(patch.metadata_edit.iter().all(|metadata| !metadata.block.0.contains("history-")));
-            assert!(patch.text_edit.iter().all(|edit| edit.removed_rows <= 1));
+            assert!(patch.text_edit.iter().all(|edit| edit.removed_rows <= 4),
+                "stream updates replace only the four-row preview or its count");
         }
         assert!(owner.open.as_ref().unwrap().sections.nodes.tool["active:turn:1:tool"].preview(true)?.row.contains(&"seventh"));
+        let snapshot = owner.snapshot(&document)?;
+        let preview = snapshot.block.iter().find(|block| block.id.0 == "active:turn:1:tool:preview").unwrap();
+        assert!(preview.text.wire_rows().iter().any(|row| row.contains("seventh")));
+        assert!(preview.text.row_count() <= 4);
         Ok(())
     }
 

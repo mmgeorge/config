@@ -25,7 +25,7 @@ local function present(view)
   for name, value in pairs(view.columns) do applied[name] = value end
   if view.fold_markers then
     applied.statuscolumn = "%{%v:lua.require'forge.folds'.sign()%}"
-    applied.signcolumn, applied.foldcolumn = "no", "0"
+    applied.signcolumn, applied.foldcolumn = view.columns.signcolumn or "no", "0"
     local fillchars = {}
     for item in vim.wo[view.window].fillchars:gmatch("[^,]+") do
       if not item:match("^foldopen:") and not item:match("^foldclose:") and not item:match("^foldsep:") then

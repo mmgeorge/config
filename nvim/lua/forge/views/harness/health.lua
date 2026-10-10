@@ -11,6 +11,7 @@ end
 ---@field text string
 ---@field animated boolean
 ---@field failed boolean?
+---@field waiting boolean?
 ---@param state table
 ---@return HarnessStatusNotice?
 function M.notice(state)
@@ -19,7 +20,7 @@ function M.notice(state)
     or state.presentation and state.presentation.section_error
   if failure then return { text = failure, animated = false, failed = failure ~= "Paused" } end
   if #(state.approval or {}) > 0 then
-    return { text = "Waiting for your approval", animated = false }
+    return { text = "Waiting for your approval", animated = false, waiting = true }
   end
   if awaiting_user(state) or not state.busy then return nil end
   return state.wait_notice and { text = state.wait_notice, animated = true } or nil

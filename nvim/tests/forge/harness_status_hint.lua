@@ -14,10 +14,11 @@ local namespace = vim.api.nvim_create_namespace("ForgeHarnessStatusHint")
 local function displayed()
   hint.render(transcript, command_set, 120)
   local marks = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
-  if #marks == 0 then return "" end
-  local text = {}
-  for _, chunk in ipairs(marks[1][4].virt_text) do text[#text + 1] = chunk[1] end
-  return table.concat(text)
+  local hints = {}
+  for _, mark in ipairs(marks) do
+    for _, chunk in ipairs(mark[4].virt_text or {}) do hints[#hints + 1] = chunk[1] end
+  end
+  return table.concat(hints)
 end
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 0, block = { {
@@ -36,7 +37,7 @@ config.options.keymaps.harness.open_artifact = original
 commands.register(command_set, "abort_plan", function() end)
 assert(displayed():find("or abort plan", 1, true), "review status omitted the configured abort hint")
 local review_hint = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
-for _, chunk in ipairs(review_hint[1][4].virt_text) do
+for _, chunk in ipairs(review_hint[#review_hint][4].virt_text) do
   assert(chunk[2] ~= "ForgeHarnessPlan", "review hints inherited the purple status text")
 end
 assert(buffer.apply_snapshot(transcript, {
@@ -98,11 +99,11 @@ vim.wait(150, function() return false end, 25)
 assert(vim.deep_equal(stopped, vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })),
   "stopped host retained its animation timer")
 transcript.status_notice = nil
-transcript.status_notice = { text = "Waiting for your approval", animated = false }
+transcript.status_notice = { text = "Waiting for your approval", animated = false, waiting = true }
 for _ = 1, 3 do
   hint.render(transcript, command_set, 120)
   local waiting = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
-  assert(#waiting == 1 and not waiting[1][4].sign_text, "approval wait retained a working spinner")
+  assert(#waiting == 1 and vim.trim(waiting[1][4].sign_text) == "◷", "approval wait retained a working spinner")
   assert(waiting[1][4].virt_text[1][1]:find("Waiting for your approval", 1, true))
   assert(waiting[1][4].virt_text[1][2] == "ForgeStatusHint", "approval wait used failure styling")
 end
@@ -241,7 +242,8 @@ for _, key in ipairs({ "oe", "<F8>" }) do
 end
 config.options.keymaps.harness.reopen_question = false
 hint.render(question_transcript, command_set, 120)
-assert(#vim.api.nvim_buf_get_extmarks(question_transcript.buffer, namespace, 0, -1, {}) == 0)
+assert(#vim.api.nvim_buf_get_extmark_by_id(question_transcript.buffer, namespace, 2, {}) == 0)
+assert(vim.trim(vim.api.nvim_buf_get_extmark_by_id(question_transcript.buffer, namespace, 1, { details = true })[3].sign_text) == "◷")
 config.options.keymaps.harness.reopen_question = original_question_key
 hint.clear(question_transcript.buffer)
 buffer.close(question_transcript)

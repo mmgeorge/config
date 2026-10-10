@@ -51,7 +51,7 @@ impl<'profile> TranscriptRenderer<'profile> {
     pub(super) fn tool_hidden(&self, call_id: &str, output: &ToolOutputView, expanded: bool) -> Result<BufferBlock> {
         let hidden = if expanded { 0 } else { preview_rows(self.profile,&output.preview(false)?)?.1 };
         let mut rows = if hidden == 0 { Vec::new() }
-            else { tool_body_rows(self.profile,&format!("…({hidden} hidden)"),false)? };
+            else { tool_body_rows(self.profile,&format!("…({hidden} earlier {})", if hidden == 1 { "line" } else { "lines" }),false)? };
         if output.truncated()? {
             rows.extend(tool_body_rows(self.profile,"Display truncated; export output for the complete response.",false)?);
         }
@@ -273,27 +273,34 @@ impl<'profile> TranscriptRenderer<'profile> {
 }
 
 fn preview_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>) -> Result<(Vec<String>,usize)> {
+    let mut content_profile = profile.clone();
+    let margin = 4.min(content_profile.columns - 1);
+    content_profile.columns -= margin;
     let mut row = Vec::new();
     let mut hidden_rows = output.hidden_rows;
-    for (index, text) in output.row.iter().enumerate() {
+    for (index, text) in output.row.iter().enumerate().rev() {
         let byte_limit = (profile.columns * 64).min(65536);
         let truncated = text.len() > byte_limit;
         let text = if truncated {
-            let mut end = byte_limit;
-            while !text.is_char_boundary(end) { end -= 1; }
-            &text[..end]
+            let mut start = text.len() - byte_limit;
+            while !text.is_char_boundary(start) { start += 1; }
+            &text[start..]
         } else { text };
-        let wrapped = tool_body_rows(profile, text, index == 0)?;
+        let wrapped = content_profile.wrap_plain(text, 0)?;
         let remaining = 4_usize.saturating_sub(row.len());
-        if wrapped.len() > remaining || truncated {
-            row.extend(wrapped.into_iter().take(remaining));
-            hidden_rows += output.row.len() - index;
+        let clipped = wrapped.len() > remaining || truncated;
+        row.extend(wrapped.into_iter().rev().take(remaining));
+        if clipped || row.len() == 4 {
+            hidden_rows += index + usize::from(clipped);
             break;
         }
-        row.extend(wrapped);
     }
-    if output.row.is_empty() { row.extend(tool_body_rows(profile, "no output", true)?); }
-    Ok((row,hidden_rows))
+    row.reverse();
+    if row.is_empty() { row.push("no output".into()); }
+    Ok((row.into_iter().enumerate().map(|(index, text)| {
+        let prefix = if index == 0 && margin == 4 { "  └ ".into() } else { " ".repeat(margin) };
+        format!("{prefix}{text}")
+    }).collect(), hidden_rows))
 }
 
 fn tool_output_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>, expanded: bool) -> Result<Vec<String>> {
@@ -304,7 +311,7 @@ fn tool_output_rows(profile: &WidthProfile, output: &ToolOutputPreview<'_>, expa
         return Ok(row);
     }
     let (mut row,hidden) = preview_rows(profile,output)?;
-    if hidden > 0 { row.extend(tool_body_rows(profile,&format!("…({hidden} hidden)"),false)?); }
+    if hidden > 0 { row.extend(tool_body_rows(profile,&format!("…({hidden} earlier {})", if hidden == 1 { "line" } else { "lines" }),false)?); }
     Ok(row)
 }
 
@@ -603,8 +610,8 @@ mod test {
                     "harness_plan_read", &ToolOutputPreview { row: vec![response], hidden_rows: 0, total_rows: 1 }, expanded,
                 )?;
                 let rows = block.text.wire_rows();
-                assert!(rows[1].starts_with("  └ {\"ok\":false"));
-                let truncated = rows.last().is_some_and(|row| row.contains("…(1 hidden)"));
+                assert!(rows[1].starts_with("  └ "));
+                let truncated = rows.last().is_some_and(|row| row.contains("…(1 earlier line)"));
                 let content_end = rows.len() - usize::from(truncated);
                 let restored = rows[1..content_end].iter().enumerate().map(|(index, row)| {
                     if index == 0 { row.strip_prefix("  └ ").unwrap() } else { row.strip_prefix("    ").unwrap() }
@@ -612,7 +619,7 @@ mod test {
                 if truncated {
                     assert!(!expanded);
                     assert_eq!(content_end - 1, 4);
-                    assert!(response.starts_with(&restored));
+                    assert!(response.ends_with(&restored));
                 } else {
                     assert_eq!(restored, response);
                 }
@@ -722,7 +729,7 @@ mod test {
                 "    second",
                 "    third",
                 "    fourth",
-                "    …(96 hidden)"
+                "    …(96 earlier lines)"
             ]
         );
         assert_eq!(block.metadata.target[0].range.end.row, block.text.row_count());
@@ -789,11 +796,11 @@ mod test {
             block.text.wire_rows(),
             vec![
                 "•    2s docs_lookup(crate, Item)",
-                "  └ one",
-                "    two",
+                "  └ two",
                 "    three",
                 "    four",
-                "    …(1 hidden)"
+                "    five",
+                "    …(1 earlier line)"
             ]
         );
         assert!(
@@ -834,8 +841,9 @@ mod test {
         let preview = render(false)?;
         let rows = preview.text.wire_rows();
         assert_eq!(rows.len(), 6, "preview must contain a heading, four output rows, and a hidden-count row");
-        assert_eq!(rows[5], "    …(3 hidden)");
-        assert!(!rows.iter().any(|row| row.contains("second")));
+        assert_eq!(rows[5], "    …(1 earlier line)");
+        assert!(rows.iter().any(|row| row.contains("second")));
+        assert!(rows.iter().any(|row| row.contains("third")));
         let expanded = render(true)?;
         let restored = expanded.text.wire_rows().iter().skip(1)
             .map(|row| row.strip_prefix("  └ ").or_else(|| row.strip_prefix("    ")).unwrap())
@@ -962,7 +970,7 @@ mod test {
         let rows = tool_output_rows(&WidthProfile::default(),
             &ToolOutputPreview { row:vec![&source],hidden_rows:0,total_rows:1 },false)?;
         assert_eq!(rows.len(),5);
-        assert!(rows[4].contains("1 hidden"));
+        assert!(rows[4].contains("1 earlier line"));
         assert!(rows.iter().map(String::len).sum::<usize>() < 1024);
         assert_eq!(source.len(),2 * 1024 * 1024);
         Ok(())
