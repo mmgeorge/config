@@ -62,6 +62,7 @@
 ---@field submit ForgeKeymap submit the review to GitHub
 
 ---@class ForgeHarnessKeymapConfig
+---@field visual_line_with_gutter ForgeKeymap
 ---@field submit ForgeKeymap
 ---@field queue ForgeKeymap
 ---@field steer ForgeKeymap
@@ -247,6 +248,7 @@ M.defaults = {
       submit = "cc",
     },
     harness = {
+      visual_line_with_gutter = "W",
       submit = "<C-s>",
       queue = "<C-q>",
       steer = false,

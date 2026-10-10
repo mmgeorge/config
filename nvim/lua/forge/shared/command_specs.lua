@@ -86,6 +86,7 @@ M.hint_command_ids_by_view = {
 ---@type table<string, ForgeStatusCommandSpec[]>
 M.view_specs = {
   harness = {
+    { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
     { id = "submit", label = "submit", desc = "Submit the composer", modes = { "n", "i" }, pinned = true,
       hints = { composer = function() return "submit" end } },
     { id = "queue", label = "queue", desc = "Queue the composer as the next prompt", modes = { "n", "i" }, pinned = true,

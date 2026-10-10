@@ -338,7 +338,14 @@ fn target_rule_list(request: &PermissionRequest, broad: bool) -> Vec<(String, St
 fn display_rule_list(rule_list: &[(String, String)]) -> String {
     rule_list
         .iter()
-        .map(|(category, pattern)| format!("{category} {pattern}"))
+        .map(|(category, pattern)| {
+            let label = if category == CATEGORY_BASH {
+                "shell"
+            } else {
+                category.as_str()
+            };
+            format!("{label} {pattern}")
+        })
         .collect::<Vec<_>>()
         .join(", ")
 }

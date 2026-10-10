@@ -2313,6 +2313,13 @@ end
 ---@return ForgeViewCommandSet
 function M.command_set()
   local set = command_set.new()
+  command_set.register(set, "visual_line_with_gutter", function()
+    local state = harness_state()
+    local presentation = state.presentation
+    if vim.api.nvim_get_current_buf() ~= state.transcript_buf or not presentation
+      or not presentation.ready or presentation.closed or presentation.failure then return end
+    presentation.selection.start()
+  end)
   command_set.register(set, "edit_queued", M.edit_last_queued)
   command_set.register(set, "submit", M.submit)
   command_set.register(set, "queue", M.queue_submit)
@@ -2356,6 +2363,7 @@ function M.attach()
   state.command_set = M.command_set()
   M.attach_transcript(state.transcript_buf)
   local composer_command_set = M.command_set()
+  command_set.unregister(composer_command_set, "visual_line_with_gutter")
   command_set.unregister(composer_command_set, "open_timeline")
   command_set.register(composer_command_set, "history_previous", prompt_history.previous)
   command_set.register(composer_command_set, "history_next", prompt_history.next)

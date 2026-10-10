@@ -212,6 +212,7 @@ function M.open(options, callback)
   local transcript_tick = vim.api.nvim_buf_get_changedtick(options.transcript_buffer)
   local function reject_open(message)
     owner.closed = true
+    if owner.selection then owner.selection.close() end
     markdown.clear(options.transcript_buffer)
     if owner.group then vim.api.nvim_del_augroup_by_id(owner.group) end
     if owner.view then input.close(owner.view) end
@@ -231,6 +232,7 @@ function M.open(options, callback)
       owner.save_timeline = nil
     end,
     recover = function() recovery(owner.transcript) end })
+  owner.selection = require("forge.document_commands").attach_selection(owner.transcript, { normalize = false })
   owner.transcript.fold_loading = {}
   owner.view = input.open(owner.transcript, options.transcript_window, transcript_options)
   owner.views[options.transcript_window] = owner.view
@@ -796,6 +798,7 @@ function M.open(options, callback)
     local collected = owner.host_generation ~= client.host_generation()
       or not vim.api.nvim_buf_is_valid(options.composer_buffer) or not vim.api.nvim_buf_is_valid(options.transcript_buffer)
     owner.closed = true
+    owner.selection.close()
     owner.epoch = owner.epoch + 1
     owner.applying = false
     owner.section_inflight = {}

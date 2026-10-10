@@ -695,6 +695,14 @@ this document focused on architecture.
 
 ### Harness timeline ownership
 
+The transcript presentation owns a shared gutter selection controller. `W` enters linewise
+Visual mode and highlights selected source rows together with their virtual gutters.
+`<Space>l` copies those rows with gutters in display order without changing buffer text.
+Selection exit, buffer leave, rejected startup, and presentation close release selection
+ownership and restore the prior clipboard mapping. Ordinary timeline cursor movement retains
+its existing behavior. Harness keymap configuration and help expose this command only in the
+transcript, while the composer retains its normal `W` behavior.
+
 Timeline prompts and final-response bodies use `●`, thoughts use `○`, non-foldable response summaries use `●`, and lifecycle rows use `◇`. Only fold headings use
 `▸` when closed and `▾` when open. Rust assigns markers from actual fold ownership, including
 file headings. Response summaries retain `●` until they own foldable content. Tool calls
