@@ -66,7 +66,7 @@ pub fn progress_command(
     progress: Option<&CommandProgressSink>,
     check: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
-    collect_command(command, limits, input, progress, false, check)
+    collect_command(command, limits, input, progress, false, None, check)
 }
 
 /// Retains a bounded diagnostic tail while draining both streams to completion.
@@ -77,7 +77,17 @@ pub fn diagnostic_command(
     progress: Option<&CommandProgressSink>,
     check: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
-    collect_command(command, limits, input, progress, true, check)
+    collect_command(command, limits, input, progress, true, None, check)
+}
+
+/// Drains stdout directly to an owned file while retaining bounded stderr and process deadlines.
+pub fn file_command(
+    command: &mut Command,
+    destination: std::fs::File,
+    limits: CommandLimits,
+    check: impl FnMut() -> Result<()>,
+) -> Result<Output> {
+    collect_command(command, limits, None, None, false, Some(destination), check)
 }
 
 fn collect_command(
@@ -86,6 +96,7 @@ fn collect_command(
     input: Option<&[u8]>,
     progress: Option<&CommandProgressSink>,
     diagnostic: bool,
+    destination: Option<std::fs::File>,
     mut check: impl FnMut() -> Result<()>,
 ) -> Result<Output> {
     ensure!(
@@ -115,7 +126,16 @@ fn collect_command(
     let input = input.map(ToOwned::to_owned);
     let progress = progress.cloned();
     runtime.block_on(async move {
-        collect_async(command, limits, input, progress, diagnostic, &mut check).await
+        collect_async(
+            command,
+            limits,
+            input,
+            progress,
+            diagnostic,
+            destination,
+            &mut check,
+        )
+        .await
     })
 }
 
@@ -125,6 +145,7 @@ async fn collect_async(
     input: Option<Vec<u8>>,
     progress: Option<CommandProgressSink>,
     diagnostic: bool,
+    destination: Option<std::fs::File>,
     check: &mut impl FnMut() -> Result<()>,
 ) -> Result<Output> {
     let started = Instant::now();
@@ -136,7 +157,7 @@ async fn collect_async(
         } else {
             Stdio::null()
         })
-        .stdout(Stdio::piped())
+        .stdout(destination.map(Stdio::from).unwrap_or_else(Stdio::piped))
         .stderr(Stdio::piped());
     wrapped.wrap(KillOnDrop);
     #[cfg(windows)]
@@ -150,17 +171,20 @@ async fn collect_async(
     wrapped.wrap(process_wrap::tokio::ProcessGroup::leader());
 
     let mut child = wrapped.spawn().context("start bounded command")?;
-    let stdout = child.stdout().take().context("command stdout is missing")?;
+    let stdout = child.stdout().take();
     let stderr = child.stderr().take().context("command stderr is missing")?;
     let failed = Arc::new(AtomicBool::new(false));
-    let stdout_reader = spawn_reader(
-        stdout,
-        limits.stdout_bytes,
-        CommandStream::Stdout,
-        progress.clone(),
-        diagnostic,
-        Arc::clone(&failed),
-    );
+    let stdout_reader = match stdout {
+        Some(stdout) => spawn_reader(
+            stdout,
+            limits.stdout_bytes,
+            CommandStream::Stdout,
+            progress.clone(),
+            diagnostic,
+            Arc::clone(&failed),
+        ),
+        None => tokio::spawn(async { Ok(Vec::new()) }),
+    };
     let stderr_reader = spawn_reader(
         stderr,
         limits.stderr_bytes,

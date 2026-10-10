@@ -1893,10 +1893,12 @@ backend turn completes
 **Roll back and revise an interaction**
 
 ```
-/undo → newest-first interaction picker → confirmation picker
-  └─ exchange.rollback revalidates HEAD, index digest, and workspace digest
-       ├─ restore worktree-only CAS objects or refuse without changing files
-       └─ success → reconcile Harness → restore the selected prompt to HarnessInput
+/undo → recovery or newest-first exchange picker → saved preview → confirmation
+  └─ exchange.rollback.apply revalidates HEAD and affected file contents
+       ├─ stale preview → no mutation, refresh and confirm again
+       ├─ saved recovery journal → replace files and persist per-file progress
+       ├─ interrupted restore → persistent recovery state, block new workspace work
+       └─ completed restore → mark exchange history, refresh, return the original prompt
 ```
 
 ### Harness broker boundary
@@ -2095,13 +2097,27 @@ remain visible as tools without being misattributed as authored edits. Backends 
 publish structured file changes omit the thought-level Changed node instead of inferring it from
 the filesystem or command output.
 
-Every Git interaction captures one baseline before its first provider turn and one terminal
-checkpoint when the interaction completes, fails, or cancels. Steering and automatic goal
-continuations reuse that baseline without intermediate Git scans. The terminal checkpoint uses
-`git ls-files --cached --others --exclude-standard`, so the aggregate interaction diff includes
-tracked files and nonignored untracked files while excluding ignored build output at any depth.
-`GitCheckpoint` owns capture and restoration directly. The stored `CheckpointRecord` represents
-captured data rather than a second snapshot implementation.
+Every Git interaction captures a baseline before its first provider turn and a terminal
+checkpoint when it completes, fails, or cancels. The first baseline is checkpoint zero,
+including pre-existing staged and unstaged content. Steering within an exchange retains
+its baseline. Each later exchange captures the current workspace before starting.
+
+`CheckpointRecord` stores an existing Git tree ID, complete content overrides, deletions,
+file modes, and sampled checkout conversion rules. Capture never creates commits, changes
+refs, stages files, or writes the user's index. `forge_git::checkpoint` enumerates the tree,
+index, and nonignored worktree entries through gix. Matching non-racy index metadata avoids
+reading clean files. A bounded process-local cache reuses unchanged dirty file identities.
+New or uncertain content streams through a 64 KiB buffer and is published only when it
+actually differs from the Git baseline. A second metadata observation rejects captures
+that observe concurrent changes. This is optimistic validation, not a filesystem snapshot.
+
+Clean files resolve through the recorded tree, independently of the current branch.
+Checkout rules are sampled with Git attribute precedence. External filters and encodings
+use captured raw overrides rather than running commands during restoration. Individual
+source reads traverse only the requested tree path. Large baseline acquisition streams
+through a temporary file using a bounded, 30-second `git cat-file` operation. Missing
+baseline objects produce an explicit error before mutation. No checkpoint refs are added
+to protect objects from a later external prune.
 
 At terminal capture, `ProviderChangeIndex` collects normalized paths from successful structured
 file changes in the main timeline and every referenced child-agent turn. The checkpoint comparer
@@ -3443,36 +3459,45 @@ memory, disk usage, or end-to-end latency.
 
 ## 39. Streamed checkpoint restoration
 
-`ObjectStore::restore_file` verifies stored bytes into a private temporary file before opening a
-rollback destination. Both source verification and destination copying use the same 64 KiB bounded
-reader. Empty objects truncate the destination to zero bytes, and longer existing destinations
-are truncated to the exact restored length. The caller retains destination validation and mutation
-admission ownership.
+`ObjectStore::restore_file` verifies stored bytes into a private temporary file, then
+replaces each destination from a same-directory temporary file. The transfer buffer is
+64 KiB. This prevents an interrupted write from leaving a truncated destination. The batch
+remains interruptible between files and retains durable progress rather than claiming
+multi-file atomicity.
 
-Corrupt or unreadable object preparation leaves that destination untouched. The final copy uses
-the existing create/truncate behavior, preserving existing destination permissions rather than
-replacing the destination with the temporary file. A destination write failure can still leave
-partial bytes, so checkpoint rollback retains its uncertain-outcome behavior on error. Previously
-completed targets are not rolled back automatically.
+## 40. Checkpoint restore preview and recovery
 
-Temporary storage is released on success and failure but still requires object-sized disk space.
-This removes rollback's whole-object byte vector. It does not establish total disk admission,
-per-target durable receipts, source-path race isolation, or bounded diff object retrieval. The Unix
-executable-permission fixture remains unexecuted on this Windows host.
+`exchange.rollback.prepare` computes only paths changed between the expected and target
+checkpoints. Unrelated later files remain untouched. It acquires recovery copies of affected
+current files, resolves target objects, and saves an immutable preview outside the worktree.
+A changed HEAD or later edit adds an overwrite warning rather than prohibiting restoration.
+The confirmation has Cancel selected by default and pages warning lists in groups of 50.
+The apply request carries only the preview ID.
 
-## 40. Checkpoint restore preflight
+`exchange.rollback.apply` revalidates the affected paths and HEAD under repository mutation
+ownership. Staging changes do not invalidate a preview because restoration never writes the
+index. Changed files or HEAD require a new preview and confirmation. Unsafe paths, symlink
+ancestors, missing objects, and unsettled exchanges reject before mutation.
 
-Checkpoint rollback validates every deletion path and every changed restore path before mutating
-the worktree. It also verifies each required stored object before the first deletion. A corrupt
-object or invalid later path therefore rejects the batch while preserving earlier worktree files.
-Object verification uses a 64 KiB buffer with an initial-length-plus-one-byte read bound and
-compares descriptor metadata after hashing.
+A saved `RestorePreview` contains original and target identities. A separate constant-size
+progress journal records Applying, FilesComplete, or Complete. Both publish with file sync
+and atomic replacement. Each file operation compares its actual state with original and
+target content, so restart handles a crash between replacement and progress publication.
+A concurrent third state stops with a visible error. Empty directories are removed only
+when required to restore a file and only when empty. Symlink targets are captured as data.
 
-Preflight does not retain an open descriptor or prepared temporary file for every target.
-Restoration still verifies each object again before opening its destination. External changes
-between these phases and destination I/O failures can still produce partial restoration. The
-coordinator continues to classify restore errors conservatively as uncertain. Native path race
-isolation, atomic batch restoration, and durable per-target outcomes remain incomplete.
+New workspace work is blocked until a pending restore is resolved. Harness undo offers
+Continue interrupted restore and Restore pre-restore files. A completed restore also offers
+Undo last restore. Recovery does not resurrect a task or provider execution. It restores
+file content, while exchange history retains the completed rollback disposition. A failed
+history or provider finalization leaves FilesComplete recoverable and does not repeat file
+writes unnecessarily. Confirmation after later edits warns again. Git's index, branches,
+commits, and ignored untracked output remain outside the mutation scope.
+
+The checkpoint format intentionally has no legacy decoder. Opening the new store removes
+sessions owning old complete-file checkpoint records through SQLite foreign-key cascades.
+Preferences, prompt history, and provider-owned sessions remain intact. Immutable object
+cleanup is separate from format reset.
 
 ## 41. Checkpoint diff source admission
 
@@ -3792,21 +3817,16 @@ the broker executor. Discovery resolves the canonical worktree before capture ad
 scopes. The request charges its retained workspace path and session identity before acquisition
 starts. Completed records retain the read slot until collection or disposal.
 
-The native capture operation checks cancellation after HEAD and index acquisition, before each file, and before
-manifest construction. Cancelling a queued capture prevents acquisition. Cancelling an active
-capture can leave immutable objects without a checkpoint reference, but the waiter cannot publish
-the cancelled result. A blocked operating-system call or one large file transfer remains active
-until that stage returns, with its read slot retained.
+Capture checks cancellation during enumeration, between 64 KiB file reads, and before
+manifest publication. Dropping a waiter retains native ownership until the worker exits.
+Published but unreferenced immutable objects are harmless and may remain after cancellation.
+Source metadata includes file identity and change time where the operating system provides
+it. File replacement invalidates cached identities. The content and baseline caches retain
+at most 65,536 entries each. Reopening a host rebuilds those caches from current metadata.
 
-Initial interaction startup saves the captured record before publishing its checkpoint identity,
-working timer, or runtime state. Admission or acquisition failure leaves those fields unset for a
-new interaction. Rollback uses the same native capture implementation inside its existing mutation
-worker, preserving its admitted scope without recursively acquiring a read slot.
-
-Capture concurrency and retained request inputs are bounded. Aggregate memory accounting,
-checkpoint manifest allocation, whole-worktree snapshot consistency against concurrent external writers,
-and durable cleanup of unreferenced objects remain separate acceptance work. Checkpoint capture
-continues to stream full file content regardless of the 8 MiB diff-preview source limit.
+Initial interaction startup persists its checkpoint before publishing the provider turn.
+Admission and acquisition failures leave a visible finalization error. Capture diagnostics
+report candidate and override counts, cache hits, file bytes read, and elapsed milliseconds.
 
 ## 55. Bounded checkpoint command output
 
@@ -3823,11 +3843,10 @@ child cleanup ownership. The deadline is a termination deadline rather than a gu
 time. Operating-system waits and inherited pipes held by descendants can outlive it. Process-tree
 containment remains incomplete.
 
-Checkpoint HEAD, index, and file-list commands use 16 MiB stdout, 64 KiB stderr, and 30-second
-deadlines. They disable pagers, optional locks, and filesystem-monitor hooks for these read
-operations. Their argument vectors remain literal, and error chains reach the broker response.
-The default four read slots permit at most eight concurrent command reader threads for capture.
-File content streams into the object store independently of these command-output limits.
+Checkpoint discovery reads Git metadata through gix rather than shell file lists.
+`file_command` sends large immutable blob output directly to an owned temporary file,
+retains at most 64 KiB of stderr, and applies a 30-second deadline. It shares process-group
+or Windows Job Object ownership and cancellation cleanup with the bounded command runner.
 
 ## 56. Capture and rollback share repository scopes
 
@@ -3850,8 +3869,9 @@ the receipt. Rollback keeps its separate uncertain-outcome recovery contract for
 This serializes capture against operations already routed through the coordinator, including
 Harness rollback. Legacy Lua mutation paths and external writers remain outside that guarantee
 until their cutover or explicit observation. Generation checks do not discover external changes
-automatically. Persistent recovery, complete writer integration, and aggregate memory admission
-remain incomplete.
+automatically. The saved restore journal provides restart recovery. External writers remain outside
+coordinator ownership and are checked through file preconditions. Aggregate disk admission
+and external-writer isolation remain separate constraints.
 
 ## 57. Rust status metadata enumeration
 

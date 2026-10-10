@@ -266,12 +266,12 @@ impl ConversionSession {
     }
 }
 
-struct AttributeSelection {
+pub(crate) struct AttributeSelection {
     outcome: gix::attrs::search::Outcome,
-    attribute: Vec<State>,
+    pub(crate) attribute: Vec<State>,
 }
 
-fn resolve_attributes(
+pub(crate) fn resolve_attributes(
     local: &gix::Repository,
     repository: &RepositoryIdentity,
     path: &RepositoryPath,
@@ -398,7 +398,7 @@ pub(super) fn verify_context(
     check()
 }
 
-fn read_info(
+pub(crate) fn read_info(
     repository: &RepositoryIdentity,
     check: &mut dyn FnMut() -> Result<()>,
 ) -> Result<Option<Vec<u8>>> {

@@ -273,6 +273,13 @@ impl SqliteStore {
             "#,
         )?;
         tool_output::initialize(&mut connection)?;
+        // Old complete-file checkpoints cannot be interpreted as Git overlays.
+        // Session cascades retain preferences, prompt history, and provider-owned files.
+        let removed = connection.execute(
+            "DELETE FROM session_record WHERE id IN (SELECT session_id FROM checkpoint_record WHERE json_type(payload, '$.deleted') IS NOT 'array')",
+            [],
+        )?;
+        if removed != 0 { eprintln!("checkpoint.format_reset sessions={removed}"); }
         Ok(Self {
             connection,
             session_lock: Default::default(),
@@ -1078,6 +1085,24 @@ fn decode_current_session(value: &str) -> Result<Option<HarnessSession>> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn legacy_checkpoint_sessions_are_reset_without_removing_preferences_or_prompt_history() -> Result<()> {
+        let directory = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(directory.path())?;
+        store.save_session(&session("legacy", "D:/work"))?;
+        store.connection.execute("INSERT INTO checkpoint_record(id,session_id,payload) VALUES('old','legacy','{}')", [])?;
+        store.connection.execute("INSERT INTO preference_record(workspace,backend,payload) VALUES('D:/work','mock','{}')", [])?;
+        store.connection.execute("INSERT INTO prompt_history_record(text,created_at_ms) VALUES('keep',1)", [])?;
+        drop(store);
+        let store = SqliteStore::open(directory.path())?;
+        let count = |table: &str| -> Result<i64> { Ok(store.connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?) };
+        assert_eq!(count("session_record")?, 0);
+        assert_eq!(count("checkpoint_record")?, 0);
+        assert_eq!(count("preference_record")?, 1);
+        assert_eq!(count("prompt_history_record")?, 1);
+        Ok(())
+    }
 
     #[test]
     fn streamed_output_reopens_migrates_and_commits_completion_atomically() -> Result<()> {

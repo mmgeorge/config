@@ -139,6 +139,7 @@ pub struct BrokerSnapshot {
     pub exchange: Vec<Exchange>,
     pub capability: BackendCapability,
     pub no_checkpoint: bool,
+    pub restore_recovery: Option<Value>,
     pub goal: Option<GoalRecord>,
     pub active_plan: Option<PlanRecord>,
     pub active_elicitation: Option<ActiveElicitation>,
@@ -940,6 +941,9 @@ impl HarnessBroker {
             exchange: interaction,
             capability: self.capability.clone(),
             no_checkpoint: matches!(self.workspace_kind, WorkspaceKind::Untracked(_)),
+            restore_recovery: crate::checkpoint::RestoreJournal::progress(&self.store.objects, &self.session.id)?
+                .filter(|progress| progress.state != crate::checkpoint::RestoreState::Complete)
+                .map(|progress| json!({"applied":progress.applied,"files":progress.files})),
             goal,
             active_plan,
             active_elicitation,
@@ -1226,7 +1230,14 @@ impl HarnessBroker {
             )),
             HarnessMethod::ExchangeCommentSave => self.save_exchange_comment(params),
             HarnessMethod::ExchangeRequestChanges => self.request_exchange_changes(params).await,
-            HarnessMethod::ExchangeRollback => self.rollback_exchange(params).await,
+            HarnessMethod::ExchangeRollbackPrepare => self.prepare_rollback(params).await,
+            HarnessMethod::ExchangeRollbackApply => self.apply_rollback(params).await,
+            HarnessMethod::ExchangeRollbackPreview => {
+                let id = required_text(&params, "preview_id")?;
+                let preview = crate::checkpoint::RestorePreview::load(&self.store.objects, &self.session.id, &id)?;
+                Ok((preview.summary(params.get("offset").and_then(Value::as_u64).unwrap_or(0) as usize), Vec::new()))
+            }
+            HarnessMethod::ExchangeRecovery => self.restore_recovery(params).await,
             HarnessMethod::SessionNew | HarnessMethod::SessionClear => {
                 self.new_session(params).await
             }
@@ -2395,6 +2406,7 @@ impl HarnessBroker {
     }
 
     async fn submit_prompt_inner(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        self.require_restore_recovered()?;
         let text = required_text(&params, "text")?;
         if text.trim() == "/plan" {
             return self.list_replanning_choices();
@@ -3609,8 +3621,12 @@ Planning continuation: turn {} of {}.",
                 let final_checkpoint_id = self
                     .capture_final_checkpoint(&mut interaction, outcome)
                     .await?;
-                let workspace_unchanged = interaction.checkpoint_before.is_some()
-                    && interaction.checkpoint_before == final_checkpoint_id;
+                let workspace_unchanged = if let (Some(before), Some(after)) = (&interaction.checkpoint_before, &final_checkpoint_id) {
+                    let before = self.store.load_checkpoint(before)?.context("initial checkpoint disappeared")?;
+                    let after = self.store.load_checkpoint(after)?.context("final checkpoint disappeared")?;
+                    let objects = self.store.objects.clone();
+                    tokio::task::spawn_blocking(move || before.equivalent(&after, &objects)).await.context("checkpoint comparison worker failed")??
+                } else { false };
                 let retraction_eligible = cancelled
                     && self.turn_cancellation.restores_prompt()
                     && self.capability.native_turn_rollback
@@ -4183,6 +4199,7 @@ Planning continuation: turn {} of {}.",
         interaction: &mut Exchange,
         now_ms: i64,
     ) -> Result<()> {
+        self.require_restore_recovered()?;
         if let WorkspaceKind::Git(workspace) = &self.workspace_kind {
             let checkpoint = GitCheckpoint::new(workspace)
                 .capture(
@@ -4211,6 +4228,7 @@ Planning continuation: turn {} of {}.",
     }
 
     fn resume_exchange_runtime(&mut self, interaction: &Exchange) -> Result<()> {
+        self.require_restore_recovered()?;
         self.exchange_runtime = Some(ExchangeRuntime {
             exchange_id: interaction.id.clone(),
             synthetic_turn: None,
@@ -6412,12 +6430,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         .await
     }
 
-    async fn rollback_exchange(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+    async fn prepare_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let exchange_id = required_text(&params, "exchange_id")?;
         let exchange_id = self
             .store
             .checkpoint_owner(&self.session.id, &exchange_id)?;
-        let mut interaction = self.store.list_exchange(&self.session.id)?;
+        let interaction = self.store.list_exchange(&self.session.id)?;
         let target_index = interaction
             .iter()
             .position(|item| item.id == exchange_id)
@@ -6468,38 +6486,195 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         let WorkspaceKind::Git(workspace) = &self.workspace_kind else {
             anyhow::bail!("rollback is unavailable because this session has NO CHECKPOINT")
         };
-        GitCheckpoint::new(workspace)
-            .admit_restore(Arc::clone(&self.repositories), expected, target)
-            .await?
-            .restore(self.store.objects.clone())
-            .await?;
-        self.store.record_rollback(
-            &self.session.id,
-            &interaction
-                .iter()
-                .skip(target_index)
-                .map(|exchange| exchange.id.clone())
-                .collect::<Vec<_>>(),
-        )?;
-        interaction = self.store.list_exchange(&self.session.id)?;
-        if self.session.goal_id.is_some() {
-            let mut goal = self.active_goal()?;
-            self.sync_native_goal(&goal, "cleared").await?;
-            goal.state = GoalState::Cleared;
-            goal.updated_at_ms = self.clock.now_ms();
-            self.store.save_goal(&goal)?;
-            self.session.goal_id = None;
-        }
-        self.save_session()?;
-        Ok((
-            json!({ "rolled_back": interaction[target_index].id }),
-            vec![self.event(
-                "interaction_rolled_back",
-                serde_json::to_value(&interaction[target_index])?,
-            )?],
-        ))
+        self.require_restore_recovered()?;
+        let objects = self.store.objects.clone();
+        let workspace = workspace.to_owned();
+        let exchange_ids = interaction
+            .iter()
+            .skip(target_index)
+            .map(|exchange| exchange.id.clone())
+            .collect();
+        let preview = tokio::task::spawn_blocking(move || {
+            let mut preview = crate::checkpoint::RestorePreview::prepare(
+                &objects, &workspace, &expected, &target,
+            )?;
+            preview.exchange_ids = exchange_ids;
+            preview.save(&objects)?;
+            Ok::<_, anyhow::Error>(preview)
+        })
+        .await
+        .context("restore preparation worker failed")??;
+        Ok((preview.summary(0), Vec::new()))
     }
 
+    fn require_restore_recovered(&self) -> Result<()> {
+        if let Some(progress) =
+            crate::checkpoint::RestoreJournal::progress(&self.store.objects, &self.session.id)?
+        {
+            anyhow::ensure!(
+                progress.state == crate::checkpoint::RestoreState::Complete,
+                "an interrupted restore requires recovery before new workspace work; open Harness undo"
+            );
+        }
+        Ok(())
+    }
+
+    async fn apply_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let preview_id = required_text(&params, "preview_id")?;
+        let objects = self.store.objects.clone();
+        let session_id = self.session.id.clone();
+        let preview = tokio::task::spawn_blocking(move || {
+            crate::checkpoint::RestorePreview::load(&objects, &session_id, &preview_id)
+        })
+        .await
+        .context("restore preview read failed")??;
+        anyhow::ensure!(
+            crate::workspace::same(&preview.workspace, &self.session.workspace),
+            "restore preview belongs to another workspace"
+        );
+        let exchanges = self.store.list_exchange(&self.session.id)?;
+        anyhow::ensure!(
+            exchanges
+                .iter()
+                .all(|exchange| exchange.completed_at_ms.is_some()),
+            "cancel or finish the active exchange before restoring files"
+        );
+        if let Some(first) = preview.exchange_ids.first() {
+            let position = exchanges
+                .iter()
+                .position(|exchange| &exchange.id == first)
+                .context("restore exchange disappeared")?;
+            anyhow::ensure!(
+                exchanges[position..]
+                    .iter()
+                    .map(|exchange| &exchange.id)
+                    .eq(preview.exchange_ids.iter())
+                    && exchanges[position].disposition
+                        == crate::exchange::HistoryDisposition::Current,
+                "restore preview is stale: exchange history changed"
+            );
+            self.store
+                .require_settled_exchange_tree(&self.session.id, &preview.exchange_ids)?;
+        }
+        let journal = GitCheckpoint::new(&preview.workspace)
+            .apply_preview(
+                Arc::clone(&self.repositories),
+                self.store.objects.clone(),
+                preview,
+                false,
+            )
+            .await?;
+        self.finish_restore(journal).await
+    }
+
+    async fn finish_restore(
+        &mut self,
+        mut journal: crate::checkpoint::RestoreJournal,
+    ) -> Result<(Value, Vec<SessionEvent>)> {
+        let mut events = Vec::new();
+        if let Some(first) = journal.preview.exchange_ids.first() {
+            self.store
+                .record_rollback(&self.session.id, &journal.preview.exchange_ids)?;
+            if self.session.goal_id.is_some() {
+                let mut goal = self.active_goal()?;
+                self.sync_native_goal(&goal, "cleared").await?;
+                goal.state = GoalState::Cleared;
+                goal.updated_at_ms = self.clock.now_ms();
+                self.store.save_goal(&goal)?;
+                self.session.goal_id = None;
+            }
+            self.save_session()?;
+            if let Some(exchange) = self
+                .store
+                .list_exchange(&self.session.id)?
+                .into_iter()
+                .find(|exchange| &exchange.id == first)
+            {
+                events
+                    .push(self.event("interaction_rolled_back", serde_json::to_value(exchange)?)?);
+            }
+        }
+        journal.state = crate::checkpoint::RestoreState::Complete;
+        journal.save(&self.store.objects)?;
+        Ok((json!({"restored":true}), events))
+    }
+
+    #[cfg(test)]
+    async fn rollback_exchange(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let (preview, _) = self.prepare_rollback(params).await?;
+        anyhow::ensure!(
+            preview["warning_count"].as_u64() == Some(0),
+            "restore requires confirmation of later changes"
+        );
+        self.apply_rollback(json!({"preview_id":preview["preview_id"]}))
+            .await
+    }
+
+    async fn restore_recovery(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let action = params
+            .get("action")
+            .and_then(Value::as_str)
+            .unwrap_or("status");
+        if action == "status" {
+            let progress =
+                crate::checkpoint::RestoreJournal::progress(&self.store.objects, &self.session.id)?;
+            return Ok((progress.map(|progress| json!({"pending": progress.state != crate::checkpoint::RestoreState::Complete,
+                "applied": progress.applied, "files": progress.files})).unwrap_or(Value::Null), Vec::new()));
+        }
+        anyhow::ensure!(
+            matches!(action, "continue" | "undo"),
+            "unknown restore recovery action"
+        );
+        let objects = self.store.objects.clone();
+        let session_id = self.session.id.clone();
+        let journal = tokio::task::spawn_blocking(move || {
+            crate::checkpoint::RestoreJournal::load(&objects, &session_id)
+        })
+        .await
+        .context("restore journal read failed")??
+        .context("restore journal is missing")?;
+        if action == "continue" {
+            anyhow::ensure!(
+                journal.state != crate::checkpoint::RestoreState::Complete,
+                "restore is already complete"
+            );
+            let exchange = self.store.list_exchange(&self.session.id)?;
+            anyhow::ensure!(
+                exchange
+                    .iter()
+                    .all(|exchange| exchange.completed_at_ms.is_some()),
+                "cancel or finish active work before restore recovery"
+            );
+            self.store.require_settled_exchange_tree(
+                &self.session.id,
+                &exchange
+                    .iter()
+                    .map(|exchange| exchange.id.clone())
+                    .collect::<Vec<_>>(),
+            )?;
+            let journal = GitCheckpoint::new(&journal.preview.workspace)
+                .apply_preview(
+                    Arc::clone(&self.repositories),
+                    self.store.objects.clone(),
+                    journal.preview,
+                    true,
+                )
+                .await?;
+            return self.finish_restore(journal).await;
+        }
+        if action == "undo" {
+            let objects = self.store.objects.clone();
+            let preview = tokio::task::spawn_blocking(move || {
+                let preview = journal.reverse(&objects)?;
+                preview.save(&objects)?;
+                Ok::<_, anyhow::Error>(preview)
+            })
+            .await
+            .context("recovery preparation worker failed")??;
+            return Ok((preview.summary(0), Vec::new()));
+        }
+        unreachable!("recovery action was validated")
+    }
     async fn new_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
         let now_ms = self.clock.now_ms();
         let child = prepare_new_session(
@@ -8321,6 +8496,7 @@ mod test {
         exchange.finalization_outcome = Some(ExchangeState::Cancelled);
         exchange.checkpoint_before = Some(before.id.clone());
         broker.store.save_checkpoint_exchange(&before, &exchange).unwrap();
+        std::fs::write(repository.path().join("seed.txt"), "changed after checkpoint\n").unwrap();
         let locked = std::fs::OpenOptions::new()
             .read(true)
             .share_mode(0)

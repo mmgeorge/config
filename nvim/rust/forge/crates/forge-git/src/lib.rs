@@ -1,3 +1,4 @@
+pub mod checkpoint;
 pub mod completion;
 pub mod config_location;
 pub mod content;

@@ -309,6 +309,7 @@ end
 
 local function render_status_hint(state)
   if state.presentation and state.presentation.transcript then
+    state.presentation.transcript.restore_recovery = state.restore_recovery
     state.presentation.transcript.recap = state.recap
     state.presentation.transcript.rename_status = state.rename_status
     state.presentation.transcript.execution_notice = state.presentation.failure or state.execution_notice
@@ -1235,46 +1236,72 @@ local function restore_composer_prompt(text)
   end)
 end
 
----@param interaction ForgeRollbackInteraction
-local function rollback_exchange(interaction)
+---@param preview table
+---@param interaction table?
+local function confirm_restore_preview(preview, interaction)
   local state = harness_state()
-  if state.busy then
-    notifications.warn("Cancel or finish the active turn before undoing an exchange", "Harness undo")
-    return
+  local session_id, generation = state.session.id, client.host_generation()
+  local function current()
+    return harness_state() == state and state.session and state.session.id == session_id
+      and client.host_generation() == generation
   end
-  client.request("exchange.rollback", { exchange_id = interaction.id }, function(_, request_error)
-    if request_error then
-      notifications.error(request_error, "Harness undo")
+  local description = { tostring(preview.files) .. " files will be restored.", "Git’s index will not change." }
+  for _, warning in ipairs(preview.warnings or {}) do description[#description + 1] = warning end
+  local choices = {
+    { label = "Cancel", value = "cancel" },
+    { label = (preview.warning_count or 0) > 0 and "Restore anyway" or "Restore", value = "restore" },
+  }
+  if preview.next_offset then
+    choices[#choices + 1] = { label = "More warnings", value = "more" }
+  end
+  open_choice_picker(state, "Restore checkpoint", table.concat(description, "\n"), choices, function(choice)
+    if not current() or choice == "cancel" or not choice then return end
+    if choice == "more" then
+      client.request_for(session_id, "exchange.rollback.preview", { preview_id = preview.preview_id, offset = preview.next_offset }, function(page, err)
+        if not current() then return end
+        if err then notifications.error(err, "Harness undo") return end
+        confirm_restore_preview(page, interaction)
+      end)
       return
     end
-    synchronize_state()
-    restore_composer_prompt(interaction.prompt or "")
+    if state.restore_applying or state.busy then return end
+    local operation = {}
+    state.restore_applying = operation
+    client.request_for(session_id, "exchange.rollback.apply", { preview_id = preview.preview_id }, function(_, err)
+      if not current() or state.restore_applying ~= operation then return end
+      state.restore_applying = nil
+      synchronize_state()
+      if err then
+        notifications.error(err, "Harness undo")
+        if err:find("preview is stale", 1, true) and interaction then
+          client.request_for(session_id, "exchange.rollback.prepare", { exchange_id = interaction.id }, function(refreshed, failure)
+            if not current() then return end
+            if failure then notifications.error(failure, "Harness undo") return end
+            confirm_restore_preview(refreshed, interaction)
+          end)
+        end
+        return
+      end
+      if interaction then restore_composer_prompt(interaction.prompt or "") end
+    end)
   end)
 end
 
 ---@param interaction ForgeRollbackInteraction
 local function confirm_rollback(interaction)
-  open_choice_picker(
-    harness_state(),
-    "Confirm Rollback",
-    "Restore the worktree before Exchange " .. tostring(interaction.ordinal)
-      .. " and supersede every later exchange?",
-    {
-      { label = "Cancel", detail = "Keep the current workspace.", value = false },
-      {
-        label = "Rollback to before Exchange " .. tostring(interaction.ordinal),
-        detail = "Restore its checkpoint and return the prompt to the composer.",
-        value = true,
-      },
-    },
-    function(confirmed)
-      if confirmed then rollback_exchange(interaction) end
-    end
-  )
+  local state = harness_state()
+  local session_id, generation = state.session.id, client.host_generation()
+  if state.busy or state.restore_applying then return end
+  client.request_for(session_id, "exchange.rollback.prepare", { exchange_id = interaction.id }, function(preview, err)
+    if harness_state() ~= state or not state.session or state.session.id ~= session_id
+      or client.host_generation() ~= generation then return end
+    if err then notifications.error(err, "Harness undo") return end
+    confirm_restore_preview(preview, interaction)
+  end)
 end
 
 ---Open the checkpointed interaction picker for an editable rollback.
-function M.open_undo_picker()
+local function open_exchange_undo_picker()
   local state = harness_state()
   if state.busy then
     notifications.warn("Cancel or finish the active turn before undoing an exchange", "Harness undo")
@@ -1284,7 +1311,11 @@ function M.open_undo_picker()
     notifications.warn("Undo is unavailable because this session has NO CHECKPOINT", "Harness undo")
     return
   end
-  client.request("exchange.list", {}, function(interaction_list, request_error)
+  local session_id, generation = state.session and state.session.id, client.host_generation()
+  if not session_id then return end
+  client.request_for(session_id, "exchange.list", {}, function(interaction_list, request_error)
+    if harness_state() ~= state or not state.session or state.session.id ~= session_id
+      or client.host_generation() ~= generation then return end
     if request_error then
       notifications.error(request_error, "Harness undo")
       return
@@ -1313,6 +1344,44 @@ function M.open_undo_picker()
       confirm_rollback,
       "This session has no exchanges available to undo."
     )
+  end)
+end
+
+---Open saved restore recovery before offering exchange history.
+function M.open_undo_picker()
+  local state = harness_state()
+  if state.busy or state.restore_applying then
+    notifications.warn("Cancel or finish the active turn before restoring files", "Harness undo")
+    return
+  end
+  if not state.session then return end
+  local session_id, generation = state.session.id, client.host_generation()
+  client.request_for(session_id, "exchange.recovery", {}, function(recovery, err)
+    if harness_state() ~= state or not state.session or state.session.id ~= session_id
+      or client.host_generation() ~= generation then return end
+    if err then notifications.error(err, "Harness recovery") return end
+    if not recovery or recovery == vim.NIL then open_exchange_undo_picker() return end
+    local choices = { { label = "Cancel", value = "cancel" } }
+    if recovery.pending then
+      choices[#choices + 1] = { label = "Continue interrupted restore", value = "continue" }
+      choices[#choices + 1] = { label = "Restore pre-restore files", value = "undo" }
+    else
+      choices[#choices + 1] = { label = "Select an earlier exchange", value = "history" }
+      choices[#choices + 1] = { label = "Undo last restore", value = "undo" }
+    end
+    open_choice_picker(state, "Harness restore", recovery.pending and "An interrupted restore requires recovery." or nil, choices, function(choice)
+      if harness_state() ~= state or not state.session or state.session.id ~= session_id
+        or client.host_generation() ~= generation then return end
+      if choice == "history" then open_exchange_undo_picker() return end
+      if choice ~= "undo" and choice ~= "continue" then return end
+      if harness_state() ~= state or not state.session or state.session.id ~= session_id then return end
+      client.request_for(session_id, "exchange.recovery", { action = choice }, function(result, failure)
+        if harness_state() ~= state or not state.session or state.session.id ~= session_id
+          or client.host_generation() ~= generation then return end
+        if failure then notifications.error(failure, "Harness recovery") synchronize_state() return end
+        if choice == "undo" then confirm_restore_preview(result) else synchronize_state() end
+      end)
+    end)
   end)
 end
 
@@ -1462,6 +1531,7 @@ function M.submit()
     set_composer_text(state.composer_buf, "")
     recap.request(state, function()
       if state.presentation and state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
+        state.presentation.transcript.restore_recovery = state.restore_recovery
         state.presentation.transcript.recap = state.recap
         require("forge.views.harness.status_hint").render(state.presentation.transcript,
           M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))

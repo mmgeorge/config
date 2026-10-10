@@ -101,8 +101,14 @@ pub enum HarnessMethod {
     ExchangeCommentSave,
     #[serde(rename = "exchange.request_changes")]
     ExchangeRequestChanges,
-    #[serde(rename = "exchange.rollback")]
-    ExchangeRollback,
+    #[serde(rename = "exchange.rollback.prepare")]
+    ExchangeRollbackPrepare,
+    #[serde(rename = "exchange.rollback.apply")]
+    ExchangeRollbackApply,
+    #[serde(rename = "exchange.rollback.preview")]
+    ExchangeRollbackPreview,
+    #[serde(rename = "exchange.recovery")]
+    ExchangeRecovery,
     #[serde(rename = "session.new")]
     SessionNew,
     #[serde(rename = "session.clear")]
@@ -178,7 +184,10 @@ mod test {
             "list",
             "comment.save",
             "request_changes",
-            "rollback",
+            "rollback.prepare",
+            "rollback.preview",
+            "rollback.apply",
+            "recovery",
         ] {
             assert!(super::HarnessMethod::decode(&format!("exchange.{suffix}")).is_ok());
             assert!(super::HarnessMethod::decode(&format!("interaction.{suffix}")).is_err());
@@ -187,6 +196,7 @@ mod test {
 
     #[test]
     fn rejects_independent_child_submission() {
+        assert!(super::HarnessMethod::decode("exchange.rollback").is_err());
         assert!(super::HarnessMethod::decode("agent.submit").is_err());
     }
 }

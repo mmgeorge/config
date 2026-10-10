@@ -19,7 +19,7 @@ use crate::{
 };
 
 mod batch;
-mod conversion;
+pub(crate) mod conversion;
 pub(crate) use batch::ContentBatch;
 pub use conversion::ConversionIdentity;
 

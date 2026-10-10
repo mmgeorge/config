@@ -37,9 +37,10 @@ local ok, failure = xpcall(function()
   waiting.id, waiting.state, waiting.awaiting_input = "waiting", "running", true
   waiting.execution_started_at_ms = nil
   local frozen = renderer.build({ waiting }, { expanded = {}, working_seconds = 90, now_ms = 90000 })
-  assert(frozen.lines[2]:find("for 1s", 1, true), "another request's clock must not advance a waiting exchange")
+  assert(frozen.lines[2]:find("1s", 1, true) and not frozen.lines[2]:find("90s", 1, true), "another request's clock must not advance a waiting exchange")
 
   local state = require("forge.session").harness
+  state.session = { id = "history-session" }
   state.busy, state.no_checkpoint = false, false
   local history = {}
   for _, spec in ipairs({
@@ -51,7 +52,8 @@ local ok, failure = xpcall(function()
       state = spec[1], disposition = spec[2], checkpoint_before = "checkpoint",
     }
   end
-  require("forge.client").request = function(method, _, callback)
+  require("forge.client").request_for = function(_, method, _, callback)
+    if method == "exchange.recovery" then callback(nil) return end
     assert(method == "exchange.list")
     callback(history)
   end

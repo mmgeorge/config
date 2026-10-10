@@ -13,6 +13,9 @@ local animation = {}
 ---@param terminal_chunks table[]?
 local function render_footer(transcript, row, width, terminal_chunks)
   local lines = {}
+  if transcript.restore_recovery then
+    lines[#lines + 1] = { { "Restore interrupted. Open Harness undo to continue or recover pre-restore files.", "ErrorMsg" } }
+  end
   if transcript.rename_status then
     lines[#lines + 1] = { { transcript.rename_status, "ForgeStatusHint" } }
   end

@@ -230,12 +230,8 @@ impl HarnessBroker {
                         .cloned()
                         .collect::<Vec<_>>();
                     for path in newly_captured {
-                        if let Some(file) = checkpoint.file.iter().find(|file| file.path == path) {
-                            let source = self
-                                .store
-                                .objects
-                                .get(&file.object_id, 1024 * 1024)?
-                                .context("original source exceeds 1 MiB")?;
+                        if let Some(source) = checkpoint.read(&self.store.objects, &path, 1024 * 1024)? {
+                            let source_digest = crate::plan::digest(&source);
                             let source = String::from_utf8(source)?;
                             let (text, calls) =
                                 forge_diff::syntax::DeclarationOverview::extract_with_calls(
@@ -252,7 +248,7 @@ impl HarnessBroker {
                                 path.clone(),
                                 crate::plan::DeclarationFile {
                                     text,
-                                    source_digest: file.object_id.clone(),
+                                    source_digest,
                                 },
                             );
                             design
