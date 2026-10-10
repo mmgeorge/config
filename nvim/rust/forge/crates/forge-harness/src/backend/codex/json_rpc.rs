@@ -526,7 +526,7 @@ impl CodexJsonRpc {
             }
         }
         write_result?;
-        if response_success && matches!(control_tool_name(message.get("method").and_then(Value::as_str).unwrap_or_default(), message.get("params").unwrap_or(message)), Some("harness_plan_phase_done" | "harness_plan_submit")) && self.control_runtime.as_ref().is_some_and(|runtime| runtime.execution_finished()) {
+        if response_success && matches!(control_tool_name(message.get("method").and_then(Value::as_str).unwrap_or_default(), message.get("params").unwrap_or(message)), Some("harness_plan_phase_done")) && self.control_runtime.as_ref().is_some_and(|runtime| runtime.execution_finished()) {
             let params = message.get("params").unwrap_or(message);
             if let (Some(thread), Some(turn)) = (params.get("threadId").and_then(Value::as_str), params.get("turnId").and_then(Value::as_str)) {
                 self.send_request("turn/interrupt", json!({"threadId":thread,"turnId":turn})).await?;

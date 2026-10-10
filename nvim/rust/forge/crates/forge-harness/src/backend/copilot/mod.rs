@@ -602,7 +602,7 @@ impl Backend for CopilotBackend {
                     if request.mode == PromptMode::ExecutePlan && !execution_turn_stopped {
                         let call_id = provider_event.data.get("toolCallId").and_then(Value::as_str);
                         if provider_event.event_type == "tool.execution_start"
-                            && matches!(provider_event.data.get("toolName").and_then(Value::as_str), Some("harness_plan_phase_done" | "harness_plan_submit"))
+                            && matches!(provider_event.data.get("toolName").and_then(Value::as_str), Some("harness_plan_phase_done"))
                             && let Some(call_id) = call_id {
                             execution_control_call.insert(call_id.to_owned());
                         }

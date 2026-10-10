@@ -31,6 +31,7 @@ mod graph;
 mod prompt;
 mod render;
 pub(crate) mod revision;
+pub(crate) mod revision_review;
 mod resolution;
 mod review_annotation;
 mod review_feedback;

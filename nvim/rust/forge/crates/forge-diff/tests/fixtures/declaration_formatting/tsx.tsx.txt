@@ -1,0 +1,55 @@
+import type { ReactNode, Ref, ComponentType } from "react";
+import type { Input, Output } from "./contracts";
+export type { Input };
+
+export type AttributeName = `data-${string}` | `aria-${string}`;
+export type Label = "two  spaces" | "<div>// literal content</div>";
+export type Children = ReactNode | readonly ReactNode[];
+export type PropsFor<Component> = Component extends ComponentType<infer Props> ? Props : never;
+
+export interface ViewProps<Value extends Input> {
+    /** Caller-owned data, including optional nested children. */
+    readonly value: Value;
+    children?: Children;
+    ref?: Ref<HTMLElement>;
+    style?: { color?: string; margin?: number | `${number}px` };
+    onChange(value: Value, source: "keyboard" | "pointer"): void;
+    renderItem?: (item: Value, index: number) => ReactNode;
+    [name: `data-${string}`]: unknown;
+}
+
+export interface ProviderProps {
+    children: ReactNode;
+    context: { readonly request: Input; dispatch(request: Input): Promise<Output> };
+}
+
+export declare function View<Value extends Input>(properties: ViewProps<Value>, forwarded_reference: Ref<HTMLElement>): ReactNode;
+export declare function Provider(properties: ProviderProps): ReactNode;
+export const Component = <Value extends Input,>(properties: ViewProps<Value>, forwarded_reference: Ref<HTMLElement>): ReactNode =>;
+export const Panel = (properties: ProviderProps, children: readonly ReactNode[]): ReactNode =>;
+export const Legacy = function(properties: ProviderProps);
+
+export abstract class ViewController<Value extends Input> {
+    protected current: Value;
+    readonly ref: Ref<HTMLElement>;
+    constructor(initial_value: Value, forwarded_reference: Ref<HTMLElement>);
+    abstract render(properties: ViewProps<Value>, render_callback: (value: Value, index: number) => ReactNode): ReactNode;
+    update(value: Value): void;
+    get active(): boolean;
+}
+
+export namespace Components {
+    export interface ButtonProps {
+        label: string;
+        disabled?: boolean;
+        onClick(event: MouseEvent): void;
+    }
+    export function Button(properties: ButtonProps): ReactNode;
+    export type Wrapped<Props> = Props & { children?: ReactNode; key?: string | number };
+}
+
+/**
+ * JSX implementation bodies are excluded from declaration overviews. Their component signatures, generic parameters, callbacks, and literal prop types remain.
+ * <View label="// not a code comment" /> is documentation text.
+ */
+export function Documented(properties: ViewProps<Input>, response_callback: (value: Output, source: "ui") => void): ReactNode;

@@ -323,7 +323,7 @@ impl HarnessBroker {
                         recorded_at_ms: now_ms,
                     });
                     execution.progress = SemanticProgress::default();
-                    title = "Plan revision automatically accepted";
+                    title = "Plan revision accepted (auto)";
                 } else {
                     plan.state = PlanState::AwaitingReview;
                     execution.pending_revision_reason = Some(reason);
@@ -520,14 +520,24 @@ impl HarnessBroker {
         }
         self.store
             .save_execution_transition(&execution, &goal, Some(&plan), Some(interaction))?;
+        if !phase_completion && execution.state == PlanExecutionState::Active {
+            return self.revision_review_response(execution_id);
+        }
         let mut response = execution.response();
         response["result"] = json!("transitioned");
         response["instructions"] = if phase_completion { json!(
             "End this turn now. Do not start the next phase. Forge will start a separate exchange with its instructions."
-        ) } else { json!(format!(
-            "End this turn. Forge will continue with the persisted state. {}",
-            execution.instructions()
-        )) };
+        ) } else { json!(execution.instructions()) };
+        Ok(response)
+    }
+
+    pub(super) fn revision_review_response(&self, execution_id: &str) -> Result<Value> {
+        let execution = self.store.load_plan_execution(execution_id)?.context("review execution is missing")?;
+        let plan = self.store.load_plan(&execution.plan_id)?.context("review plan is missing")?;
+        let mut response = execution.response();
+        response["result"] = json!("reviewed");
+        response["plan_state"] = serde_json::to_value(plan.state)?;
+        response["document"] = serde_json::to_value(self.plan_file.read_working_document(&self.session.id, &plan.id)?)?;
         Ok(response)
     }
 

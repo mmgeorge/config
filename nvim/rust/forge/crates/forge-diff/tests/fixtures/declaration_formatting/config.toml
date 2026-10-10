@@ -1,0 +1,31 @@
+# Complete values and comment placement are retained in configuration files.
+title = "two  spaces # not a comment"
+enabled = true
+count = 1_000
+ratio = 1.25
+special = inf
+date = 2026-10-10T12:00:00Z
+literal = 'C:\path\to\file'
+multiline = """
+first line
+  second line with indentation
+"""
+literal_multiline = '''
+literal \n and # markers
+'''
+items = ["first", "second", { key = "value", nested = [1, 2] }]
+
+[package]
+name = "fixture"
+version = "0.1.0"
+
+[package.metadata."quoted.key"]
+description = "Unicode café 世界"
+
+[[bin]]
+name = "first"
+path = "src/main.rs"
+
+[[bin]]
+name = "second"
+path = "src/second.rs"

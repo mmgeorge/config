@@ -1,0 +1,13 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Preserve attributes, mixed content, CDATA, and namespaces. -->
+<project xmlns="urn:fixture" xmlns:meta="urn:metadata" enabled="true">
+  <property name="label">two  spaces &amp; &lt;markup&gt;</property>
+  <property name="unicode">café 世界</property>
+  <meta:content><![CDATA[line one
+  line two with <tag> and // markers]]></meta:content>
+  <items>
+    <item name="first" />
+    <item name="second"><nested value="3" /></item>
+  </items>
+  <mixed>before <emphasis>inside</emphasis> after</mixed>
+</project>

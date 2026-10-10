@@ -424,7 +424,7 @@ impl PlanExecutionRecord {
             }
         };
         format!(
-            "{work} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Prefer matching the plan. If a design change is necessary, use harness_design_apply_patch and harness_plan_submit with a revision reason, then end the turn after success and await Harness continuation. Do not call harness_goal_complete for this execution.",
+            "{work} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Prefer matching the plan. If a design change is necessary, use harness_design_apply_patch and harness_plan_submit with a revision reason. Submission waits for automatic acceptance or the user's review decision. Continue in this same turn using the returned revision and feedback. Do not call harness_goal_complete for this execution.",
             self.phase, self.revision
         )
     }

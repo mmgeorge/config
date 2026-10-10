@@ -1,0 +1,22 @@
+# Preserve scalar styles, comments, anchors, aliases, and document markers.
+---
+defaults: &defaults
+  enabled: true
+  retries: 3
+text: "two  spaces # literal"
+literal: |
+  first line
+    indented line
+folded: >-
+  first line
+  second line
+items:
+  - name: first
+    settings: *defaults
+  - name: second
+    values: [1, 2, null]
+flow: { nested: [true, false], label: 'a: b' }
+unicode: café 世界
+...
+---
+second: document

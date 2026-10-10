@@ -1,0 +1,15 @@
+{
+  "text": "two  spaces // literal",
+  "escaped": "quote: \" newline: \n slash: \\",
+  "unicode": "café 世界",
+  "enabled": true,
+  "absent": null,
+  "number": -1.25e+4,
+  "emptyArray": [],
+  "emptyObject": {},
+  "items": [1, "two", false, null, { "nested": [3, 4] }],
+  "configuration": {
+    "paths": { "@/*": ["src/*"] },
+    "flags": ["first", "second"]
+  }
+}

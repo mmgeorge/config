@@ -1,0 +1,12 @@
+# Preserve rule order, negation, spaces, and escaped markers.
+/target/
+/build/
+*.tmp
+!important.tmp
+cache/**
+!cache/keep.txt
+\#literal
+\!literal
+folder with spaces/
+trailing\ 
+**/generated/*.rs

@@ -1,0 +1,91 @@
+/** A declaration corpus with nested objects, imports, classes, and type operators. */
+import type { Input, Output as Response } from "./contracts";
+import DefaultClient, * as platform from "./platform";
+export { DefaultClient as Client };
+export type { Input };
+export * from "./shared";
+
+export type Id = string & { readonly brand: unique symbol };
+export type State = "ready" | "working" | "complete";
+export type Route = `/api/${string}/items/${number}`;
+export type Escaped = "two  spaces, // not a comment, and \"quoted\"";
+export type Tuple = readonly [name: string, count?: number, ...flags: boolean[]];
+export type Indexed<Value> = Value[keyof Value];
+export type Conditional<Value> = Value extends Promise<infer Item> ? Item : never;
+export type Mapped<Value> = { readonly [Key in keyof Value as `get${Capitalize<string & Key>}`]?: Value[Key] };
+export type Callback = <Value extends Input>(value: Value, index: number) => Promise<Response>;
+export type Constructable = new (name: string, options?: Map<string, [number, boolean]>) => ClientInstance;
+
+export interface Request<Value extends Input = Input> {
+    /** The original object must survive formatting unchanged. */
+    readonly value: Value;
+    label?: string;
+    [key: `metadata-${string}`]: unknown;
+    nested: {
+        readonly identifier: Id;
+        response: Promise<{ status: number; payload: Value | null }>;
+        callback(value: Value, context: Map<string, [number, boolean]>): void;
+    };
+    send(value: Value, headers: Map<string, string>, callback: (error: Error | null, result: Response) => void): Promise<Response>;
+    send(value: Value): Promise<Response>;
+    new (value: Value): Request<Value>;
+    (value: Value, index?: number): Response;
+}
+
+interface Base { readonly id: Id; }
+export interface Extended extends Base, Request<Input> {
+    readonly [index: number]: Input;
+    readonly enabled: boolean;
+}
+
+export enum Status {
+    /** No request is in progress. */
+    Idle,
+    Active,
+    Complete,
+}
+
+export abstract class ClientInstance<Value extends Input> implements Base {
+    readonly id: Id;
+    protected values: Map<string, Value>;
+    private state: State;
+    static readonly version: string;
+    abstract send(request_identifier: Value, response_callback: (response: Response, index: number) => void): Promise<Response>;
+    constructor(readonly name: string, protected options: Map<string, [number, boolean]>);
+    get size(): number;
+    set enabled(value: boolean);
+    dispose(): void;
+}
+
+declare const registry: Map<string, ClientInstance<Input>>;
+declare let current: State;
+declare var fallback: Input | undefined;
+export declare function create<Value extends Input>(request_identifier: Value, client_options: Map<string, [number, boolean]>, completion_callback: (response: Response, elapsed: number) => void): ClientInstance<Value>;
+export function lookup(name: string): ClientInstance<Input> | undefined;
+
+export namespace Protocol {
+    export type Header = readonly [name: string, value: string];
+    export interface Envelope<Value> {
+        headers: Header[];
+        payload: Value;
+        retry?: { delay: number; limit: number };
+    }
+    export function decode<Value>(source: string, decoder: (text: string) => Value): Envelope<Value>;
+}
+
+declare module "external-plugin" {
+    export interface Settings {
+        enabled: boolean;
+        pattern: `${string}:${number}`;
+    }
+    export function install(options: Settings): void;
+}
+
+/**
+ * Keep an intentionally long documentation paragraph intact while reflowing the lines to the selected declaration width.
+ *
+ * ```ts
+ * const example = "a long literal with // comment markers and  double spaces that is documentation only";
+ * ```
+ */
+export function documented(request_identifier: string, registry_identifier: Map<string, Request<Input>>, response_callback: (result: Response) => void): void;

@@ -239,11 +239,15 @@ impl ControlToolRuntime {
                     submitted.design = Some(design);
                     if let Some(execution) = &self.context.execution {
                         let reason = invocation.arguments.get("reason").and_then(serde_json::Value::as_str).filter(|reason| !reason.trim().is_empty()).context("execution revision requires a reason")?;
-                        let response = execution.send(crate::plan::execution::ExecutionOperation::Submit { document: submitted.clone(), reason: reason.into() }).await?;
-                        self.plan_document = Some(submitted);
-                        self.terminal = true;
+                        let mut response = execution.send(crate::plan::execution::ExecutionOperation::Submit { document: submitted, reason: reason.into() }).await?;
+                        let generation = response["generation"].as_u64().context("revision response has no generation")?;
+                        let plan_state = serde_json::from_value(response["plan_state"].clone())?;
+                        let document = serde_json::from_value(response.as_object_mut().context("revision response is not an object")?
+                            .remove("document").context("revision response has no canonical document")?)?;
+                        self.context.execution.as_mut().unwrap().generation = generation;
+                        self.context.plan_state = Some(plan_state);
+                        self.plan_document = Some(document);
                         let message = serde_json::to_string(&response)?;
-                        self.completion = Some((identity, message.clone()));
                         return Ok(ControlToolResult { invocation: None, message });
                     }
                     self.plan_document = Some(submitted);

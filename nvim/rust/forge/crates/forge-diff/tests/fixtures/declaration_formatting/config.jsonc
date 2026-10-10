@@ -1,0 +1,10 @@
+{
+  // Line comments retain their original locations and text.
+  "text": "two  spaces // literal",
+  /* Block comment with a comma, brace }, and Unicode 世界. */
+  "compilerOptions": {
+    "strict": true,
+    "paths": { "@/*": ["src/*",], },
+  },
+  "items": [1, false, null, { "nested": "value" },],
+}

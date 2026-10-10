@@ -2439,8 +2439,9 @@ validation contracts, and patch examples. `PlanPrompt` embeds it in draft, feedb
 editable discussion requests. Execution prompts retain execution ID, plan ID, accepted revision,
 phase, findings, and the accepted document. Start, continuation, and interruption resume have distinct
 guidance. Resume requires checking current files, tool results, and background processes before
-repeating work. Successful phase completion and revision submission end the model turn so Harness
-owns the next transition. Ordinary pending-question follow-ups do not claim to be Plan tasks.
+repeating work. Successful phase completion ends the model turn so Harness owns the next phase
+transition. Execution revision submission retains the provider turn while the broker commits the
+revision and returns the decision. Ordinary pending-question follow-ups do not claim to be Plan tasks.
 
 `harness_question_ask` pauses either backend on one to three structured decisions while
 `harness_plan_submit` alone creates a review artifact. `ControlToolRegistry` owns every Harness
@@ -5400,9 +5401,22 @@ Exchange recovery retains the last persisted active elapsed coordinate. It exclu
 offline interval and may omit activity after the last saved provider event.
 The approval picker shares the configured Harness interrupt key. Interrupt closes the picker
 and pauses the task without approving the pending tool. Closing with `q` leaves approval pending.
-Review UI starts execution only when acceptance creates an initial acceptance record. Revision
-approval respects the backend's existing pause or continuation decision. A completed execution
-exchange is labelled `Plan turn complete`, independently of the task's completion gates.
+Review UI starts execution only when acceptance creates an initial acceptance record. An execution
+revision emits a foldable `Plan revision requested` record followed by `Plan revision accepted (auto)`
+when automatic approval is enabled. Manual review retains the submission tool response and pauses
+exchange timing without cancelling the provider. A bounded review channel serves plan capture, review
+edits, acceptance, requested changes, and rejection through the broker that owns the running exchange,
+without acquiring its execution mutex. A stale review fails without releasing the pending tool.
+Acceptance, requested changes, or rejection returns the canonical document, current generation, and
+feedback to the same control runtime before its next tool call. These decisions never request another
+exchange while the provider is waiting. Cancellation drops the review channel and leaves the persisted
+revision pending for recovery. Approval after interruption starts a new exchange through the existing
+resume path. Acceptance retains its
+anchor at the end of the planning exchange. The first execution exchange starts with
+`Implementation started` and never takes ownership of the acceptance event. Each subsequent
+exchange identifies the phase being started or continued. Completing an exchange without a
+phase result reports a completed implementation, verification, or resolution turn, independently
+of the task's completion gates. Only recorded phase results claim phase completion.
 
 Health requests use reserved admission and output scheduling independently of the broker
 execution lock. The UI sends at most one outstanding health request per conversation. Ten

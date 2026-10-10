@@ -133,7 +133,9 @@ impl HarnessService {
             } => {
                 let capture_started = Instant::now();
                 let admission = controller.plan_review.admit(document.clone())?;
-                let mut source = {
+                let mut source = if let Some(source) = controller.revision_review.capture(plan_id, digest, *revision).await? {
+                    source
+                } else {
                     let broker = controller.broker.lock().await;
                     if let Some(revision) = revision {
                         let source = broker.capture_plan_revision(plan_id, *revision)?;
@@ -597,6 +599,7 @@ struct SessionController {
     execution_admission: Arc<Semaphore>,
     control_admission: Arc<Semaphore>,
     plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
+    revision_review: Arc<crate::plan::revision_review::RevisionReview>,
     broker: Mutex<HarnessBroker>,
     presentation: Arc<std::sync::Mutex<crate::buffer::session::SessionPresentation>>,
     cancellation: Arc<TurnCancellation>,
@@ -628,6 +631,7 @@ impl SessionController {
             execution_admission: Arc::new(Semaphore::new(1)),
             control_admission: Arc::new(Semaphore::new(1)),
             plan_review: Arc::clone(&broker.plan_review),
+            revision_review: Arc::clone(&broker.revision_review),
             presentation: broker.presentation(),
             cancellation: broker.turn_cancellation(),
             backend: broker.backend_handle(),
@@ -1274,6 +1278,13 @@ async fn route_control_request(
     method: HarnessMethod,
     message_sink: &MessageSender,
 ) -> Result<bool> {
+    if matches!(method, HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanCancel
+        | HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete)
+        && let Some((value, events)) = controller.revision_review.decide(method, request.params.clone()).await? {
+        for event in events { message_sink.send_event(event).await?; }
+        message_sink.send_response(Response::success(request.id, value)?).await?;
+        return Ok(true);
+    }
     let _control = if matches!(method, HarnessMethod::TurnCancel | HarnessMethod::TurnRestart | HarnessMethod::BackendMcpSetEnabled) {
         Some(Arc::clone(&controller.control_admission)
             .try_acquire_owned()
@@ -1563,6 +1574,41 @@ async fn run_lease_heartbeat(
 mod tests {
     use super::*;
     use forge_diff::cache::CacheLimits;
+
+    #[tokio::test]
+    async fn revision_review_controls_bypass_the_waiting_provider_broker_lock() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await.unwrap();
+        let controller = registry.resolve(&session_id).await.unwrap();
+        let broker = controller.broker.lock().await;
+        let mut review = controller.revision_review.open().unwrap();
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        for method in [HarnessMethod::PlanAcceptanceBegin, HarnessMethod::PlanRequestChanges,
+            HarnessMethod::PlanCancel, HarnessMethod::PlanEntityRename, HarnessMethod::PlanTestsDelete] {
+            let request = Request { id:2, method:"review".into(), params:json!({"plan_id":"plan"}) };
+            let respond = async {
+                let Some(crate::plan::revision_review::RevisionReviewRequest::Decide {
+                    method: received, params, response,
+                }) = review.receiver.recv().await else { panic!("missing review decision") };
+                assert_eq!(received, method);
+                assert_eq!(params, request.params);
+                response.send(Ok((json!({"reviewed":true}), Vec::new()))).unwrap();
+            };
+            let (routed, ()) = tokio::time::timeout(Duration::from_secs(1), async {
+                tokio::join!(route_control_request(&controller, &request, method, &sink), respond)
+            }).await.expect("review controls must not acquire the provider's broker lock");
+            assert!(routed.unwrap());
+            let frame = output.recv().await.unwrap().unwrap();
+            let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+            assert_eq!(value["result"]["reviewed"], true);
+        }
+        drop(review);
+        drop(broker);
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
 
     #[tokio::test]
     async fn task_stop_intent_and_health_remain_available_while_the_broker_is_owned() {

@@ -512,6 +512,7 @@ pub struct HarnessBroker {
     plan_file: PlanFileStore,
     /// Shares admitted review documents between view requests and serialized question turns.
     pub(crate) plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
+    pub(crate) revision_review: Arc<crate::plan::revision_review::RevisionReview>,
     workspace_kind: WorkspaceKind,
     data_root: PathBuf,
     client_id: String,
@@ -727,6 +728,7 @@ impl HarnessBroker {
             trace,
             rustdoc: Arc::clone(&runtime.rustdoc),
             plan_review: Arc::new(crate::plan::review_document::PlanReviewStore::default()),
+            revision_review: Arc::new(crate::plan::revision_review::RevisionReview::default()),
             event_sink: None,
             clock,
             exchange_runtime: None,
@@ -4267,6 +4269,10 @@ Planning continuation: turn {} of {}.",
         scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         scan_interval.tick().await;
         let mut stream_open = true;
+        let mut pending_revision: Option<(
+            tokio::sync::oneshot::Sender<Result<Value>>,
+            crate::plan::revision_review::RevisionReviewWait,
+        )> = None;
         let delivery_sink = self.event_sink.clone();
         let outcome = {
             let prompt = async move {
@@ -4284,16 +4290,86 @@ Planning continuation: turn {} of {}.",
                             while let Ok(backend_event) = backend_event_stream.try_recv() {
                                 self.process_backend_event(&mut runtime, interaction, backend_event, event).await?;
                             }
+                            let submission = matches!(&control.operation, crate::plan::execution::ExecutionOperation::Submit { .. });
                             let result = self.handle_execution_control(&control.execution_id, control.generation, control.operation, interaction).await;
                             let committed = result.is_ok();
-                            let _ = control.response.send(result);
+                            let waiting = submission && result.as_ref().is_ok_and(|response| response["status"] == "paused");
+                            if waiting {
+                                anyhow::ensure!(pending_revision.is_none(), "another revision review is already pending");
+                                let wait = self.revision_review.open()?;
+                                interaction.pause(self.clock.now_ms());
+                                interaction.awaiting_input = true;
+                                self.store.save_exchange(interaction)?;
+                                pending_revision = Some((control.response, wait));
+                            } else {
+                                let _ = control.response.send(result);
+                            }
                             if committed {
                                 let patch = self.reconcile_timeline()?;
                                 self.emit_timeline_patch(patch, event).await?;
                             }
                         }
                     }
-                    _ = scan_interval.tick(), if execution.is_some() => {
+                    review = async {
+                        if let Some((_, wait)) = &mut pending_revision {
+                            wait.receiver.recv().await
+                        } else {
+                            std::future::pending().await
+                        }
+                    } => {
+                        use crate::plan::revision_review::RevisionReviewRequest;
+                        match review.context("revision review request lane closed")? {
+                            RevisionReviewRequest::Capture { plan_id, digest, revision, response } => {
+                                let result = if interaction.plan_id.as_deref() != Some(plan_id.as_str()) {
+                                    Err(anyhow::anyhow!("review belongs to another plan"))
+                                } else if let Some(revision) = revision {
+                                    self.capture_plan_revision(&plan_id, revision).and_then(|source| {
+                                        anyhow::ensure!(crate::plan::digest(&serde_json::to_vec(&source.document)?) == digest,
+                                            "plan revision changed before opening");
+                                        Ok(source)
+                                    })
+                                } else { self.capture_plan_review(&plan_id, &digest) };
+                                let _ = response.send(result);
+                            }
+                            RevisionReviewRequest::Decide { method, params, response } => {
+                                let result = if params.get("plan_id").and_then(Value::as_str)
+                                    .is_some_and(|id| interaction.plan_id.as_deref() != Some(id)) {
+                                    Err(anyhow::anyhow!("review decision belongs to another plan"))
+                                } else {
+                                    match method {
+                                        HarnessMethod::PlanAcceptanceBegin => self.begin_plan_acceptance(params),
+                                        HarnessMethod::PlanRequestChanges => Box::pin(self.request_plan_changes(params)).await,
+                                        HarnessMethod::PlanCancel => self.cancel_plan(),
+                                        HarnessMethod::PlanEntityRename => self.rename_plan_entity(params),
+                                        HarnessMethod::PlanTestsDelete => self.delete_plan_tests(params),
+                                        _ => Err(anyhow::anyhow!("unsupported revision review decision")),
+                                    }
+                                };
+                                match result {
+                                    Err(error) => { let _ = response.send(Err(error)); }
+                                    Ok(result) if matches!(method, HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete) => {
+                                        let _ = response.send(Ok(result));
+                                    }
+                                    Ok((_, mut events)) => {
+                                        interaction.awaiting_input = false;
+                                        interaction.resume(self.clock.now_ms())?;
+                                        self.store.save_exchange(interaction)?;
+                                        let provider_response = self.revision_review_response(interaction.execution_id.as_deref()
+                                            .context("review has no execution")?)?;
+                                        events.retain(|event| event.event != "goal_continue_requested");
+                                        let patch = self.reconcile_timeline()?;
+                                        self.emit_timeline_patch(patch, event).await?;
+                                        let snapshot = serde_json::to_value(self.snapshot()?)?;
+                                        let (provider, wait) = pending_revision.take().context("revision review lost its provider wait")?;
+                                        drop(wait);
+                                        let _ = response.send(Ok((snapshot, events)));
+                                        let _ = provider.send(Ok(provider_response));
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    _ = scan_interval.tick(), if execution.is_some() && pending_revision.is_none() => {
                         if let Some(execution) = &execution {
                             match self.scan_execution(&execution.id).await {
                                 Ok(progress) => {
@@ -4344,6 +4420,7 @@ Planning continuation: turn {} of {}.",
                 }
             }
         };
+        drop(pending_revision.take());
         let mut outcome = if !matches!(*cancellation.cleanup.borrow(), ExecutionCleanup::Idle) {
             Err(anyhow::Error::new(TurnCancelled))
         } else {
@@ -5667,7 +5744,7 @@ Planning continuation: turn {} of {}.",
         let mut admission = ExchangeAdmission::execution(
             String::new(), plan.id.clone(),
             execution_record.id.clone(), goal.id.clone());
-        admission.plan_event_id = Some(lifecycle.id.clone());
+        admission.lifecycle = Some("Implementation started".into());
         let execution = self.run_interaction(execution_prompt, PromptMode::ExecutePlan, Some(admission))
             .await;
         let execution_succeeded = execution.is_ok();
@@ -7645,10 +7722,15 @@ mod test {
         let result = broker.dispatch(Request { id:3,method:"plan.acceptance.begin".into(),params:json!({"plan_id":revised.id,"digest":revised.review_digest}) }).await;
         assert!(result.response.error().is_none(),"{:?}",result.response.error());
         assert!(broker.snapshot().unwrap().active_plan.unwrap().acceptance.is_some());
+        let planning_exchange_id = broker.store.list_exchange(&broker.session.id).unwrap()
+            .last().unwrap().id.clone();
         broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: 2 });
         let result = broker.dispatch(Request { id:4, method:"plan.accept".into(), params:json!({"plan_id":revised.id,"digest":revised.review_digest,"execution_mode":"write"}) }).await;
         assert!(result.response.error().is_none(), "{:?}", result.response.error());
         let snapshot = broker.snapshot().unwrap();
+        let acceptance = broker.store.list_plan_lifecycle(&broker.session.id).unwrap()
+            .into_iter().find(|event| event.kind == PlanLifecycleKind::Accepted).unwrap();
+        assert_eq!(acceptance.anchor.as_ref().unwrap().exchange_id, planning_exchange_id);
         assert_eq!(snapshot.active_plan.unwrap().state, PlanState::Accepted);
         assert_eq!(snapshot.goal_execution.as_ref().unwrap().phase, crate::plan::PlanPhase::Verify);
         let execution_id = snapshot.goal_execution.unwrap().id;
@@ -7703,8 +7785,19 @@ mod test {
             vec![Some(20), Some(21), Some(22), Some(23)]);
         assert_eq!(exchanges.iter().map(|exchange| exchange.turn.iter().flat_map(|turn| turn.tools())
             .filter(|tool| tool.title == "cargo test").count()).collect::<Vec<_>>(), vec![0, 1, 0, 1]);
+        assert_eq!(exchanges[0].lifecycle.as_deref(), Some("Implementation started"));
         assert_eq!(exchanges[3].lifecycle.as_deref(), Some("Verification started"));
-        let text = timeline_text(&broker.snapshot().unwrap());
+        let snapshot = broker.snapshot().unwrap();
+        let acceptance_owner = snapshot.timeline.iter().filter_map(|entry| match entry {
+            crate::timeline::TimelineEntry::Exchange { exchange, .. }
+                if exchange.node_list.iter().any(|node| matches!(node,
+                    crate::exchange::ExchangeNode::PlanEvent { event }
+                    if event.id == acceptance.id)) => Some(exchange.id.as_str()),
+            _ => None,
+        }).collect::<Vec<_>>();
+        assert_eq!(acceptance_owner, vec![planning_exchange_id.as_str()]);
+        let text = timeline_text(&snapshot);
+        assert!(text.find("Plan accepted:").unwrap() < text.find("Implementation started").unwrap());
         for label in ["Plan accepted:", "Implemented plan", "Verification failed", "Resolved findings", "Verified plan", "Plan complete:"] {
             assert!(text.contains(label), "missing {label}: {text}");
         }
@@ -7831,7 +7924,17 @@ mod test {
             let mut runtime = ControlToolRuntime::new(context);
             runtime.invoke(ControlToolInvocation { name:"harness_design_apply_patch".into(), arguments:json!({"plan_id":plan_id,"expected_version":version,"patch":patch}) }).await?;
             let result = runtime.invoke(ControlToolInvocation { name:"harness_plan_submit".into(), arguments:json!({"plan_id":plan_id,"expected_version":version+1,"reason":"Verification needs an explicit score reset requirement"}) }).await?;
-            assert!(result.message.contains("transitioned"));
+            assert!(!runtime.execution_finished(), "revision review must retain the provider turn");
+            let response: Value = serde_json::from_str(&result.message)?;
+            assert!(response.get("document").is_none(), "internal canonical source must not inflate tool output");
+            let read = runtime.invoke(ControlToolInvocation { name:"harness_plan_read".into(), arguments:json!({"plan_id":plan_id}) }).await?;
+            let state: Value = serde_json::from_str(&read.message)?;
+            assert_eq!(state["execution"]["generation"], response["generation"], "the next tool must use the reviewed generation");
+            let canonical = runtime.invoke(ControlToolInvocation { name:"harness_plan_read".into(),
+                arguments:json!({"plan_id":plan_id,"path":"plan.json"}) }).await?;
+            let rejected = response["plan_state"] == "accepted" && response["revision"] == 1;
+            assert_eq!(canonical.message.contains("score reset"), !rejected,
+                "the running provider must adopt the reviewed canonical document");
             Ok(crate::backend::BackendOutput {
                 backend_session_id:Some("revision-execution".into()),
                 capability: crate::backend::BackendCapability {
@@ -7861,7 +7964,20 @@ mod test {
             let original = broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, 1).unwrap();
             broker.session.plan_auto_approve_revisions = decision == "automatic";
             broker.backend = Arc::new(RevisionExecutionBackend);
-            let accepted = broker.dispatch(Request { id:2, method:"plan.accept".into(), params:json!({"plan_id":plan.id,"digest":plan.review_digest,"execution_mode":"write"}) }).await;
+            let review = Arc::clone(&broker.revision_review);
+            let cancellation = broker.turn_cancellation();
+            let files = PlanFileStore::new(data.path(), repository.path());
+            let session_id = broker.session.id.clone();
+            let stop_pending = async {
+                if decision != "automatic" {
+                    wait_for_revision_review(&review, &files, &session_id, &plan.id).await;
+                    cancellation.request(false);
+                }
+            };
+            let (accepted, ()) = tokio::join!(
+                broker.dispatch(Request { id:2, method:"plan.accept".into(), params:json!({"plan_id":plan.id,"digest":plan.review_digest,"execution_mode":"write"}) }),
+                stop_pending,
+            );
             assert!(accepted.response.error().is_none(), "{decision}: {:?}", accepted.response.error());
             let execution = broker.snapshot().unwrap().goal_execution.unwrap();
             assert_eq!(execution.original_revision, 1);
@@ -7871,10 +7987,14 @@ mod test {
                 assert_eq!(execution.revision, 2);
                 assert_eq!(execution.state, PlanExecutionState::Active);
                 assert_eq!(execution.revision_history[0].approval, "automatic");
+                let rendered = timeline_text(&broker.snapshot().unwrap());
+                assert!(rendered.contains("Plan revision requested"), "{rendered}");
+                assert!(rendered.contains("Plan revision accepted (auto)"), "{rendered}");
             } else {
                 assert_eq!(execution.revision, 1);
                 assert_eq!(execution.state, PlanExecutionState::Paused);
                 assert!(broker.resume_goal(None, None).await.unwrap_err().to_string().contains("review the pending"));
+                cancellation.arm(false);
                 if decision.starts_with("recovered_") {
                     let mut previous = broker.store.list_exchange(&broker.session.id).unwrap().pop().unwrap();
                     let outcome = match decision {
@@ -7883,7 +8003,9 @@ mod test {
                         "recovered_failed" => ExchangeState::Failed,
                         _ => ExchangeState::Complete,
                     };
-                    broker.capture_final_checkpoint(&mut previous, outcome).await.unwrap();
+                    previous.state = outcome;
+                    previous.finalization_outcome = Some(outcome);
+                    broker.store.save_exchange(&previous).unwrap();
                     broker.exchange_runtime = None;
                 }
                 if decision == "paused_accept" {
@@ -7929,6 +8051,73 @@ mod test {
             assert!(revised.proposed.contains_key("added.rs"));
             assert!(!revised.baseline.contains_key("added.rs"), "implemented additions must not become the original baseline");
             assert!(broker.execution_review(&plan.id).unwrap().unwrap().contains("Original approved revision: 1"));
+        }
+    }
+
+    async fn wait_for_revision_review(
+        review: &Arc<crate::plan::revision_review::RevisionReview>,
+        files: &PlanFileStore,
+        session_id: &str,
+        plan_id: &str,
+    ) -> crate::plan::review_source::PlanReviewSource {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                if let Ok(document) = files.read_submitted_document(session_id, plan_id, 2) {
+                    let digest = crate::plan::digest(&serde_json::to_vec(&document).unwrap());
+                    if let Some(source) = review.capture(plan_id, &digest, None).await.unwrap() {
+                        return source;
+                    }
+                }
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("provider must reach review without finishing its turn")
+    }
+
+    #[tokio::test]
+    async fn live_revision_review_continues_the_same_provider_exchange() {
+        for decision in ["accept", "reject", "changes"] {
+            let repository = repository();
+            let data = tempfile::tempdir().unwrap();
+            let mut broker = planning_question_broker(repository.path(), data.path(), false);
+            broker.backend = Arc::from(crate::backend::build(
+                BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
+                Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace),
+            ).unwrap());
+            broker.submit_prompt(json!({"text":"/plan add a reusable API"})).await.unwrap();
+            let plan = broker.snapshot().unwrap().active_plan.unwrap();
+            broker.session.plan_auto_approve_revisions = false;
+            broker.backend = Arc::new(RevisionExecutionBackend);
+            let review = Arc::clone(&broker.revision_review);
+            let files = PlanFileStore::new(data.path(), repository.path());
+            let session_id = broker.session.id.clone();
+            let before = broker.store.list_exchange(&session_id).unwrap().len();
+            let decide = async {
+                let source = wait_for_revision_review(&review, &files, &session_id, &plan.id).await;
+                assert!(source.document.design.as_ref().unwrap().document.design.contains("score reset"));
+                assert!(review.capture(&plan.id, "stale", None).await.is_err());
+                assert!(review.decide(HarnessMethod::PlanAcceptanceBegin,
+                    json!({"plan_id":plan.id,"digest":"stale"})).await.is_err());
+                let (method, params) = match decision {
+                    "accept" => (HarnessMethod::PlanAcceptanceBegin, json!({"plan_id":plan.id})),
+                    "reject" => (HarnessMethod::PlanCancel, json!({"plan_id":plan.id})),
+                    _ => (HarnessMethod::PlanRequestChanges, json!({"plan_id":plan.id,"comment":"Retain the approved scope"})),
+                };
+                let (_, events) = review.decide(method, params).await.unwrap().unwrap();
+                assert!(events.iter().all(|event| event.event != "goal_continue_requested"));
+            };
+            let (accepted, ()) = tokio::time::timeout(std::time::Duration::from_secs(15), async {
+                tokio::join!(broker.accept_plan(json!({"plan_id":plan.id,"execution_mode":"write"})), decide)
+            }).await.expect("a live review must resume its waiting provider");
+            accepted.unwrap();
+            let exchanges = broker.store.list_exchange(&session_id).unwrap();
+            assert_eq!(exchanges.len(), before + 1, "review must not start a continuation exchange");
+            assert!(review.capture(&plan.id, "unused", None).await.unwrap().is_none());
+            let execution = broker.snapshot().unwrap().goal_execution.unwrap();
+            assert!(execution.pending_revision_reason.is_none());
+            assert_eq!(execution.revision, if decision == "accept" { 2 } else { 1 });
+            let rendered = timeline_text(&broker.snapshot().unwrap());
+            assert!(rendered.contains("Plan revision requested"), "{rendered}");
+            assert!(!rendered.contains("Implementation continued"), "{rendered}");
         }
     }
 

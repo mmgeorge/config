@@ -1,0 +1,73 @@
+--- Declaration corpus for modules, aliases, callbacks, and nested ownership.
+local platform = require("platform.runtime")
+local utility = require('platform.utility')
+require("platform.setup")
+
+---@alias RequestId string
+---@alias Phase "ready"|"running"|"complete"
+---@alias Result string|number|nil
+---@alias Callback fun(result: Result, error: string|nil): boolean
+---@class Request
+---@field id RequestId
+---@field phase Phase
+---@field payload table<string, string|number>
+---@field callback Callback
+---@class Options
+---@field enabled boolean
+---@field label "two  spaces // literal"
+---@field values table<string, { name: string, count: integer }>
+
+local M
+local pending
+local cache
+M.options
+M.options.enabled
+M.options.label
+M.client
+M.client.requests
+M.client.transport
+M.client.transport.options
+
+--- Returns a module-owned request, retaining its caller-supplied callback.
+---@param identifier RequestId
+---@param options Options
+---@param callback Callback
+---@return Request|nil
+function M.create(identifier, options, callback)
+
+--- Cancels a request and reports whether it was still active.
+---@param request Request
+---@param reason string
+---@return boolean
+function M.cancel(request, reason)
+
+---@param request Request
+---@param response_callback fun(response: Result, source: string): boolean
+function M.client:dispatch(request, response_callback)
+
+---@param request_identifier RequestId
+---@param request_configuration Options
+---@param request_completion_callback Callback
+---@param request_transport_configuration table<string, string>
+function M.client.transport.send(request_identifier, request_configuration, request_completion_callback, request_transport_configuration)
+
+---@param request Request
+---@return string, integer
+local function describe(request)
+
+---@vararg string
+function M.log(level, ...)
+
+--- This paragraph describes cancellation ownership across several requests and needs wrapping without changing the words or merging executable syntax into comments.
+---
+--- ```lua
+--- local message = "a deliberately long example with -- markers and  two spaces that must remain intact"
+--- ```
+--- - Keep list entries separate.
+--- - Preserve a second entry.
+---@param request_identifier RequestId
+---@param request_callback Callback
+function M.documented(request_identifier, request_callback)
+
+-- A standalone module comment with Unicode: café, 世界, →.
+return M

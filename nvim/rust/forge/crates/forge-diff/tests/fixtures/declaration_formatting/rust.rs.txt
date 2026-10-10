@@ -1,0 +1,143 @@
+//! Declaration formatting corpus: preserve public contracts, comments, and literals.
+//! A second module documentation paragraph with Unicode: café, 世界, →.
+
+use std::{collections::{BTreeMap, HashMap}, fmt::Debug, marker::PhantomData};
+pub use crate::model::{Record, RecordId as Id};
+extern crate alloc;
+
+/// Configuration constant with its value intentionally absent from an overview.
+pub const DEFAULT_LIMIT: usize;
+static mut REGISTRY: Option<Registry>;
+pub type Callback = for<'request> unsafe extern "C" fn(&'request [u8], *mut u8) -> usize;
+type ResultMap<Value> = Result<BTreeMap<String, Vec<Value>>, Box<dyn std::error::Error + Send + Sync>>;
+pub type Fixed<const SIZE: usize> = [u8; SIZE];
+pub type Pair = (u32, Vec<(String, Option<u64>)>);
+
+#[derive(Debug, Clone)]
+/// Named fields retain their documentation and visibility.
+pub struct Configuration<'config, Value: Debug, const SIZE: usize>
+where
+    Value: Clone + 'config,
+{
+    /// A borrowed map with nested generic arguments.
+    pub entries: &'config BTreeMap<String, Vec<Value>>,
+    pub(crate) callback: Callback,
+    #[cfg(feature = "extra")]
+    /// Conditionally available bytes.
+    pub bytes: [u8; SIZE],
+    private: PhantomData<&'config Value>,
+}
+
+/// A unit struct remains distinct from an empty named or tuple struct.
+pub struct Marker;
+pub struct EmptyNamed {}
+pub struct EmptyTuple();
+
+/// Documented tuple fields must never be merged into line comments.
+pub struct Position(
+    /// Horizontal and vertical coordinates in world units.
+    pub Vec2,
+);
+
+pub struct Packet<'packet>(
+    /// The packet identifier belongs to the caller.
+    pub u64,
+    #[cfg(feature = "extra")]
+    /// The payload can include commas and spaces in its contents.
+    pub(crate) &'packet [u8],
+    /* Block comment beside a nested tuple. */
+    (Option<u32>, Result<Vec<u8>, String>),
+);
+
+#[non_exhaustive]
+pub enum Event<'event, Value> {
+    /// No payload.
+    Idle,
+    /// Anonymous fields with a nested type.
+    Received(&'event Value, Option<(u32, u64)>),
+    /// Field documentation inside an enum tuple also needs a newline.
+    Progress(
+        /// Number of completed bytes.
+        u64,
+        /// Total number of bytes.
+        u64,
+    ),
+    Failed {
+        /// A quoted marker is text, not a comment delimiter: "//".
+        message: String,
+        retry: bool,
+    },
+}
+
+pub unsafe trait Storage<Value>: Send + Sync
+where
+    Value: Debug,
+{
+    type Error: Debug;
+    const CAPACITY: usize;
+    /// Writes a value and reports its stable key.
+    fn insert(&mut self, key: &str, value: Value) -> Result<u64, Self::Error>;
+    fn read<'read>(&'read self, key: &str) -> Option<&'read Value>;
+    fn callback(&self, callback: impl FnOnce(&Value) -> bool + Send) -> bool;
+}
+
+impl<'config, Value: Debug + Clone, const SIZE: usize> Configuration<'config, Value, SIZE> {
+    pub fn new(entries: &'config BTreeMap<String, Vec<Value>>, callback: Callback, bytes: [u8; SIZE]) -> Self;
+    pub fn entries(&self) -> impl Iterator<Item = (&String, &Vec<Value>)>;
+    pub fn split(&mut self) -> (&mut Callback, &mut PhantomData<&'config Value>);
+    pub async fn fetch(&self, request: &str) -> ResultMap<Value>;
+    pub const fn capacity(&self) -> usize;
+    pub unsafe fn pointer(&self) -> *const Value;
+}
+
+unsafe impl<Value: Debug> Storage<Value> for Registry {
+    type Error = String;
+    const CAPACITY: usize;
+    fn insert(&mut self, key: &str, value: Value) -> Result<u64, Self::Error>;
+    fn read<'read>(&'read self, key: &str) -> Option<&'read Value>;
+    fn callback(&self, callback: impl FnOnce(&Value) -> bool + Send) -> bool;
+}
+
+/// Long parameter lists must retain commas within nested types and callback arguments.
+pub fn dispatch<'request, Value: Debug>(registry: &'request mut Registry, entries: Result<Vec<(String, Value)>, String>, callback: for<'item> fn(&'item Value, usize) -> bool, options: &[Option<Value>]) -> Result<(), String>
+where
+    Value: Send + Sync + 'request;
+
+pub unsafe extern "C" fn exported(buffer: *const u8, length: usize) -> i32;
+pub fn never() -> !;
+
+extern "C" {
+    pub fn external_call(buffer: *const u8, length: usize, callback: Option<unsafe extern "C" fn(i32, *mut u8)>);
+    pub static mut EXTERNAL_STATE: i32;
+}
+
+#[path = "nested/module.rs"]
+pub mod external_module;
+
+pub mod nested {
+    //! Nested documentation stays attached to this module.
+    pub(crate) use super::Marker;
+    pub struct Handle {
+        pub id: u64,
+        pub label: &'static str,
+    }
+    impl Handle {
+        /// Returns the stable identifier.
+        pub fn id(&self) -> u64;
+    }
+    pub mod inner {
+        pub enum State { Ready, Waiting, Complete }
+        pub fn transition(state: State, reason: &str) -> State;
+    }
+}
+
+/// Paragraph wrapping may change whitespace but not documentation contents.
+/// The returned guard keeps a caller-owned object alive until the callback finishes, including when an operation returns an error.
+///
+/// ```rust
+/// let literal = "a deliberately long example with // comment markers and  spaces that must stay intact";
+/// ```
+/// - Preserve a Markdown list item.
+///   Preserve its continuation.
+#[doc = "Literal documentation with  two spaces and // markers"]
+pub fn documented(request_identifier: &str, callback_identifier: impl FnOnce(&str, usize) -> bool, registry_identifier: &mut Registry) -> bool;

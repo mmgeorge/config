@@ -808,15 +808,6 @@ impl TimelineRenderer<'_> {
         if depth == 0 && self.leading_separator {
             self.literal(&format!("{}:separator", interaction.id), "", None)?;
         }
-        for node in &interaction.node_list {
-            if let ExchangeNode::PlanEvent { event } = node
-                && interaction.kind == ExchangeKind::PlanExecution
-                && matches!(&event.content, crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                    if lifecycle.kind == crate::plan::PlanLifecycleKind::Accepted)
-            {
-                self.plan_event(event)?;
-            }
-        }
         if let Some(lifecycle) = &interaction.lifecycle {
             self.literal(&format!("{}:lifecycle", interaction.id), &format!("◇ {lifecycle}"), None)?;
         } else if !interaction.prompt.is_empty() {
@@ -866,10 +857,7 @@ impl TimelineRenderer<'_> {
         let section = self.begin_section(0);
         let mut layout = super::layout::ExchangeLayout::new(interaction)?;
         let inside = |node: &&ExchangeNode| !matches!(node, ExchangeNode::PlanEvent { event }
-            if (interaction.kind == ExchangeKind::PlanExecution
-                && matches!(&event.content, crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
-                    if lifecycle.kind == crate::plan::PlanLifecycleKind::Accepted))
-            || matches!(&event.content, crate::plan::PlanEventContent::Execution {
+            if matches!(&event.content, crate::plan::PlanEventContent::Execution {
                 event: crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
                     | crate::plan::PlanExecutionLifecycleEvent::Failed { .. }
             }));
@@ -1141,9 +1129,18 @@ impl TimelineRenderer<'_> {
                 }
                 ExchangeNode::ArtifactChange { change } => {
                     if let Some(declaration) = &change.declaration {
-                        self.diff(&change.id, "Proposed changes", &change.diff_text, "", None, Some((declaration, false)))?;
+                        let revision_request = interaction.kind == ExchangeKind::PlanExecution;
+                        let revision_section = if revision_request {
+                            self.literal(&format!("{}:request", change.id),
+                                &format!("▸ Plan revision requested · revision {}", declaration.revision), None)?;
+                            Some(self.begin_section(2))
+                        } else { None };
+                        self.diff(&change.id, if revision_request { "Changes" } else { "Proposed changes" }, &change.diff_text, "", None, Some((declaration, false)))?;
                         self.diff(&format!("{}:document", change.id), "Plan overview", &declaration.document_diff, "",
                             None, Some((declaration, true)))?;
+                        if let Some(section) = revision_section {
+                            self.finish_section(section, &format!("{}:request", change.id), true);
+                        }
                         continue;
                     }
                     let label = visible
@@ -1672,7 +1669,10 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
                     Some((PlanPhase::Implement, Some(_))) => "Implemented plan",
                     Some((PlanPhase::Resolve, Some(_))) => "Resolved findings",
                     Some((PlanPhase::Verify, Some(_))) => "Verified plan",
-                    _ if complete => "Plan execution stopped",
+                    Some((PlanPhase::Implement, None)) if complete => "Implementation turn complete",
+                    Some((PlanPhase::Verify, None)) if complete => "Verification turn complete",
+                    Some((PlanPhase::Resolve, None)) if complete => "Resolution turn complete",
+                    _ if complete => "Plan turn complete",
                     Some((PlanPhase::Verify, None)) if paused => "Verification paused",
                     Some((PlanPhase::Verify, None)) => "Verifying plan",
                     Some((PlanPhase::Resolve, None)) if paused => "Resolving findings paused",
@@ -1770,15 +1770,10 @@ mod tests {
         let source = json!({
             "id":"phase", "session_id":"session", "agent_id":"primary", "ordinal":1,
             "prompt":"", "kind":"plan_execution", "state":"running", "created_at_ms":0,
+            "lifecycle":"Implementation started",
             "execution_started_at_ms":0, "attributed_matches_checkpoint":false,
             "execution_phase":{"phase":"implement","outcome":null},
             "node_list":[
-                {"kind":"plan_event","event":{"id":"acceptance","node_count":0,"content":{
-                    "kind":"lifecycle","title":"Collection game","lifecycle":{
-                        "id":"acceptance","session_id":"session","plan_id":"plan","kind":"accepted",
-                        "model_revision":1,"user_revision":0,"created_at_ms":0
-                    }
-                }}},
                 {"kind":"artifact_change","change":{"id":"files","path":"lib.rs",
                     "diff_text":"diff --git a/lib.rs b/lib.rs\n--- a/lib.rs\n+++ b/lib.rs\n@@ -1 +1 @@\n-old\n+new\n",
                     "created_at_ms":1}},
@@ -1787,25 +1782,34 @@ mod tests {
                 }}}
             ]
         });
-        for (phase, outcome, expected) in [
-            ("implement", None, "Executing plan"),
-            ("verify", None, "Verifying plan"),
-            ("resolve", None, "Resolving findings"),
-            ("implement", Some("passed"), "Implemented plan"),
-            ("verify", Some("failed"), "Verification failed"),
-            ("verify", Some("blocked"), "Verification blocked"),
-            ("resolve", Some("passed"), "Resolved findings"),
-            ("verify", Some("passed"), "Verified plan"),
+        for (phase, outcome, state, expected) in [
+            ("implement", None, "running", "Executing plan"),
+            ("verify", None, "running", "Verifying plan"),
+            ("resolve", None, "running", "Resolving findings"),
+            ("implement", Some("passed"), "complete", "Implemented plan"),
+            ("verify", Some("failed"), "complete", "Verification failed"),
+            ("verify", Some("blocked"), "complete", "Verification blocked"),
+            ("resolve", Some("passed"), "complete", "Resolved findings"),
+            ("verify", Some("passed"), "complete", "Verified plan"),
+            ("implement", None, "complete", "Implementation turn complete"),
+            ("verify", None, "complete", "Verification turn complete"),
+            ("resolve", None, "complete", "Resolution turn complete"),
+            ("implement", None, "cancelled", "Cancelled"),
+            ("implement", None, "interrupted", "Interrupted"),
+            ("implement", None, "failed", "Failed"),
         ] {
             let mut value = source.clone();
             value["execution_phase"] = json!({"phase":phase,"outcome":outcome});
+            value["state"] = json!(state);
+            value["completed_at_ms"] = if state == "running" { json!(null) } else { json!(1000) };
             let exchange: Exchange = serde_json::from_value(value).unwrap();
             let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange).unwrap()).unwrap();
             let projected = project_at(&TimelineEntry::Exchange {
                 id:"phase".into(), created_at_ms:0, exchange, agent_by_id:HashMap::new(),
             }, &WidthProfile::default(), 1000).unwrap();
             let blocks = &projected.entry.block;
-            assert_eq!(blocks[0].id.0, "acceptance");
+            assert_eq!(blocks[0].id.0, "phase:lifecycle");
+            assert_eq!(blocks[0].text.wire_rows().join("\n"), "◇ Implementation started");
             let summary = blocks.iter().find(|block| block.id.0 == "phase:summary").unwrap();
             assert!(summary.text.wire_rows().join("\n").contains(expected));
             assert_eq!(blocks.last().unwrap().id.0, "done");

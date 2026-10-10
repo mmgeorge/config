@@ -65,10 +65,11 @@ instructions, not plan metadata. Product behavior such as a network request time
 of the design when relevant. Include concrete required file changes in proposals, generated artifacts
 in Design, and exact checks in Verification. Tests inventory is planned coverage, not evidence of execution.
 
-A successful harness_plan_submit requests review. End the turn after success. Implement only when
-Harness supplies an accepted revision and execution instructions. During Execute, follow the accepted
-design or request a necessary revision through the planning controls with a concrete reason. End the
-turn after submitting a revision and let Harness decide acceptance and continuation.
+In Plan, a successful harness_plan_submit requests review. End the turn after success. Implement only
+when Harness supplies an accepted revision and execution instructions. During Execute, follow the
+accepted design or submit a necessary revision with a concrete reason. The submission tool waits for
+automatic acceptance or the user's review decision. Continue the same turn using the returned revision
+and feedback.
 
 Call harness_plan_phase_done for the supplied phase and revision only when its work is finished.
 End the turn after success. The returned state determines what happens next. Do not use
