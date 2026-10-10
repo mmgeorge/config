@@ -19,6 +19,12 @@ pub enum ExchangeKind {
 pub struct ExecutionPhase {
     pub phase: crate::plan::PlanPhase,
     pub outcome: Option<crate::plan::execution::VerificationOutcome>,
+    #[serde(default)]
+    /// Phase-completion summary retained independently of subsequent attempts.
+    pub summary: Option<String>,
+    #[serde(default)]
+    /// Effective verification findings, including structural comparison failures.
+    pub findings: Vec<String>,
 }
 
 /// Owns one admitted action or plan phase and its backend turns.

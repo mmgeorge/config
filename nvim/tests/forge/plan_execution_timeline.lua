@@ -87,7 +87,7 @@ local ok, failure = pcall(function()
   local summary_count = 0
   local text = table.concat(result.lines, "\n")
   for _, line in ipairs(result.lines) do
-    if line:find("▾ Plan implementation stopped", 1, true) then summary_count = summary_count + 1 end
+    if line:find("▾ Implementation stopped", 1, true) then summary_count = summary_count + 1 end
   end
   assert_equals(summary_count, 2, "each expanded exchange should retain its own summary")
   assert_equals(text:find("First continuation", 1, true) ~= nil, true,
@@ -102,15 +102,14 @@ local ok, failure = pcall(function()
     "the next canonical task should render once")
   assert_equals(text:find("! Plan deviation recorded: Add the missing input path", 1, true) ~= nil, true,
     "persisted deviations should render immediately")
-  assert_equals(text:find("Plan implementation stopped (", 1, true), nil,
+  assert_equals(text:find("Implementation stopped (", 1, true), nil,
     "provider task snapshots should not drive accepted-plan progress")
 
   for _, phase in ipairs({ "verify", "resolve" }) do
-    local label = phase == "verify" and "Plan verification" or "Plan resolution"
     for _, scenario in ipairs({
-      { state = "running", suffix = "" },
-      { state = "complete", suffix = " stopped" },
-      { state = "complete", outcome = "passed", suffix = " complete" },
+      { state = "running", label = phase == "verify" and "Verifying" or "Resolving" },
+      { state = "complete", label = phase == "verify" and "Verification stopped" or "Resolution stopped" },
+      { state = "complete", outcome = "passed", label = phase == "verify" and "Verified" or "Resolved" },
     }) do
       local rendered = renderer.build({ {
         kind = "exchange",
@@ -120,10 +119,29 @@ local ok, failure = pcall(function()
           duration_ms = 1000, execution_started_at_ms = 0, node_list = {}, turn = {},
         },
       } })
-      assert_equals(table.concat(rendered.lines, "\n"):find(label .. scenario.suffix .. " 1s", 1, true) ~= nil,
+      assert_equals(table.concat(rendered.lines, "\n"):find(scenario.label .. " 1s", 1, true) ~= nil,
         true, "phase summaries should preserve the phase and outcome: " .. vim.inspect(rendered.lines))
     end
   end
+
+  local exchange = {
+    id = "verification", kind = "plan_execution", state = "complete", duration_ms = 18000,
+    completed_at_ms = 18000, node_list = {}, turn = {},
+    execution_phase = { phase = "verify", outcome = "failed", summary = "Ran eight tests.",
+      findings = { "restart_resets_round: expected score 0, got 3", "pause_freezes_timer: time changed" } },
+  }
+  local collapsed = renderer.build({ { kind = "exchange", exchange = exchange } }, { expanded = {} })
+  local collapsed_text = table.concat(collapsed.lines, "\n")
+  assert(collapsed_text:find("▸ Verified 18s", 1, true))
+  assert(collapsed_text:find("▸ Verification failed · restart_resets_round: expected score 0, got 3 (+1 more)", 1, true))
+  assert(not collapsed_text:find("pause_freezes_timer", 1, true))
+  local expanded = renderer.build({ { kind = "exchange", exchange = exchange } }, {
+    expanded = { ["exchange:verification:verification-result"] = true },
+  })
+  assert(table.concat(expanded.lines, "\n"):find("pause_freezes_timer: time changed", 1, true))
+  exchange.execution_phase = { phase = "verify", outcome = "passed", summary = "Eight tests passed.", findings = {} }
+  local passed = renderer.build({ { kind = "exchange", exchange = exchange } }, { expanded = {} })
+  assert(table.concat(passed.lines, "\n"):find("◇ Verification passed · Eight tests passed.", 1, true))
 end)
 
 if not ok then

@@ -3452,6 +3452,8 @@ Planning continuation: turn {} of {}.",
                 interaction.execution_phase = Some(crate::exchange::ExecutionPhase {
                     phase: execution.phase,
                     outcome: None,
+                    summary: None,
+                    findings: Vec::new(),
                 });
             }
             interaction.goal_id.clone_from(&admission.goal_id);
@@ -7807,9 +7809,16 @@ mod test {
         assert_eq!(acceptance_owner, vec![planning_exchange_id.as_str()]);
         let text = timeline_text(&snapshot);
         assert!(text.find("Plan accepted:").unwrap() < text.find("Plan implementation started").unwrap());
-        for label in ["Plan accepted:", "Plan implemented", "Plan verification failed", "Plan resolution complete", "Plan verification complete", "Plan complete:"] {
+        for label in ["Plan accepted:", "Implemented", "Verification failed", "Resolved", "Verified", "Verification passed", "Plan complete:"] {
             assert!(text.contains(label), "missing {label}: {text}");
         }
+        let failed_phase = exchanges[1].execution_phase.as_ref().unwrap();
+        assert!(failed_phase.summary.as_ref().is_some_and(|summary| !summary.is_empty()));
+        assert!(!failed_phase.findings.is_empty());
+        assert!(text.contains(&failed_phase.findings[0]));
+        let passed_phase = exchanges[3].execution_phase.as_ref().unwrap();
+        assert!(passed_phase.findings.is_empty());
+        assert!(passed_phase.summary.as_ref().is_some_and(|summary| text.contains(summary)));
         assert_eq!(text.matches("Plan accepted:").count(), 1);
         assert!(!text.contains("Accept plan:") && !text.contains("Execution started") && !text.contains("Plan turn complete"));
         let review = broker.capture_plan_review(&revised.id, revised.review_digest.as_deref().unwrap()).unwrap();

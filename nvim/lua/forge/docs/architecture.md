@@ -5424,6 +5424,15 @@ exchange identifies the phase as `Plan implementation`, `Plan verification`, or 
 including when it starts, continues, pauses, or resumes. An exchange that ends without a phase
 result reports that phase as stopped. Only recorded phase results claim phase completion.
 
+Activity headings use `Implementing`, `Verifying`, and `Resolving` while a phase runs,
+then `Implemented`, `Verified`, and `Resolved` when its completion is recorded.
+Verification outcomes remain separate from the activity fold. A passing result is a diamond
+event. Failed and blocked results show the first finding in a collapsed heading, with the phase
+summary and all findings inside its lazy-loaded section. The broker persists the effective
+outcome, summary, and findings on that exchange before transitioning to the next phase, so later
+resolution and restarts cannot replace an earlier verification's reason. Structural findings
+remain visible even when the agent reports that its behavioral checks passed.
+
 Health requests use reserved admission and output scheduling independently of the broker
 execution lock. The UI sends at most one outstanding health request per conversation. Ten
 seconds without a response shows connection uncertainty. Thirty seconds without provider

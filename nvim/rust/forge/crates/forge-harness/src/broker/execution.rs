@@ -456,6 +456,7 @@ impl HarnessBroker {
                 }
                 execution.progress = progress.clone();
                 self.store.save_plan_execution(&execution)?;
+                let summary = request.summary.clone();
                 execution.finish_phase(request, progress, now_ms)?;
                 if let Some(phase) = &mut interaction.execution_phase {
                     use crate::plan::execution::VerificationOutcome;
@@ -464,6 +465,10 @@ impl HarnessBroker {
                         (_, crate::plan::PlanPhase::Resolve) => VerificationOutcome::Failed,
                         _ => VerificationOutcome::Passed,
                     });
+                    phase.summary = Some(summary);
+                    if phase.phase == crate::plan::PlanPhase::Verify {
+                        phase.findings.clone_from(&execution.findings);
+                    }
                 }
                 goal.state = match execution.state {
                     PlanExecutionState::Complete => GoalState::Complete,

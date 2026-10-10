@@ -838,6 +838,7 @@ impl TimelineRenderer<'_> {
             node.lifecycle = if interaction.completed_at_ms.is_some() { NodeLifecycle::Settled } else { NodeLifecycle::Live };
         }
         self.content(interaction, agents, depth, &layout.continuation, Some(&layout.questions), MarkdownRole::Response)?;
+        self.verification_result(interaction)?;
         if let Some(diff) = &interaction.attributed_diff_text {
             self.diff(
                 &format!("{}:changes", interaction.id),
@@ -874,6 +875,37 @@ impl TimelineRenderer<'_> {
                 self.plan_event(event)?;
             }
         }
+        Ok(())
+    }
+
+    fn verification_result(&mut self, interaction: &Exchange) -> Result<()> {
+        use crate::plan::{PlanPhase, execution::VerificationOutcome};
+        let Some(phase) = interaction.execution_phase.as_ref()
+            .filter(|phase| phase.phase == PlanPhase::Verify) else { return Ok(()); };
+        let Some(outcome) = phase.outcome else { return Ok(()); };
+        let identity = format!("{}:verification-result", interaction.id);
+        if outcome == VerificationOutcome::Passed {
+            let summary = phase.summary.as_deref().unwrap_or("")
+                .split_whitespace().collect::<Vec<_>>().join(" ");
+            return self.literal(&identity, &format!("◇ Verification passed{}",
+                if summary.is_empty() { String::new() } else { format!(" · {summary}") }), None);
+        }
+        let label = if outcome == VerificationOutcome::Failed { "Verification failed" }
+            else { "Verification blocked" };
+        let first = phase.findings.iter().find(|finding| !finding.trim().is_empty());
+        let reason = first.map_or_else(|| "No findings recorded".into(),
+            |finding| finding.split_whitespace().collect::<Vec<_>>().join(" "));
+        let remaining = phase.findings.iter().filter(|finding| !finding.trim().is_empty()).count().saturating_sub(1);
+        let suffix = if remaining == 0 { String::new() } else { format!(" (+{remaining} more)") };
+        self.literal(&identity, &format!("▸ {label} · {reason}{suffix}"), None)?;
+        let section = self.begin_section(2);
+        if let Some(summary) = phase.summary.as_deref().filter(|summary| !summary.trim().is_empty()) {
+            self.markdown(&format!("{identity}:summary"), summary, MarkdownRole::Detail)?;
+        }
+        for (index, finding) in phase.findings.iter().enumerate() {
+            self.markdown(&format!("{identity}:finding:{index}"), &format!("- {finding}"), MarkdownRole::Detail)?;
+        }
+        self.finish_section(section, &identity, true);
         Ok(())
     }
 
@@ -1633,23 +1665,20 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => "Planning",
             ExchangeKind::PlanExecution => {
                 use crate::plan::PlanPhase;
-                use crate::plan::execution::VerificationOutcome;
                 match interaction.execution_phase.as_ref().map(|phase| (phase.phase, phase.outcome)) {
-                    Some((PlanPhase::Verify, Some(VerificationOutcome::Failed))) => "Plan verification failed",
-                    Some((PlanPhase::Verify, Some(VerificationOutcome::Blocked))) => "Plan verification blocked",
-                    Some((PlanPhase::Implement, Some(_))) => "Plan implemented",
-                    Some((PlanPhase::Resolve, Some(_))) => "Plan resolution complete",
-                    Some((PlanPhase::Verify, Some(_))) => "Plan verification complete",
-                    Some((PlanPhase::Implement, None)) if complete => "Plan implementation stopped",
-                    Some((PlanPhase::Verify, None)) if complete => "Plan verification stopped",
-                    Some((PlanPhase::Resolve, None)) if complete => "Plan resolution stopped",
-                    _ if complete => "Plan implementation stopped",
-                    Some((PlanPhase::Verify, None)) if paused => "Plan verification paused",
-                    Some((PlanPhase::Verify, None)) => "Plan verification",
-                    Some((PlanPhase::Resolve, None)) if paused => "Plan resolution paused",
-                    Some((PlanPhase::Resolve, None)) => "Plan resolution",
-                    _ if paused => "Plan implementation paused",
-                    _ => "Plan implementation",
+                    Some((PlanPhase::Implement, Some(_))) => "Implemented",
+                    Some((PlanPhase::Resolve, Some(_))) => "Resolved",
+                    Some((PlanPhase::Verify, Some(_))) => "Verified",
+                    Some((PlanPhase::Implement, None)) if complete => "Implementation stopped",
+                    Some((PlanPhase::Verify, None)) if complete => "Verification stopped",
+                    Some((PlanPhase::Resolve, None)) if complete => "Resolution stopped",
+                    _ if complete => "Implementation stopped",
+                    Some((PlanPhase::Verify, None)) if paused => "Verifying paused",
+                    Some((PlanPhase::Verify, None)) => "Verifying",
+                    Some((PlanPhase::Resolve, None)) if paused => "Resolving paused",
+                    Some((PlanPhase::Resolve, None)) => "Resolving",
+                    _ if paused => "Implementing paused",
+                    _ => "Implementing",
                 }
             },
             ExchangeKind::Chat if complete => "Thought",
@@ -1735,6 +1764,51 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     #[test]
+    fn verification_result_retains_findings_outside_the_activity_fold() -> anyhow::Result<()> {
+        use super::*;
+        use serde_json::json;
+        for outcome in ["failed", "blocked", "passed"] {
+            let findings = if outcome == "passed" { vec![] } else {
+                vec!["restart_resets_round: expected score 0, got 3", "pause_freezes_timer: remaining time changed"]
+            };
+            let exchange: Exchange = serde_json::from_value(json!({
+                "id":"verify-result", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"", "kind":"plan_execution", "state":"complete", "created_at_ms":0,
+                "completed_at_ms":18000, "duration_ms":18000, "attributed_matches_checkpoint":true,
+                "execution_phase":{"phase":"verify","outcome":outcome,
+                    "summary":"Ran eight gameplay tests.", "findings":findings},
+                "node_list":[{"kind":"artifact_change","change":{
+                    "id":"inspected-change", "path":"game.rs", "created_at_ms":1,
+                    "diff_text":"diff --git a/game.rs b/game.rs\n--- a/game.rs\n+++ b/game.rs\n@@ -1 +1 @@\n-old\n+new\n"
+                }}]
+            }))?;
+            let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
+            let projected = project_at(&TimelineEntry::Exchange {
+                id:"verify-result".into(), created_at_ms:0, exchange, agent_by_id:HashMap::new(),
+            }, &WidthProfile::default(), 18000)?;
+            let blocks = &projected.entry.block;
+            let result_index = blocks.iter().position(|block| block.id.0 == "verify-result:verification-result").unwrap();
+            let result = &blocks[result_index];
+            assert!(blocks[0].text.wire_rows().join("\n").contains("Verified 18s"));
+            assert!(!blocks[0].metadata.fold.is_empty());
+            assert!(blocks[0].metadata.fold.iter().all(|fold| !blocks[result_index..].iter()
+                .any(|block| block.id == fold.end.block)));
+            let text = result.text.wire_rows().join("\n");
+            if outcome == "passed" {
+                assert!(text.contains("◇ Verification passed · Ran eight gameplay tests."));
+                assert!(result.metadata.fold.is_empty());
+            } else {
+                assert!(text.contains("restart_resets_round: expected score 0, got 3 (+1 more)"));
+                assert!(text.contains(if outcome == "failed" { "Verification failed" } else { "Verification blocked" }));
+                assert!(result.metadata.fold[0].closed);
+                assert!(blocks.iter().any(|block| block.text.wire_rows().join("\n")
+                    .contains("pause_freezes_timer: remaining time changed")));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
     fn execution_phase_headings_and_lifecycle_events_survive_serialization() {
         use super::*;
         use serde_json::json;
@@ -1754,17 +1828,17 @@ mod tests {
             ]
         });
         for (phase, outcome, state, expected) in [
-            ("implement", None, "running", "Plan implementation"),
-            ("verify", None, "running", "Plan verification"),
-            ("resolve", None, "running", "Plan resolution"),
-            ("implement", Some("passed"), "complete", "Plan implemented"),
-            ("verify", Some("failed"), "complete", "Plan verification failed"),
-            ("verify", Some("blocked"), "complete", "Plan verification blocked"),
-            ("resolve", Some("passed"), "complete", "Plan resolution complete"),
-            ("verify", Some("passed"), "complete", "Plan verification complete"),
-            ("implement", None, "complete", "Plan implementation stopped"),
-            ("verify", None, "complete", "Plan verification stopped"),
-            ("resolve", None, "complete", "Plan resolution stopped"),
+            ("implement", None, "running", "Implementing"),
+            ("verify", None, "running", "Verifying"),
+            ("resolve", None, "running", "Resolving"),
+            ("implement", Some("passed"), "complete", "Implemented"),
+            ("verify", Some("failed"), "complete", "Verified"),
+            ("verify", Some("blocked"), "complete", "Verified"),
+            ("resolve", Some("passed"), "complete", "Resolved"),
+            ("verify", Some("passed"), "complete", "Verified"),
+            ("implement", None, "complete", "Implementation stopped"),
+            ("verify", None, "complete", "Verification stopped"),
+            ("resolve", None, "complete", "Resolution stopped"),
             ("implement", None, "cancelled", "Cancelled"),
             ("implement", None, "interrupted", "Interrupted"),
             ("implement", None, "failed", "Failed"),
@@ -3271,8 +3345,8 @@ mod tests {
             ("plan_revision", "Planning paused", "Planning"),
             (
                 "plan_execution",
-                "Plan implementation paused",
-                "Plan implementation",
+                "Implementing paused",
+                "Implementing",
             ),
         ] {
             let mut exchange: Exchange = serde_json::from_value(json!({

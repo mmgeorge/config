@@ -596,16 +596,14 @@ local function append_exchange_summary(result, interaction, options)
   elseif interaction.kind == "plan_execution" then
     local execution_phase = interaction.execution_phase or {}
     local phase = execution_phase.phase or "implement"
-    local label = ({ implement = "Plan implementation", verify = "Plan verification", resolve = "Plan resolution" })[phase]
-      or "Plan implementation"
-    if phase == "verify" and execution_phase.outcome == "failed" then
-      verb = "Plan verification failed"
-    elseif phase == "verify" and execution_phase.outcome == "blocked" then
-      verb = "Plan verification blocked"
-    elseif execution_phase.outcome then
-      verb = phase == "implement" and "Plan implemented" or label .. " complete"
+    if execution_phase.outcome and execution_phase.outcome ~= vim.NIL then
+      verb = ({ implement = "Implemented", verify = "Verified", resolve = "Resolved" })[phase] or "Implemented"
+    elseif complete then
+      verb = (({ implement = "Implementation", verify = "Verification", resolve = "Resolution" })[phase]
+        or "Implementation") .. " stopped"
     else
-      verb = label .. (complete and " stopped" or paused and " paused" or "")
+      verb = (({ implement = "Implementing", verify = "Verifying", resolve = "Resolving" })[phase]
+        or "Implementing") .. (paused and " paused" or "")
     end
   elseif paused then
     verb = "Paused"
@@ -652,6 +650,42 @@ local function append_exchange_summary(result, interaction, options)
     last = -1,
     group = complete and "ForgeHarnessThought" or "ForgeHarnessThinking",
   }
+end
+
+--- Keeps verification evidence outside the exchange activity expansion.
+---@param result table Render collection.
+---@param interaction table Exchange with its persisted phase result.
+---@param options table Render options.
+local function append_verification_result(result, interaction, options)
+  local phase = interaction.execution_phase
+  if type(phase) ~= "table" or phase.phase ~= "verify" then return end
+  if phase.outcome ~= "passed" and phase.outcome ~= "failed" and phase.outcome ~= "blocked" then return end
+  local summary = type(phase.summary) == "string" and phase.summary or ""
+  local findings = vim.tbl_filter(function(finding) return finding:match("%S") ~= nil end, phase.findings or {})
+  local key = ("exchange:%s:verification-result"):format(interaction.id or interaction.ordinal)
+  local first = #result.lines + 1
+  if phase.outcome == "passed" then
+    local suffix = summary:match("%S") and " · " .. summary:gsub("%s+", " ") or ""
+    append_wrapped(result, "Verification passed" .. suffix, "◇ ", "  ", "Normal", options.content_width)
+  else
+    local expanded = result.expanded[key] == true
+    local label = phase.outcome == "failed" and "Verification failed" or "Verification blocked"
+    local reason = findings[1] and findings[1]:gsub("%s+", " ") or "No findings recorded"
+    local suffix = #findings > 1 and (" (+%d more)"):format(#findings - 1) or ""
+    append_wrapped(result, label .. " · " .. reason .. suffix, expanded and "▾ " or "▸ ", "  ", "Normal", options.content_width)
+    for line = first, #result.lines do
+      result.rows[line] = { kind = "verification_result", interaction = interaction, node_id = key, expand_key = key }
+    end
+    if expanded then
+      if summary:match("%S") then append_wrapped(result, summary, "  ", "  ", "Normal", options.content_width) end
+      for _, finding in ipairs(findings) do
+        append_wrapped(result, finding, "  • ", "    ", "Normal", options.content_width)
+      end
+    end
+  end
+  for line = first, #result.lines do
+    result.rows[line] = result.rows[line] or { kind = "verification_result", interaction = interaction, node_id = key }
+  end
 end
 
 --- Appends prompt, segment list, diff summaries, and response blocks for an interaction.
@@ -856,6 +890,7 @@ local function append_interaction(result, interaction, options, agent_by_id)
       }
     end
   end
+  append_verification_result(result, interaction, options)
 end
 
 --- Builds the complete harness timeline render tree with lines, highlights, extmarks, and row mappings.
