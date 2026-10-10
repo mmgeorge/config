@@ -188,6 +188,12 @@ commit restores those anchors against the new document. Movement during preparat
 included in the capture and never suppresses restoration. Cursor snapshots do not cross
 asynchronous preparation boundaries.
 
+The replica's `before_commit` callback runs at that same boundary. Timeline switches use it
+to save the outgoing view after backend requests and local preparation finish. Declaration
+expansion captures its viewport after the response, immediately before publication. Rejected
+editable-text changes capture cursors inside the scheduled rollback, not when queuing it.
+Action-target snapshots remain separate and only validate whether a response still applies.
+
 Each tool owns independent command-heading, preview, and hidden-count blocks. Expanding output
 replaces only that tool's body with stable 16 KiB source chunks. Subsequent deltas render only
 the last mutable chunk and newly appended chunks. UTF-8 boundaries remain stable across appends.

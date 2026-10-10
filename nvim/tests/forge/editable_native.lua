@@ -101,6 +101,22 @@ local ok, failure = xpcall(function()
   assert(vim.wait(200, function() return not state.native.rejecting end, 1))
   assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), { "Label: draft" }),
     "whole-line deletion removed a protected prefix")
+
+  editable.detach(state)
+  state = editable.new("rollback-cursor")
+  vim.api.nvim_set_current_buf(buffer)
+  vim.api.nvim_buf_set_lines(buffer, 0, -1, false, { "Label: first", "second" })
+  editable.register(state, "body", 0)
+  editable.attach(state, buffer, {
+    body = { start = { row = 0, column = 7 }, finish = { row = 1, column = 6 } },
+  }, { send = function() return true end })
+  vim.api.nvim_win_set_cursor(0, { 1, 8 })
+  vim.api.nvim_buf_set_text(buffer, 0, 0, 0, 1, { "X" })
+  assert(state.native.rejecting, "protected edit did not schedule rollback")
+  vim.api.nvim_win_set_cursor(0, { 2, 3 })
+  assert(vim.wait(200, function() return not state.native.rejecting end, 1))
+  assert(vim.deep_equal(vim.api.nvim_win_get_cursor(0), { 2, 3 }),
+    "scheduled rollback restored a cursor captured before the reader moved")
 end, debug.traceback)
 
 editable.detach(state)

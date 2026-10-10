@@ -212,6 +212,15 @@ function M.open(options, callback)
   end
   owner.transcript = replica.open(identity, { buffer = options.transcript_buffer, generated = true, preserve_view = true,
     expected_changedtick = transcript_tick, filetype = "ForgeHarness", notice = notice,
+    before_commit = function()
+      if not owner.save_timeline then return end
+      local saved = {}
+      for _, window in ipairs(vim.fn.win_findbuf(options.transcript_buffer)) do
+        saved[window] = vim.api.nvim_win_call(window, vim.fn.winsaveview)
+      end
+      owner.timeline_view[owner.save_timeline] = saved
+      owner.save_timeline = nil
+    end,
     recover = function() recovery(owner.transcript) end })
   owner.transcript.fold_loading = {}
   owner.view = input.open(owner.transcript, options.transcript_window, transcript_options)
@@ -400,7 +409,11 @@ function M.open(options, callback)
       end
       local snapshot = type(result.snapshot) == "table" and result.snapshot or nil
       local update = snapshot or { patch = result.patch or {} }
-      if not snapshot and #update.patch == 0 then complete() return end
+      if not snapshot and #update.patch == 0 then
+        owner.transcript.before_commit()
+        complete()
+        return
+      end
       if not snapshot and #update.patch == 1 then update = update.patch[1] end
       replica.apply_async(owner.transcript, update, alive, guard(function(applied)
           if not alive() then owner.applying, owner.syncing = false, false return end
@@ -682,14 +695,6 @@ function M.open(options, callback)
     if owner.syncing or owner.selecting or owner.applying then return end
     owner.next_timeline = nil
     if target == owner.timeline_key then owner.sync() return end
-    ---@type table<integer, table>
-    local saved = {}
-    for window in pairs(owner.views) do
-      if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.transcript_buffer then
-        saved[window] = vim.api.nvim_win_call(window, vim.fn.winsaveview)
-      end
-    end
-    owner.timeline_view[owner.timeline_key] = saved
     owner.epoch = owner.epoch + 1
     owner.section_inflight, owner.section_request, owner.section_intent = {}, {}, {}
     owner.section_failure, owner.section_page = {}, {}
@@ -700,6 +705,7 @@ function M.open(options, callback)
       owner.selecting = false
       if not alive() then return end
       if failure then notice(failure) return end
+      owner.save_timeline = owner.timeline_key
       owner.timeline_key, owner.restore_timeline = target, target
       owner.sync()
     end)

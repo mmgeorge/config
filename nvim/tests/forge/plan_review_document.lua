@@ -28,7 +28,7 @@ local success, failure = xpcall(function()
     window = vim.api.nvim_get_current_win(), plan = { id = "plan", review_digest = "canonical" },
   }, function(value, error_message) assert(not error_message, error_message) attached = value end)
   local open = requests[1].params
-  requests[1].callback({ path = path, version = 1, saved_source_digest = "saved",
+  local initial = { path = path, version = 1, saved_source_digest = "saved",
     annotation = {}, source_row = {
       { id = "source:1", text = "# Native plan", source_line = 1, block = "plan:source", position = { row = 0, column = 0 }, target = "plan:source:1", metadata = { gutter = { { position = { row = 0, column = 0 }, priority = 100, chunk = { { text = " 1 + ", capture = "Normal" } } } } } },
       { id = "source:2", text = "", source_line = 2, block = "plan:source", position = { row = 1, column = 0 }, metadata = {} },
@@ -37,7 +37,8 @@ local success, failure = xpcall(function()
     snapshot = { document = open.document, revision = 0, block = { { id = "plan:source",
       text = { "# Native plan", "", "Task" }, metadata = { gutter = { { position = { row = 0, column = 0 }, priority = 100, chunk = { { text = " 1 + ", capture = "Normal" } } } }, decoration = {}, editable_region = {}, target = {
         { id = "plan:source:1", range = { start = { row = 0, column = 0 }, ["end"] = { row = 0, column = 13 } } },
-      } } } } } })
+      } } } } } }
+  requests[1].callback(initial)
   assert(attached == owner and owner.saved_source_digest == "saved")
   local gutter_count = 0
   for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(native_buffer, -1, 0, -1, { details = true })) do
@@ -59,6 +60,25 @@ local success, failure = xpcall(function()
   vim.api.nvim_win_set_buf(0, native_buffer)
   assert(not vim.bo[native_buffer].modifiable and vim.fs.normalize(vim.api.nvim_buf_get_name(native_buffer)) == vim.fs.normalize(path))
   assert(vim.deep_equal(vim.fn.readfile(path), { "# Native plan", "", "Task" }), "projection overwrote its physical source")
+  local buffer_view = require("forge.buffer_view")
+  local capture_viewport = buffer_view.capture_viewport
+  local capture_count = 0
+  buffer_view.capture_viewport = function(...)
+    capture_count = capture_count + 1
+    return capture_viewport(...)
+  end
+  owner.replica.sequence.node["plan:source"].entry.metadata.collapse = {
+    { id = "declaration", closed = true, opening = { block = "plan:source", position = { row = 0, column = 0 } } },
+  }
+  local toggled
+  owner.action("toggle_declaration", function(value, message) assert(not message, message) toggled = value end)
+  assert(capture_count == 0, "declaration toggle captured its viewport before the response")
+  local updated = vim.deepcopy(initial)
+  updated.snapshot.revision = 1
+  updated.patch = {}
+  requests[#requests].callback(updated)
+  buffer_view.capture_viewport = capture_viewport
+  assert(toggled and capture_count == 1, "declaration toggle did not capture at publication")
   local selected
   owner.action("open", function(value) selected = value end)
   local action = requests[#requests]

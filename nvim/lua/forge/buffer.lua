@@ -138,6 +138,10 @@ local function validate_order(order, block, row_count, read_row)
   return region_seen
 end
 
+--- Creates a native replica. before_commit runs after preparation, without yielding,
+--- immediately before view capture and native mutation. It must not schedule work.
+---@param document string
+---@param options? {buffer?: integer, physical?: boolean, generated?: boolean, expected_changedtick?: integer, filetype?: string, preserve_view?: boolean, before_commit?: fun(), editable?: table, recover?: fun(), notice?: fun(message: string)}
 function M.open(document, options)
   options = options or {}
   identity(document)
@@ -163,6 +167,7 @@ function M.open(document, options)
   local session = {
     physical = physical, generated = generated, previous_native = previous_native,
     preserve_view = options.preserve_view == true,
+    before_commit = options.before_commit,
     expected_changedtick = generated and options.expected_changedtick or nil,
     generated_filetype = options.filetype or "forge",
     document = document, buffer = buffer, namespace = vim.api.nvim_create_namespace(""),
@@ -475,6 +480,7 @@ local function commit_patch(session, patch)
   checkpoint("preflight")
   if not ok then finish("preflight_failed") return M.fail_apply(session, prepared) end
   return cooperative.atomic(function()
+    if session.before_commit then session.before_commit() end
     local retained_view = buffer_view.capture(session, function(id)
       local entry = not prepared.retired[id] and (prepared.block[id] or session.block[id])
       return entry ~= nil and entry ~= false and entry.row_count > 0
@@ -606,6 +612,7 @@ function M.apply_snapshot(session, snapshot)
   end)
   if not ok then return M.fail_apply(session, prepared) end
   return cooperative.atomic(function()
+    if session.before_commit then session.before_commit() end
     local retained_view = buffer_view.capture(session, function(id)
       return prepared.block[id] ~= nil and prepared.block[id].row_count > 0
     end)

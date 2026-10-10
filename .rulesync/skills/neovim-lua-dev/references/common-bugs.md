@@ -110,9 +110,11 @@ view.renderer._folded[destination_id] = true
 
 - **Defect:** Background syntax highlighting or Tree-sitter callbacks complete after a stage/unstage action and reposition the cursor to an outdated line.
 - **Remedy:** Enforce distinct cursor policies per render type:
-  - **Passive Rerenders:** Capture the active item ID and line index immediately before applying line updates.
+  - **Passive Rerenders:** Finish asynchronous work, then capture the current cursor identity and viewport immediately before synchronous text or fold changes. Restore in the same non-yielding commit. Never capture before a request, scheduled callback, timer, or coroutine yield and restore afterward.
   - **Stage and Unstage:** Disable explicit cursor relocation and let Neovim maintain position relative to minimal line diffs.
   - **Discard:** Provide an explicit replacement target determined prior to deletion.
+
+Action-target snapshots validate the requested operation and do not authorize restoring an old cursor. Explicit navigation history records the view at departure. Test delayed responses and preparation yields by moving the cursor and scrolling while work is pending, then inserting rows above the new position. The commit must preserve the latest position and viewport.
 
 ### 12. Uncoordinated Burst Refresh
 

@@ -2,6 +2,10 @@
 
 This reference defines buffer management, decoration providers, extmark lifecycles, and syntax optimization strategies for rendering large datasets in Neovim plugins.
 
+## Cursor Preservation at the Commit Boundary
+
+Asynchronous work must not restore a cursor or viewport captured before the user could move again. Complete loading and preparation first. In one non-yielding commit, capture the current cursor identity and viewport of each affected window, apply text and fold changes, and restore against the resulting document. Do not capture restoration state before requests, scheduled callbacks, timers, or coroutine yields. Keep action targets for stale-response validation separate from restoration state, and record navigation return positions only at actual departure.
+
 ## Concrete Buffer Lines vs Viewport Text Virtualization
 
 Do not virtualize buffer text by paging rows in and out of a small physical buffer. Virtualizing text breaks core editor capabilities:

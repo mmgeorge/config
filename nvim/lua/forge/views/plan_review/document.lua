@@ -331,15 +331,6 @@ function M.attach(options, callback)
     if not view then receive(nil, "Plan review window is no longer available") return false end
     local captured, failure = input.capture(owner.replica, view, action)
     if not captured then receive(nil, failure) return false end
-    local viewport
-    if action == "toggle_declaration" then
-      local node = owner.replica.sequence.node[captured.block]
-      local collapse = node and node.entry.metadata.collapse and node.entry.metadata.collapse[1]
-      if collapse then
-        viewport = require("forge.buffer_view").capture_viewport(owner.replica,
-          view.window, collapse.opening)
-      end
-    end
     request({ operation = "plan_action", input = captured }, function(result, error)
       local reference_preview = action:find("reveal_reference:", 1, true) == 1
       if not owner.is_current(captured, not reference_preview) then
@@ -347,6 +338,14 @@ function M.attach(options, callback)
         return
       end
       if not error and result.patch and result.patch ~= vim.NIL then
+        if action == "toggle_declaration" then
+          local node = owner.replica.sequence.node[captured.block]
+          local collapse = node and node.entry.metadata.collapse and node.entry.metadata.collapse[1]
+          if collapse then
+            result.viewport = require("forge.buffer_view").capture_viewport(owner.replica,
+              view.window, collapse.opening)
+          end
+        end
         comments.detach(options.buffer, false)
         owner.replica.locate, owner.replica.physical_row = nil, nil
         owner.replica.prepare_source, owner.replica.decoration_location, owner.replica.fold_location = nil, nil, nil
@@ -359,7 +358,6 @@ function M.attach(options, callback)
           view.changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)
         end
       end
-      if not error and viewport then result.viewport = viewport end
       receive(result, error, captured)
     end)
     return true

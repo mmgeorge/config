@@ -206,26 +206,26 @@ end
 local function reject_edit(state, message, start, finish)
   local native = state.native
   local marks = vim.api.nvim_buf_get_extmarks(native.buffer, -1, 0, -1, { details = true })
-  local cursor = {}
-  for _, window in ipairs(vim.fn.win_findbuf(native.buffer)) do
-    cursor[window] = vim.api.nvim_win_get_cursor(window)
-    local region = M.guard_region(state, finish, finish) or M.guard_region(state, start, start)
-    if region then
-      local anchor = refresh_anchor(native, region)
-      local position = { row = cursor[window][1] - 1, column = cursor[window][2] }
-      if not before_or_equal(anchor.start, position) then
-        cursor[window] = { anchor.start.row + 1, anchor.start.column }
-      elseif not before_or_equal(position, anchor.finish) then
-        cursor[window] = { anchor.finish.row + 1, anchor.finish.column }
-      end
-    end
-  end
   native.rejecting = true
   vim.schedule(function()
     if not native.active or state.native ~= native or not vim.api.nvim_buf_is_valid(native.buffer) then return end
     local modifiable = vim.bo[native.buffer].modifiable
     local modified = native.modified
     local ok, failure = pcall(function()
+      local cursor = {}
+      for _, window in ipairs(vim.fn.win_findbuf(native.buffer)) do
+        cursor[window] = vim.api.nvim_win_get_cursor(window)
+        local region = M.guard_region(state, finish, finish) or M.guard_region(state, start, start)
+        if region then
+          local anchor = refresh_anchor(native, region)
+          local position = { row = cursor[window][1] - 1, column = cursor[window][2] }
+          if not before_or_equal(anchor.start, position) then
+            cursor[window] = { anchor.start.row + 1, anchor.start.column }
+          elseif not before_or_equal(position, anchor.finish) then
+            cursor[window] = { anchor.finish.row + 1, anchor.finish.column }
+          end
+        end
+      end
       vim.bo[native.buffer].modifiable = true
       vim.api.nvim_buf_call(native.buffer, function() pcall(vim.cmd, "undojoin") end)
       vim.api.nvim_buf_set_lines(native.buffer, 0, -1, false, native.shadow:text())
