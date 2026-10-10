@@ -854,6 +854,7 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
         id: source.id.clone(),
         text: BufferText::from_rows(&rows)?,
         metadata: BlockMetadata {
+            status: metadata.status.as_ref().filter(|status| status.row < rows.len()).cloned(),
             node: metadata.node.clone(),
             content_node: metadata.content_node.clone(),
             section: metadata.section.clone(),

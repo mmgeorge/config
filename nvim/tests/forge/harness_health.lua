@@ -23,19 +23,19 @@ local success, failure = xpcall(function()
   end
   advance(30)
   assert(state.wait_notice == nil, "approval wait triggered provider inactivity")
-  assert(health.wait_notice(state) == "Awaiting approval")
+  assert(health.notice(state).text == "Waiting for your approval")
   state.approval_open = false
   advance(15)
-  assert(health.wait_notice(state) == "Awaiting approval", "closing the picker resolved the approval")
+  assert(health.notice(state).text == "Waiting for your approval", "closing the picker resolved the approval")
   state.approval = {}
   advance(14)
-  assert(health.wait_notice(state) == nil, "approval time counted toward resumed inactivity")
+  assert(health.notice(state) == nil, "approval time counted toward resumed inactivity")
   advance(1)
-  assert(health.wait_notice(state):find("Waiting for provider or tool update", 1, true))
+  assert(health.notice(state).text:find("Waiting for provider or tool", 1, true))
   for _, kind in ipairs({ "awaiting_input", "awaiting_plan_review" }) do
     state.status.kind = kind
     advance(30)
-    assert(state.wait_notice == nil and health.wait_notice(state) == nil)
+    assert(state.wait_notice == nil and health.notice(state) == nil)
   end
   state.status.kind = "working"
   state.active_elicitation = { id = "question" }
@@ -46,7 +46,7 @@ local success, failure = xpcall(function()
   assert(state.wait_notice ~= nil)
   state.busy = false
   advance(1)
-  assert(state.wait_notice == nil and health.wait_notice(state) == nil)
+  assert(state.wait_notice == nil and health.notice(state) == nil)
   local previous_refreshes = refresh_count
   generation = 2
   state.busy = true

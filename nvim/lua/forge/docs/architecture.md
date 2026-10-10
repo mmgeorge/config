@@ -774,7 +774,7 @@ centralizes the total-turn and consecutive-no-progress mechanics shared by goals
 turns without canonical document progress. `/plan retry` resets only that budget while retaining the plan document
 and question ledger. Provider adapters stream one turn and never decide whether planning should continue.
 An automatic planning retry admits a new exchange with an empty user prompt and the persisted
-`Planning resumed` lifecycle label. The preceding exchange completes before the retry starts,
+`Planning continued` lifecycle label. The preceding exchange completes before the retry starts,
 so its answer, activity fold, duration, and usage remain separate after reload. Admission
 publishes the preceding exchange's terminal state before the new exchange appears. The task
 and canonical plan retain their identities across these exchange boundaries.
@@ -2533,18 +2533,22 @@ totals without recovering how many reports were missed. Requests without usage r
 failed attempts and calls still in progress, remain outside this observed completion count.
 
 Running, paused, and completed headers share the layout
-`Planning 120s (12s tools) │ ~65 tok/s │ I 820.0k (94%) · R 2.8k · O 4.2k │ 8 req · 21 tools`.
+`Planning 120s │ Tools 12s · 20/21 pass │ Tokens 820.0k -> 7.0k · 65 tps`.
 The outer duration includes tools, approvals, and delegated waits within active execution and
-freezes across explicit pauses. The parenthetical counts tool-only wall time, taking the union
+freezes across explicit pauses. The Tools section counts tool-only wall time, taking the union
 of overlapping calls and capping outstanding intervals at interruption or completion.
 Tool time uses milliseconds below one second and rounded tenths of a second thereafter,
-omitting a zero fractional digit. The outer duration remains whole seconds.
+omitting a zero fractional digit. The outer duration remains whole seconds. The pass numerator
+counts successful completed calls only. Running, failed, interrupted, and cancelled calls remain
+in the denominator without counting as passed.
 
 Each distinct admitted usage report refreshes cumulative input, cache percentage, reasoning,
 non-reasoning output, and request count immediately. Turns that have not reported usage do not
 erase previously reported totals. Missing categories within reported usage remain unavailable.
 Input includes cached tokens and cache percentage divides cumulative cached input by cumulative
-input. Inclusive generated tokens include reasoning and tool arguments.
+input. The compact header shows input and inclusive generated tokens, which include reasoning
+and tool arguments. Cache, reasoning, and request counts remain recorded but are omitted from
+the header. Unavailable categories remain hidden, with partial token counts labeled in or out.
 
 The same report captures cumulative generated tokens and active elapsed time minus the union
 of tool, approval, and delegated waits. Their quotient supplies approximate effective throughput,
@@ -2572,7 +2576,7 @@ in one column across timer updates, tool groups, and expansion. Labels that exce
 use compact minutes, hours, or days. Timer updates do not scan peer tools to size this column.
 These durations measure Harness lifecycle observations rather than provider CPU execution time.
 
-`/plan` uses the same `Thinking` and `Thought` interaction summaries as every model turn. A
+`/plan` uses `Planning` and `Planned` summaries, while plan revision uses `Revising plan` during work. A
 question-only turn saves `PlanElicitation` under the active `AwaitingInput` plan, renders its
 choices in the timeline, and opens the shared picker across the bottom of the complete Harness
 transcript-and-composer surface. The border shows the question title and `N/M` progress. The
@@ -5477,3 +5481,29 @@ report. A missing report object shows unavailable content rather than silently d
 Report publication checks source identities before committing a successful phase result. A changed
 workspace rejects that result for a fresh verification attempt, rather than pairing stale evidence
 with a newer report.
+
+
+## Harness status presentation and lifecycle vocabulary
+
+`WorkflowActivity` owns active, completed, and lifecycle labels. The broker builds
+persisted lifecycle text from that activity and `LifecycleAction`: Started enters
+a task or phase, Continued starts another automatic exchange for unfinished work,
+and Resumed restarts paused or interrupted work. Each exchange retains its own
+metrics and task ownership. Planning continuation does not imply a user revision.
+Its turn budget stays internal and exhausted limits surface their actual cause.
+
+The Rust status projection commits text with `BlockMetadata.status`, containing
+its block-relative row, animation flag, and optional Working, Question, or Review
+hint context. The buffer contract validates that the row exists. Lua reads this
+metadata from the committed sequence, never from label text or target suffixes.
+Active labels are Working, Planning, Revising plan, Implementing, Verifying,
+Resolving, and Saving exchange. Completed headings retain Planned, Implemented,
+Verified, and Resolved. Idle has no status row.
+
+`health.notice` resolves local failures before user approval waits and provider
+inactivity. Failures and user decisions do not animate. Provider/tool waits,
+agent waits, planning retries, saving, and ordinary work animate. The status hint
+renderer owns one timer per transcript. Ticks update only the spinner extmark.
+They do not read history, clear other decorations, mutate buffer text, or capture
+or restore a cursor. A committed update, closure, or session replacement stops
+the old timer. New status metadata supplies the next animation policy.

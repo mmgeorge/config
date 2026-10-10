@@ -142,7 +142,22 @@ pub struct DeferredSection {
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+/// Status decoration committed with its text and row location.
+pub struct StatusPresentation {
+    pub row: usize,
+    pub animated: bool,
+    pub hint: Option<StatusHint>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum StatusHint { Working, Question, Review }
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BlockMetadata {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub status: Option<StatusPresentation>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Node state is published atomically with this heading's materialized text.
     pub node: Option<crate::node::NodeState>,
@@ -281,6 +296,9 @@ impl BufferBlock {
     }
 
     pub fn validate(&self) -> Result<(), ContractError> {
+        if self.metadata.status.as_ref().is_some_and(|status| status.row >= self.text.row_count()) {
+            return Err(ContractError("status requires a physical row"));
+        }
         if let Some(layout) = &self.metadata.layout {
             if !(2..=256).contains(&layout.indent) || layout.source_indent > layout.indent - 2 {
                 return Err(ContractError("content indent must contain 2..=256 cells"));

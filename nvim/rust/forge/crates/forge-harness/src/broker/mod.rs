@@ -40,6 +40,7 @@ use crate::session::{
     ProviderForkState, SessionStore,
 };
 use crate::storage::SqliteStore;
+use crate::session::state_machine::{WorkflowActivity, LifecycleAction};
 use crate::timeline::stream::TimelinePatch;
 use crate::timeline::{
     SessionEventKind, SessionEventRecord, TimelineEntry, TimelineProjection, TimelineProjector,
@@ -1662,13 +1663,13 @@ impl HarnessBroker {
                     return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
                 }
                 let resumed = match task.kind {
-                    TaskKind::Plan => "Planning resumed".to_owned(),
-                    TaskKind::Execute => format!("{} resumed", match task.phase.as_str() {
+                    TaskKind::Plan => WorkflowActivity::Planning.event(LifecycleAction::Resumed),
+                    TaskKind::Execute => WorkflowActivity::from(match task.phase.as_str() {
                         "verify" => crate::plan::PlanPhase::Verify,
                         "resolve" => crate::plan::PlanPhase::Resolve,
                         _ => crate::plan::PlanPhase::Implement,
-                    }.label()),
-                    TaskKind::Goal => "Goal resumed".to_owned(),
+                    }).event(LifecycleAction::Resumed),
+                    TaskKind::Goal => WorkflowActivity::Goal.event(LifecycleAction::Resumed),
                 };
                 let lifecycle = action.get("reason").and_then(Value::as_str)
                     .map(|reason| format!("{reason} · {resumed}")).unwrap_or(resumed);
@@ -3389,7 +3390,7 @@ Planning continuation: turn {} of {}.",
             let mut continuation = ExchangeAdmission::plan(
                 String::new(), Some(plan.id.clone()), plan.model_revision > 0,
             );
-            continuation.lifecycle = Some("Planning resumed".into());
+            continuation.lifecycle = Some(if plan.state == PlanState::Revising { WorkflowActivity::Revising } else { WorkflowActivity::Planning }.event(LifecycleAction::Continued));
             admission = Some(continuation);
         }
     }
@@ -5053,7 +5054,7 @@ Planning continuation: turn {} of {}.",
         self.capture_final_checkpoint(interaction, outcome).await?;
         let (mut continuation, _, boundary_event) = self.interaction_for_turn("", true, self.clock.now_ms()).await?;
         event.extend(boundary_event);
-        continuation.lifecycle = Some("Goal continued".into());
+        continuation.lifecycle = Some(WorkflowActivity::Goal.event(LifecycleAction::Continued));
         continuation.kind = interaction.kind;
         continuation.goal_id.clone_from(&interaction.goal_id);
         continuation.task.clone_from(&interaction.task);
@@ -5753,7 +5754,7 @@ Planning continuation: turn {} of {}.",
         let mut admission = ExchangeAdmission::execution(
             String::new(), plan.id.clone(),
             execution_record.id.clone(), goal.id.clone());
-        admission.lifecycle = Some("Plan implementation started".into());
+        admission.lifecycle = Some(WorkflowActivity::Implementing.event(LifecycleAction::Started));
         let execution = self.run_interaction(execution_prompt, PromptMode::ExecutePlan, Some(admission))
             .await;
         let execution_succeeded = execution.is_ok();
@@ -6279,8 +6280,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             .unwrap_or_else(|| ExchangeAdmission::goal(visible_prompt, goal.id.clone()));
         if control_resume {
             admission.lifecycle = Some(lifecycle.unwrap_or_else(|| resumed_phase
-                .map(|phase| format!("{} resumed", phase.label()))
-                .unwrap_or_else(|| "Goal resumed".into())));
+                .map(|phase| WorkflowActivity::from(phase).event(LifecycleAction::Resumed))
+                .unwrap_or_else(|| WorkflowActivity::Goal.event(LifecycleAction::Resumed))));
         }
         match self
             .run_interaction(prompt, mode, Some(admission))
@@ -6356,15 +6357,15 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         {
             let previous_phase = self.store.list_exchange(&self.session.id)?.last()
                 .and_then(|exchange| exchange.execution_phase.as_ref().map(|phase| phase.phase));
-            let phase = execution.phase.label();
-            let action = if previous_phase == Some(execution.phase) { "continued" } else { "started" };
+            let activity = WorkflowActivity::from(execution.phase);
+            let action = if previous_phase == Some(execution.phase) { LifecycleAction::Continued } else { LifecycleAction::Started };
             let mut admission = ExchangeAdmission::execution(
                 String::new(), execution.plan_id, execution.id, goal.id.clone());
-            admission.lifecycle = Some(format!("{phase} {action}"));
+            admission.lifecycle = Some(activity.event(action));
             admission
         } else {
             let mut admission = ExchangeAdmission::goal(String::new(), goal.id.clone());
-            admission.lifecycle = Some("Goal continued".into());
+            admission.lifecycle = Some(WorkflowActivity::Goal.event(LifecycleAction::Continued));
             admission
         };
         if let Some(mut previous) = self.store.list_exchange(&self.session.id)?.pop()
@@ -11772,7 +11773,7 @@ mod test {
             2,
             "automatic retries must follow the answered exchange as a separate attempt"
         );
-        assert_eq!(snapshot.exchange[1].lifecycle.as_deref(), Some("Planning resumed"));
+        assert_eq!(snapshot.exchange[1].lifecycle.as_deref(), Some("Planning continued"));
         assert_eq!(
             broker
                 .store
@@ -12267,13 +12268,13 @@ mod test {
         assert_eq!(exchanges.len(), 2);
         assert_eq!(exchanges[0].prompt, "/plan migrate the event format");
         assert!(exchanges[1].prompt.is_empty(), "internal continuation appeared as user input");
-        assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Planning resumed"));
+        assert_eq!(exchanges[1].lifecycle.as_deref(), Some("Planning continued"));
         assert_ne!(exchanges[0].id, exchanges[1].id);
         assert!(exchanges.iter().all(|exchange| exchange.state == ExchangeState::Complete
             && exchange.completed_at_ms.is_some() && exchange.turn.len() == 1
             && exchange.plan_id.as_deref() == Some(plan.id.as_str())));
         let restored: Vec<Exchange> = serde_json::from_value(serde_json::to_value(&exchanges).unwrap()).unwrap();
-        assert_eq!(restored[1].lifecycle.as_deref(), Some("Planning resumed"));
+        assert_eq!(restored[1].lifecycle.as_deref(), Some("Planning continued"));
         assert_eq!(restored[0].turn.len(), 1);
         assert_eq!(restored[1].turn.len(), 1);
     }

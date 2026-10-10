@@ -5,7 +5,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result, ensure};
 use forge_buffer::block::{
     BlockAnchor, BufferBlock, ContentLayout, Decoration, FoldRange, TargetRange, TextChunk, TextPosition,
-    TextRange,
+    TextRange, StatusPresentation, StatusHint,
 };
 use forge_buffer::identity::{BlockId, FoldId, TargetId};
 use forge_buffer::width::WidthProfile;
@@ -375,8 +375,8 @@ impl TimelineRenderer<'_> {
                     SessionPhase::Idle => String::new(),
                     SessionPhase::Paused => "Paused".into(),
                     SessionPhase::Finalizing { error, .. } => error.as_ref().map_or_else(
-                        || "Finalizing".into(),
-                        |error| format!("Finalization failed: {error}"),
+                        || "Saving exchange".into(),
+                        |error| format!("Saving exchange failed · {error}"),
                     ),
                     SessionPhase::Working {
                         started_at_ms,
@@ -394,15 +394,16 @@ impl TimelineRenderer<'_> {
                             execution.as_ref(),
                         )?
                     }
-                    SessionPhase::AwaitingInput { .. } => "Awaiting input".into(),
+                    SessionPhase::AwaitingInput { .. } => "Waiting for your answer".into(),
                     SessionPhase::AwaitingPlanReview { revision, .. } => {
-                        format!("Awaiting plan review · revision {revision}")
+                        format!("Waiting for plan review · revision {revision}")
                     }
-                    SessionPhase::RetryingPlanGeneration { turn, max_turn, .. } => {
-                        format!("Revising plan · attempt {turn}/{max_turn}")
+                    SessionPhase::RetryingPlanGeneration { activity, started_at_ms, .. } => {
+                        let elapsed = self.now_ms.saturating_sub(*started_at_ms).max(0) / 1_000;
+                        format!("{} · {elapsed}s", activity.active_label())
                     }
-                    SessionPhase::PlanningFailed { turn_count, .. } => {
-                        format!("Plan generation failed after {turn_count} attempts")
+                    SessionPhase::PlanningFailed { reason, .. } => {
+                        format!("Planning stopped · {reason}")
                     }
                     SessionPhase::WaitingForAgent { agent_count } => {
                         format!("Waiting for {agent_count} agents")
@@ -418,6 +419,21 @@ impl TimelineRenderer<'_> {
                     &text,
                     0,
                 )?;
+                if status.visible() {
+                    block.metadata.status = Some(StatusPresentation {
+                        row: 1,
+                        animated: matches!(status, SessionPhase::Working { .. }
+                            | SessionPhase::RetryingPlanGeneration { .. } | SessionPhase::WaitingForAgent { .. }
+                            | SessionPhase::Finalizing { error: None, .. }),
+                        hint: match status {
+                            SessionPhase::Working { .. } | SessionPhase::RetryingPlanGeneration { .. }
+                                | SessionPhase::WaitingForAgent { .. } => Some(StatusHint::Working),
+                            SessionPhase::AwaitingInput { .. } => Some(StatusHint::Question),
+                            SessionPhase::AwaitingPlanReview { .. } => Some(StatusHint::Review),
+                            _ => None,
+                        },
+                    });
+                }
                 if let SessionPhase::AwaitingPlanReview { plan_id, .. } = status {
                     block.metadata.decoration.push(Decoration {
                         range: TextRange {
@@ -1584,7 +1600,7 @@ fn working_status_text(
     execution: Option<&ExecutionStatus>,
 ) -> Result<String> {
     if let Some(execution) = execution {
-        let phase = execution.phase.label();
+        let phase = WorkflowActivity::from(execution.phase).active_label();
         let progress = &execution.progress;
         let count = progress.missing.iter().chain(&progress.different).chain(&progress.unverified)
             .map(|finding| finding.split_once(": ").map_or(finding.as_str(), |(path, _)| path))
@@ -1595,7 +1611,7 @@ fn working_status_text(
             else { "all files matched".into() };
         return Ok(format!("{phase} · {elapsed_seconds}s · {attention}"));
     }
-    let phase = match activity { WorkflowActivity::Planning => "Planning", WorkflowActivity::Working => "Working" };
+    let phase = activity.active_label();
     let prefix = format!("{phase} · {elapsed_seconds}s");
     let Some(reasoning_summary) = reasoning_summary else {
         return Ok(prefix);
@@ -1649,111 +1665,62 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     let activity = if interaction.state == ExchangeState::Cancelled {
         "Cancelled"
     } else if interaction.state == ExchangeState::Finalizing {
-        "Finalizing"
+        "Saving exchange"
     } else if interaction.state == ExchangeState::Interrupted {
         "Interrupted"
     } else if interaction.state == ExchangeState::Failed {
         "Failed"
     } else {
+        let activity = WorkflowActivity::from_exchange(interaction);
         match interaction.kind {
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision
-                if interaction.awaiting_input || paused =>
-            {
-                "Planning paused"
-            }
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if complete => "Planned",
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => "Planning",
-            ExchangeKind::PlanExecution => {
-                use crate::plan::PlanPhase;
-                match interaction.execution_phase.as_ref().map(|phase| (phase.phase, phase.outcome)) {
-                    Some((PlanPhase::Implement, Some(_))) => "Implemented",
-                    Some((PlanPhase::Resolve, Some(_))) => "Resolved",
-                    Some((PlanPhase::Verify, Some(_))) => "Verified",
-                    Some((PlanPhase::Implement, None)) if complete => "Implementation stopped",
-                    Some((PlanPhase::Verify, None)) if complete => "Verification stopped",
-                    Some((PlanPhase::Resolve, None)) if complete => "Resolution stopped",
-                    _ if complete => "Implementation stopped",
-                    Some((PlanPhase::Verify, None)) if paused => "Verifying paused",
-                    Some((PlanPhase::Verify, None)) => "Verifying",
-                    Some((PlanPhase::Resolve, None)) if paused => "Resolving paused",
-                    Some((PlanPhase::Resolve, None)) => "Resolving",
-                    _ if paused => "Implementing paused",
-                    _ => "Implementing",
-                }
+            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if interaction.awaiting_input || paused =>
+                if activity == WorkflowActivity::Revising { "Revising plan paused" } else { "Planning paused" },
+            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if complete => activity.completed_label(),
+            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => activity.active_label(),
+            ExchangeKind::PlanExecution if interaction.execution_phase.as_ref().is_some_and(|phase| phase.outcome.is_some()) => activity.completed_label(),
+            ExchangeKind::PlanExecution if complete => match activity {
+                WorkflowActivity::Verifying => "Verification stopped",
+                WorkflowActivity::Resolving => "Resolution stopped",
+                _ => "Implementation stopped",
             },
-            ExchangeKind::Chat if complete => "Thought",
+            ExchangeKind::PlanExecution if paused => match activity {
+                WorkflowActivity::Verifying => "Verifying paused",
+                WorkflowActivity::Resolving => "Resolving paused",
+                _ => "Implementing paused",
+            },
+            ExchangeKind::PlanExecution => activity.active_label(),
+            ExchangeKind::Chat if complete => activity.completed_label(),
             ExchangeKind::Chat if paused => "Paused",
-            ExchangeKind::Chat => "Thinking",
+            ExchangeKind::Chat => activity.active_label(),
         }
     };
-    let mut summary = format!(
+    let summary = format!(
         "● {}{activity} {duration}s",
         history_prefix(interaction.disposition)
     );
     let count: usize = interaction.turn.iter().map(|turn| turn.tools().count()).sum();
-    if count > 0
-        && let Some(duration) = interaction.metrics.tool_ms(interaction.elapsed(now_ms)) {
-        summary.push_str(&format!(" ({} tools)", super::duration::duration_label(duration)));
-    }
     let mut sections = vec![summary];
-    let usage = interaction.usage();
-    if let Some((tokens, duration)) = interaction.metrics.reported_output_tokens
-        .zip(interaction.metrics.reported_response_ms)
-        .filter(|(tokens, duration)| *tokens > 0 && *duration > 0 && interaction.metrics.timing_complete) {
-        sections.push(format!("~{:.0} tok/s", tokens as f64 * 1000.0 / duration as f64));
-    }
-    let mut tokens = Vec::new();
-    if let Some(input) = usage.input {
-        let mut text = format!("I {}", token_display(input));
-        if let Some(percent) = usage.cached_percent() {
-            text.push_str(&format!(" ({percent}%)"));
-        }
-        tokens.push(text);
-    }
-    if let Some(reasoning) = usage.reasoning {
-        tokens.push(format!("R {}", token_display(reasoning)));
-    }
-    if let Some(output) = usage.non_reasoning_output() {
-        tokens.push(format!("O {}", token_display(output)));
-    }
-    if !tokens.is_empty() {
-        sections.push(tokens.join(" · "));
-    }
-    let spawned = interaction
-        .node_list
-        .iter()
-        .filter_map(|node| match node {
-            ExchangeNode::AgentReference { agent } => Some(agent.child_agent_id.as_str()),
-            _ => None,
-        })
-        .collect::<std::collections::HashSet<_>>()
-        .len() as u64;
-    let failed = interaction
-        .turn
-        .iter()
-        .flat_map(|turn| turn.tools())
-        .filter(|tool| tool.failed)
-        .count();
-    let mut counts = Vec::new();
-    if interaction.metrics.request_count > 0 {
-        counts.push(format!("{} req", interaction.metrics.request_count));
-    }
     if count > 0 {
-        let mut tools = format!("{count} {}", if count == 1 { "tool" } else { "tools" });
-        if failed > 0 {
-            tools.push_str(&format!(" ({failed} failed)"));
-        }
-        counts.push(tools);
+        let passed = interaction.turn.iter().flat_map(|turn| turn.tools())
+            .filter(|tool| tool.state() == crate::turn::ToolState::Completed && !tool.failed).count();
+        let duration = interaction.metrics.tool_ms(interaction.elapsed(now_ms))
+            .map(|duration| format!("{} · ", super::duration::duration_label(duration))).unwrap_or_default();
+        sections.push(format!("Tools {duration}{passed}/{count} pass"));
     }
-    let mut activity = counts.join(" · ");
-    if spawned > 0 {
-        if !activity.is_empty() { activity.push_str(", "); }
-        activity.push_str(&format!(
-            "{spawned} {} spawned",
-            if spawned == 1 { "agent" } else { "agents" }
-        ));
+    let usage = interaction.usage();
+    let mut tokens = Vec::new();
+    match (usage.input, usage.output) {
+        (Some(input), Some(output)) => tokens.push(format!("Tokens {} -> {}", token_display(input), token_display(output))),
+        (Some(input), None) => tokens.push(format!("Tokens in {}", token_display(input))),
+        (None, Some(output)) => tokens.push(format!("Tokens out {}", token_display(output))),
+        (None, None) => {}
     }
-    if !activity.is_empty() { sections.push(activity); }
+    if let Some((output, duration)) = interaction.metrics.reported_output_tokens
+        .zip(interaction.metrics.reported_response_ms)
+        .filter(|(output, duration)| *output > 0 && *duration > 0 && interaction.metrics.timing_complete) {
+        tokens.push(format!("{:.0} tps", output as f64 * 1000.0 / duration as f64));
+    }
+    if !tokens.is_empty() { sections.push(tokens.join(" · ")); }
     let mut summary = sections.join(" │ ");
     if let Some(error) = &interaction.finalization_error {
         summary.push_str(&format!(" — {}", error.replace(['\n', '\r'], " ")));
@@ -3106,7 +3073,7 @@ mod tests {
             },
         }, &WidthProfile::default(), 133_000).unwrap();
         let initial = render(execution.clone());
-        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Plan implementation · 133s · 2 files need attention"]);
+        assert_eq!(initial.entry.block[0].text.wire_rows(), vec!["", "Implementing · 133s · 2 files need attention"]);
         assert!(initial.entry.block[0].metadata.target[0].id.0.ends_with(":working"));
         assert!(initial.entry.block[1].metadata.fold[0].closed);
         let file_id = format!("session:status:implementation:execution:{}", crate::plan::digest(b"src/player.rs"));
@@ -3122,8 +3089,32 @@ mod tests {
         execution.progress.unverified.clear();
         execution.progress.matched.extend(["src/player.rs".into(), "src/ui.rs".into()]);
         let matched = render(execution);
-        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Plan verification · 133s · all files matched"]);
+        assert_eq!(matched.entry.block[0].text.wire_rows(), vec!["", "Verifying · 133s · all files matched"]);
         assert!(matched.entry.block.iter().any(|block| block.id.0 == file_id));
+    }
+
+    #[test]
+    fn status_text_and_animation_are_committed_together() {
+        use forge_buffer::block::StatusHint;
+        let cases = [
+            (SessionPhase::Paused, "Paused", false, None),
+            (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: None }, "Saving exchange", true, None),
+            (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: Some("locked".into()) }, "Saving exchange failed · locked", false, None),
+            (SessionPhase::WaitingForAgent { agent_count: 2 }, "Waiting for 2 agents", true, Some(StatusHint::Working)),
+            (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 2, max_turn: 20, started_at_ms: 0, activity: WorkflowActivity::Planning }, "Planning · 3s", true, Some(StatusHint::Working)),
+            (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 3, max_turn: 20, started_at_ms: 0, activity: WorkflowActivity::Revising }, "Revising plan · 3s", true, Some(StatusHint::Working)),
+            (SessionPhase::PlanningFailed { plan_id: "plan".into(), turn_count: 2, reason: "no progress limit reached".into() }, "Planning stopped · no progress limit reached", false, None),
+        ];
+        for (phase, expected, animated, hint) in cases {
+            let projection = project_at(&TimelineEntry::Status { id: "status".into(), created_at_ms: 0, status: phase }, &WidthProfile::default(), 3000).unwrap();
+            let block = &projection.entry.block[0];
+            assert_eq!(block.text.wire_rows(), vec!["", expected]);
+            assert_eq!(block.metadata.status, Some(forge_buffer::block::StatusPresentation { row: 1, animated, hint }));
+            block.validate().unwrap();
+            let encoded = serde_json::to_vec(block).unwrap();
+            let reopened: forge_buffer::block::BufferBlock = serde_json::from_slice(&encoded).unwrap();
+            assert_eq!(&reopened, block);
+        }
     }
 
     #[test]
@@ -3202,7 +3193,7 @@ mod tests {
             )
             .unwrap();
             let block = &projected.entry.block[0];
-            assert_eq!(block.text.wire_rows(), vec!["", "Awaiting input"]);
+            assert_eq!(block.text.wire_rows(), vec!["", "Waiting for your answer"]);
             assert_eq!(block.metadata.target[0].id.0, "session:status:question");
             assert_eq!(block.metadata.target[0].range.start.row, 1);
             assert!(block.metadata.fold.is_empty());
@@ -3228,7 +3219,7 @@ mod tests {
         let block = &projected.entry.block[0];
         assert_eq!(
             block.text.wire_rows(),
-            vec!["", "Awaiting plan review · revision 1"]
+            vec!["", "Waiting for plan review · revision 1"]
         );
         let target = &block.metadata.target[0];
         assert_eq!(target.range.start.row, 1);
@@ -3340,9 +3331,9 @@ mod tests {
     #[test]
     fn paused_exchange_activity_summary_freezes_until_execution_resumes() {
         for (kind, paused, running) in [
-            ("chat", "Paused", "Thinking"),
+            ("chat", "Paused", "Working"),
             ("plan_draft", "Planning paused", "Planning"),
-            ("plan_revision", "Planning paused", "Planning"),
+            ("plan_revision", "Revising plan paused", "Revising plan"),
             (
                 "plan_execution",
                 "Implementing paused",
@@ -3410,6 +3401,36 @@ mod tests {
     }
 
     #[test]
+    fn compact_header_reports_successful_tools_and_inclusive_output_tokens() {
+        let mut calls = serde_json::Map::new();
+        let order = (1..=20).map(|index| index.to_string()).collect::<Vec<_>>();
+        for id in &order {
+            calls.insert(id.clone(), json!({"id":id,"kind":"tool_call","title":"inspect",
+                "output":"", "status":if id == "20" { "failed" } else { "completed" },
+                "failed":id == "20", "started_at_ms":0,"completed_at_ms":200}));
+        }
+        let mut value = json!({
+            "id":"header","session_id":"session","agent_id":"primary","ordinal":1,
+            "kind":"plan_draft","state":"complete","prompt":"Plan","created_at_ms":0,
+            "completed_at_ms":44000,"duration_ms":44000,"attributed_matches_checkpoint":true,"node_list":[],
+            "metrics":{"timing_complete":true,"tool_duration_ms":4000,
+                "reported_output_tokens":7906,"reported_response_ms":40132},
+            "turn":[{"id":"turn","provider":{"thread_id":"thread","turn_id":"turn"},
+                "state":{"kind":"finished","outcome":"completed"},"started_at_ms":0,"completed_at_ms":44000,
+                "usage":{"input":855100,"output":7906,"reasoning":906},
+                "tool":{"order":order,"item":calls},"message":[],"item":[],"current_message":null}]
+        });
+        let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
+        assert_eq!(super::exchange_activity_summary(&exchange, 44000),
+            "● Planned 44s │ Tools 4s · 19/20 pass │ Tokens 855.1k -> 7.9k · 197 tps");
+        for status in ["running", "cancelled", "interrupted"] {
+            value["turn"][0]["tool"]["item"]["1"]["status"] = json!(status);
+            let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
+            assert!(super::exchange_activity_summary(&exchange, 44000).contains("18/20 pass"));
+        }
+    }
+
+    #[test]
     fn compact_summary_counts_native_usage_and_total_time_including_tools() {
         use crate::backend::usage::{TokenUsage, UsageUpdate};
         use crate::backend::{
@@ -3457,7 +3478,7 @@ mod tests {
             assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter()
                 .any(|row| row.contains(&format!("• {duration:>5} cargo test")))));
             assert!(super::exchange_activity_summary(&exchange, now_ms)
-                .contains(&format!("({aggregate} tools)")));
+                .contains(&format!("Tools {aggregate} · 0/1 pass")));
         }
         event.activity.as_mut().unwrap().status = Some("failed".into());
         exchange.observe_turn(&event, 5000).unwrap();
@@ -3495,7 +3516,7 @@ mod tests {
         exchange.observe_turn(&event, 9000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 6s (3s tools) │ ~1400 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)"
+            "● Thought 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1400 tps"
         );
         event.address.as_mut().unwrap().thread_id = "unowned-child".into();
         assert!(!exchange.observe_turn(&event, 90_000).unwrap());
@@ -3504,13 +3525,13 @@ mod tests {
             exchange.duration_ms = duration_ms;
             assert_eq!(
                 super::exchange_activity_summary(&exchange, 90_000),
-                format!("● Thought {}s (3s tools) │ ~1400 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)", duration_ms / 1000)
+                format!("● Thought {}s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1400 tps", duration_ms / 1000)
             );
         }
         exchange.metrics.timing_complete = false;
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 3s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)"
+            "● Thought 3s │ Tools 0/1 pass │ Tokens 76.0k -> 4.2k"
         );
     }
 
@@ -3534,13 +3555,13 @@ mod tests {
         };
         exchange.observe_turn(&event, 3000).unwrap();
         assert_eq!(super::exchange_activity_summary(&exchange, 4000),
-            "● Thinking 3s │ ~50 tok/s │ I 1.0k (90%) · R 40 · O 60 │ 1 req");
+            "● Working 3s │ Tokens 1.0k -> 100 · 50 tps");
         exchange.observe_turn(&event, 6000).unwrap();
-        assert!(super::exchange_activity_summary(&exchange, 6000).contains("~50 tok/s"));
+        assert!(super::exchange_activity_summary(&exchange, 6000).contains("50 tps"));
         event.data["id"] = json!("second");
         exchange.observe_turn(&event, 6000).unwrap();
         assert_eq!(super::exchange_activity_summary(&exchange, 9000),
-            "● Thinking 8s │ ~40 tok/s │ I 2.0k (90%) · R 80 · O 120 │ 2 req");
+            "● Working 8s │ Tokens 2.0k -> 200 · 40 tps");
     }
 
     #[test]
@@ -3554,13 +3575,13 @@ mod tests {
         original.resume(1000).unwrap();
         let address = ProviderAddress { thread_id: "parent".into(), turn_id: "turn".into() };
         original.start_turn(address.clone(), 1000).unwrap();
-        assert_eq!(super::exchange_activity_summary(&original, 4000), "● Thinking 3s");
+        assert_eq!(super::exchange_activity_summary(&original, 4000), "● Working 3s");
         for (usage, expected) in [
-            (json!({}), "● Thinking 3s │ 1 req"),
-            (json!({"input":1000,"output":100}), "● Thinking 3s │ ~50 tok/s │ I 1.0k │ 1 req"),
-            (json!({"reasoning":23}), "● Thinking 3s │ R 23 │ 1 req"),
+            (json!({}), "● Working 3s"),
+            (json!({"input":1000,"output":100}), "● Working 3s │ Tokens 1.0k -> 100 · 50 tps"),
+            (json!({"reasoning":23}), "● Working 3s"),
             (json!({"input":1000,"cached_input":0,"reasoning":0,"output":0}),
-                "● Thinking 3s │ I 1.0k (0%) · R 0 · O 0 │ 1 req"),
+                "● Working 3s │ Tokens 1.0k -> 0"),
         ] {
             let mut exchange = original.clone();
             let event = BackendEvent {
@@ -3617,7 +3638,7 @@ mod tests {
         interaction.awaiting_input = true;
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "● Planning paused 4s │ I 1.0k (90%) · R 200 · O 80"
+            "● Planning paused 4s │ Tokens 1.0k -> 280"
         );
         interaction.kind = ExchangeKind::Chat;
         interaction
@@ -3625,7 +3646,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "● Thought 4s │ I 1.0k (90%) · R 200 · O 80"
+            "● Thought 4s │ Tokens 1.0k -> 280"
         );
     }
     #[test]

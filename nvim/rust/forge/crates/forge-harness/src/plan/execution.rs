@@ -17,11 +17,7 @@ pub enum PlanPhase {
 
 impl PlanPhase {
     pub(crate) fn label(self) -> &'static str {
-        match self {
-            Self::Implement => "Plan implementation",
-            Self::Verify => "Plan verification",
-            Self::Resolve => "Plan resolution",
-        }
+        crate::session::state_machine::WorkflowActivity::from(self).lifecycle_label()
     }
 }
 

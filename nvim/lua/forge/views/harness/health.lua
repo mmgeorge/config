@@ -7,10 +7,22 @@ local function awaiting_user(state)
     or kind == "awaiting_input" or kind == "awaiting_plan_review"
 end
 
-function M.wait_notice(state)
-  if #(state.approval or {}) > 0 then return "Awaiting approval" end
+---@class HarnessStatusNotice
+---@field text string
+---@field animated boolean
+---@field failed boolean?
+---@param state table
+---@return HarnessStatusNotice?
+function M.notice(state)
+  local failure = state.presentation and state.presentation.failure or state.execution_notice
+    or state.host_error or state.connection_error or state.sync_error
+    or state.presentation and state.presentation.section_error
+  if failure then return { text = failure, animated = false, failed = failure ~= "Paused" } end
+  if #(state.approval or {}) > 0 then
+    return { text = "Waiting for your approval", animated = false }
+  end
   if awaiting_user(state) or not state.busy then return nil end
-  return state.wait_notice
+  return state.wait_notice and { text = state.wait_notice, animated = true } or nil
 end
 
 ---@param state table
@@ -40,7 +52,7 @@ function M.watch(state, refresh)
     elseif state.last_provider_progress then
       local elapsed = vim.uv.now() - math.max(state.last_provider_progress, resumed_at)
       if elapsed >= 30000 then
-        state.wait_notice = ("Waiting for provider or tool update (%ds)"):format(math.floor(elapsed / 1000))
+        state.wait_notice = ("Waiting for provider or tool · %ds without update"):format(math.floor(elapsed / 1000))
         refresh()
       end
     end

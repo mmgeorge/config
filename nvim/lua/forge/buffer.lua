@@ -37,6 +37,13 @@ local function before_or_equal(left, right)
 end
 
 local function validate_metadata(entry, read_row, region_seen)
+  local status = entry.metadata.status
+  if status and status ~= vim.NIL then
+    assert(type(status) == "table" and counter(status.row) < entry.row_count, "status requires a physical row")
+    assert(type(status.animated) == "boolean", "invalid status animation")
+    assert(status.hint == nil or status.hint == vim.NIL or status.hint == "working"
+      or status.hint == "question" or status.hint == "review", "invalid status hint")
+  end
   if entry.metadata.content_node and entry.metadata.content_node ~= vim.NIL then identity(entry.metadata.content_node) end
   local node = entry.metadata.node
   if node and node ~= vim.NIL then

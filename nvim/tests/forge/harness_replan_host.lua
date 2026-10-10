@@ -66,7 +66,7 @@ local success, failure = xpcall(function()
     for _, mark in ipairs(vim.api.nvim_buf_get_extmarks(state.transcript_buf,
       state.presentation.transcript.namespace, 0, -1, { details = true })) do
       local text = vim.api.nvim_buf_get_lines(state.transcript_buf, mark[2], mark[2] + 1, false)[1] or ""
-      if mark[4].hl_group == "ForgeHarnessPlan" and text:find("Awaiting plan review", 1, true) then return true end
+      if mark[4].hl_group == "ForgeHarnessPlan" and text:find("Waiting for plan review", 1, true) then return true end
     end
     return false
   end, "review status did not use Plan purple")
@@ -77,7 +77,7 @@ local success, failure = xpcall(function()
   assert(not state.active_elicitation, "abort retained input status")
   await(function()
     return not table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
-      :find("Awaiting plan review", 1, true)
+      :find("Waiting for plan review", 1, true)
   end, "abort retained the rendered review status")
   submit("/plan")
   await(function() return picker.is_open() end, "replan picker missing")

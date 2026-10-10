@@ -18,7 +18,8 @@ state.active_elicitation = { owner = "interaction", exchange_id = "question-flow
       options = { { label = "Rust CLI", description = "Replace the demo" } }, allow_freeform = true },
   } }, answer = {}, current_index = 0,
 } }
-blocks[#blocks + 1] = { id = "status", text = { "", "Awaiting input" }, metadata = {
+blocks[#blocks + 1] = { id = "status", text = { "", "Waiting for your answer" }, metadata = {
+  status = { row = 1, animated = false, hint = "question" },
   target = { { id = "status:question", range = { start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 } } } },
   decoration = {}, fold = {}, editable_region = {},
 } }

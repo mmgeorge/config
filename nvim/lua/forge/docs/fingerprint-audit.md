@@ -84,7 +84,6 @@ precedence over modification time. Omitted checksums use metadata instead.
 | `forge-harness/rustdoc/resolver.rs::cache_path` | Documentation lookup key. | Produces a bounded, filesystem-safe persistent filename from arbitrary lookup text. Replacing it with file metadata cannot locate the cached item. This is not hashing document contents. |
 | `forge-status/ignored.rs::path` | Repository identity string. | Produces a bounded, filesystem-safe persistent filename for repository-specific ignore settings. It does not scan repository files. |
 | `forge-review/service/{file,document,thread_projection}.rs` and `forge-buffer/markdown.rs` standard hashers | Existing path/row/thread/annotation identifiers and ranges. | Produce compact presentation identifiers for independent blocks and anchors. These are in-memory identifiers, not file-freshness fingerprints or cryptographic content scans. |
-| `views/harness/timeline_status.lua::status_trace` | Serialized trace fields. | This variable is named fingerprint, but it performs direct string equality to suppress duplicate trace events. No hashing or filesystem I/O occurs. |
 
 Cryptographic hashing is therefore absent from AI comparison identity, ordinary
 index observation, revision-page identity, and the Lua diff-syntax cache. It remains

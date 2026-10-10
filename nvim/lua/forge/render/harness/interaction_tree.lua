@@ -76,7 +76,7 @@ end
 local function format_exchange_usage(interaction, metrics)
   local totals = {}
   local reported = vim.tbl_filter(function(turn) return type(turn.usage) == "table" end, interaction.turn or {})
-  for _, field in ipairs({ "input", "cached_input", "reasoning", "output" }) do
+  for _, field in ipairs({ "input", "output" }) do
     local total = 0
     local available = #reported > 0
     for _, turn in ipairs(reported) do
@@ -85,28 +85,20 @@ local function format_exchange_usage(interaction, metrics)
     end
     if available then totals[field] = total end
   end
-  local cached
-  if totals.input and totals.input > 0 and totals.cached_input and totals.cached_input <= totals.input then
-    cached = ("%d%%"):format(math.floor(totals.cached_input / totals.input * 100 + 0.5))
-  end
-  local output
-  if totals.output and totals.reasoning and totals.output >= totals.reasoning then
-    output = totals.output - totals.reasoning
-  end
   local sections = {}
+  if totals.input and totals.output then
+    sections[#sections + 1] = "Tokens " .. format_token_count(totals.input) .. " -> " .. format_token_count(totals.output)
+  elseif totals.input then
+    sections[#sections + 1] = "Tokens in " .. format_token_count(totals.input)
+  elseif totals.output then
+    sections[#sections + 1] = "Tokens out " .. format_token_count(totals.output)
+  end
   if metrics.timing_complete and type(metrics.reported_output_tokens) == "number"
     and metrics.reported_output_tokens > 0
     and type(metrics.reported_response_ms) == "number" and metrics.reported_response_ms > 0 then
-    sections[#sections + 1] = ("~%.0f tok/s"):format(math.floor(metrics.reported_output_tokens * 1000 / metrics.reported_response_ms + 0.5))
+    sections[#sections + 1] = ("%.0f tps"):format(math.floor(metrics.reported_output_tokens * 1000 / metrics.reported_response_ms + 0.5))
   end
-  local tokens = {}
-  if totals.input then
-    tokens[#tokens + 1] = "I " .. format_token_count(totals.input) .. (cached and " (" .. cached .. ")" or "")
-  end
-  if totals.reasoning then tokens[#tokens + 1] = "R " .. format_token_count(totals.reasoning) end
-  if output then tokens[#tokens + 1] = "O " .. format_token_count(output) end
-  if #tokens > 0 then sections[#sections + 1] = table.concat(tokens, " · ") end
-  return table.concat(sections, " │ ")
+  return table.concat(sections, " · ")
 end
 
 --- Formats a concise summary of tool execution counts and failure metrics.
@@ -559,21 +551,16 @@ local function append_exchange_summary(result, interaction, options)
     or interaction.state ~= "running" and interaction.state ~= "finalizing" and interaction.state ~= "queued"
   local paused = interaction.state == "running" and not complete
     and type(interaction.execution_started_at_ms) ~= "number"
-  local tool_count, failed_count, agent_count = 0, 0, 0
-  local agent_seen = {}
+  local tool_count, passed_count = 0, 0
   for _, turn in ipairs(interaction.turn or {}) do
     for _, tool_id in ipairs((turn.tool and turn.tool.order) or {}) do
       local tool = turn.tool.item and turn.tool.item[tool_id]
       if tool then
         tool_count = tool_count + 1
-        if tool_render.failed(tool) then failed_count = failed_count + 1 end
+        local status = tostring(tool.status or ""):lower()
+        if not tool_render.failed(tool) and (status == "completed" or status == "complete"
+          or status == "success" or status == "succeeded") then passed_count = passed_count + 1 end
       end
-    end
-  end
-  for _, node in ipairs(interaction.node_list or {}) do
-    if node.kind == "agent_reference" and not agent_seen[node.agent.child_agent_id] then
-      agent_seen[node.agent.child_agent_id] = true
-      agent_count = agent_count + 1
     end
   end
   local duration_ms = interaction.duration_ms or 0
@@ -590,9 +577,10 @@ local function append_exchange_summary(result, interaction, options)
     end
     tools = duration_format.label(elapsed)
   end
-  local verb = complete and "Thought" or "Thinking"
+  local verb = complete and "Thought" or "Working"
   if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
-    verb = (interaction.awaiting_input or paused) and "Planning paused" or complete and "Planned" or "Planning"
+    local activity = interaction.kind == "plan_revision" and "Revising plan" or "Planning"
+    verb = (interaction.awaiting_input or paused) and (activity .. " paused") or complete and "Planned" or activity
   elseif interaction.kind == "plan_execution" then
     local execution_phase = interaction.execution_phase or {}
     local phase = execution_phase.phase or "implement"
@@ -608,30 +596,20 @@ local function append_exchange_summary(result, interaction, options)
   elseif paused then
     verb = "Paused"
   end
-  local outcome = { cancelled = "Cancelled", finalizing = "Finalizing", interrupted = "Interrupted", failed = "Failed" }
+  local outcome = { cancelled = "Cancelled", finalizing = "Saving exchange", interrupted = "Interrupted", failed = "Failed" }
   verb = outcome[interaction.state] or verb
   local history = { rolled_back = "Rolled back · ", superseded = "Superseded · " }
   local key = ("exchange:%s"):format(interaction.id or interaction.ordinal)
   local expanded = not complete or result.expanded[key] == true
   local summary = ("%s %s%s %ds"):format(
     expanded and "▾" or "▸", history[interaction.disposition] or "", verb, duration)
-  if tools then summary = summary .. (" (%s tools)"):format(tools) end
   local sections = { summary }
+  if tool_count > 0 then
+    sections[#sections + 1] = "Tools " .. (tools and tools .. " · " or "")
+      .. ("%d/%d pass"):format(passed_count, tool_count)
+  end
   local usage = format_exchange_usage(interaction, metrics)
   if usage ~= "" then sections[#sections + 1] = usage end
-  local counts = {}
-  if (metrics.request_count or 0) > 0 then counts[#counts + 1] = ("%d req"):format(metrics.request_count) end
-  if tool_count > 0 then
-    local tools_label = ("%d %s"):format(tool_count, tool_count == 1 and "tool" or "tools")
-    if failed_count > 0 then tools_label = tools_label .. (" (%d failed)"):format(failed_count) end
-    counts[#counts + 1] = tools_label
-  end
-  local activity = table.concat(counts, " · ")
-  if agent_count > 0 then
-    activity = activity .. (activity ~= "" and ", " or "")
-      .. ("%d %s spawned"):format(agent_count, agent_count == 1 and "agent" or "agents")
-  end
-  if activity ~= "" then sections[#sections + 1] = activity end
   summary = table.concat(sections, " │ ")
   if type(interaction.finalization_error) == "string" then
     summary = summary .. " — " .. interaction.finalization_error:gsub("[\r\n]", " ")

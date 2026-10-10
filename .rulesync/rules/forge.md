@@ -110,23 +110,19 @@ until provider metadata arrives. Stream provider events into the transcript
 before the final response, but discard Codex `userMessage` lifecycle echoes
 because the broker already records each admitted user action.
 
-Render every explicit assistant delta and tool lifecycle update on the Neovim
-main loop without coalescing distinct provider events into one visual frame.
-Never classify arbitrary lifecycle string fields as assistant prose. Route
-token-usage notifications into final turn metadata. Render user prompts with
-`>` and aligned continuation rows, omit `You` and `Assistant` labels, indent
-assistant Markdown, and replace the streaming `▸ Thinking…` marker with
-`▸ Thought for <duration>, <tokens>` at completion. Guard snapshots with a
-transcript revision so initialization and state reconciliation cannot flash an
-older empty transcript over optimistic or streamed content.
+Preserve the order of assistant deltas and tool lifecycle updates while publishing
+atomic, incremental frames at the shared presentation cadence. Rust owns durable
+status labels and projects status animation and hint metadata with the row. Lua
+owns transient notices and the spinner. Do not infer animation from text or target
+suffixes. Use Working, Planning, Revising plan, Implementing, Verifying, Resolving,
+and Saving exchange for active work. Animate active work and provider/tool/agent
+waits. Stop animation for user decisions, pause, failure, and idle. Spinner ticks
+update only their extmark and must not rescan or rebuild the transcript.
 
-Normalize each provider tool lifecycle by its stable call ID. Keep complete
-tool output in durable state, but render commands as one Codex-style preview:
-the command, first output line, folded middle-line count, and last output line.
-`oa` expands the native fold to show every real output row. While any request
-runs, append a transient `Working (Ns)` row, update it once per second, keep the
-transcript at the tail unless the user is actively inspecting it, and remove
-the row without persisting it when the request finishes.
+Keep full tool output in durable state. Show the four-line preview only for the
+active/latest tool while its exchange runs. Completed exchanges keep tool output
+collapsed until explicitly opened. Status updates preserve the user's cursor and
+viewport and use the same atomic commit boundary as other buffer changes.
 
 Map `Shift-Tab` in both normal and insert mode to toggle Read and Write approval
 handling through the durable task transition coordinator. Keep approval mode independent
@@ -148,13 +144,14 @@ unsupported-model failure once through a fresh ACP process and session. Preserve
 established sessions and surface actionable provider model guidance instead of
 discarding their context, looping, or silently changing models.
 
-One Harness interaction starts with one admitted user action. Automatic goal
-continuations stay in that interaction until another user action starts the next
-record. Render admitted review actions separately from typed questions so prompt
-navigation remains exact. Keep the 20-total-turn limit and the
-two-consecutive-no-progress guard. A tool call or workspace change resets the
-no-progress count. A failed backend turn pauses the goal before the client
-reconciles durable state, preventing an automatic retry loop.
+Each admitted user action, automatic task continuation, or execution phase starts
+its own persisted exchange with separate metrics. Shared lifecycle formatting uses
+Started for task/phase entry, Continued for automatic continuation, and Resumed for
+work restarted after a pause or interruption. Apply this consistently to planning,
+goals, implementation, verification, and resolution. Planning turn counts remain
+internal. Report the actual continuation or no-progress limit when planning stops.
+Keep existing continuation limits and recovery behavior. Never render internal
+continuation instructions as user prompts.
 
 Native fork must remain capability gated. When the backend or ACP agent cannot
 fork, omit the mapping, hint, help entry, and action. Do not copy transcripts or

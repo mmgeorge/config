@@ -15,7 +15,6 @@ local context_status = require("forge.views.harness.context_status")
 local model_picker = require("forge.views.harness.model_picker")
 local snapshot = require("forge.views.harness.snapshot")
 local picker = require("forge.views.picker")
-local timeline_status = require("forge.views.harness.timeline_status")
 local question_presentation = require("forge.views.harness.question_presentation")
 local recap = require("forge.views.harness.recap")
 local session_navigation = require("forge.views.harness.session_navigation")
@@ -312,9 +311,7 @@ local function render_status_hint(state)
     state.presentation.transcript.restore_recovery = state.restore_recovery
     state.presentation.transcript.recap = state.recap
     state.presentation.transcript.rename_status = state.rename_status
-    state.presentation.transcript.execution_notice = state.presentation.failure or state.execution_notice
-      or state.connection_error or state.sync_error or state.presentation.section_error
-    state.presentation.transcript.wait_notice = require("forge.views.harness.health").wait_notice(state)
+    state.presentation.transcript.status_notice = require("forge.views.harness.health").notice(state)
     if state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
       require("forge.views.harness.status_hint").render(state.presentation.transcript,
         M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
@@ -883,7 +880,7 @@ finish_execution = function(request_error, error_detail)
   end
   if request_error and not (error_detail and error_detail.code == "turn_retracted") then
     state.execution_notice = error_detail and error_detail.code == "turn_cancelled" and "Paused"
-      or ("Stopped: " .. request_error)
+      or ("Stopped · " .. request_error)
   end
   set_busy(false)
   return false
@@ -948,7 +945,7 @@ function M.cancel_turn()
       if state.host_error then return end
       state.cancel_requested = false
       if request_error then
-        state.execution_notice = "Finalization failed: " .. request_error
+        state.execution_notice = "Saving exchange failed · " .. request_error
         notifications.error(request_error, "Harness finalization")
       else
         state.execution_notice = "Paused"
@@ -1061,11 +1058,7 @@ function M.rename_session(name)
   local state = harness_state()
   local model = selected_setting(state, "model")
   require("forge.views.harness.session_name").rename(state, name, model, function()
-    if state.presentation and state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
-      state.presentation.transcript.rename_status = state.rename_status
-      require("forge.views.harness.status_hint").render(state.presentation.transcript,
-        state.command_set or M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
-    end
+    render_status_hint(state)
     M.refresh_winbar()
   end)
 end
@@ -1523,12 +1516,7 @@ function M.submit()
   if text == "/recap" then
     set_composer_text(state.composer_buf, "")
     recap.request(state, function()
-      if state.presentation and state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
-        state.presentation.transcript.restore_recovery = state.restore_recovery
-        state.presentation.transcript.recap = state.recap
-        require("forge.views.harness.status_hint").render(state.presentation.transcript,
-          M.command_set(), vim.api.nvim_win_get_width(state.transcript_win))
-      end
+      render_status_hint(state)
     end)
     return
   end
@@ -2120,7 +2108,9 @@ function M.task_transition(action, submitted_text, completed)
   task_control.transition(state, action, M.render, function(failure)
     if harness_state() ~= state then
       state.busy = false
-      timeline_status.stop(state)
+      if state.presentation and state.presentation.transcript then
+        require("forge.views.harness.status_hint").clear(state.presentation.transcript.buffer)
+      end
       synchronize_state(nil, state)
       return
     end
@@ -2287,7 +2277,6 @@ local function close()
   end
   state.presentation = nil
   recap.clear(state)
-  timeline_status.stop(state)
   local tab_count = vim.fn.tabpagenr("$")
   tabline.clear(state.timeline_tab)
   if tab_count > 1 then

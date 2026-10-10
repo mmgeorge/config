@@ -13,8 +13,8 @@ state.transcript_buf = transcript.buffer
 vim.api.nvim_win_set_buf(state.transcript_win, transcript.buffer)
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 0, block = { {
-    id = "status", text = { "User: Fix background terminal counts", "", "Working (2s)" },
-    metadata = { target = { { id = "status:working", range = {
+    id = "status", text = { "User: Fix background terminal counts", "", "Working · 2s" },
+    metadata = { status = { row = 2, animated = true, hint = "working" }, target = { { id = "status:working", range = {
       start = { row = 2, column = 0 }, ["end"] = { row = 3, column = 0 },
     } } }, decoration = {}, fold = {}, editable_region = {} },
   } },

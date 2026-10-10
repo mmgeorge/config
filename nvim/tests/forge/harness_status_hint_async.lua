@@ -7,6 +7,7 @@ local notices = {}
 local replica = buffer.open("status-hint-async", { notice = function(message) notices[#notices + 1] = message end })
 local function status(text)
   return { id = "status", text = { text }, metadata = {
+    status = { row = 0, animated = true, hint = "working" },
     decoration = {}, fold = {}, editable_region = {}, target = {
       { id = "status:working", range = { start = { row = 0, column = 0 }, ["end"] = { row = 1, column = 0 } } },
     },
@@ -72,7 +73,7 @@ hint.render(replica, commands, 100)
 assert(replica.status == "Desynchronized" and #notices == 1,
   "invalid committed status location did not request recovery")
 assert(notices[1]:find("outside the committed buffer", 1, true))
-replica.execution_notice = "Presentation stopped. Recovering transcript."
+replica.status_notice = { text = "Presentation stopped. Recovering transcript.", animated = false, failed = true }
 hint.render(replica, commands, 100)
 local stopped = vim.api.nvim_buf_get_extmark_by_id(replica.buffer, namespace, 1, { details = true })
 assert(stopped[3].virt_lines and not stopped[3].sign_text, "failure retained a working spinner")

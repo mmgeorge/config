@@ -21,8 +21,8 @@ local function displayed()
 end
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 0, block = { {
-    id = "status", text = { "", "Awaiting plan review · revision 1" },
-    metadata = { target = { { id = "status:review-plan", range = {
+    id = "status", text = { "", "Waiting for plan review · revision 1" },
+    metadata = { status = { row = 1, animated = false, hint = "review" }, target = { { id = "status:review-plan", range = {
       start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
     } } }, decoration = {}, fold = {}, editable_region = {} },
   } },
@@ -49,7 +49,7 @@ assert(displayed() == "", "review hint must disappear when the status changes")
 assert(buffer.apply_snapshot(transcript, {
   document = transcript.document, revision = 2, block = { {
     id = "status", text = { "", "Working · 2s · Inspecting repository structure" },
-    metadata = { target = { { id = "status:working", range = {
+    metadata = { status = { row = 1, animated = true, hint = "working" }, target = { { id = "status:working", range = {
       start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
     } } }, decoration = {}, fold = {}, editable_region = {} },
   } },
@@ -89,7 +89,7 @@ for _, mode in ipairs({ "read", "write", "yolo", "plan" }) do
   assert(colored[1][4].sign_hl_group == capture, "spinner differs from Working text")
 end
 state.session = original_session
-transcript.execution_notice = "Host stopped. Reopen Harness to reconnect."
+transcript.status_notice = { text = "Host stopped. Reopen Harness to reconnect.", animated = false, failed = true }
 hint.render(transcript, command_set, 120)
 local stopped = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
 assert(#stopped == 1 and not stopped[1][4].sign_text, "stopped host retained a spinner or interrupt hint")
@@ -97,21 +97,21 @@ assert(stopped[1][4].virt_text[1][1]:find("Host stopped", 1, true))
 vim.wait(150, function() return false end, 25)
 assert(vim.deep_equal(stopped, vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })),
   "stopped host retained its animation timer")
-transcript.execution_notice = nil
-transcript.wait_notice = "Awaiting approval"
+transcript.status_notice = nil
+transcript.status_notice = { text = "Waiting for your approval", animated = false }
 for _ = 1, 3 do
   hint.render(transcript, command_set, 120)
   local waiting = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
   assert(#waiting == 1 and not waiting[1][4].sign_text, "approval wait retained a working spinner")
-  assert(waiting[1][4].virt_text[1][1]:find("Awaiting approval", 1, true))
+  assert(waiting[1][4].virt_text[1][1]:find("Waiting for your approval", 1, true))
   assert(waiting[1][4].virt_text[1][2] == "ForgeStatusHint", "approval wait used failure styling")
 end
-transcript.execution_notice = "Connection lost"
+transcript.status_notice = { text = "Connection lost", animated = false, failed = true }
 hint.render(transcript, command_set, 120)
 local failed = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
 assert(failed[1][4].virt_text[1][1]:find("Connection lost", 1, true))
 assert(failed[1][4].virt_text[1][2] == "ForgeHarnessToolFailure", "approval hid a connection failure")
-transcript.execution_notice, transcript.wait_notice = nil, nil
+transcript.status_notice = nil
 hint.render(transcript, command_set, 120)
 assert(vim.wait(500, function()
   local _, current = working_marks()
@@ -164,11 +164,11 @@ hint.render(transcript, command_set, 120)
 assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working · 2s · Inspecting repository structure",
   "terminal status modified the exchange clock")
 for revision, phase in ipairs({ "review-plan", "working" }) do
-  local label = phase == "working" and "Working · 1s" or "Awaiting plan review"
+  local label = phase == "working" and "Working · 1s" or "Waiting for plan review"
   assert(buffer.apply_snapshot(transcript, {
     document = transcript.document, revision = revision + 2, block = { {
       id = "status", text = { "", label },
-      metadata = { target = { { id = "status:" .. phase, range = {
+      metadata = { status = { row = 1, animated = phase == "working", hint = phase == "working" and "working" or "review" }, target = { { id = "status:" .. phase, range = {
         start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
       } } }, decoration = {}, fold = {}, editable_region = {} },
     } },
@@ -223,8 +223,8 @@ local question_transcript = buffer.open("question-status-hint", {})
 commands.register(command_set, "reopen_question", function() end)
 assert(buffer.apply_snapshot(question_transcript, {
   document = question_transcript.document, revision = 0, block = { {
-    id = "status", text = { "", "Awaiting input" },
-    metadata = { target = { { id = "status:question", range = {
+    id = "status", text = { "", "Waiting for your answer" },
+    metadata = { status = { row = 1, animated = false, hint = "question" }, target = { { id = "status:question", range = {
       start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
     } } }, decoration = {}, fold = {}, editable_region = {} },
   } },
@@ -249,7 +249,7 @@ local details = buffer.open("implementation-details-hint", {})
 assert(buffer.apply_snapshot(details, {
   document = details.document, revision = 0, block = {
     { id = "status", text = { "", "Implementing · 133s · 1 file needs attention" },
-      metadata = { decoration = {}, fold = {}, editable_region = {}, target = { { id = "status:working", range = {
+      metadata = { status = { row = 1, animated = true, hint = "working" }, decoration = {}, fold = {}, editable_region = {}, target = { { id = "status:working", range = {
         start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
       } } } } },
     { id = "status:implementation:execution", text = { "Implementation details", "src/player.rs", "move_player differs" },

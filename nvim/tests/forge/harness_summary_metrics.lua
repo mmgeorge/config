@@ -28,63 +28,80 @@ local ok, failure = pcall(function()
     end
     error("exchange summary is missing")
   end
-  assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1400 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1400 tps")
   exchange.metrics.tool_duration_ms = 439
   exchange.metrics.reported_response_ms = 5561
-  assert_equals(summary(), "▸ Thought 6s (439ms tools) │ ~755 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s │ Tools 439ms · 0/1 pass │ Tokens 76.0k -> 4.2k · 755 tps")
   exchange.metrics.tool_duration_ms = 2500
   exchange.metrics.reported_response_ms = 3500
-  assert_equals(summary(), "▸ Thought 6s (2.5s tools) │ ~1200 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s │ Tools 2.5s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1200 tps")
   exchange.metrics.tool_duration_ms = 3000
   exchange.metrics.reported_response_ms = 3000
   exchange.duration_ms = 6500
-  assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1400 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1400 tps")
   exchange.duration_ms = 3500
-  assert_equals(summary(), "▸ Thought 3s (3s tools) │ ~1400 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 3s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1400 tps")
   exchange.duration_ms = 3000
-  assert_equals(summary(), "▸ Thought 3s (3s tools) │ ~1400 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 3s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1400 tps")
   exchange.duration_ms = 6000
   exchange.turn[1].usage.output = 4251
   exchange.metrics.reported_output_tokens = 4251
-  assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1417 tok/s │ I 76.0k (90%) · R 3.0k · O 1.3k │ 1 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.3k · 1417 tps")
   exchange.turn[1].usage.output = 4200
   exchange.turn[2] = { id = "second", usage = { input = 4000, cached_input = 0, reasoning = 0, output = 100 }, tool = { order = {}, item = {} } }
   exchange.metrics.request_count = 2
   exchange.metrics.reported_output_tokens = 4300
-  assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1433 tok/s │ I 80.0k (86%) · R 3.0k · O 1.3k │ 2 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s │ Tools 3s · 0/1 pass │ Tokens 80.0k -> 4.3k · 1433 tps")
   exchange.turn[2].usage.reasoning = vim.NIL
-  assert_equals(summary(), "▸ Thought 6s (3s tools) │ ~1433 tok/s │ I 80.0k (86%) │ 2 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s │ Tools 3s · 0/1 pass │ Tokens 80.0k -> 4.3k · 1433 tps")
   exchange.turn[2].usage = vim.NIL
   exchange.metrics.timing_complete = false
-  assert_equals(summary(), "▸ Thought 6s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 2 req · 1 tool (1 failed)")
+  assert_equals(summary(), "▸ Thought 6s │ Tools 0/1 pass │ Tokens 76.0k -> 4.2k")
   exchange.state = "running"
   exchange.completed_at_ms = vim.NIL
   exchange.execution_started_at_ms = 10000
   exchange.metrics.timing_complete = true
   exchange.metrics.blocked_started_ms = 6000
   exchange.metrics.tool_started_ms = 6000
-  assert_equals(summary({ now_ms = 12000 }), "▾ Thinking 8s (5s tools) │ ~1433 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 2 req · 1 tool (1 failed)")
+  assert_equals(summary({ now_ms = 12000 }), "▾ Working 8s │ Tools 5s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1433 tps")
   exchange.execution_started_at_ms = vim.NIL
-  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s (3s tools) │ ~1433 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 2 req · 1 tool (1 failed)")
+  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1433 tps")
   exchange.metrics.request_count = 0
-  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s (3s tools) │ ~1433 tok/s │ I 76.0k (90%) · R 3.0k · O 1.2k │ 1 tool (1 failed)")
+  assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1433 tps")
   exchange.metrics = { timing_complete = true, request_count = 0 }
   exchange.turn = {}
   assert_equals(summary(), "▾ Paused 6s")
   exchange.metrics.request_count = 1
-  assert_equals(summary(), "▾ Paused 6s │ 1 req")
+  assert_equals(summary(), "▾ Paused 6s")
   exchange.turn = { { id = "partial", usage = { input = 1000, output = 100 } } }
-  assert_equals(summary(), "▾ Paused 6s │ I 1.0k │ 1 req")
+  assert_equals(summary(), "▾ Paused 6s │ Tokens 1.0k -> 100")
   exchange.turn[1].usage = { reasoning = 23 }
-  assert_equals(summary(), "▾ Paused 6s │ R 23 │ 1 req")
+  assert_equals(summary(), "▾ Paused 6s")
   exchange.turn[1].usage = { input = 1000, cached_input = 0, reasoning = 0, output = 0 }
   exchange.metrics.reported_output_tokens = 0
   exchange.metrics.reported_response_ms = 2000
-  assert_equals(summary(), "▾ Paused 6s │ I 1.0k (0%) · R 0 · O 0 │ 1 req")
+  assert_equals(summary(), "▾ Paused 6s │ Tokens 1.0k -> 0")
   exchange.turn = {}
   exchange.metrics = { request_count = 0 }
   exchange.node_list = { { kind = "agent_reference", agent = { child_agent_id = "child" } } }
-  assert_equals(summary(), "▾ Paused 6s │ 1 agent spawned")
+  assert_equals(summary(), "▾ Paused 6s")
+  exchange.kind, exchange.state = "plan_draft", "complete"
+  exchange.duration_ms, exchange.completed_at_ms = 44000, 44000
+  exchange.node_list = {}
+  exchange.metrics = { timing_complete = true, tool_duration_ms = 4000,
+    reported_output_tokens = 7906, reported_response_ms = 40132 }
+  local calls = { order = {}, item = {} }
+  for index = 1, 20 do
+    local id = tostring(index)
+    calls.order[index] = id
+    calls.item[id] = { id = id, status = index == 20 and "failed" or "completed", failed = index == 20 }
+  end
+  exchange.turn = { { id = "compact", usage = { input = 855100, output = 7906, reasoning = 906 }, tool = calls } }
+  assert_equals(summary(), "▸ Planned 44s │ Tools 4s · 19/20 pass │ Tokens 855.1k -> 7.9k · 197 tps")
+  calls.item["1"].status = "running"
+  assert(summary():find("18/20 pass", 1, true), "running tools must not count as passed")
+  calls.item["1"].status = "cancelled"
+  assert(summary():find("18/20 pass", 1, true), "cancelled tools must not count as passed")
   assert_equals(renderer.foldtext("▸ Thought 6s (3s)")[1][2], "ForgeHarnessThought")
 end)
 

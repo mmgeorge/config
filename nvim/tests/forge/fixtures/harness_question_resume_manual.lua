@@ -31,11 +31,12 @@ controller.render = function()
   local text = {
     "▸ Plan out a new one",
     explanation and "○ Choose a Rust CLI replacement or a redesigned TypeScript demo." or "○ The migration scope determines the implementation.",
-    "", state.busy and "Working (1s)" or "Awaiting input",
+    "", state.busy and "Working · 1s" or "Waiting for your answer",
   }
   assert(buffer.apply_snapshot(transcript, {
     document = transcript.document, revision = revision,
     block = { { id = "status", text = text, metadata = {
+      status = { row = 3, animated = state.busy == true, hint = state.busy and "working" or "question" },
       target = { { id = state.busy and "status:working" or "status:question", range = {
         start = { row = 3, column = 0 }, ["end"] = { row = 4, column = 0 },
       } } }, decoration = {}, fold = {}, editable_region = {},

@@ -12,6 +12,90 @@ use crate::{
 pub enum WorkflowActivity {
     Working,
     Planning,
+    Revising,
+    Implementing,
+    Verifying,
+    Resolving,
+    Goal,
+}
+
+impl WorkflowActivity {
+    /// Label an active exchange and its live status with the same activity.
+    pub fn active_label(self) -> &'static str {
+        match self {
+            Self::Working | Self::Goal => "Working",
+            Self::Planning => "Planning",
+            Self::Revising => "Revising plan",
+            Self::Implementing => "Implementing",
+            Self::Verifying => "Verifying",
+            Self::Resolving => "Resolving",
+        }
+    }
+
+    /// Label an exchange whose activity finished.
+    pub fn completed_label(self) -> &'static str {
+        match self {
+            Self::Working | Self::Goal => "Thought",
+            Self::Planning | Self::Revising => "Planned",
+            Self::Implementing => "Implemented",
+            Self::Verifying => "Verified",
+            Self::Resolving => "Resolved",
+        }
+    }
+
+    /// Name the task phase independently of its transition.
+    pub fn lifecycle_label(self) -> &'static str {
+        match self {
+            Self::Working => "Work",
+            Self::Planning => "Planning",
+            Self::Revising => "Plan revision",
+            Self::Implementing => "Plan implementation",
+            Self::Verifying => "Plan verification",
+            Self::Resolving => "Plan resolution",
+            Self::Goal => "Goal",
+        }
+    }
+
+    /// Render a persisted task lifecycle event.
+    pub fn event(self, action: LifecycleAction) -> String {
+        format!("{} {}", self.lifecycle_label(), action.label())
+    }
+
+    /// Resolve activity from the exchange kind and execution phase.
+    pub fn from_exchange(exchange: &Exchange) -> Self {
+        match exchange.kind {
+            ExchangeKind::PlanDraft => Self::Planning,
+            ExchangeKind::PlanRevision => Self::Revising,
+            ExchangeKind::PlanExecution => exchange.execution_phase.as_ref()
+                .map_or(Self::Implementing, |phase| phase.phase.into()),
+            ExchangeKind::Chat if exchange.goal_id.is_some() => Self::Goal,
+            ExchangeKind::Chat => Self::Working,
+        }
+    }
+}
+
+impl From<PlanPhase> for WorkflowActivity {
+    fn from(phase: PlanPhase) -> Self {
+        match phase {
+            PlanPhase::Implement => Self::Implementing,
+            PlanPhase::Verify => Self::Verifying,
+            PlanPhase::Resolve => Self::Resolving,
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+/// Distinguishes entry, automatic continuation, and explicit resumption.
+pub enum LifecycleAction { Started, Continued, Resumed }
+
+impl LifecycleAction {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Started => "started",
+            Self::Continued => "continued",
+            Self::Resumed => "resumed",
+        }
+    }
 }
 
 /// Represents the authoritative workflow phase exposed to one session timeline.
@@ -45,10 +129,12 @@ pub enum SessionPhase {
         turn: u32,
         max_turn: u32,
         started_at_ms: i64,
+        activity: WorkflowActivity,
     },
     PlanningFailed {
         plan_id: String,
         turn_count: u32,
+        reason: String,
     },
     WaitingForAgent {
         agent_count: usize,
@@ -88,6 +174,13 @@ impl SessionPhase {
             return Self::PlanningFailed {
                 plan_id: plan.id.clone(),
                 turn_count: plan.generation.budget.turn_count,
+                reason: if plan.generation.budget.turn_count >= plan.generation.budget.max_turn_count {
+                    "continuation limit reached"
+                } else if plan.generation.budget.consecutive_no_progress >= plan.generation.budget.max_consecutive_no_progress {
+                    "no progress limit reached"
+                } else {
+                    "planning could not finish"
+                }.into(),
             };
         }
         if let Some(plan) = active_plan
@@ -140,12 +233,7 @@ impl SessionPhase {
         let working = exchange
             .filter(|exchange| exchange.state == ExchangeState::Running)
             .map(|exchange| {
-                let activity = match exchange.kind {
-                    ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => {
-                        WorkflowActivity::Planning
-                    }
-                    ExchangeKind::Chat | ExchangeKind::PlanExecution => WorkflowActivity::Working,
-                };
+                let activity = WorkflowActivity::from_exchange(exchange);
                 (
                     exchange
                         .execution_started_at_ms
@@ -154,7 +242,7 @@ impl SessionPhase {
                     exchange.latest_reasoning_summary().map(str::to_owned),
                 )
             });
-        if let (Some(plan), Some((started_at_ms, WorkflowActivity::Planning, _))) = (
+        if let (Some(plan), Some((started_at_ms, activity @ (WorkflowActivity::Planning | WorkflowActivity::Revising), _))) = (
             active_plan.filter(|plan| {
                 matches!(plan.state, PlanState::Generating | PlanState::Revising)
                     && plan.generation.budget.turn_count > 0
@@ -166,6 +254,7 @@ impl SessionPhase {
                 turn: plan.generation.budget.turn_count + 1,
                 max_turn: plan.generation.budget.max_turn_count,
                 started_at_ms: *started_at_ms,
+                activity: *activity,
             };
         }
         if let Some(wait) = active_wait {
@@ -242,6 +331,29 @@ mod test {
         exchange.kind = ExchangeKind::PlanDraft;
         exchange.resume(42).unwrap();
         exchange
+    }
+
+    #[test]
+    fn planning_retries_preserve_creation_and_revision_activity() {
+        for (kind, state, activity) in [
+            (ExchangeKind::PlanDraft, PlanState::Generating, WorkflowActivity::Planning),
+            (ExchangeKind::PlanRevision, PlanState::Revising, WorkflowActivity::Revising),
+        ] {
+            let mut exchange = exchange();
+            exchange.kind = kind;
+            let mut plan = plan(state);
+            plan.generation.budget.observe(true);
+            assert!(matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
+                SessionPhase::RetryingPlanGeneration { activity: actual, .. } if actual == activity));
+            plan.state = PlanState::Failed;
+            plan.generation.budget.turn_count = plan.generation.budget.max_turn_count;
+            assert!(matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
+                SessionPhase::PlanningFailed { reason, .. } if reason == "continuation limit reached"));
+            plan.generation.budget.turn_count = 2;
+            plan.generation.budget.consecutive_no_progress = plan.generation.budget.max_consecutive_no_progress;
+            assert!(matches!(SessionPhase::resolve(Some(&plan), None, Some(&exchange)),
+                SessionPhase::PlanningFailed { reason, .. } if reason == "no progress limit reached"));
+        }
     }
 
     #[test]
@@ -336,6 +448,7 @@ mod test {
                 plan_id: "plan".into(),
                 turn: 2,
                 max_turn: 20,
+                activity: WorkflowActivity::Planning,
                 started_at_ms: 42,
             }
         );
