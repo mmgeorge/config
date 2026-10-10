@@ -101,10 +101,17 @@ impl ControlToolRegistry {
                     ("summary", string_schema()),
                     ("verification", strict_object_input_schema(vec![
                         ("outcome", json!({"type":"string","enum":["passed","failed","blocked"]})),
+                        ("checks", json!({"type":"array","description":"One result per accepted automated command and manual check, in plan order. Use the exact command or manual check label. Do not repeat these results in findings.","items":strict_object_input_schema(vec![
+                            ("category", json!({"type":"string","enum":["automated","manual"]})),
+                            ("label", string_schema()),
+                            ("outcome", json!({"type":"string","enum":["passed","failed","blocked"]})),
+                            ("summary", string_schema()),
+                            ("evidence", json!({"type":"array","items":{"type":"string"}}))
+                        ], &["category","label","outcome","summary","evidence"])})),
                         ("evidence", json!({"type":"array","description":"Exact completed tool-call IDs from harness_plan_read execution.verification_evidence", "items":{"type":"string"}})),
                         ("findings", json!({"type":"array","items":{"type":"string"}})),
                         ("reason", string_schema()), ("reuse_reason", string_schema())
-                    ], &["outcome"]))
+                    ], &["outcome","checks"]))
                 ], &["phase","revision","summary"]),
             },
             ControlToolDefinition {

@@ -48,6 +48,8 @@ pub enum VerificationOutcome {
 pub struct VerificationReport {
     pub outcome: VerificationOutcome,
     #[serde(default)]
+    pub checks: Vec<VerificationCheck>,
+    #[serde(default)]
     pub evidence: Vec<String>,
     #[serde(default)]
     pub findings: Vec<String>,
@@ -55,6 +57,55 @@ pub struct VerificationReport {
     pub reason: Option<String>,
     #[serde(default)]
     pub reuse_reason: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Identifies the accepted plan's verification group.
+pub enum VerificationCategory {
+    Automated,
+    Manual,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+#[serde(deny_unknown_fields)]
+/// Records one planned check and the tool evidence supporting its result.
+pub struct VerificationCheck {
+    pub category: VerificationCategory,
+    pub label: String,
+    pub outcome: VerificationOutcome,
+    pub summary: String,
+    #[serde(default)]
+    pub evidence: Vec<String>,
+}
+
+impl VerificationReport {
+    /// Validate check identities and evidence before a phase transition is committed.
+    pub(crate) fn validate_checks(&self, automated: &str) -> Result<()> {
+        let commands = automated.lines().map(str::trim).filter(|line| !line.is_empty()).collect::<Vec<_>>();
+        let mut seen = BTreeSet::new();
+        let mut previous_command = None;
+        for check in &self.checks {
+            ensure!(!check.label.trim().is_empty() && !check.summary.trim().is_empty(),
+                "verification checks require a label and result summary");
+            let automated = check.category == VerificationCategory::Automated;
+            ensure!(seen.insert((automated, check.label.as_str())), "duplicate verification check: {}", check.label);
+            if automated {
+                let position = commands.iter().position(|command| *command == check.label.trim())
+                    .with_context(|| format!("verification command is not in the accepted plan: {}", check.label))?;
+                ensure!(previous_command.is_none_or(|previous| previous < position),
+                    "report automated commands in accepted plan order");
+                previous_command = Some(position);
+                ensure!(check.outcome == VerificationOutcome::Blocked || !check.evidence.is_empty(),
+                    "executed command requires tool evidence: {}", check.label);
+            }
+        }
+        if !self.checks.is_empty() {
+            ensure!(commands.iter().all(|command| seen.contains(&(true, *command))),
+                "report every accepted automated command, including blocked commands");
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -77,6 +128,17 @@ pub struct SemanticProgress {
     pub unverified: Vec<String>,
     pub warning: Vec<String>,
     pub source_digest: BTreeMap<String, String>,
+    #[serde(default)]
+    pub declaration_changes: Vec<DeclarationMismatch>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+/// Retains an accepted-to-observed declaration patch at verification time.
+pub struct DeclarationMismatch {
+    pub path: String,
+    pub name: String,
+    pub diff: String,
+    pub finding: String,
 }
 
 impl SemanticProgress {
@@ -110,11 +172,18 @@ impl SemanticProgress {
                 (None, Some(_)) => progress
                     .different
                     .push(format!("{path}: planned deletion still exists")),
-                (Some(_), None) => progress.missing.push(path),
+                (Some(expected), None) => {
+                    progress.declaration_changes.push(super::conformance::declaration_mismatch(
+                        &path, "Missing file", expected, "", "missing planned file")?);
+                    progress.missing.push(path);
+                }
                 (Some(expected), Some(source)) => {
-                    match super::conformance::compare_in_workspace(workspace, &path, expected, &source) {
-                        Ok(differences) if differences.is_empty() => progress.matched.push(path),
-                        Ok(differences) => progress.different.extend(differences.into_iter().map(|difference| format!("{path}: {difference}"))),
+                    match super::conformance::inspect_in_workspace(workspace, &path, expected, &source) {
+                        Ok((differences, changes)) => {
+                            progress.declaration_changes.extend(changes);
+                            if differences.is_empty() { progress.matched.push(path); }
+                            else { progress.different.extend(differences.into_iter().map(|difference| format!("{path}: {difference}"))); }
+                        }
                         Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
                     }
                 }
@@ -252,6 +321,8 @@ impl PlanExecutionRecord {
                 .context("Verify requires a verification assessment")?;
             match report.outcome {
                 VerificationOutcome::Passed => {
+                    ensure!(report.checks.iter().all(|check| check.outcome == VerificationOutcome::Passed),
+                        "a passed assessment cannot contain failed or blocked checks");
                     ensure!(
                         report.findings.is_empty(),
                         "a passed assessment cannot retain unresolved findings"
@@ -274,11 +345,15 @@ impl PlanExecutionRecord {
                         report
                             .findings
                             .iter()
-                            .any(|finding| !finding.trim().is_empty()),
+                            .any(|finding| !finding.trim().is_empty())
+                            || report.checks.iter().any(|check| check.outcome == VerificationOutcome::Failed),
                         "failed verification requires concrete findings"
                     );
                     self.phase = PlanPhase::Resolve;
                     self.findings = report.findings.clone();
+                    self.findings.extend(report.checks.iter()
+                        .filter(|check| check.outcome != VerificationOutcome::Passed)
+                        .map(|check| format!("{}: {}", check.label, check.summary)));
                     self.findings.extend(progress.findings());
                 }
                 VerificationOutcome::Blocked => {
@@ -331,8 +406,11 @@ impl PlanExecutionRecord {
                 "Assess the implementation against the accepted contract and collect all findings together. Harness checks required declaration shapes and public API, permits additional internal helpers, and reports Calls/Accesses separately without gating completion. Do not edit the plan in Verify. Send contract changes and code defects to Resolve. Read plan.json with harness_plan_read and verify its verification requirements and tests inventory. Confirm each new, modified, or reused test is covered by the executed checks, and confirm removed tests were intentionally removed. Do not treat a listed test as evidence that it ran. Run each nonblank line of verification.automated as a separate command in the project workspace, in listed order, using normal execution tools and permissions. Perform every verification.manual check and record the observed result. Report blocked when a required check cannot be performed, including checks requiring user action. Do not claim passed with outstanding checks. After running checks, call harness_plan_read with only plan_id to retrieve execution.verification_evidence. Use its exact tool IDs in verification.evidence, not command descriptions or output text. Select affected checks to rerun and justify any reused evidence. Report passed, failed, or blocked with evidence and concrete findings."
             }
         };
+        let reporting = if self.phase == PlanPhase::Verify {
+            " Report verification.checks with one entry per accepted automated command and manual check, in plan order. Each entry contains category (automated or manual), the exact command or manual check label, outcome (passed, failed, or blocked), a concise result summary, and evidence tool IDs. Include checks that could not run as blocked with a concrete reason. Put only additional unresolved findings in verification.findings, without repeating check summaries or Harness declaration diagnostics. The UI renders the structured report. Keep the final response brief instead of repeating the inventory."
+        } else { "" };
         format!(
-            "{work} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Do not call harness_goal_complete for this execution.",
+            "{work}{reporting} Phase: {:?}. Accepted revision: {}. Read the target with harness_plan_read. Call harness_plan_phase_done with this phase and revision when its work is finished, then end the turn after success. Harness commits the transition and supplies the next phase. Ending a turn alone does not end the phase. Do not call harness_goal_complete for this execution.",
             self.phase, self.revision
         )
     }
@@ -414,6 +492,24 @@ impl ExecutionControlSender {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn structured_checks_require_planned_commands_and_real_evidence() {
+        let mut report: VerificationReport = serde_json::from_value(json!({
+            "outcome":"failed", "checks":[
+                {"category":"automated","label":"cargo test","outcome":"passed","summary":"8 passed","evidence":["tool-test"]},
+                {"category":"automated","label":"cargo check","outcome":"failed","summary":"Compilation failed","evidence":["tool-check"]},
+                {"category":"manual","label":"Open window","outcome":"blocked","summary":"Build failed","evidence":[]}
+            ]
+        })).unwrap();
+        assert!(report.validate_checks("cargo test\ncargo check").is_ok());
+        assert!(report.validate_checks("cargo check\ncargo test").is_err());
+        assert!(report.validate_checks("cargo test\ncargo check\ncargo fmt").is_err());
+        report.checks[0].evidence.clear();
+        assert!(report.validate_checks("cargo test\ncargo check").is_err());
+        report.checks[0].outcome = VerificationOutcome::Blocked;
+        assert!(report.validate_checks("cargo test\ncargo check").is_ok());
+    }
+
     use super::*;
 
     fn execution() -> PlanExecutionRecord {
@@ -498,6 +594,7 @@ mod tests {
                     None
                 },
                 reuse_reason: None,
+                checks: Vec::new(),
             }),
         }
     }

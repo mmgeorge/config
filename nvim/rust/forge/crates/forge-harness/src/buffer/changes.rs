@@ -33,6 +33,25 @@ fn file_action(path: &str, line: usize, previous: bool, declaration: Option<(&cr
 }
 
 impl ChangeTree {
+    /// Render one captured declaration change using the shared file and hunk projection.
+    pub fn declaration(renderer: &TranscriptRenderer<'_>, id: &str, name: &str, patch: &str) -> Result<Self> {
+        let mut tree = Self::render(renderer, id, name, "", patch, None, None)?;
+        if tree.block.len() < 2 { return Ok(tree); }
+        tree.block.remove(0);
+        tree.action.clear();
+        for block in &mut tree.block { block.metadata.target.clear(); }
+        let heading = &mut tree.block[0];
+        let mut replacement = renderer.literal(heading.id.clone(), &format!("▸ {name}"), 2)?;
+        replacement.metadata.fold = std::mem::take(&mut heading.metadata.fold);
+        replacement.metadata.node = heading.metadata.node.take();
+        TranscriptRenderer::fold_marker(&mut replacement);
+        let target = TargetId(replacement.id.0.clone());
+        replacement.metadata.target.push(TargetRange { id: target.clone(), range: whole_block(&replacement) });
+        tree.action.insert(target, TranscriptAction::Diff { text: patch.into() });
+        tree.block[0] = replacement;
+        Ok(tree)
+    }
+
     /// Retain file and hunk rows under stable folds while preserving the raw patch action.
     pub fn render(
         renderer: &TranscriptRenderer<'_>,

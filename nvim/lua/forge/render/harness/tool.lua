@@ -1,25 +1,19 @@
 local M = {}
 local duration = require("forge.render.harness.duration")
 
---- Splits text into wrapped substrings based on display column width.
----@param text string Content text string to wrap.
----@param width integer Maximum column width.
----@return string[] lines Array of wrapped text line fragments.
-local function split_display_width(text, width)
-  local line_list = {}
+--- Keeps a heading within its display width without adding continuation rows.
+---@param text string
+---@param width? integer
+---@return string
+local function truncate_heading(text, width)
+  if not width or vim.fn.strdisplaywidth(text) <= width then return text end
   local fragment = ""
-  local char_count = vim.fn.strchars(text)
-  for char_index = 0, char_count - 1 do
+  for char_index = 0, vim.fn.strchars(text) - 1 do
     local character = vim.fn.strcharpart(text, char_index, 1)
-    if fragment ~= "" and vim.fn.strdisplaywidth(fragment .. character) > width then
-      line_list[#line_list + 1] = fragment
-      fragment = character
-    else
-      fragment = fragment .. character
-    end
+    if vim.fn.strdisplaywidth(fragment .. character .. "…") > width then break end
+    fragment = fragment .. character
   end
-  if fragment ~= "" then line_list[#line_list + 1] = fragment end
-  return line_list
+  return fragment .. "…"
 end
 
 --- Tokenizes a command string into commands, options, and arguments with highlight categories.
@@ -79,65 +73,24 @@ local function mcp_title_parts(title)
   return name or title, arguments
 end
 
---- Generates formatted heading lines for a tool invocation with optional column wrapping.
----@param tool table Tool descriptor table.
----@param width? integer Maximum display column width.
----@param indent? string Leading indentation string.
----@param now_ms? number Current render timestamp in milliseconds.
----@return table[] lines Array of `{ text: string, command?: string, command_offset?: integer, title_fragment?: string }` line records.
+--- Renders one width-bounded invocation heading.
+---@param tool table
+---@param width? integer
+---@param indent? string
+---@param now_ms? number
+---@return table[]
 function M.heading_lines(tool, width, indent, now_ms)
-  local leading = indent or ""
-  if tool.kind ~= "command" then
-    local heading = M.heading(tool, now_ms)
-    if tool.kind ~= "tool_call" or not width or vim.fn.strdisplaywidth(leading .. heading) <= width then
-      return { {
-        text = leading .. heading,
-        title_fragment = tool.kind == "tool_call" and (tool.title or "tool") or nil,
-      } }
-    end
-    local duration = tool_duration(tool, now_ms)
-    local title = tool.title or "tool"
-    local title_prefix = leading .. "  └ "
-    local continuation_prefix = leading .. "    "
-    local title_width = math.max(1, width - vim.fn.strdisplaywidth(title_prefix))
-    local title_line_list = split_display_width(title, title_width)
-    local line_list = { { text = leading .. "• " .. duration } }
-    for line_index, line in ipairs(title_line_list) do
-      local prefix = line_index == 1 and title_prefix or continuation_prefix
-      line_list[#line_list + 1] = { text = prefix .. line, title_fragment = line }
-    end
-    return line_list
-  end
-
-  local command = M.display_command(tool.title or "command")
-  if not width or width < 20 then
-    local text = leading .. "• " .. tool_duration(tool, now_ms) .. " " .. command
-    return { { text = text, command = command, command_offset = #text - #command } }
-  end
-  local current = leading .. "• " .. tool_duration(tool, now_ms) .. " "
-  local command_fragment = ""
-  local line_list = {}
-  for word in command:gmatch("%S+") do
-    local separator = command_fragment == "" and "" or " "
-    if command_fragment ~= "" and vim.fn.strdisplaywidth(current .. separator .. word) > width then
-      line_list[#line_list + 1] = {
-        text = current,
-        command = command_fragment,
-        command_offset = #current - #command_fragment,
-      }
-      current = leading .. word
-      command_fragment = word
-    else
-      current = current .. separator .. word
-      command_fragment = command_fragment .. separator .. word
-    end
-  end
-  line_list[#line_list + 1] = {
-    text = current,
-    command = command_fragment,
-    command_offset = #current - #command_fragment,
-  }
-  return line_list
+  local title = tool.kind == "command" and M.display_command(tool.title or "command") or (tool.title or "tool")
+  title = title:gsub("%s+", " ")
+  local prefix = (indent or "") .. "• " .. tool_duration(tool, now_ms) .. " "
+  local text = truncate_heading(prefix .. title, width)
+  local fragment = text:sub(#prefix + 1)
+  return { {
+    text = text,
+    command = tool.kind == "command" and fragment or nil,
+    command_offset = tool.kind == "command" and math.min(#prefix, #text) or nil,
+    title_fragment = tool.kind == "tool_call" and fragment or nil,
+  } }
 end
 
 --- Strips outer PowerShell command-line wrappers to display the underlying command.

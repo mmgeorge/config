@@ -9,6 +9,7 @@ use super::{DeclarationOverview, SyntaxError, SyntaxLanguage};
 pub struct ContractDeclaration {
     pub identity: String,
     pub signature: String,
+    pub text: String,
     pub exposed: bool,
     pub position: Option<(u32, u32)>,
 }
@@ -17,6 +18,14 @@ pub struct ContractDeclaration {
 #[derive(Clone, Debug, Default)]
 pub struct DeclarationContract {
     pub declaration: BTreeMap<String, Vec<ContractDeclaration>>,
+}
+
+/// A required contract difference with readable, body-free source on both sides.
+pub struct ContractDifference {
+    pub identity: String,
+    pub message: String,
+    pub expected: String,
+    pub observed: String,
 }
 
 impl DeclarationContract {
@@ -59,6 +68,11 @@ impl DeclarationContract {
 
     /// Compare required declarations while allowing additional internal declarations.
     pub fn differences(&self, actual: &Self) -> Vec<String> {
+        self.changes(actual).into_iter().map(|change| change.message).collect()
+    }
+
+    /// Compare contracts once, retaining source for declaration diff presentation.
+    pub fn changes(&self, actual: &Self) -> Vec<ContractDifference> {
         let mut differences = Vec::new();
         for (identity, required) in &self.declaration {
             let observed = actual
@@ -74,7 +88,11 @@ impl DeclarationContract {
                 {
                     remaining.remove(position);
                 } else {
-                    differences.push(format!(
+                    differences.push(ContractDifference {
+                        identity: identity.clone(),
+                        expected: expected.text.clone(),
+                        observed: observed.iter().map(|item| item.text.as_str()).collect::<Vec<_>>().join("\n"),
+                        message: format!(
                         "{identity}: expected {}; observed {}",
                         expected.signature,
                         observed
@@ -82,7 +100,7 @@ impl DeclarationContract {
                             .map(|item| item.signature.as_str())
                             .collect::<Vec<_>>()
                             .join(" | ")
-                    ));
+                    )});
                 }
             }
         }
@@ -103,10 +121,14 @@ impl DeclarationContract {
                     && (!self.declaration.contains_key(identity)
                         || observed.len() > self.declaration[identity].len())
                 {
-                    differences.push(format!(
+                    differences.push(ContractDifference {
+                        identity: identity.clone(),
+                        expected: String::new(),
+                        observed: declaration.text.clone(),
+                        message: format!(
                         "{identity}: additional exposed declaration {}",
                         declaration.signature
-                    ));
+                    )});
                 }
             }
         }
@@ -125,6 +147,7 @@ fn collect(
 ) {
     let mut cursor = node.walk();
     let mut attributes = String::new();
+    let mut attribute_source = String::new();
     for child in node.named_children(&mut cursor) {
         let kind = child.kind();
         if kind.contains("comment") {
@@ -132,10 +155,13 @@ fn collect(
         }
         if matches!(kind, "attribute_item" | "inner_attribute_item") {
             attributes.push_str(&tokens(child, source, None));
+            attribute_source.push_str(&source[child.byte_range()]);
+            attribute_source.push('\n');
             continue;
         }
         if kind == "import_statement" || kind == "extern_crate_declaration" {
             attributes.clear();
+            attribute_source.clear();
             continue;
         }
         if kind == "export_statement" && child.child_by_field_name("declaration").is_some() {
@@ -161,6 +187,7 @@ fn collect(
                 || (language == SyntaxLanguage::Lua && !text.trim_start().starts_with("local ")));
         if kind == "use_declaration" && !public {
             attributes.clear();
+            attribute_source.clear();
             continue;
         }
         let container = matches!(
@@ -195,6 +222,7 @@ fn collect(
             );
         if !recognized {
             attributes.clear();
+            attribute_source.clear();
             continue;
         }
         let body = if container {
@@ -206,6 +234,15 @@ fn collect(
             "{attributes}{}",
             tokens(child, source, body.map(|body| body.id()))
         );
+        let display_body = child.child_by_field_name("body");
+        let display = if let Some(body) = display_body.filter(|_| container) {
+            format!("{} {{}}", source[child.start_byte()..body.start_byte()].trim_end())
+        } else if let Some(body) = display_body.filter(|_| matches!(kind,
+            "function_item" | "function_declaration" | "method_definition")) {
+            format!("{};", source[child.start_byte()..body.start_byte()].trim_end())
+        } else {
+            text.to_owned()
+        };
         let role = match kind {
             "function_item"
             | "function_signature_item"
@@ -227,6 +264,7 @@ fn collect(
             .push(ContractDeclaration {
                 identity: identity.clone(),
                 signature,
+                text: format!("{attribute_source}{display}"),
                 exposed,
                 position,
             });
@@ -256,6 +294,7 @@ fn collect(
             );
         }
         attributes.clear();
+        attribute_source.clear();
     }
 }
 

@@ -101,7 +101,7 @@ impl DeclarationDelta {
     }
 }
 
-fn write_file(
+pub(crate) fn write_file(
     before_path: &str,
     after_path: &str,
     before: Option<&str>,

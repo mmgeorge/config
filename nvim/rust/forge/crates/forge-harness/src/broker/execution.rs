@@ -20,10 +20,9 @@ impl HarnessBroker {
             .filter(|exchange| exchange.id != interaction.id
                 && exchange.execution_id.as_deref() == Some(execution_id))
             .chain(std::iter::once(interaction))
-            .flat_map(|exchange| &exchange.turn)
-            .flat_map(|turn| turn.tools())
-            .filter(|tool| matches!(tool.state(), crate::turn::ToolState::Completed | crate::turn::ToolState::Failed))
-            .map(|tool| json!({"id":tool.id,"title":tool.title.chars().take(240).collect::<String>(),
+            .flat_map(|exchange| exchange.turn.iter().flat_map(move |turn| turn.tools().map(move |tool| (exchange, tool))))
+            .filter(|(_, tool)| matches!(tool.state(), crate::turn::ToolState::Completed | crate::turn::ToolState::Failed))
+            .map(|(exchange, tool)| json!({"id":tool.id,"call_id":format!("{}:{}", exchange.id, tool.id),"title":tool.title.chars().take(240).collect::<String>(),
                 "state":if tool.state() == crate::turn::ToolState::Failed { "failed" } else { "completed" },
                 "output_preview":tool.output.chars().take(512).collect::<String>()}))
             .collect())
@@ -356,6 +355,9 @@ impl HarnessBroker {
                 let design = document
                     .design
                     .context("execution requires a semantic design")?;
+                if let Some(report) = &request.verification {
+                    report.validate_checks(&design.document.verification.automated)?;
+                }
                 let workspace = PathBuf::from(&self.session.workspace);
                 let accepted_paths = design
                     .baseline
@@ -394,14 +396,20 @@ impl HarnessBroker {
                                 (Some(expected), Some(source)) => {
                                     let overview = forge_diff::syntax::DeclarationOverview::extract(path, &expected)
                                         .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                                    match crate::plan::conformance::compare_in_workspace(&workspace, path, &overview, &source) {
-                                        Ok(differences) => progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}"))),
+                                    match crate::plan::conformance::inspect_in_workspace(&workspace, path, &overview, &source) {
+                                        Ok((differences, changes)) => {
+                                            progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}")));
+                                            progress.declaration_changes.extend(changes);
+                                        }
                                         Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
                                     }
                                 }
                                 (None, Some(source)) if forge_diff::syntax::ConfigurationFormat::for_path(path).is_none() => {
-                                    match crate::plan::conformance::compare_in_workspace(&workspace, path, "", &source) {
-                                        Ok(differences) => progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}"))),
+                                    match crate::plan::conformance::inspect_in_workspace(&workspace, path, "", &source) {
+                                        Ok((differences, changes)) => {
+                                            progress.different.extend(differences.into_iter().map(|item| format!("{path}: {item}")));
+                                            progress.declaration_changes.extend(changes);
+                                        }
                                         Err(error) => progress.unverified.push(format!("{path}: {error:#}")),
                                     }
                                 }
@@ -423,20 +431,28 @@ impl HarnessBroker {
                         "{path}: workspace changed during validation. Retry phase completion."
                     );
                 }
+                let mut verification_tools = std::collections::BTreeMap::new();
                 if let Some(report) = &request.verification {
                     let tools = self.verification_evidence(execution_id, interaction)?;
-                    for reference in &report.evidence {
+                    for reference in report.evidence.iter().chain(report.checks.iter().flat_map(|check| &check.evidence)) {
                         anyhow::ensure!(
                             tools.iter().any(|tool| tool["id"].as_str() == Some(reference.as_str())),
                             "verification evidence {reference} is not a completed tool result in this execution. Call harness_plan_read with only plan_id and use exact IDs from execution.verification_evidence."
                         );
+                        if let Some(call_id) = tools.iter().find(|tool| tool["id"].as_str() == Some(reference.as_str()))
+                            .and_then(|tool| tool["call_id"].as_str()) {
+                            verification_tools.insert(reference.clone(), call_id.to_owned());
+                        }
                     }
                     let reused = execution.verification.iter().any(|evidence| {
                         evidence
                             .report
                             .evidence
                             .iter()
-                            .any(|reference| report.evidence.contains(reference))
+                            .chain(evidence.report.checks.iter().flat_map(|check| &check.evidence))
+                            .any(|reference| report.evidence.iter()
+                                .chain(report.checks.iter().flat_map(|check| &check.evidence))
+                                .any(|observed| observed == reference))
                     });
                     anyhow::ensure!(
                         !reused
@@ -457,6 +473,9 @@ impl HarnessBroker {
                 execution.progress = progress.clone();
                 self.store.save_plan_execution(&execution)?;
                 let summary = request.summary.clone();
+                let verification = request.verification.clone();
+                let declaration_findings = progress.findings();
+                let declaration_changes = progress.declaration_changes.clone();
                 execution.finish_phase(request, progress, now_ms)?;
                 if let Some(phase) = &mut interaction.execution_phase {
                     use crate::plan::execution::VerificationOutcome;
@@ -468,6 +487,10 @@ impl HarnessBroker {
                     phase.summary = Some(summary);
                     if phase.phase == crate::plan::PlanPhase::Verify {
                         phase.findings.clone_from(&execution.findings);
+                        phase.verification = verification;
+                        phase.declaration_findings = declaration_findings;
+                        phase.declaration_changes = declaration_changes;
+                        phase.verification_tools = verification_tools;
                     }
                 }
                 goal.state = match execution.state {

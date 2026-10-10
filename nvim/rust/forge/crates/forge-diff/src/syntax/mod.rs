@@ -6,7 +6,7 @@ mod query;
 mod configuration;
 mod declaration;
 mod declaration_contract;
-pub use declaration_contract::{ContractDeclaration, DeclarationContract};
+pub use declaration_contract::{ContractDeclaration, ContractDifference, DeclarationContract};
 mod declaration_fold;
 mod declaration_index;
 mod declaration_calls;

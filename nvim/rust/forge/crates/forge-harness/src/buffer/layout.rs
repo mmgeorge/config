@@ -9,20 +9,60 @@ use super::question::QuestionHistory;
 
 pub(super) struct ExchangeLayout<'exchange> {
     pub questions: QuestionHistory<'exchange>,
+    pub opening: Vec<&'exchange ExchangeNode>,
+    pub conclusion: Vec<&'exchange ExchangeNode>,
+    pub results: Vec<&'exchange ExchangeNode>,
     pub activity: Vec<&'exchange ExchangeNode>,
     pub continuation: Vec<&'exchange ExchangeNode>,
 }
 
 impl<'exchange> ExchangeLayout<'exchange> {
-    /// Preserves visible node order and ends the activity fold before the first outer response.
+    /// Places review admission first and generated results before the outer response.
     /// Question clarifications retain their branch ownership. Missing turn or message references fail.
     pub fn new(exchange: &'exchange Exchange) -> Result<Self> {
         let questions = QuestionHistory::new(exchange);
+        let mut opening = Vec::new();
+        let mut results = Vec::new();
+        let mut conclusion = Vec::new();
         let mut activity = exchange
             .node_list
             .iter()
             .filter(|node| !questions.nested.contains(node.id()))
             .collect::<Vec<_>>();
+        activity.retain(|node| {
+            match node {
+                ExchangeNode::PlanEvent { event } => match &event.content {
+                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
+                        if event.node_count == 0 && matches!(lifecycle.kind,
+                            crate::plan::PlanLifecycleKind::Accepted | crate::plan::PlanLifecycleKind::ChangesRequested) => {
+                        opening.push(*node);
+                        false
+                    }
+                    crate::plan::PlanEventContent::Lifecycle { lifecycle, .. }
+                        if matches!(lifecycle.kind, crate::plan::PlanLifecycleKind::Created
+                            | crate::plan::PlanLifecycleKind::RevisionCreated) => {
+                        results.push(*node);
+                        false
+                    }
+                    crate::plan::PlanEventContent::Execution { event }
+                        if matches!(event, crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
+                            | crate::plan::PlanExecutionLifecycleEvent::Failed { .. }) => {
+                        conclusion.push(*node);
+                        false
+                    }
+                    crate::plan::PlanEventContent::Execution { .. } | crate::plan::PlanEventContent::Resolution { .. } => {
+                        results.push(*node);
+                        false
+                    }
+                    _ => true,
+                },
+                ExchangeNode::ArtifactChange { .. } | ExchangeNode::ImplementationReport { .. } => {
+                    results.push(*node);
+                    false
+                }
+                _ => true,
+            }
+        });
         let mut response_position = activity.len();
         for (position, node) in activity.iter().enumerate() {
             let ExchangeNode::TurnContent {
@@ -51,6 +91,9 @@ impl<'exchange> ExchangeLayout<'exchange> {
         let continuation = activity.split_off(response_position);
         Ok(Self {
             questions,
+            opening,
+            results,
+            conclusion,
             activity,
             continuation,
         })

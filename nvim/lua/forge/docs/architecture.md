@@ -752,14 +752,15 @@ the presentation invalidates late transitions. Plan preparation and Git checkpoi
 precede acceptance.
 
 Rust projects the semantic timeline and its synthetic bottom status from the same session-scoped durable owners.
-`ExchangeLayout` preserves the exchange's ordered nodes while assigning question clarifications to their branches.
-The activity summary fold ends before the first outer final response. That response and later question groups,
-messages, tools, and plan events retain their relative order outside the summary fold. The transcript renderer
-consumes those ordered ranges directly without deferring responses to the end of the exchange. Clarification
-responses remain inside their question branch folds. Streaming, completion, and reload use the same layout.
-Thoughts and tool groups nest one two-column level below their exchange summary, including
-continued activity after an intermediate final answer. Tool calls and output retain their
-additional nesting. Final answers stay at the response level in their original chronological position.
+`ExchangeLayout` keeps provider activity in the summary fold and renders generated artifacts,
+plan submission events, verification results, and checkpoint changes before the outer final response.
+It partitions references to durable nodes without cloning response or diff bodies. Review acceptance
+and requests for revision belong to the newly admitted implementation or revision exchange and render
+before its lifecycle heading, prompt, and metrics. Rejection without revision remains a terminal event.
+Question clarifications retain their branch ownership. Legacy activity following an intermediate final
+answer retains its relative order. Streaming, completion, and reload use the same layout and node IDs.
+Thoughts and tool groups nest one two-column level below their exchange summary. Tool calls and output
+retain their additional nesting. Final answers remain outside the activity fold. Tool invocation headings retain one display row in both collapsed and expanded states. The shared width-bounded title formatting preserves the duration column and truncates the displayed command or arguments. Full provider titles remain in durable tool state.
 `PlanStateMachine` validates question, feedback, submission, review, acceptance, cancellation, and failure
 transitions. `PlanQuestionLedger` records answers, skips, and withdrawals before generation resumes. It matches both
 the provider's logical id and a canonical digest of the user-visible content, so a resolved decision cannot become
@@ -5422,20 +5423,27 @@ feedback to the same control runtime before its next tool call. These decisions 
 exchange while the provider is waiting. Cancellation drops the review channel and leaves the persisted
 revision pending for recovery. Approval after interruption starts a new exchange through the existing
 resume path. Acceptance retains its
-anchor at the end of the planning exchange. The first execution exchange starts with
-`Plan implementation started` and never takes ownership of the acceptance event. Each subsequent
+anchor at the start of the admitted implementation exchange. That exchange starts with acceptance followed by
+`Plan implementation started`. The previous planning exchange retains its submission and final response. Each subsequent
 exchange identifies the phase as `Plan implementation`, `Plan verification`, or `Plan resolution`,
 including when it starts, continues, pauses, or resumes. An exchange that ends without a phase
 result reports that phase as stopped. Only recorded phase results claim phase completion.
 
 Activity headings use `Implementing`, `Verifying`, and `Resolving` while a phase runs,
 then `Implemented`, `Verified`, and `Resolved` when its completion is recorded.
-Verification outcomes remain separate from the activity fold. A passing result is a diamond
-event. Failed and blocked results show the first finding in a collapsed heading, with the phase
-summary and all findings inside its lazy-loaded section. The broker persists the effective
-outcome, summary, and findings on that exchange before transitioning to the next phase, so later
-resolution and restarts cannot replace an earlier verification's reason. Structural findings
-remain visible even when the agent reports that its behavioral checks passed.
+Verification outcomes remain separate from the activity fold. Structured reports contain
+foldable Automated, Manual, and Declarations groups with no spacer rows between them. Each
+command or manual check owns its result summary and evidence links. The overall heading counts
+failed and blocked checks and declaration mismatches rather than selecting an arbitrary finding.
+The broker validates command identities against the accepted plan and tool references against
+completed execution evidence before saving the report on its exchange. Additional findings remain
+in a separate group. Older unstructured reports retain their findings without guessing categories.
+Declaration comparison captures readable accepted-to-observed patches for each changed symbol.
+The Declarations group nests files and symbol diffs using the existing diff projection, folds, and
+intraline highlighting. Captured patches never depend on later workspace contents, and their
+synthetic declaration line numbers do not navigate to implementation source. The broker persists
+the effective outcome, report, and declaration findings before transitioning, so resolution and
+restarts cannot replace an earlier verification result.
 
 Health requests use reserved admission and output scheduling independently of the broker
 execution lock. The UI sends at most one outstanding health request per conversation. Ten

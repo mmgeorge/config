@@ -573,10 +573,10 @@ impl TimelineRenderer<'_> {
                     PlanLifecycleKind::QuestionAnswered => "Clarification answered",
                     PlanLifecycleKind::QuestionWithdrawn => "Clarification withdrawn",
                     PlanLifecycleKind::Created => "Plan submitted",
-                    PlanLifecycleKind::RevisionCreated => "Plan revised",
-                    PlanLifecycleKind::ChangesRequested => "Plan changes requested",
+                    PlanLifecycleKind::RevisionCreated => "Plan submitted",
+                    PlanLifecycleKind::ChangesRequested => "Plan revision requested",
                     PlanLifecycleKind::Accepted => "Plan accepted",
-                    PlanLifecycleKind::Cancelled => "Plan cancelled",
+                    PlanLifecycleKind::Cancelled => "Plan rejected",
                 };
                 let question = matches!(
                     lifecycle.kind,
@@ -631,7 +631,8 @@ impl TimelineRenderer<'_> {
                         }
                     }
                 }
-                if let Some(comment) = &lifecycle.overall_comment {
+                if let Some(comment) = lifecycle.overall_comment.as_ref().filter(|_|
+                    lifecycle.kind != PlanLifecycleKind::ChangesRequested) {
                     self.markdown(
                         &format!("{}:comment", event.id),
                         comment,
@@ -787,6 +788,8 @@ impl TimelineRenderer<'_> {
         if depth == 0 && self.leading_separator {
             self.literal(&format!("{}:separator", interaction.id), "", None)?;
         }
+        let layout = super::layout::ExchangeLayout::new(interaction)?;
+        self.content(interaction, agents, depth, &layout.opening, Some(&layout.questions), MarkdownRole::Response)?;
         if let Some(lifecycle) = &interaction.lifecycle {
             self.literal(&format!("{}:lifecycle", interaction.id), &format!("◇ {lifecycle}"), None)?;
         } else if !interaction.prompt.is_empty() {
@@ -834,14 +837,6 @@ impl TimelineRenderer<'_> {
         TranscriptRenderer::heading_marker(&mut heading, &capture);
         self.push(heading)?;
         let section = self.begin_section(0);
-        let mut layout = super::layout::ExchangeLayout::new(interaction)?;
-        let inside = |node: &&ExchangeNode| !matches!(node, ExchangeNode::PlanEvent { event }
-            if matches!(&event.content, crate::plan::PlanEventContent::Execution {
-                event: crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
-                    | crate::plan::PlanExecutionLifecycleEvent::Failed { .. }
-            }));
-        layout.activity.retain(inside);
-        layout.continuation.retain(inside);
         self.content(interaction, agents, depth, &layout.activity, Some(&layout.questions), MarkdownRole::Response)?;
         let exchange_start = section.start;
         self.finish_section(
@@ -853,7 +848,7 @@ impl TimelineRenderer<'_> {
             node.kind = NodeKind::Exchange;
             node.lifecycle = if interaction.completed_at_ms.is_some() { NodeLifecycle::Settled } else { NodeLifecycle::Live };
         }
-        self.content(interaction, agents, depth, &layout.continuation, Some(&layout.questions), MarkdownRole::Response)?;
+        self.content(interaction, agents, depth, &layout.results, Some(&layout.questions), MarkdownRole::Response)?;
         self.verification_result(interaction)?;
         if let Some(diff) = &interaction.attributed_diff_text {
             self.diff(
@@ -881,16 +876,8 @@ impl TimelineRenderer<'_> {
                 )?;
             }
         }
-        for node in &interaction.node_list {
-            if let ExchangeNode::PlanEvent { event } = node
-                && matches!(&event.content, crate::plan::PlanEventContent::Execution {
-                    event: crate::plan::PlanExecutionLifecycleEvent::Completed { .. }
-                        | crate::plan::PlanExecutionLifecycleEvent::Failed { .. }
-                })
-            {
-                self.plan_event(event)?;
-            }
-        }
+        self.content(interaction, agents, depth, &layout.conclusion, Some(&layout.questions), MarkdownRole::Response)?;
+        self.content(interaction, agents, depth, &layout.continuation, Some(&layout.questions), MarkdownRole::Response)?;
         Ok(())
     }
 
@@ -900,26 +887,92 @@ impl TimelineRenderer<'_> {
             .filter(|phase| phase.phase == PlanPhase::Verify) else { return Ok(()); };
         let Some(outcome) = phase.outcome else { return Ok(()); };
         let identity = format!("{}:verification-result", interaction.id);
-        if outcome == VerificationOutcome::Passed {
+        if outcome == VerificationOutcome::Passed && phase.verification.as_ref().is_none_or(|report| report.checks.is_empty()) {
             let summary = phase.summary.as_deref().unwrap_or("")
                 .split_whitespace().collect::<Vec<_>>().join(" ");
             return self.literal(&identity, &format!("◇ Verification passed{}",
                 if summary.is_empty() { String::new() } else { format!(" · {summary}") }), None);
         }
-        let label = if outcome == VerificationOutcome::Failed { "Verification failed" }
-            else { "Verification blocked" };
-        let first = phase.findings.iter().find(|finding| !finding.trim().is_empty());
-        let reason = first.map_or_else(|| "No findings recorded".into(),
-            |finding| finding.split_whitespace().collect::<Vec<_>>().join(" "));
-        let remaining = phase.findings.iter().filter(|finding| !finding.trim().is_empty()).count().saturating_sub(1);
-        let suffix = if remaining == 0 { String::new() } else { format!(" (+{remaining} more)") };
-        self.literal(&identity, &format!("▸ {label} · {reason}{suffix}"), None)?;
+        let label = match outcome { VerificationOutcome::Failed => "Verification failed",
+            VerificationOutcome::Blocked => "Verification blocked", VerificationOutcome::Passed => "Verification passed" };
+        let checks = phase.verification.as_ref().map_or(&[][..], |report| report.checks.as_slice());
+        let failed = checks.iter().filter(|check| check.outcome == VerificationOutcome::Failed).count();
+        let blocked = checks.iter().filter(|check| check.outcome == VerificationOutcome::Blocked).count();
+        let mut totals = Vec::new();
+        if failed > 0 { totals.push(format!("{failed} failed check{}", if failed == 1 { "" } else { "s" })); }
+        if blocked > 0 { totals.push(format!("{blocked} blocked check{}", if blocked == 1 { "" } else { "s" })); }
+        if !phase.declaration_findings.is_empty() { totals.push(format!("{} declaration mismatch{}", phase.declaration_findings.len(), if phase.declaration_findings.len() == 1 { "" } else { "es" })); }
+        let suffix = if totals.is_empty() { String::new() } else { format!(" · {}", totals.join(", ")) };
+        self.literal(&identity, &format!("▸ {label}{suffix}"), None)?;
         let section = self.begin_section(2);
-        if let Some(summary) = phase.summary.as_deref().filter(|summary| !summary.trim().is_empty()) {
-            self.markdown(&format!("{identity}:summary"), summary, MarkdownRole::Detail)?;
+        for (category, label) in [(crate::plan::execution::VerificationCategory::Automated, "Automated"),
+            (crate::plan::execution::VerificationCategory::Manual, "Manual")] {
+            let group_checks = checks.iter().filter(|check| check.category == category).collect::<Vec<_>>();
+            if group_checks.is_empty() { continue; }
+            let group_id = format!("{identity}:{label}");
+            let counts = [(VerificationOutcome::Passed, "passed"), (VerificationOutcome::Failed, "failed"), (VerificationOutcome::Blocked, "blocked")]
+                .into_iter().filter_map(|(outcome, label)| {
+                    let count = group_checks.iter().filter(|check| check.outcome == outcome).count();
+                    (count > 0).then(|| format!("{count} {label}"))
+                }).collect::<Vec<_>>().join(", ");
+            self.literal(&group_id, &format!("▸ {label} · {counts}"), None)?;
+            let group = self.begin_section(2);
+            for (index, check) in group_checks.into_iter().enumerate() {
+                let check_id = format!("{group_id}:{index}");
+                let outcome = match check.outcome { VerificationOutcome::Passed => "passed", VerificationOutcome::Failed => "failed", VerificationOutcome::Blocked => "blocked" };
+                self.literal(&check_id, &format!("▸ {} · {outcome}", check.label.replace(['\r', '\n'], " ")), None)?;
+                let check_section = self.begin_section(2);
+                self.markdown(&format!("{check_id}:summary"), check.summary.trim_end(), MarkdownRole::Detail)?;
+                for (evidence_index, evidence) in check.evidence.iter().enumerate() {
+                    let call_id = phase.verification_tools.get(evidence).cloned()
+                        .unwrap_or_else(|| format!("{}:{evidence}", interaction.id));
+                    self.literal(&format!("{check_id}:evidence:{evidence_index}"), "Command output",
+                        Some(TranscriptAction::Tool { call_id }))?;
+                }
+                self.finish_section(check_section, &check_id, true);
+            }
+            self.finish_section(group, &group_id, true);
         }
-        for (index, finding) in phase.findings.iter().enumerate() {
-            self.markdown(&format!("{identity}:finding:{index}"), &format!("- {finding}"), MarkdownRole::Detail)?;
+        if !phase.declaration_findings.is_empty() || !phase.declaration_changes.is_empty() {
+            let declaration_id = format!("{identity}:declarations");
+            let count = phase.declaration_findings.len().max(phase.declaration_changes.len());
+            self.literal(&declaration_id, &format!("▸ Declarations · {count} mismatch{}", if count == 1 { "" } else { "es" }), None)?;
+            let declarations = self.begin_section(2);
+            let mut files = std::collections::BTreeMap::<&str, Vec<&crate::plan::execution::DeclarationMismatch>>::new();
+            for change in &phase.declaration_changes { files.entry(&change.path).or_default().push(change); }
+            for (file_index, (path, changes)) in files.into_iter().enumerate() {
+                let file_id = format!("{declaration_id}:{file_index}");
+                self.literal(&file_id, &format!("▸ {path} · {} mismatch{}", changes.len(), if changes.len() == 1 { "" } else { "es" }), None)?;
+                let file = self.begin_section(2);
+                for (index, change) in changes.iter().enumerate() {
+                    let tree = super::changes::ChangeTree::declaration(&TranscriptRenderer::new(&self.content_width())?,
+                        &format!("{file_id}:{index}"), &change.name, &change.diff)?;
+                    self.action.extend(tree.action);
+                    for block in tree.block { self.push(block)?; }
+                }
+                self.finish_section(file, &file_id, true);
+            }
+            for (index, finding) in phase.declaration_findings.iter().enumerate() {
+                if phase.declaration_changes.iter().any(|change| finding == &change.finding) { continue; }
+                self.markdown(&format!("{declaration_id}:finding:{index}"), finding, MarkdownRole::Detail)?;
+            }
+            self.finish_section(declarations, &declaration_id, true);
+        }
+        let findings = phase.verification.as_ref().map_or(phase.findings.as_slice(), |report| report.findings.as_slice());
+        if !findings.is_empty() {
+            let finding_id = format!("{identity}:findings");
+            self.literal(&finding_id, &format!("▸ Findings · {}", findings.len()), None)?;
+            let finding_section = self.begin_section(2);
+            for (index, finding) in findings.iter().enumerate() {
+                self.markdown(&format!("{finding_id}:{index}"), finding, MarkdownRole::Detail)?;
+            }
+            self.finish_section(finding_section, &finding_id, true);
+        }
+        if checks.is_empty() && findings.is_empty() && phase.declaration_findings.is_empty() {
+            if let Some(reason) = phase.verification.as_ref().and_then(|report| report.reason.as_deref())
+                .or(phase.summary.as_deref()) {
+                self.markdown(&format!("{identity}:reason"), reason, MarkdownRole::Detail)?;
+            }
         }
         self.finish_section(section, &identity, true);
         Ok(())
@@ -1709,9 +1762,16 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     }
     let usage = interaction.usage();
     let mut tokens = Vec::new();
-    match (usage.input, usage.output) {
-        (Some(input), Some(output)) => tokens.push(format!("Tokens {} -> {}", token_display(input), token_display(output))),
-        (Some(input), None) => tokens.push(format!("Tokens in {}", token_display(input))),
+    let input = usage.input.map(|input| {
+        let mut label = token_display(input);
+        if let Some(percent) = usage.cached_percent() {
+            label.push_str(&format!(" ({percent}%)"));
+        }
+        label
+    });
+    match (input, usage.output) {
+        (Some(input), Some(output)) => tokens.push(format!("Tokens {input} -> {}", token_display(output))),
+        (Some(input), None) => tokens.push(format!("Tokens in {input}")),
         (None, Some(output)) => tokens.push(format!("Tokens out {}", token_display(output))),
         (None, None) => {}
     }
@@ -1730,6 +1790,52 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn verification_groups_keep_checks_and_declaration_diffs_separate() -> anyhow::Result<()> {
+        use super::*;
+        use serde_json::json;
+        let exchange: Exchange = serde_json::from_value(json!({
+            "id":"verify", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"", "kind":"plan_execution", "state":"complete", "created_at_ms":0,
+            "completed_at_ms":1000, "attributed_matches_checkpoint":true, "node_list":[],
+            "execution_phase":{"phase":"verify","outcome":"failed", "findings":[],
+                "verification":{"outcome":"failed", "checks":[
+                    {"category":"automated","label":"cargo test","outcome":"passed","summary":"8 tests passed","evidence":["test-tool"]},
+                    {"category":"automated","label":"cargo check","outcome":"failed","summary":"Expected FontSize","evidence":[]},
+                    {"category":"manual","label":"Initial display","outcome":"blocked","summary":"Compilation failed","evidence":[]}
+                ]},
+                "verification_tools":{"test-tool":"earlier-exchange:test-tool"},
+                "declaration_findings":["src/lib.rs: function update: changed"],
+                "declaration_changes":[{"path":"src/lib.rs","name":"function update",
+                    "finding":"src/lib.rs: function update: changed",
+                    "diff":"diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n@@ -1 +1 @@\n-fn update(input: State);\n+fn update(mut input: State);\n"}]
+            }
+        }))?;
+        let exchange = serde_json::from_slice(&serde_json::to_vec(&exchange)?)?;
+        let projection = project_at(&TimelineEntry::Exchange { id:"verify".into(), created_at_ms:0,
+            exchange, agent_by_id:HashMap::new() }, &WidthProfile::default(), 1000)?;
+        let blocks = &projection.entry.block;
+        let rows = blocks.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>();
+        let text = rows.join("\n");
+        assert!(text.contains("Verification failed · 1 failed check, 1 blocked check, 1 declaration mismatch"));
+        assert!(text.contains("Automated · 1 passed, 1 failed"));
+        assert!(text.contains("Manual · 1 blocked"));
+        assert!(text.contains("Declarations · 1 mismatch"));
+        assert!(text.contains("fn update(mut input: State);"));
+        assert_eq!(text.matches("Expected FontSize").count(), 1);
+        assert!(!text.contains("src/lib.rs: function update: changed"));
+        assert!(!rows.iter().any(|row| row.is_empty()));
+        for id in ["verify:verification-result:Automated", "verify:verification-result:Manual",
+            "verify:verification-result:declarations", "verify:verification-result:Automated:0"] {
+            let block = blocks.iter().find(|block| block.id.0 == id).unwrap();
+            assert!(block.metadata.fold[0].closed);
+        }
+        assert!(projection.action.values().any(|action| matches!(action,
+            TranscriptAction::Tool { call_id } if call_id == "earlier-exchange:test-tool")));
+        assert!(!projection.action.values().any(|action| matches!(action, TranscriptAction::File { .. })));
+        Ok(())
+    }
+
     #[test]
     fn verification_result_retains_findings_outside_the_activity_fold() -> anyhow::Result<()> {
         use super::*;
@@ -1757,7 +1863,7 @@ mod tests {
             let result_index = blocks.iter().position(|block| block.id.0 == "verify-result:verification-result").unwrap();
             let result = &blocks[result_index];
             assert!(blocks[0].text.wire_rows().join("\n").contains("Verified 18s"));
-            assert!(!blocks[0].metadata.fold.is_empty());
+            assert!(blocks[0].metadata.fold.is_empty(), "result-only exchanges have no activity to fold");
             assert!(blocks[0].metadata.fold.iter().all(|fold| !blocks[result_index..].iter()
                 .any(|block| block.id == fold.end.block)));
             let text = result.text.wire_rows().join("\n");
@@ -1765,7 +1871,7 @@ mod tests {
                 assert!(text.contains("◇ Verification passed · Ran eight gameplay tests."));
                 assert!(result.metadata.fold.is_empty());
             } else {
-                assert!(text.contains("restart_resets_round: expected score 0, got 3 (+1 more)"));
+                assert!(!text.contains("expected score"));
                 assert!(text.contains(if outcome == "failed" { "Verification failed" } else { "Verification blocked" }));
                 assert!(result.metadata.fold[0].closed);
                 assert!(blocks.iter().any(|block| block.text.wire_rows().join("\n")
@@ -1825,7 +1931,7 @@ mod tests {
             let summary = blocks.iter().find(|block| block.id.0 == "phase:summary").unwrap();
             assert!(summary.text.wire_rows().join("\n").contains(expected));
             assert_eq!(blocks.last().unwrap().id.0, "done");
-            assert_ne!(summary.metadata.fold[0].end.block.0, "done");
+            assert!(summary.metadata.fold.is_empty(), "artifacts and outcomes stay outside activity");
             assert!(!blocks.iter().any(|block| block.id.0 == "phase:prompt"));
         }
     }
@@ -2648,6 +2754,23 @@ mod tests {
             "prompt":"Request plan changes", "kind":"plan_revision", "state":"running",
             "created_at_ms":0, "attributed_matches_checkpoint":false, "node_list":[]
         })).unwrap();
+        let mut response = crate::backend::BackendEvent {
+            received_at_ms: None,
+            address: Some(crate::backend::ProviderAddress {
+                thread_id: "thread".into(), turn_id: "turn".into(),
+            }),
+            turn_boundary: Some(crate::backend::TurnBoundary::Started),
+            kind: "assistant_message".into(), text: Some("Submitted the revised design.".into()),
+            data: json!({"phase":"final_answer"}), activity: None, summary: None, task_update: None,
+        };
+        exchange.start_turn(response.address.clone().unwrap(), 0).unwrap();
+        response.turn_boundary = None;
+        exchange.observe_turn(&response, 1).unwrap();
+        response.turn_boundary = Some(crate::backend::TurnBoundary::Finished {
+            outcome: crate::turn::TurnOutcome::Completed,
+        });
+        response.text = None;
+        exchange.observe_turn(&response, 2).unwrap();
         exchange.node_list.push(crate::exchange::ExchangeNode::ArtifactChange {
             change: crate::exchange::ArtifactChange {
                 id: "artifact".into(), path: "working.md".into(), created_at_ms: 1,
@@ -2659,11 +2782,14 @@ mod tests {
                 }),
             },
         });
+        let exchange: Exchange = serde_json::from_slice(&serde_json::to_vec(&exchange).unwrap()).unwrap();
         let projected = project_at(&TimelineEntry::Exchange {
             id: exchange.id.clone(), created_at_ms: 0, exchange, agent_by_id: HashMap::new(),
         }, &WidthProfile::default(), 10).unwrap();
         let text = projected.entry.block.iter().flat_map(|block|
             (0..block.text.row_count()).map(|row| block.text.row(row).unwrap())).collect::<Vec<_>>().join("\n");
+        assert!(text.find("Proposed changes").unwrap() < text.find("Submitted the revised design.").unwrap());
+        assert!(text.find("Plan overview").unwrap() < text.find("Submitted the revised design.").unwrap());
         assert!(text.contains("Proposed changes 1 file +1 -1"));
         assert!(text.contains("Modified src/lib.rs +1 -1"));
         assert!(text.contains("Plan overview 1 section +1 -1"));
@@ -2800,7 +2926,7 @@ mod tests {
             let indentation = |block: &forge_buffer::block::BufferBlock, _row| {
                 " ".repeat(block.metadata.layout.as_ref().unwrap().indent - 2)
             };
-            for index in 0..8 {
+            for index in 1..8 {
                 let heading = blocks
                     .iter()
                     .find(|block| block.id.0 == format!("event-{index}"))
@@ -2841,7 +2967,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 summary.metadata.fold[0].end.block,
-                blocks.last().unwrap().id
+                forge_buffer::identity::BlockId("event-7:comment".into())
             );
             assert_eq!(indentation(summary, 0), "");
             for block in blocks {
@@ -3031,7 +3157,7 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(
-            text.find("Finished the work").unwrap() < text.find("Plan cancelled").unwrap(),
+            text.find("Finished the work").unwrap() < text.find("Plan rejected").unwrap(),
             "review actions after completion must not precede the final answer"
         );
     }
@@ -3516,7 +3642,7 @@ mod tests {
         exchange.observe_turn(&event, 9000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1400 tps"
+            "● Thought 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k (90%) -> 4.2k · 1400 tps"
         );
         event.address.as_mut().unwrap().thread_id = "unowned-child".into();
         assert!(!exchange.observe_turn(&event, 90_000).unwrap());
@@ -3525,13 +3651,13 @@ mod tests {
             exchange.duration_ms = duration_ms;
             assert_eq!(
                 super::exchange_activity_summary(&exchange, 90_000),
-                format!("● Thought {}s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1400 tps", duration_ms / 1000)
+                format!("● Thought {}s │ Tools 3s · 0/1 pass │ Tokens 76.0k (90%) -> 4.2k · 1400 tps", duration_ms / 1000)
             );
         }
         exchange.metrics.timing_complete = false;
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 3s │ Tools 0/1 pass │ Tokens 76.0k -> 4.2k"
+            "● Thought 3s │ Tools 0/1 pass │ Tokens 76.0k (90%) -> 4.2k"
         );
     }
 
@@ -3555,13 +3681,13 @@ mod tests {
         };
         exchange.observe_turn(&event, 3000).unwrap();
         assert_eq!(super::exchange_activity_summary(&exchange, 4000),
-            "● Working 3s │ Tokens 1.0k -> 100 · 50 tps");
+            "● Working 3s │ Tokens 1.0k (90%) -> 100 · 50 tps");
         exchange.observe_turn(&event, 6000).unwrap();
         assert!(super::exchange_activity_summary(&exchange, 6000).contains("50 tps"));
         event.data["id"] = json!("second");
         exchange.observe_turn(&event, 6000).unwrap();
         assert_eq!(super::exchange_activity_summary(&exchange, 9000),
-            "● Working 8s │ Tokens 2.0k -> 200 · 40 tps");
+            "● Working 8s │ Tokens 2.0k (90%) -> 200 · 40 tps");
     }
 
     #[test]
@@ -3579,9 +3705,12 @@ mod tests {
         for (usage, expected) in [
             (json!({}), "● Working 3s"),
             (json!({"input":1000,"output":100}), "● Working 3s │ Tokens 1.0k -> 100 · 50 tps"),
+            (json!({"input":1000,"cached_input":876}), "● Working 3s │ Tokens in 1.0k (88%)"),
+            (json!({"input":0,"cached_input":0}), "● Working 3s │ Tokens in 0"),
+            (json!({"input":1000,"cached_input":1001}), "● Working 3s │ Tokens in 1.0k"),
             (json!({"reasoning":23}), "● Working 3s"),
             (json!({"input":1000,"cached_input":0,"reasoning":0,"output":0}),
-                "● Working 3s │ Tokens 1.0k -> 0"),
+                "● Working 3s │ Tokens 1.0k (0%) -> 0"),
         ] {
             let mut exchange = original.clone();
             let event = BackendEvent {
@@ -3638,7 +3767,7 @@ mod tests {
         interaction.awaiting_input = true;
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "● Planning paused 4s │ Tokens 1.0k -> 280"
+            "● Planning paused 4s │ Tokens 1.0k (90%) -> 280"
         );
         interaction.kind = ExchangeKind::Chat;
         interaction
@@ -3646,7 +3775,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "● Thought 4s │ Tokens 1.0k -> 280"
+            "● Thought 4s │ Tokens 1.0k (90%) -> 280"
         );
     }
     #[test]

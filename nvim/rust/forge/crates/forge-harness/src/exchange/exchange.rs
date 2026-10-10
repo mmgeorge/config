@@ -25,6 +25,16 @@ pub struct ExecutionPhase {
     #[serde(default)]
     /// Effective verification findings, including structural comparison failures.
     pub findings: Vec<String>,
+    #[serde(default)]
+    /// Structured check results captured before the next phase starts.
+    pub verification: Option<crate::plan::execution::VerificationReport>,
+    #[serde(default)]
+    /// Harness-owned declaration findings, separate from behavioral checks.
+    pub declaration_findings: Vec<String>,
+    #[serde(default)]
+    pub declaration_changes: Vec<crate::plan::execution::DeclarationMismatch>,
+    #[serde(default)]
+    pub verification_tools: std::collections::BTreeMap<String, String>,
 }
 
 /// Owns one admitted action or plan phase and its backend turns.

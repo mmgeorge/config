@@ -3455,6 +3455,10 @@ Planning continuation: turn {} of {}.",
                     outcome: None,
                     summary: None,
                     findings: Vec::new(),
+                    verification: None,
+                    declaration_findings: Vec::new(),
+                    declaration_changes: Vec::new(),
+                    verification_tools: Default::default(),
                 });
             }
             interaction.goal_id.clone_from(&admission.goal_id);
@@ -5755,6 +5759,7 @@ Planning continuation: turn {} of {}.",
             String::new(), plan.id.clone(),
             execution_record.id.clone(), goal.id.clone());
         admission.lifecycle = Some(WorkflowActivity::Implementing.event(LifecycleAction::Started));
+        admission.plan_event_id = Some(lifecycle.id.clone());
         let execution = self.run_interaction(execution_prompt, PromptMode::ExecutePlan, Some(admission))
             .await;
         let execution_succeeded = execution.is_ok();
@@ -5931,10 +5936,7 @@ Planning continuation: turn {} of {}.",
             "plan_changes_requested",
             json!({ "plan": &plan, "lifecycle": &lifecycle }),
         )?;
-        let review_prompt = overall_comment
-            .as_deref()
-            .map(|comment| format!("Request plan changes: {comment}"))
-            .unwrap_or_else(|| "Request plan changes".into());
+        let review_prompt = overall_comment.clone().unwrap_or_default();
         let mut admission = ExchangeAdmission::plan(review_prompt, Some(plan.id.clone()), true);
         admission.plan_event_id = Some(lifecycle.id.clone());
         match self.run_planning_interaction(instruction, Some(admission))
@@ -7738,7 +7740,7 @@ mod test {
         let snapshot = broker.snapshot().unwrap();
         let acceptance = broker.store.list_plan_lifecycle(&broker.session.id).unwrap()
             .into_iter().find(|event| event.kind == PlanLifecycleKind::Accepted).unwrap();
-        assert_eq!(acceptance.anchor.as_ref().unwrap().exchange_id, planning_exchange_id);
+        assert_ne!(acceptance.anchor.as_ref().unwrap().exchange_id, planning_exchange_id);
         assert_eq!(snapshot.active_plan.unwrap().state, PlanState::Accepted);
         assert_eq!(snapshot.goal_execution.as_ref().unwrap().phase, crate::plan::PlanPhase::Verify);
         let execution_id = snapshot.goal_execution.unwrap().id;
@@ -7807,7 +7809,7 @@ mod test {
                     if event.id == acceptance.id)) => Some(exchange.id.as_str()),
             _ => None,
         }).collect::<Vec<_>>();
-        assert_eq!(acceptance_owner, vec![planning_exchange_id.as_str()]);
+        assert_eq!(acceptance_owner, vec![exchanges[0].id.as_str()]);
         let text = timeline_text(&snapshot);
         assert!(text.find("Plan accepted:").unwrap() < text.find("Plan implementation started").unwrap());
         for label in ["Plan accepted:", "Implemented", "Verification failed", "Resolved", "Verified", "Verification passed", "Plan complete:"] {
@@ -8189,7 +8191,14 @@ mod test {
                 sink.as_ref().unwrap().send_wait(BackendEvent {
             received_at_ms: None, address:Some(address.clone()), turn_boundary:None, kind:"tool".into(), text:None, data:Value::Null,
                     activity:Some(crate::backend::ToolActivity { id:id.clone(), kind:crate::backend::ToolActivityKind::Command, title:"cargo test".into(), output:Some(if turn == 1 { "round reset failed" } else { "all checks passed" }.into()), status:Some("completed".into()), change:Default::default(), output_delta:false }), summary:None, task_update:None }).await?;
-                arguments["verification"] = json!({"outcome":if turn == 1 { "failed" } else { "passed" },"evidence":[id],"findings":if turn == 1 { vec!["Round reset retains score"] } else { Vec::<&str>::new() }});
+                let checks = document.design.as_ref().unwrap().document.verification.automated.lines()
+                    .map(str::trim).filter(|line| !line.is_empty()).map(|command| json!({
+                        "category":"automated", "label":command,
+                        "outcome":if turn == 1 { "failed" } else { "passed" },
+                        "summary":if turn == 1 { "Round reset retains score" } else { "All checks passed" },
+                        "evidence":[id]
+                    })).collect::<Vec<_>>();
+                arguments["verification"] = json!({"outcome":if turn == 1 { "failed" } else { "passed" },"checks":checks,"evidence":[id],"findings":if turn == 1 { vec!["Round reset retains score"] } else { Vec::<&str>::new() }});
             }
             if phase == "verify" {
                 let read = runtime.invoke(ControlToolInvocation {

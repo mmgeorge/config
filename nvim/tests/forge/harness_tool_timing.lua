@@ -25,6 +25,17 @@ local ok, failure = pcall(function()
   tool.title = "sem_entities({})"
   tool.started_at_ms = 1000
   assert(renderer.heading_lines(tool, 80, "  ", 90000)[1].text == "  •  2.5s sem_entities({})")
+  for _, kind in ipairs({ "command", "tool_call" }) do
+    tool.kind = kind
+    tool.title = "inspect " .. string.rep("界 very long argument ", 20) .. "\nnext command"
+    for _, width in ipairs({ 12, 40, 90 }) do
+      local rows = renderer.heading_lines(tool, width, "  ", 90000)
+      assert(#rows == 1)
+      assert(not rows[1].text:find("\n", 1, true))
+      assert(vim.fn.strdisplaywidth(rows[1].text) <= width)
+    end
+  end
+
 end)
 
 if not ok then

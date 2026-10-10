@@ -112,7 +112,11 @@ impl<'profile> TranscriptRenderer<'profile> {
 
     pub fn response(&self, id: BlockId, source: &str) -> Result<RenderedMarkdown> {
         let source = markdown_math::normalize(source);
-        let mut rendered = MarkdownRenderer::file_link_labels(id, &source, self.profile)?;
+        let mut rendered = MarkdownRenderer::file_link_labels(
+            id,
+            source.trim_end_matches(['\r', '\n']),
+            self.profile,
+        )?;
         rendered.block.metadata.markdown = true;
         rendered.block.metadata.layout = Some(ContentLayout {
             indent: 2,
@@ -225,19 +229,8 @@ impl<'profile> TranscriptRenderer<'profile> {
     ) -> Result<BufferBlock> {
         id.validate()?;
         target.validate()?;
-        let arguments = expanded.then(|| title.split_once('('))
-            .flatten().filter(|_| kind == "tool_call")
-            .and_then(|(name, arguments)| arguments.strip_suffix(')').map(|arguments| (name, arguments)));
         let duration = tool_duration(elapsed_ms);
-        let mut row = if let Some((name, arguments)) = arguments {
-            let mut row = vec![tool_heading(self.profile, kind, name, &duration)?];
-            row.extend(tool_body_rows(self.profile, arguments, true)?);
-            row
-        } else if expanded {
-            self.profile.wrap_plain(&format!("• {duration} {title}"), 2.min(self.profile.columns - 1))?
-        } else {
-            vec![tool_heading(self.profile, kind, title, &duration)?]
-        };
+        let mut row = vec![tool_heading(self.profile, kind, title, &duration)?];
         let title_rows = row.len();
         row.extend(tool_output_rows(self.profile, output, expanded)?);
         let text = BufferText::from_rows(row)?;
@@ -257,17 +250,7 @@ impl<'profile> TranscriptRenderer<'profile> {
                 ..BlockMetadata::default()
             },
         };
-        decorate_tool_heading(&mut block, if arguments.is_some() { 1 } else { title_rows }, kind, failed);
-        if arguments.is_some() && title_rows > 1 {
-            block.metadata.decoration.push(Decoration {
-                range: TextRange {
-                    start: TextPosition { row: 1, column: 0 },
-                    end: TextPosition { row: title_rows, column: 0 },
-                },
-                capture: "ForgeHarnessMcpArguments".into(),
-                priority: 110,
-            });
-        }
+        decorate_tool_heading(&mut block, title_rows, kind, failed);
         if block.text.row_count() > title_rows {
             block.metadata.decoration.push(Decoration {
                 range: TextRange {
@@ -590,7 +573,7 @@ mod test {
     }
 
     #[test]
-    fn expanded_mcp_keeps_name_arguments_and_response_on_distinct_rows() -> Result<()> {
+    fn expanded_mcp_keeps_one_heading_above_response() -> Result<()> {
         let profile = WidthProfile { columns: 70, ..WidthProfile::default() };
         let renderer = TranscriptRenderer::new(&profile)?;
         let arguments = r#"{"entity_name":"CosmosDbClient","file_path":"cosmos-db-client.ts","hops":1,"token_budget":3500}"#;
@@ -600,13 +583,10 @@ mod test {
             &ToolOutputPreview { row: vec!["response"], hidden_rows: 0, total_rows: 1 }, true,
         )?;
         let rows = block.text.wire_rows();
-        assert_eq!(rows[0], "•    2s sem.sem_context");
-        assert!(rows[1].starts_with("  └ {\"entity_name\""));
-        assert_eq!(rows.last(), Some(&"  └ response"));
-        let restored = rows[1..rows.len() - 1].iter().enumerate()
-            .map(|(index, row)| if index == 0 { row.trim_start_matches("  └ ") } else { row.trim_start() })
-            .collect::<String>();
-        assert_eq!(restored, arguments);
+        assert!(rows[0].starts_with("•    2s sem.sem_context({"));
+        assert!(rows[0].contains('…'));
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1], "  └ response");
         assert!(rows.iter().all(|row| profile.cells(row, 0).unwrap() <= profile.columns));
         Ok(())
     }
@@ -675,7 +655,29 @@ mod test {
         assert_eq!(heading.text.row(0), Some("•  0.3s inspect({})"));
         let expanded = TranscriptRenderer::new(&profile)?
             .refresh_tool_heading(&heading, "tool_call", Some(300), false, "inspect({})", true)?;
-        assert_eq!(expanded.text.row(0), Some("•  0.3s inspect"));
+        assert_eq!(expanded.text.row(0), heading.text.row(0));
+        assert_eq!(expanded.text.row_count(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn tool_headings_stay_single_line_when_expanded_and_resized() -> Result<()> {
+        for columns in [12, 40, 90] {
+            let profile = WidthProfile { columns, ..WidthProfile::default() };
+            let renderer = TranscriptRenderer::new(&profile)?;
+            for (kind, title) in [
+                ("command", "Get-Content src/game.rs,src/config.rs;\nGet-ChildItem -Force -Name"),
+                ("tool_call", r#"sem.context({"path":"src/game.rs","query":"a long query with 界 characters"})"#),
+            ] {
+                let collapsed = renderer.tool_header(BlockId("tool".into()), TargetId("tool".into()),
+                    kind, Some(400), false, title, false)?;
+                let expanded = renderer.refresh_tool_heading(&collapsed, kind, Some(400), false, title, true)?;
+                assert_eq!(collapsed.text.row_count(), 1);
+                assert_eq!(expanded.text, collapsed.text);
+                assert!(profile.cells(expanded.text.row(0).unwrap(), 0)? <= columns);
+                expanded.validate()?;
+            }
+        }
         Ok(())
     }
 
@@ -882,7 +884,7 @@ mod test {
         };
         let rendered = TranscriptRenderer::new(&profile)?.response(
             BlockId("response".into()),
-            "A [界 link](https://example.test).\n\nMore text wraps.",
+            "A [界 link](https://example.test).\n\nMore text wraps.\r\n\n\r\n",
         )?;
         assert!(rendered.block.metadata.gutter.is_empty());
         assert_eq!(rendered.block.metadata.layout.as_ref().unwrap().indent, 2);
