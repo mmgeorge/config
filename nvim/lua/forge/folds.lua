@@ -7,6 +7,7 @@ local cooperative = require("forge.cooperative")
 ---@class ForgeFoldView
 ---@field applied boolean
 ---@field preference ForgeFoldPreference
+---@field native? boolean
 
 ---@param saved table
 ---@param state table<string, boolean>
@@ -89,7 +90,13 @@ local function option_with_pair(option, name, value)
 end
 vim.api.nvim_create_autocmd("WinClosed", {
   group = vim.api.nvim_create_augroup("ForgeDocumentFolds", { clear = true }),
-  callback = function(event) window_state[tonumber(event.match)] = nil end,
+  callback = function(event)
+    local window = tonumber(event.match)
+    M.release(window)
+    for _, session in pairs(sessions) do
+      if session.fold_view then session.fold_view[window] = nil end
+    end
+  end,
 })
 
 function M.validate(sequence, changed, retired, state, read_row)
@@ -458,6 +465,7 @@ function M.set_open(session, window, id, opening)
       for _, child_start in ipairs(children) do close_open_fold(child_start) end
     end
   end)
+  M.capture(session, window)
   return true
 end
 
@@ -503,12 +511,13 @@ function M.toggle_heading(session, window, options)
 end
 
 ---@param session table
+---@param selected_window? integer
 ---@return table<integer, table<string, boolean>>
-function M.capture(session)
+function M.capture(session, selected_window)
   local captured = {}
   if session.status ~= "Applied" then return captured end
   for window, saved in pairs(window_state) do
-    if saved.session == session and vim.api.nvim_win_is_valid(window)
+    if (not selected_window or window == selected_window) and saved.session == session and vim.api.nvim_win_is_valid(window)
       and vim.api.nvim_win_get_buf(window) == session.buffer then
       captured[window] = capture_window(session, window)
       retain_preferences(saved, captured[window])
@@ -696,8 +705,11 @@ function M.attach(session, window)
   assert(vim.api.nvim_win_get_buf(window) == session.buffer, "fold window has another document")
   if window_state[window] and window_state[window].session == session then return end
   M.release(window)
-  local retained = session.fold_view and session.fold_view[window]
+  local retained = session.fold_view and session.fold_view[window] or session.last_fold_view
   local saved = { session = session, fold = retained and vim.deepcopy(retained.fold) or {} }
+  for id in pairs(saved.fold) do
+    if not session.fold or not session.fold.record[id] then saved.fold[id] = nil end
+  end
   for _, name in ipairs({ "foldmethod", "foldexpr", "foldenable", "foldlevel", "foldtext", "fillchars", "winhighlight" }) do saved[name] = vim.wo[window][name] end
   window_state[window] = saved
   vim.wo[window].foldmethod = "manual"
@@ -711,7 +723,6 @@ function M.attach(session, window)
   vim.api.nvim_win_call(window, function() vim.cmd("silent! normal! zE") end)
   for _, fold in pairs(saved.fold) do fold.native = false end
   if session.fold then apply_defaults(session, window, saved, session.fold.record) end
-  if retained then M.restore(session, { [window] = retained.state }) end
 end
 
 function M.release(window)
@@ -721,12 +732,13 @@ function M.release(window)
   if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == session.buffer then
     local state = capture_window(session, window)
     retain_preferences(saved, state)
-    local retained = { fold = vim.deepcopy(saved.fold), state = state }
-    session.fold_view = session.fold_view or {}
-    session.fold_view[window] = retained
   end
+  local retained = { fold = vim.deepcopy(saved.fold) }
+  session.fold_view = session.fold_view or {}
+  session.fold_view[window] = retained
+  session.last_fold_view = retained
   window_state[window] = nil
-  if vim.api.nvim_win_is_valid(window) then
+  if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == session.buffer then
     for _, name in ipairs({ "foldmethod", "foldexpr", "foldenable", "foldlevel", "foldtext", "fillchars", "winhighlight" }) do
       vim.wo[window][name] = saved[name]
     end
@@ -741,16 +753,16 @@ function M.restore_inherited(origin, target)
       vim.wo[target][name] = saved[name]
     end
   end
-  if origin == target then window_state[origin] = nil end
+  if origin == target then M.release(origin) end
 end
 
 ---@param session table
 function M.detach(session)
   sessions[session.buffer] = nil
-  session.fold_view = nil
   for window, saved in pairs(window_state) do
     if saved.session == session then M.release(window) end
   end
+  session.fold_view, session.last_fold_view = nil, nil
 end
 
 return M

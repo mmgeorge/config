@@ -274,6 +274,7 @@ function M.demand(state)
         for window in pairs(fold_open.window) do
           if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == state.replica.buffer then
             vim.api.nvim_win_call(window, function() vim.cmd("normal! " .. fold_open.command) end)
+            require("forge.folds").capture(state.replica, window)
           end
         end
       end

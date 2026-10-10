@@ -8,8 +8,6 @@ use forge_buffer::text::BufferText;
 use crate::display::{DisplayHunk, DisplayRow, RowKind};
 use crate::syntax::{SyntaxCapture, SyntaxFamily, SyntaxHandle, SyntaxLanguage};
 
-const MAX_DECORATIONS: usize = 8192;
-
 /// Build a file or hunk heading with an independent display margin and unchanged text coordinates.
 pub fn header(
     id: BlockId,
@@ -104,16 +102,7 @@ pub fn append_patch_row(
             byte_column: 0,
         }),
         raw_id: None,
-        emphasis: if metadata.decoration.len()
-            + metadata.visible_decoration.len()
-            + emphasis.len()
-            + 1
-            <= MAX_DECORATIONS
-        {
-            emphasis.to_vec()
-        } else {
-            Vec::new()
-        },
+        emphasis: emphasis.to_vec(),
         emphasis_fallback: None,
     };
     let group = DisplayHunk {
@@ -151,9 +140,6 @@ pub fn append_source_syntax_row(
         })
     });
     if fenced_code {
-        if metadata.source_highlight.len() >= MAX_DECORATIONS {
-            return Err(ContractError("source row exceeds 8192 highlights"));
-        }
         metadata.source_highlight.push(Decoration {
             range: TextRange {
                 start: TextPosition { row, column: 0 },
@@ -167,13 +153,6 @@ pub fn append_source_syntax_row(
         });
     }
     if let Some(info) = opening_fence {
-        if metadata.conceal.len() >= MAX_DECORATIONS
-            || metadata.source_overlay.len() >= MAX_DECORATIONS
-        {
-            return Err(ContractError(
-                "source row exceeds 8192 code fence decorations",
-            ));
-        }
         metadata.conceal.push(forge_buffer::block::Conceal {
             range: TextRange {
                 start: TextPosition { row, column: 0 },
@@ -216,9 +195,6 @@ pub fn append_source_syntax_row(
         if capture.language == SyntaxLanguage::MarkdownInline
             && capture.name.as_ref() == "markup.raw"
         {
-            if metadata.source_highlight.len() >= MAX_DECORATIONS {
-                return Err(ContractError("source row exceeds 8192 highlights"));
-            }
             metadata.source_highlight.push(Decoration {
                 range: range.clone(),
                 capture: "RenderMarkdownCodeInline".to_owned(),
@@ -232,9 +208,6 @@ pub fn append_source_syntax_row(
         {
             let column = capture.range.start.column;
             if matches!(text.as_bytes().get(column), Some(b'-' | b'+' | b'*')) {
-                if metadata.source_overlay.len() >= MAX_DECORATIONS {
-                    return Err(ContractError("source row exceeds 8192 overlays"));
-                }
                 metadata
                     .source_overlay
                     .push(forge_buffer::block::SourceOverlay {
@@ -258,12 +231,6 @@ pub fn append_source_syntax_row(
         {
             let marker = text.bytes().take_while(|byte| *byte == b'#').count();
             if (1..=6).contains(&marker) && text.as_bytes().get(marker) == Some(&b' ') {
-                if metadata.conceal.len() >= MAX_DECORATIONS
-                    || metadata.source_highlight.len() >= MAX_DECORATIONS
-                    || metadata.source_overlay.len() >= MAX_DECORATIONS
-                {
-                    return Err(ContractError("source row exceeds 8192 heading decorations"));
-                }
                 let background = format!("RenderMarkdownH{marker}Bg");
                 metadata.source_highlight.push(Decoration {
                     range: range.clone(),
@@ -303,9 +270,6 @@ pub fn append_source_syntax_row(
             || (capture.conceal.is_none() && !capture.conceal_line)
         {
             continue;
-        }
-        if metadata.conceal.len() >= MAX_DECORATIONS {
-            return Err(ContractError("source row exceeds 8192 conceal ranges"));
         }
         metadata.conceal.push(forge_buffer::block::Conceal {
             range,
@@ -439,7 +403,6 @@ pub fn append_display_row(
         );
     }
     if display.kind != RowKind::Context {
-        admit_decoration(metadata)?;
         metadata.decoration.push(Decoration {
             range: TextRange {
                 start: TextPosition { row, column: 0 },
@@ -470,7 +433,6 @@ pub fn append_display_row(
                 "diff emphasis is outside source byte boundaries",
             ));
         }
-        admit_decoration(metadata)?;
         metadata.visible_decoration.push(Decoration {
             range: TextRange {
                 start: TextPosition {
@@ -499,29 +461,17 @@ pub fn append_syntax_row(
     let mut captures: Vec<_> = syntax
         .captures_intersecting_rows(source_row, source_row.saturating_add(1))
         .filter(|capture| capture.family == SyntaxFamily::Highlight)
-        .take(MAX_DECORATIONS + 1)
         .collect();
-    if captures.len() > MAX_DECORATIONS {
-        return Err(ContractError("diff row batch exceeds 8192 decorations"));
-    }
     captures.sort_by_key(|capture| (capture.tree, capture.pattern));
     for capture in captures {
         let Some(range) = syntax_row_range(capture, source_row, row, text) else {
             continue;
         };
-        admit_decoration(metadata)?;
         metadata.visible_decoration.push(Decoration {
             range,
             capture: format!("@{}.{}", capture.name, capture.language.name()),
             priority: capture.priority.max(100),
         });
-    }
-    Ok(())
-}
-
-fn admit_decoration(metadata: &BlockMetadata) -> Result<(), ContractError> {
-    if metadata.decoration.len() + metadata.visible_decoration.len() >= MAX_DECORATIONS {
-        return Err(ContractError("diff row batch exceeds 8192 decorations"));
     }
     Ok(())
 }
@@ -584,7 +534,6 @@ mod tests {
         let diff = crate::engine::DiffEngine::new(crate::cache::CacheLimits::default(), 1);
         let engine = crate::syntax::SyntaxEngine::new(
             diff.analysis_pool(),
-            crate::syntax::SyntaxLimits::default(),
         );
         let text = "# Heading\n\n**日本語** and `value`\n\n```rust\nfn example() {}\n```\n\n- Bullet\n+ Second\n1. Ordered\n\n```text\n- Literal\n```\n";
         let syntax = engine
@@ -737,7 +686,7 @@ mod tests {
     }
 
     #[test]
-    fn projection_rejects_over_budget_before_adding_a_decoration() {
+    fn projection_keeps_syntax_dense_blocks() {
         let range = TextRange {
             start: TextPosition { row: 0, column: 0 },
             end: TextPosition { row: 1, column: 0 },
@@ -749,7 +698,7 @@ mod tests {
                     capture: "DiffAdd".into(),
                     priority: 90
                 };
-                MAX_DECORATIONS
+                8192
             ],
             ..BlockMetadata::default()
         };
@@ -769,8 +718,8 @@ mod tests {
             new_lines: 0..1,
             raw_range: 0..1,
         };
-        assert!(append_display_row(&mut metadata, 0, &row, &group, None, None, 0).is_err());
-        assert_eq!(metadata.decoration.len(), MAX_DECORATIONS);
+        assert!(append_display_row(&mut metadata, 0, &row, &group, None, None, 0).is_ok());
+        assert!(metadata.decoration.len() + metadata.visible_decoration.len() > 8192);
     }
 
     #[test]

@@ -55,9 +55,10 @@ The statusline resolves the source type from physical native-buffer paths withou
 the buffer's parser-admission filetype. Generated URI buffers retain their declared type.
 Collapsed fold labels use the same syntax and conceal metadata as expanded source rows.
 Markdown inline regions retain independent parse trees so delimiters cannot cross paragraph
-boundaries. Syntax admission permits 1,024 trees, depth four, and 65,536 captures within
-the existing 64 MiB retained-work budget. Tree/depth exhaustion reports `InjectionLimit`
-separately from capture exhaustion.
+boundaries. Syntax analysis accepts at most 10,000 source lines, counting a trailing
+newline as the end of the last line rather than an extra line. Longer files retain
+their source and diff content without trees, captures, or an error notification.
+Injected languages use the same source and stop repeated language/range cycles.
 
 `crates/forge-buffer` owns block documents, revisions, editable regions, targets,
 fold metadata, display width, and Markdown rendering. Its Markdown source map relates
@@ -149,7 +150,13 @@ columns without adding gutter bytes to the source text.
 and semantic decorations. Each attached window retains its own open or closed preference.
 Ordinary patches remove and recreate only affected fold subtrees. Unchanged native ranges
 survive timer updates. Attaching a window or replacing an authoritative snapshot rebuilds
-the native ranges without replacing retained window preferences. Status demand skips closed folds,
+the native ranges without replacing retained window preferences. Fold actions capture the
+affected window's choices immediately. Detaching retains those choices even after its buffer
+has changed, and a replacement window inherits the document's most recently detached view.
+An existing window restores its own choices. Native ranges are rebuilt once from those
+preferences, without a second fold-open/close replay. Closing a window drops its retained
+entry, while the last detached view remains available until the document closes.
+Status demand skips closed folds,
 and expanding a file admits its source through the existing bounded demand path.
 
 `forge.cooperative` prepares Harness document updates in slices targeting four milliseconds
@@ -182,6 +189,30 @@ navigation continues to require the captured revision and coordinates.
 Lazy section projection preserves zero-row blocks as empty anchors. An empty hidden-count
 block consumes no page budget and cannot mark a tool group as truncated. This prevents
 spurious blank rows and repeated page requests after all source content has loaded.
+
+Section expansion prepares its next view intent, quota, and rendered prefix before committing
+them. A continuation requires an existing continuation marker and must advance the final
+loaded block or finish the section. Failed preparation preserves the previous expansion state.
+Projection refresh retains dirty entries until publication succeeds. A publication failure
+invalidates the native presentation and requires reopening rather than serving a partial frame.
+
+Lua tracks each section request by view and request sequence. An acknowledgement permits
+opening only after the matching content has been adopted. Superseded requests cannot clear
+another view's loading state. Automatic pagination compares the final loaded block and row,
+so unrelated transcript revisions cannot restart the same continuation. Failed sections retain
+one diagnostic and stop automatic demand until an explicit reopen.
+
+The presentation request queue checks host, document, view, and timeline lifetimes before
+dispatch and delivery. Timeline selection retires pending section and action callbacks while
+retaining view registration and cleanup operations. Requests settle once. A 30-second timeout
+reports an unknown outcome and stops presentation work until reopening. Callback exceptions
+follow the same failure path, preserving committed buffer text and replacing the working hint
+with a persistent presentation error. These errors do not mark the underlying task complete.
+
+Standalone tool output stops demand after delivery errors or pages that add no rows while
+claiming more content. Explicit retry first adopts the native snapshot before requesting another
+page, recovering from responses that advanced the native cursor without reaching the buffer.
+Closed output views and replaced hosts cannot adopt late responses.
 
 Harness Markdown resolves visible message owners through the weighted sequence and skips closed
 native folds. The parser includes complete visible messages across all attached windows, retaining
@@ -338,12 +369,12 @@ while Lua formats text, highlights, decorations, folds, and cursor preservation.
 document events use bounded multipart transport and Lua publishes the update only after
 the complete event has been assembled and validated.
 
-Native syntax admission reserves the maximum capture capacity while a parse is active.
-Completed parses release unused capture and capture-index capacity from that charge,
-retaining the allocated vector capacities and the conservative source/tree allowance.
-Pinned file bodies therefore retain their completed-analysis charge rather than the
-maximum capture reservation. Cache eviction cannot release charges still owned by a
-body, and the final handle release returns the remaining charge to the shared budget.
+Native syntax analysis applies the 10,000-line cutoff independently to each source
+version. It has no source-byte reservation, retained-memory rejection, capture-count
+limit, injection-count limit, or decoration-count limit. The shared worker pool still
+queues work and propagates cancellation. Its byte admission excludes syntax sources,
+which are already retained by their owners. The cache retains up to 256 results and
+evicts old entries without invalidating document handles or rejecting new analysis.
 
 Startup logging separates repository acquisition, serialization, transport decoding,
 semantic formatting, index construction, buffer writes, post-application setup, and the
@@ -642,7 +673,8 @@ jobs analyze saved diffs and Markdown code through the shared syntax engine outs
 lock. Completion must match the open document and retained source before adding viewport decorations.
 Replacement, reflow, and close invalidate obsolete work. Unknown fence languages retain plain text.
 Code source and coordinate maps count toward the 64 MiB presentation limit. Each syntax job has a
-10-second deadline and a 16 MiB result limit, and each decorated block admits at most 8192 spans.
+10-second deadline and uses the shared source-line cutoff. Syntax results have no separate
+byte or span-count rejection. Document and transport admission remain independent of syntax eligibility.
 
 Each Rust session controller owns one `TimelineStream`. The stream compares stable top-level entry identities, advances
 its own monotonic revision, and emits ordered `insert`, `replace`, `remove`, `tool_output`, and `message` operations. Provider lifecycle events
@@ -3550,13 +3582,13 @@ requests wait until retirement releases the slot. A retiring job cannot gain new
 consumers after its worker has committed to cancellation.
 
 Diff and syntax callers register a capacity notification before attempting admission. Temporary
-job-slot or input-byte pressure suspends the caller without holding a cache reservation or a pool
-permit. Completion wakes the caller to recheck cache coalescing and admission. Closing either
-analysis owner wakes its pending callers without closing the other owner's shared pool. Syntax
-deadlines also bound admission waits. Dropping a waiting future cancels that caller without
-starting native work. Disabled workers, oversized input, retained-memory exhaustion, and closed
-owners remain explicit errors. Caller-owned sources waiting for capacity remain outside pool
-input accounting.
+job-slot pressure suspends both callers, while input-byte pressure applies only to diff work.
+Completion wakes the caller to recheck cache coalescing and admission. Closing either analysis
+owner wakes its pending callers without closing the other owner's shared pool. Syntax deadlines
+also bound admission waits. Dropping a waiting future cancels that caller without starting native
+work. Disabled workers and closed owners remain explicit errors. Diff admission also rejects
+oversized input and retained-memory exhaustion. Caller-owned sources waiting for capacity remain
+outside pool input accounting.
 
 After the final waiter drops, queued work is removed and its inputs are released. Running work
 remains charged until native execution exits. An already running comparison

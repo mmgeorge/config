@@ -311,7 +311,8 @@ local function render_status_hint(state)
   if state.presentation and state.presentation.transcript then
     state.presentation.transcript.recap = state.recap
     state.presentation.transcript.rename_status = state.rename_status
-    state.presentation.transcript.execution_notice = state.execution_notice or state.connection_error or state.sync_error
+    state.presentation.transcript.execution_notice = state.presentation.failure or state.execution_notice
+      or state.connection_error or state.sync_error or state.presentation.section_error
     state.presentation.transcript.wait_notice = require("forge.views.harness.health").wait_notice(state)
     if state.transcript_win and vim.api.nvim_win_is_valid(state.transcript_win) then
       require("forge.views.harness.status_hint").render(state.presentation.transcript,

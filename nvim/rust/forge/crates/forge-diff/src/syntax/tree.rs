@@ -10,8 +10,8 @@ use crate::source::{SourceIdentity, SourceVersion};
 use crate::workers::WorkBudget;
 
 use super::query::{CompiledQuery, source};
-use super::service::{SyntaxCharge, stop_error};
-use super::{SyntaxError, SyntaxLanguage, SyntaxLimits};
+use super::service::{SYNTAX_LINE_LIMIT, stop_error};
+use super::{SyntaxError, SyntaxLanguage};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct SyntaxPoint {
@@ -67,7 +67,6 @@ pub(super) struct ParsedSyntax {
     injection: Vec<SyntaxInjection>,
     pub(super) tree: Vec<Tree>,
     pub(super) line: Vec<usize>,
-    _charge: SyntaxCharge,
 }
 
 struct CaptureIndex {
@@ -91,7 +90,7 @@ struct LanguageQuery {
 struct ParseSession<'a> {
     parsed: ParsedSyntax,
     budget: &'a WorkBudget,
-    limits: SyntaxLimits,
+    active_injection: Vec<(SyntaxLanguage, Vec<Range>)>,
     line: Vec<usize>,
 }
 
@@ -140,13 +139,31 @@ impl SyntaxHandle {
 pub(super) fn parse(
     source: SourceVersion,
     language: SyntaxLanguage,
-    limits: SyntaxLimits,
     budget: &WorkBudget,
-    charge: SyntaxCharge,
 ) -> Result<ParsedSyntax, SyntaxError> {
+    budget.check().map_err(stop_error)?;
+    let parsed = ParsedSyntax {
+        source,
+        language,
+        capture: Vec::new(),
+        index: Vec::new(),
+        injection: Vec::new(),
+        tree: Vec::new(),
+        line: Vec::new(),
+    };
+    if parsed
+        .source
+        .text()
+        .lines()
+        .take(SYNTAX_LINE_LIMIT + 1)
+        .count()
+        > SYNTAX_LINE_LIMIT
+    {
+        return Ok(parsed);
+    }
     let line = std::iter::once(0)
         .chain(
-            source
+            parsed.source
                 .bytes()
                 .iter()
                 .enumerate()
@@ -154,36 +171,15 @@ pub(super) fn parse(
         )
         .collect();
     let mut session = ParseSession {
-        parsed: ParsedSyntax {
-            source,
-            language,
-            capture: Vec::new(),
-            index: Vec::new(),
-            injection: Vec::new(),
-            tree: Vec::new(),
-            line: Vec::new(),
-            _charge: charge,
-        },
+        parsed,
         budget,
-        limits,
+        active_injection: Vec::new(),
         line,
     };
     budget.check().map_err(stop_error)?;
-    session.parse_language(language, &[], 0)?;
+    session.parse_language(language, &[])?;
     session.parsed.index = capture_index(&session.parsed.capture);
     session.parsed.line = session.line;
-    let unused_capture_bytes = limits
-        .captures
-        .saturating_sub(session.parsed.capture.capacity())
-        .saturating_mul(std::mem::size_of::<SyntaxCapture>());
-    let unused_index_bytes = limits
-        .captures
-        .saturating_sub(session.parsed.index.capacity())
-        .saturating_mul(std::mem::size_of::<CaptureIndex>());
-    session
-        .parsed
-        ._charge
-        .release_unused(unused_capture_bytes.saturating_add(unused_index_bytes));
     Ok(session.parsed)
 }
 
@@ -250,14 +246,14 @@ impl ParseSession<'_> {
         &mut self,
         language: SyntaxLanguage,
         included: &[Range],
-        depth: usize,
     ) -> Result<(), SyntaxError> {
         self.budget.check().map_err(stop_error)?;
-        if depth > self.limits.injection_depth
-            || self.parsed.tree.len() >= self.limits.injection_trees
-        {
-            return Err(SyntaxError::InjectionLimit);
+        if self.active_injection.iter().any(|(active_language, active_range)| {
+            *active_language == language && active_range.as_slice() == included
+        }) {
+            return Ok(());
         }
+        self.active_injection.push((language, included.to_vec()));
         let mut parser = Parser::new();
         parser
             .set_language(&language.grammar())
@@ -298,7 +294,7 @@ impl ParseSession<'_> {
         ] {
             let query = language_query(language, kind)?;
             let mut cursor = QueryCursor::new();
-            cursor.set_match_limit(4096);
+            cursor.set_match_limit(u32::MAX);
             let mut query_progress = |_: &tree_sitter::QueryCursorState| {
                 if budget.check().is_ok() {
                     ControlFlow::Continue(())
@@ -395,9 +391,6 @@ impl ParseSession<'_> {
                     if name.starts_with('_') && url.is_none() {
                         continue;
                     }
-                    if self.parsed.capture.len() >= self.limits.captures {
-                        return Err(SyntaxError::CaptureLimit);
-                    }
                     let applicable = |property: &&tree_sitter::QueryProperty| {
                         property
                             .capture_id
@@ -453,9 +446,6 @@ impl ParseSession<'_> {
                 }
             }
             drop(matches);
-            if cursor.did_exceed_match_limit() {
-                return Err(SyntaxError::CaptureLimit);
-            }
         }
         for (_, name, mut range) in injection {
             range.sort_by_key(|range| range.start_byte);
@@ -473,9 +463,10 @@ impl ParseSession<'_> {
                 {
                     continue;
                 }
-                self.parse_language(injected, &included, depth + 1)?;
+                self.parse_language(injected, &included)?;
             }
         }
+        self.active_injection.pop();
         Ok(())
     }
 

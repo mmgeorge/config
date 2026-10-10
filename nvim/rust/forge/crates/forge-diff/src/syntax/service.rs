@@ -11,27 +11,10 @@ use crate::workers::{AnalysisPool, WorkBudget, WorkPriority, WorkStop, WorkTicke
 use super::tree::{ParsedSyntax, parse};
 use super::{SyntaxError, SyntaxHandle, SyntaxLanguage};
 
-#[derive(Clone, Copy, Debug)]
-pub struct SyntaxLimits {
-    /// Admission charge for pinned results and active jobs, not a native allocator RSS limit.
-    pub retained_bytes: usize,
-    pub cached_entries: usize,
-    pub captures: usize,
-    pub injection_depth: usize,
-    pub injection_trees: usize,
-}
+/// Files above this line count retain source text without syntax analysis.
+pub const SYNTAX_LINE_LIMIT: usize = 10_000;
 
-impl Default for SyntaxLimits {
-    fn default() -> Self {
-        Self {
-            retained_bytes: 64 * 1024 * 1024,
-            cached_entries: 256,
-            captures: 65_536,
-            injection_depth: 4,
-            injection_trees: 1024,
-        }
-    }
-}
+const CACHE_ENTRIES: usize = 256;
 
 #[derive(Clone)]
 pub struct SyntaxRequest {
@@ -43,16 +26,13 @@ pub struct SyntaxRequest {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SyntaxUsage {
-    pub retained_bytes: usize,
     pub cached_entries: usize,
     pub active_jobs: usize,
 }
 
 pub struct SyntaxEngine {
     pool: Arc<AnalysisPool>,
-    limits: SyntaxLimits,
     state: Mutex<SyntaxState>,
-    retained: Arc<AtomicUsize>,
 }
 
 #[derive(Clone, Copy, Eq, Hash, PartialEq)]
@@ -79,11 +59,6 @@ struct SyntaxInterest {
     pool: Arc<AnalysisPool>,
 }
 
-pub(super) struct SyntaxCharge {
-    retained: Arc<AtomicUsize>,
-    bytes: usize,
-}
-
 struct SyntaxCompletion {
     engine: Arc<SyntaxEngine>,
     key: SyntaxKey,
@@ -93,12 +68,10 @@ struct SyntaxCompletion {
 }
 
 impl SyntaxEngine {
-    /// Shares worker admission with repository comparisons and owns bounded exact-source retention.
-    pub fn new(pool: Arc<AnalysisPool>, limits: SyntaxLimits) -> Arc<Self> {
+    /// Shares parser workers and caches exact-source results without restricting live handles.
+    pub fn new(pool: Arc<AnalysisPool>) -> Arc<Self> {
         Arc::new(Self {
             pool,
-            limits,
-            retained: Arc::new(AtomicUsize::new(0)),
             state: Mutex::new(SyntaxState {
                 cache: HashMap::new(),
                 job: HashMap::new(),
@@ -110,9 +83,9 @@ impl SyntaxEngine {
 
     /// Coalesces one source/language identity and retains native ownership through cancellation.
     ///
-    /// Captures, recursive injections, and retained charge have explicit limits. A saturated
-    /// cache evicts unpinned entries before returning `MemoryLimit`. At most 64 consumers join
-    /// one job. Unavailable injected languages remain explicit metadata on the parent result.
+    /// Files exceeding `SYNTAX_LINE_LIMIT` return their source without trees or captures.
+    /// Cache eviction never rejects analysis or invalidates handles held by documents.
+    /// Unavailable injected languages remain explicit metadata on the parent result.
     pub async fn analyze(
         self: &Arc<Self>,
         request: SyntaxRequest,
@@ -158,15 +131,9 @@ impl SyntaxEngine {
             if let Some(job) = state.job.get(&key) {
                 job.consumer
                     .fetch_update(Ordering::AcqRel, Ordering::Acquire, |count| {
-                        (count > 0 && count < 64).then_some(count + 1)
+                        (count > 0).then(|| count + 1)
                     })
-                    .map_err(|count| {
-                        if count == 0 {
-                            SyntaxError::Busy
-                        } else {
-                            SyntaxError::ConsumerLimit
-                        }
-                    })?;
+                    .map_err(|_| SyntaxError::Busy)?;
                 (
                     SyntaxInterest {
                         job: Arc::clone(job),
@@ -176,37 +143,8 @@ impl SyntaxEngine {
                     None,
                 )
             } else {
-                // Reserve source/tree allowance and complete capture capacity before native admission.
-                let bytes = request
-                    .source
-                    .retained_bytes()
-                    .saturating_mul(64)
-                    .saturating_add(self.limits.captures.saturating_mul(
-                        std::mem::size_of::<super::SyntaxCapture>()
-                            + 2 * std::mem::size_of::<usize>(),
-                    ));
-                while bytes
-                    > self
-                        .limits
-                        .retained_bytes
-                        .saturating_sub(self.retained.load(Ordering::Acquire))
-                {
-                    let Some(oldest) = state
-                        .cache
-                        .iter()
-                        .min_by_key(|(_, (used, _))| *used)
-                        .map(|(key, _)| *key)
-                    else {
-                        return Err(SyntaxError::MemoryLimit);
-                    };
-                    state.cache.remove(&oldest);
-                }
-                self.retained.fetch_add(bytes, Ordering::AcqRel);
-                let charge = SyntaxCharge {
-                    retained: Arc::clone(&self.retained),
-                    bytes,
-                };
-                let budget = WorkBudget::new(request.source.retained_bytes(), request.deadline);
+                // The source is already retained. Syntax eligibility depends only on its line count.
+                let budget = WorkBudget::new(0, request.deadline);
                 let permit = self
                     .pool
                     .reserve(request.priority, budget.clone())
@@ -231,14 +169,13 @@ impl SyntaxEngine {
                         pool: Arc::clone(&self.pool),
                     },
                     receiver,
-                    Some((permit, charge, completion)),
+                    Some((permit, completion)),
                 )
             }
         };
-        if let Some((permit, charge, mut completion)) = work {
-            let limits = self.limits;
+        if let Some((permit, mut completion)) = work {
             permit.submit(move |budget| {
-                let result = parse(request.source, request.language, limits, &budget, charge);
+                let result = parse(request.source, request.language, &budget);
                 completion.publish(result);
             });
         }
@@ -265,7 +202,6 @@ impl SyntaxEngine {
     pub fn usage(&self) -> SyntaxUsage {
         let state = self.state.lock().expect("syntax state poisoned");
         SyntaxUsage {
-            retained_bytes: self.retained.load(Ordering::Acquire),
             cached_entries: state.cache.len(),
             active_jobs: state.job.len(),
         }
@@ -284,8 +220,7 @@ impl SyntaxCompletion {
             (Ok(()), result) => result.map(|parsed| SyntaxHandle(Arc::new(parsed))),
         };
         if let Ok(handle) = &result {
-            while state.cache.len() >= self.engine.limits.cached_entries && !state.cache.is_empty()
-            {
+            while state.cache.len() >= CACHE_ENTRIES {
                 let oldest = state
                     .cache
                     .iter()
@@ -294,9 +229,7 @@ impl SyntaxCompletion {
                     .unwrap();
                 state.cache.remove(&oldest);
             }
-            if self.engine.limits.cached_entries > 0
-                && self.job.consumer.load(Ordering::Acquire) > 0
-            {
+            if self.job.consumer.load(Ordering::Acquire) > 0 {
                 let sequence = state.sequence;
                 state.cache.insert(self.key, (sequence, handle.clone()));
             }
@@ -322,20 +255,6 @@ impl Drop for SyntaxInterest {
         if self.job.consumer.fetch_sub(1, Ordering::AcqRel) == 1 {
             self.pool.cancel(&self.job.ticket);
         }
-    }
-}
-
-impl SyntaxCharge {
-    pub(super) fn release_unused(&mut self, bytes: usize) {
-        let released = bytes.min(self.bytes);
-        self.bytes -= released;
-        self.retained.fetch_sub(released, Ordering::AcqRel);
-    }
-}
-
-impl Drop for SyntaxCharge {
-    fn drop(&mut self) {
-        self.retained.fetch_sub(self.bytes, Ordering::AcqRel);
     }
 }
 

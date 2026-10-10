@@ -74,47 +74,62 @@ impl SectionProjection {
                 &HashMap::new(),
             )?);
         }
-        source.dirty.clear();
-        source.structure_dirty = false;
-        Ok(Self {
+        let projection = Self {
             document: TranscriptDocument::initialize(id, "loaded-transcript".into(), 0, entry)?,
             view: HashMap::new(),
             owner,
             file,
             quota: HashMap::new(),
             entry_sections,
-        })
+        };
+        source.dirty.clear();
+        source.structure_dirty = false;
+        Ok(projection)
     }
 
     pub fn refresh(&mut self, source: &mut TranscriptDocument) -> Result<Vec<BufferPatch>> {
-        let dirty = std::mem::take(&mut source.dirty);
-        let structural = std::mem::take(&mut source.structure_dirty);
+        let dirty = source.dirty.clone();
+        let structural = source.structure_dirty;
         let mut projected = HashMap::new();
+        let mut prepared_owner = HashMap::new();
+        let mut prepared_file = HashMap::new();
+        let mut prepared_sections = HashMap::new();
+        let mut retired_sections = Vec::new();
+        for id in &dirty {
+            if source.entry_position(id).is_none() {
+                continue;
+            }
+            let original = source.source_entry(id)?;
+            prepared_sections.insert(
+                id.clone(),
+                index(&original, &mut prepared_owner, &mut prepared_file),
+            );
+            projected.insert(
+                id.clone(),
+                project(original, self.document.document.revision().0 + 1, &self.view, &self.quota)?,
+            );
+        }
         for id in &dirty {
             if let Some(previous) = self.entry_sections.remove(id) {
                 for section in previous {
                     if self.owner.get(&section) == Some(id) {
                         self.owner.remove(&section);
                         self.file.remove(&section);
+                        retired_sections.push(section);
                     }
                 }
             }
         }
-        for id in dirty {
-            let original = source.source_entry(&id)?;
-            self.entry_sections.insert(
-                id.clone(),
-                index(&original, &mut self.owner, &mut self.file),
-            );
-            projected.insert(
-                id,
-                project(
-                    original,
-                    self.document.document.revision().0 + 1,
-                    &self.view,
-                    &self.quota,
-                )?,
-            );
+        self.owner.extend(prepared_owner);
+        self.file.extend(prepared_file);
+        self.entry_sections.extend(prepared_sections);
+        for section in retired_sections {
+            if !self.owner.contains_key(&section) {
+                self.quota.remove(&section);
+                for (_, intent) in self.view.values_mut() {
+                    intent.remove(&section);
+                }
+            }
         }
         let displaced: HashSet<String> = projected
             .values()
@@ -196,6 +211,10 @@ impl SectionProjection {
                 }])?);
             }
         }
+        for id in dirty {
+            source.dirty.remove(&id);
+        }
+        source.structure_dirty = false;
         Ok(patch)
     }
 
@@ -228,6 +247,11 @@ impl SectionProjection {
         more: bool,
         page: Option<(usize, WidthProfile)>,
     ) -> Result<()> {
+        let (last, intent) = self.view.get(&view).context("section view is closed")?;
+        ensure!(sequence <= forge_buffer::MAX_COUNTER, "section sequence exhausted");
+        if sequence <= *last || (more && (!expanded || intent.get(id) == Some(&false))) {
+            return Ok(());
+        }
         let owner = self
             .owner
             .get(id)
@@ -235,6 +259,14 @@ impl SectionProjection {
             .clone();
         let children = self.file.get(id);
         let file = children.is_some();
+        let loaded = if more { Some(self.document.source_entry(&owner)?) } else { None };
+        if let Some(loaded) = &loaded {
+            if !loaded.block.iter().any(|block| block.metadata.section.iter()
+                .any(|section| section.id.0 == id && section.more)) {
+                self.view.get_mut(&view).expect("validated section view").0 = sequence;
+                return Ok(());
+            }
+        }
         if let Some((rows, width)) = &page {
             ensure!(
                 (1..=8192).contains(rows),
@@ -267,7 +299,7 @@ impl SectionProjection {
                         .position(|block| &block.id == end_id)
                         .unwrap_or(start);
                     let mut rows = 0;
-                    for block in &loaded.block[start + 1..=end] {
+                    for block in &loaded.block[start + 1..end.saturating_add(1).max(start + 1)] {
                         if block.id.0.ends_with(":deferred-body") {
                             continue;
                         }
@@ -288,17 +320,9 @@ impl SectionProjection {
         } else {
             0
         };
-        let (last, intent) = self.view.get_mut(&view).context("section view is closed")?;
-        ensure!(
-            sequence <= forge_buffer::MAX_COUNTER,
-            "section sequence exhausted"
-        );
-        if sequence <= *last {
-            return Ok(());
-        }
-        if more && (!expanded || intent.get(id) == Some(&false)) {
-            return Ok(());
-        }
+        let mut next_view = self.view.clone();
+        let mut next_quota = self.quota.clone();
+        let (last, intent) = next_view.get_mut(&view).expect("validated section view");
         *last = sequence;
         if !more {
             intent.insert(id.into(), expanded);
@@ -309,7 +333,7 @@ impl SectionProjection {
             }
         }
         if expanded {
-            let quota = self.quota.entry(id.into()).or_insert_with(|| {
+            let quota = next_quota.entry(id.into()).or_insert_with(|| {
                 if file {
                     let (rows, width) = page.clone().unwrap_or((48, WidthProfile::default()));
                     PageQuota {
@@ -329,7 +353,7 @@ impl SectionProjection {
                         quota.bytes < MAX_BODY_BYTES,
                         "section exceeds the 16 MiB loaded-body limit"
                     );
-                    quota.rows = quota.rows.max(loaded_rows).saturating_add(rows);
+                    quota.rows = quota.rows.max(loaded_rows).saturating_add(rows).min(1_048_576);
                     quota.bytes = (quota.bytes + PAGE_BYTES).min(MAX_BODY_BYTES);
                     quota.width = Some(width);
                 } else {
@@ -341,9 +365,29 @@ impl SectionProjection {
                 }
             }
         }
+        let candidate = project(
+            source.source_entry(&owner)?,
+            self.document.document.revision().0 + 1,
+            &next_view,
+            &next_quota,
+        )?;
+        if let Some(loaded) = &loaded {
+            let before = page_boundary(loaded, id);
+            let after = page_boundary(&candidate, id);
+            ensure!(after.is_none() || after != before, "section loading made no progress; reopen the section to retry");
+        }
+        self.view = next_view;
+        self.quota = next_quota;
         source.dirty.insert(owner);
         Ok(())
     }
+}
+
+fn page_boundary(entry: &TranscriptEntry, id: &str) -> Option<(BlockId, usize)> {
+    let boundary = entry.block.iter().position(|block| block.metadata.section.iter()
+        .any(|section| section.id.0 == id && section.more))?;
+    entry.block[..boundary].iter().rev().find(|block| block.text.row_count() > 0)
+        .map(|block| (block.id.clone(), block.text.byte_count()))
 }
 
 fn index(
@@ -364,7 +408,7 @@ fn index(
                     .unwrap_or(start);
                 file.insert(
                     fold.id.0.clone(),
-                    entry.block[start + 1..=end]
+                    entry.block[start + 1..end.saturating_add(1).max(start + 1)]
                         .iter()
                         .flat_map(|block| block.metadata.fold.iter().map(|fold| fold.id.0.clone()))
                         .collect(),
@@ -425,7 +469,7 @@ fn render(
     parent_file: Option<&str>,
 ) -> Result<bool> {
     while cursor < end {
-        if budget.exhausted() {
+        if budget.exhausted() && source[cursor].text.row_count() > 0 {
             return Ok(true);
         }
         let source_block = &source[cursor];

@@ -20,7 +20,7 @@ mod tree;
 
 pub use assets::SyntaxLanguage;
 pub use context::HunkContext;
-pub use service::{SyntaxEngine, SyntaxLimits, SyntaxRequest, SyntaxUsage};
+pub use service::{SYNTAX_LINE_LIMIT, SyntaxEngine, SyntaxRequest, SyntaxUsage};
 pub use tree::{
     SyntaxCapture, SyntaxFamily, SyntaxHandle, SyntaxInjection, SyntaxPoint, SyntaxRange,
 };
@@ -30,10 +30,8 @@ pub enum SyntaxError {
     Query(String),
     Closed,
     Busy,
-    ConsumerLimit,
     MemoryLimit,
     CaptureLimit,
-    InjectionLimit,
     Cancelled,
     Deadline,
     WorkerFailed,
@@ -55,7 +53,6 @@ mod tests {
                 jobs: 2,
                 input_bytes: 8 * 1024 * 1024,
             })),
-            SyntaxLimits::default(),
         )
     }
 
@@ -69,31 +66,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn markdown_paragraphs_keep_independent_inline_trees_with_explicit_admission() {
-        let text = (0..128)
+    async fn markdown_paragraphs_keep_all_inline_trees_below_line_limit() {
+        let text = (0..1100)
             .map(|index| format!("Paragraph **{index}**.\n\n"))
             .collect::<String>();
         let syntax = engine()
             .analyze(request(SyntaxLanguage::Markdown, &text))
             .await
             .unwrap();
-        assert_eq!(syntax.tree_count(), 129);
-        let mut limits = SyntaxLimits::default();
-        limits.injection_trees = 32;
-        let limited = SyntaxEngine::new(
-            Arc::new(AnalysisPool::new(PoolLimits {
-                workers: 1,
-                jobs: 1,
-                input_bytes: 8 * 1024 * 1024,
-            })),
-            limits,
-        );
-        assert!(matches!(
-            limited
-                .analyze(request(SyntaxLanguage::Markdown, &text))
-                .await,
-            Err(SyntaxError::InjectionLimit)
-        ));
+        assert_eq!(syntax.tree_count(), 1101);
+        assert!(syntax.captures().iter().any(|capture| capture.range.start.row == 2198));
     }
 
     #[tokio::test]
@@ -325,11 +307,9 @@ mod tests {
         assert_eq!(SyntaxLanguage::ALL.len(), 22);
         assert_eq!(usage.active_jobs, 0);
         assert!(usage.cached_entries > 0 && usage.cached_entries <= 22);
-        assert!(capture_count <= SyntaxLimits::default().captures);
         eprintln!(
-            "syntax_acceptance={{\"languages\":22,\"source_bytes\":{source_bytes},\"captures\":{capture_count},\"cached_entries\":{},\"retained_bytes\":{},\"elapsed_us\":{}}}",
+            "syntax_acceptance={{\"languages\":22,\"source_bytes\":{source_bytes},\"captures\":{capture_count},\"cached_entries\":{},\"elapsed_us\":{}}}",
             usage.cached_entries,
-            usage.retained_bytes,
             started.elapsed().as_micros(),
         );
     }
@@ -416,7 +396,7 @@ mod tests {
         )
         .unwrap();
         running.await.unwrap();
-        let engine = SyntaxEngine::new(Arc::clone(&pool), SyntaxLimits::default());
+        let engine = SyntaxEngine::new(Arc::clone(&pool));
         let mut first = Box::pin(engine.analyze(request(SyntaxLanguage::Rust, "fn shared() {}")));
         let mut second = Box::pin(engine.analyze(request(SyntaxLanguage::Rust, "fn shared() {}")));
         assert!(
@@ -450,7 +430,7 @@ mod tests {
             input_bytes: 1024,
         }));
         let occupied = pool.reserve(WorkPriority::Foreground, WorkBudget::new(0, None)).unwrap();
-        let engine = SyntaxEngine::new(Arc::clone(&pool), SyntaxLimits::default());
+        let engine = SyntaxEngine::new(Arc::clone(&pool));
         let mut pending = Box::pin(engine.analyze(SyntaxRequest {
             priority: WorkPriority::Visible,
             ..request(SyntaxLanguage::Rust, "fn visible() {}")
@@ -466,25 +446,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn syntax_admission_waits_for_bytes_and_releases_cancelled_waiters() {
+    async fn syntax_uses_workers_when_shared_byte_capacity_is_occupied() {
         use crate::workers::WorkBudget;
-        use std::future::Future;
-        use std::task::Poll;
-        let pool = Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 4, input_bytes: 1024 }));
-        let occupied = pool.reserve(WorkPriority::Foreground, WorkBudget::new(1024, None)).unwrap();
-        let engine = SyntaxEngine::new(Arc::clone(&pool), SyntaxLimits::default());
-        let mut cancelled = Box::pin(engine.analyze(request(SyntaxLanguage::Rust, "fn cancelled() {}")));
-        assert!(std::future::poll_fn(|context| Poll::Ready(cancelled.as_mut().poll(context))).await.is_pending());
-        assert_eq!(engine.usage().retained_bytes, 0);
-        assert_eq!(engine.usage().active_jobs, 0);
-        drop(cancelled);
-        let mut waiting = Box::pin(engine.analyze(request(SyntaxLanguage::Rust, "fn waiting() {}")));
-        assert!(std::future::poll_fn(|context| Poll::Ready(waiting.as_mut().poll(context))).await.is_pending());
-        drop(occupied);
-        let syntax = tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await.unwrap().unwrap();
+        let pool = Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 4, input_bytes: 1 }));
+        let occupied = pool.reserve(WorkPriority::Foreground, WorkBudget::new(1, None)).unwrap();
+        let engine = SyntaxEngine::new(Arc::clone(&pool));
+        let syntax = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            engine.analyze(request(SyntaxLanguage::Rust, "fn highlighted() {}")),
+        ).await.unwrap().unwrap();
         assert!(!syntax.captures().is_empty());
+        assert_eq!(pool.usage().input_bytes, 1);
+        drop(occupied);
         assert_eq!(pool.usage().admitted_jobs, 0);
-        assert_eq!(pool.usage().input_bytes, 0);
     }
 
     #[tokio::test]
@@ -495,7 +469,7 @@ mod tests {
         for boundary in ["deadline", "syntax close", "pool close"] {
             let pool = Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 1, input_bytes: 1024 }));
             let occupied = pool.reserve(WorkPriority::Foreground, WorkBudget::new(0, None)).unwrap();
-            let engine = SyntaxEngine::new(Arc::clone(&pool), SyntaxLimits::default());
+            let engine = SyntaxEngine::new(Arc::clone(&pool));
             let mut source = request(SyntaxLanguage::Rust, "fn waiting() {}");
             if boundary == "deadline" {
                 source.deadline = Some(std::time::Instant::now() + std::time::Duration::from_millis(30));
@@ -513,7 +487,6 @@ mod tests {
                 "pool close" => SyntaxError::Pool(PoolError::Closed),
                 _ => SyntaxError::Deadline,
             });
-            assert_eq!(engine.usage().retained_bytes, 0);
             assert_eq!(pool.usage().admitted_jobs, 1);
             drop(occupied);
         }
@@ -525,98 +498,67 @@ mod tests {
         for (workers, jobs, input_bytes, expected) in [
             (0, 1, 1024, PoolError::WorkerUnavailable),
             (1, 0, 1024, PoolError::WorkerUnavailable),
-            (1, 1, 1, PoolError::Oversized),
         ] {
             let pool = Arc::new(AnalysisPool::new(PoolLimits { workers, jobs, input_bytes }));
-            let engine = SyntaxEngine::new(pool, SyntaxLimits::default());
+            let engine = SyntaxEngine::new(pool);
             let outcome = tokio::time::timeout(std::time::Duration::from_secs(2), engine.analyze(request(SyntaxLanguage::Rust, "fn main() {}"))).await.unwrap();
             assert_eq!(outcome.err(), Some(SyntaxError::Pool(expected)));
-            assert_eq!(engine.usage().retained_bytes, 0);
         }
     }
 
     #[tokio::test]
-    async fn ordinary_pinned_sources_do_not_retain_maximum_capture_reservations() {
+    async fn pinned_syntax_survives_cache_eviction_without_blocking_new_files() {
         let engine = engine();
-        let mut pinned = Vec::new();
-        for revision in 0..32 {
+        let pinned = engine.analyze(request(SyntaxLanguage::Rust, "fn pinned() {}"))
+            .await.unwrap();
+        for revision in 0..257 {
             let source = format!("fn revision_{revision}() {{ let value = {revision}; }}");
-            let syntax = engine
-                .analyze(request(SyntaxLanguage::Rust, &source))
-                .await
-                .unwrap_or_else(|error| panic!("revision {revision}: {error:?}"));
+            let syntax = engine.analyze(request(SyntaxLanguage::Rust, &source)).await.unwrap();
             assert!(!syntax.captures().is_empty());
-            pinned.push(syntax);
         }
-        let usage = engine.usage();
-        eprintln!("32 pinned syntax sources: {} charged bytes", usage.retained_bytes);
-        assert!(usage.retained_bytes < 1024 * 1024);
+        let reloaded = engine.analyze(request(SyntaxLanguage::Rust, "fn pinned() {}"))
+            .await.unwrap();
+        assert!(!Arc::ptr_eq(&pinned.0, &reloaded.0));
+        assert_eq!(pinned.source_identity(), reloaded.source_identity());
+        assert!(!pinned.captures().is_empty());
     }
 
     #[tokio::test]
-    async fn pinned_syntax_retains_its_budget_after_cache_eviction() {
-        let pool = Arc::new(AnalysisPool::new(PoolLimits {
-            workers: 1,
-            jobs: 1,
-            input_bytes: 1024,
-        }));
-        let engine = SyntaxEngine::new(
-            pool,
-            SyntaxLimits {
-                retained_bytes: (std::mem::size_of::<SyntaxCapture>()
-                    + 2 * std::mem::size_of::<usize>())
-                    * 128
-                    + 1024,
-                captures: 128,
-                cached_entries: 1,
-                ..SyntaxLimits::default()
-            },
-        );
-        let pinned = engine
-            .analyze(request(SyntaxLanguage::Rust, "fn first() {}"))
-            .await
-            .unwrap();
-        assert!(matches!(
-            engine
-                .analyze(request(SyntaxLanguage::Rust, "fn other() {}"))
-                .await,
-            Err(SyntaxError::MemoryLimit)
-        ));
-        assert_eq!(engine.usage().cached_entries, 0);
-        assert!(engine.usage().retained_bytes > 0);
-        drop(pinned);
-        assert_eq!(engine.usage().retained_bytes, 0);
-        assert!(
-            engine
-                .analyze(request(SyntaxLanguage::Rust, "fn other() {}"))
-                .await
-                .is_ok()
-        );
+    async fn syntax_accepts_ten_thousand_lines_and_skips_larger_sources() {
+        let engine = engine();
+        for newline in ["\n", "\r\n"] {
+            for trailing_newline in [false, true] {
+                for lines in [SYNTAX_LINE_LIMIT, SYNTAX_LINE_LIMIT + 1] {
+                    let mut source = vec!["// padding"; lines];
+                    source[0] = "fn boundary() {}";
+                    let mut source = source.join(newline);
+                    if trailing_newline { source.push_str(newline); }
+                    let syntax = engine.analyze(request(SyntaxLanguage::Rust, &source)).await.unwrap();
+                    assert_eq!(syntax.source().text(), source);
+                    if lines == SYNTAX_LINE_LIMIT {
+                        assert_eq!(syntax.tree_count(), 1);
+                        assert!(!syntax.captures().is_empty());
+                    } else {
+                        assert_eq!(syntax.tree_count(), 0);
+                        assert!(syntax.captures().is_empty());
+                        assert!(syntax.injections().is_empty());
+                        assert!(syntax.hunk_context(0).is_none());
+                    }
+                }
+            }
+        }
     }
 
     #[tokio::test]
-    async fn capture_limit_returns_explicit_failure_without_retaining_partial_analysis() {
-        let pool = Arc::new(AnalysisPool::new(PoolLimits {
-            workers: 1,
-            jobs: 1,
-            input_bytes: 1024,
-        }));
-        let engine = SyntaxEngine::new(
-            pool,
-            SyntaxLimits {
-                captures: 1,
-                ..SyntaxLimits::default()
-            },
-        );
-        assert!(matches!(
-            engine
-                .analyze(request(SyntaxLanguage::Rust, "fn main() {}"))
-                .await,
-            Err(SyntaxError::CaptureLimit)
-        ));
-        assert_eq!(engine.usage().active_jobs, 0);
-        assert_eq!(engine.usage().retained_bytes, 0);
-        assert_eq!(engine.usage().cached_entries, 0);
+    async fn long_lines_and_many_captures_remain_eligible() {
+        let engine = engine();
+        let source = format!("fn long_line() {{}} // {}", "x".repeat(1024 * 1024));
+        let syntax = engine.analyze(request(SyntaxLanguage::Rust, &source)).await.unwrap();
+        assert_eq!(syntax.tree_count(), 1);
+        assert!(!syntax.captures().is_empty());
+        let source = "fn dense() { let first = 1; let second = first + 2; }\n".repeat(SYNTAX_LINE_LIMIT);
+        let syntax = engine.analyze(request(SyntaxLanguage::Rust, &source)).await.unwrap();
+        assert!(syntax.captures().len() > 65_536);
     }
 
     #[tokio::test]

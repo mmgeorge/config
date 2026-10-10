@@ -1942,7 +1942,6 @@ mod tests {
         let contender_diff = DiffEngine::new(CacheLimits::default(), 1);
         let contender_syntax = SyntaxEngine::new(
             contender_diff.analysis_pool(),
-            forge_diff::syntax::SyntaxLimits::default(),
         );
         let contender = HarnessService::new(
             Arc::new(RepositoryStore::default()),
@@ -2033,7 +2032,6 @@ mod tests {
         let diff = DiffEngine::new(CacheLimits::default(), 1);
         let syntax = SyntaxEngine::new(
             diff.analysis_pool(),
-            forge_diff::syntax::SyntaxLimits::default(),
         );
         HarnessService::new(Arc::new(RepositoryStore::default()), diff, syntax)
     }

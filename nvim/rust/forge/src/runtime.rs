@@ -39,10 +39,7 @@ impl ForgeRuntime {
         let repositories = Arc::new(RepositoryStore::default());
         let writes = repository_write::RepositoryWriteGateway::new(Arc::clone(&repositories))?;
         let diff = DiffEngine::with_cache(Arc::clone(&repositories.analysis), 4);
-        let syntax = forge_diff::syntax::SyntaxEngine::new(
-            diff.analysis_pool(),
-            forge_diff::syntax::SyntaxLimits::default(),
-        );
+        let syntax = forge_diff::syntax::SyntaxEngine::new(diff.analysis_pool());
         let status = forge_status::StatusService::new(
             Arc::clone(&repositories),
             Arc::clone(&diff),

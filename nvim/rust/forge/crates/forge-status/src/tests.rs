@@ -9,7 +9,7 @@ use forge_buffer::{
 use forge_diff::{
     cache::CacheLimits,
     engine::DiffEngine,
-    syntax::{SyntaxEngine, SyntaxLimits},
+    syntax::{SyntaxEngine},
 };
 use forge_git::{
     command::{CommandLimits, read_command},
@@ -69,7 +69,7 @@ async fn fixture() -> (
     std::fs::write(directory.path().join("sample.txt"), "new\n").unwrap();
     let store = Arc::new(RepositoryStore::default());
     let diff = DiffEngine::with_cache(Arc::clone(&store.analysis), 4);
-    let syntax = SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default());
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
     let writer = Arc::new(GitWriteService::new(Arc::clone(&store)));
     let service = StatusService::new(store, Arc::clone(&diff), syntax, Arc::clone(&writer));
     (directory, service, diff, writer)
@@ -79,7 +79,7 @@ async fn fixture() -> (
 fn literal_source_uses_shared_admission_and_bounded_first_delivery() {
     let store = Arc::new(RepositoryStore::default());
     let diff = DiffEngine::new(CacheLimits::default(), 2);
-    let syntax = SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default());
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
     let service = crate::source_document::SourceDocumentService::new(store, syntax);
     let text = (0..300)
         .map(|line| format!("message {line}\n"))
@@ -181,7 +181,7 @@ async fn staging_with_many_open_syntax_bodies_preserves_highlighting() {
         assert!(file.old_syntax.is_some(), "{} old syntax absent", file.id);
         assert!(file.new_syntax.is_some(), "{} new syntax absent", file.id);
     }
-    assert!(service.syntax.usage().retained_bytes < 1024 * 1024);
+    assert_eq!(service.syntax.usage().active_jobs, 0);
 }
 
 #[test]
@@ -367,7 +367,7 @@ async fn source_document_retains_exact_revision_and_bounded_continuation() {
     git(directory.path(), &["commit", "-m", "historical source"]);
     let service = crate::source_document::SourceDocumentService::new(
         Arc::new(RepositoryStore::default()),
-        SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default()),
+        SyntaxEngine::new(diff.analysis_pool()),
     );
     let opened = service
         .open(
@@ -414,7 +414,7 @@ async fn source_document_index_revision_is_immutable_and_distinct_from_later_ind
     let (directory, _, diff, _) = fixture().await;
     let service = crate::source_document::SourceDocumentService::new(
         Arc::new(RepositoryStore::default()),
-        SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default()),
+        SyntaxEngine::new(diff.analysis_pool()),
     );
     let first = service
         .open(
@@ -1455,22 +1455,16 @@ async fn whole_section_stages_current_contents_and_only_selected_paths() {
     writer.acknowledge(outcome.operation);
 }
 #[tokio::test]
-async fn syntax_capture_failure_preserves_status_and_source_text() {
+async fn oversized_syntax_preserves_status_and_source_text_without_warnings() {
     let (directory, _, diff, _) = fixture().await;
-    let old = "fn before() {}\nfn retained() {}\n";
-    let new = "fn after() {}\nfn retained() {}\n";
-    std::fs::write(directory.path().join("syntax.rs"), old).unwrap();
+    let old = format!("fn before() {{}}\nfn retained() {{}}\n{}", "\n".repeat(9999));
+    let new = format!("fn after() {{}}\nfn retained() {{}}\n{}", "\n".repeat(9999));
+    std::fs::write(directory.path().join("syntax.rs"), &old).unwrap();
     git(directory.path(), &["add", "syntax.rs"]);
     git(directory.path(), &["commit", "-m", "syntax source"]);
-    std::fs::write(directory.path().join("syntax.rs"), new).unwrap();
+    std::fs::write(directory.path().join("syntax.rs"), &new).unwrap();
     let store = Arc::new(RepositoryStore::default());
-    let syntax = SyntaxEngine::new(
-        diff.analysis_pool(),
-        SyntaxLimits {
-            captures: 1,
-            ..SyntaxLimits::default()
-        },
-    );
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
     let writer = Arc::new(GitWriteService::new(Arc::clone(&store)));
     let service = StatusService::new(Arc::clone(&store), diff, Arc::clone(&syntax), writer);
     let (opened, timing) = service
@@ -1499,12 +1493,7 @@ async fn syntax_capture_failure_preserves_status_and_source_text() {
         .unwrap()
         .unwrap();
     assert_eq!(update.phase, "context");
-    assert!(
-        update
-            .diagnostic
-            .iter()
-            .any(|diagnostic| diagnostic.contains("CaptureLimit"))
-    );
+    assert!(update.diagnostic.is_empty());
     let refreshed = service.snapshot(&opened.document).await.unwrap();
     let loaded = body(&service, &refreshed, file(&refreshed, "syntax.rs", None)).await;
     let rows: Vec<_> = loaded
@@ -1549,15 +1538,10 @@ async fn syntax_capture_failure_preserves_status_and_source_text() {
         )
         .await
         .unwrap();
-    assert_eq!(historical.state, BodyState::Ready);
-    assert!(
-        historical
-            .syntax_diagnostic
-            .unwrap()
-            .contains("CaptureLimit")
-    );
+    assert_eq!(historical.state, BodyState::Partial);
+    assert!(historical.syntax_diagnostic.is_none());
     assert_eq!(
-        historical.snapshot.block[0].text.wire_rows(),
+        &historical.snapshot.block[0].text.wire_rows()[..2],
         vec!["fn before() {}", "fn retained() {}"]
     );
     let captured = source
@@ -1572,10 +1556,10 @@ async fn syntax_capture_failure_preserves_status_and_source_text() {
         )
         .await
         .unwrap();
-    assert_eq!(captured.state, BodyState::Ready);
-    assert!(captured.syntax_diagnostic.unwrap().contains("CaptureLimit"));
+    assert_eq!(captured.state, BodyState::Partial);
+    assert!(captured.syntax_diagnostic.is_none());
     assert_eq!(
-        captured.snapshot.block[0].text.wire_rows(),
+        &captured.snapshot.block[0].text.wire_rows()[..2],
         vec!["fn after() {}", "fn retained() {}"]
     );
 }
@@ -1609,7 +1593,7 @@ async fn removed_status_row_opens_captured_blob_after_index_changes() {
     git(directory.path(), &["add", "sample.txt"]);
     let source = crate::source_document::SourceDocumentService::new(
         Arc::new(RepositoryStore::default()),
-        SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default()),
+        SyntaxEngine::new(diff.analysis_pool()),
     );
     let opened = source
         .open(

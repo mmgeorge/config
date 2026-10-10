@@ -631,13 +631,6 @@ impl SessionPresentation {
             if current.text.row_count() != syntax.text.row_count() {
                 return Ok(());
             }
-            ensure!(
-                current.metadata.decoration.len()
-                    + current.metadata.visible_decoration.len()
-                    + syntax.metadata.visible_decoration.len()
-                    <= 8192,
-                "transcript syntax block exceeds 8192 decorations"
-            );
             let mut replacement = current.clone();
             for mut span in syntax.metadata.visible_decoration {
                 let row = span.range.start.row;
@@ -1354,7 +1347,17 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
 }
 
 fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>) -> Result<()> {
-    for patch in open.sections.refresh(&mut open.transcript).context("loaded section projection")? {
+    if let Some(failure) = &open.failure {
+        anyhow::bail!("transcript projection requires reopening: {failure}");
+    }
+    let patches = match open.sections.refresh(&mut open.transcript) {
+        Ok(patches) => patches,
+        Err(failure) => {
+            open.failure = Some(format!("loaded section projection: {failure:#}"));
+            return Err(failure.context("loaded section projection"));
+        }
+    };
+    for patch in patches {
         let bytes = serde_json::to_vec(&patch)?.len();
         while open.pending.len() >= 64 || open.pending_bytes + bytes > MAX_PENDING_BYTES {
             let Some((_, removed)) = open.pending.pop_front() else {
@@ -1605,7 +1608,7 @@ mod tests {
     #[tokio::test]
     async fn saved_syntax_rejects_stale_and_closed_documents_and_survives_timer_refresh()
     -> Result<()> {
-        use forge_diff::syntax::{SyntaxEngine, SyntaxLimits};
+        use forge_diff::syntax::{SyntaxEngine};
         use forge_diff::workers::{AnalysisPool, PoolLimits};
         use std::sync::Arc;
         let engine = SyntaxEngine::new(
@@ -1614,7 +1617,6 @@ mod tests {
                 jobs: 2,
                 input_bytes: 1024 * 1024,
             })),
-            SyntaxLimits::default(),
         );
         let mut entry = interaction_entry("syntax");
         let TimelineEntry::Exchange { exchange, .. } = &mut entry else {

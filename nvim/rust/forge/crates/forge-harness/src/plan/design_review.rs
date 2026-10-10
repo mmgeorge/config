@@ -935,7 +935,7 @@ mod tests {
     #[tokio::test]
     async fn synthetic_function_bodies_preserve_following_declaration_syntax() {
         use std::sync::Arc;
-        use forge_diff::syntax::{SyntaxEngine, SyntaxLanguage, SyntaxLimits, SyntaxRequest};
+        use forge_diff::syntax::{SyntaxEngine, SyntaxLanguage, SyntaxRequest};
         use forge_diff::workers::{AnalysisPool, PoolLimits, WorkPriority};
 
         let mut document = crate::plan::document::test_fixture("syntax-rows", "Syntax rows");
@@ -954,7 +954,7 @@ mod tests {
         design.proposed_calls.insert("arena.rs".into(), proposed);
         document.design = Some(design);
         let original = document.clone();
-        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2, input_bytes: 8 * 1024 * 1024 })), SyntaxLimits::default());
+        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2, input_bytes: 8 * 1024 * 1024 })));
         let mut syntax = HashMap::new();
         for (side, text) in [("baseline", before), ("proposed", after.as_str())] {
             let plain = forge_diff::syntax::DeclarationOverview::present("arena.rs", text).unwrap().text;

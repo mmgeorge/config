@@ -98,11 +98,11 @@ fn row_node<'tree>(root: Node<'tree>, line: &[usize], source: &str, row: usize) 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{source::{Representation, SourceVersion}, syntax::{SyntaxEngine, SyntaxLanguage, SyntaxLimits, SyntaxRequest}, workers::{AnalysisPool, PoolLimits, WorkPriority}};
+    use crate::{source::{Representation, SourceVersion}, syntax::{SyntaxEngine, SyntaxLanguage, SyntaxRequest}, workers::{AnalysisPool, PoolLimits, WorkPriority}};
     use std::sync::Arc;
 
     async fn syntax(language: SyntaxLanguage, source: &str) -> SyntaxHandle {
-        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2, input_bytes: 8 * 1024 * 1024 })), SyntaxLimits::default());
+        let engine = SyntaxEngine::new(Arc::new(AnalysisPool::new(PoolLimits { workers: 1, jobs: 2, input_bytes: 8 * 1024 * 1024 })));
         engine.analyze(SyntaxRequest {
             source: SourceVersion::new(source.as_bytes().to_vec(), Representation::GitCanonical).unwrap(),
             language, priority: WorkPriority::Foreground, deadline: None,

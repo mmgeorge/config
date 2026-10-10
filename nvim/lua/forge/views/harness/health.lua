@@ -24,12 +24,15 @@ function M.watch(state, refresh)
   local last_response = vim.uv.now()
   local pending = false
   local resumed_at = 0
+  local connection_notice = "Connection unresponsive — task status unknown"
+  local function current()
+    return state.health_owner == identity and client.host_generation() == generation
+      and not state.host_error and state.session and state.session.id == session_id
+  end
   local function tick()
-    if state.health_owner ~= identity or client.host_generation() ~= generation or state.host_error
-      or not state.session or state.session.id ~= session_id then return end
+    if not current() then return end
     if vim.uv.now() - last_response >= 10000 then
-      state.connection_error = "Connection unresponsive — task status unknown"
-      refresh()
+      if not state.connection_error then state.connection_error = connection_notice refresh() end
     end
     if awaiting_user(state) or not state.busy then
       resumed_at = vim.uv.now()
@@ -44,11 +47,11 @@ function M.watch(state, refresh)
     if not pending then
       pending = true
       client.request_for(session_id, "health.get", {}, function(_, failure)
-        if state.health_owner ~= identity or client.host_generation() ~= generation then return end
+        if not current() then return end
         pending = false
         if not failure then
           last_response = vim.uv.now()
-          if state.connection_error then state.connection_error = nil refresh() end
+          if state.connection_error == connection_notice then state.connection_error = nil refresh() end
         end
       end)
     end

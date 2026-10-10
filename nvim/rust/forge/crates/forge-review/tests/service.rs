@@ -271,13 +271,13 @@ async fn editable_description_keeps_markdown_source_and_typescript_syntax() {
     use forge_diff::{
         cache::CacheLimits,
         engine::DiffEngine,
-        syntax::{SyntaxEngine, SyntaxLimits},
+        syntax::{SyntaxEngine},
     };
     let remote = remote();
     let source = "# Description\n\n**Bold** text and [a link](https://example.com).\n\n```ts\ninterface TestValue {\n  Foobar: number,\n  Test: number;\n  NextValue: number\n}\n```\n\nFollowing paragraph.\n";
     remote.state.lock().unwrap().body = Some(source.into());
     let diff = DiffEngine::new(CacheLimits::default(), 2);
-    let syntax = SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default());
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
     let service = ReviewService::with_engines(github(&remote), diff, syntax);
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
     let rendered = service
@@ -1357,7 +1357,7 @@ async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
     use forge_diff::{
         cache::CacheLimits,
         engine::DiffEngine,
-        syntax::{SyntaxEngine, SyntaxLimits},
+        syntax::{SyntaxEngine},
     };
     use forge_github::review_api::ReviewPage;
     use forge_review::service::ReviewSectionKind;
@@ -1379,7 +1379,7 @@ async fn immutable_file_continuation_publishes_only_new_rows_after_an_edit() {
         ReviewPage { records: vec![], next_cursor:None, complete:true },
     ]);
     let diff = DiffEngine::new(CacheLimits::default(), 2);
-    let syntax = SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default());
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
     let service = ReviewService::with_engines(github(&remote), diff.clone(), syntax);
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
     let directory = remote.recovery.path().to_path_buf();
@@ -1566,7 +1566,7 @@ async fn batched_file_sections_remain_stable_and_move_viewed_files() {
     use forge_diff::{
         cache::CacheLimits,
         engine::DiffEngine,
-        syntax::{SyntaxEngine, SyntaxLimits},
+        syntax::{SyntaxEngine},
     };
     use forge_github::review_api::ReviewPage;
     use forge_review::service::ReviewSectionKind;
@@ -1593,7 +1593,7 @@ async fn batched_file_sections_remain_stable_and_move_viewed_files() {
         complete: true,
     });
     let diff = DiffEngine::new(CacheLimits::default(), 2);
-    let syntax = SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default());
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
     let service = ReviewService::with_engines(github(&remote), diff, syntax);
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
     service
@@ -4160,7 +4160,7 @@ async fn immutable_file_analysis_uses_merge_base_and_fork_head_sources() {
     use forge_diff::{
         cache::CacheLimits,
         engine::DiffEngine,
-        syntax::{SyntaxEngine, SyntaxLimits},
+        syntax::{SyntaxEngine},
     };
     use forge_github::review_api::ReviewPage;
     use forge_review::service::ReviewSectionKind;
@@ -4171,7 +4171,7 @@ async fn immutable_file_analysis_uses_merge_base_and_fork_head_sources() {
     ReviewPage { records: vec![serde_json::json!({"filename":"src/new.rs","previous_filename":"src/old.rs","status":"renamed","sha":"e".repeat(40)})], next_cursor:None, complete:true },
 ]);
     let diff = DiffEngine::new(CacheLimits::default(), 2);
-    let syntax = SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default());
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
     let service = ReviewService::with_engines(github(&remote), diff.clone(), syntax.clone());
     let opened = service.open_pr(remote.clone(), target()).await.unwrap();
     let directory = remote.recovery.path().to_path_buf();
@@ -4589,7 +4589,7 @@ async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_u
     use forge_diff::{
         cache::CacheLimits,
         engine::DiffEngine,
-        syntax::{SyntaxEngine, SyntaxLimits},
+        syntax::{SyntaxEngine},
     };
     use forge_github::review_api::ReviewPage;
     use forge_review::service::ReviewSectionKind;
@@ -4615,7 +4615,7 @@ async fn native_file_targets_open_the_retained_diff_workspace_file_and_browser_u
         },
     ]);
     let diff = DiffEngine::new(CacheLimits::default(), 2);
-    let syntax = SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default());
+    let syntax = SyntaxEngine::new(diff.analysis_pool());
     let service = ReviewService::with_engines(github(&remote), diff, syntax);
     let directory = remote.recovery.path().to_path_buf();
     let opened = service

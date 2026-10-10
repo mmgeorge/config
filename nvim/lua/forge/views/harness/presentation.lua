@@ -16,7 +16,7 @@ function M.open(options, callback)
   local identity = "harness:" .. options.session_id .. ":" .. tostring(vim.uv.hrtime())
   local owner = { document = identity, submission_sequence = 0, closed = false, syncing = false, pending = false, output = {},
     session_id = options.session_id, host_generation = client.host_generation(), views = {},
-    timeline_key = "main", timeline_view = {} }
+    timeline_key = "main", timeline_view = {}, epoch = 0 }
   local function alive()
     return not owner.closed and owner.host_generation == client.host_generation()
       and client.host_accepting() and options.is_alive()
@@ -25,6 +25,49 @@ function M.open(options, callback)
     if options.notice then options.notice(message) end
   end
   local queued, active = {}, false
+  local function fail(message)
+    local previous = owner.failure
+    owner.failure = tostring(message) .. ". Reopen Harness to retry."
+    owner.pending, owner.syncing, owner.applying, owner.highlighting, owner.selecting = false, false, false, false, false
+    owner.section_inflight = {}
+    if owner.transcript then owner.transcript.fold_loading = {} end
+    if previous ~= owner.failure then notice(owner.failure) end
+    if options.on_update then pcall(options.on_update) end
+    if not owner.ready and not owner.open_failed then
+      owner.open_failed = true
+      pcall(callback, nil, owner.failure)
+      vim.schedule(function() if owner.close then owner.close() end end)
+    end
+  end
+  local function guard(callback)
+    local epoch = owner.epoch
+    return function(...)
+      if not alive() or owner.epoch ~= epoch then return end
+      local ok, failure = pcall(callback, ...)
+      if not ok then fail("Presentation callback failed: " .. tostring(failure)) end
+    end
+  end
+  local function cleanup_request(params)
+    return params.operation == "close" or params.operation == "close_view"
+  end
+  local function lifetime_request(params)
+    return cleanup_request(params) or params.operation == "open_view" or params.operation == "resize"
+  end
+  local function valid_request(current)
+    if cleanup_request(current.params) then return true end
+    if not alive() or owner.failure then return false end
+    if current.epoch ~= owner.epoch and not lifetime_request(current.params) then return false end
+    if current.valid and not current.valid() then return false end
+    local view_id = current.params.view or (current.params.input and current.params.input.view)
+    if view_id then
+      for _, view in pairs(owner.views) do
+        if view.id == view_id and view.active and vim.api.nvim_win_is_valid(view.window)
+          and vim.api.nvim_win_get_buf(view.window) == options.transcript_buffer then return true end
+      end
+      return false
+    end
+    return true
+  end
   local markdown = require("forge.render.harness.markdown")
   local function render_markdown(force)
     if not alive() or owner.transcript.status ~= "Applied" or owner.transcript.applying or owner.transcript.update_pending then return end
@@ -56,34 +99,55 @@ function M.open(options, callback)
   end
   local function dispatch_next()
     if active or owner.applying or #queued == 0 then return end
+    while #queued > 0 and not valid_request(queued[1]) do
+      local discarded = table.remove(queued, 1)
+      if discarded.cancel then discarded.cancel() end
+    end
+    if #queued == 0 then return end
     active = true
     local current = table.remove(queued, 1)
+    local completed = false
+    local deadline
     local started = perf.now()
     perf.event("harness", "ui.request", { phase = "begin", session_id = options.session_id,
       operation = current.params.operation, revision = current.params.revision,
       queue_count = #queued, elapsed_ms = perf.elapsed_ms(current.queued_at) })
     local function receive(result, failure)
+      if completed then return end
+      completed = true
+      if deadline then deadline:stop() deadline:close() deadline = nil end
       perf.event("harness", "ui.request", { phase = "end", session_id = options.session_id,
         operation = current.params.operation, revision = current.params.revision,
         elapsed_ms = perf.elapsed_ms(started), status = failure and "error" or "ok" })
       local accepted, callback_error = pcall(perf.trace, "harness", "ui.response", {
         session_id = options.session_id, operation = current.params.operation,
-        revision = current.params.revision }, function() current.done(result, failure) end)
+        revision = current.params.revision }, function()
+          if valid_request(current) then current.done(result, failure)
+          elseif current.cancel then current.cancel() end
+        end)
       active = false
+      if not accepted and alive() then fail("Presentation callback failed: " .. tostring(callback_error)) end
       dispatch_next()
-      if not accepted then notice(tostring(callback_error)) end
     end
+    deadline = vim.defer_fn(function()
+      if completed then return end
+      if alive() and current.epoch == owner.epoch then
+        fail("Presentation request timed out (" .. current.params.operation .. "); its outcome is unknown")
+      end
+      receive(nil, "Presentation request timed out")
+    end, 30000)
     if owner.host_generation ~= client.host_generation() or not client.host_accepting() then
       receive(current.params.operation == "close" and {} or nil, current.params.operation ~= "close" and "Harness host generation changed" or nil)
     else client.request_for(options.session_id, "harness.document", current.params, receive) end
   end
-  local function request(params, done)
+  local function request(params, done, valid, cancel)
     if owner.host_generation ~= client.host_generation() or not client.host_accepting() then
       done(params.operation == "close" and {} or nil, params.operation ~= "close" and "Harness host generation changed" or nil)
       return
     end
     if #queued >= 63 and params.operation ~= "close" then done(nil, "Harness presentation request capacity is full") return end
-    queued[#queued + 1] = { params = params, done = done, queued_at = perf.now() }
+    queued[#queued + 1] = { params = params, done = done, queued_at = perf.now(), epoch = owner.epoch,
+      valid = valid, cancel = cancel }
     dispatch_next()
   end
   local function view_for(window)
@@ -107,21 +171,33 @@ function M.open(options, callback)
     end
     return view_for(vim.api.nvim_get_current_win()) or view_for(options.transcript_window)
   end
+  local function current_input(view, captured, semantic)
+    if not alive() or owner.failure or owner.transcript.status ~= "Applied"
+      or owner.views[view.window] ~= view or view.sequence ~= captured.sequence
+      or not vim.api.nvim_win_is_valid(view.window)
+      or vim.api.nvim_win_get_buf(view.window) ~= owner.transcript.buffer then return false end
+    local cursor = vim.api.nvim_win_get_cursor(view.window)
+    local location = replica.locate(owner.transcript, cursor[1] - 1, cursor[2])
+    if not location or location.block ~= captured.block or location.target ~= captured.target then return false end
+    return semantic or (owner.transcript.revision == captured.revision
+      and vim.deep_equal(location.position, captured.position))
+  end
   local function recovery(document)
     request({ operation = "snapshot", document = document.document }, function(snapshot, failure)
       if not alive() then return end
-      if failure then notice(failure) return end
+      if failure then fail("Transcript recovery failed: " .. tostring(failure)) return end
       owner.applying = true
-      replica.apply_async(document, snapshot, alive, function(result)
+      replica.apply_async(document, snapshot, alive, guard(function(result)
         owner.applying = false
         if not alive() then return end
         if result.kind ~= "Applied" then
-          notice("Harness snapshot could not be adopted: " .. tostring(result.kind))
+          fail("Harness snapshot could not be adopted: " .. tostring(result.kind))
         elseif vim.api.nvim_get_current_buf() ~= options.transcript_buffer then
           owner.follow_tail()
         end
         dispatch_next()
-      end)
+        if owner.next_timeline then owner.sync() end
+      end))
     end)
   end
   local transcript_tick = vim.api.nvim_buf_get_changedtick(options.transcript_buffer)
@@ -152,7 +228,7 @@ function M.open(options, callback)
       return
     end
     owner.applying = true
-    replica.apply_async(owner.transcript, opened.transcript, alive, function(transcript)
+    replica.apply_async(owner.transcript, opened.transcript, alive, guard(function(transcript)
     owner.applying = false
     if not alive() then return end
     if transcript.kind ~= "Applied" then
@@ -174,7 +250,7 @@ function M.open(options, callback)
     if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then owner.follow_tail() end
     if opened.syntax_pending then vim.schedule(function() owner.highlight() end) end
     dispatch_next()
-    end)
+    end))
   end)
 
   local function section_state(id)
@@ -193,9 +269,49 @@ function M.open(options, callback)
     end
   end
 
+  local function page_boundary(id)
+    local boundary_id = id .. ":deferred-body"
+    local block = owner.transcript.block[boundary_id]
+    if not block then return nil end
+    local more = false
+    for _, section in ipairs(block.metadata.section or {}) do
+      if section.id == id and section.more then more = true break end
+    end
+    if not more then return nil end
+    local _, row = owner.transcript.sequence:position(boundary_id)
+    if not row or row == 0 then return id .. ":empty" end
+    local previous = replica.locate(owner.transcript, row - 1, 0)
+    if not previous then return id .. ":empty" end
+    local text = vim.api.nvim_buf_get_lines(owner.transcript.buffer, row - 1, row, false)[1] or ""
+    return previous.block .. ":" .. previous.position.row .. ":" .. text
+  end
+
+  local function section_pending(id)
+    for _, pending in pairs(owner.section_inflight or {}) do
+      if pending[id] then return true end
+    end
+    return false
+  end
+
+  local function section_failed(id, message)
+    owner.section_failure = owner.section_failure or {}
+    local changed = owner.section_failure[id] ~= tostring(message)
+    owner.section_failure[id] = tostring(message)
+    owner.section_error = "Section could not be loaded: " .. tostring(message)
+    if changed then notice(owner.section_error) end
+    if options.on_update then options.on_update() end
+  end
+
   local function publish_openings()
-    for id, pending in pairs(owner.section_inflight or {}) do
-      if pending.ready then owner.section_inflight[id] = nil end
+    for _, requests in pairs(owner.section_inflight or {}) do
+      for id, pending in pairs(requests) do
+        if pending.ready then
+          if pending.more and pending.boundary and page_boundary(id) == pending.boundary then
+            section_failed(id, "Loading made no progress. Close and reopen the section to retry.")
+          end
+          requests[id] = nil
+        end
+      end
     end
     for window, opening in pairs(owner.transcript.fold_loading) do
       local view = owner.views[window]
@@ -207,6 +323,9 @@ function M.open(options, callback)
         elseif pending.ready and section.open then
           clear_opening(window, id)
           require("forge.folds").set_open(owner.transcript, window, id, true)
+        elseif pending.ready then
+          clear_opening(window, id)
+          section_failed(id, "The requested content was not published. Reopen the section to retry.")
         end
       end
     end
@@ -220,7 +339,7 @@ function M.open(options, callback)
   end
 
   function owner.sync()
-    if not alive() or not owner.ready then return end
+    if not alive() or not owner.ready or owner.failure then return end
     owner.pending = true
     if owner.syncing or owner.selecting then return end
     if owner.next_timeline and not owner.restore_timeline then
@@ -254,10 +373,7 @@ function M.open(options, callback)
       if failure then
         owner.syncing = false
         reject_openings()
-        if owner.sync_failure ~= failure then
-          owner.sync_failure = failure
-          notice(failure)
-        end
+        fail("Transcript synchronization failed: " .. tostring(failure))
         return
       end
       owner.sync_failure = nil
@@ -286,26 +402,31 @@ function M.open(options, callback)
       local update = snapshot or { patch = result.patch or {} }
       if not snapshot and #update.patch == 0 then complete() return end
       if not snapshot and #update.patch == 1 then update = update.patch[1] end
-      replica.apply_async(owner.transcript, update, alive, function(applied)
+      replica.apply_async(owner.transcript, update, alive, guard(function(applied)
           if not alive() then owner.applying, owner.syncing = false, false return end
           if applied.kind ~= "Applied" then
             owner.applying, owner.syncing = false, false
             reject_openings()
-            notice("Harness transcript update failed: " .. tostring(applied.diagnostic or applied.kind))
+            fail("Harness transcript update failed: " .. tostring(applied.diagnostic or applied.kind))
             dispatch_next()
             return
           end
           complete()
-      end)
+      end))
     end)
   end
 
   function owner.set_section(section, expanded, more, selected_view)
-    if not alive() or not owner.ready then return end
+    if not alive() or not owner.ready or owner.failure then return end
     local view = selected_view or action_view()
     if not view then return end
     owner.section_failure = owner.section_failure or {}
-    owner.section_failure[section] = nil
+    if expanded and not more then
+      owner.section_failure[section] = nil
+      if owner.section_page then owner.section_page[section] = nil end
+      local _, failure = next(owner.section_failure)
+      owner.section_error = failure and ("Section could not be loaded: " .. failure) or nil
+    elseif more and owner.section_failure[section] then return end
     owner.section_intent = owner.section_intent or {}
     local intent = owner.section_intent[view.id] or {}
     owner.section_intent[view.id] = intent
@@ -317,7 +438,10 @@ function M.open(options, callback)
     owner.section_request[view.id] = requests
     requests[section] = sequence
     owner.section_inflight = owner.section_inflight or {}
-    owner.section_inflight[section] = { sequence = sequence, ready = false, view = view.id }
+    local pending = owner.section_inflight[view.id] or {}
+    owner.section_inflight[view.id] = pending
+    pending[section] = { sequence = sequence, ready = false, view = view.id,
+      more = more, boundary = more and page_boundary(section) or nil }
     request({ operation = "section_expansion", document = identity, view = view.id,
       sequence = sequence, section = section, expanded = expanded, more = more or false,
       rows = 2 * vim.api.nvim_win_get_height(view.window),
@@ -327,23 +451,20 @@ function M.open(options, callback)
       for _, candidate in pairs(owner.views) do if candidate.id == view.id then attached = true break end end
       if not attached then return end
       if requests[section] ~= sequence then return end
-      local active = owner.section_inflight[section]
+      local active = pending[section]
       if active and active.sequence ~= sequence then return end
       if failure then
-        owner.section_inflight[section] = nil
-        owner.section_failure[section] = failure
-        for window in pairs(owner.transcript.fold_loading) do clear_opening(window, section) end
+        pending[section] = nil
+        clear_opening(view.window, section)
         intent[section] = nil
-        if owner.section_page then owner.section_page[section] = nil end
-        notice("Section could not be loaded: " .. tostring(failure))
+        section_failed(section, failure)
       else
         if active then active.ready = true end
-        for _, opening in pairs(owner.transcript.fold_loading) do
-          if opening[section] then opening[section].ready = true end
-        end
+        local opening = owner.transcript.fold_loading[view.window]
+        if opening and opening[section] then opening[section].ready = true end
         owner.sync()
       end
-    end)
+    end, function() return requests[section] == sequence end)
   end
 
   function owner.defer_open(window, id)
@@ -366,7 +487,7 @@ function M.open(options, callback)
   end
 
   function owner.observe_sections()
-    if not alive() or not owner.ready or owner.applying or owner.transcript.update_pending then return end
+    if not alive() or not owner.ready or owner.applying or owner.transcript.update_pending or owner.failure then return end
     if vim.api.nvim_get_current_buf() ~= options.transcript_buffer then return end
     owner.section_page = owner.section_page or {}
     local admitted = 0
@@ -392,7 +513,7 @@ function M.open(options, callback)
               for _, section in ipairs(block.metadata.section or {}) do
                 if admitted >= 8 then return end
                 local loading = owner.transcript.fold_loading[window]
-                local active = owner.section_inflight and owner.section_inflight[section.id]
+                local active = section_pending(section.id)
                 local failed = owner.section_failure and owner.section_failure[section.id]
                 if not active and not (loading and loading[section.id]) then
                   local expanded = closed == -1
@@ -403,8 +524,8 @@ function M.open(options, callback)
                     owner.set_section(section.id, expanded, false, view)
                   elseif expanded and section.more and intent[section.id] ~= false
                     and not failed
-                    and owner.section_page[section.id] ~= section.revision then
-                    owner.section_page[section.id] = section.revision
+                    and owner.section_page[section.id] ~= page_boundary(section.id) then
+                    owner.section_page[section.id] = page_boundary(section.id)
                     admitted = admitted + 1
                     owner.set_section(section.id, true, true, view)
                   end
@@ -424,14 +545,14 @@ function M.open(options, callback)
         if opening and owner.defer_open(window, section) then return false end
         return true
       end,
-      on_toggled = function(section, closed) owner.set_section(section, not closed) end,
+      on_toggled = function(section, closed) owner.set_section(section, not closed, false, view_for(window)) end,
     })
   end
 
   function owner.highlight()
-    if not alive() or not owner.ready or owner.highlighting then return end
+    if not alive() or not owner.ready or owner.highlighting or owner.failure then return end
     owner.highlighting = true
-    client.request_for(options.session_id, "harness.document", { operation = "highlight", document = identity }, function(_, failure)
+    request({ operation = "highlight", document = identity }, function(_, failure)
       owner.highlighting = false
       if not alive() then return end
       if failure then notice(failure) end
@@ -441,7 +562,7 @@ function M.open(options, callback)
 
   ---@return boolean
   function owner.toggle_tool()
-    if not alive() or not owner.ready then return false end
+    if not alive() or not owner.ready or owner.failure then return false end
     local view = action_view()
     if not view then return false end
     local captured, failure = input.capture(owner.transcript, view, "activate")
@@ -455,7 +576,7 @@ function M.open(options, callback)
   end
 
   function owner.activate(callback)
-    if not alive() or not owner.ready then return end
+    if not alive() or not owner.ready or owner.failure then return end
     local view = action_view()
     if not view then return end
     local captured, failure = input.capture(owner.transcript, view, "activate")
@@ -464,10 +585,7 @@ function M.open(options, callback)
     request({ operation = "input", input = captured }, function(action, action_error)
       if not alive() then return end
       if action_error then notice(action_error) return end
-      if owner.transcript.status ~= "Applied" or owner.transcript.revision ~= captured.revision or view.sequence ~= captured.sequence
-          or not vim.api.nvim_win_is_valid(view.window)
-          or vim.api.nvim_win_get_buf(view.window) ~= owner.transcript.buffer then return end
-      if not vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), view.cursor) then return end
+      if not current_input(view, captured, action.kind == "tool") then return end
       callback(action, captured)
     end)
   end
@@ -482,9 +600,7 @@ function M.open(options, callback)
         owner.transcript.fold_loading[window] = nil
         if owner.section_intent then owner.section_intent[view.id] = nil end
         if owner.section_request then owner.section_request[view.id] = nil end
-        for id, pending in pairs(owner.section_inflight or {}) do
-          if pending.view == view.id then owner.section_inflight[id] = nil end
-        end
+        if owner.section_inflight then owner.section_inflight[view.id] = nil end
         if owner.pending_width then owner.pending_width[view.id] = nil end
         request({ operation = "close_view", document = identity, view = view.id }, function(_, failure)
           if not alive() then return end
@@ -512,7 +628,7 @@ function M.open(options, callback)
         if not alive() then return end
         if failure then notice(failure) return end
         send_width()
-      end)
+      end, nil, function() owner.resizing = false end)
     end
     send_width()
   end
@@ -523,11 +639,9 @@ function M.open(options, callback)
     if not view then return false end
     local captured, failure = input.capture(owner.transcript, view, "activate")
     if not captured then notice(failure) return false end
+    local epoch = owner.epoch
     local function current()
-      return alive() and owner.transcript.status == "Applied" and owner.transcript.revision == captured.revision
-        and view.sequence == captured.sequence and vim.api.nvim_win_is_valid(view.window)
-        and vim.api.nvim_win_get_buf(view.window) == owner.transcript.buffer
-        and vim.deep_equal(vim.api.nvim_win_get_cursor(view.window), view.cursor)
+      return owner.epoch == epoch and current_input(view, captured, action.kind == "tool")
     end
     local output_options = { session_id = options.session_id, input = captured, window = view.window,
       is_current = current, notice = notice, on_error = notice }
@@ -562,10 +676,10 @@ function M.open(options, callback)
 
   ---@param run_id string?
   function owner.select_agent(run_id)
-    if not alive() or not owner.ready then return end
+    if not alive() or not owner.ready or owner.failure then return end
     local target = run_id or "main"
     owner.next_timeline, owner.pending = target, true
-    if owner.syncing or owner.selecting then return end
+    if owner.syncing or owner.selecting or owner.applying then return end
     owner.next_timeline = nil
     if target == owner.timeline_key then owner.sync() return end
     ---@type table<integer, table>
@@ -576,6 +690,11 @@ function M.open(options, callback)
       end
     end
     owner.timeline_view[owner.timeline_key] = saved
+    owner.epoch = owner.epoch + 1
+    owner.section_inflight, owner.section_request, owner.section_intent = {}, {}, {}
+    owner.section_failure, owner.section_page = {}, {}
+    owner.section_error, owner.highlighting = nil, false
+    owner.transcript.fold_loading = {}
     owner.selecting = true
     request({ operation = "select_agent", document = identity, run_id = target ~= "main" and target or vim.NIL }, function(_, failure)
       owner.selecting = false
@@ -600,6 +719,7 @@ function M.open(options, callback)
 
   function owner.submit(callback)
     if not alive() or not owner.ready then callback(nil, "Harness documents are not ready") return end
+    if owner.failure then callback(nil, owner.failure) return end
     if owner.submission then callback(nil, "Composer submission is already active") return end
     local row_count = vim.api.nvim_buf_line_count(options.composer_buffer)
     if row_count > 4096 or vim.api.nvim_buf_get_offset(options.composer_buffer, row_count) - 1 > 65536 then
@@ -653,6 +773,10 @@ function M.open(options, callback)
     local collected = owner.host_generation ~= client.host_generation()
       or not vim.api.nvim_buf_is_valid(options.composer_buffer) or not vim.api.nvim_buf_is_valid(options.transcript_buffer)
     owner.closed = true
+    owner.epoch = owner.epoch + 1
+    owner.applying = false
+    owner.section_inflight = {}
+    owner.transcript.fold_loading = {}
     if owner.refresh_timer then
       owner.refresh_timer:stop()
       owner.refresh_timer:close()

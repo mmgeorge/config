@@ -503,7 +503,7 @@ impl SourceDocument {
 mod tests {
     use super::*;
     use forge_buffer::block::TextPosition;
-    use forge_diff::{cache::CacheLimits, engine::DiffEngine, syntax::SyntaxLimits};
+    use forge_diff::{cache::CacheLimits, engine::DiffEngine};
 
     #[tokio::test]
     async fn saved_diff_retains_large_read_only_source_through_bounded_delivery() -> Result<()> {
@@ -511,7 +511,7 @@ mod tests {
         let diff = DiffEngine::new(CacheLimits::default(), 2);
         let service = SourceDocumentService::new(
             store,
-            SyntaxEngine::new(diff.analysis_pool(), SyntaxLimits::default()),
+            SyntaxEngine::new(diff.analysis_pool()),
         );
         let text = format!("+{}\n", "x".repeat(254)).repeat(8192).into_bytes();
         assert!(

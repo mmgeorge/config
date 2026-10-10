@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use anyhow::{Result, ensure};
+use anyhow::Result;
 use forge_buffer::block::{BlockMetadata, BufferBlock};
 use forge_buffer::identity::{BlockId, TargetId};
 use forge_buffer::markdown::MarkdownCode;
@@ -110,10 +110,6 @@ impl MarkdownSyntax {
                     span.priority = span.priority.saturating_add(20);
                 }
             }
-            ensure!(
-                block.retained_bytes() <= 16 * 1024 * 1024,
-                "Markdown code syntax exceeds 16 MiB"
-            );
         }
         Ok(vec![block])
     }
@@ -125,7 +121,6 @@ impl SavedDiffSyntax {
         let patch = UnifiedPatch::parse(&self.text)?;
         let deadline = Instant::now() + Duration::from_secs(10);
         let mut block = Vec::new();
-        let mut retained = 0;
         for (file_index, file) in patch.file.iter().enumerate() {
             let Some(language) = file
                 .new_path
@@ -179,11 +174,6 @@ impl SavedDiffSyntax {
                             row.text.trim_end_matches('\r'),
                         )?;
                     }
-                    retained += result.retained_bytes();
-                    ensure!(
-                        retained <= 16 * 1024 * 1024,
-                        "saved diff syntax exceeds 16 MiB"
-                    );
                     block.push(result);
                 }
             }
@@ -209,7 +199,6 @@ fn fragment(hunk: &PatchHunk<'_>, old: bool) -> Result<SourceVersion> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use forge_diff::syntax::SyntaxLimits;
     use forge_diff::workers::{AnalysisPool, PoolLimits};
 
     #[tokio::test]
@@ -229,7 +218,6 @@ mod tests {
                 jobs: 2,
                 input_bytes: 1024 * 1024,
             })),
-            SyntaxLimits::default(),
         );
         let job = MarkdownSyntax {
             target: TargetId("syntax".into()),
@@ -300,7 +288,6 @@ mod tests {
                 jobs: 2,
                 input_bytes: 1024 * 1024,
             })),
-            SyntaxLimits::default(),
         );
         let job = SavedDiffSyntax {
             target: TargetId("diff".into()),
