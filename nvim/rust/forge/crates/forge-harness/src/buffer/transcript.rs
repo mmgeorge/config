@@ -771,7 +771,7 @@ mod test {
     fn active_tool_preview_keeps_four_output_rows_and_call_syntax() -> Result<()> {
         let profile = WidthProfile::default();
         let renderer = TranscriptRenderer::new(&profile)?;
-        let output = super::super::tool::ToolOutputView::new("preview".into(), "one\r\ntwo\nthree\nfour\nfive\n".into())?;
+        let output = super::super::tool::ToolOutputView::new("preview".into(), "one\r\ntwo\nthree\nfour\nfive\n")?;
         let block = renderer.tool_preview(
             BlockId("active:tool".into()),
             TargetId("active:tool".into()),
@@ -823,7 +823,7 @@ mod test {
         let profile = WidthProfile { columns: 24, ..WidthProfile::default() };
         let renderer = TranscriptRenderer::new(&profile)?;
         let source = format!("{}\nsecond\nthird\n", "界".repeat(60));
-        let output = super::super::tool::ToolOutputView::new("wrapped".into(), source.clone().into())?;
+        let output = super::super::tool::ToolOutputView::new("wrapped".into(), &source)?;
         let render = |expanded| renderer.tool_preview(
             BlockId("wrapped:tool".into()), TargetId("wrapped:tool".into()),
             "command", Some(10), false, "inspect",

@@ -318,7 +318,7 @@ mod tests {
             .append_input(InputIntent::Steering, "Continue after answer".into(), 11)
             .unwrap();
         expected.push(source.node_list[2].id().to_owned());
-        crate::plan::event::replace_exchange(&mut projected[0], &source);
+        projected[0] = crate::plan::event::replacement_exchange(&projected[0], &source);
         assert_eq!(ids(&projected[0]), expected);
         let source: Exchange =
             serde_json::from_value(serde_json::to_value(source).unwrap()).unwrap();

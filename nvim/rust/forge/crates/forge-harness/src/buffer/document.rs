@@ -16,6 +16,12 @@ pub struct TranscriptEntry {
     pub block: Vec<BufferBlock>,
 }
 
+/// Borrows canonical blocks for read-only projection without copying hidden bodies.
+pub(super) struct TranscriptSource<'source> {
+    pub id: &'source str,
+    pub block: Vec<&'source BufferBlock>,
+}
+
 pub enum TranscriptChange {
     Block { block: BufferBlock },
     ToolBody { owner: String, anchor: BlockId, removed: usize, block: Vec<BufferBlock> },
@@ -105,9 +111,12 @@ impl TranscriptDocument {
         self.entry.iter().map(|entry|entry.id.clone()).collect()
     }
 
-    pub(super) fn source_entry(&self, id: &str) -> Result<TranscriptEntry> {
+    pub(super) fn source_entry(&self, id: &str) -> Result<TranscriptSource<'_>> {
         let index = *self.entry_index.get(id).context("unknown source entry")?;
-        Ok(TranscriptEntry { id: id.into(), block: self.document.blocks(self.document.revision(),self.entry_range(index)?)?.cloned().collect() })
+        Ok(TranscriptSource {
+            id: &self.entry[index].id,
+            block: self.document.blocks(self.document.revision(), self.entry_range(index)?)?.collect(),
+        })
     }
 
     fn remove_entry_owners(&mut self, id: &str) {
@@ -262,7 +271,7 @@ impl TranscriptDocument {
             self.synchronized,
             "transcript requires a new canonical snapshot"
         );
-        self.track(&TranscriptChange::Block { block: block.clone() });
+        self.mark_block_dirty(&block.id);
         let index = self
             .document
             .block_index(&block.id)

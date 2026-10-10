@@ -47,11 +47,11 @@ pub(crate) struct MarkdownSyntax {
     pub target: TargetId,
     pub block: BlockId,
     pub text: BufferText,
-    pub code: Vec<MarkdownCode>,
+    pub code: Arc<Vec<MarkdownCode>>,
 }
 
 impl MarkdownSyntax {
-    /// Include duplicated source and coordinate maps in presentation admission.
+    /// Charge retained source and coordinate maps even when jobs share their storage.
     pub fn retained_bytes(&self) -> usize {
         std::mem::size_of::<Self>()
             + self.target.0.capacity() * 2
@@ -73,7 +73,7 @@ impl MarkdownSyntax {
             text: self.text.clone(),
             metadata: BlockMetadata::default(),
         };
-        for code in &self.code {
+        for code in self.code.iter() {
             let Some(language) = SyntaxLanguage::from_name(&code.language) else {
                 continue;
             };
@@ -223,7 +223,7 @@ mod tests {
             target: TargetId("syntax".into()),
             block: rendered.block.id,
             text: rendered.block.text,
-            code: rendered.code,
+            code: Arc::new(rendered.code),
         };
         assert_eq!(
             job.code

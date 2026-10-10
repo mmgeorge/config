@@ -127,7 +127,7 @@ impl TimelineEntry {
                 ..
             } => {
                 if exchange.id == replacement.id {
-                    crate::plan::event::replace_exchange(exchange, replacement);
+                    *exchange = crate::plan::event::replacement_exchange(exchange, replacement);
                     true
                 } else {
                     agent_by_id
@@ -142,7 +142,7 @@ impl TimelineEntry {
                     .iter_mut()
                     .find(|exchange| exchange.id == replacement.id)
                 {
-                    crate::plan::event::replace_exchange(exchange, replacement);
+                    *exchange = crate::plan::event::replacement_exchange(exchange, replacement);
                     true
                 } else {
                     agent

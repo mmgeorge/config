@@ -129,8 +129,29 @@ struct Section {
     child_indent: usize,
 }
 
-pub fn project(
-    entry: &TimelineEntry,
+#[derive(Clone, Copy)]
+pub enum ProjectionSource<'source> {
+    Entry(&'source TimelineEntry),
+    Exchange(&'source Exchange),
+}
+
+impl<'source> From<&'source TimelineEntry> for ProjectionSource<'source> {
+    fn from(entry: &'source TimelineEntry) -> Self {
+        Self::Entry(entry)
+    }
+}
+
+impl ProjectionSource<'_> {
+    fn id(self) -> String {
+        match self {
+            Self::Entry(entry) => entry.id(),
+            Self::Exchange(exchange) => exchange.id.clone(),
+        }
+    }
+}
+
+pub fn project<'source>(
+    entry: impl Into<ProjectionSource<'source>>,
     width: &WidthProfile,
     leading_separator: bool,
     expanded_tool: &std::collections::HashSet<String>,
@@ -140,7 +161,7 @@ pub fn project(
         .map_or(0, |duration| {
             duration.as_millis().min(i64::MAX as u128) as i64
         });
-    project_at_with_separator(entry, width, now_ms, leading_separator, expanded_tool)
+    project_at_with_separator(entry.into(), width, now_ms, leading_separator, expanded_tool)
 }
 
 fn tool_group_label<'tool>(calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>,
@@ -198,7 +219,7 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
         }
     }
     if matches!(entry,TimelineEntry::Status { .. }) {
-        return Ok(project(entry,width,false,expanded)?.entry.block);
+        return Ok(project(ProjectionSource::Entry(entry),width,false,expanded)?.entry.block);
     }
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     let mut source = Vec::new();
@@ -300,7 +321,7 @@ pub(super) fn message_block(previous: &BufferBlock, message: &crate::turn::Messa
 #[cfg(test)]
 fn project_at(entry: &TimelineEntry, width: &WidthProfile, now_ms: i64) -> Result<ProjectedEntry> {
     project_at_with_separator(
-        entry,
+        ProjectionSource::Entry(entry),
         width,
         now_ms,
         false,
@@ -309,7 +330,7 @@ fn project_at(entry: &TimelineEntry, width: &WidthProfile, now_ms: i64) -> Resul
 }
 
 fn project_at_with_separator(
-    entry: &TimelineEntry,
+    entry: ProjectionSource<'_>,
     width: &WidthProfile,
     now_ms: i64,
     leading_separator: bool,
@@ -328,7 +349,10 @@ fn project_at_with_separator(
         leading_separator,
         expanded_tool,
     };
-    projection.entry(entry, 0)?;
+    match entry {
+        ProjectionSource::Entry(entry) => projection.entry(entry, 0)?,
+        ProjectionSource::Exchange(exchange) => projection.interaction(exchange, &HashMap::new(), 0)?,
+    }
     for block in &mut projection.block {
         TranscriptRenderer::resolve_marker(block)?;
         super::layout::materialize(block)?;
@@ -359,7 +383,10 @@ impl TimelineRenderer<'_> {
                 exchange: interaction,
                 agent_by_id,
                 ..
-            } => self.interaction(interaction, agent_by_id, depth)?,
+            } => {
+                let agents = agent_by_id.iter().map(|(id, entry)| (id.as_str(), entry)).collect();
+                self.interaction(interaction, &agents, depth)?;
+            }
             TimelineEntry::SessionEvent { id, event, .. } => {
                 let text = format!("◇ {}", session_event_text(&event.detail));
                 let action = match &event.detail {
@@ -686,7 +713,7 @@ impl TimelineRenderer<'_> {
         let children: HashMap<_, _> = agent
             .iter()
             .filter_map(|entry| match entry {
-                TimelineEntry::AgentLifecycle { id, .. } => Some((id.clone(), entry.clone())),
+                TimelineEntry::AgentLifecycle { id, .. } => Some((id.as_str(), entry)),
                 _ => None,
             })
             .collect();
@@ -767,7 +794,7 @@ impl TimelineRenderer<'_> {
     fn interaction(
         &mut self,
         interaction: &Exchange,
-        agents: &HashMap<String, TimelineEntry>,
+        agents: &HashMap<&str, &TimelineEntry>,
         depth: usize,
     ) -> Result<()> {
         if depth == 0 && self.leading_separator {
@@ -889,7 +916,7 @@ impl TimelineRenderer<'_> {
     fn content<'exchange>(
         &mut self,
         interaction: &'exchange Exchange,
-        agents: &HashMap<String, TimelineEntry>,
+        agents: &HashMap<&str, &TimelineEntry>,
         depth: usize,
         visible: &[&'exchange ExchangeNode],
         questions: Option<&super::question::QuestionHistory<'exchange>>,
@@ -1052,8 +1079,8 @@ impl TimelineRenderer<'_> {
                 }
                 ExchangeNode::AgentReference { agent } => {
                     if let Some(entry) = agents
-                        .get(&agent.id)
-                        .or_else(|| agents.get(&agent.child_agent_id))
+                        .get(agent.id.as_str())
+                        .or_else(|| agents.get(agent.child_agent_id.as_str())).copied()
                     {
                         if let TimelineEntry::AgentLifecycle {
                             id: _,
@@ -1146,7 +1173,7 @@ impl TimelineRenderer<'_> {
         &mut self,
         group: &super::question::QuestionGroup<'_>,
         exchange: &Exchange,
-        agents: &HashMap<String, TimelineEntry>,
+        agents: &HashMap<&str, &TimelineEntry>,
         depth: usize,
     ) -> Result<()> {
         let answered = group.branch.iter().filter(|branch| branch.answer.is_some()).count();
@@ -1198,7 +1225,7 @@ impl TimelineRenderer<'_> {
         &mut self,
         clarification: &super::question::Clarification<'_>,
         exchange: &Exchange,
-        agents: &HashMap<String, TimelineEntry>,
+        agents: &HashMap<&str, &TimelineEntry>,
         depth: usize,
         closed: bool,
     ) -> Result<()> {
@@ -1227,7 +1254,7 @@ impl TimelineRenderer<'_> {
             self.bytes <= 32 * 1024 * 1024,
             "transcript entry exceeds 32 MiB"
         );
-        let mut output = ToolOutputView::new(call_id.clone(), Arc::from(tool.output.as_str()))?;
+        let mut output = ToolOutputView::new(call_id.clone(), &tool.output)?;
         output.heading(tool);
         output.group = group.to_owned();
         let id = format!("{call_id}:tool");
@@ -1339,7 +1366,7 @@ impl TimelineRenderer<'_> {
                     target,
                     block: rendered.block.id.clone(),
                     text: rendered.block.text.clone(),
-                    code: rendered.code,
+                    code: Arc::new(rendered.code),
                 },
             );
         }
@@ -3187,12 +3214,12 @@ mod tests {
         assert_eq!(first.entry.block[0].id.0, "interaction:prompt");
 
         let projection = project_at_with_separator(
-            &TimelineEntry::Exchange {
+            super::ProjectionSource::Entry(&TimelineEntry::Exchange {
                 id: "interaction".into(),
                 created_at_ms: 1_000,
                 exchange: interaction,
                 agent_by_id: HashMap::new(),
-            },
+            }),
             &WidthProfile::default(),
             1_000,
             true,

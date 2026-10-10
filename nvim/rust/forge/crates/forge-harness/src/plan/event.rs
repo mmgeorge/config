@@ -88,7 +88,7 @@ pub(crate) fn insert_events(exchange: &mut Exchange, events: Vec<ExchangePlanEve
 }
 
 /// Preserve derived events when live provider updates replace the exchange's source state.
-pub(crate) fn replace_exchange(current: &mut Exchange, replacement: &Exchange) {
+pub(crate) fn replacement_exchange(current: &Exchange, replacement: &Exchange) -> Exchange {
     let events = current
         .node_list
         .iter()
@@ -97,6 +97,7 @@ pub(crate) fn replace_exchange(current: &mut Exchange, replacement: &Exchange) {
             _ => None,
         })
         .collect();
-    *current = replacement.clone();
-    insert_events(current, events);
+    let mut replacement = replacement.clone();
+    insert_events(&mut replacement, events);
+    replacement
 }

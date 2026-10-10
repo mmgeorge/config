@@ -216,6 +216,36 @@ loaded block or finish the section. Failed preparation preserves the previous ex
 Projection refresh retains dirty entries until publication succeeds. A publication failure
 invalidates the native presentation and requires reopening rather than serving a partial frame.
 
+Timeline projection borrows canonical blocks and agent exchanges. Opening a parent does not
+copy closed descendant text into a temporary exchange. It constructs only the requested
+visible prefix, copying only metadata that belongs to that prefix. Source indexing still
+visits the owning exchange's block metadata. Full-size borrowed indexes contain references,
+not duplicated text.
+
+`BufferText` shares immutable packed rows and their row index through `Arc`. Block snapshots,
+pending patches, fold metadata replacements, and Markdown jobs retain that storage without
+copying its bytes. New text creates new storage, so an older published snapshot cannot change.
+Admission accounting conservatively charges the full retained storage to each owner.
+Serialization visits rows directly without allocating an intermediate row vector. Pending
+patch sizing uses a counting writer instead of retaining another encoded copy.
+
+`ToolOutputSnapshot` shares raw output, normalized display text, and row offsets with the live
+tool view. It owns an independent pagination cursor and cannot append. Creating an output
+window neither copies nor reparses the saved output. A subsequent live append copies shared
+storage on write, preserving the output window's captured version. The streaming parser
+remains exclusively owned by the live view, including incomplete ANSI sequences.
+
+The timeline copy audit retains these ownership boundaries:
+
+| Boundary | Retained copying |
+| --- | --- |
+| Canonical events and timeline state | Changed exchanges and deltas own their mutable strings independently. Patches own changed entries until delivery. Settled history is borrowed during reconciliation. |
+| Reconciliation comparison cache | Serialized values support exact content comparison. The working reconciliation uses references to those values and entries, preserving rollback without another history copy. |
+| Rendered text and Markdown jobs | Text and fenced-code maps share immutable storage. Metadata remains independently owned where projection rewrites coordinates or fold endpoints. |
+| Section preparation | Expansion intent and quota maps are copied before validation. They contain identifiers and layout values, not transcript bodies. Failed preparation leaves committed state intact. |
+| Native Lua adoption | Lua copies changed metadata tables because normalization and decoration preparation mutate them. Lua strings remain shared, and patch adoption does not deep-copy transcript text or the full block sequence. |
+| Transport | Encoding creates the wire payload. Decoding creates the receiving process's strings. These process-boundary copies remain necessary. |
+
 Lua tracks each section request by view and request sequence. An acknowledgement permits
 opening only after the matching content has been adopted. Superseded requests cannot clear
 another view's loading state. Automatic pagination compares the final loaded block and row,

@@ -10,11 +10,11 @@ use forge_buffer::{
 };
 use serde::Serialize;
 
-use super::tool::{OwnedToolExport, ToolOutputView};
+use super::tool::{OwnedToolExport, ToolOutputSnapshot};
 
 pub struct OutputDocument {
     document: BufferDocument,
-    output: ToolOutputView,
+    output: ToolOutputSnapshot,
     export: Option<OwnedToolExport>,
     complete: bool,
     retained: usize,
@@ -27,7 +27,7 @@ pub struct OutputDelivery {
 }
 
 impl OutputDocument {
-    pub fn new(id: DocumentId, mut output: ToolOutputView) -> Result<Self> {
+    pub fn new(id: DocumentId, mut output: ToolOutputSnapshot) -> Result<Self> {
         output.expand();
         Ok(Self {
             document: BufferDocument::new(id, Vec::new())?,
@@ -123,15 +123,15 @@ impl OutputDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Arc;
+    use super::super::tool::ToolOutputView;
 
     #[test]
     fn rejected_demand_preserves_complete_source_and_export_lifetime() -> Result<()> {
         let source = (0..1001)
             .map(|line| format!("line {line}\n"))
             .collect::<String>();
-        let output = ToolOutputView::new("call".into(), Arc::from(source.as_str()))?;
-        let mut document = OutputDocument::new(DocumentId("tool:test".into()), output)?;
+        let output = ToolOutputView::new("call".into(), &source)?;
+        let mut document = OutputDocument::new(DocumentId("tool:test".into()), output.snapshot())?;
         assert!(document.demand(DocumentRevision(1), usize::MAX).is_err());
         let mut revision = DocumentRevision(0);
         loop {

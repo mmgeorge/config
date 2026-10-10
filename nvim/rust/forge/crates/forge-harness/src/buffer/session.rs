@@ -16,7 +16,7 @@ use crate::timeline::{
 
 use super::document::{TranscriptChange, TranscriptDocument};
 use super::output::OutputDocument;
-use super::projection::{ProjectedEntry, TranscriptAction, project};
+use super::projection::{ProjectedEntry, ProjectionSource, TranscriptAction, project};
 use super::tool::ToolOutputView;
 
 const MAX_PROJECTED_BYTES: usize = 64 * 1024 * 1024;
@@ -308,7 +308,7 @@ impl SessionPresentation {
                     .tool
                     .get(&call_id)
                     .context("saved tool output is unavailable")?
-                    .clone();
+                    .snapshot();
                 let output = OutputDocument::new(document.clone(), source)?;
                 ensure!(
                     open.output
@@ -454,7 +454,7 @@ impl SessionPresentation {
         let mut projected = Vec::new();
         let mut retained_bytes = 0;
         for (index, entry) in self.timeline.entry_list().iter().enumerate() {
-            let entry = project(entry, &width, index > 0, &HashSet::new())?;
+            let entry = project(ProjectionSource::Entry(entry), &width, index > 0, &HashSet::new())?;
             retained_bytes += entry.retained_bytes();
             ensure!(
                 retained_bytes <= MAX_PROJECTED_BYTES,
@@ -925,13 +925,13 @@ impl SessionPresentation {
             if patch.operation.iter().all(|operation|matches!(operation,
                 TimelineOperation::ToolOutput { .. } | TimelineOperation::Message { .. })
                 || matches!(operation,TimelineOperation::Replace { entry:TimelineEntry::Status { .. },.. })) {
-                let filtered = TimelinePatch { operation:patch.operation.iter().filter(|operation|match operation {
+                let filtered: Vec<_> = patch.operation.iter().filter(|operation|match operation {
                     TimelineOperation::ToolOutput { call_id,.. } => open.tool.contains_key(call_id),
                     TimelineOperation::Message { block_id,message,.. } => message.kind() != crate::turn::MessageKind::Assistant
                         || open.transcript.document.block(&forge_buffer::identity::BlockId(block_id.clone())).is_some(),
                     _ => false,
-                }).cloned().collect(),..patch.clone() };
-                apply_projection(open,&filtered)
+                }).collect();
+                apply_projection(open,patch,filtered.iter().copied())
             } else { reflow(open, self.timeline.entry_list(), self.timeline.revision()) }
         } else if patch.operation.iter().any(|operation|match operation {
             TimelineOperation::ToolOutput { call_id,.. } => !open.tool.contains_key(call_id),
@@ -941,7 +941,7 @@ impl SessionPresentation {
         }) {
             reflow(open,self.timeline.entry_list(),self.timeline.revision())
         } else {
-            apply_projection(open, patch)
+            apply_projection(open, patch, patch.operation.iter())
         };
         if let Err(error) = applied {
             open.failure = Some(format!("{error:#}"));
@@ -1096,22 +1096,17 @@ fn reflow(
     timeline_revision: u64,
 ) -> Result<()> {
     let source = match open.agent_scope.as_deref() {
-        None => std::borrow::Cow::Borrowed(source),
-        Some(run_id) => std::borrow::Cow::Owned(
+        None => source.iter().map(ProjectionSource::Entry).collect::<Vec<_>>(),
+        Some(run_id) => {
             find_agent(source, run_id, 0)
                 .into_iter()
                 .flat_map(|entry| match entry {
                     TimelineEntry::AgentLifecycle { exchange, .. } => exchange.iter(),
                     _ => unreachable!("agent lookup returns an agent lifecycle"),
                 })
-                .map(|interaction| TimelineEntry::Exchange {
-                    id: interaction.id.clone(),
-                    created_at_ms: interaction.created_at_ms,
-                    exchange: interaction.clone(),
-                    agent_by_id: HashMap::new(),
-                })
-                .collect::<Vec<_>>(),
-        ),
+                .map(ProjectionSource::Exchange)
+                .collect::<Vec<_>>()
+        }
     };
     let width = open
         .transcript
@@ -1121,7 +1116,7 @@ fn reflow(
         .clone();
     let mut projected = Vec::new();
     let mut retained = 0;
-    for (index, entry) in source.iter().enumerate() {
+    for (index, entry) in source.into_iter().enumerate() {
         let entry = project(entry, &width, index > 0, &open.expanded_tool)?;
         retained += entry.retained_bytes();
         ensure!(
@@ -1160,12 +1155,13 @@ fn reflow(
     retain_patches(open, patch)
 }
 
-fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Result<()> {
+fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePatch,
+    operations: impl Iterator<Item = &'operation TimelineOperation> + Clone) -> Result<()> {
     let width = open.transcript.views.profile().unwrap_or(&open.last_width);
     let mut projected = Vec::new();
     let mut changed = Vec::new();
     let mut retained = open.retained_bytes;
-    for operation in &patch.operation {
+    for operation in operations.clone() {
         match operation {
             TimelineOperation::Message { entry_id, exchange_id, block_id, message, .. } => {
                 if message.kind() != crate::turn::MessageKind::Assistant { continue; }
@@ -1267,7 +1263,7 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
             }
             TimelineOperation::Insert { index, entry }
             | TimelineOperation::Replace { index, entry } => {
-                let entry = project(entry, width, *index > 0, &open.expanded_tool)?;
+                let entry = project(ProjectionSource::Entry(entry), width, *index > 0, &open.expanded_tool)?;
                 retained = retained.saturating_sub(
                     open.entry
                         .get(&entry.entry.id)
@@ -1313,7 +1309,7 @@ fn apply_projection(open: &mut OpenPresentation, patch: &TimelinePatch) -> Resul
         patch.revision,
         changed,
     )?;
-    for operation in &patch.operation {
+    for operation in operations {
         let id = match operation {
             TimelineOperation::ToolOutput { .. } | TimelineOperation::Message { .. } => continue,
             TimelineOperation::Insert { entry, .. } | TimelineOperation::Replace { entry, .. } => {
@@ -1358,7 +1354,7 @@ fn retain_patches(open: &mut OpenPresentation, _source_patches: Vec<BufferPatch>
         }
     };
     for patch in patches {
-        let bytes = serde_json::to_vec(&patch)?.len();
+        let bytes = crate::limits::serialized_size(&patch, usize::MAX)?;
         while open.pending.len() >= 64 || open.pending_bytes + bytes > MAX_PENDING_BYTES {
             let Some((_, removed)) = open.pending.pop_front() else {
                 break;

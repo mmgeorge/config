@@ -177,6 +177,15 @@ impl TimelineStream {
         );
         let next_interaction = interaction.map(|interaction| {
             if let Some(index) = self.exchange_owner.get(&interaction.id) {
+                if let TimelineEntry::Exchange { id, created_at_ms, exchange, agent_by_id } = &self.entry_list[*index]
+                    && exchange.id == interaction.id {
+                    return TimelineEntry::Exchange {
+                        id: id.clone(),
+                        created_at_ms: *created_at_ms,
+                        exchange: crate::plan::event::replacement_exchange(exchange, interaction),
+                        agent_by_id: agent_by_id.clone(),
+                    };
+                }
                 let mut entry = self.entry_list[*index].clone();
                 let replaced = entry.replace_exchange(interaction);
                 debug_assert!(replaced, "exchange owner index must resolve its exchange");
@@ -296,8 +305,8 @@ impl TimelineStream {
         );
         let base_revision = self.revision;
         let next_value_list = serialize_entry_list(&next_entry_list)?;
-        let mut working_entry_list = self.entry_list.clone();
-        let mut working_value_list = self.value_list.clone();
+        let mut working_entry_list: Vec<_> = self.entry_list.iter().collect();
+        let mut working_value_list: Vec<_> = self.value_list.iter().collect();
         let mut operation = Vec::new();
 
         for index in (0..working_entry_list.len()).rev() {
@@ -315,9 +324,9 @@ impl TimelineStream {
                 .get(index)
                 .is_some_and(|entry| entry.id() == next_id)
             {
-                if working_value_list[index] != next_value_list[index] {
-                    working_entry_list[index] = next_entry.clone();
-                    working_value_list[index] = next_value_list[index].clone();
+                if working_value_list[index] != &next_value_list[index] {
+                    working_entry_list[index] = next_entry;
+                    working_value_list[index] = &next_value_list[index];
                     operation.push(TimelineOperation::Replace {
                         index,
                         entry: next_entry.clone(),
@@ -338,8 +347,8 @@ impl TimelineStream {
                     id: removed_id,
                 });
             }
-            working_entry_list.insert(index, next_entry.clone());
-            working_value_list.insert(index, next_value_list[index].clone());
+            working_entry_list.insert(index, next_entry);
+            working_value_list.insert(index, &next_value_list[index]);
             operation.push(TimelineOperation::Insert {
                 index,
                 entry: next_entry.clone(),
@@ -347,7 +356,7 @@ impl TimelineStream {
         }
 
         ensure!(
-            working_value_list == next_value_list,
+            working_value_list.into_iter().eq(next_value_list.iter()),
             "timeline reconciliation did not converge"
         );
         if !operation.is_empty() {
@@ -436,6 +445,36 @@ mod test {
         let patch = stream.reconcile(vec![status(SessionPhase::Idle)]).unwrap();
         assert!(patch.is_empty());
         assert_eq!(patch.base_revision, patch.revision);
+    }
+
+    #[test]
+    fn reconciliation_preserves_patch_order_across_moves_removals_and_replacements() {
+        let entry = |id: &str, name: &str| TimelineEntry::SessionEvent {
+            id: id.into(), created_at_ms: 0,
+            event: crate::timeline::SessionEventRecord {
+                id: id.into(), session_id: "session".into(), created_at_ms: 0,
+                detail: crate::timeline::SessionEventKind::Renamed { name: name.into() },
+            },
+        };
+        let original = vec![entry("first", "original"), entry("removed", "removed"), entry("last", "last")];
+        let mut replica: Vec<_> = original.iter().map(|entry| serde_json::to_value(entry).unwrap()).collect();
+        let mut stream = TimelineStream::new("session".into());
+        stream.initialize(original).unwrap();
+        let next = vec![entry("last", "last"), entry("first", "changed"), entry("new", "new")];
+        let expected: Vec<_> = next.iter().map(|entry| serde_json::to_value(entry).unwrap()).collect();
+        let patch = stream.reconcile(next).unwrap();
+        for operation in patch.operation {
+            match operation {
+                TimelineOperation::Remove { index, .. } => { replica.remove(index); }
+                TimelineOperation::Insert { index, entry } => replica.insert(index, serde_json::to_value(entry).unwrap()),
+                TimelineOperation::Replace { index, entry } => replica[index] = serde_json::to_value(entry).unwrap(),
+                _ => panic!("reconciliation emitted a streaming operation"),
+            }
+        }
+        assert_eq!(replica, expected);
+        assert_eq!(stream.value_list, expected);
+        let unchanged = vec![entry("last", "last"), entry("first", "changed"), entry("new", "new")];
+        assert!(stream.reconcile(unchanged).unwrap().is_empty());
     }
 
     #[test]

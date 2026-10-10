@@ -31,14 +31,23 @@ pub struct ToolOutputView {
     saved: Arc<String>,
     display: Arc<String>,
     row: Arc<Vec<Range<usize>>>,
-    loaded_rows: usize,
-    expanded: bool,
     parser: strip_ansi_escapes::Writer<OutputCollector>,
     collected: Arc<Mutex<Vec<u8>>>,
     total_rows: usize,
     heading: Option<crate::turn::ToolCall>,
     owner: String,
     pub(super) group: String,
+}
+
+/// A fixed output version shares parsed bytes without owning a streaming parser.
+pub struct ToolOutputSnapshot {
+    call_id: String,
+    saved: Arc<String>,
+    display: Arc<String>,
+    row: Arc<Vec<Range<usize>>>,
+    total_rows: usize,
+    loaded_rows: usize,
+    expanded: bool,
 }
 
 struct OutputCollector(Arc<Mutex<Vec<u8>>>);
@@ -51,20 +60,18 @@ impl Write for OutputCollector {
     fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
 }
 
-impl Clone for ToolOutputView {
-    fn clone(&self) -> Self {
-        let mut view = Self::new(self.call_id.clone(), Arc::from(self.saved.as_str()))
-            .expect("validated tool output");
-        view.loaded_rows = self.loaded_rows;
-        view.expanded = self.expanded;
-        view.heading = self.heading.clone();
-        view.owner = self.owner.clone();
-        view.group = self.group.clone();
-        view
-    }
-}
-
 impl ToolOutputView {
+    pub fn snapshot(&self) -> ToolOutputSnapshot {
+        ToolOutputSnapshot {
+            call_id: self.call_id.clone(),
+            saved: Arc::clone(&self.saved),
+            display: Arc::clone(&self.display),
+            row: Arc::clone(&self.row),
+            total_rows: self.total_rows,
+            loaded_rows: 0,
+            expanded: false,
+        }
+    }
     /// Retains source heading fields without copying the saved output or change tree.
     pub(super) fn heading(&mut self, call: &crate::turn::ToolCall) {
         self.heading = Some(crate::turn::ToolCall {
@@ -125,7 +132,7 @@ impl ToolOutputView {
             + self.row.capacity() * std::mem::size_of::<Range<usize>>()
     }
 
-    pub fn new(call_id: String, saved: Arc<str>) -> Result<Self> {
+    pub fn new(call_id: String, saved: &str) -> Result<Self> {
         ensure!(
             !call_id.is_empty() && call_id.len() <= 256,
             "invalid tool call identity"
@@ -140,8 +147,6 @@ impl ToolOutputView {
             saved: Arc::new(String::new()),
             display: Arc::new(String::new()),
             row: Arc::new(Vec::new()),
-            loaded_rows: 0,
-            expanded: false,
             parser: strip_ansi_escapes::Writer::new(OutputCollector(collected.clone())),
             collected,
             total_rows: 0,
@@ -149,7 +154,7 @@ impl ToolOutputView {
             owner: String::new(),
             group: String::new(),
         };
-        view.append(&saved)?;
+        view.append(saved)?;
         Ok(view)
     }
 
@@ -191,6 +196,13 @@ impl ToolOutputView {
             hidden_rows: self.total_rows.saturating_sub(visible),
             total_rows: self.total_rows,
         }
+    }
+}
+
+impl ToolOutputSnapshot {
+    pub fn retained_bytes(&self) -> usize {
+        self.saved.len() + self.display.capacity()
+            + self.row.capacity() * std::mem::size_of::<Range<usize>>()
     }
 
     pub fn expand(&mut self) {
@@ -339,8 +351,22 @@ mod tests {
     use super::*;
 
     #[test]
+    fn output_snapshot_shares_storage_and_survives_fragmented_live_appends() {
+        let mut output = ToolOutputView::new("call".into(), "first\n\u{1b}[3").unwrap();
+        let mut snapshot = output.snapshot();
+        assert!(Arc::ptr_eq(&output.saved, &snapshot.saved));
+        assert!(Arc::ptr_eq(&output.display, &snapshot.display));
+        assert!(Arc::ptr_eq(&output.row, &snapshot.row));
+        output.append("1msecond\u{1b}[0m\n").unwrap();
+        snapshot.expand();
+        assert_eq!(snapshot.next_batch(256, 65536).unwrap().unwrap().row, ["first"]);
+        assert_eq!(output.preview(true).row, ["first", "second"]);
+        assert_eq!(snapshot.saved.as_str(), "first\n\u{1b}[3");
+    }
+
+    #[test]
     fn append_preserves_fragmented_ansi_partial_rows_and_trailing_blanks() {
-        let mut output = ToolOutputView::new("call".into(), Arc::from("")).unwrap();
+        let mut output = ToolOutputView::new("call".into(), "").unwrap();
         for chunk in ["\u{1b}[3", "1mλ", "\r", "\n\n", "tail", " continued\u{1b}[", "0m\n\n"] {
             output.append(chunk).unwrap();
         }
@@ -355,7 +381,7 @@ mod tests {
     fn preview_keeps_first_four_lines_and_counts_only_remaining_lines() {
         for count in 0usize..=6 {
             let saved = (0..count).map(|index| format!("line {index}\n")).collect::<String>();
-            let view = ToolOutputView::new("call".into(), Arc::from(saved)).unwrap();
+            let view = ToolOutputView::new("call".into(), &saved).unwrap();
             let preview = view.preview(false);
             assert_eq!(preview.row, (0..count.min(4)).map(|index| format!("line {index}")).collect::<Vec<_>>());
             assert_eq!(preview.hidden_rows, count.saturating_sub(4));
@@ -367,8 +393,9 @@ mod tests {
         let saved = (0..10000)
             .map(|row| format!("output {row}\n"))
             .collect::<String>();
-        let mut view = ToolOutputView::new("call".into(), Arc::from(saved.as_str())).unwrap();
+        let view = ToolOutputView::new("call".into(), &saved).unwrap();
         assert_eq!(view.preview(false).hidden_rows, 9996);
+        let mut view = view.snapshot();
         view.expand();
         let first = view.next_batch(256, 65536).unwrap().unwrap();
         assert_eq!(view.next_batch(256, 65536).unwrap().unwrap().start_row, 0);
@@ -390,8 +417,8 @@ mod tests {
     fn export_keeps_complete_saved_bytes_and_cleans_its_owned_artifact() {
         let directory = tempfile::tempdir().unwrap();
         let saved = "\u{1b}[31mred\u{1b}[0m\r\n\0tail\n";
-        let view = ToolOutputView::new("call".into(), Arc::from(saved)).unwrap();
-        let mut export = view.export_saved_output(directory.path()).unwrap();
+        let view = ToolOutputView::new("call".into(), saved).unwrap();
+        let mut export = view.snapshot().export_saved_output(directory.path()).unwrap();
         let path = export.path().unwrap().to_owned();
         assert_eq!(std::fs::read(&path).unwrap(), saved.as_bytes());
         export.close().unwrap();
@@ -402,7 +429,7 @@ mod tests {
     #[test]
     fn display_strips_ansi_and_normalizes_terminal_controls_without_changing_export() {
         let saved = "\u{1b}[31mred\u{1b}[0m\r\nprogress\rdone\n\0tail\n";
-        let view = ToolOutputView::new("call".into(), Arc::from(saved)).unwrap();
+        let view = ToolOutputView::new("call".into(), saved).unwrap();
         let collapsed = view.preview(false);
 
         assert_eq!(collapsed.row, vec!["red", "progressdone", "tail"]);
@@ -412,7 +439,7 @@ mod tests {
 
     #[test]
     fn rejected_delivery_does_not_advance_the_output_cursor() {
-        let mut view = ToolOutputView::new("call".into(), Arc::from("first\nlast\n")).unwrap();
+        let mut view = ToolOutputView::new("call".into(), "first\nlast\n").unwrap().snapshot();
         view.expand();
         let mut batch = view.next_batch(1, 65536).unwrap().unwrap();
         batch.complete = true;

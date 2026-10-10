@@ -7,7 +7,7 @@ use forge_buffer::patch::BufferPatch;
 use forge_buffer::text::BufferText;
 use forge_buffer::width::WidthProfile;
 
-use super::document::{TranscriptChange, TranscriptDocument, TranscriptEntry};
+use super::document::{TranscriptChange, TranscriptDocument, TranscriptEntry, TranscriptSource};
 
 const PAGE_BYTES: usize = 64 * 1024;
 const MAX_BODY_BYTES: usize = 16 * 1024 * 1024;
@@ -372,8 +372,8 @@ impl SectionProjection {
             &next_quota,
         )?;
         if let Some(loaded) = &loaded {
-            let before = page_boundary(loaded, id);
-            let after = page_boundary(&candidate, id);
+            let before = page_boundary(&loaded.block, id);
+            let after = page_boundary(&candidate.block.iter().collect::<Vec<_>>(), id);
             ensure!(after.is_none() || after != before, "section loading made no progress; reopen the section to retry");
         }
         self.view = next_view;
@@ -383,22 +383,22 @@ impl SectionProjection {
     }
 }
 
-fn page_boundary(entry: &TranscriptEntry, id: &str) -> Option<(BlockId, usize)> {
-    let boundary = entry.block.iter().position(|block| block.metadata.section.iter()
+fn page_boundary(blocks: &[&BufferBlock], id: &str) -> Option<(BlockId, usize)> {
+    let boundary = blocks.iter().position(|block| block.metadata.section.iter()
         .any(|section| section.id.0 == id && section.more))?;
-    entry.block[..boundary].iter().rev().find(|block| block.text.row_count() > 0)
+    blocks[..boundary].iter().rev().find(|block| block.text.row_count() > 0)
         .map(|block| (block.id.clone(), block.text.byte_count()))
 }
 
 fn index(
-    entry: &TranscriptEntry,
+    entry: &TranscriptSource<'_>,
     owner: &mut HashMap<String, String>,
     file: &mut HashMap<String, Vec<String>>,
 ) -> Vec<String> {
     let mut sections = Vec::new();
     for (start, block) in entry.block.iter().enumerate() {
         for fold in &block.metadata.fold {
-            owner.insert(fold.id.0.clone(), entry.id.clone());
+            owner.insert(fold.id.0.clone(), entry.id.to_owned());
             sections.push(fold.id.0.clone());
             if fold.expand_children {
                 let end = entry
@@ -420,11 +420,12 @@ fn index(
 }
 
 pub(crate) fn preview(entry: TranscriptEntry) -> Result<TranscriptEntry> {
-    project(entry, 0, &HashMap::new(), &HashMap::new())
+    project(TranscriptSource { id: &entry.id, block: entry.block.iter().collect() },
+        0, &HashMap::new(), &HashMap::new())
 }
 
 fn project(
-    entry: TranscriptEntry,
+    entry: TranscriptSource<'_>,
     revision: u64,
     view: &HashMap<ViewId, (u64, HashMap<String, bool>)>,
     quota: &HashMap<String, PageQuota>,
@@ -433,7 +434,7 @@ fn project(
         .block
         .iter()
         .enumerate()
-        .map(|(index, block)| (block.id.clone(), index))
+        .map(|(index, block)| (&block.id, index))
         .collect();
     let mut output = Vec::new();
     render(
@@ -450,19 +451,19 @@ fn project(
         None,
     )?;
     Ok(TranscriptEntry {
-        id: entry.id,
+        id: entry.id.to_owned(),
         block: output,
     })
 }
 
 fn render(
-    source: &[BufferBlock],
+    source: &[&BufferBlock],
     mut cursor: usize,
     end: usize,
     revision: u64,
     view: &HashMap<ViewId, (u64, HashMap<String, bool>)>,
     quota: &HashMap<String, PageQuota>,
-    position: &HashMap<BlockId, usize>,
+    position: &HashMap<&BlockId, usize>,
     output: &mut Vec<BufferBlock>,
     mut budget: PageQuota,
     within_file: bool,
@@ -472,7 +473,7 @@ fn render(
         if budget.exhausted() && source[cursor].text.row_count() > 0 {
             return Ok(true);
         }
-        let source_block = &source[cursor];
+        let source_block = source[cursor];
         let selected = source_block
             .metadata
             .fold
@@ -607,6 +608,10 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
     if source.text.row_count() == 0 {
         return Ok(source.clone());
     }
+    if budget.width.is_none() && source.text.byte_count() <= budget.bytes
+        && source.text.row_count() <= budget.rows {
+        return Ok(source.clone());
+    }
     let mut rows = Vec::new();
     let mut remaining = budget.bytes;
     let mut remaining_rows = budget.rows;
@@ -632,11 +637,10 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
     if rows.is_empty() {
         rows.push("");
     }
-    let text = BufferText::from_rows(&rows)?;
-    if text == source.text {
+    let complete_row = source.text.row(rows.len() - 1) == rows.last().copied();
+    if rows.len() == source.text.row_count() && complete_row {
         return Ok(source.clone());
     }
-    let complete_row = source.text.row(rows.len() - 1) == rows.last().copied();
     let end = if complete_row {
         TextPosition {
             row: rows.len(),
@@ -648,39 +652,26 @@ fn prefix(source: &BufferBlock, budget: &PageQuota) -> Result<BufferBlock> {
             column: rows.last().expect("prefix row").len(),
         }
     };
-    let mut block = source.clone();
-    block.text = text;
-    block.metadata.target.retain(|item| item.range.end <= end);
-    block
-        .metadata
-        .decoration
-        .retain(|item| item.range.end <= end);
-    block
-        .metadata
-        .visible_decoration
-        .retain(|item| item.range.end <= end);
-    block
-        .metadata
-        .source_highlight
-        .retain(|item| item.range.end <= end);
-    block.metadata.conceal.retain(|item| item.range.end <= end);
-    block
-        .metadata
-        .source_overlay
-        .retain(|item| item.range.end <= end);
-    block
-        .metadata
-        .editable_region
-        .retain(|item| item.range.end <= end);
-    block
-        .metadata
-        .gutter
-        .retain(|item| item.position.row < block.text.row_count() && item.position <= end);
-    block
-        .metadata
-        .fold
-        .retain(|item| item.end.block == block.id && item.end.position <= end);
-    Ok(block)
+    let metadata = &source.metadata;
+    Ok(BufferBlock {
+        id: source.id.clone(),
+        text: BufferText::from_rows(&rows)?,
+        metadata: BlockMetadata {
+            section: metadata.section.clone(),
+            collapse: metadata.collapse.clone(),
+            layout: metadata.layout.clone(),
+            markdown: metadata.markdown,
+            target: metadata.target.iter().filter(|item| item.range.end <= end).cloned().collect(),
+            decoration: metadata.decoration.iter().filter(|item| item.range.end <= end).cloned().collect(),
+            visible_decoration: metadata.visible_decoration.iter().filter(|item| item.range.end <= end).cloned().collect(),
+            source_highlight: metadata.source_highlight.iter().filter(|item| item.range.end <= end).cloned().collect(),
+            conceal: metadata.conceal.iter().filter(|item| item.range.end <= end).cloned().collect(),
+            source_overlay: metadata.source_overlay.iter().filter(|item| item.range.end <= end).cloned().collect(),
+            editable_region: metadata.editable_region.iter().filter(|item| item.range.end <= end).cloned().collect(),
+            fold: metadata.fold.iter().filter(|item| item.end.block == source.id && item.end.position <= end).cloned().collect(),
+            gutter: metadata.gutter.iter().filter(|item| item.position.row < rows.len() && item.position <= end).cloned().collect(),
+        },
+    })
 }
 
 #[cfg(test)]
@@ -688,6 +679,11 @@ mod tests {
     use super::*;
     use forge_buffer::block::FoldRange;
     use forge_buffer::identity::FoldId;
+
+    fn owned_entry(source: &TranscriptDocument, id: &str) -> Result<TranscriptEntry> {
+        let entry = source.source_entry(id)?;
+        Ok(TranscriptEntry { id: entry.id.to_owned(), block: entry.block.into_iter().cloned().collect() })
+    }
 
     #[test]
     fn empty_tool_blocks_do_not_add_rows_or_truncate_following_tools() -> Result<()> {
@@ -1128,7 +1124,7 @@ mod tests {
 
     #[test]
     fn display_row_pages_split_large_hunks_without_losing_row_metadata() -> Result<()> {
-        let mut initial = source()?.source_entry("entry")?;
+        let mut initial = owned_entry(&source()?, "entry")?;
         initial.block[0].metadata.fold[0].expand_children = true;
         initial.block[1].text =
             BufferText::from_rows((0..100).map(|row| format!("{row:03} {}", "x".repeat(16))))?;
@@ -1220,11 +1216,11 @@ mod tests {
                 metadata: Default::default(),
             }],
         };
-        let original = source.source_entry("entry")?;
+        let original = owned_entry(&source, "entry")?;
         source.replace_scope(vec![original, extra], 0)?;
         let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;
-        let original = source.source_entry("entry")?;
-        let extra = source.source_entry("extra")?;
+        let original = owned_entry(&source, "entry")?;
+        let extra = owned_entry(&source, "extra")?;
         source.replace_scope(vec![extra, original], 0)?;
         visible.refresh(&mut source)?;
         assert_eq!(visible.document.entry_ids(), ["extra", "entry"]);
@@ -1243,11 +1239,11 @@ mod tests {
                 metadata: Default::default(),
             }],
         };
-        let original = source.source_entry("entry")?;
+        let original = owned_entry(&source, "entry")?;
         source.replace_scope(vec![extra, original], 0)?;
         let mut visible = SectionProjection::new(&mut source, DocumentId("visible".into()))?;
-        let mut receiver = source.source_entry("extra")?;
-        let mut sender = source.source_entry("entry")?;
+        let mut receiver = owned_entry(&source, "extra")?;
+        let mut sender = owned_entry(&source, "entry")?;
         receiver.block.append(&mut sender.block);
         sender.block.push(BufferBlock {
             id: BlockId("remaining".into()),
