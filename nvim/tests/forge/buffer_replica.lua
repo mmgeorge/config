@@ -41,15 +41,15 @@ local ok, failure = xpcall(function()
     { start_row = 1, removed_rows = 1, text = { "tail" } },
     { start_row = 0, removed_rows = 1, text = { "head" } },
   }
-  local native_set_lines = vim.api.nvim_buf_set_lines
+  local native_set_text = vim.api.nvim_buf_set_text
   local calls = 0
-  vim.api.nvim_buf_set_lines = function(...)
+  vim.api.nvim_buf_set_text = function(...)
     calls = calls + 1
     if calls == 2 then error("injected second-edit failure") end
-    return native_set_lines(...)
+    return native_set_text(...)
   end
   local result = replica.apply_patch(session, two_edits)
-  vim.api.nvim_buf_set_lines = native_set_lines
+  vim.api.nvim_buf_set_text = native_set_text
   assert(result.kind == "Desynchronized" and result.diagnostic:find("injected second-edit failure", 1, true))
   assert(session.revision == 2, "partial application acknowledged target revision")
   assert(vim.deep_equal(vim.api.nvim_buf_get_lines(session.buffer, 0, -1, true), { "one", "tail" }))

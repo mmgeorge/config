@@ -149,8 +149,11 @@ columns without adding gutter bytes to the source text.
 `forge.folds` owns native manual fold ranges and renders collapsed labels from header text
 and semantic decorations. Each attached window retains its own open or closed preference.
 Ordinary patches remove and recreate only affected fold subtrees. Unchanged native ranges
-survive timer updates. Subtree deletion selects the complete native range before removing
-its descendants, including folds that share a header row. Creation temporarily opens
+survive timer updates. One-line replacements use `nvim_buf_set_text` to preserve the line
+and its fold membership. `nvim_buf_set_lines` can shorten a manual fold when replacing its
+last line, even when the row count stays unchanged. Row insertions and deletions remove
+affected folds before the edit and recreate them afterward. Subtree deletion selects the
+complete native range before removing its descendants, including folds that share a header row. Creation temporarily opens
 containing folds so Neovim does not widen a child range to a closed ancestor. Both operations
 restore retained ancestor preferences within the atomic buffer update. Attaching a window
 or replacing an authoritative snapshot rebuilds the native ranges without replacing retained
@@ -160,6 +163,10 @@ has changed, and a replacement window inherits the document's most recently deta
 An existing window restores its own choices. Native ranges are rebuilt once from those
 preferences, without a second fold-open/close replay. Closing a window drops its retained
 entry, while the last detached view remains available until the document closes.
+Native fold preparation and publication failures mark the replica desynchronized, report
+the diagnostic, and request an authoritative snapshot through the document's recovery path.
+Fold views record native ownership only after creation succeeds. Deletion restores temporary
+window options even when an editor command fails.
 Status demand skips closed folds,
 and expanding a file admits its source through the existing bounded demand path.
 
@@ -175,8 +182,11 @@ Profiling records slice counts, maximum callback duration, maximum preparation d
 maximum non-yielding commit duration in `ui.document.slices`. Large initial snapshots can exceed
 the preparation time budget during their atomic commit, so commit timing is tracked separately.
 
-Adoption records each window after its own slice. If the reader moves between slices, final
-publication preserves that newer view instead of restoring the earlier cursor and viewport.
+Each synchronous commit captures every attached window's current cursor identity and viewport
+after preparation, immediately before changing native text or folds. The same non-yielding
+commit restores those anchors against the new document. Movement during preparation is therefore
+included in the capture and never suppresses restoration. Cursor snapshots do not cross
+asynchronous preparation boundaries.
 
 Each tool owns independent command-heading, preview, and hidden-count blocks. Expanding output
 replaces only that tool's body with stable 16 KiB source chunks. Subsequent deltas render only

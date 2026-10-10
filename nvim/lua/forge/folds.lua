@@ -263,8 +263,7 @@ local function apply_defaults(session, window, saved, changed)
         local view = saved.fold[id] or { preference = "auto" }
         local target = view.preference == "closed"
           or view.preference == "auto" and record.fold.closed
-        if not view.native then created[#created + 1] = { start = start + 1, finish = finish } end
-        view.native = true
+        if not view.native then created[#created + 1] = { id = id, start = start + 1, finish = finish } end
         if view.applied == nil or view.applied ~= target or changed[id] then
           if target then closed[start + 1] = true else opened[start + 1] = true end
         end
@@ -293,6 +292,7 @@ local function apply_defaults(session, window, saved, changed)
         ancestor = vim.fn.foldclosed(range.start)
       end
       vim.cmd(("%d,%dfold"):format(range.start, range.finish))
+      saved.fold[range.id].native = true
       vim.cmd(tostring(range.start) .. "foldopen!")
       vim.fn.winrestview(view)
     end)
@@ -388,10 +388,13 @@ local function remove_native(session, affected)
               vim.api.nvim_win_set_cursor(window, { range.start, 0 })
               vim.cmd("normal! zD")
             end)
-            for index = #ancestors, 1, -1 do close_open_fold(ancestors[index]) end
+            local restored, restore_failure = pcall(function()
+              for index = #ancestors, 1, -1 do close_open_fold(ancestors[index]) end
+            end)
             vim.wo.foldminlines = minimum_lines
             vim.fn.winrestview(view)
             if not ok then error(failure, 0) end
+            if not restored then error(restore_failure, 0) end
             removed_end = range.finish
           end
           vim.fn.winrestview(view)

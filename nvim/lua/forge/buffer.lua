@@ -485,8 +485,9 @@ local function commit_patch(session, patch)
       if edit.removed_rows ~= 1 or #edit.text ~= 1 then prepared.retain_folds = false break end
     end
     local readonly = vim.bo[session.buffer].readonly
-    folds.prepare(session, prepared)
+    ok, prepared.failure = pcall(folds.prepare, session, prepared)
     checkpoint("fold_capture")
+    if not ok then finish("fold_capture_failed") return M.fail_apply(session, prepared.failure) end
     ok, prepared.failure = pcall(function()
       assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
       session.applying = true
@@ -505,7 +506,13 @@ local function commit_patch(session, patch)
       for _, edit in ipairs(patch.text_edit) do
         local finish = edit.start_row + edit.removed_rows
         if session.row_count == 0 then finish = 1 end
-        vim.api.nvim_buf_set_lines(session.buffer, edit.start_row, finish, true, edit.text)
+        if edit.removed_rows == 1 and #edit.text == 1 then
+          -- Replacing the line itself can shorten native folds ending on it.
+          local previous_text = vim.api.nvim_buf_get_lines(session.buffer, edit.start_row, finish, true)[1]
+          vim.api.nvim_buf_set_text(session.buffer, edit.start_row, 0, edit.start_row, #previous_text, edit.text)
+        else
+          vim.api.nvim_buf_set_lines(session.buffer, edit.start_row, finish, true, edit.text)
+        end
       end
       if timing then
         timing.buffer_api_ms = perf.elapsed_ms(text_started)
@@ -532,12 +539,15 @@ local function commit_patch(session, patch)
     if not ok then finish("regions_failed") return M.fail_apply(session, prepared.failure) end
     session.row_count, session.revision = patch.next_rows, patch.next
     session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
-    decorations.attach(session)
-    checkpoint("decorations")
-    folds.refresh(session)
-    checkpoint("fold_refresh")
-    buffer_view.restore(session, retained_view)
-    checkpoint("view_restore")
+    ok, prepared.failure = pcall(function()
+      decorations.attach(session)
+      checkpoint("decorations")
+      folds.refresh(session)
+      checkpoint("fold_refresh")
+      buffer_view.restore(session, retained_view)
+      checkpoint("view_restore")
+    end)
+    if not ok then finish("presentation_failed") return M.fail_apply(session, prepared.failure) end
     finish("ok")
     return { kind = "Applied", revision = session.revision }
   end)
@@ -600,7 +610,8 @@ function M.apply_snapshot(session, snapshot)
       return prepared.block[id] ~= nil and prepared.block[id].row_count > 0
     end)
     local readonly = vim.bo[session.buffer].readonly
-    folds.reset(session)
+    ok, prepared.failure = pcall(folds.reset, session)
+    if not ok then return M.fail_apply(session, prepared.failure) end
     ok, prepared.failure = pcall(function()
       assert(not vim.in_fast_event(), "buffer mutation requires the main loop")
       editable.detach(session.editable)
@@ -632,9 +643,12 @@ function M.apply_snapshot(session, snapshot)
     session.changedtick = vim.api.nvim_buf_get_changedtick(session.buffer)
     session.status, session.diagnostic = "Applied", nil
     session.expected_changedtick = nil
-    decorations.attach(session)
-    folds.refresh(session)
-    buffer_view.restore(session, retained_view)
+    ok, prepared.failure = pcall(function()
+      decorations.attach(session)
+      folds.refresh(session)
+      buffer_view.restore(session, retained_view)
+    end)
+    if not ok then return M.fail_apply(session, prepared.failure) end
     return { kind = "Applied", revision = session.revision }
   end)
 end
@@ -651,20 +665,6 @@ function M.apply_async(session, update, alive, done)
   local token = {}
   local readonly = vim.bo[session.buffer].readonly
   local observed_tick = vim.api.nvim_buf_get_changedtick(session.buffer)
-  local observed_view = {}
-  local changed_view = {}
-  local function observe_views(compare)
-    if not session.preserve_view then return end
-    for _, window in ipairs(vim.fn.win_findbuf(session.buffer)) do
-      local view = vim.api.nvim_win_call(window, vim.fn.winsaveview)
-      if compare and observed_view[window] and not vim.deep_equal(view, observed_view[window]) then
-        changed_view[window] = true
-      end
-      observed_view[window] = view
-    end
-  end
-  observe_views(false)
-  session.changed_view = changed_view
   session.update_pending = token
   cooperative.run(function()
     if update.patch then
@@ -682,7 +682,6 @@ function M.apply_async(session, update, alive, done)
     if update.block then return M.apply_snapshot(session, update) end
     return M.apply_patch(session, update)
   end, function()
-    observe_views(true)
     return session.update_pending == token and session.status ~= "Closed"
       and vim.api.nvim_buf_is_valid(session.buffer)
       and vim.api.nvim_buf_get_changedtick(session.buffer) == observed_tick and alive()
@@ -690,7 +689,6 @@ function M.apply_async(session, update, alive, done)
     if session.update_pending ~= token then return end
     session.update_pending = nil
     session.applying = nil
-    session.changed_view = nil
     session.update_timing = { slices = timing.slices, maximum_ms = timing.maximum_ms,
       maximum_prepare_ms = timing.maximum_prepare_ms, maximum_commit_ms = timing.maximum_commit_ms }
     if failure then
@@ -711,7 +709,6 @@ function M.apply_async(session, update, alive, done)
   end, function()
     if vim.api.nvim_buf_is_valid(session.buffer) then
       observed_tick = vim.api.nvim_buf_get_changedtick(session.buffer)
-      observe_views(false)
     end
   end)
 end

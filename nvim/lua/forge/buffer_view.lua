@@ -96,8 +96,7 @@ end
 ---@param retained ForgeRetainedView[]
 function M.restore(session, retained)
   for _, saved in ipairs(retained) do
-    if not (session.changed_view and session.changed_view[saved.window])
-      and vim.api.nvim_win_is_valid(saved.window) and vim.api.nvim_win_get_buf(saved.window) == session.buffer then
+    if vim.api.nvim_win_is_valid(saved.window) and vim.api.nvim_win_get_buf(saved.window) == session.buffer then
       local row = math.min(saved.original_row, math.max(0, session.row_count - 1))
       local node = saved.block and session.sequence.node[saved.block]
       if node then

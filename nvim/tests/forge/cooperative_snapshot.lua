@@ -44,26 +44,31 @@ vim.api.nvim_buf_set_lines = function(native, ...)
   end
   return result
 end
-buffer.apply_async(replica, { document = replica.document, revision = 8, block = block },
+local recovery_block = { { id = "new-heading", text = { "New heading", "New context" },
+  metadata = { target = {}, decoration = {}, editable_region = {}, fold = {} } } }
+vim.list_extend(recovery_block, block)
+buffer.apply_async(replica, { document = replica.document, revision = 8, block = recovery_block },
   function() return true end, function(adopted) recovering = adopted end)
 vim.api.nvim_win_set_cursor(view.window, { 91, 0 })
 assert(vim.wait(10000, function() return recovering ~= nil end, 1))
 vim.api.nvim_buf_set_lines = write_lines
 assert(recovering.kind == "Applied", recovering.diagnostic)
-assert(vim.api.nvim_win_get_cursor(view.window)[1] == 91, "recovery restored a cursor after the reader moved it")
+assert(vim.api.nvim_win_get_cursor(view.window)[1] == 93,
+  "recovery lost the reader's latest cursor identity when rows were inserted above it")
+assert(vim.api.nvim_get_current_line() == "history 10 row 1", "recovery selected a different history entry")
 assert(replica.update_timing.maximum_prepare_ms < 50, "recovery preparation exceeded 50ms")
 assert(recovery_writes == 1, "snapshot cleared or incrementally refilled the live buffer")
-assert(vim.fn.foldclosed(29991) == 29991)
+assert(vim.fn.foldclosed(29993) == 29993)
 local patch_result
 local replacement = {}
 for row = 1, 30000 do replacement[row] = "expanded output row " .. row end
 buffer.apply_async(replica, {
   document = replica.document, base = 8, next = 9,
-  base_rows = 30000, next_rows = 30000, base_blocks = 3000, next_blocks = 1,
-  block_edit = { { start_block = 0, removed_blocks = 3000, inserted = { "expanded" } } },
-  removed_block = vim.tbl_map(function(entry) return entry.id end, block),
+  base_rows = 30002, next_rows = 30000, base_blocks = 3001, next_blocks = 1,
+  block_edit = { { start_block = 0, removed_blocks = 3001, inserted = { "expanded" } } },
+  removed_block = vim.tbl_map(function(entry) return entry.id end, recovery_block),
   metadata_edit = { { block = "expanded", row_count = 30000, metadata = { target = {}, decoration = {}, editable_region = {}, fold = {} } } },
-  text_edit = { { start_row = 0, removed_rows = 30000, text = replacement } },
+  text_edit = { { start_row = 0, removed_rows = 30002, text = replacement } },
 }, function() return true end, function(adopted) patch_result = adopted end)
 assert(vim.wait(10000, function() return patch_result ~= nil end, 1))
 assert(patch_result.kind == "Applied", patch_result.diagnostic)
