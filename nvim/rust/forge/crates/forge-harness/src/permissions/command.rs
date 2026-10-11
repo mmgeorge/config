@@ -27,6 +27,28 @@ pub struct CommandDisplay {
 }
 
 impl CommandDisplay {
+    /// Summarizes literal file operations without changing execution or approval input.
+    pub(crate) fn summary(&self) -> Option<String> {
+        if self.source.chars().any(|character| matches!(character,
+            '\n' | '\r' | '|' | ';' | '&' | '<' | '>' | '$' | '`' | '(' | ')' | '{' | '}')) {
+            return None;
+        }
+        let tokens = shell_tokens(&self.source, self.shell).ok()?;
+        let command = tokens.first()?.text.as_str();
+        let command = if self.shell == CommandShell::PowerShell { command.to_ascii_lowercase() }
+            else { command.to_owned() };
+        let arguments: Vec<&str> = tokens.iter().skip(1).map(|token| token.text.as_str()).collect();
+        match command.as_str() {
+            "get-content" | "cat" | "head" | "tail" => read_summary(&command, &arguments),
+            "get-childitem" | "ls" => list_summary(&command, &arguments, self.shell),
+            "select-string" | "grep" => search_summary(&command, &arguments),
+            "open" if self.shell == CommandShell::Nushell => read_summary(&command, &arguments),
+            "glob" if self.shell == CommandShell::Nushell && arguments.len() == 1
+                && !arguments[0].starts_with('-') => Some(format!("Find files · {}", arguments[0])),
+            _ => None,
+        }
+    }
+
     /// Maps an executable occurrence through removed launchers and decoded argument quoting.
     pub fn project_range(&self, range: &Range<usize>) -> Option<Range<usize>> {
         let mut matched = self
@@ -37,6 +59,98 @@ impl CommandDisplay {
         let first = matched.next()?.0;
         Some(first..matched.last().map_or(first, |(index, _)| index) + 1)
     }
+}
+
+fn read_summary(command: &str, arguments: &[&str]) -> Option<String> {
+    let mut path = None;
+    let mut range = None;
+    let mut raw = false;
+    let mut arguments = arguments.iter().copied();
+    while let Some(argument) = arguments.next() {
+        let option = if command == "get-content" { argument.to_ascii_lowercase() } else { argument.to_owned() };
+        match (command, option.as_str()) {
+            ("get-content", "-path" | "-literalpath") => {
+                if path.is_some() { return None; }
+                path = Some(arguments.next()?);
+            }
+            ("get-content", "-totalcount" | "-tail") | ("head" | "tail", "-n" | "--lines") => {
+                if range.is_some() { return None; }
+                let count = arguments.next()?.parse::<u64>().ok()?;
+                let position = if command == "tail" || argument.eq_ignore_ascii_case("-tail") { "last" } else { "first" };
+                range = Some(format!("{position} {count} lines"));
+            }
+            ("get-content", "-raw") | ("open", "--raw" | "-r") => raw = true,
+            _ if !argument.starts_with('-') && path.is_none() => path = Some(argument),
+            _ => return None,
+        }
+    }
+    let path = path.filter(|path| !path.is_empty())?;
+    if raw && range.is_some() { return None; }
+    let range = range.or_else(|| matches!(command, "head" | "tail")
+        .then(|| format!("{} 10 lines", if command == "head" { "first" } else { "last" })));
+    let suffix = range.map_or_else(|| if raw { " · raw".into() } else { String::new() }, |range| format!(" · {range}"));
+    Some(format!("Read · {path}{suffix}"))
+}
+
+fn list_summary(command: &str, arguments: &[&str], shell: CommandShell) -> Option<String> {
+    let mut path = None;
+    let mut all = false;
+    let mut long = false;
+    let mut recursive = false;
+    let mut filter = None;
+    let mut arguments = arguments.iter().copied();
+    while let Some(argument) = arguments.next() {
+        let option = if command == "get-childitem" { argument.to_ascii_lowercase() } else { argument.to_owned() };
+        match (command, option.as_str()) {
+            ("get-childitem", "-path" | "-literalpath") => {
+                if path.is_some() { return None; }
+                path = Some(arguments.next()?);
+            }
+            ("get-childitem", "-recurse") => recursive = true,
+            ("get-childitem", "-force") | ("ls", "-a" | "--all") => all = true,
+            ("ls", "-l") if shell != CommandShell::Nushell => long = true,
+            ("ls", "-la" | "-al") if shell != CommandShell::Nushell => { all = true; long = true; }
+            ("get-childitem", "-filter") => {
+                if filter.is_some() { return None; }
+                filter = Some(arguments.next()?);
+            }
+            _ if !argument.starts_with('-') && path.is_none() => path = Some(argument),
+            _ => return None,
+        }
+    }
+    let mut title = format!("List · {}", path.unwrap_or("."));
+    if recursive { title.push_str(" · recursive"); }
+    if all { title.push_str(" · all"); }
+    if long { title.push_str(" · long"); }
+    if let Some(filter) = filter { title.push_str(&format!(" · {filter}")); }
+    Some(title)
+}
+
+fn search_summary(command: &str, arguments: &[&str]) -> Option<String> {
+    let mut path = None;
+    let mut pattern = None;
+    let mut line_numbers = false;
+    let mut arguments = arguments.iter().copied();
+    while let Some(argument) = arguments.next() {
+        let option = if command == "select-string" { argument.to_ascii_lowercase() } else { argument.to_owned() };
+        match (command, option.as_str()) {
+            ("select-string", "-path" | "-literalpath") => {
+                if path.is_some() { return None; }
+                path = Some(arguments.next()?);
+            }
+            ("select-string", "-pattern") => {
+                if pattern.is_some() { return None; }
+                pattern = Some(arguments.next()?);
+            }
+            ("grep", "-n" | "--line-number") if pattern.is_none() => line_numbers = true,
+            ("grep", _) if !argument.starts_with('-') && pattern.is_none() => pattern = Some(argument),
+            ("grep", _) if !argument.starts_with('-') && path.is_none() => path = Some(argument),
+            _ => return None,
+        }
+    }
+    let label = if command == "grep" { "Search" } else { "Search files" };
+    let pattern = serde_json::to_string(pattern?).ok()?;
+    Some(format!("{label} · {pattern} · {}{}", path?, if line_numbers { " · line numbers" } else { "" }))
 }
 
 /// Removes shell launchers from display text without changing permission or execution input.
@@ -470,6 +584,56 @@ pub fn exact_command_pattern(invocation: &CommandInvocation) -> Option<String> {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn summarizes_simple_file_operations_in_each_shell() {
+        for (shell, source, expected) in [
+            (CommandShell::PowerShell, "Get-Content src/main.rs", "Read · src/main.rs"),
+            (CommandShell::PowerShell, "Get-Content -LiteralPath 'src/main file.rs' -TotalCount 40", "Read · src/main file.rs · first 40 lines"),
+            (CommandShell::PowerShell, "Get-Content src/main.rs -Tail 20", "Read · src/main.rs · last 20 lines"),
+            (CommandShell::PowerShell, "Get-ChildItem src", "List · src"),
+            (CommandShell::PowerShell, "Get-ChildItem src -Recurse -Filter *.rs", "List · src · recursive · *.rs"),
+            (CommandShell::PowerShell, "Select-String -Path src/*.rs -Pattern TODO", "Search files · \"TODO\" · src/*.rs"),
+            (CommandShell::PowerShell, "GET-CONTENT -PATH src/main.rs -TOTALCOUNT 40", "Read · src/main.rs · first 40 lines"),
+            (CommandShell::Bash, "cat src/main.rs", "Read · src/main.rs"),
+            (CommandShell::Bash, "head -n 40 src/main.rs", "Read · src/main.rs · first 40 lines"),
+            (CommandShell::Bash, "tail -n 20 src/main.rs", "Read · src/main.rs · last 20 lines"),
+            (CommandShell::Bash, "ls -la src", "List · src · all · long"),
+            (CommandShell::Bash, "grep -n TODO src/main.rs", "Search · \"TODO\" · src/main.rs · line numbers"),
+            (CommandShell::Nushell, "open --raw src/main.rs", "Read · src/main.rs · raw"),
+            (CommandShell::Nushell, "ls -a src", "List · src · all"),
+            (CommandShell::Nushell, "glob 'src/**/*.rs'", "Find files · src/**/*.rs"),
+            (CommandShell::PowerShell, "bash -lc 'cat src/main.rs'", "Read · src/main.rs"),
+            (CommandShell::PowerShell, "nu -c 'open --raw src/main.rs'", "Read · src/main.rs · raw"),
+        ] {
+            assert_eq!(display_command(source, shell).summary().as_deref(), Some(expected), "{source}");
+        }
+    }
+
+    #[test]
+    fn command_summaries_preserve_unrecognized_or_compound_sources() {
+        for (shell, source) in [
+            (CommandShell::PowerShell, "rg -n TODO src"),
+            (CommandShell::Bash, "rg -n TODO src"),
+            (CommandShell::Nushell, "rg -n TODO src"),
+            (CommandShell::PowerShell, "Get-Content src/main.rs; Remove-Item other.rs"),
+            (CommandShell::PowerShell, "Get-Content src/main.rs | Select-Object -First 5"),
+            (CommandShell::PowerShell, "Get-Content src/main.rs -Unknown"),
+            (CommandShell::Bash, "cat src/main.rs && touch other.rs"),
+            (CommandShell::Bash, "cat $(find src)"),
+            (CommandShell::Bash, "cat src/main.rs > other.rs"),
+            (CommandShell::Bash, "head -N 40 src/main.rs"),
+            (CommandShell::Bash, "grep -n TODO src/main.rs other.rs"),
+            (CommandShell::Bash, "grep -e TODO src/main.rs"),
+            (CommandShell::Bash, "open src/main.rs"),
+            (CommandShell::Nushell, "open --raw src/main.rs | lines"),
+            (CommandShell::Nushell, "ls --unknown src"),
+        ] {
+            let display = display_command(source, shell);
+            assert!(display.summary().is_none(), "{source}");
+            assert_eq!(display.source, source);
+        }
+    }
 
     #[test]
     fn shell_launcher_display_matches_cross_platform_fixtures() {

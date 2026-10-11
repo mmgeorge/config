@@ -1848,7 +1848,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
                 ExchangeState::Running if exchange.metrics.awaiting_approval() => "Waiting for approval",
                 ExchangeState::Running => "Running",
                 ExchangeState::Finalizing => "Saving exchange",
-                ExchangeState::Complete => "Completed",
+                ExchangeState::Complete => "Ran",
                 ExchangeState::Failed => "Failed",
                 ExchangeState::Cancelled => "Cancelled",
                 ExchangeState::Interrupted => "Interrupted",
@@ -1862,7 +1862,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
             };
             format!(" · {} · {}{speed}", crate::agent::provider_name(selection.provider), selection.model)
         }).unwrap_or_default();
-        let heading = format!("● Agent {}{selection} · {lifecycle} {}s",run.label(),exchange.elapsed(now_ms) / 1000);
+        let heading = format!("● {lifecycle} {}s · {}{selection}",exchange.elapsed(now_ms) / 1000,run.label());
         return exchange_metrics_summary(exchange,now_ms,heading);
     }
 
@@ -1874,15 +1874,15 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
         .max(0)
         / 1_000;
     let lifecycle = match run.state {
-        AgentState::Starting => format!("starting for {elapsed_seconds}s"),
+        AgentState::Starting => format!("Starting {elapsed_seconds}s"),
         AgentState::Ready => {
             let elapsed_seconds = now_ms.saturating_sub(run.created_at_ms).max(0) / 1_000;
-            format!("ready for {elapsed_seconds}s")
+            format!("Ready {elapsed_seconds}s")
         }
-        AgentState::Closing => format!("closing after {elapsed_seconds}s"),
-        AgentState::Closed => format!("closed after {elapsed_seconds}s"),
+        AgentState::Closing => format!("Closing {elapsed_seconds}s"),
+        AgentState::Closed => format!("Closed {elapsed_seconds}s"),
     };
-    format!("● Agent {} {lifecycle}", run.label())
+    format!("● {lifecycle} · {}", run.label())
 }
 
 fn session_event_text(event: &SessionEventKind) -> String {
@@ -2048,8 +2048,12 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
         let passed = interaction.turn.iter().flat_map(|turn| turn.tools())
             .filter(|tool| tool.state() == crate::turn::ToolState::Completed && !tool.failed).count();
         let duration = interaction.metrics.tool_ms(interaction.elapsed(now_ms))
-            .map(|duration| format!("{} · ", super::duration::duration_label(duration))).unwrap_or_default();
-        sections.push(format!("Tools {duration}{passed}/{count} pass"));
+            .map(|duration| {
+                let label = super::duration::duration_label(duration);
+                let value = label.trim_end_matches(|character: char| character.is_ascii_alphabetic());
+                format!(" · {value} {}", &label[value.len()..])
+            }).unwrap_or_default();
+        sections.push(format!("{passed}/{count} tools{duration}"));
     }
     let usage = interaction.usage();
     let mut tokens = Vec::new();
@@ -2061,9 +2065,9 @@ fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String
         label
     });
     match (input, usage.output) {
-        (Some(input), Some(output)) => tokens.push(format!("Tokens {input} -> {}", token_display(output))),
-        (Some(input), None) => tokens.push(format!("Tokens in {input}")),
-        (None, Some(output)) => tokens.push(format!("Tokens out {}", token_display(output))),
+        (Some(input), Some(output)) => tokens.push(format!("{input} -> {}", token_display(output))),
+        (Some(input), None) => tokens.push(format!("in {input}")),
+        (None, Some(output)) => tokens.push(format!("out {}", token_display(output))),
         (None, None) => {}
     }
     if let Some((output, duration)) = interaction.metrics.reported_output_tokens
@@ -3396,9 +3400,9 @@ mod tests {
         let thought = projected.entry.block.iter().find(|block|block.id.0 == "delegation:thought").unwrap();
         assert!(thought.metadata.layout.as_ref().unwrap().indent > 2);
         let heading = projected.entry.block.iter().find(|block|block.id.0 == "delegation").unwrap();
-        assert!(heading.text.wire_rows().join("\n").contains("Tools"));
+        assert!(heading.text.wire_rows().join("\n").contains("tools"));
         assert_eq!(heading.metadata.node.as_ref().unwrap().kind,forge_buffer::node::NodeKind::Exchange);
-        assert!(heading.text.wire_rows().join("\n").contains("Agent Nested · Running"));
+        assert!(heading.text.wire_rows().join("\n").contains("Running 0s · Nested"));
         assert_eq!(heading.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text,"▸");
         assert!(!heading.metadata.fold[0].closed);
         assert_eq!(heading.metadata.node.as_ref().unwrap().parent.as_ref().unwrap().0, "parent:exchange");
@@ -3412,7 +3416,7 @@ mod tests {
         let refreshed = super::timing_blocks(&entry,&WidthProfile::default(),&document,
             &Default::default(),&projected.tool).unwrap();
         let refreshed_heading = refreshed.iter().find(|block|block.id.0 == "delegation").unwrap();
-        assert!(refreshed_heading.text.wire_rows().join("\n").contains("Agent Nested"));
+        assert!(refreshed_heading.text.wire_rows().join("\n").contains("s · Nested"));
         assert_eq!(refreshed_heading.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text,"▸");
         assert!(!refreshed.iter().any(|block|block.id.0 == "delegation:thought"),
             "timers must not replace the retained child thought");
@@ -3421,7 +3425,7 @@ mod tests {
             (crate::backend::ServiceTier::Fast, " +"),
             (crate::backend::ServiceTier::Ultrafast, " ++"),
         ] {
-            for (state, lifecycle) in [(ExchangeState::Running, "Running"), (ExchangeState::Complete, "Completed")] {
+            for (state, lifecycle) in [(ExchangeState::Running, "Running"), (ExchangeState::Complete, "Ran")] {
                 let mut selected_entry = entry.clone();
                 if let TimelineEntry::Exchange { agent_by_id, .. } = &mut selected_entry {
                     let Some(TimelineEntry::AgentLifecycle { run, exchange, .. }) = agent_by_id.get_mut("nested-agent") else {
@@ -3437,8 +3441,9 @@ mod tests {
                     exchange[0].completed_at_ms = (state == ExchangeState::Complete).then_some(7000);
                 }
                 let selected = project_at(&selected_entry, &WidthProfile::default(), 7000).unwrap();
-                let expected = format!("Agent Nested · codex · gpt-6.1-sol{suffix} · {lifecycle}");
+                let expected = format!("s · Nested · codex · gpt-6.1-sol{suffix}");
                 let heading = selected.entry.block.iter().find(|block|block.id.0 == "delegation").unwrap();
+                assert!(heading.text.wire_rows().join("\n").contains(&format!("{lifecycle} ")));
                 assert!(heading.text.wire_rows().join("\n").contains(&expected));
                 assert_eq!(heading.metadata.fold[0].closed, state == ExchangeState::Complete);
                 let contents = selected.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
@@ -3463,6 +3468,7 @@ mod tests {
                 let refreshed = super::timing_blocks(&selected_entry, &WidthProfile::default(), &document,
                     &Default::default(), &selected.tool).unwrap();
                 let heading = refreshed.iter().find(|block|block.id.0 == "delegation").unwrap();
+                assert!(heading.text.wire_rows().join("\n").contains(&format!("{lifecycle} ")));
                 assert!(heading.text.wire_rows().join("\n").contains(&expected));
             }
         }
@@ -4170,12 +4176,29 @@ mod tests {
         });
         let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
         assert_eq!(super::exchange_activity_summary(&exchange, 44000),
-            "● Planned 44s │ Tools 4s · 19/20 pass │ Tokens 855.1k -> 7.9k · 197 tps");
+            "● Planned 44s │ 19/20 tools · 4 s │ 855.1k -> 7.9k · 197 tps");
         for status in ["running", "cancelled", "interrupted"] {
             value["turn"][0]["tool"]["item"]["1"]["status"] = json!(status);
             let exchange: Exchange = serde_json::from_value(value.clone()).unwrap();
-            assert!(super::exchange_activity_summary(&exchange, 44000).contains("18/20 pass"));
+            assert!(super::exchange_activity_summary(&exchange, 44000).contains("18/20 tools"));
         }
+        value["kind"] = json!("chat");
+        value["duration_ms"] = json!(31000);
+        value["metrics"] = json!({"timing_complete":true,"tool_duration_ms":29,
+            "reported_output_tokens":846,"reported_response_ms":9097});
+        value["turn"][0]["usage"] = json!({"input":77000,"cached_input":49280,"output":846});
+        value["turn"][0]["tool"] = json!({"order":["first","second"],"item":{
+            "first":{"id":"first","kind":"tool_call","title":"inspect","status":"completed","output":"",
+                "failed":false,"started_at_ms":0,"completed_at_ms":29},
+            "second":{"id":"second","kind":"tool_call","title":"inspect","status":"completed","output":"",
+                "failed":false,"started_at_ms":0,"completed_at_ms":29}
+        }});
+        let exchange: Exchange = serde_json::from_value(value).unwrap();
+        assert_eq!(super::exchange_activity_summary(&exchange, 44000),
+            "● Thought 31s │ 2/2 tools · 29 ms │ 77.0k (64%) -> 846 · 93 tps");
+        let child = crate::agent::Agent::pending("session", "Child", "Inspect", 0);
+        assert!(super::agent_summary(&child, Some(&exchange), 44000)
+            .ends_with("│ 2/2 tools · 29 ms │ 77.0k (64%) -> 846 · 93 tps"));
     }
 
     #[test]
@@ -4217,8 +4240,8 @@ mod tests {
             task_update: None,
         };
         exchange.observe_turn(&event, 2000).unwrap();
-        for (now_ms, duration, aggregate) in [(2439, "0.4s", "439ms"), (2500, "0.5s", "500ms"),
-            (3000, "1s", "1s"), (4500, "2.5s", "2.5s")] {
+        for (now_ms, duration, aggregate) in [(2439, "0.4s", "439 ms"), (2500, "0.5s", "500 ms"),
+            (3000, "1s", "1 s"), (4500, "2.5s", "2.5 s")] {
             let entry = crate::timeline::TimelineEntry::Exchange {
                 id: exchange.id.clone(), created_at_ms: 1000, exchange: exchange.clone(),
                 agent_by_id: HashMap::new(),
@@ -4227,18 +4250,18 @@ mod tests {
             assert!(rendered.entry.block.iter().any(|block| block.text.wire_rows().iter()
                 .any(|row| row.contains(&format!("• {duration:>5} cargo test")))));
             assert!(super::exchange_activity_summary(&exchange, now_ms)
-                .contains(&format!("Tools {aggregate} · 0/1 pass")));
+                .contains(&format!("0/1 tools · {aggregate}")));
         }
         let mut permission_wait = exchange.clone();
         permission_wait.kind = crate::exchange::ExchangeKind::PlanDraft;
         permission_wait.observe_blocker("approval:command".into(), true, 4500);
         for now_ms in [90_000, 900_000] {
             assert_eq!(super::exchange_activity_summary(&permission_wait, now_ms),
-                "● Planning paused 3s │ Tools 2.5s · 0/1 pass");
+                "● Planning paused 3s │ 0/1 tools · 2.5 s");
         }
         permission_wait.observe_blocker("approval:command".into(), false, 900_000);
         assert_eq!(super::exchange_activity_summary(&permission_wait, 902_000),
-            "● Planning 5s │ Tools 4.5s · 0/1 pass");
+            "● Planning 5s │ 0/1 tools · 4.5 s");
         event.activity.as_mut().unwrap().status = Some("failed".into());
         exchange.observe_turn(&event, 5000).unwrap();
         let entry = crate::timeline::TimelineEntry::Exchange {
@@ -4275,7 +4298,7 @@ mod tests {
         exchange.observe_turn(&event, 9000).unwrap();
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k (90%) -> 4.2k · 1400 tps"
+            "● Thought 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps"
         );
         event.address.as_mut().unwrap().thread_id = "unowned-child".into();
         assert!(!exchange.observe_turn(&event, 90_000).unwrap());
@@ -4284,13 +4307,13 @@ mod tests {
             exchange.duration_ms = duration_ms;
             assert_eq!(
                 super::exchange_activity_summary(&exchange, 90_000),
-                format!("● Thought {}s │ Tools 3s · 0/1 pass │ Tokens 76.0k (90%) -> 4.2k · 1400 tps", duration_ms / 1000)
+                format!("● Thought {}s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1400 tps", duration_ms / 1000)
             );
         }
         exchange.metrics.timing_complete = false;
         assert_eq!(
             super::exchange_activity_summary(&exchange, 90_000),
-            "● Thought 3s │ Tools 0/1 pass │ Tokens 76.0k (90%) -> 4.2k"
+            "● Thought 3s │ 0/1 tools │ 76.0k (90%) -> 4.2k"
         );
     }
 
@@ -4314,13 +4337,13 @@ mod tests {
         };
         exchange.observe_turn(&event, 3000).unwrap();
         assert_eq!(super::exchange_activity_summary(&exchange, 4000),
-            "● Working 3s │ Tokens 1.0k (90%) -> 100 · 50 tps");
+            "● Working 3s │ 1.0k (90%) -> 100 · 50 tps");
         exchange.observe_turn(&event, 6000).unwrap();
         assert!(super::exchange_activity_summary(&exchange, 6000).contains("50 tps"));
         event.data["id"] = json!("second");
         exchange.observe_turn(&event, 6000).unwrap();
         assert_eq!(super::exchange_activity_summary(&exchange, 9000),
-            "● Working 8s │ Tokens 2.0k (90%) -> 200 · 40 tps");
+            "● Working 8s │ 2.0k (90%) -> 200 · 40 tps");
     }
 
     #[test]
@@ -4337,13 +4360,13 @@ mod tests {
         assert_eq!(super::exchange_activity_summary(&original, 4000), "● Working 3s");
         for (usage, expected) in [
             (json!({}), "● Working 3s"),
-            (json!({"input":1000,"output":100}), "● Working 3s │ Tokens 1.0k -> 100 · 50 tps"),
-            (json!({"input":1000,"cached_input":876}), "● Working 3s │ Tokens in 1.0k (88%)"),
-            (json!({"input":0,"cached_input":0}), "● Working 3s │ Tokens in 0"),
-            (json!({"input":1000,"cached_input":1001}), "● Working 3s │ Tokens in 1.0k"),
+            (json!({"input":1000,"output":100}), "● Working 3s │ 1.0k -> 100 · 50 tps"),
+            (json!({"input":1000,"cached_input":876}), "● Working 3s │ in 1.0k (88%)"),
+            (json!({"input":0,"cached_input":0}), "● Working 3s │ in 0"),
+            (json!({"input":1000,"cached_input":1001}), "● Working 3s │ in 1.0k"),
             (json!({"reasoning":23}), "● Working 3s"),
             (json!({"input":1000,"cached_input":0,"reasoning":0,"output":0}),
-                "● Working 3s │ Tokens 1.0k (0%) -> 0"),
+                "● Working 3s │ 1.0k (0%) -> 0"),
         ] {
             let mut exchange = original.clone();
             let event = BackendEvent {
@@ -4401,7 +4424,7 @@ mod tests {
         interaction.awaiting_input = true;
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "● Planning paused 4s │ Tokens 1.0k (90%) -> 280"
+            "● Planning paused 4s │ 1.0k (90%) -> 280"
         );
         interaction.kind = ExchangeKind::Chat;
         interaction
@@ -4409,7 +4432,7 @@ mod tests {
             .unwrap();
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "● Thought 4s │ Tokens 1.0k (90%) -> 280"
+            "● Thought 4s │ 1.0k (90%) -> 280"
         );
     }
     #[test]

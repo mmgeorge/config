@@ -1797,6 +1797,7 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
         && !item_type.is_empty()
         && !matches!(item_type.as_str(), "mcptoolcall" | "dynamictoolcall");
     let title = mcp_tool_title(item)
+        .or_else(|| builtin_tool_title(item))
         .or_else(|| {
             [
                 item.get("command"),
@@ -1812,6 +1813,7 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
             .flatten()
             .find_map(tool_title)
         })
+        .or_else(|| generic_item.then(|| generic_tool_title(item)).flatten())
         .unwrap_or_else(|| match kind {
             ToolActivityKind::Command => "command".into(),
             ToolActivityKind::FileChange => "file changes".into(),
@@ -2002,10 +2004,69 @@ fn mcp_tool_title(item: &Value) -> Option<String> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| Value::Object(Default::default()));
-    let mut arguments = redact_mcp_arguments(&arguments);
+    let mut arguments = redact_tool_arguments(&arguments);
     arguments.sort_all_objects();
     let arguments = serde_json::to_string(&arguments).ok()?;
     compact_tool_title(&format!("{server}.{tool}({arguments})"))
+}
+
+fn generic_tool_title(item: &Value) -> Option<String> {
+    let title = item.get("type").and_then(Value::as_str)?;
+    let mut details = redact_tool_arguments(item);
+    details.sort_all_objects();
+    Some(format!("{title}({})", serde_json::to_string(&details).ok()?))
+}
+
+fn builtin_tool_title(item: &Value) -> Option<String> {
+    match item.get("type")?.as_str()? {
+        "webSearch" => web_tool_title(item),
+        "sleep" => Some(format!("Wait · {}s",
+            Duration::from_millis(item.get("durationMs")?.as_u64()?).as_secs_f64())),
+        _ => None,
+    }
+}
+
+fn web_tool_title(item: &Value) -> Option<String> {
+    let Some(action) = item.get("action").filter(|action| !action.is_null()) else {
+        return Some(item.get("query").and_then(Value::as_str)
+            .filter(|query| !query.trim().is_empty())
+            .and_then(|query| compact_tool_title(&format!("Web Search · {query}")))
+            .unwrap_or_else(|| "Web Search".into()));
+    };
+    let url = action.get("url").and_then(Value::as_str)
+        .filter(|url| !url.trim().is_empty())
+        .map(|url| url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url));
+    match action.get("type")?.as_str()? {
+        "search" => {
+            let mut queries: Vec<&str> = action.get("queries").and_then(Value::as_array)
+                .into_iter().flatten().filter_map(Value::as_str)
+                .filter(|query| !query.trim().is_empty()).collect();
+            if queries.is_empty() {
+                queries.extend(action.get("query").and_then(Value::as_str)
+                    .or_else(|| item.get("query").and_then(Value::as_str))
+                    .filter(|query| !query.trim().is_empty()));
+            }
+            let first = queries.first()?;
+            let remaining = queries.len() - 1;
+            let suffix = if remaining == 0 { String::new() }
+                else { format!(" · +{remaining} {}", if remaining == 1 { "query" } else { "queries" }) };
+            compact_tool_title(&format!("Search web · {first}{suffix}"))
+        }
+        "openPage" => {
+            let url = url.or_else(|| item.get("query").and_then(Value::as_str)
+                .filter(|url| !url.trim().is_empty())
+                .map(|url| url.strip_prefix("https://").or_else(|| url.strip_prefix("http://")).unwrap_or(url)))?;
+            compact_tool_title(&format!("Open web · {url}"))
+        }
+        "findInPage" => {
+            let pattern = action.get("pattern")?.as_str()?;
+            if pattern.trim().is_empty() { return None; }
+            let pattern = serde_json::to_string(pattern).ok()?;
+            let suffix = url.map_or(String::new(), |url| format!(" · {url}"));
+            compact_tool_title(&format!("Find in page · {pattern}{suffix}"))
+        }
+        _ => None,
+    }
 }
 
 fn mcp_tool_output(item: &Value) -> Option<String> {
@@ -2033,19 +2094,19 @@ fn mcp_tool_output(item: &Value) -> Option<String> {
         .and_then(|content| serde_json::to_string_pretty(content).ok())
 }
 
-fn redact_mcp_arguments(value: &Value) -> Value {
+fn redact_tool_arguments(value: &Value) -> Value {
     match value {
         Value::Array(value_list) => {
-            Value::Array(value_list.iter().map(redact_mcp_arguments).collect())
+            Value::Array(value_list.iter().map(redact_tool_arguments).collect())
         }
         Value::Object(value_map) => Value::Object(
             value_map
                 .iter()
                 .map(|(key, value)| {
-                    let value = if sensitive_mcp_argument_key(key) {
+                    let value = if sensitive_tool_argument_key(key) {
                         Value::String("[REDACTED]".into())
                     } else {
-                        redact_mcp_arguments(value)
+                        redact_tool_arguments(value)
                     };
                     (key.clone(), value)
                 })
@@ -2055,7 +2116,7 @@ fn redact_mcp_arguments(value: &Value) -> Value {
     }
 }
 
-fn sensitive_mcp_argument_key(key: &str) -> bool {
+fn sensitive_tool_argument_key(key: &str) -> bool {
     matches!(
         key.to_ascii_lowercase().replace(['-', '_'], "").as_str(),
         "token"
@@ -3166,9 +3227,14 @@ mod test {
         let mut turn = crate::turn::Turn::new("child-turn".into(), address.clone(), 0);
         let mut output = BackendOutput::default();
         let (event_sink, mut event_stream) = crate::backend::events::channel();
-        for (id, action) in [
-            ("search-1", json!({ "type": "search", "queries": ["engine documentation"] })),
-            ("open-1", json!({ "type": "openPage", "url": "https://example.com/docs" })),
+        for (id, action, expected_title) in [
+            ("search-1", json!({ "type": "search", "queries": ["engine documentation", "engine pricing"] }),
+                "Search web · engine documentation · +1 query"),
+            ("open-1", json!({ "type": "openPage", "url": "https://example.com/docs" }), "Open web · example.com/docs"),
+            ("find-1", json!({ "type": "findInPage", "url": "https://example.com/docs", "pattern": "royalty" }),
+                "Find in page · \"royalty\" · example.com/docs"),
+            ("find-2", json!({ "type": "findInPage", "url": null, "pattern": "royalty" }),
+                "Find in page · \"royalty\""),
         ] {
             let result = json!({
                 "type": "webSearch", "id": id, "query": "engine documentation",
@@ -3190,21 +3256,58 @@ mod test {
                 assert_eq!(event.kind, "tool");
                 assert_eq!(event.address.as_ref(), Some(&address));
                 turn.record_tool_event(&event, now_ms)?;
+                let tool = turn.tools().find(|tool| tool.id == id).unwrap();
+                if method == "item/started" {
+                    assert_eq!(tool.title, "Web Search");
+                } else {
+                    assert_eq!(tool.title, expected_title);
+                }
             }
             let tool = turn.tools().find(|tool| tool.id == id).expect("persisted web activity");
-            assert_eq!(tool.title, "webSearch");
+            assert_eq!(tool.title, expected_title);
             assert_eq!(tool.status, "completed");
             assert_eq!(tool.started_at_ms, Some(1000));
             assert_eq!(tool.completed_at_ms, Some(2000));
             assert_eq!(serde_json::from_str::<Value>(&tool.output)?, result);
         }
-        assert_eq!(output.event.len(), 2);
-        assert_eq!(turn.tools().count(), 2);
+        assert_eq!(output.event.len(), 4);
+        assert_eq!(turn.tools().count(), 4);
         assert!(output.evidence.tool_called);
         let restored: crate::turn::Turn = serde_json::from_value(serde_json::to_value(&turn)?)?;
-        assert_eq!(restored.tools().count(), 2);
-        assert!(restored.tools().all(|tool| tool.output.contains("Tool documentation")));
+        assert_eq!(restored.tools().count(), 4);
+        assert!(restored.tools().all(|tool| tool.output.contains("Tool documentation")
+            && !tool.title.starts_with("webSearch(")));
         Ok(())
+    }
+
+    #[tokio::test]
+    async fn builtin_titles_handle_sleep_and_web_fallbacks_without_aliasing_mcp() {
+        for (item, expected) in [
+            (json!({"type":"sleep", "durationMs":20000}), Some("Wait · 20s")),
+            (json!({"type":"sleep", "durationMs":1500}), Some("Wait · 1.5s")),
+            (json!({"type":"sleep"}), None),
+            (json!({"type":"webSearch", "query":"", "action":null, "results":null}), Some("Web Search")),
+            (json!({"type":"webSearch"}), Some("Web Search")),
+            (json!({"type":"webSearch", "query":"documentation", "action":null}), Some("Web Search · documentation")),
+            (json!({"type":"webSearch", "action":{"type":"search","query":"documentation"}}), Some("Search web · documentation")),
+            (json!({"type":"webSearch", "query":"documentation", "action":{"type":"search","query":null}}), Some("Search web · documentation")),
+            (json!({"type":"webSearch", "action":{"type":"search","queries":["one","two","three"]}}), Some("Search web · one · +2 queries")),
+            (json!({"type":"webSearch", "query":"https://example.com", "action":{"type":"openPage","url":null}}), Some("Open web · example.com")),
+            (json!({"type":"webSearch", "action":{"type":"other"}}), None),
+            (json!({"type":"webSearch", "action":{"type":"search","queries":[]}}), None),
+            (json!({"type":"mcpToolCall", "server":"webSearch", "tool":"search","arguments":{"query":"documentation"}}), None),
+        ] {
+            assert_eq!(builtin_tool_title(&item).as_deref(), expected, "{item}");
+        }
+        let event = json!({"method":"item/completed", "params":{"item":{
+            "type":"webSearch", "id":"unknown-web", "action":{"type":"other"}, "results":[{"title":"Retained result"}]
+        }}});
+        let mut output = BackendOutput::default();
+        normalize_event(&event, &mut output, None).await;
+        let activity = output.event[0].activity.as_ref().unwrap();
+        assert!(activity.title.starts_with("webSearch("));
+        assert!(activity.title.contains("Retained result"));
+        assert!(activity.output.as_ref().unwrap().contains("Retained result"));
     }
 
     #[tokio::test]
@@ -3212,7 +3315,9 @@ mod test {
         for status in ["completed", "failed", "cancelled"] {
             let mut output = BackendOutput::default();
             let item = json!({ "type": "futureBuiltin", "id": "future-1", "status": status,
-                "result": { "type": "error", "message": "structured result", "items": [1, 2] }
+                "arguments": { "api_key": "private-value", "text": "preserve  spacing" },
+                "result": { "type": "error", "message": "structured result", "items": [1, 2],
+                    "credentials": [{ "access_token": "nested-private-value" }] }
             });
             normalize_event(&json!({ "method": "item/completed", "params": {
                 "item": item
@@ -3220,7 +3325,12 @@ mod test {
             assert_eq!(output.event.len(), 1);
             assert_eq!(output.event[0].kind, "tool");
             let activity = output.event[0].activity.as_ref().unwrap();
-            assert_eq!(activity.title, "futureBuiltin");
+            let title_payload = activity.title.strip_prefix("futureBuiltin(").unwrap()
+                .strip_suffix(')').unwrap();
+            let mut expected = item.clone();
+            expected["arguments"]["api_key"] = json!("[REDACTED]");
+            expected["result"]["credentials"][0]["access_token"] = json!("[REDACTED]");
+            assert_eq!(serde_json::from_str::<Value>(title_payload).unwrap(), expected);
             assert_eq!(activity.status.as_deref(), Some(status));
             assert_eq!(serde_json::from_str::<Value>(activity.output.as_deref().unwrap()).unwrap(), item);
             assert!(output.evidence.tool_called);

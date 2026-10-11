@@ -35,14 +35,19 @@ impl<'profile> TranscriptRenderer<'profile> {
         let id = if chunk == 0 { format!("{call_id}:preview") } else { format!("{call_id}:output:{chunk}") };
         let rows = if expanded {
             let source = output.inline_chunk(chunk)?;
-            if source.is_empty() && chunk == 0 { tool_body_rows(self.profile,"no output",true)? }
-            else {
-                let mut rows = Vec::new();
+            let mut rows = if chunk == 0 {
+                output.header().map_or(Ok(Vec::new()), |header|
+                    command_source_rows(self.profile, &header.kind, &header.title))?
+            } else { Vec::new() };
+            if source.is_empty() && chunk == 0 {
+                rows.extend(tool_body_rows(self.profile,"no output",rows.is_empty())?);
+            } else {
                 for (index,text) in source.into_iter().enumerate() {
-                    rows.extend(tool_body_rows(self.profile,text,chunk == 0 && index == 0)?);
+                    let branch = rows.is_empty() && chunk == 0 && index == 0;
+                    rows.extend(tool_body_rows(self.profile,text,branch)?);
                 }
-                rows
             }
+            rows
         } else { preview_rows(self.profile,&output.preview(false)?)?.0 };
         self.output_block(BlockId(id),rows)
     }
@@ -232,6 +237,7 @@ impl<'profile> TranscriptRenderer<'profile> {
         let duration = tool_duration(elapsed_ms);
         let mut row = vec![tool_heading(self.profile, kind, title, &duration)?];
         let title_rows = row.len();
+        if expanded { row.extend(command_source_rows(self.profile, kind, title)?); }
         row.extend(tool_output_rows(self.profile, output, expanded)?);
         let text = BufferText::from_rows(row)?;
         let range = TextRange {
@@ -330,7 +336,8 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
 fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str) -> Result<String> {
     let display = matches!(kind, "command" | "check").then(||
         crate::permissions::command::display_command(title, crate::permissions::shell::CommandShell::default()));
-    let title = display.as_ref().map_or(title, |display| display.source.as_str());
+    let summary = if kind == "command" { display.as_ref().and_then(|display| display.summary()) } else { None };
+    let title = summary.as_deref().unwrap_or_else(|| display.as_ref().map_or(title, |display| display.source.as_str()));
     let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let full = if kind == "check" { format!("▸ {normalized} · {}",duration.trim()) } else { format!("• {duration} {normalized}") };
     if profile.cells(&full, 0)? <= profile.columns {
@@ -366,6 +373,14 @@ fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str)
         best = candidate;
     }
     Ok(best)
+}
+
+fn command_source_rows(profile: &WidthProfile, kind: &str, title: &str) -> Result<Vec<String>> {
+    if kind != "command" { return Ok(Vec::new()); }
+    let display = crate::permissions::command::display_command(title,
+        crate::permissions::shell::CommandShell::default());
+    if display.summary().is_none() { return Ok(Vec::new()); }
+    tool_body_rows(profile, &format!("Command: {title}"), true)
 }
 
 fn decorate_tool_heading(block: &mut BufferBlock, title_rows: usize, kind: &str, failed: bool) {
@@ -646,6 +661,37 @@ mod test {
                 expanded.validate()?;
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn shell_summaries_keep_original_commands_in_expanded_output() -> Result<()> {
+        let profile = WidthProfile { columns: 100, ..WidthProfile::default() };
+        let renderer = TranscriptRenderer::new(&profile)?;
+        for (source, expected) in [
+            ("pwsh -Command 'Get-Content src/main.rs -TotalCount 40'", "Read · src/main.rs · first 40 lines"),
+            ("bash -lc 'grep -n TODO src/main.rs'", "Search · \"TODO\" · src/main.rs · line numbers"),
+            ("nu -c 'open --raw src/main.rs'", "Read · src/main.rs · raw"),
+        ] {
+            let heading = crate::turn::ToolCall {
+                id:"shell".into(), kind:"command".into(), title:source.into(), output:String::new(),
+                started_at_ms:Some(0), completed_at_ms:Some(100), task_id:None,
+                status:"completed".into(), failed:false, change:Default::default(),
+            };
+            let mut output = ToolOutputView::new("shell".into(), "matching content\n")?;
+            output.heading(&heading);
+            let header = renderer.tool_header(BlockId("shell".into()), TargetId("shell".into()),
+                "command",Some(100),false,source,false)?;
+            assert!(header.text.row(0).unwrap().ends_with(expected));
+            let body = renderer.tool_body("shell", &output, true, 0)?;
+            let rendered = body.text.wire_rows().join("\n");
+            assert!(rendered.contains(&format!("Command: {source}")));
+            assert!(rendered.contains("matching content"));
+            assert_eq!(output.header().unwrap().title, source);
+            header.validate()?;
+            body.validate()?;
+        }
+        assert_eq!(tool_heading(&profile,"command","rg -n TODO src","1s")?, "• 1s rg -n TODO src");
         Ok(())
     }
 

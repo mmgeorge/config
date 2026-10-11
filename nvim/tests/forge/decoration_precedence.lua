@@ -1,10 +1,12 @@
 local original_provider = vim.api.nvim_set_decoration_provider
 local original_extmark = vim.api.nvim_buf_set_extmark
+local original_redraw = vim.api.nvim__redraw
 local provider
 vim.api.nvim_set_decoration_provider = function(_, callbacks) provider = callbacks end
 package.loaded['forge.decorations'] = nil
 local decorations = require('forge.decorations')
 vim.api.nvim_set_decoration_provider = original_provider
+vim.api.nvim__redraw = function() end
 
 local succeeded, failure = xpcall(function()
   local spans = {}
@@ -62,6 +64,7 @@ local succeeded, failure = xpcall(function()
   gutter.highlight = original_highlight
   decorations.detach(session)
   vim.api.nvim_buf_set_extmark = original_extmark
+  vim.api.nvim__redraw = original_redraw
 
   local replica = require('forge.buffer')
   local persistent = replica.open('full-width-diff')
@@ -78,6 +81,7 @@ local succeeded, failure = xpcall(function()
   replica.close(persistent)
 end, debug.traceback)
 vim.api.nvim_buf_set_extmark = original_extmark
+vim.api.nvim__redraw = original_redraw
 if not succeeded then
   io.stderr:write(tostring(failure), '\n')
   vim.cmd('cquit 1')

@@ -140,7 +140,7 @@ local succeeded,failure = xpcall(function()
     assert(vim.wait(10000,function()
       if not state.presentation or state.presentation.transcript.update_pending then return false end
       for row,text in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false)) do
-        if text:find("Agent " .. admitted.agent.task_name,1,true) and text:find(expected,1,true) then
+        if text:find(" · " .. admitted.agent.task_name,1,true) and text:find(expected,1,true) then
           heading_row=row return true
         end
       end
@@ -155,11 +155,11 @@ local succeeded,failure = xpcall(function()
   local snapshot,child = child_result(id,1)
   assert(vim.wait(10000,function()
     return not state.presentation.transcript.update_pending and
-      table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"):find("Completed",1,true)
+      table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"):find("Ran ",1,true)
   end,10),"completed child did not render")
   local rows = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n")
   assert(not rows:find(marker,1,true),"completed child did not collapse")
-  enter_child("Completed")
+  enter_child("Ran ")
   assert(vim.wait(10000,function()
     return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"):find(marker,1,true)
   end,10),"child timeline omitted marker")

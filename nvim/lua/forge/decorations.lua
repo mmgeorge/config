@@ -138,6 +138,8 @@ end
 
 function M.attach(session)
   sessions[session.buffer] = session
+  -- Highlight metadata can change without invalidating Neovim's cached screen rows.
+  vim.api.nvim__redraw({ buf = session.buffer, valid = false, flush = false })
 end
 
 function M.detach(session)

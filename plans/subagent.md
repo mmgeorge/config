@@ -253,11 +253,11 @@ Beneath each running agent's heading, show its most recent non-final thought and
 Nest agent folds inside their owning parent Thought fold. Use the existing fold marker, `○` thought rendering, and `•` tool heading. The example values and thought text below are illustrative. Preserve normal wrapping and styling.
 
 ```text
-▾ Thought 9s │ Tools 4s · 4/5 pass
-  ▾ Agent parser-review · codex · gpt-6.1-sol ++ · Running 6s │ Tokens 28.3k (0%) -> 136 · 20 tps
+▾ Thought 9s │ 4/5 tools · 4 s
+  ▾ Running 6s · parser-review · codex · gpt-6.1-sol ++ │ 28.3k (0%) -> 136 · 20 tps
     ○ The parser returns early here. I’m checking whether cleanup still runs.
     •  0.2s sem.sem_context(...)
-  ▸ Agent test-review · claude · Completed 9s │ Tokens 19.2k (42%) -> 284 · 32 tps
+  ▸ Ran 9s · test-review · claude │ 19.2k (42%) -> 284 · 32 tps
 ```
 
 On completion, replace the live preview with the delegated exchange's full timeline, including its prompt, thoughts, tools, and final answer, and automatically collapse the agent fold. Keep normal child Thought and tool folds inside it. Explicit expansion after completion persists across later updates. Keep the parent's final answer outside its Thought fold.

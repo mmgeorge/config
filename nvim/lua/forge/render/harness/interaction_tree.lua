@@ -60,7 +60,7 @@ end
 local function format_exchange_usage(interaction, metrics)
   local totals = {}
   local reported = vim.tbl_filter(function(turn) return type(turn.usage) == "table" end, interaction.turn or {})
-  for _, field in ipairs({ "input", "output" }) do
+  for _, field in ipairs({ "input", "output", "cached_input" }) do
     local total = 0
     local available = #reported > 0
     for _, turn in ipairs(reported) do
@@ -70,12 +70,16 @@ local function format_exchange_usage(interaction, metrics)
     if available then totals[field] = total end
   end
   local sections = {}
+  local input = totals.input and format_token_count(totals.input)
+  if input and totals.input > 0 and totals.cached_input and totals.cached_input <= totals.input then
+    input = input .. (" (%d%%)"):format(math.floor(totals.cached_input * 100 / totals.input + 0.5))
+  end
   if totals.input and totals.output then
-    sections[#sections + 1] = "Tokens " .. format_token_count(totals.input) .. " -> " .. format_token_count(totals.output)
+    sections[#sections + 1] = input .. " -> " .. format_token_count(totals.output)
   elseif totals.input then
-    sections[#sections + 1] = "Tokens in " .. format_token_count(totals.input)
+    sections[#sections + 1] = "in " .. input
   elseif totals.output then
-    sections[#sections + 1] = "Tokens out " .. format_token_count(totals.output)
+    sections[#sections + 1] = "out " .. format_token_count(totals.output)
   end
   if metrics.timing_complete and type(metrics.reported_output_tokens) == "number"
     and metrics.reported_output_tokens > 0
@@ -559,7 +563,7 @@ local function append_exchange_summary(result, interaction, options)
     if type(metrics.tool_started_ms) == "number" then
       elapsed = elapsed + math.max(0, duration_ms - metrics.tool_started_ms)
     end
-    tools = duration_format.label(elapsed)
+    tools = duration_format.label(elapsed):gsub("(%a+)$", " %1")
   end
   local verb = complete and "Thought" or "Working"
   if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
@@ -589,8 +593,8 @@ local function append_exchange_summary(result, interaction, options)
     expanded and "▾" or "▸", history[interaction.disposition] or "", verb, duration)
   local sections = { summary }
   if tool_count > 0 then
-    sections[#sections + 1] = "Tools " .. (tools and tools .. " · " or "")
-      .. ("%d/%d pass"):format(passed_count, tool_count)
+    sections[#sections + 1] = ("%d/%d tools"):format(passed_count, tool_count)
+      .. (tools and " · " .. tools or "")
   end
   local usage = format_exchange_usage(interaction, metrics)
   if usage ~= "" then sections[#sections + 1] = usage end

@@ -2215,11 +2215,26 @@ Codex activity classification reads the top-level item type rather than searchin
 payload text. Errors, messages, reasoning, plans, compaction, review transitions, and native
 child lifecycle items remain separate from tools. Every other typed `item/started` or `item/completed`
 with a nonempty item ID becomes a tool activity, including `webSearch` search and page-open
-operations. Unknown activity types use their provider type as the fallback title and retain the
-complete completed item as JSON output. The provider thread, turn, and item IDs correlate live
+operations. Known web actions use `Search web`, `Open web`, and `Find in page` titles with
+their query, target, and additional-query count. Before Codex supplies an action, the title is
+`Web Search`, with the query appended when available. Later events replace that pending title
+with the specific action. Unknown actions retain the fallback title. Native sleeps use `Wait`
+with the requested duration.
+Activity types without a dedicated title use `type(compact JSON)` with the complete
+item payload, including queries, actions, results, and provider metadata. The fallback title uses
+the same credential redaction as MCP arguments and updates as lifecycle events supply details.
+The renderer clips only the visible header to the window width. Completed items remain available
+in full as JSON output. The provider thread, turn, and item IDs correlate live
 updates with durable records. Main and child timelines, activity summaries, and
 `harness_agent_tool_output` consume those same records without provider-specific rendering.
 Missing IDs or untyped payloads cannot create fallback tool records.
+
+Shell command headings summarize simple file reads, directory listings, and text searches
+after decoding PowerShell, Bash, or Nushell launchers. Summaries retain supported flags such
+as line limits, recursion, and line-number output. `grep` uses `Search`, while `rg` retains
+its command text. Compound commands, expressions, and unknown options keep their command
+text. The durable command stays unchanged, and expanded output includes that original
+command above its output. These display summaries do not alter approval or execution input.
 
 `trace::TraceStore` owns opt-in protocol diagnostics independently from timeline persistence.
 The persisted global preference overrides the initial `harness_logging` default. `/log on`,
@@ -2502,6 +2517,9 @@ Invalid committed targets trigger diagnostic recovery instead of indexing a miss
 Commands continue in the provider process throughout these editor updates.
 
 Row-preserving single-line edits and metadata-only updates retain identical fold definitions.
+Installing decoration metadata invalidates cached screen rows for the affected buffer without
+flushing an intermediate frame. The next redraw applies viewport highlights in every attached
+window, including when a patch changes only highlight metadata and the cursor stays still.
 Structural edits rebuild native folds and restore each window's fold preferences. With
 Harness logging enabled, `ui.buffer.patch` records validation, view capture, fold capture,
 sequence updates, buffer text writes, metadata installation, editable-region attachment,
@@ -2769,12 +2787,12 @@ totals without recovering how many reports were missed. Requests without usage r
 failed attempts and calls still in progress, remain outside this observed completion count.
 
 Running, paused, and completed headers share the layout
-`Planning 120s │ Tools 12s · 20/21 pass │ Tokens 820.0k -> 7.0k · 65 tps`.
+`Planning 120s │ 20/21 tools · 12 s │ 820.0k -> 7.0k · 65 tps`.
 The outer duration includes tools and delegated waits within active execution and freezes
 across user-input and permission waits. The first pending permission freezes its owning
 exchange's execution clock. The last decision resumes it only if execution remains eligible.
 Closing the permission window leaves the clock frozen. Explicit pauses, finalization, and
-host restarts discard the live coordinator's resume intent. The Tools section counts tool
+host restarts discard the live coordinator's resume intent. The tool summary counts tool
 time in that same active clock, taking the union of overlapping calls and capping outstanding
 intervals at interruption or completion.
 Tool time uses milliseconds below one second and rounded tenths of a second thereafter,
