@@ -103,6 +103,12 @@ impl NodeMap {
         };
         self.anchor.insert(source.id.0.clone(), block.id.clone());
         let previous = self.state.get(&source.id.0);
+        if source.kind == forge_buffer::node::NodeKind::Exchange
+            && source.lifecycle == forge_buffer::node::NodeLifecycle::Settled
+            && previous.is_some_and(|state| state.lifecycle == forge_buffer::node::NodeLifecycle::Live)
+        {
+            self.choice.remove(&source.id.0);
+        }
         let changed = previous.is_none_or(|state| {
             state.default_display != source.default_display
                 || state.parent != source.parent

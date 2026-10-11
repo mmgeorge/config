@@ -1,123 +1,59 @@
 local SpawnPicker = {}
-local generation = 0
-
-local config = require("forge.infra.config")
 local picker = require("forge.views.picker")
-local model_picker = require("forge.views.harness.model_picker")
 local notifications = require("forge.infra.notifications")
 
----@class ForgeSpawnPickerOptions
----@field host table
----@field task_name? string
----@field provider string
----@field model? string
----@field load_models fun(provider: string, callback: function)
----@field on_spawn fun(request: table)
----@field on_close? fun()
-
----@param options ForgeSpawnPickerOptions
----@return boolean opened
+--- Select an enabled profile before composing a fresh child's task.
+---@param options table
+---@return boolean
 function SpawnPicker.open(options)
-  generation = generation + 1
-  local opening_generation = generation
-  local request = { task_name = options.task_name, provider = options.provider }
-  local open_task
-  local open_provider
-  local function update(spec)
-    spec.owner = "spawn"
-    spec.host = options.host
-    spec.on_close = options.on_close
+  local profile = options.profile
+  local function show(spec)
+    spec.owner, spec.host, spec.on_close = "spawn", options.host, options.on_close
     if picker.is_open("spawn") then picker.update(spec) else picker.open(spec) end
   end
-  local function open_model()
-    options.load_models(request.provider, function(model_list, failure)
-      if opening_generation ~= generation or not picker.is_open("spawn") then return end
-      if failure then notifications.error(failure, "Harness child model") return end
-      if type(model_list) ~= "table" or #model_list == 0 then
-        notifications.error("The selected backend did not advertise any models", "Harness child model")
-        return
-      end
-      model_picker.open({
-        host = options.host,
-        backend = request.provider,
-        model_list = model_list,
-        current_model = request.provider == options.provider and options.model or nil,
-        on_confirm = function(selection)
-          request.model = selection.model
-          request.reasoning_effort = selection.effort and selection.effort ~= "" and selection.effort or nil
-          options.on_spawn(request)
-        end,
-      })
-    end)
-  end
-  open_provider = function()
-    local option_list = {}
-    local selected_index = 1
-    for _, provider in ipairs({ "codex", "copilot", "claude", "antigravity" }) do
-      if provider == request.provider then selected_index = #option_list + 1 end
-      local backend = config.options.harness.backends[provider] or {}
-      option_list[#option_list + 1] = {
-        id = provider,
-        label = backend.label or provider,
-        detail = backend.detail or "Independent child conversation in the shared workspace",
-        value = provider,
-      }
-    end
-    update({
-      page_list = { {
-        id = "spawn-provider", title = "Provider for " .. request.task_name,
-        column_headers = { "Provider", "Details" }, option_list = option_list,
-        selected_index = selected_index, footer = "↑↓ provider  Enter model and reasoning  q close",
-      } },
-      on_confirm = function(result)
-        request.provider = result.option.value
-        open_model()
-        return false
-      end,
-    })
-  end
-  open_task = function()
-    update({
+  local function task()
+    show({
       initial_input_kind = "other",
       page_list = { {
-        id = "spawn-task", title = "Task for " .. request.task_name,
+        id = "spawn-task", title = "Task for " .. profile,
         column_headers = { "Task", "Details" }, allow_input = true, input_height = 5,
-        option_list = { { id = "task", label = "Task message", value = "task", input_kind = "other",
-          detail = "The child receives this task and workspace instructions in a fresh conversation." } },
-        footer = "C-s choose provider  Tab options  q close",
+        option_list = { { id = "task", label = "Task message", input_kind = "other",
+          detail = "Fresh conversation using this profile's configured provider and model." } },
+        footer = "C-s spawn  q close",
       } },
       on_confirm = function(result)
         if not result.text or result.text:match("^%s*$") then return false end
-        request.message = result.text
-        open_provider()
-        return false
+        options.on_spawn({ profile = profile, text = result.text })
       end,
     })
   end
-  if request.task_name then
-    open_task()
-  else
-    update({
-      initial_input_kind = "other",
-      page_list = { {
-        id = "spawn-name", title = "Create Child Agent",
-        column_headers = { "Name", "Details" }, allow_input = true, input_height = 2,
-        option_list = { { id = "name", label = "Task name", value = "name", input_kind = "other",
-          detail = "Unique name with letters, digits, underscores, or hyphens. Canonical path: /root/<name>." } },
-        footer = "C-s describe task  Tab options  q close",
-      } },
-      on_confirm = function(result)
-        local name = (result.text or ""):match("^%s*(.-)%s*$")
-        if name == "" or #name > 64 or not name:match("^[A-Za-z0-9_-]+$") then
-          notifications.warn("Use 1 to 64 letters, digits, underscores, or hyphens", "Harness child name")
-          return false
-        end
-        request.task_name = name
-        open_task()
-        return false
-      end,
-    })
+  if profile then
+    local selected = options.document.profiles[profile]
+    if not selected or not selected.enabled then
+      notifications.warn("Unknown or disabled subagent profile: " .. profile, "Harness agent")
+      return false
+    end
+    task()
+    return true
   end
+  local entries = {}
+  for name, entry in pairs(options.document.profiles) do
+    if entry.enabled then entries[#entries + 1] = { id = name, label = name, value = name, detail = entry.description } end
+  end
+  table.sort(entries, function(left, right) return left.label < right.label end)
+  local selected_index = 1
+  for index, entry in ipairs(entries) do
+    if entry.value == options.document.default_profile then selected_index = index end
+  end
+  show({
+    page_list = { { id = "spawn-profile", title = "Spawn Agent", column_headers = { "Profile", "Purpose" },
+      option_list = entries, selected_index = selected_index, footer = "Enter compose task  q close" } },
+    on_confirm = function(result)
+      profile = result.option.value
+      task()
+      return false
+    end,
+  })
   return true
 end
 

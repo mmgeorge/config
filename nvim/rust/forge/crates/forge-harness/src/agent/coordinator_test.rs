@@ -3,12 +3,12 @@ use super::{AgentSelection, AgentSource};
 use crate::{backend::{BackendKind, ServiceTier}, session::PermissionMode};
 
 fn selection(provider: BackendKind) -> AgentSelection {
-    AgentSelection { provider, model: "model".into(), reasoning_effort: "low".into(), context_window: None,
+    AgentSelection { profile: "worker".into(), instructions: String::new(),  provider, model: "model".into(), reasoning_effort: "low".into(), context_window: None,
         service_tier: ServiceTier::Standard, access: Default::default(), execution_mode: PermissionMode::Write }
 }
 
 fn request(operation_id: &str, task_name: &str) -> (AgentRequest, SpawnAgentRequest) {
-    let spawn = SpawnAgentRequest { task_name: task_name.into(), message: "bounded task".into(), provider: None, model: None, reasoning_effort: None };
+    let spawn = SpawnAgentRequest { profile: Some(task_name.into()), text: "bounded task".into() };
     (AgentRequest { operation_id: operation_id.into(), source: AgentSource::User, operation: AgentOperation::Spawn(spawn.clone()) }, spawn)
 }
 
@@ -50,10 +50,11 @@ fn retries_resolve_one_identity_and_rejected_persistence_releases_reservation() 
     coordinator.commit(&first).unwrap();
     assert!(!coordinator.commit(&replay).unwrap());
     let mut conflict = spawn.clone();
-    conflict.message = "different work".into();
+    conflict.text = "different work".into();
     assert!(coordinator.reserve_spawn(&request, &conflict, selection(BackendKind::Claude), "parent", 3).is_err());
     let (duplicate, spawn) = super::coordinator_test::request("another-operation", "review");
-    assert!(coordinator.reserve_spawn(&duplicate, &spawn, selection(BackendKind::Claude), "parent", 3).is_err());
+    assert!(coordinator.reserve_spawn(&duplicate, &spawn, selection(BackendKind::Claude), "parent", 3).is_ok());
+    coordinator.reject("another-operation");
     let (failed, spawn) = super::coordinator_test::request("failed", "failed");
     coordinator.reserve_spawn(&failed, &spawn, selection(BackendKind::Claude), "parent", 3).unwrap();
     coordinator.reject("failed");
@@ -73,10 +74,7 @@ fn names_and_targets_remain_root_owned() {
     assert!(other.resolve(&admission.agent.id).is_err());
     assert!(coordinator.resolve("/root").is_err());
     assert!(coordinator.resolve("/other/review").is_err());
-    for name in ["", "root", "Main", "../review", "has space", "name/child"] {
-        let (request, spawn) = request(name, name);
-        assert!(coordinator.reserve_spawn(&request, &spawn, selection(BackendKind::Mock), "parent", 0).is_err());
-    }
+
 }
 
 #[test]
@@ -100,7 +98,7 @@ fn followups_serialize_and_interruption_cancels_pending_without_restarting() {
     assert!(coordinator.reserve_followup(&overflow, &first.agent.id, "next task", "parent", 2).is_err());
     assert!(coordinator.settled(&first.agent.id, &first.task.id, false).unwrap().is_none());
     assert_eq!(coordinator.active_count(), 0);
-    assert!(coordinator.resolve("review").is_ok());
+    assert!(coordinator.resolve("worker-1").is_ok());
     let explicit = coordinator.reserve_followup(&overflow, &first.agent.id, "next task", "parent", 3).unwrap();
     assert!(explicit.launch);
     coordinator.commit(&explicit).unwrap();
@@ -113,8 +111,8 @@ fn settled_task_selects_only_the_next_queued_task_and_retains_selection() {
     let coordinator = AgentCoordinator::new("root".into());
     let first = admit(&coordinator, "first", "review");
     let request = AgentRequest { operation_id: "followup".into(), source: AgentSource::User,
-        operation: AgentOperation::Followup { target: "review".into(), message: "next".into() } };
-    let second = coordinator.reserve_followup(&request, "review", "next", "parent", 2).unwrap();
+        operation: AgentOperation::Followup { target: "worker-1".into(), message: "next".into() } };
+    let second = coordinator.reserve_followup(&request, "worker-1", "next", "parent", 2).unwrap();
     coordinator.commit(&second).unwrap();
     let next = coordinator.settled(&first.agent.id, &first.task.id, false).unwrap().unwrap();
     assert_eq!(next.task.id, second.task.id);

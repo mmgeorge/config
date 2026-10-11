@@ -19,7 +19,7 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 41;
+const SESSION_FORMAT_VERSION: u32 = 42;
 const PREFERENCE_FORMAT_VERSION: u32 = 40;
 
 /// Stores one session with the exact durable format that produced it.
@@ -1184,7 +1184,7 @@ mod test {
         let mut parent = Exchange::agent_admission("session",1,"manual spawn".into(),1);
         let task = AgentTask {id:"child-task".into(),session_id:"session".into(),agent_id:agent.id.clone(),operation_id:"operation".into(),
             ordinal:1,source:AgentSource::User,parent_exchange_id:parent.id.clone(),message:"review".into(),state:crate::exchange::ExchangeState::Queued,
-            final_response:None,error:None,parent_reported:false,created_at_ms:1,completed_at_ms:None};
+            final_response:None,error:None,parent_reported:false,created_at_ms:1,last_activity_at_ms:None,completed_at_ms:None};
         parent.append_agent_task(&task)?;
         agent.inbox.push(crate::agent::AgentMessage {
             id:"retained-information".into(),ordinal:1,message:"Inspect this after recovery".into(),

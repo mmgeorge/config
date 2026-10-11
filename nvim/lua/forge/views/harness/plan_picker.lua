@@ -60,8 +60,8 @@ function M.open(options)
         options.on_confirm({ plan_id = result.option.value.id, revision = revision[result.option.value.id] })
       end,
       action_list = {
-        { key = "<Left>", id = "previous-revision", callback = function() cycle(-1) end },
-        { key = "<Right>", id = "next-revision", callback = function() cycle(1) end },
+        { command = "previous_value", id = "previous-revision", callback = function() cycle(-1) end },
+        { command = "next_value", id = "next-revision", callback = function() cycle(1) end },
       },
     }
   end

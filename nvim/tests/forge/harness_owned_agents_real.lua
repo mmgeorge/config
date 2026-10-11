@@ -12,7 +12,7 @@ local workspace = vim.fn.tempname()
 vim.fn.mkdir(data,"p")
 vim.fn.mkdir(workspace,"p")
 local original_stdpath = vim.fn.stdpath
-vim.fn.stdpath = function(kind) return kind == "data" and data or original_stdpath(kind) end
+vim.fn.stdpath = function(kind) return (kind == "data" or kind == "config") and data or original_stdpath(kind) end
 local binary = vim.g.forge_agent_test_binary or require("forge.builder").binary_path()
 local private_binary = data .. "/forge" .. (vim.fn.has("win32") == 1 and ".exe" or "")
 assert(vim.uv.fs_copyfile(binary,private_binary))
@@ -119,24 +119,66 @@ local succeeded,failure = xpcall(function()
   end
   local marker = "CHILD_FRESH_D529"
   local child_model = model_for(child_backend,vim.g.forge_agent_test_child_model)
+  local profiles = request("agent.profiles.get")
+  profiles.document.profiles["test-child"] = { enabled=true,description="Runtime verification child",instructions="",
+    provider=child_backend == "mock" and "inherit" or child_backend,model=child_model or "inherit",
+    reasoning_effort="default",service_tier="default",permission_mode="inherit" }
+  request("agent.profiles.save",{expected_revision=profiles.revision,document=profiles.document})
   if vim.g.forge_agent_test_manual ~= false then
-  local admitted = request("agent.start",{task_name="fresh-child",message="Reply exactly " .. marker .. ". Do not use tools or access files.",
-    provider=child_backend,model=child_model})
+  local admitted = request("agent.start",{profile="test-child",text="Reply exactly " .. marker .. ". Do not use tools or access files."})
   local id = assert(admitted.agent.id)
+  assert(admitted.agent.definition == "test-child", "admission lost profile attribution")
+  assert(admitted.agent.task_name == "test-child-1", "instance name must be profile-scoped")
+  local captured = vim.deepcopy(admitted.agent.selection)
   require("forge.views.harness.controller").open_agent_picker()
+  require("forge.views.harness.agent_picker").close()
+  local function enter_child(expected)
+    local heading_row
+    assert(vim.wait(10000,function()
+      if not state.presentation or state.presentation.transcript.update_pending then return false end
+      for row,text in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false)) do
+        if text:find("Agent " .. admitted.agent.task_name,1,true) and text:find(expected,1,true) then
+          heading_row=row return true
+        end
+      end
+      return false
+    end,10),expected .. " child heading is missing: " .. table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"))
+    vim.api.nvim_set_current_win(state.transcript_win)
+    vim.api.nvim_win_set_cursor(state.transcript_win,{heading_row,0})
+    vim.api.nvim_feedkeys(vim.api.nvim_replace_termcodes("<CR>",true,false,true),"xt",false)
+    assert(vim.wait(10000,function() return state.selected_agent_run_id == id end,10),
+      "Enter on the " .. expected .. " agent heading did not select its timeline")
+  end
   local snapshot,child = child_result(id,1)
-  require("forge.views.harness.controller").select_agent(id)
+  assert(vim.wait(10000,function()
+    return not state.presentation.transcript.update_pending and
+      table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"):find("Completed",1,true)
+  end,10),"completed child did not render")
+  local rows = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n")
+  assert(not rows:find(marker,1,true),"completed child did not collapse")
+  enter_child("Completed")
   assert(vim.wait(10000,function()
     return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"):find(marker,1,true)
   end,10),"child timeline omitted marker")
   assert(snapshot.session.backend_session_id == vim.NIL or snapshot.session.backend_session_id == nil,"manual children changed root provider history")
   require("forge.views.harness.agent_picker").refresh()
   require("forge.views.harness.agent_picker").close()
+  local edited = request("agent.profiles.get")
+  local original_profile = vim.deepcopy(edited.document.profiles["test-child"])
+  edited.document.profiles["test-child"].enabled = false
+  edited.document.profiles["test-child"].instructions = "These instructions apply only to future children."
+  request("agent.profiles.save",{expected_revision=edited.revision,document=edited.document})
   request("agent.message",{target=id,message="Remember the token INBOX_P492 for your next task."})
   local idle = request("state.get")
   assert(idle.agent.summary[id].exchange_count == 1,"informational message started an idle child")
   request("agent.followup",{target=id,message="Reply with the remembered INBOX token only. Do not use tools."})
   snapshot,child = child_result(id,2)
+  for _,agent in ipairs(snapshot.agent.run) do
+    if agent.id == id then assert(vim.deep_equal(agent.selection,captured),"profile edit retuned existing child") end
+  end
+  local restored = request("agent.profiles.get")
+  restored.document.profiles["test-child"] = original_profile
+  request("agent.profiles.save",{expected_revision=restored.revision,document=restored.document})
   assert(vim.wait(10000,function()
     return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n"):find("INBOX_P492",1,true)
   end,10),"follow-up lost the retained inbox")
@@ -149,15 +191,18 @@ local succeeded,failure = xpcall(function()
     local configured = request("state.get")
     assert(configured.subagent_tools == true)
     assert(configured.session.access.sandbox == false,"delegation toggle reset sandbox policy: " .. vim.inspect(configured.session))
+    request("prompt.submit",{text="Reply exactly ROOT_WARMUP. Do not use tools."})
+    local updated = request("agent.profiles.get")
+    updated.document.profiles["model-child"] = vim.deepcopy(updated.document.profiles["test-child"])
+    request("agent.profiles.save",{expected_revision=updated.revision,document=updated.document})
     require("forge.views.harness.controller").open_agent_picker()
-    request("prompt.submit",{text="Use harness_spawn_agent to create a child named model-child on " .. child_backend
-      .. (child_model and (" using model " .. child_model) or "")
-      .. " with the task: Reply exactly MODEL_CHILD_R783. Do not use tools. Then use harness_wait_agent to collect its result."
+    request("prompt.submit",{text="Use harness_spawn_agent with profile model-child and text"
+      .. " with the task: Reply exactly MODEL_CHILD_R783. Do not use tools. End your turn if only the child remains unfinished. Harness will resume you with its result."
       .. " After receiving the result, reply ROOT_SYNTHESIS_R783. Do not spawn native agents. Do not use files or shell commands."})
     local model_snapshot = request("state.get")
     local found
     for _,agent in ipairs(model_snapshot.agent.run or {}) do
-      if agent.task_name == "model-child" then found=agent end
+      if agent.definition == "model-child" and agent.source == "model" then found=agent end
     end
     local root_transcript = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf,0,-1,false),"\n")
     assert(found,"root did not admit a managed model child: " .. vim.inspect(model_snapshot.agent.run) .. "\n" .. root_transcript)
@@ -168,8 +213,8 @@ local succeeded,failure = xpcall(function()
   if vim.g.forge_agent_test_controls then
     local target = {}
     local function spawn_control(name)
-      local result = request("agent.start",{task_name=name,provider=child_backend,model=child_model,
-        message="Use a shell command to wait 20 seconds, then reply CONTROL_FINISHED. This is a bounded interruption test. Do not edit files or spawn agents."})
+      local result = request("agent.start",{profile="test-child",
+        text="Use a shell command to wait 20 seconds, then reply CONTROL_FINISHED. This is a bounded interruption test. Do not edit files or spawn agents."})
       target[#target+1] = result.agent.id
       return result.agent.id
     end

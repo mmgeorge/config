@@ -56,4 +56,19 @@ state.queue = {}
 draft("unsupported backend")
 controller.submit()
 assert(#calls == 2 and state.queue[1].text == "unsupported backend", "unsupported backend attempted steering")
+state.queue = {}
+state.status = { kind = "waiting_for_agent", agent_count = 2 }
+draft("resume while the children continue")
+controller.submit()
+assert(#calls == 3 and calls[3].method == "turn.steer", "Harness wait incorrectly required native steering")
+assert(calls[3].params.text == "resume while the children continue" and #state.queue == 0)
+reply({})
+draft("explicit steer during Harness wait")
+controller.steer_submit()
+assert(#calls == 4 and calls[4].method == "turn.steer", "explicit steer rejected Harness wait")
+reply({})
+state.status = { kind = "working" }
+draft("queue during unsupported active generation")
+controller.submit()
+assert(#calls == 4 and state.queue[1].text == "queue during unsupported active generation")
 print("harness_submit_steering: passed")

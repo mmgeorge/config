@@ -408,20 +408,32 @@ local function install_option_keymaps(instance, buf, preserve)
   end
 end
 
+---@class ForgePickerAction
+---@field id? string
+---@field key? string
+---@field command? string Configured picker command used instead of a literal key.
+---@field modes? string|string[]
+---@field desc? string
+---@field callback? fun(context: ForgePickerSelectionContext, picker: table)
+
 ---@param instance table
 ---@param buf integer
 ---@param preserve boolean
 local function install_action_keymaps(instance, buf, preserve)
+  ---@type ForgePickerAction[]
   local action_list = vim.list_extend(vim.deepcopy(instance.spec.action_list or {}),
     vim.deepcopy(picker_state.page(instance.state, instance.spec).action_list or {}))
   for _, action in ipairs(action_list) do
-    if preserve then preserve_mapping(instance, buf, action.key) end
-    vim.keymap.set(action.modes or "n", action.key, function() run_action(instance, action) end, {
-      buffer = buf,
-      silent = true,
-      nowait = true,
-      desc = action.desc or action.id or "Picker action",
-    })
+    local keys = action.command and keymaps.view_keys_for("picker", action.command) or { action.key }
+    for _, key in ipairs(keys) do
+      if preserve then preserve_mapping(instance, buf, key) end
+      vim.keymap.set(action.modes or "n", key, function() run_action(instance, action) end, {
+        buffer = buf,
+        silent = true,
+        nowait = true,
+        desc = action.desc or action.id or "Picker action",
+      })
+    end
   end
 end
 

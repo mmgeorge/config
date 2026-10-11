@@ -256,7 +256,7 @@ function ModelPicker.open(options)
         end,
       },
       {
-        key = "<Left>",
+        command = "previous_value",
         id = "previous-value",
         callback = function()
           local model = find_model(model_list, selected_model_id)
@@ -267,7 +267,7 @@ function ModelPicker.open(options)
         end,
       },
       {
-        key = "<Right>",
+        command = "next_value",
         id = "next-value",
         callback = function()
           local model = find_model(model_list, selected_model_id)

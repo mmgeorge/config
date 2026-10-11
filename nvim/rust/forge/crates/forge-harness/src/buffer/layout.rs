@@ -88,7 +88,15 @@ impl<'exchange> ExchangeLayout<'exchange> {
                 break;
             }
         }
-        let continuation = activity.split_off(response_position);
+        let mut continuation = activity.split_off(response_position);
+        continuation.retain(|node| {
+            if matches!(node, ExchangeNode::AgentReference { .. }) {
+                activity.push(*node);
+                false
+            } else {
+                true
+            }
+        });
         Ok(Self {
             questions,
             opening,

@@ -21,7 +21,8 @@ pub use catalog::{
     McpStatus, McpToolDefinition, SkillDefinition,
 };
 pub use execution::{ExecutionOwner, ProviderAddress, TurnBoundary};
-pub use steering::SteerTarget;
+pub use steering::{SteerTarget, SteeringInput};
+pub(crate) use steering::{ActiveSteering, SteerCommand, SteeringLane};
 
 mod backend;
 pub use backend::*;

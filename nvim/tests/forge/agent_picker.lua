@@ -163,60 +163,37 @@ local ok, failure = pcall(function()
   assert_equals(selected_run_id, nil, "Main should clear the selected child timeline")
 
   local spawned_request
-  local loaded_provider
+  local document = { default_profile = "reviewer", profiles = {
+    reviewer = { enabled = true, description = "Review code" },
+    disabled = { enabled = false, description = "Hidden" },
+  } }
   assert_true(spawn_picker.open({
-    host = { window_list = { origin_win }, control_win = origin_win },
-    provider = "claude",
-    load_models = function(provider, callback)
-      loaded_provider = provider
-      callback({ { id = "test-model", description = "Fixture", reasoning = {}, context_window = {}, is_default = true } })
-    end,
+    host = { window_list = { origin_win }, control_win = origin_win }, document = document,
     on_spawn = function(request) spawned_request = request end,
-  }), "generic child composer should open")
+  }), "profile picker should open")
   active = picker._state_for_test()
-  assert_true(active.input_win and vim.api.nvim_win_is_valid(active.input_win), "name input should own focus")
-  vim.api.nvim_buf_set_lines(active.input_buf, 0, -1, false, { "review-worker" })
-  invoke("<C-s>", "i", active.input_buf)
+  page = picker_state.page(active.state, active.spec)
+  assert_equals(page.id, "spawn-profile")
+  assert_equals(#page.option_list, 1, "disabled profiles must be hidden")
+  assert_equals(page.option_list[1].value, "reviewer")
+  invoke("<CR>", "n", active.buf)
   active = picker._state_for_test()
   assert_equals(picker_state.page(active.state, active.spec).id, "spawn-task")
   vim.api.nvim_buf_set_lines(active.input_buf, 0, -1, false, { "Inspect the renderer" })
   invoke("<C-s>", "i", active.input_buf)
-  active = picker._state_for_test()
-  assert_equals(picker_state.page(active.state, active.spec).id, "spawn-provider")
-  invoke("<CR>", "n", active.buf)
-  active = picker._state_for_test()
-  assert_equals(loaded_provider, "claude")
-  invoke("<CR>", "n", active.buf)
-  assert_equals(spawned_request.task_name, "review-worker")
-  assert_equals(spawned_request.message, "Inspect the renderer")
-  assert_equals(spawned_request.provider, "claude")
-  assert_equals(spawned_request.model, "test-model")
-  assert_equals(spawned_request.reasoning_effort, nil, "models without reasoning must omit the override")
+  assert_equals(spawned_request.profile, "reviewer")
+  assert_equals(spawned_request.text, "Inspect the renderer")
+  assert_equals(spawned_request.provider, nil, "task composer must not choose provider")
+  assert_equals(spawned_request.model, nil, "task composer must not choose model")
   assert_equals(vim.api.nvim_get_current_win(), origin_win)
-
   assert_true(spawn_picker.open({
-    host = { window_list = { origin_win }, control_win = origin_win },
-    provider = "claude", task_name = "another-worker",
-    load_models = function() end, on_spawn = function() end,
-  }), "direct task names should skip the name page")
+    host = { window_list = { origin_win }, control_win = origin_win }, document = document, profile = "reviewer",
+    on_spawn = function() end,
+  }), "explicit profile should skip profile selection")
   active = picker._state_for_test()
   assert_equals(picker_state.page(active.state, active.spec).id, "spawn-task")
-  local late_models
   picker.close(true)
-  spawn_picker.open({
-    host = { window_list = { origin_win }, control_win = origin_win },
-    provider = "claude", task_name = "late-worker",
-    load_models = function(_, callback) late_models = callback end, on_spawn = function() error("closed composer spawned work") end,
-  })
-  active = picker._state_for_test()
-  vim.api.nvim_buf_set_lines(active.input_buf,0,-1,false,{"Deferred model lookup"})
-  invoke("<C-s>","i",active.input_buf)
-  active = picker._state_for_test()
-  invoke("<CR>","n",active.buf)
-  assert_true(late_models ~= nil)
-  picker.close(true)
-  late_models({{id="late-model",reasoning={},context_window={},is_default=true}})
-  assert_true(not picker.is_open("model"),"late model response reopened a closed composer")
+
 end)
 
 if not ok then

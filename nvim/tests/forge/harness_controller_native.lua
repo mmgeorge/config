@@ -359,6 +359,45 @@ local success, failure = xpcall(function()
   state.goal = { state = "active" }
   receive("goal_changed", { state = "cleared" }, "native-controller")
   assert(state.goal == nil, "cleared goal survived its lifecycle event")
+  local profiles = require("forge.views.harness.subagent_profiles")
+  local original_profile_open, original_spawn, original_spawn_picker = profiles.open, controller.spawn_agent, controller.open_spawn_picker
+  local original_agents, original_select = controller.open_agent_picker, controller.select_agent
+  local original_configure = controller.configure
+  local routed = {}
+  profiles.open = function(selected_state, _, profile) assert(selected_state == state) routed = { "edit", profile } end
+  controller.spawn_agent = function(profile, text) routed = { "spawn", profile, text } end
+  controller.open_spawn_picker = function(profile) routed = { "spawn_picker", profile } end
+  controller.open_agent_picker = function() routed = { "agents" } end
+  controller.select_agent = function(name) routed = { "select", name } end
+  controller.configure = function(params, validate)
+    assert(vim.deep_equal(params, { subagent_tools = params.subagent_tools }))
+    routed = { "tools", params.subagent_tools, validate }
+  end
+  state.selected_agent_run_id = "child"
+  for _, command in ipairs({
+    { "/agents on", { "tools", true, true } },
+    { "/agents on", { "tools", true, true } },
+    { "/agents off", { "tools", false, true } },
+    { "/agents off", { "tools", false, true } },
+    { "/agent edit", { "edit" } },
+    { "/agent edit reviewer", { "edit", "reviewer" } },
+    { "/agents edit", { "edit" } },
+    { "/agents edit reviewer", { "edit", "reviewer" } },
+    { "/agents spawn reviewer Inspect parser", { "spawn", "reviewer", "Inspect parser" } },
+    { "/agents spawn reviewer", { "spawn_picker", "reviewer" } },
+    { "/agents spawn", { "spawn_picker" } },
+    { "/agents", { "agents" } },
+    { "/agents main", { "select", "main" } },
+  }) do
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { command[1] })
+    controller.submit()
+    assert(vim.deep_equal(routed, command[2]), "incorrect route for " .. command[1])
+    assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
+    assert(#state.queue == 1 and state.queue[1] == "keep queued work", "agent command was queued as a prompt")
+  end
+  profiles.open, controller.spawn_agent, controller.open_spawn_picker = original_profile_open, original_spawn, original_spawn_picker
+  controller.open_agent_picker, controller.select_agent = original_agents, original_select
+  controller.configure = original_configure
 end, debug.traceback)
 if state.working_timer then state.working_timer:stop() state.working_timer:close() state.working_timer = nil end
 client.request_for, client.subscribe, client.host_generation = original_request, original_subscribe, original_generation

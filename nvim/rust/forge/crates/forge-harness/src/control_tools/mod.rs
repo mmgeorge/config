@@ -19,7 +19,7 @@ pub use runtime::{ControlToolResult, ControlToolRuntime, ControlTurnContext};
 
 pub(crate) fn is_agent_tool(name: &str) -> bool {
     matches!(name,"harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
-        | "harness_list_agents" | "harness_wait_agent")
+        | "harness_list_agents" | "harness_agent_activity" | "harness_agent_tool_output")
 }
 
 /// Defines one Harness control tool independently from any provider transport.
@@ -51,9 +51,8 @@ impl ControlToolRegistry {
         vec![
             ControlToolDefinition {
                 name:"harness_spawn_agent",
-                description:"Admit a fresh Harness-owned child with no parent history. Requires a unique task_name. Optional provider, model, and reasoning_effort resolve before admission. Returns its stable identity and execution selection without waiting for completion.",
-                input_schema:strict_object_input_schema(vec![("task_name",json!({"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]+$"})),("message",string_schema()),
-                    ("provider",json!({"type":"string","enum":["codex","copilot","claude","antigravity"]})),("model",string_schema()),("reasoning_effort",string_schema())],&["task_name","message"]),
+                description:"Start a fresh child using a user-configured profile and task text. The profile owns provider, model, thinking, speed, and instructions. Omit profile to use the configured default. Returns its unique identity without waiting for completion. Child results arrive as separate messages. When only delegated work remains, end your turn. Harness waits for the children and resumes you with their results. New user input can resume you sooner.",
+                input_schema:strict_object_input_schema(vec![("profile",string_schema()),("text",string_schema())],&["text"]),
             },
             ControlToolDefinition {
                 name:"harness_send_message",
@@ -76,9 +75,17 @@ impl ControlToolRegistry {
                 input_schema:strict_object_input_schema(vec![("path_prefix",string_schema())],&[]),
             },
             ControlToolDefinition {
-                name:"harness_wait_agent",
-                description:"Wait asynchronously for child activity, results, timeout, or root interruption. Returns available final responses and outcomes directly. Default 30000 ms, minimum 10000 ms, maximum 3600000 ms.",
-                input_schema:strict_object_input_schema(vec![("timeout_ms",json!({"type":"integer","minimum":10000,"maximum":3600000}))],&[]),
+                name:"harness_agent_activity",
+                description:"Inspect a child's active run, or its latest run when idle. Returns chronological recent thoughts (up to 4000 characters each) and tool metadata with stable call_ref values, without tool output. Includes elapsed time, last activity, and approval state. Omit limit to use the global activity limit (default 5). Does not message or restart the child.",
+                input_schema:strict_object_input_schema(vec![("target",string_schema()),
+                    ("limit",json!({"type":"integer","minimum":1,"maximum":20}))],&["target"]),
+            },
+            ControlToolDefinition {
+                name:"harness_agent_tool_output",
+                description:"Read existing output for a call_ref from harness_agent_activity. Works during execution and after child follow-ups. Offsets and limits count Unicode characters. Default limit 8000, maximum 32000. Follow next_offset for more currently available output. A running call may produce more later. Never executes the tool again.",
+                input_schema:strict_object_input_schema(vec![("call_ref",string_schema()),
+                    ("offset",json!({"type":"integer","minimum":0})),
+                    ("limit",json!({"type":"integer","minimum":1,"maximum":32000}))],&["call_ref"]),
             },
             ControlToolDefinition {
                 name: "harness_repository_status",
@@ -208,6 +215,12 @@ impl ControlToolRegistry {
             if !root {return definition.name.starts_with("harness_repository_") && context.is_some_and(|context|context.repository.is_some());}
             if is_agent_tool(definition.name) {return context.and_then(|context|context.agent.as_ref()).is_some_and(|scope|scope.available());}
             !matches!(definition.name,"harness_design_apply_patch" | "harness_plan_submit") || phase.is_none_or(|phase|phase == crate::plan::PlanPhase::Resolve)
+        }).map(|mut definition| {
+            if definition.name == "harness_spawn_agent"
+                && let Some(schema) = context.and_then(|context|context.agent.as_ref()).and_then(|scope|scope.profile_schema()) {
+                definition.input_schema["properties"]["profile"] = schema;
+            }
+            definition
         }).collect()
     }
 
@@ -276,7 +289,7 @@ pub fn apply_invocation(
                 Some(decode_arguments::<PlanQuestionWithdrawal>(invocation)?);
         }
         "harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
-        | "harness_list_agents" | "harness_wait_agent" => {},
+        | "harness_list_agents" | "harness_agent_activity" | "harness_agent_tool_output" => {},
         "harness_plan_phase_done" => {},
         "harness_goal_complete" => output.evidence.structured_complete = true,
         "harness_goal_blocked" => output.evidence.structured_blocked = true,

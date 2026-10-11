@@ -390,15 +390,15 @@ mod test {
         });
         *state.control.lock().await = Some(ControlToolRuntime::new(ControlTurnContext::inactive(crate::backend::PromptMode::Chat)));
         let failure = state.request("forge/control",json!({"name":"harness_spawn_agent",
-            "arguments":{"message":"task","provider":"incorrect"}})).await.unwrap_err();
+            "arguments":{"provider":"incorrect"}})).await.unwrap_err();
         let diagnostic:Value = serde_json::from_str(&failure.to_string())?;
         assert_eq!(diagnostic["code"],"invalid_arguments");
         let violation = diagnostic["violation"].as_array().unwrap();
-        assert!(violation.iter().any(|item|item["code"] == "missing_field" && item["message"].as_str().unwrap().contains("task_name")));
-        assert!(violation.iter().any(|item|item["path"] == "provider" && item["code"] == "invalid_value"));
+        assert!(violation.iter().any(|item|item["code"] == "missing_field" && item["message"].as_str().unwrap().contains("text")));
+        assert!(violation.iter().any(|item|item["path"] == "provider" && item["code"] == "unknown_field"));
         let output = state.output.lock().await;
         assert_eq!(output.event.last().unwrap().kind,"error");
-        assert!(output.event.last().unwrap().text.as_ref().unwrap().contains("task_name"));
+        assert!(output.event.last().unwrap().text.as_ref().unwrap().contains("text"));
         Ok(())
     }
 

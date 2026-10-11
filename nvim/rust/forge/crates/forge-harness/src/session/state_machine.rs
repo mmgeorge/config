@@ -260,6 +260,11 @@ impl SessionPhase {
                     exchange.latest_reasoning_summary().map(str::to_owned),
                 )
             });
+        if let Some(wait) = active_wait {
+            return Self::WaitingForAgent {
+                agent_count: wait.agent_count,
+            };
+        }
         if let (Some(plan), Some((started_at_ms, activity @ (WorkflowActivity::Planning | WorkflowActivity::Revising), _))) = (
             active_plan.filter(|plan| {
                 matches!(plan.state, PlanState::Generating | PlanState::Revising)
@@ -273,11 +278,6 @@ impl SessionPhase {
                 max_turn: plan.generation.budget.max_turn_count,
                 started_at_ms: *started_at_ms,
                 activity: *activity,
-            };
-        }
-        if let Some(wait) = active_wait {
-            return Self::WaitingForAgent {
-                agent_count: wait.agent_count,
             };
         }
         if let Some((started_at_ms, activity, reasoning_summary)) = working {

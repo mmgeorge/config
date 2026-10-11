@@ -258,8 +258,18 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
             let mut groups: BTreeMap<&str, Vec<&crate::turn::ToolCall>> = BTreeMap::new();
             for tool in turn.tools() {
                 let call_id = format!("{}:{}",turn.id(),tool.id);
-                if let Some(output) = tools.get(&call_id).filter(|output| !output.group.is_empty()) {
-                    groups.entry(&output.group).or_default().push(tool);
+                if let Some(output) = tools.get(&call_id) {
+                    if output.group.is_empty() {
+                        if let Some(previous) = document.block(&BlockId(format!("{call_id}:tool"))) {
+                            let mut profile = width.clone();
+                            profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
+                                .map_or(0, |layout| layout.indent.saturating_sub(2))).max(1);
+                            blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(
+                                previous, &tool.kind, tool.elapsed_ms(now_ms), tool.failed, &tool.title, false)?);
+                        }
+                    } else {
+                        groups.entry(&output.group).or_default().push(tool);
+                    }
                 }
             }
             for (id, calls) in groups {
@@ -403,7 +413,7 @@ impl TimelineRenderer<'_> {
                 };
                 self.literal(id, &text, action)?;
             }
-            TimelineEntry::Status { id, status, .. } => {
+            TimelineEntry::Status { id, status, agent_count, .. } => {
                 let text = match status {
                     SessionPhase::Idle => String::new(),
                     SessionPhase::Paused => "Paused".into(),
@@ -443,9 +453,12 @@ impl TimelineRenderer<'_> {
                         format!("Planning stopped · {reason}")
                     }
                     SessionPhase::WaitingForAgent { agent_count } => {
-                        format!("Waiting for {agent_count} agents")
+                        format!("Waiting for agents · {agent_count} running")
                     }
                 };
+                let text = if *agent_count > 0 && !matches!(status,SessionPhase::WaitingForAgent {..}) {
+                    format!("{text} · {agent_count} agent{} running",if *agent_count == 1 {""} else {"s"})
+                } else {text};
                 let text = if text.is_empty() {
                     text
                 } else {
@@ -721,7 +734,7 @@ impl TimelineRenderer<'_> {
         run: &crate::agent::Agent,
         _task: &str,
         interaction: &[Exchange],
-        _agent: &[TimelineEntry],
+        agent: &[TimelineEntry],
         exchange_id: Option<&str>,
         depth: usize,
     ) -> Result<()> {
@@ -735,21 +748,34 @@ impl TimelineRenderer<'_> {
             }),
         )?;
         let section = self.begin_section(2);
-        if let Some(message) = exchange.and_then(|exchange|exchange.turn.iter().rev().find_map(|turn|
-            turn.messages().iter().rev().find(|message|!message.text().is_empty()
-                && matches!(message.kind(),crate::turn::MessageKind::Assistant | crate::turn::MessageKind::ReasoningSummary)))) {
-            self.markdown(&format!("{id}:thought"),message.text(),MarkdownRole::Commentary)?;
+        let completed = exchange.is_some_and(|exchange| exchange.completed_at_ms.is_some());
+        if let Some(exchange) = exchange {
+            if completed {
+                let agents = agent.iter().filter_map(|entry| match entry {
+                    TimelineEntry::AgentLifecycle { id, .. } => Some((id.as_str(), entry)),
+                    _ => None,
+                }).collect();
+                self.interaction(exchange, &agents, depth)?;
+            } else {
+                if let Some(message) = exchange.turn.iter().rev().find_map(|turn|
+                    turn.messages().iter().rev().find(|message| !message.text().is_empty()
+                        && message.delivery() != crate::turn::MessageDelivery::Final
+                        && matches!(message.kind(), crate::turn::MessageKind::Assistant
+                            | crate::turn::MessageKind::ReasoningSummary))) {
+                    self.markdown(&format!("{id}:thought"), message.text(), MarkdownRole::Commentary)?;
+                }
+                if let Some((turn, tool)) = exchange.turn.iter().rev()
+                    .find_map(|turn| turn.tools().last().map(|tool| (turn, tool))) {
+                    self.tool(turn.id(), tool, "", false)?;
+                }
+            }
         }
         let heading = section.start;
-        self.finish_section(section, id, false);
+        self.finish_section(section, id, completed);
         let heading = &mut self.block[heading];
-        heading.metadata.fold.clear();
-        if let Some(marker) = heading.metadata.layout.as_mut().and_then(|layout|layout.marker.as_mut()) {
-            marker.text = "●".into();
-        }
         if let Some(node) = heading.metadata.node.as_mut() {
             node.kind = NodeKind::Exchange;
-            node.lifecycle = if exchange.is_some_and(|exchange|exchange.completed_at_ms.is_some()) {
+            node.lifecycle = if completed {
                 NodeLifecycle::Settled
             } else {NodeLifecycle::Live};
         }
@@ -1208,6 +1234,8 @@ impl TimelineRenderer<'_> {
                     self.push(block)?;
                 }
                 ExchangeNode::AgentReference { agent } => {
+                    let start = self.block.len();
+                    self.margin += 2;
                     if let Some(entry) = agents
                         .get(agent.id.as_str())
                         .or_else(|| agents.get(agent.child_agent_id.as_str())).copied()
@@ -1239,6 +1267,8 @@ impl TimelineRenderer<'_> {
                             }),
                         )?;
                     }
+                    self.margin -= 2;
+                    self.offset_layout(start, 1);
                 }
                 ExchangeNode::QuestionPresented { id, question, answer } => {
                     self.question(id, question, answer.as_deref())?;
@@ -1596,7 +1626,7 @@ impl TimelineRenderer<'_> {
         let width = self.content_width();
         let renderer = TranscriptRenderer::new(&width)?;
         let choice = self.expansion.get(&format!("{call_id}:tool")).copied();
-        let expanded = choice == Some(true);
+        let expanded = !group.is_empty() && choice == Some(true);
         let preview = preview && choice != Some(false);
         let block = renderer.tool_header(
             BlockId(id),
@@ -1822,8 +1852,14 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
                 ExchangeState::Interrupted => "Interrupted",
             }
         };
-        let selection = run.selection.as_ref().map(|selection|format!(" · {} · {}",
-            crate::agent::provider_name(selection.provider),selection.model)).unwrap_or_default();
+        let selection = run.selection.as_ref().map(|selection| {
+            let speed = match selection.service_tier {
+                crate::backend::ServiceTier::Standard => "",
+                crate::backend::ServiceTier::Fast => " +",
+                crate::backend::ServiceTier::Ultrafast => " ++",
+            };
+            format!(" · {} · {}{speed}", crate::agent::provider_name(selection.provider), selection.model)
+        }).unwrap_or_default();
         let heading = format!("● Agent {}{selection} · {lifecycle} {}s",run.label(),exchange.elapsed(now_ms) / 1000);
         return exchange_metrics_summary(exchange,now_ms,heading);
     }
@@ -3267,7 +3303,8 @@ mod tests {
     }
 
     #[test]
-    fn child_preview_keeps_latest_thought_and_inspection_retains_full_history() {
+    fn child_preview_nests_live_activity_and_completed_task_history() {
+        use crate::exchange::ExchangeState;
         let mut nested: Exchange = serde_json::from_value(json!({
             "id":"nested", "session_id":"session", "agent_id":"nested-agent", "ordinal":1,
             "prompt":"Inspect nested work", "kind":"chat", "state":"running", "created_at_ms":0,
@@ -3284,12 +3321,15 @@ mod tests {
         nested.observe_turn(&update,0).unwrap();
         update.turn_boundary = None;
         update.kind = "assistant_message".into();
-        update.data = json!({"phase":"commentary"});
+        update.data = json!({"phase":"commentary", "provider_message_id":"earlier"});
         update.text = Some("Earlier child thought".into());
         nested.observe_turn(&update,1).unwrap();
-        update.data = json!({"phase":"final_answer"});
+        update.data = json!({"phase":"commentary", "provider_message_id":"latest"});
         update.text = Some("Latest child thought".into());
         nested.observe_turn(&update,2).unwrap();
+        update.data = json!({"phase":"final_answer"});
+        update.text = Some("Child final response".into());
+        nested.observe_turn(&update,3).unwrap();
         update.text = None;
         update.activity = Some(crate::backend::ToolActivity {
             id:"call".into(),kind:crate::backend::ToolActivityKind::ToolCall,title:"Child tool".into(),
@@ -3311,6 +3351,9 @@ mod tests {
             output:Some("SPAWN_PAYLOAD".into()),output_delta:false,status:Some("completed".into()),change:Default::default(),
         });
         parent.observe_turn(&update, 1).unwrap();
+        parent.observe_turn(&crate::backend::BackendEvent {
+            activity: None, text: Some("Parent final response".into()), ..update.clone()
+        }, 2).unwrap();
         parent
             .node_list
             .push(crate::exchange::ExchangeNode::AgentReference {
@@ -3343,6 +3386,8 @@ mod tests {
         let text = projected.entry.block.iter().flat_map(|block|block.text.wire_rows()).collect::<Vec<_>>().join("\n");
         assert!(text.contains("Latest child thought"));
         assert!(!text.contains("Earlier child thought"));
+        assert!(!text.contains("Child final response"));
+        assert!(text.contains("Child tool"));
         assert!(!text.contains("Child tool result"));
         assert!(!text.contains("harness_spawn_agent"));
         assert!(!text.contains("SPAWN_PAYLOAD"));
@@ -3352,17 +3397,73 @@ mod tests {
         assert!(heading.text.wire_rows().join("\n").contains("Tools"));
         assert_eq!(heading.metadata.node.as_ref().unwrap().kind,forge_buffer::node::NodeKind::Exchange);
         assert!(heading.text.wire_rows().join("\n").contains("Agent Nested · Running"));
-        assert_eq!(heading.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text,"●");
-        assert!(heading.metadata.fold.is_empty(),"agent headings navigate to full child history");
+        assert_eq!(heading.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text,"▸");
+        assert!(!heading.metadata.fold[0].closed);
+        assert_eq!(heading.metadata.node.as_ref().unwrap().parent.as_ref().unwrap().0, "parent:exchange");
+        let action = heading.metadata.target.first().unwrap();
+        assert!(matches!(&projected.action[&action.id], super::TranscriptAction::Agent { run_id } if !run_id.is_empty()));
+        let child_position = projected.entry.block.iter().position(|block| block.id.0 == "delegation").unwrap();
+        let response_position = projected.entry.block.iter().position(|block| block.text.wire_rows().join("\n").contains("Parent final response")).unwrap();
+        assert!(child_position < response_position, "late child references belong inside parent activity");
         let document = forge_buffer::document::BufferDocument::new(
             forge_buffer::identity::DocumentId("child-preview".into()), projected.entry.block.clone()).unwrap();
         let refreshed = super::timing_blocks(&entry,&WidthProfile::default(),&document,
             &Default::default(),&projected.tool).unwrap();
         let refreshed_heading = refreshed.iter().find(|block|block.id.0 == "delegation").unwrap();
         assert!(refreshed_heading.text.wire_rows().join("\n").contains("Agent Nested"));
-        assert_eq!(refreshed_heading.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text,"●");
+        assert_eq!(refreshed_heading.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text,"▸");
         assert!(!refreshed.iter().any(|block|block.id.0 == "delegation:thought"),
             "timers must not replace the retained child thought");
+        for (service_tier, suffix) in [
+            (crate::backend::ServiceTier::Standard, ""),
+            (crate::backend::ServiceTier::Fast, " +"),
+            (crate::backend::ServiceTier::Ultrafast, " ++"),
+        ] {
+            for (state, lifecycle) in [(ExchangeState::Running, "Running"), (ExchangeState::Complete, "Completed")] {
+                let mut selected_entry = entry.clone();
+                if let TimelineEntry::Exchange { agent_by_id, .. } = &mut selected_entry {
+                    let Some(TimelineEntry::AgentLifecycle { run, exchange, .. }) = agent_by_id.get_mut("nested-agent") else {
+                        panic!("missing child fixture");
+                    };
+                    run.selection = Some(crate::agent::AgentSelection {
+                        profile: "remote-explorer".into(), instructions: String::new(),
+                        provider: crate::backend::BackendKind::Codex, model: "gpt-6.1-sol".into(),
+                        reasoning_effort: "high".into(), context_window: None, service_tier,
+                        access: Default::default(), execution_mode: crate::session::PermissionMode::Write,
+                    });
+                    exchange[0].state = state;
+                    exchange[0].completed_at_ms = (state == ExchangeState::Complete).then_some(7000);
+                }
+                let selected = project_at(&selected_entry, &WidthProfile::default(), 7000).unwrap();
+                let expected = format!("Agent Nested · codex · gpt-6.1-sol{suffix} · {lifecycle}");
+                let heading = selected.entry.block.iter().find(|block|block.id.0 == "delegation").unwrap();
+                assert!(heading.text.wire_rows().join("\n").contains(&expected));
+                assert_eq!(heading.metadata.fold[0].closed, state == ExchangeState::Complete);
+                let contents = selected.entry.block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+                if state == ExchangeState::Complete {
+                    assert!(contents.contains("Earlier child thought") && contents.contains("Child final response"));
+                    assert!(contents.contains("Child tool") && contents.contains("Inspect nested work"));
+                    assert!(selected.tool.values().any(|output| output.preview(true).unwrap().row.contains(&"Child tool result")));
+                    let mut nodes = super::super::nodes::NodeMap::default();
+                    let live_heading = projected.entry.block.iter().find(|block| block.id.0 == "delegation").unwrap();
+                    nodes.register(live_heading).unwrap();
+                    nodes.choice.insert("delegation".into(), true);
+                    nodes.register(heading).unwrap();
+                    assert!(!nodes.choice.contains_key("delegation"), "completion resets a live expansion");
+                    nodes.choice.insert("delegation".into(), true);
+                    nodes.register(heading).unwrap();
+                    assert_eq!(nodes.choice.get("delegation"), Some(&true), "completed history stays manually expandable");
+                } else {
+                    assert!(!contents.contains("Child final response") && !contents.contains("Child tool result"));
+                }
+                let document = forge_buffer::document::BufferDocument::new(
+                    forge_buffer::identity::DocumentId("speed-preview".into()), selected.entry.block).unwrap();
+                let refreshed = super::timing_blocks(&selected_entry, &WidthProfile::default(), &document,
+                    &Default::default(), &selected.tool).unwrap();
+                let heading = refreshed.iter().find(|block|block.id.0 == "delegation").unwrap();
+                assert!(heading.text.wire_rows().join("\n").contains(&expected));
+            }
+        }
         let mut failed_entry = entry.clone();
         if let TimelineEntry::Exchange { exchange,.. } = &mut failed_entry {
             update.activity.as_mut().unwrap().id = "failed-spawn-call".into();
@@ -3708,7 +3809,7 @@ mod tests {
                 ..Default::default()
             },
         };
-        let render = |execution| project_at(&TimelineEntry::Status {
+        let render = |execution| project_at(&TimelineEntry::Status { agent_count: 0,
             id: "session:status".into(), created_at_ms: 0,
             status: SessionPhase::Working {
                 started_at_ms: 0, activity: WorkflowActivity::Working,
@@ -3745,13 +3846,13 @@ mod tests {
             (SessionPhase::Compacting { started_at_ms: 4_000 }, "Compacting · 0s", true, None),
             (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: None }, "Saving exchange", true, None),
             (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: Some("locked".into()) }, "Saving exchange failed · locked", false, None),
-            (SessionPhase::WaitingForAgent { agent_count: 2 }, "Waiting for 2 agents", true, Some(StatusHint::Working)),
+            (SessionPhase::WaitingForAgent { agent_count: 2 }, "Waiting for agents · 2 running", true, Some(StatusHint::Working)),
             (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 2, max_turn: 20, started_at_ms: 0, activity: WorkflowActivity::Planning }, "Planning · 3s", true, Some(StatusHint::Working)),
             (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 3, max_turn: 20, started_at_ms: 0, activity: WorkflowActivity::Revising }, "Revising plan · 3s", true, Some(StatusHint::Working)),
             (SessionPhase::PlanningFailed { plan_id: "plan".into(), turn_count: 2, reason: "no progress limit reached".into() }, "Planning stopped · no progress limit reached", false, None),
         ];
         for (phase, expected, animated, hint) in cases {
-            let projection = project_at(&TimelineEntry::Status { id: "status".into(), created_at_ms: 0, status: phase }, &WidthProfile::default(), 3000).unwrap();
+            let projection = project_at(&TimelineEntry::Status { agent_count: 0, id: "status".into(), created_at_ms: 0, status: phase }, &WidthProfile::default(), 3000).unwrap();
             let block = &projection.entry.block[0];
             assert_eq!(block.text.wire_rows(), vec!["", expected]);
             assert_eq!(block.metadata.status, Some(forge_buffer::block::StatusPresentation { row: 1, animated, hint }));
@@ -3765,7 +3866,7 @@ mod tests {
     #[test]
     fn working_status_reports_elapsed_seconds_without_persisting_a_timer_value() {
         let projection = project_at(
-            &TimelineEntry::Status {
+            &TimelineEntry::Status { agent_count: 0,
                 id: "session:status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
@@ -3792,7 +3893,7 @@ mod tests {
     #[test]
     fn working_status_shows_one_normalized_reasoning_summary_line() {
         let projection = project_at(
-            &TimelineEntry::Status {
+            &TimelineEntry::Status { agent_count: 0,
                 id: "session:status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
@@ -3824,7 +3925,7 @@ mod tests {
             crate::broker::ElicitationOwner::PlanAcceptance,
         ] {
             let projected = project_at(
-                &TimelineEntry::Status {
+                &TimelineEntry::Status { agent_count: 0,
                     id: "session:status".into(),
                     created_at_ms: 0,
                     status: SessionPhase::AwaitingInput {
@@ -3849,7 +3950,7 @@ mod tests {
     #[test]
     fn review_status_has_a_separate_unindented_action_row() {
         let projected = project_at(
-            &TimelineEntry::Status {
+            &TimelineEntry::Status { agent_count: 0,
                 id: "session:status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::AwaitingPlanReview {
@@ -4340,4 +4441,23 @@ mod tests {
         assert!(text.contains("Implementation differences"));
     }
 
+}
+
+
+#[cfg(test)]
+#[test]
+fn agent_counts_preserve_the_primary_status_and_spinner() -> anyhow::Result<()> {
+    for (status,label,animated) in [
+        (SessionPhase::Working {started_at_ms:0,reasoning_summary:None,activity:WorkflowActivity::Working,execution:None},"Working",true),
+        (SessionPhase::Compacting {started_at_ms:0},"Compacting",true),
+        (SessionPhase::Paused,"Paused",false),
+        (SessionPhase::AwaitingPlanReview {plan_id:"plan".into(),revision:1},"Waiting for plan review",false),
+    ] {
+        let projection=project_at(&TimelineEntry::Status {id:"status".into(),created_at_ms:0,status,agent_count:2},
+            &WidthProfile::default(),1000)?;
+        let text=projection.entry.block.iter().flat_map(|block|block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains(label) && text.contains("2 agents running"),"{text}");
+        assert_eq!(projection.entry.block.iter().find_map(|block|block.metadata.status.as_ref()).unwrap().animated,animated);
+    }
+    Ok(())
 }

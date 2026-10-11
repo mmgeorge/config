@@ -1216,7 +1216,7 @@ impl Backend for CodexBackend {
             );
             let completed = if let Some(text) = resume_message {
                 let lane = self.steering_lane(&request.runtime_key()?).await;
-                let (completed, delivered) = tokio::join!(completion, lane.steer(text));
+                let (completed, delivered) = tokio::join!(completion, lane.steer(text.into()));
                 delivered.context("deliver instructions to resumed native goal")?;
                 completed?
             } else { completion.await? };
@@ -1298,12 +1298,8 @@ impl Backend for CodexBackend {
         })
     }
 
-    async fn steer(&self, _text: String) -> Result<()> {
-        anyhow::bail!("Codex steering requires a Harness session target")
-    }
-
-    async fn steer_session(&self, session_id: &str, text: String) -> Result<()> {
-        self.steering_lane(session_id).await.steer(text).await
+    async fn steer_session(&self, session_id: &str, input: super::SteeringInput) -> Result<()> {
+        self.steering_lane(session_id).await.steer(input).await
     }
 
 

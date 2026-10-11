@@ -3,6 +3,9 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 /// Persists a child's resolved provider selection and inherited execution authority.
 pub struct AgentSelection {
+    /// Captures the selected profile so later edits cannot change this child.
+    pub profile: String,
+    pub instructions: String,
     /// Chooses the adapter independently of the root provider.
     pub provider: crate::backend::BackendKind,
     /// Retains the advertised model selected before task admission.

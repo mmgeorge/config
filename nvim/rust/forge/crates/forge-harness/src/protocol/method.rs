@@ -61,6 +61,10 @@ pub enum HarnessMethod {
     AgentInterruptAll,
     #[serde(rename = "agent.models")]
     AgentModels,
+    #[serde(rename = "agent.profiles.get")]
+    AgentProfilesGet,
+    #[serde(rename = "agent.profiles.save")]
+    AgentProfilesSave,
     #[serde(rename = "permissions.open")]
     PermissionsOpen,
     #[serde(rename = "permissions.save")]

@@ -594,14 +594,10 @@ pub trait Backend: Send + Sync {
         Ok(None)
     }
 
-    /// Append user input to the active provider turn when native steering is available.
-    async fn steer(&self, _text: String) -> Result<()> {
+    /// Appends input to an active turn without starting an idle provider session.
+    /// Implementations render user additions only and keep agent results out of user-prompt rows.
+    async fn steer_session(&self, _session_id: &str, _input: SteeringInput) -> Result<()> {
         Err(UnsupportedCapability("native_steer").into())
-    }
-
-    /// Append user input to one Harness session's active provider turn.
-    async fn steer_session(&self, _session_id: &str, text: String) -> Result<()> {
-        self.steer(text).await
     }
 
     /// Interrupt the parent and descendants for one session and await terminal evidence.
@@ -1107,12 +1103,8 @@ impl Backend for MockBackend {
         )))
     }
 
-    async fn steer(&self, _text: String) -> Result<()> {
-        anyhow::bail!("Mock steering requires a Harness session target")
-    }
-
-    async fn steer_session(&self, session_id: &str, text: String) -> Result<()> {
-        self.steering_lane(session_id).steer(text).await
+    async fn steer_session(&self, session_id: &str, input: SteeringInput) -> Result<()> {
+        self.steering_lane(session_id).steer(input).await
     }
 
     async fn rollback_cancelled_turn(&self) -> Result<bool> {

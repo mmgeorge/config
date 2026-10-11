@@ -30,6 +30,14 @@
 
 ---@alias ForgeKeymap string|string[]|false
 
+---@class ForgeFormKeymapConfig
+---@field save ForgeKeymap
+---@field previous_value ForgeKeymap
+---@field next_value ForgeKeymap
+---@field reload ForgeKeymap
+---@field close ForgeKeymap
+---@field help ForgeKeymap
+
 ---@class ForgeStatusKeymapConfig
 ---@field close ForgeKeymap
 ---@field refresh ForgeKeymap
@@ -107,11 +115,14 @@
 ---@field feedback ForgeKeymap
 ---@field page_previous ForgeKeymap
 ---@field page_next ForgeKeymap
+---@field previous_value ForgeKeymap
+---@field next_value ForgeKeymap
 ---@field focus_input ForgeKeymap
 ---@field submit_input ForgeKeymap
 ---@field close ForgeKeymap
 
 ---@class ForgeKeymapConfig
+---@field form ForgeFormKeymapConfig
 ---@field status ForgeStatusKeymapConfig
 ---@field review ForgeReviewKeymapConfig
 ---@field harness ForgeHarnessKeymapConfig
@@ -304,6 +315,14 @@ M.defaults = {
       close = "q",
       help = "?",
     },
+    form = {
+      save = "<C-s>",
+      previous_value = "<Left>",
+      next_value = "<Right>",
+      reload = "R",
+      close = "q",
+      help = "?",
+    },
     picker = {
       previous = { "<Up>", "s" },
       next = { "<Down>", "t" },
@@ -311,6 +330,8 @@ M.defaults = {
       feedback = "<Tab>",
       page_previous = "<Left>",
       page_next = "<Right>",
+      previous_value = { "<Left>", "r" },
+      next_value = { "<Right>", "h" },
       focus_input = "go",
       submit_input = "<C-s>",
       clear_input = "<C-c>",

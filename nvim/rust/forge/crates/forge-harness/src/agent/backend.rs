@@ -14,6 +14,7 @@ pub struct AgentBackendFactory {
     permission: Arc<crate::backend::approval::PermissionCoordinator>,
     trace: Arc<crate::trace::TraceStore>,
     settings_root: PathBuf,
+    pub profiles: Arc<super::AgentProfileStore>,
 }
 
 impl AgentBackendFactory {
@@ -21,7 +22,8 @@ impl AgentBackendFactory {
         permission: Arc<crate::backend::approval::PermissionCoordinator>, trace: Arc<crate::trace::TraceStore>, settings_root: PathBuf) -> Self {
         let mut launch_by_provider = configured;
         launch_by_provider.insert(root.kind.clone(), root);
-        Self { launch_by_provider, permission, trace, settings_root,
+        let profiles = Arc::new(super::AgentProfileStore::new(settings_root.join("subagents.json")));
+        Self { launch_by_provider, permission, trace, settings_root, profiles,
             #[cfg(test)] backend_by_provider:HashMap::new() }
     }
 
@@ -58,37 +60,36 @@ impl AgentBackendFactory {
     }
 
     pub async fn resolve(&self, root: &BackendRequest, root_provider: BackendKind, spawn: &SpawnAgentRequest) -> Result<AgentSelection> {
-        let provider = spawn.provider.as_deref().map(BackendKind::parse).transpose()?.unwrap_or(root_provider);
+        let (profile_name, profile) = self.profiles.resolve(spawn.profile.as_deref())?;
+        let provider = if profile.provider == "inherit" { root_provider } else { BackendKind::parse(&profile.provider)? };
         ensure!(provider != BackendKind::Mock || root_provider == BackendKind::Mock, "mock is not a user-selectable provider");
         validate_access(provider, &root.access)?;
         let same_provider = provider == root_provider;
-        let defaults = crate::settings::SettingsStore::open(&self.settings_root)?.get(&root.workspace, &root.harness_session_id, provider_name(provider))?;
-        let configured_model = defaults.provider.get("model").and_then(serde_json::Value::as_str).unwrap_or("default");
-        let configured_effort = defaults.provider.get("effort").and_then(serde_json::Value::as_str).unwrap_or("default");
-        let model = spawn.model.clone().unwrap_or_else(|| if same_provider { root.model.clone() } else { configured_model.into() });
-        let effort = spawn.reasoning_effort.clone().unwrap_or_else(|| if same_provider && spawn.model.is_none() { root.effort.clone() } else { configured_effort.into() });
-        let configured_context:Option<String> = defaults.provider.get("context_window")
-            .map(|value|serde_json::from_value(value.clone())).transpose()?.flatten();
-        let configured_tier = defaults.provider.get("service_tier")
-            .map(|value|serde_json::from_value(value.clone())).transpose()?.unwrap_or_default();
-        let mut selection = AgentSelection { provider, model, reasoning_effort: effort,
-            context_window: if spawn.model.is_none() {
-                if same_provider { root.context_window.clone() } else { configured_context }
-            } else { None },
-            service_tier: if same_provider { root.service_tier } else { configured_tier },
-            access: root.access.clone(), execution_mode: root.execution_mode };
-        if spawn.model.is_some() || spawn.reasoning_effort.is_some() || !same_provider {
+        let model = if profile.model == "inherit" { root.model.clone() } else { profile.model.clone() };
+        let effort = if profile.reasoning_effort == "inherit" { root.effort.clone() } else { profile.reasoning_effort.clone() };
+        let service_tier = if profile.service_tier == "inherit" { root.service_tier }
+            else { serde_json::from_value(serde_json::json!(profile.service_tier))? };
+        let execution_mode = if profile.permission_mode == "inherit" { root.execution_mode }
+            else { narrow_permission(root.execution_mode, serde_json::from_value(serde_json::json!(profile.permission_mode))?) };
+        let mut selection = AgentSelection { profile: profile_name, instructions: profile.instructions, provider, model, reasoning_effort: effort,
+            context_window: if same_provider && profile.model == "inherit" { root.context_window.clone() } else { None },
+            service_tier, access: root.access.clone(), execution_mode };
+        ensure!(service_tier == crate::backend::ServiceTier::Standard || matches!(provider, BackendKind::Codex | BackendKind::Mock),
+            "profile {} requests a speed tier unsupported by {}", selection.profile, provider_name(provider));
+        if profile.model != "inherit" || profile.reasoning_effort != "inherit" || !same_provider {
+            ensure!(same_provider || profile.model != "inherit" || root.model != "default",
+                "profile {} inherits an unresolved model from another provider. Select a model or default explicitly", selection.profile);
             let model_list = self.model_list(provider,root.clone()).await?;
             let model = if selection.model == "default" {
                 model_list.iter().find(|model|model.is_default).or_else(||model_list.first())
             } else { model_list.iter().find(|model|model.id == selection.model) }
                 .with_context(||format!("model {} is not available on {}", selection.model, provider_name(provider)))?;
             selection.model = model.id.clone();
-            if spawn.reasoning_effort.is_some() {
+            if selection.reasoning_effort == "default" {
+                selection.reasoning_effort = model.default_reasoning.clone().unwrap_or_else(|| "default".into());
+            } else {
                 ensure!(model.reasoning.iter().any(|effort|effort == &selection.reasoning_effort),
                     "reasoning effort {} is not supported by model {}", selection.reasoning_effort, selection.model);
-            } else if !model.reasoning.iter().any(|effort|effort == &selection.reasoning_effort) {
-                selection.reasoning_effort = model.default_reasoning.clone().unwrap_or_default();
             }
             if !selection.context_window.as_ref().is_some_and(|selected|
                 model.context_window.iter().any(|window|&window.id == selected)) {
@@ -102,11 +103,22 @@ impl AgentBackendFactory {
         let selection = agent.selection.as_ref().context("child has no resolved provider selection")?;
         validate_access(selection.provider, &root.access)?;
         ensure!(agent.session_id == root.harness_session_id && !agent.is_primary(), "child request crosses root ownership");
+        let message = if selection.instructions.trim().is_empty() { message }
+            else { format!("Subagent profile instructions:\n{}\n\nAssigned task:\n{message}", selection.instructions) };
         Ok(BackendRequest { execution_owner: Some(ExecutionOwner { session_id: agent.session_id.clone(), agent_id: agent.id.clone() }),
             harness_session_id: root.harness_session_id.clone(), workspace: root.workspace.clone(), input: BackendInput::from_text(message),
             mode: PromptMode::Chat, model: selection.model.clone(), effort: selection.reasoning_effort.clone(),
             context_window: selection.context_window.clone(), service_tier: selection.service_tier, access: root.access.clone(),
-            execution_mode: root.execution_mode, backend_session_id: agent.provider_thread_id.clone(), control_context: None })
+            execution_mode: narrow_permission(root.execution_mode, selection.execution_mode), backend_session_id: agent.provider_thread_id.clone(), control_context: None })
+    }
+}
+
+fn narrow_permission(root: crate::session::PermissionMode, selected: crate::session::PermissionMode) -> crate::session::PermissionMode {
+    use crate::session::PermissionMode;
+    match (root, selected) {
+        (PermissionMode::Read, _) | (_, PermissionMode::Read) => PermissionMode::Read,
+        (PermissionMode::Write, _) | (_, PermissionMode::Write) => PermissionMode::Write,
+        _ => PermissionMode::Yolo,
     }
 }
 

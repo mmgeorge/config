@@ -1,0 +1,45 @@
+{
+  "default_profile": "code-explorer",
+  "profiles": {
+    "code-explorer": {
+      "enabled": true,
+      "description": "Explore the local codebase",
+      "instructions": "Inspect the local codebase and answer the assigned question with source references. Do not modify files.",
+      "provider": "inherit",
+      "model": "inherit",
+      "reasoning_effort": "inherit",
+      "service_tier": "inherit",
+      "permission_mode": "inherit"
+    },
+    "remote-explorer": {
+      "enabled": true,
+      "description": "Research external code and documentation",
+      "instructions": "Research the assigned external code or documentation. Prefer primary sources and cite them. Do not modify local files.",
+      "provider": "inherit",
+      "model": "inherit",
+      "reasoning_effort": "inherit",
+      "service_tier": "inherit",
+      "permission_mode": "inherit"
+    },
+    "reviewer": {
+      "enabled": true,
+      "description": "Review changes for defects",
+      "instructions": "Review the assigned changes for correctness and regressions. Report findings with file references. Do not modify files.",
+      "provider": "inherit",
+      "model": "inherit",
+      "reasoning_effort": "inherit",
+      "service_tier": "inherit",
+      "permission_mode": "inherit"
+    },
+    "worker": {
+      "enabled": true,
+      "description": "Implement a scoped task",
+      "instructions": "Complete the assigned task and report the result and verification.",
+      "provider": "inherit",
+      "model": "inherit",
+      "reasoning_effort": "inherit",
+      "service_tier": "inherit",
+      "permission_mode": "inherit"
+    }
+  }
+}

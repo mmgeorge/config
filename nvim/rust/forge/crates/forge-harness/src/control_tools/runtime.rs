@@ -127,7 +127,7 @@ impl ControlToolRuntime {
             && let Some(execution) = &self.context.execution { execution.require_revision_phase()?; }
         match invocation.name.as_str() {
             "harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
-            | "harness_list_agents" | "harness_wait_agent" => {
+            | "harness_list_agents" | "harness_agent_activity" | "harness_agent_tool_output" => {
                 let scope = self.context.agent.as_ref().context("agent tools require an authenticated active root turn")?;
                 let message = scope.invoke(&invocation.name,invocation.arguments).await?;
                 Ok(ControlToolResult {invocation:None,message})

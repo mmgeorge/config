@@ -8,7 +8,31 @@ const MAX_TARGET_BYTES: usize = 4096;
 
 use super::{BackendEvent, BackendEventSink};
 
-/// Routes user input into the provider turn that currently owns the backend transport.
+#[derive(Clone, Debug)]
+/// Distinguishes user steering from child results delivered without user-prompt rendering.
+pub enum SteeringInput {
+    /// Records an explicit user addition in the parent timeline.
+    User(String),
+    /// Adds an attributed child result while its transcript remains under the child.
+    AgentResult(String),
+}
+
+impl SteeringInput {
+    /// Returns the provider-visible message without its presentation origin.
+    pub fn text(&self) -> &str {
+        match self { Self::User(text) | Self::AgentResult(text) => text }
+    }
+}
+
+impl From<String> for SteeringInput {
+    fn from(text: String) -> Self { Self::User(text) }
+}
+
+impl From<&str> for SteeringInput {
+    fn from(text: &str) -> Self { Self::User(text.into()) }
+}
+
+/// Routes input into the provider turn that currently owns the backend transport.
 #[derive(Clone, Default)]
 pub struct SteeringLane {
     state: Arc<Mutex<SteeringState>>,
@@ -43,6 +67,7 @@ pub struct SteerCommand {
     pub operation: ActiveTurnOperation,
     completion: Option<oneshot::Sender<std::result::Result<(), String>>>,
     event_sink: Option<BackendEventSink>,
+    publish_input: bool,
 }
 
 /// Identifies the provider child receiving steering or interruption.
@@ -63,6 +88,11 @@ pub enum ActiveTurnOperation {
 }
 
 impl SteeringLane {
+    /// Reports whether a provider turn or Harness continuation owns the input receiver.
+    pub(crate) fn is_active(&self) -> bool {
+        self.state.lock().expect("steering lane lock poisoned").sender.is_some()
+    }
+
     /// Stop native goal continuation through the active provider reader.
     pub async fn stop_goal(&self, clear: bool) -> Result<()> {
         self.submit(
@@ -73,6 +103,7 @@ impl SteeringLane {
             },
             String::new(),
             None,
+            false,
         )
         .await
     }
@@ -96,14 +127,15 @@ impl SteeringLane {
         })
     }
 
-    /// Deliver user input to the active turn and wait for the provider acknowledgement.
-    pub async fn steer(&self, text: String) -> Result<()> {
-        self.submit(ActiveTurnOperation::Steer, text, None).await
+    /// Delivers input to the active turn and publishes only acknowledged user additions.
+    pub async fn steer(&self, input: SteeringInput) -> Result<()> {
+        let publish_input = matches!(input, SteeringInput::User(_));
+        self.submit(ActiveTurnOperation::Steer, input.text().to_owned(), None, publish_input).await
     }
 
     /// Interrupt the parent and descendants and wait for terminal provider evidence.
     pub async fn cleanup_execution(&self) -> Result<()> {
-        self.submit(ActiveTurnOperation::CleanupExecution, String::new(), None)
+        self.submit(ActiveTurnOperation::CleanupExecution, String::new(), None, false)
             .await
     }
 
@@ -112,6 +144,7 @@ impl SteeringLane {
         operation: ActiveTurnOperation,
         text: String,
         target: Option<SteerTarget>,
+        publish_input: bool,
     ) -> Result<()> {
         let sender = self
             .state
@@ -155,6 +188,7 @@ impl SteeringLane {
                 operation,
                 completion: Some(completion),
                 event_sink: None,
+                publish_input,
             })
             .map_err(|_| anyhow::anyhow!("active turn completed before steering input was sent"))?;
         response
@@ -165,6 +199,13 @@ impl SteeringLane {
 }
 
 impl ActiveSteering {
+    /// Drains input already admitted before a provider-turn boundary.
+    pub(crate) fn try_receive(&mut self) -> Option<SteerCommand> {
+        let mut command = self.receiver.try_recv().ok()?;
+        command.event_sink.clone_from(&self.event_sink);
+        Some(command)
+    }
+
     /// Receive the next steering input in submission order.
     pub async fn receive(&mut self) -> Option<SteerCommand> {
         let mut command = self.receiver.recv().await?;
@@ -186,6 +227,7 @@ impl SteerCommand {
     /// Resolve the originating Harness request with the provider result.
     pub async fn complete(mut self, result: Result<()>) {
         if result.is_ok()
+            && self.publish_input
             && self.operation == ActiveTurnOperation::Steer
             && let Some(event_sink) = self.event_sink.take()
         {
@@ -235,7 +277,7 @@ mod test {
         let mut active = lane.activate(None).unwrap();
         let mut pending = Vec::new();
         for sequence in 0..super::MAX_STEERING_REQUESTS {
-            let mut request = Box::pin(lane.steer(sequence.to_string()));
+            let mut request = Box::pin(lane.steer(sequence.to_string().into()));
             assert!(futures_util::poll!(request.as_mut()).is_pending());
             pending.push(request);
         }
@@ -248,9 +290,9 @@ mod test {
         );
         let first = active.receive().await.unwrap();
         assert!(lane.steer("still full".into()).await.is_err());
-        let mut interrupt = Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None));
+        let mut interrupt = Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None,false));
         assert!(futures_util::poll!(interrupt.as_mut()).is_pending());
-        assert!(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None).await.is_err());
+        assert!(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None,false).await.is_err());
         for sequence in 1..super::MAX_STEERING_REQUESTS {
             let command = active.receive().await.unwrap();
             assert_eq!(command.text, sequence.to_string());
@@ -276,7 +318,7 @@ mod test {
         let lane = SteeringLane::default();
         let mut active = lane.activate(None).unwrap();
         assert!(
-            lane.steer("x".repeat(super::MAX_STEERING_BYTES + 1))
+            lane.steer("x".repeat(super::MAX_STEERING_BYTES + 1).into())
                 .await
                 .is_err()
         );
@@ -287,7 +329,8 @@ mod test {
                 Some(super::SteerTarget {
                     thread_id: "x".repeat(super::MAX_TARGET_BYTES + 1),
                     turn_id: "turn".into(),
-                })
+                }),
+                true,
             )
             .await
             .is_err()
@@ -327,6 +370,22 @@ mod test {
         drop(lane.activate(None).unwrap());
         let error = lane.steer("too late".into()).await.unwrap_err();
         assert!(format!("{error:#}").contains("no active turn"));
+    }
+
+    #[tokio::test]
+    async fn child_results_reach_the_provider_without_user_steering_events() {
+        let lane = SteeringLane::default();
+        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let mut active = lane.activate(Some(event_sink)).unwrap();
+        let sender = lane.clone();
+        let delivery = tokio::spawn(async move {
+            sender.steer(super::SteeringInput::AgentResult("child report".into())).await
+        });
+        let command = active.receive().await.unwrap();
+        assert_eq!(command.text,"child report");
+        command.complete(Ok(())).await;
+        delivery.await.unwrap().unwrap();
+        assert!(event_stream.try_recv().is_err());
     }
 
     #[tokio::test]

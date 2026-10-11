@@ -200,7 +200,10 @@ impl TimelineStream {
             }
         });
         let status_id = format!("{}:status", self.session_id);
-        let next_status = status.visible().then(|| TimelineEntry::Status {
+        let agent_count = self.entry_list.iter().find_map(|entry|match entry {
+            TimelineEntry::Status {agent_count,..} => Some(*agent_count),_=>None,
+        }).unwrap_or(0);
+        let next_status = status.visible().then(|| TimelineEntry::Status { agent_count,
             id: status_id.clone(),
             created_at_ms: 0,
             status,
@@ -417,7 +420,7 @@ mod test {
     };
 
     fn status(kind: SessionPhase) -> TimelineEntry {
-        TimelineEntry::Status {
+        TimelineEntry::Status { agent_count: 0,
             id: "session:status".into(),
             created_at_ms: 0,
             status: kind,

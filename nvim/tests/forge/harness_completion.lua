@@ -51,6 +51,9 @@ local ok, failure = xpcall(function()
   session.harness.model_list = { { id = "fixture-model", reasoning = { "low", "high" } } }
   client.request = function(method, _, callback)
     if method == "backend.model_pins" then callback({}) return end
+    if method == "agent.profiles.get" then callback({document={profiles={
+      reviewer={enabled=true,description="Review code"}, disabled={enabled=false},
+    }}}) return end
     assert(method == "backend.skills", "unexpected completion request " .. method)
     vim.schedule(function()
       callback({ { name = "fixture-skill", enabled = true, user_invocable = true } })
@@ -79,10 +82,22 @@ local ok, failure = xpcall(function()
   session.harness.timeline = { { kind = "agent_lifecycle", run = session.harness.agent.run[1],
     exchange = { { id = "child-exchange", agent_id = "child", state = "running", turn = {} } }, agent = {} } }
   item(complete(commands, "/agents"), "/agents")
-  item(complete(commands, "/spawn"), "/spawn")
+  item(complete(commands, "/agents "), "/agents edit")
+  item(complete(commands, "/agent "), "/agent edit")
+  item(complete(commands, "/agents "), "/agents spawn")
+  item(complete(commands, "/agents "), "/agents on")
+  item(complete(commands, "/agents "), "/agents off")
+  item(complete(commands, "/agents o"), "/agents on")
+  item(complete(commands, "/agents o"), "/agents off")
+  assert(not require("forge.views.harness.completion.command_source").accepts_prompt("/spawn"))
   session.harness.timeline[1].exchange[1].state = "complete"
   item(complete(commands, "/agents"), "/agents")
-  assert(#complete(commands, "/spawn ") == 0, "spawn completion exposed a native role catalog")
+  local profiles = complete(commands, "/agents spawn ")
+  assert(#profiles == 1, "only enabled profiles should complete")
+  item(profiles, "reviewer")
+  assert(#complete(commands, "/agents spawn reviewer task") == 0, "task text must not complete profiles")
+  assert(#complete(commands, "/agents edit ") == 2, "disabled profiles must remain editable")
+  assert(#complete(commands, "/agent edit ") == 2, "singular edit must complete all profiles")
   item(complete(commands, "/model "), "fixture-model")
   local effort = complete(commands, "/model fixture-model ")
   assert(#effort == 2)

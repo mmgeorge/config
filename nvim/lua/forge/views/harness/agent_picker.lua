@@ -54,7 +54,7 @@ end
 ---@return integer
 local function option_list(state, selected_run_id)
   local result = {
-    { id = "main", value = { kind = "main" }, label = "Main", detail = "Parent conversation" },
+    { id = "main", value = { kind = "main" }, label = "Main", detail = "Parent conversation", columns = { "Main", "—", "Parent conversation" } },
   }
   local now_ms = os.time() * 1000
   for _, group in ipairs({
@@ -73,6 +73,11 @@ local function option_list(state, selected_run_id)
         ),
         section = group.title,
       }
+      local entry = result[#result]
+      local selection = run.selection or {}
+      local tuning = selection.provider and (selection.provider .. " · " .. (selection.model or "default")
+        .. " · Thinking " .. (selection.reasoning_effort or "default") .. " · " .. (selection.service_tier or "default")) or ""
+      entry.columns = { entry.label, run.definition or "", entry.detail .. (tuning ~= "" and " · " .. tuning or "") }
     end
   end
   local initial = 1
@@ -95,7 +100,7 @@ build_spec = function(instance)
       {
         id = "agents",
         title = "Agents · model tools " .. (state.subagent_tools == true and "On" or "Off"),
-        column_headers = { "Timeline", "Status" },
+        column_headers = { "Timeline", "Profile", "Status" },
         option_list = entries,
         selected_index = initial,
         footer = "Enter inspect  C-g message  C-f follow up  C-x interrupt  C-a interrupt all  C-t tools  q close",

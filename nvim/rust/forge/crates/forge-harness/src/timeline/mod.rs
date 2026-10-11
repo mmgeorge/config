@@ -79,6 +79,8 @@ pub enum TimelineEntry {
         id: String,
         created_at_ms: i64,
         status: SessionPhase,
+        /// Active child executions across the root session, independent of its phase.
+        agent_count: usize,
     },
 }
 

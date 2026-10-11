@@ -14,11 +14,8 @@ pub const MAX_PENDING_TASKS: usize = 32;
 #[serde(deny_unknown_fields)]
 /// Describes a fresh child without inheriting parent transcript or workflow state.
 pub struct SpawnAgentRequest {
-    pub task_name: String,
-    pub message: String,
-    pub provider: Option<String>,
-    pub model: Option<String>,
-    pub reasoning_effort: Option<String>,
+    pub profile: Option<String>,
+    pub text: String,
 }
 
 #[derive(Clone, Debug)]
@@ -38,7 +35,8 @@ pub enum AgentOperation {
     Interrupt { target: String },
     InterruptAll,
     List { prefix: Option<String> },
-    Report { task_id: Vec<String> },
+    Activity { target: String, limit: Option<usize> },
+    ToolOutput { call_ref: String, offset: usize, limit: usize },
 }
 
 /// Serializes durable mutations without reacquiring an in-flight prompt's broker lock.
@@ -114,6 +112,7 @@ pub struct AgentCoordinator {
     receiver: Mutex<mpsc::Receiver<AgentCommand>>,
     sender: AgentCommandSender,
     activity: watch::Sender<u64>,
+    profiles: Mutex<Option<Arc<super::AgentProfileStore>>>,
 }
 
 #[must_use]
@@ -125,6 +124,7 @@ pub struct AgentQuiescence {
 impl Drop for AgentQuiescence {
     fn drop(&mut self) {
         self.coordinator.state.lock().expect("agent state poisoned").quiescence_count -= 1;
+        self.coordinator.sender.revision.send_modify(|revision| *revision = revision.wrapping_add(1));
     }
 }
 
@@ -134,7 +134,7 @@ impl AgentCoordinator {
         let (revision, _) = watch::channel(0);
         let (activity, _) = watch::channel(0);
         Arc::new(Self { session_id, enabled: AtomicBool::new(false), state: Mutex::new(AgentStateStore::default()),
-            receiver: Mutex::new(receiver), sender: AgentCommandSender { sender, revision }, activity })
+            receiver: Mutex::new(receiver), sender: AgentCommandSender { sender, revision }, activity, profiles: Mutex::new(None) })
     }
 
     pub fn sender(&self) -> AgentCommandSender { self.sender.clone() }
@@ -144,6 +144,20 @@ impl AgentCoordinator {
     pub fn set_enabled(&self, enabled: bool) { self.enabled.store(enabled, Ordering::Release); }
 
     pub fn enabled(&self) -> bool { self.enabled.load(Ordering::Acquire) }
+
+    pub fn set_profiles(&self, profiles: Arc<super::AgentProfileStore>) {
+        *self.profiles.lock().expect("agent profiles poisoned") = Some(profiles);
+    }
+
+    pub fn profile_schema(&self) -> Option<serde_json::Value> {
+        let profiles = self.profiles.lock().expect("agent profiles poisoned").clone()?;
+        let snapshot = profiles.snapshot().ok()?;
+        let names: Vec<_> = snapshot.document.profiles.iter().filter(|(_, profile)| profile.enabled).map(|(name,_)|name).collect();
+        let description = snapshot.document.profiles.iter().filter(|(_, profile)|profile.enabled)
+            .map(|(name, profile)|format!("{name}: {}", profile.description)).collect::<Vec<_>>().join("\n");
+        Some(serde_json::json!({"type":"string", "enum":names,
+            "description":format!("Default: {}.\n{description}",snapshot.document.default_profile)}))
+    }
 
     pub fn owns(&self, owner: &ExecutionOwner) -> bool {owner.session_id == self.session_id}
 
@@ -166,7 +180,13 @@ impl AgentCoordinator {
 
     pub fn begin_quiescence(self: &Arc<Self>) -> AgentQuiescence {
         self.state.lock().expect("agent state poisoned").quiescence_count += 1;
+        self.sender.revision.send_modify(|revision| *revision = revision.wrapping_add(1));
         AgentQuiescence { coordinator: Arc::clone(self) }
+    }
+
+    /// Prevents parent continuation while cancellation or a policy transition owns child cleanup.
+    pub(crate) fn is_quiescing(&self) -> bool {
+        self.state.lock().expect("agent state poisoned").quiescence_count > 0
     }
 
     pub fn try_receive(&self) -> Option<AgentCommand> {
@@ -175,35 +195,37 @@ impl AgentCoordinator {
 
     pub fn reserve_spawn(&self, request: &AgentRequest, spawn: &SpawnAgentRequest, selection: AgentSelection,
         parent_exchange_id: &str, now_ms: i64) -> Result<AgentAdmission> {
-        validate_message(&spawn.message)?;
-        ensure!(!spawn.task_name.is_empty() && spawn.task_name.len() <= 64
-            && spawn.task_name.bytes().all(|character| character.is_ascii_alphanumeric() || matches!(character, b'_' | b'-')),
-            "task_name must contain 1 to 64 ASCII letters, digits, underscores, or hyphens");
-        ensure!(spawn.task_name != "root" && spawn.task_name != "Main", "task_name is reserved for the root");
+        validate_message(&spawn.text)?;
         ensure!(matches!(request.source, AgentSource::User | AgentSource::Model), "only root callers can admit children");
         let mut state = self.state.lock().expect("agent state poisoned");
         if let Some(existing) = state.admission_by_operation.get(&request.operation_id) {
-            ensure!(existing.agent.task_name == spawn.task_name && existing.task.message == spawn.message
+            ensure!(existing.agent.definition == selection.profile && existing.task.message == spawn.text
                 && existing.task.source == request.source && existing.task.parent_exchange_id == parent_exchange_id,
                 "operation identity was reused for different child work");
             return Ok(existing.clone());
         }
         ensure!(state.quiescence_count == 0, "child admission is closed during cancellation or a policy transition");
-        ensure!(!state.agent_by_id.values().any(|agent| agent.task_name == spawn.task_name)
-            && !state.admission_by_operation.values().any(|admission| admission.agent.task_name == spawn.task_name),
-            "task name is already admitted in this session: {}", spawn.task_name);
         let reservation_count = state.admission_by_operation.values().filter(|admission|
             admission.launch && !state.execution_by_agent.contains_key(&admission.agent.id)
                 && !state.task_by_id.contains_key(&admission.task.id)).count();
         ensure!(state.execution_by_agent.len() + reservation_count < MAX_ACTIVE_CHILDREN,
             "this session already has eight active children");
-        let mut agent = Agent::pending(&self.session_id, &spawn.task_name, &spawn.message, now_ms);
+        let mut ordinal = 1;
+        let task_name = loop {
+            let candidate = format!("{}-{ordinal}", selection.profile);
+            if !state.agent_by_id.values().any(|agent|agent.task_name == candidate)
+                && !state.admission_by_operation.values().any(|admission|admission.agent.task_name == candidate) { break candidate; }
+            ordinal += 1;
+        };
+        let mut agent = Agent::pending(&self.session_id, &selection.profile, &spawn.text, now_ms);
+        agent.task_path = format!("/root/{task_name}");
+        agent.task_name = task_name;
         agent.source = request.source;
         agent.selection = Some(selection);
         let task = AgentTask { id: uuid::Uuid::new_v4().to_string(), session_id: self.session_id.clone(), agent_id: agent.id.clone(),
             operation_id: request.operation_id.clone(), ordinal: 1, source: request.source,
-            parent_exchange_id: parent_exchange_id.into(), message: spawn.message.clone(), state: ExchangeState::Queued,
-            final_response: None, error: None, parent_reported: false, created_at_ms: now_ms, completed_at_ms: None };
+            parent_exchange_id: parent_exchange_id.into(), message: spawn.text.clone(), state: ExchangeState::Queued,
+            final_response: None, error: None, parent_reported: false, created_at_ms: now_ms, last_activity_at_ms: None, completed_at_ms: None };
         let admission = AgentAdmission { agent, task, launch: true };
         state.admission_by_operation.insert(request.operation_id.clone(), admission.clone());
         Ok(admission)
@@ -240,7 +262,7 @@ impl AgentCoordinator {
         let task = AgentTask { id: uuid::Uuid::new_v4().to_string(), session_id: self.session_id.clone(), agent_id: agent.id.clone(),
             operation_id: request.operation_id.clone(), ordinal, source: request.source, parent_exchange_id: parent_exchange_id.into(),
             message: message.into(), state: ExchangeState::Queued, final_response: None, error: None,
-            parent_reported: false, created_at_ms: now_ms, completed_at_ms: None };
+            parent_reported: false, created_at_ms: now_ms, last_activity_at_ms: None, completed_at_ms: None };
         let admission = AgentAdmission { agent, task, launch };
         state.admission_by_operation.insert(request.operation_id.clone(), admission.clone());
         Ok(admission)
@@ -282,6 +304,17 @@ impl AgentCoordinator {
         Ok(resolve_agent(&self.state.lock().expect("agent state poisoned"), &self.session_id, target)?.clone())
     }
 
+    /// Selects the executing run before queued follow-ups, or the last run when idle.
+    pub(crate) fn inspection(&self, target: &str) -> Result<(Agent, AgentTask)> {
+        let state = self.state.lock().expect("agent state poisoned");
+        let agent = resolve_agent(&state, &self.session_id, target)?.clone();
+        let active = state.execution_by_agent.get(&agent.id)
+            .and_then(|execution|state.task_by_id.get(&execution.active_task_id));
+        let task = active.or_else(||state.task_by_id.values().filter(|task|task.agent_id == agent.id)
+            .max_by_key(|task|task.ordinal)).context("child has no admitted task")?.clone();
+        Ok((agent,task))
+    }
+
     pub fn interrupt(&self, target: &str) -> Result<Vec<AgentTask>> {
         let mut state = self.state.lock().expect("agent state poisoned");
         let agent = resolve_agent(&state, &self.session_id, target)?.clone();
@@ -315,6 +348,12 @@ impl AgentCoordinator {
             && task.parent_exchange_id == parent_exchange_id && task.completed_at_ms.is_some() && !task.parent_reported).cloned().collect();
         result.sort_by_key(|task| (task.completed_at_ms, task.created_at_ms, task.ordinal));
         result
+    }
+
+    /// Reports unfinished model-delegated work owned by this exchange.
+    pub fn has_active_task(&self, parent_exchange_id: &str) -> bool {
+        self.state.lock().expect("agent state poisoned").task_by_id.values().any(|task|task.source == AgentSource::Model
+            && task.parent_exchange_id == parent_exchange_id && task.completed_at_ms.is_none())
     }
 
     pub fn has_unresolved_task(&self, parent_exchange_id: &str) -> bool {

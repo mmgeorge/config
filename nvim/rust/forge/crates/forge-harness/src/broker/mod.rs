@@ -535,6 +535,7 @@ pub struct HarnessBroker {
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
     prompt_admission: Option<(forge_buffer::identity::DocumentId, u64)>,
     active_wait_projection: Option<ActiveWait>,
+    pub(crate) parent_input: crate::backend::SteeringLane,
     timeline_reconciled_after_dispatch: bool,
     turn_cancellation: Arc<TurnCancellation>,
 }
@@ -718,8 +719,12 @@ impl HarnessBroker {
             let agent = agent_registry.get(&task.agent_id).cloned().context("stored task has no owning child")?;
             agent_coordinator.retain(agent, task)?;
         }
-        let agent_backend_factory = crate::agent::AgentBackendFactory::new(request.backend.clone(), request.backend_launch_by_provider.clone(),
+        let mut agent_backend_factory = crate::agent::AgentBackendFactory::new(request.backend.clone(), request.backend_launch_by_provider.clone(),
             permission_coordinator.clone(), trace.clone(), data_root.clone());
+        let profile_path = request.permission_file.as_deref().map(std::path::Path::new)
+            .and_then(std::path::Path::parent).unwrap_or(&data_root).join("subagents.json");
+        agent_backend_factory.profiles = Arc::new(crate::agent::AgentProfileStore::new(profile_path));
+        agent_coordinator.set_profiles(agent_backend_factory.profiles.clone());
         let presentation = Arc::new(std::sync::Mutex::new(SessionPresentation::new(
             session.id.clone(),
         )));
@@ -758,6 +763,7 @@ impl HarnessBroker {
             presentation,
             prompt_admission: None,
             active_wait_projection: None,
+            parent_input: Default::default(),
             timeline_reconciled_after_dispatch: false,
             turn_cancellation: Arc::new(TurnCancellation::new()),
         };
@@ -920,6 +926,9 @@ impl HarnessBroker {
             active_wait.as_ref(),
             interaction.last(),
         );
+        if status == crate::session::state_machine::SessionPhase::Idle && self.agent_coordinator.active_count() > 0 {
+            status = crate::session::state_machine::SessionPhase::WaitingForAgent {agent_count:self.agent_coordinator.active_count()};
+        }
         if let Some(execution) = goal_execution.as_ref() { Self::execution_status(&mut status, execution); }
         if let Some(started_at_ms) = session_event_list.iter().rev().find_map(|event| match &event.detail {
             SessionEventKind::Compaction { compaction }
@@ -952,7 +961,7 @@ impl HarnessBroker {
             plan_file: &self.plan_file,
         })?;
         if status.visible() {
-            timeline.push(TimelineEntry::Status {
+            timeline.push(TimelineEntry::Status { agent_count: self.agent_coordinator.active_count(),
                 id: format!("{}:status", self.session.id),
                 created_at_ms: 0,
                 status: status.clone(),
@@ -1245,6 +1254,12 @@ impl HarnessBroker {
                 let provider = crate::backend::BackendKind::parse(&required_text(&params,"provider")?)?;
                 let model = self.agent_backend_factory.model_list(provider,self.backend_request(BackendInput::from_text(String::new()),PromptMode::Chat)).await?;
                 Ok((serde_json::to_value(model)?,Vec::new()))
+            }
+            HarnessMethod::AgentProfilesGet => Ok((serde_json::to_value(self.agent_backend_factory.profiles.snapshot()?)?, Vec::new())),
+            HarnessMethod::AgentProfilesSave => {
+                let revision = required_text(&params, "expected_revision")?;
+                let document = serde_json::from_value(params["document"].clone())?;
+                Ok((serde_json::to_value(self.agent_backend_factory.profiles.save(&revision, document)?)?, Vec::new()))
             }
             HarnessMethod::PermissionsOpen => self.open_permission_document(),
             HarnessMethod::PermissionsSave => self.save_permission_document(params),
@@ -1940,11 +1955,8 @@ impl HarnessBroker {
         if let Some(task) = self.store.list_agent_task(&self.session.id)?.into_iter().find(|task|task.operation_id == request.operation_id) {
             let agent = self.agent_coordinator.resolve(&task.agent_id)?;
             let same_work = match &request.operation {
-                AgentOperation::Spawn(spawn) => task.ordinal == 1 && agent.task_name == spawn.task_name && task.message == spawn.message
-                    && agent.selection.as_ref().is_some_and(|selection|
-                        spawn.provider.as_deref().is_none_or(|provider|provider == crate::agent::provider_name(selection.provider))
-                        && spawn.model.as_deref().is_none_or(|model|model == selection.model)
-                        && spawn.reasoning_effort.as_deref().is_none_or(|effort|effort == selection.reasoning_effort)),
+                AgentOperation::Spawn(spawn) => task.ordinal == 1 && task.message == spawn.text
+                    && spawn.profile.as_deref().is_none_or(|profile|profile == agent.definition),
                 AgentOperation::Followup {target,message} => task.ordinal > 1 && task.message == *message
                     && self.agent_coordinator.resolve(target)?.id == agent.id,
                 _ => false,
@@ -1955,6 +1967,42 @@ impl HarnessBroker {
             return Ok(json!({"agent":agent,"task":task,"status":"admitted","replayed":true}));
         }
         match &request.operation {
+            AgentOperation::Activity { target, limit } => {
+                let settings = self.agent_backend_factory.profiles.snapshot()?;
+                let limit = limit.unwrap_or(settings.document.activity_limit);
+                let (agent, task) = self.agent_coordinator.inspection(target)?;
+                let saved;
+                let exchange = if let Some(runtime) = self.child_exchange_runtime_by_agent.get(&agent.id)
+                    .filter(|runtime|runtime.exchange.id == task.id) { &runtime.exchange }
+                else {
+                    saved = self.store.load_exchange_metadata(&task.id)?.context("child activity exchange missing")?;
+                    &saved
+                };
+                let awaiting_approval = self.permission_coordinator.pending_list()?.iter().any(|approval|
+                    approval.execution_owner.as_ref().is_some_and(|owner|owner.agent_id == agent.id && owner.session_id == self.session.id));
+                let mut result = serde_json::to_value(crate::agent::AgentActivity::capture(
+                    &agent,&task,exchange,limit,self.clock.now_ms(),awaiting_approval)?)?;
+                if let Some(warning) = settings.error {result["warning"] = warning.into();}
+                return Ok(result);
+            }
+            AgentOperation::ToolOutput { call_ref, offset, limit } => {
+                let reference = crate::agent::AgentToolReference::decode(call_ref)?;
+                anyhow::ensure!(reference.session_id == self.session.id, "tool reference belongs to another root session");
+                let agent = self.agent_coordinator.resolve(&reference.agent_id)?;
+                let task = self.agent_coordinator.task(&reference.exchange_id).context("tool reference has no admitted child run")?;
+                anyhow::ensure!(task.agent_id == agent.id && task.session_id == self.session.id,
+                    "tool reference crosses child ownership");
+                let exchange = self.store.load_exchange_metadata(&reference.exchange_id)?.context("tool reference exchange missing")?;
+                anyhow::ensure!(exchange.agent_id == agent.id && exchange.session_id == self.session.id,
+                    "tool reference crosses exchange ownership");
+                let tool = exchange.turn.iter().find(|turn|turn.id() == reference.turn_id)
+                    .and_then(|turn|turn.tools().find(|tool|tool.id == reference.tool_id))
+                    .context("tool reference does not identify a recorded call")?;
+                let page = self.store.tool_output_page(&exchange.id,&reference.turn_id,&reference.tool_id,*offset,*limit)?;
+                return Ok(json!({"call_ref":call_ref,"status":crate::agent::tool_activity_status(tool),
+                    "failed":tool.failed,"output":page.output,"offset":offset,
+                    "next_offset":page.next_offset,"total_chars":page.total_chars}));
+            }
             AgentOperation::List { prefix } => {
                 let mut entry = Vec::new();
                 if prefix.as_deref().is_none_or(|prefix|"/root".starts_with(prefix)) {
@@ -1962,18 +2010,6 @@ impl HarnessBroker {
                 }
                 entry.extend(self.agent_coordinator.snapshot(prefix.as_deref()).into_iter().map(|(agent, task)|json!({"agent":agent,"latest_task":task})));
                 return Ok(json!({"agents":entry}));
-            }
-            AgentOperation::Report { task_id } => {
-                anyhow::ensure!(request.source == AgentSource::Model, "only the authenticated root can acknowledge child results");
-                for id in task_id {
-                    let mut task = self.agent_coordinator.task(id).context("result task is not owned by this root")?;
-                    anyhow::ensure!(task.session_id == self.session.id && task.completed_at_ms.is_some(),
-                        "result acknowledgment crosses session ownership or precedes completion");
-                    task.parent_reported = true;
-                    self.store.save_agent_task(&task)?;
-                    self.agent_coordinator.retain(self.agent_coordinator.resolve(&task.agent_id)?,task)?;
-                }
-                return Ok(json!({"reported":task_id}));
             }
             AgentOperation::Message { target, message } => {
                 anyhow::ensure!(!message.trim().is_empty() && message.len() <= 256 * 1024, "informational message must contain 1 to 262144 bytes");
@@ -1987,7 +2023,7 @@ impl HarnessBroker {
                 if let Some(backend) = self.child_backend_by_agent.get(&agent.id)
                     && backend.descriptor().capability.native_steer
                     && backend.has_active_turn(&crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()}.runtime_key()).await {
-                    match backend.steer_session(&crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()}.runtime_key(), message.clone()).await {
+                    match backend.steer_session(&crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()}.runtime_key(), message.clone().into()).await {
                         Ok(()) => delivery = crate::agent::MessageDelivery::Steered,
                         Err(error) => self.trace.record(&self.session.id,"agent.message_queued",json!({
                             "agent_id":agent.id,"reason":"steering_not_accepted","error":format!("{error:#}")})),
@@ -2036,7 +2072,10 @@ impl HarnessBroker {
         if let Some(parent) = parent.as_deref_mut() { *parent = admitted_parent; }
         else { admitted_parent.finish(ExchangeState::Complete, self.clock.now_ms())?; self.store.save_exchange(&admitted_parent)?; }
         self.trace.record(&self.session.id,"agent.admitted",json!({"agent_id":admission.agent.id,"exchange_id":admission.task.id,"parent_exchange_id":admission.task.parent_exchange_id,"source":admission.task.source}));
-        let result = json!({"agent":admission.agent,"task":admission.task,"status":"admitted"});
+        let warning = if matches!(request.operation, AgentOperation::Spawn(_)) {
+            self.agent_backend_factory.profiles.snapshot()?.error
+        } else { None };
+        let result = json!({"agent":admission.agent,"task":admission.task,"status":"admitted","warning":warning});
         if launch && admission.launch { self.launch_managed_agent(admission, event).await?; }
         self.publish_agent_state(event).await?;
         Ok(result)
@@ -2110,10 +2149,6 @@ impl HarnessBroker {
     async fn launch_managed_agent(&mut self, mut admission: crate::agent::AgentAdmission, event: &mut Vec<SessionEvent>) -> Result<()> {
         let owner = crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:admission.agent.id.clone()};
         let prepared = (|| -> Result<_> {
-            if let Some(selection) = admission.agent.selection.as_mut() {
-                selection.access = self.session.access.clone();
-                selection.execution_mode = self.session.execution_mode;
-            }
             let mut message = admission.task.message.clone();
             for incoming in admission.agent.inbox.iter_mut().filter(|message|message.delivery == crate::agent::MessageDelivery::Queued) {
                 message.push_str(&format!("\n\nAdditional information:\n{}",incoming.message));
@@ -2252,6 +2287,10 @@ impl HarnessBroker {
         }
         if backend_event.tool_output_delta().is_some() { self.store.save_tool_output_delta(&runtime.exchange,&backend_event)?; }
         else { self.store.save_exchange(&runtime.exchange)?; }
+        task.last_activity_at_ms = Some(task.last_activity_at_ms.unwrap_or(i64::MIN)
+            .max(backend_event.received_at_ms.unwrap_or_else(||self.clock.now_ms())));
+        self.store.save_agent_task(&task)?;
+        self.agent_coordinator.retain(self.agent_coordinator.resolve(&owner.agent_id)?,task)?;
         self.child_exchange_runtime_by_agent.insert(owner.agent_id,runtime);
         if matches!(backend_event.kind.as_str(),"approval_requested" | "approval_resolved" | "approval_cancelled") {
             self.emit_backend_event(backend_event,event).await?;
@@ -4308,89 +4347,299 @@ Planning continuation: turn {} of {}.",
         Ok(())
     }
 
+    fn agent_result_message(&self, task: &crate::agent::AgentTask) -> Result<String> {
+        let agent = self.agent_coordinator.resolve(&task.agent_id)?;
+        Ok(format!("Harness child result. This is a report from a child agent, not a new user request.\n{}",
+            serde_json::to_string(&json!({
+                "agent":agent.task_path,"task_id":task.id,"status":task.state,
+                "response":task.final_response,"error":task.error,
+            }))?))
+    }
+
+    fn acknowledge_agent_result(&mut self, mut task: crate::agent::AgentTask) -> Result<()> {
+        task.parent_reported = true;
+        self.store.save_agent_task(&task)?;
+        self.agent_coordinator.retain(self.agent_coordinator.resolve(&task.agent_id)?,task)
+    }
+
+    fn start_agent_result_delivery(&self, attached: &[crate::agent::AgentTask],
+        attempted: &mut std::collections::HashSet<String>,
+        delivery: &mut tokio::task::JoinSet<(crate::agent::AgentTask,Result<()>)>) -> Result<()> {
+        if !self.backend.descriptor().capability.native_steer {return Ok(());}
+        for task in self.agent_coordinator.unreported_result() {
+            if attached.iter().any(|attached|attached.id == task.id) || !attempted.insert(task.id.clone()) {continue;}
+            let message = self.agent_result_message(&task)?;
+            let backend = self.backend.clone();
+            let session_id = self.session.id.clone();
+            delivery.spawn(async move {
+                let result = tokio::time::timeout(std::time::Duration::from_secs(30),async {
+                    anyhow::ensure!(backend.has_active_turn(&session_id).await,"parent provider turn ended before delivery");
+                    backend.steer_session(&session_id,crate::backend::SteeringInput::AgentResult(message)).await
+                }).await.context("parent result delivery exceeded 30 seconds").and_then(|result|result);
+                (task,result)
+            });
+        }
+        Ok(())
+    }
+
+    fn finish_agent_result_delivery(&mut self, delivery: std::result::Result<(crate::agent::AgentTask,Result<()>),tokio::task::JoinError>) -> Result<()> {
+        let (task,result) = delivery.context("parent result delivery task failed")?;
+        match result {
+            Ok(()) => {
+                self.trace.record(&self.session.id,"agent.result_delivered",json!({"task_id":task.id,"delivery":"steered"}));
+                self.acknowledge_agent_result(task)?;
+            }
+            Err(error) => self.trace.record(&self.session.id,"agent.result_queued",json!({
+                "task_id":task.id,"error":format!("{error:#}")})),
+        }
+        Ok(())
+    }
+
     async fn prompt_with_timeline(
         &mut self,
         mut request: BackendRequest,
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
     ) -> Result<crate::backend::BackendOutput> {
+        let mut parent_input = self.parent_input.activate(None)?;
+        let mut deferred_input = std::collections::VecDeque::new();
         let mut continuation_count = 0;
-        let mut aggregate:Option<crate::backend::BackendOutput> = None;
-        let mut continuation_result:Vec<crate::agent::AgentTask> = Vec::new();
+        let mut aggregate: Option<crate::backend::BackendOutput> = None;
+        let mut continuation_result = self.agent_coordinator.unreported_result();
+        if !continuation_result.is_empty() {
+            let message = continuation_result
+                .iter()
+                .map(|task| self.agent_result_message(task))
+                .collect::<Result<Vec<_>>>()?
+                .join("\n\n");
+            match &mut request.input {
+                BackendInput::Text { text } => {
+                    text.push_str("\n\n");
+                    text.push_str(&message);
+                }
+                BackendInput::Skill { arguments, .. } => {
+                    arguments.push_str("\n\n");
+                    arguments.push_str(&message);
+                }
+            }
+        }
         loop {
             if self.turn_cancellation.requested.load(Ordering::Acquire) {
                 return Err(anyhow::Error::new(TurnCancelled));
             }
-            let output = self.prompt_provider_with_timeline(request.clone(),interaction,event).await?;
-            for mut task in continuation_result.drain(..) {
-                task.parent_reported = true;
-                self.store.save_agent_task(&task)?;
-                self.agent_coordinator.retain(self.agent_coordinator.resolve(&task.agent_id)?,task)?;
+            let output = self
+                .prompt_provider_with_timeline(
+                    request.clone(),
+                    interaction,
+                    event,
+                    &continuation_result,
+                    &mut parent_input,
+                    &mut deferred_input,
+                )
+                .await?;
+            for task in continuation_result.drain(..) {
+                self.acknowledge_agent_result(task)?;
             }
             if let Some(runtime) = &mut self.exchange_runtime {
-                finish_synthetic_turn(interaction,runtime.synthetic_turn.as_ref(),crate::turn::TurnOutcome::Completed,self.clock.now_ms())?;
+                finish_synthetic_turn(
+                    interaction,
+                    runtime.synthetic_turn.as_ref(),
+                    crate::turn::TurnOutcome::Completed,
+                    self.clock.now_ms(),
+                )?;
                 runtime.synthetic_turn = None;
                 self.store.save_exchange(interaction)?;
             }
-            let user_decision = output.plan_question.is_some() || output.question_withdrawal.is_some()
-                || output.plan_submit.is_some() || output.control_error.is_some() || output.evidence.structured_blocked
+            let user_decision = output.plan_question.is_some()
+                || output.question_withdrawal.is_some()
+                || output.plan_submit.is_some()
+                || output.control_error.is_some()
+                || output.evidence.structured_blocked
                 || interaction.awaiting_input;
-            request.backend_session_id = output.backend_session_id.clone().or(request.backend_session_id);
+            request.backend_session_id = output
+                .backend_session_id
+                .clone()
+                .or(request.backend_session_id);
             aggregate = Some(if let Some(mut aggregate) = aggregate {
                 aggregate.event.extend(output.event.clone());
-                aggregate.backend_session_id = output.backend_session_id.clone().or(aggregate.backend_session_id);
-                aggregate.provider_checkpoint_id = output.provider_checkpoint_id.or(aggregate.provider_checkpoint_id);
+                aggregate.backend_session_id = output
+                    .backend_session_id
+                    .clone()
+                    .or(aggregate.backend_session_id);
+                aggregate.provider_checkpoint_id = output
+                    .provider_checkpoint_id
+                    .or(aggregate.provider_checkpoint_id);
                 aggregate.plan_edit.extend(output.plan_edit);
                 aggregate.design_patch.extend(output.design_patch);
                 aggregate.plan_deviation.extend(output.plan_deviation);
                 aggregate.plan_task_report.extend(output.plan_task_report);
                 aggregate.plan_read = output.plan_read.or(aggregate.plan_read);
                 aggregate.question_answer = output.question_answer.or(aggregate.question_answer);
-                aggregate.question_withdrawal = output.question_withdrawal.or(aggregate.question_withdrawal);
+                aggregate.question_withdrawal =
+                    output.question_withdrawal.or(aggregate.question_withdrawal);
                 aggregate.structured_plan |= output.structured_plan;
                 aggregate.evidence.workspace_changed |= output.evidence.workspace_changed;
                 aggregate.evidence.tool_called |= output.evidence.tool_called;
-                aggregate.evidence.native_state = output.evidence.native_state.or(aggregate.evidence.native_state);
+                aggregate.evidence.native_state = output
+                    .evidence
+                    .native_state
+                    .or(aggregate.evidence.native_state);
                 aggregate.evidence.structured_complete |= output.evidence.structured_complete;
                 aggregate.evidence.structured_blocked |= output.evidence.structured_blocked;
-                aggregate.metrics.context_usage = output.metrics.context_usage.or(aggregate.metrics.context_usage);
-                aggregate.metrics.native_compact_update = output.metrics.native_compact_update.or(aggregate.metrics.native_compact_update);
+                aggregate.metrics.context_usage = output
+                    .metrics
+                    .context_usage
+                    .or(aggregate.metrics.context_usage);
+                aggregate.metrics.native_compact_update = output
+                    .metrics
+                    .native_compact_update
+                    .or(aggregate.metrics.native_compact_update);
                 aggregate.capability = output.capability;
                 aggregate.runtime = output.runtime.clone();
                 aggregate.plan_question = output.plan_question;
                 aggregate.plan_submit = output.plan_submit;
                 aggregate.control_error = output.control_error;
                 aggregate
-            } else {output});
-            if user_decision {break;}
+            } else {
+                output
+            });
+            if user_decision {
+                break;
+            }
             let mut revision = self.agent_coordinator.subscribe();
             let mut continuation_input = None;
-            while self.agent_coordinator.has_unresolved_task(&interaction.id) {
+            loop {
                 if self.turn_cancellation.requested.load(Ordering::Acquire) {
                     return Err(anyhow::Error::new(TurnCancelled));
                 }
                 event.extend(self.drain_agent_commands(Some(interaction)).await?);
+                while let Some(input) = parent_input.try_receive() {
+                    deferred_input.push_back(input);
+                }
+                if self.agent_coordinator.is_quiescing() {
+                    tokio::select! {
+                        biased;
+                        _ = self.turn_cancellation.cancelled() => return Err(anyhow::Error::new(TurnCancelled)),
+                        changed = revision.changed() => {
+                            changed.context("agent coordinator closed during child cleanup")?;
+                        }
+                    }
+                    continue;
+                }
+                if let Some(input) = deferred_input.pop_front() {
+                    self.resume_parent_input(interaction, &input.text, event)
+                        .await?;
+                    continuation_input = Some(BackendInput::from_text(input.text.clone()));
+                    input.complete(Ok(())).await;
+                    continuation_result = self.agent_coordinator.unreported_result();
+                    if let Some(BackendInput::Text { text }) = &mut continuation_input {
+                        for task in &continuation_result {
+                            text.push_str("\n\n");
+                            text.push_str(&self.agent_result_message(task)?);
+                        }
+                    }
+                    break;
+                }
+                if !self.agent_coordinator.has_unresolved_task(&interaction.id) {
+                    break;
+                }
                 let result = self.agent_coordinator.pending_result(&interaction.id);
-                if !result.is_empty() {
-                    anyhow::ensure!(continuation_count < self.goal_max_turns,"child-result continuation reached the session turn limit");
+                if !self.agent_coordinator.has_active_task(&interaction.id) && !result.is_empty() {
+                    anyhow::ensure!(
+                        continuation_count < self.goal_max_turns,
+                        "child-result continuation reached the session turn limit"
+                    );
                     continuation_count += 1;
-                    let input = format!("Continue this same request using the following Harness-owned child results. Each result retains its child identity, task, outcome, and response. The full transcripts remain separate. Synthesize the results and complete the original request when its required work is settled.\n\n{}",
-                        serde_json::to_string(&result)?);
+                    let message = result
+                        .iter()
+                        .map(|task| self.agent_result_message(task))
+                        .collect::<Result<Vec<_>>>()?
+                        .join("\n\n");
+                    continuation_input = Some(BackendInput::from_text(format!(
+                        "Continue this same unfinished request using the child messages below. Synthesize the results and complete the original request when its required work is settled.\n\n{message}"
+                    )));
                     continuation_result = result;
-                    continuation_input = Some(BackendInput::from_text(input));
                     self.trace.record(&self.session.id,"agent.parent_continuation",json!({"agent_id":self.session.primary_agent_id,"exchange_id":interaction.id,"turn":continuation_count}));
                     break;
                 }
-                if !self.agent_coordinator.has_unresolved_task(&interaction.id) {break;}
+                self.set_parent_wait(interaction, true, event).await?;
                 tokio::select! {
                     biased;
                     _ = self.turn_cancellation.cancelled() => return Err(anyhow::Error::new(TurnCancelled)),
+                    input = parent_input.receive() => {deferred_input.push_back(input.context("parent input receiver closed")?);}
                     changed = revision.changed() => {changed.context("agent coordinator closed while parent awaits results")?;}
                 }
             }
-            if let Some(input) = continuation_input {request.input = input;} else {break;}
+            self.set_parent_wait(interaction, false, event).await?;
+            if let Some(input) = continuation_input {
+                request.input = input;
+            } else {
+                break;
+            }
         }
         aggregate.context("provider returned no parent output")
+    }
+
+    async fn set_parent_wait(
+        &mut self,
+        interaction: &mut Exchange,
+        waiting: bool,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        let now_ms = self.clock.now_ms();
+        let previous = self
+            .active_wait_projection
+            .as_ref()
+            .filter(|wait| wait.exchange_id == interaction.id);
+        let started_at_ms = previous.map_or(now_ms, |wait| wait.started_at_ms);
+        if !waiting && previous.is_none() {
+            return Ok(());
+        }
+        interaction.observe_blocker("agent_wait".into(), waiting, now_ms);
+        self.active_wait_projection = waiting.then(|| ActiveWait {
+            exchange_id: interaction.id.clone(),
+            started_at_ms,
+            agent_count: self.agent_coordinator.active_count(),
+        });
+        if let Some(runtime) = &mut self.exchange_runtime {
+            runtime.active_wait = self.active_wait_projection.clone();
+        }
+        self.store.save_exchange(interaction)?;
+        let patch = self.reconcile_live_interaction(Some(interaction), None)?;
+        self.emit_timeline_patch(patch, event).await
+    }
+
+    async fn resume_parent_input(
+        &mut self,
+        interaction: &mut Exchange,
+        text: &str,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<()> {
+        interaction.append_input(
+            crate::exchange::InputIntent::Steering,
+            text.to_owned(),
+            self.clock.now_ms(),
+        )?;
+        if let Some(runtime) = &mut self.exchange_runtime {
+            runtime.retraction_eligible = false;
+        }
+        self.set_parent_wait(interaction, false, event).await?;
+        self.store.save_exchange(interaction)?;
+        self.emit_backend_event(
+            BackendEvent {
+                received_at_ms: None,
+                address: None,
+                turn_boundary: None,
+                kind: "timeline_node_updated".into(),
+                text: None,
+                data: json!({"exchange_id":interaction.id,"node":interaction.node_list.last()}),
+                activity: None,
+                summary: None,
+                task_update: None,
+            },
+            event,
+        )
+        .await
     }
 
     async fn prompt_provider_with_timeline(
@@ -4398,11 +4647,17 @@ Planning continuation: turn {} of {}.",
         mut request: BackendRequest,
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
+        attached_result: &[crate::agent::AgentTask],
+        parent_input: &mut crate::backend::ActiveSteering,
+        deferred_input: &mut std::collections::VecDeque<crate::backend::SteerCommand>,
     ) -> Result<crate::backend::BackendOutput> {
         let (agent_scope, _agent_lease) = crate::agent::AgentToolScope::new(crate::backend::ExecutionOwner::root(&self.session.id),
             interaction.id.clone(),self.agent_coordinator.clone())?;
         if let Some(context) = &mut request.control_context {context.agent = Some(agent_scope);}
         let mut agent_revision = self.agent_coordinator.subscribe();
+        let mut attempted_result = std::collections::HashSet::new();
+        let mut result_delivery = tokio::task::JoinSet::new();
+        let mut user_delivery = tokio::task::JoinSet::new();
         event.extend(self.drain_agent_commands(Some(interaction)).await?);
         let mut runtime = self
             .exchange_runtime
@@ -4439,9 +4694,30 @@ Planning continuation: turn {} of {}.",
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => break Err(anyhow::Error::new(TurnCancelled)),
+                    input = parent_input.receive(), if user_delivery.is_empty() && deferred_input.is_empty() => {
+                        let input = input.context("parent input receiver closed")?;
+                        if self.backend.descriptor().capability.native_steer {
+                            let backend = self.backend.clone();
+                            let session_id = self.session.id.clone();
+                            user_delivery.spawn(async move {
+                                let result = tokio::time::timeout(std::time::Duration::from_secs(30),
+                                    backend.steer_session(&session_id,crate::backend::SteeringInput::User(input.text.clone())))
+                                    .await.context("parent input delivery exceeded 30 seconds").and_then(|result|result);
+                                (input,result)
+                            });
+                        } else {deferred_input.push_back(input);}
+                    }
+                    delivery = user_delivery.join_next(), if !user_delivery.is_empty() => {
+                        let (input,result) = delivery.context("parent input delivery disappeared")?.context("parent input delivery failed")?;
+                        if result.is_ok() {input.complete(Ok(())).await;} else {deferred_input.push_back(input);}
+                    }
                     changed = agent_revision.changed() => {
                         changed.context("agent coordinator closed during root execution")?;
                         event.extend(self.drain_agent_commands(Some(interaction)).await?);
+                        self.start_agent_result_delivery(attached_result,&mut attempted_result,&mut result_delivery)?;
+                    }
+                    delivery = result_delivery.join_next(), if !result_delivery.is_empty() => {
+                        self.finish_agent_result_delivery(delivery.context("parent result delivery disappeared")?)?;
                     }
                     control = execution_receiver.recv() => {
                         if let Some(control) = control {
@@ -4572,12 +4848,32 @@ Planning continuation: turn {} of {}.",
                         {
                             break Err(error);
                         }
+                        self.start_agent_result_delivery(attached_result,&mut attempted_result,&mut result_delivery)?;
                     }
                     error = crate::backend::events::failed(delivery_sink.as_ref()) => break Err(error.into()),
                     result = &mut prompt => break result,
                 }
             }
         };
+        while !result_delivery.is_empty() {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {result_delivery.abort_all(); break;}
+                delivery = result_delivery.join_next() => {
+                    self.finish_agent_result_delivery(delivery.context("parent result delivery disappeared")?)?;
+                }
+            }
+        }
+        while !user_delivery.is_empty() {
+            tokio::select! {
+                biased;
+                _ = cancellation.cancelled() => {user_delivery.abort_all(); break;}
+                delivery = user_delivery.join_next() => {
+                    let (input,result) = delivery.context("parent input delivery disappeared")?.context("parent input delivery failed")?;
+                    if result.is_ok() {input.complete(Ok(())).await;} else {deferred_input.push_back(input);}
+                }
+            }
+        }
         drop(pending_revision.take());
         let mut outcome = if !matches!(*cancellation.cleanup.borrow(), ExecutionCleanup::Idle) {
             Err(anyhow::Error::new(TurnCancelled))
@@ -5444,6 +5740,9 @@ Planning continuation: turn {} of {}.",
             self.active_wait_projection.as_ref(),
             interaction,
         );
+        if status == crate::session::state_machine::SessionPhase::Idle && self.agent_coordinator.active_count() > 0 {
+            status = crate::session::state_machine::SessionPhase::WaitingForAgent {agent_count:self.agent_coordinator.active_count()};
+        }
         if let Some(execution_id) = interaction.and_then(|exchange| exchange.execution_id.as_deref())
             && let Some(execution) = self.store.load_plan_execution(execution_id)? {
             Self::execution_status(&mut status, &execution);
@@ -7876,7 +8175,7 @@ mod test {
         let mut broker = planning_question_broker(repository.path(),data.path(),false);
         broker.session.backend_session_id = Some("root-history".into());
         assert!(!broker.agent_coordinator.enabled());
-        let (admitted,_) = broker.start_agent(json!({"task_name":"review","message":"CHILD_FIRST"})).await?;
+        let (admitted,_) = broker.start_agent(json!({"profile":"worker","text":"CHILD_FIRST"})).await?;
         let agent_id = admitted["agent"]["id"].as_str().context("admission has no child identity")?.to_owned();
         assert_eq!(admitted["status"],"admitted");
         let event = settle_managed_children(&mut broker).await?;
@@ -7921,12 +8220,12 @@ mod test {
             let turn = self.turn.fetch_add(1,Ordering::AcqRel);
             if turn == 0 {
                 let scope = request.control_context.as_ref().and_then(|context|context.agent.as_ref()).context("root has no authenticated agent lane")?;
-                let response = scope.invoke("harness_spawn_agent",json!({"task_name":"child","message":"CHILD_RESULT"})).await?;
+                let response = scope.invoke("harness_spawn_agent",json!({"profile":"worker","text":"CHILD_RESULT"})).await?;
                 assert!(response.contains("admitted"));
             } else {
                 anyhow::ensure!(turn == 1,"parent continuation duplicated");
                 anyhow::ensure!(request.backend_session_id.as_deref() == Some("parent-history"),"parent lost its conversation");
-                anyhow::ensure!(matches!(&request.input,BackendInput::Text {text} if text.contains("CHILD_RESULT") && text.contains("final_response")),"parent continuation omitted child result");
+                anyhow::ensure!(matches!(&request.input,BackendInput::Text {text} if text.contains("CHILD_RESULT") && text.contains("\"response\"")),"parent continuation omitted child result");
             }
             if let Some(sink) = sink {sink.send_wait(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,kind:"assistant_message".into(),
                 text:Some(if turn == 0 {"Waiting for child"} else {"SYNTHESIZED_RESULT"}.into()),data:Value::Null,activity:None,summary:None,task_update:None}).await?;}
@@ -13154,14 +13453,15 @@ mod test {
             assert!(broker.store.list_agent_task(&broker.session.id)?.is_empty());
             assert_eq!(broker.agent_coordinator.active_count(), 0);
         }
-        let params = json!({"task_name":"manual-code-explorer","message":"Inspect tests"});
+        let params = json!({"profile":"code-explorer","text":"Inspect tests"});
         let (admitted, _) = broker.start_agent(params.clone()).await?;
-        assert_eq!(admitted["agent"]["task_name"], "manual-code-explorer");
+        assert_eq!(admitted["agent"]["task_name"], "code-explorer-1");
         settle_managed_children(&mut broker).await?;
-        assert!(broker.start_agent(params).await.is_err());
-        assert_eq!(broker.agent_registry.list().len(), 1);
+        assert!(broker.start_agent(params).await.is_ok());
+        settle_managed_children(&mut broker).await?;
+        assert_eq!(broker.agent_registry.list().len(), 2);
         let task = broker.store.list_agent_task(&broker.session.id)?;
-        assert_eq!(task.len(), 1);
+        assert_eq!(task.len(), 2);
         assert_eq!(task[0].state, ExchangeState::Complete);
         assert_eq!(broker.agent_coordinator.active_count(), 0);
         Ok(())

@@ -1139,6 +1139,7 @@ fn apply_projection<'operation>(open: &mut OpenPresentation, patch: &TimelinePat
                 let old_chunks = if expanded { source.inline_prefix_chunks(limit)? } else { 1 };
                 let first_chunk = if expanded { source.inline_tail()? } else { 0 };
                 source.append(delta)?;
+                if source.group.is_empty() { continue; }
                 let block_id = forge_buffer::identity::BlockId(format!("{call_id}:tool"));
                 let previous = open.transcript.document.block(&block_id).context("streamed tool block is missing")?;
                 let layout = previous.metadata.layout.clone();
@@ -2199,6 +2200,101 @@ mod tests {
     }
 
     #[test]
+    fn child_fold_streams_headers_then_collapses_completed_history() -> Result<()> {
+        use super::super::nodes::{NodeAction, NodeRequest};
+        use crate::backend::{BackendEvent, ToolActivity, ToolActivityKind, TurnBoundary};
+        use crate::exchange::{ExchangeNode, ExchangeState};
+        let live = |identity: &str| -> Result<Exchange> {
+            let TimelineEntry::Exchange { exchange, .. } = interaction_entry(identity) else { unreachable!() };
+            let mut raw = serde_json::to_value(exchange)?;
+            raw["state"] = serde_json::json!("running");
+            raw["completed_at_ms"] = serde_json::Value::Null;
+            raw["execution_started_at_ms"] = serde_json::json!(1);
+            raw["turn"][0]["state"] = serde_json::json!({"kind":"running"});
+            raw["turn"][0]["tool"]["item"]["tool"]["status"] = serde_json::json!("inProgress");
+            raw["turn"][0]["tool"]["item"]["tool"]["completed_at_ms"] = serde_json::Value::Null;
+            Ok(serde_json::from_value(raw)?)
+        };
+        let mut child = live("child")?;
+        let mut parent = live("parent")?;
+        parent.turn.clear();
+        parent.node_list.clear();
+        let mut run = crate::agent::Agent::pending("session", "explorer", "Inspect", 0);
+        run.id = "child-run".into();
+        parent.node_list.push(ExchangeNode::AgentReference { agent: crate::agent::Delegation {
+            id: "delegation".into(), parent_exchange_id: parent.id.clone(), parent_turn_id: None,
+            child_agent_id: run.id.clone(), child_exchange_id: child.id.clone(),
+            task: child.prompt.clone(), created_at_ms: 0,
+        } });
+        let entry = |child: Exchange| TimelineEntry::Exchange {
+            id: parent.id.clone(), created_at_ms: 0, exchange: parent.clone(),
+            agent_by_id: HashMap::from([(run.id.clone(), TimelineEntry::AgentLifecycle {
+                id: run.id.clone(), created_at_ms: 0, run: run.clone(), exchange: vec![child], agent: Vec::new(),
+            })]),
+        };
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![entry(child.clone())])?;
+        let document = DocumentId("transcript:child-fold".into());
+        let view = ViewId("view:child-fold".into());
+        owner.open(document.clone(), view.clone(), WidthProfile::default())?;
+        let contents = |owner: &SessionPresentation| -> Result<String> {
+            Ok(owner.snapshot(&document)?.block.iter().flat_map(|block| block.text.wire_rows())
+                .collect::<Vec<_>>().join("\n"))
+        };
+        assert!(contents(&owner)?.contains("Read output"));
+        assert!(!contents(&owner)?.contains("sixth"));
+        let generation = owner.open.as_ref().unwrap().sections.nodes.generation("delegation").unwrap();
+        let expand = |sequence| PresentationRequest::Node { request: NodeRequest {
+            document: document.clone(), view: view.clone(), sequence, node: "delegation".into(), generation,
+            action: NodeAction::SetExpansion { expanded: true }, rows: 48, width: WidthProfile::default(),
+        } };
+        owner.dispatch(expand(1))?;
+        owner.dispatch(PresentationRequest::SelectAgent { document: document.clone(), run_id: Some(run.id.clone()) })?;
+        assert!(contents(&owner)?.contains("Prompt child") && !contents(&owner)?.contains("Prompt parent"));
+        owner.dispatch(PresentationRequest::SelectAgent { document: document.clone(), run_id: None })?;
+        let mut event = BackendEvent {
+            received_at_ms: None, address: Some(child.turn[0].provider().clone()), turn_boundary: None,
+            kind: "tool".into(), text: None, data: serde_json::Value::Null,
+            activity: Some(ToolActivity { id: "tool".into(), kind: ToolActivityKind::Command,
+                title: "Read output".into(), output: Some("\nSTREAMED_CHILD_OUTPUT".into()),
+                output_delta: true, status: Some("inProgress".into()), change: Default::default() }),
+            summary: None, task_update: None,
+        };
+        child.observe_turn(&event, 2)?;
+        owner.append_tool_output(&child, &event)?.expect("child output patch");
+        assert!(!contents(&owner)?.contains("STREAMED_CHILD_OUTPUT"));
+        event.activity = None;
+        event.kind = "assistant_message".into();
+        event.text = Some("CHILD_FINAL_RESPONSE".into());
+        event.data = serde_json::json!({"phase":"final_answer"});
+        child.observe_turn(&event, 3)?;
+        owner.reconcile(vec![entry(child.clone())])?;
+        assert!(!contents(&owner)?.contains("CHILD_FINAL_RESPONSE"));
+        event.text = None;
+        event.turn_boundary = Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Completed });
+        child.observe_turn(&event, 4)?;
+        child.finish(ExchangeState::Complete, 4)?;
+        owner.reconcile(vec![entry(child)])?;
+        let completed = owner.snapshot(&document)?;
+        let heading = completed.block.iter().find(|block| block.id.0 == "delegation").unwrap();
+        assert_eq!(heading.metadata.node.as_ref().unwrap().display, forge_buffer::node::NodeDisplay::Heading);
+        assert!(!contents(&owner)?.contains("CHILD_FINAL_RESPONSE"));
+        owner.dispatch(expand(2))?;
+        assert!(contents(&owner)?.contains("Prompt child") && contents(&owner)?.contains("CHILD_FINAL_RESPONSE"));
+        expand_sections(&mut owner, "view:child-fold")?;
+        let tool_node = "child:turn:1:tool:tool";
+        let tool_generation = owner.open.as_ref().unwrap().sections.nodes.generation(tool_node).unwrap();
+        owner.dispatch(PresentationRequest::Node { request: NodeRequest {
+            document: document.clone(), view: view.clone(), sequence: 100, node: tool_node.into(), generation: tool_generation,
+            action: NodeAction::SetExpansion { expanded: true }, rows: 48, width: WidthProfile::default(),
+        } })?;
+        assert!(contents(&owner)?.contains("STREAMED_CHILD_OUTPUT"));
+        owner.dispatch(PresentationRequest::SelectAgent { document: document.clone(), run_id: Some(run.id) })?;
+        assert!(contents(&owner)?.contains("Prompt child") && !contents(&owner)?.contains("Prompt parent"));
+        Ok(())
+    }
+
+    #[test]
     fn selected_agent_updates_keep_the_submission_and_document_lifetime() -> Result<()> {
         use crate::agent::{Agent, AgentState};
         let TimelineEntry::Exchange {
@@ -2298,7 +2394,7 @@ mod tests {
         let started_at_ms = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status {
+        owner.initialize(vec![TimelineEntry::Status { agent_count: 0,
             id: "session:status".into(), created_at_ms: 0,
             status: SessionPhase::Compacting { started_at_ms },
         }])?;
@@ -2327,7 +2423,7 @@ mod tests {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![
             interaction_entry("completed"),
-            TimelineEntry::Status {
+            TimelineEntry::Status { agent_count: 0,
                 id: "status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
@@ -2424,7 +2520,7 @@ mod tests {
     #[test]
     fn active_projection_preserves_pending_submission() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status {
+        owner.initialize(vec![TimelineEntry::Status { agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::Idle,
@@ -2436,7 +2532,7 @@ mod tests {
             WidthProfile::default(),
         )?;
         owner.begin_submission(&document, 1, "draft")?;
-        owner.reconcile(vec![TimelineEntry::Status {
+        owner.reconcile(vec![TimelineEntry::Status { agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
@@ -2456,7 +2552,7 @@ mod tests {
     #[test]
     fn hidden_transcript_keeps_streaming_until_a_new_width_owner_attaches() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status {
+        owner.initialize(vec![TimelineEntry::Status { agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },
@@ -2471,7 +2567,7 @@ mod tests {
             document: document.clone(),
             view: ViewId("view:old".into()),
         })?;
-        owner.reconcile(vec![TimelineEntry::Status {
+        owner.reconcile(vec![TimelineEntry::Status { agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 3 },
@@ -2520,7 +2616,7 @@ mod tests {
     #[test]
     fn layout_follows_the_oldest_live_view_without_changing_timeline_revision() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Status {
+        owner.initialize(vec![TimelineEntry::Status { agent_count: 0,
             id: "status".into(),
             created_at_ms: 0,
             status: SessionPhase::WaitingForAgent { agent_count: 2 },

@@ -19,7 +19,7 @@ Model callbacks never reacquire the active prompt's broker lock.
 
 ## Public controls
 
-`/spawn` uses a task name, message, provider, model, and reasoning effort. `/agents` exposes Main,
+`/agents spawn` selects an enabled global profile and accepts task text. The profile owns provider, model, thinking, and speed. `/agents` exposes Main,
 Running, and Done timelines, informational messaging, follow-ups, interruption, and the root tool
 toggle. `subagent_tools` defaults off and persists through Forge's portable settings. Manual
 spawning remains available with the toggle off.
@@ -200,3 +200,372 @@ emitted `HARNESS_AGENTS_MANUAL_PASS`, `HARNESS_AGENTS_MODEL_PASS`,
 `e7160b30-18bf-471f-90c8-31dca51a8e02`. Approval delivery and popup ownership were verified by
 the service and Neovim regression fixtures. This follow-up did not repeat interactive terminal
 inspection or every provider pairing against live services.
+
+### Global subagent profiles verified on 2026-10-11
+
+The profile catalog is global at `stdpath("config")/forge/subagents.json`. Unit checks cover
+revision-checked saves, external edits, invalid-file retention, enabled profiles, captured tuning
+and instructions, permission narrowing, and provider compatibility. The picker checks cover
+field edits, profile creation and deletion, default selection, and late callbacks. Spawn and
+completion checks use the profile-and-text contract.
+
+The final library command ran from `D:/config/nvim/rust/forge` with a 300-second bound:
+
+```text
+cargo test --release --locked --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build -p forge-harness --lib --quiet -- --test-threads=4
+```
+
+It exited zero with 884 passed and 10 ignored in 28.66 seconds of test execution. An earlier
+unrestricted run hit the existing one-millisecond timeout assertion in
+`backend::events::tests::cancelled_receive_retains_partial_batch_for_final_drain` under parallel
+load. The final run limited concurrency to four test threads.
+
+The `agent_picker`, `subagent_profiles`, `harness_completion`, `harness_controller_native`,
+`harness_settings`, and `harness_timeline_position` Neovim fixtures each exited zero with a
+30-second bound using this command shape:
+
+```text
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/subagent_profiles.lua
+```
+
+The controller fixture's simulated provider failure is expected error-path output.
+
+The final executable build used a 300-second bound and exited zero in 19.88 seconds:
+
+```text
+cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --profile release --bin forge --locked --timings
+```
+
+The rebuilt artifact is `D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`. The timing report
+is `D:/.cache/nvim/rust-sidecar/forge/build/cargo-timings/cargo-timing-20261011T174723.0218254Z.html`.
+
+The integration-test compilation also exited zero in 14.83 seconds with a 300-second bound:
+
+```text
+cargo test --release --locked --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build -p forge-harness --tests --no-run
+```
+
+This compiled the library tests and the `codex_cli`, `codex_real`, `copilot_real`,
+`permission_document`, and `trace_clear` integration binaries without running those binaries.
+
+Fresh hosts ran the following commands from `D:/config`, each with a 120-second bound:
+
+```text
+nvim --headless -u NONE --cmd "lua vim.g.forge_agent_test_settings = true" -l D:/config/nvim/tests/forge/harness_owned_agents_real.lua
+nvim --headless -u NONE --cmd "lua vim.g.forge_agent_test_manual = false; vim.g.forge_agent_test_controls = true; vim.g.forge_agent_test_launch = {mock={command={'visible-blocking'},selectable=true}}" -l D:/config/nvim/tests/forge/harness_owned_agents_real.lua
+nvim --headless -u NONE -l C:/Users/mattm/AppData/Local/Temp/forge-owned-agents-copilot-codex.lua
+```
+
+All three exited zero. The mock fixtures passed settings, manual spawn, captured profile behavior
+after edits, follow-up, cancellation, and recovery. The real Copilot-to-Codex fixture emitted
+`HARNESS_AGENTS_MANUAL_PASS`, `HARNESS_AGENTS_MODEL_PASS`, `HARNESS_AGENTS_CONTROLS_PASS`, and
+`HARNESS_AGENTS_RECOVERY_PASS`. Its manual child ID was `09cd0f11-4713-4485-bda4-dd3ff0a85559`.
+It added a profile after the parent conversation started, then spawned that profile through the
+refreshed tool schema. The first live attempt exposed an SDK session-drop ordering bug that
+removed the replacement Copilot event router. Releasing the old session before resume corrected
+the handoff, and the final run completed in approximately 33 seconds.
+
+The fixtures isolate both configuration and session data in temporary directories. These checks
+do not replace interactive visual inspection, and this change did not repeat every provider
+pairing against live services. Session format 42 captures the profile fields. Older incompatible
+session records remain on disk but are hidden from the session list.
+
+### Full-page profile editing and grouped commands verified on 2026-10-11
+
+`/agents edit [profile]` replaces the profile entry in `/config`. The profile list opens a
+full-page form with native editable text, protected labels, inline Left/Right choices, and one
+revision-checked save. `/agents spawn [profile] [text]` replaces the standalone `/spawn` command.
+The existing `/agents` list and `/agents <name>` navigation remain available.
+
+The following checks ran from `D:/config`, each with a 30-second bound and exit status zero:
+
+```text
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/subagent_profiles.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_completion.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_controller_native.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_settings.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/review_editing.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/editable_native.lua
+```
+
+Each completed in under one second. Checks cover grouped command routing, profile completion,
+removal from `/config`, multiline instructions, one-save submission, renaming, asynchronous save
+failure, retention of newer edits, reload, return navigation, and late model responses. The PR
+editing fixture verifies that existing native editing and save behavior still work.
+
+LuaLS ran from `D:/config/nvim` with a 30-second bound and exited zero in 7.51 seconds:
+
+```text
+lua-language-server --check D:/config/nvim/lua/forge --configpath D:/config/nvim/.luarc.json --logpath C:/Users/mattm/AppData/Local/Temp/forge-subagent-form-luals-verified
+```
+
+The report contains 204 diagnostics elsewhere in the plugin and none in the new form, profile
+editor, command completion, shared command specification, or configuration modules. The
+controller and settings modules retain existing diagnostics outside the changed behavior.
+
+Interactive Terminal MCP inspection used a dedicated 120-column, 40-row terminal with:
+
+```text
+nvim -u NONE --cmd "set rtp+=D:/config/nvim" --cmd "lua vim.g.forge_profile_form_interactive = true" -c "luafile D:/config/nvim/tests/forge/subagent_profiles.lua"
+```
+
+The form occupied one full-page window in its own tab. Moving to Provider and pressing Right
+displayed the existing arrow control and a dirty marker. Native insertion edited Instructions
+in place. Ctrl-S cleared the dirty markers, and q returned to profile selection. This fixture
+uses a mocked profile service and does not write the user's global catalog. No Rust source or
+compiled input changed in this follow-up, so the existing rebuilt host remains the runtime artifact.
+
+### Profile picker aliases and Enabled toggles verified on 2026-10-11
+
+`/agent edit [profile]` now shares the `/agents edit [profile]` route and completion. Both
+pickers include disabled profiles. Left/Right toggles Enabled through an immediate revision-checked
+save and updates the existing picker without changing its selected profile. The default profile
+must remain enabled. Failed saves preserve the displayed state, and pending saves prevent another
+mutation, reload, or form entry.
+
+The following commands exited zero under the 30-second bound:
+
+```text
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/subagent_profiles.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_controller_native.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_completion.lua
+git diff --check
+```
+
+They completed in 0.38, 0.49, 0.36, and 0.37 seconds respectively. Profile checks use the real
+picker's Left/Right key mappings against a mocked service, covering successful toggles, retained
+selection, the default-profile rejection, stale revisions, and in-flight operation guards. The
+controller fixture printed its expected `simulated provider failure` diagnostic. Diff checking
+reported only existing CRLF-to-LF conversion warnings. This follow-up did not repeat interactive
+visual inspection or change Rust source.
+
+### Open profile configuration verified on 2026-10-11
+
+The edit picker ends with `Open config file`. Enter closes the picker and opens the global
+catalog in a normal editable tab. Profile enable/disable and delete actions ignore that row.
+
+`nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/subagent_profiles.lua`
+exited zero in 0.39 seconds. The test exercises the real Enter mapping, opens a temporary
+catalog whose path contains spaces, verifies editable buffer contents and a separate tab, and
+removes the fixture. The user's global catalog remains untouched.
+
+`git diff --check` exited zero in 0.35 seconds, with existing CRLF-to-LF conversion warnings.
+LuaLS checking the Forge plugin with `nvim/.luarc.json` exited zero in 6.91 seconds and reported
+204 existing diagnostics outside the profile editor. These checks completed within 30 seconds.
+
+### Shared picker value shortcuts verified on 2026-10-11
+
+Picker value actions resolve `keymaps.picker.previous_value` and `next_value` through the shared
+keymap configuration. Defaults preserve Left/Right and add `r` for previous and `h` for next.
+Settings, profiles, models, and plan revisions use those commands. Forms retain their existing
+bindings. Pickers without value actions do not acquire these aliases.
+
+Each command below exited zero within 30 seconds, completing in under one second:
+
+```text
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/picker.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/subagent_profiles.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_settings.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_plan_picker.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_model_pins.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/picker_buffer_lock.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_approval.lua
+```
+
+The tests exercise letter aliases, preserved arrows, custom bindings, disabled bindings, and
+removal of stale mappings after picker updates. The picker fixture printed its expected native
+policy diagnostic. `git diff --check` exited zero with existing CRLF conversion warnings. LuaLS
+exited zero in 6.87 seconds with the same 204 pre-existing diagnostics and none in the shared
+picker, configuration, model picker, or profile editor. No interactive visual check was repeated.
+
+### Explicit agent tool commands verified on 2026-10-11
+
+`/agents on` and `/agents off` route explicit booleans through the existing validated
+configuration path. Completion offers both commands. Repetition keeps the requested state,
+and selected child timelines and active work do not redirect these controls into prompts.
+
+`nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_controller_native.lua`
+exited zero in 0.47 seconds, including its expected simulated-provider-failure diagnostic.
+`nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_completion.lua`
+exited zero in 0.36 seconds. Checks cover repeated on/off routing, the selected-child boundary,
+preservation of queued work, composer clearing, and full and partial command completion.
+
+`git diff --check` exited zero in 0.34 seconds with existing CRLF conversion warnings. LuaLS
+exited zero in 6.92 seconds with the same 204 existing diagnostics. All checks completed within
+30 seconds. This change reuses existing persistence and does not modify Rust code.
+
+### Agent heading speed verified on 2026-10-11
+
+The Rust projection appends `+` for fast and `++` for ultrafast immediately after the child model
+name. Standard speed has no suffix. The child selection owns this value independently of later
+parent configuration. The child-preview test checks all three tiers in running and completed
+states, including timer refreshes of the rendered heading.
+
+The following commands exited zero. The Cargo commands used a 300-second build bound and the
+fresh-host fixture used a 30-second bound:
+
+```text
+cargo test --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --locked -p forge-harness --lib child_preview_keeps_latest_thought_and_inspection_retains_full_history
+cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --bin forge --locked --timings
+cargo test --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --locked -p forge-harness --lib buffer::projection::
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/client_initialize_host.lua
+```
+
+Cargo ran from `D:/config/nvim/rust/forge`. The focused test compiled in 31.12 seconds, and all
+39 projection tests passed on the subsequent cached run. The release rebuild compiled
+`forge-harness` and `forge` in 8.19 seconds and produced
+`D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`. The fresh-host fixture passed startup,
+one application request, and process collection in 0.42 seconds. Existing hosts retain their old
+process-owned executable until restarted. This verification did not include manual visual inspection.
+
+### Nested agent folds verified on 2026-10-11
+
+Agent folds now belong to the parent's Thought fold. Running children show the latest non-final
+thought and latest tool heading, without tool output or the final response. Completion replaces
+that preview with the delegated task's normal timeline and resets live expansion so the fold
+closes. A later explicit expansion survives updates. Enter on the first line opens the owned
+child timeline independently of fold controls.
+
+The projection test covers late agent references after the parent response, nested fold ownership,
+live preview filtering, completed task history, heading speed, timer metadata, and collapse state.
+The session test covers streamed output suppression, selecting a running child and returning to
+Main, completion collapse, reopening the full history and tool output, and completed child selection.
+
+These commands exited zero, with a 300-second Cargo bound and 30-second Neovim bounds:
+
+```text
+cargo test --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --locked -p forge-harness --lib buffer::
+cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --bin forge --locked --timings
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_owned_agents_real.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_timeline_position.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/client_initialize_host.lua
+```
+
+Cargo ran from `D:/config/nvim/rust/forge`. All 114 buffer tests passed in 1.11 seconds after
+9.40 seconds of compilation. The final release build compiled `forge-harness` and `forge` in
+8.17 seconds and produced `D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`.
+The real-host child fixture passed in 0.85 seconds, including a mapped Enter key on a completed
+heading and retained child follow-up history. Timeline position checks passed in 1.22 seconds,
+and fresh-host startup, application request, and collection passed in 0.45 seconds.
+The mock child completes before a live heading can be captured, so running selection is covered
+by the Rust session test. This verification did not include manual graphical inspection.
+
+### Separate child-result delivery verified on 2026-10-11
+
+The broker delivers completed child reports as attributed parent input and acknowledges each
+accepted delivery once. Active delivery runs concurrently with provider polling. Child results
+do not produce user-prompt rows. Unsupported or rejected delivery remains pending for the next
+provider input. An idle parent stays idle, and an unfinished delegated exchange can continue.
+`harness_wait_agent` returns only `message` and `timed_out` and does not consume results.
+
+Regression coverage includes two children with and without an explicit wait, a provider whose
+acceptance requires continued polling, duplicate completion, retained idle results, rejected
+steering, and suppression of user steering events for child reports. The idle fixture emits a
+complete provider-turn lifecycle before testing result retention.
+
+The final commands all exited zero:
+
+```text
+cargo test --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --locked -p forge-harness --lib idle_child_result_is_retained -- --nocapture
+cargo test --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --locked -p forge-harness --lib -- --quiet
+cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --bin forge --locked --timings
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_owned_agents_real.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_timeline_position.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/client_initialize_host.lua
+```
+
+Cargo ran from `D:/config/nvim/rust/forge`. The focused idle test passed in 0.32 seconds after
+22.96 seconds of compilation. The complete crate suite passed 889 tests with 10 ignored in
+17.26 seconds after 0.26 seconds of cached compilation. The release build completed in
+57.55 seconds and produced `D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`.
+Cargo commands completed within 300 seconds. The child fixture, timeline fixture, and startup
+fixture completed in 0.87, 1.20, and 0.45 seconds respectively, each within 30 seconds.
+The child fixture used the real host with mock providers. No live-provider or manual graphical
+verification was performed for this change. Existing hosts need a restart to load the new binary.
+
+### Harness-owned waiting verified on 2026-10-11
+
+The root exposes five child-management tools. `harness_wait_agent` is removed from the catalog
+and dispatch paths. When Main ends a provider turn with unfinished delegated children, Harness
+retains the exchange and suspends generation until all its model-delegated children settle.
+New user input resumes that exchange immediately without cancelling children, including when
+the provider lacks native steering. The existing child-cleanup guard prevents continuation
+during cancellation and policy changes. User decisions stop automatic continuation.
+
+Main keeps the existing Working, Planning, Implementing, and other activity labels. Status
+rows append the running-agent count independently. Waiting uses the existing spinner with
+`Waiting for agents`. Regression tests cover joining two children, early user input, once-only
+result delivery, cancellation during child cleanup, user decisions, status transitions, and
+composer routing without native steering.
+
+Cargo commands ran from `D:/config/nvim/rust/forge`. These final commands exited zero:
+
+```text
+cargo test --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --locked -p forge-harness --lib -- --quiet
+cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --bin forge --locked --timings
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_submit_steering.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_owned_agents_real.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_timeline_position.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/client_initialize_host.lua
+lua-language-server --check D:/config/nvim/lua/forge --configpath D:/config/nvim/.luarc.json --logpath D:/.cache/nvim/subagent-luals-configured
+```
+
+The full suite passed 891 tests with 10 ignored in 17.92 seconds including Cargo startup.
+One preceding full run failed the unchanged event-stream test
+`cancelled_receive_retains_partial_batch_for_final_drain` at its 1 ms timeout assertion.
+That test passed in isolation in 0.35 seconds and in the full rerun. The final release build
+finished without warnings in 21.12 seconds and produced
+`D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`. Cargo commands used 120-second bounds.
+
+The steering, child-host, timeline, and startup fixtures finished in 0.04, 0.52, 0.87, and 0.12
+seconds respectively, with 30-second bounds. The child-host fixture used mock providers.
+LuaLS completed in 7.17 seconds with 204 diagnostics. Comparing file, code, and message against
+the previous configured diagnostic record found no additions or removals. No live-provider or
+manual graphical verification was performed. Existing hosts need a restart to load the new binary.
+
+The final test-only import cleanup was checked with
+`cargo test --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --locked -p forge-harness --lib agent::tool_scope -- --quiet`.
+Both authority tests passed with exit zero in 37.62 seconds including compilation, within the
+120-second bound. `git diff --check` also exited zero.
+
+## Child activity inspection verified on 2026-10-11
+
+Main has two additional read-only tools. `harness_agent_activity` returns recent thoughts and
+tool metadata without output or final answers. It inspects the active run before queued
+follow-ups. `harness_agent_tool_output` reads a selected call through a stable reference that
+validates root, child, exchange, turn, and tool ownership. Reads remain valid after follow-ups
+and never execute the tool again. Output pagination preserves Unicode and NUL characters
+across stored chunks. Provider activity timestamps remain unchanged by inspection.
+
+The global `activity_limit` defaults to five entries and accepts 1–20. `/agents edit` exposes
+an `Activity entries` row using the shared Left/Right and `r`/`h` controls. Each call can override
+the entry count. Thoughts retain up to 4000 characters. Tool output pages default to 8000
+characters and accept up to 32000. The supervision timer and execution timeout are unchanged.
+
+Final Cargo commands ran from `D:/config/nvim/rust/forge` with 120-second process limits:
+
+```text
+cargo test --release --locked --target-dir D:/.cache/nvim/rust-sidecar/forge/build -p forge-harness --lib
+cargo build --release --locked --target-dir D:/.cache/nvim/rust-sidecar/forge/build --bin forge --timings
+```
+
+Both commands exited zero. The library suite passed 892 tests, with 10 optional live-provider
+tests ignored. Compilation took 9.18 seconds and test execution took 17.63 seconds. The release
+build compiled `forge-harness` and `forge` in 56.22 seconds and produced
+`D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`. Its timing report is
+`D:/.cache/nvim/rust-sidecar/forge/build/cargo-timings/cargo-timing-20261011T192003.5221327Z.html`.
+
+Fresh Neovim checks ran from `D:/config`, each with a 30-second limit:
+
+```text
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/harness_owned_agents_real.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/client_initialize_host.lua
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/subagent_profiles.lua
+```
+
+They exited zero in 0.49, 0.10, and 0.08 seconds respectively. The child-host fixture used mock
+providers and the rebuilt executable. LuaLS ran with `--configpath D:/config/nvim/.luarc.json`
+and a 60-second limit. It exited zero with 204 repository diagnostics and none in the changed
+profile-picker file. `git diff --check` exited zero with a 30-second limit. No live-provider or
+manual graphical verification was performed. Existing hosts require a restart for the rebuilt
+binary.

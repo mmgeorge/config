@@ -85,6 +85,14 @@ M.hint_command_ids_by_view = {
 
 ---@type table<string, ForgeStatusCommandSpec[]>
 M.view_specs = {
+  form = {
+    { id = "save", label = "save", desc = "Save all form fields", modes = { "n", "i" }, pinned = true },
+    { id = "previous_value", label = "previous value", desc = "Select the previous field value", modes = "n", pinned = false },
+    { id = "next_value", label = "next value", desc = "Select the next field value", modes = "n", pinned = false },
+    { id = "reload", label = "reload", desc = "Reload saved values and discard local edits", modes = "n", pinned = true },
+    { id = "close", label = "close", desc = "Close the saved form", modes = "n", pinned = true },
+    { id = "help", label = "help", desc = "Show form commands", modes = "n", pinned = true },
+  },
   harness = {
     { id = "visual_line_with_gutter", label = "select gutter", desc = "Start visual line selection including the diff gutter", modes = "n", pinned = false },
     { id = "submit", label = "submit", desc = "Submit the composer", modes = { "n", "i" }, pinned = true,

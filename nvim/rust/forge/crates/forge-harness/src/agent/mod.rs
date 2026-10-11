@@ -1,4 +1,5 @@
 mod agent;
+mod activity;
 mod backend;
 mod capability;
 mod coordinator;
@@ -7,12 +8,16 @@ mod event;
 mod registry;
 mod runtime;
 mod selection;
+mod profile;
 mod task;
 mod tool_scope;
 #[cfg(test)]
 mod coordinator_test;
 
 pub use selection::AgentSelection;
+pub(crate) use activity::{AgentActivity, AgentToolReference};
+pub(crate) use activity::status as tool_activity_status;
+pub use profile::{AgentProfile, AgentProfileDocument, AgentProfileStore};
 pub use coordinator::{AgentAdmission, AgentCommand, AgentCommandSender, AgentCoordinator, AgentOperation, AgentQuiescence, AgentRequest, SpawnAgentRequest};
 pub use task::{AgentMessage, AgentSource, AgentTask, MessageDelivery};
 

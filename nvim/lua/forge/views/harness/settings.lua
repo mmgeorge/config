@@ -281,8 +281,8 @@ function M.open(state, host)
           footer = "←→ change setting  Enter change/select provider  q close",
         } },
         action_list = {
-          { id = "previous-value", key = "<Left>", callback = function(context) toggle(context, -1) end },
-          { id = "next-value", key = "<Right>", callback = function(context) toggle(context, 1) end },
+          { id = "previous-value", command = "previous_value", callback = function(context) toggle(context, -1) end },
+          { id = "next-value", command = "next_value", callback = function(context) toggle(context, 1) end },
         },
         on_confirm = function(result)
           if result.option.id == "native-import" then

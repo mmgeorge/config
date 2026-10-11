@@ -478,8 +478,8 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
             id: 1,
             method: "agent.start".into(),
             params: serde_json::json!({
-                "definition": "local-code-explorer",
-                "task": "Read README.md and report its heading to the parent."
+                "profile": "code-explorer",
+                "text": "Read README.md and report its heading to the parent."
             }),
         }),
     )

@@ -1345,15 +1345,16 @@ function M.select_agent(selector)
   M.render()
 end
 
----Request one provider-backed child agent with an explicit definition and task.
----@param definition string
----@param task string
-function M.spawn_agent(task_name, message)
+--- Admit a fresh child using a global profile and explicit task text.
+---@param profile string|table
+---@param text? string
+function M.spawn_agent(profile, text)
   local state = harness_state()
-  local request = type(task_name) == "table" and task_name or { task_name = task_name, message = message }
+  local request = type(profile) == "table" and profile or { profile = profile, text = text }
   if state.presentation then state.presentation.follow_tail() end
-  client.request("agent.start", request, function(_, request_error)
+  client.request("agent.start", request, function(result, request_error)
     if request_error then notifications.error(request_error, "Harness agent") end
+    if result and result.warning then notifications.warn(result.warning, "Subagent profiles") end
     synchronize_state(M.drain)
   end)
 end
@@ -1388,18 +1389,19 @@ function M.open_agent_picker()
   })
 end
 
----Open the searchable agent-definition selector and attached task editor.
----@param definition_name? string
-function M.open_spawn_picker(task_name)
+--- Select an enabled profile and compose its task text.
+---@param profile? string
+function M.open_spawn_picker(profile)
   local state = harness_state()
-  require("forge.views.harness.spawn_picker").open({
-    host = picker_host(state),
-    task_name = task_name,
-    provider = state.session and state.session.backend or config.options.harness.backend,
-    model = state.session and (state.session.resolved_model or state.session.model),
-    load_models = function(provider, callback) client.request("agent.models", { provider = provider }, callback) end,
-    on_spawn = M.spawn_agent,
-  })
+  local session_id = state.session and state.session.id
+  client.request("agent.profiles.get", {}, function(snapshot, failure)
+    if not state.session or state.session.id ~= session_id then return end
+    if failure then notifications.error(failure, "Subagent profiles") return end
+    if snapshot.error then notifications.warn(snapshot.error, "Subagent profiles") end
+    require("forge.views.harness.spawn_picker").open({
+      host = picker_host(state), profile = profile, document = snapshot.document, on_spawn = M.spawn_agent,
+    })
+  end)
 end
 
 function M.open_session_picker()
@@ -1582,12 +1584,28 @@ function M.submit()
     M.present_plan_question(true)
     return
   end
+  local agent_tools_action = text:match("^/agents%s+(%S+)%s*$")
+  if agent_tools_action == "on" or agent_tools_action == "off" then
+    set_composer_text(state.composer_buf, "")
+    M.configure({ subagent_tools = agent_tools_action == "on" }, true)
+    return
+  end
+  local edit_profile = text:match("^/agents?%s+edit%s+(%S+)%s*$")
+  if text:match("^/agents?%s+edit%s*$") or edit_profile then
+    set_composer_text(state.composer_buf, "")
+    require("forge.views.harness.subagent_profiles").open(state, picker_host(state), edit_profile)
+    return
+  elseif text:match("^/agents?%s+edit%s+") then
+    set_composer_text(state.composer_buf, "")
+    notifications.warn("Use /agent edit or /agent edit <profile>", "ForgeHarness")
+    return
+  end
   if text == "/agents" then
     set_composer_text(state.composer_buf, "")
     M.open_agent_picker()
     return
   end
-  if text == "/spawn" then
+  if text:match("^/agents%s+spawn%s*$") then
     set_composer_text(state.composer_buf, "")
     M.open_spawn_picker()
     return
@@ -1602,6 +1620,18 @@ function M.submit()
     M.open_undo_picker()
     return
   end
+  local spawn_profile, spawn_task = text:match("^/agents%s+spawn%s+(%S+)%s+(.+)$")
+  if spawn_profile and spawn_task then
+    set_composer_text(state.composer_buf, "")
+    M.spawn_agent(spawn_profile, spawn_task)
+    return
+  end
+  local spawn_profile_only = text:match("^/agents%s+spawn%s+(%S+)%s*$")
+  if spawn_profile_only then
+    set_composer_text(state.composer_buf, "")
+    M.open_spawn_picker(spawn_profile_only)
+    return
+  end
   local agent_selector = text:match("^/agents%s+(%S+)%s*$")
   if agent_selector then
     set_composer_text(state.composer_buf, "")
@@ -1609,23 +1639,7 @@ function M.submit()
     return
   elseif text:match("^/agents%s+") then
     set_composer_text(state.composer_buf, "")
-    notifications.warn("Use /agents main, /agents <task name>, or /agents", "ForgeHarness")
-    return
-  end
-  local spawn_definition, spawn_task = text:match("^/spawn%s+(%S+)%s+(.+)$")
-  if spawn_definition and spawn_task then
-    set_composer_text(state.composer_buf, "")
-    M.spawn_agent(spawn_definition, spawn_task)
-    return
-  end
-  local spawn_definition_only = text:match("^/spawn%s+(%S+)%s*$")
-  if spawn_definition_only then
-    set_composer_text(state.composer_buf, "")
-    M.open_spawn_picker(spawn_definition_only)
-    return
-  elseif text:match("^/spawn%s+") then
-    set_composer_text(state.composer_buf, "")
-    notifications.warn("Use /spawn <task_name> <message>", "ForgeHarness")
+    notifications.warn("Use /agents, /agents on|off, /agents edit [profile], or /agents spawn <profile> <text>", "ForgeHarness")
     return
   end
   if text == "/compact" then
@@ -1714,7 +1728,7 @@ function M.submit()
   if state.busy or state.configuring then
     set_composer_text(state.composer_buf, "")
     if state.busy and not selected_agent_run(state)
-      and state.capability and state.capability.native_steer
+      and ((state.capability and state.capability.native_steer) or (state.status and state.status.kind == "waiting_for_agent"))
     then
       submit_immediate(state, text)
       return
@@ -1771,7 +1785,7 @@ function M.steer_submit()
     notifications.warn("Harness has no active turn to steer", "ForgeHarness")
     return
   end
-  if not (state.capability and state.capability.native_steer) then
+  if not ((state.capability and state.capability.native_steer) or (state.status and state.status.kind == "waiting_for_agent")) then
     notifications.warn("The current backend does not support active-turn steering", "ForgeHarness")
     return
   end

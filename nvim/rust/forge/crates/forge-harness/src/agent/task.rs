@@ -70,6 +70,9 @@ pub struct AgentTask {
     pub parent_reported: bool,
     /// Records admission before provider dispatch.
     pub created_at_ms: i64,
+    #[serde(default)]
+    /// Last accepted provider activity for this run, unchanged by inspection.
+    pub last_activity_at_ms: Option<i64>,
     /// Records confirmed completion after required cleanup settles.
     pub completed_at_ms: Option<i64>,
 }

@@ -23,7 +23,11 @@ local command_list = {
   { label = "/recap", detail = "Summarize the conversation without changing agent history" },
   { label = "/bg", detail = "List and terminate background terminals" },
   { label = "/agents", detail = "Inspect and manage Main and child-agent timelines" },
-  { label = "/spawn", detail = "Create a fresh Harness-owned child agent" },
+  { label = "/agents on", detail = "Enable subagent tools" },
+  { label = "/agents off", detail = "Disable subagent tools" },
+  { label = "/agents edit", detail = "Edit global subagent profiles" },
+  { label = "/agent edit", detail = "Edit global subagent profiles" },
+  { label = "/agents spawn", detail = "Create a fresh child from a profile" },
   { label = "/plan", detail = "Browse plans, or create a planning task with a prompt" },
   { label = "/task", detail = "List current and previous tasks" },
   { label = "/task new", detail = "Create a Plan, Execute, or Goal task" },
@@ -231,7 +235,24 @@ function CommandSource:get_completions(_, callback)
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end
-  if prefix:match("^%s*/spawn%s+") then
+  local edit_start = prefix:match("^%s*/agents?%s+edit%s+()([^%s]*)$")
+  local spawn_start = prefix:match("^%s*/agents%s+spawn%s+()([^%s]*)$")
+  local profile_action, profile_start = edit_start and "edit" or "spawn", edit_start or spawn_start
+  if profile_start then
+    client.request("agent.profiles.get", {}, function(snapshot, failure)
+      if not failure and snapshot and snapshot.document then
+        for name, profile in pairs(snapshot.document.profiles) do
+          if profile.enabled or profile_action == "edit" then
+            items[#items + 1] = value_completion(name, profile.description, row, profile_start - 1, cursor_column)
+          end
+        end
+        table.sort(items, function(left, right) return left.label < right.label end)
+      elseif failure then notifications.error(failure, "Subagent profiles") end
+      callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
+    end)
+    return
+  end
+  if prefix:match("^%s*/agents%s+spawn%s+") or prefix:match("^%s*/agents?%s+edit%s+") then
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end

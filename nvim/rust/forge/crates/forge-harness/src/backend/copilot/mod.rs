@@ -56,7 +56,7 @@ type CopilotSessionSlot = Arc<Mutex<Option<CopilotSessionBinding>>>;
 
 struct CopilotSessionBinding {
     session: SharedCopilotSession,
-    revision_tools: bool,
+    tool_schema: Vec<Value>,
     compaction: Option<compaction::CompactionMonitor>,
     _profile: Option<crate::settings::ResourceProfile>,
 }
@@ -212,9 +212,9 @@ impl CopilotBackend {
         let session_slot = self.session_slot(&request.runtime_key()?).await;
         let turn_event = self.turn_event(&request.runtime_key()?).await;
         let mut active_session = session_slot.lock().await;
-        let phase = request.control_context.as_ref().and_then(|context| context.execution.as_ref()).map(|execution| execution.phase);
-        let revision_tools = phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve);
-        if let Some(binding) = active_session.as_mut().filter(|binding| binding.revision_tools == revision_tools) {
+        let tool_schema = ControlToolRegistry.definition_list_for_context(request.control_context.as_ref(), request.owner()?.is_root())
+            .iter().map(|definition|definition.mcp_value()).collect::<Vec<_>>();
+        if let Some(binding) = active_session.as_mut().filter(|binding| binding.tool_schema == tool_schema) {
             if binding.compaction.is_none() {
                 binding.compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
                     .cloned().map(|subscription| compaction::CompactionMonitor::new(&binding.session, subscription, Arc::clone(&turn_event)));
@@ -265,6 +265,15 @@ impl CopilotBackend {
         }).transpose()?;
         let skill_directories = profile.as_ref().map(|profile| vec![profile.path().join("skills")]);
         let retained_session_id = active_session.as_ref().map(|binding| binding.session.id().to_string());
+        // Dropping the old SDK session after resume unregisters the replacement's event router.
+        if let Some(mut binding) = active_session.take() {
+            drop(binding.compaction.take());
+            if let Err(error) = binding.session.disconnect().await {
+                *active_session = Some(binding);
+                return Err(error).context("disconnect Copilot session before refreshing tools");
+            }
+            drop(binding);
+        }
         let session = if let Some(session_id) = retained_session_id.as_deref().or(request.backend_session_id.as_deref()) {
             let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
             config.excluded_tools = Some(native_agent_exclusions());
@@ -352,7 +361,7 @@ impl CopilotBackend {
         }
         let compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
             .cloned().map(|subscription| compaction::CompactionMonitor::new(&session, subscription, turn_event));
-        *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), revision_tools, compaction, _profile: profile });
+        *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), tool_schema, compaction, _profile: profile });
         Ok(session)
     }
 
@@ -1144,11 +1153,8 @@ impl Backend for CopilotBackend {
         self.turn_event(session_id).await.is_active()
     }
 
-    async fn steer(&self, _text: String) -> Result<()> {
-        anyhow::bail!("Copilot steering requires a Harness session target")
-    }
-
-    async fn steer_session(&self, session_id: &str, text: String) -> Result<()> {
+    async fn steer_session(&self, session_id: &str, input: super::SteeringInput) -> Result<()> {
+        let text = input.text().to_owned();
         self.trace.record(session_id, "copilot.session.steer", json!({"text":text}));
         let session = self
             .active_session(session_id)
@@ -1158,10 +1164,9 @@ impl Backend for CopilotBackend {
             .send(MessageOptions::new(text.clone()).with_mode(DeliveryMode::Immediate))
             .await
             .context("steer active Copilot turn")?;
-        self.turn_event(session_id)
-            .await
-            .publish_steering(text)
-            .await?;
+        if matches!(input, super::SteeringInput::User(_)) {
+            self.turn_event(session_id).await.publish_steering(text).await?;
+        }
         Ok(())
     }
 

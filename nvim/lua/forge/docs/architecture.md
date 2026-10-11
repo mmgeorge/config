@@ -3063,35 +3063,97 @@ at admission. Children receive no delegation tools or root planning authority.
 
 The portable `subagent_tools` setting defaults to false. Enabling it exposes exactly
 `harness_spawn_agent`, `harness_send_message`, `harness_followup_task`, `harness_interrupt_agent`,
-`harness_list_agents`, and `harness_wait_agent` to the root model. Manual spawning remains available
-when the setting is disabled. Model-delegated completion enters the owning root exchange's result
-queue. An active wait receives the result, otherwise the broker continues the same exchange to
-process it. Manual child completion does not start root model work. An explicit wait observes
-activity from every child, including manual children, and returns unreported completed tasks.
+`harness_list_agents`, `harness_agent_activity`, and `harness_agent_tool_output` to the root model. Manual spawning remains available
+when the setting is disabled. Completion enters a durable queue of unreported child results.
+The broker sends each result as an attributed parent message through supported active steering,
+or includes it at the next input boundary. Unfinished model delegation can continue the same
+exchange after a provider turn ends. Manual completion never starts idle root work. No model-facing
+wait tool is exposed. Main yields when only delegated work remains, and Harness resumes it
+after the relevant children settle or new user input arrives.
 
-`/spawn` accepts a unique task name and message. Its composer selects the provider, advertised
-model, and reasoning effort for an independent conversation. `/agents` presents Main, Running,
-and Done sections and preserves the selected identity across live updates. Its actions inspect a
-child timeline, send an informational message, queue a follow-up, interrupt a child or all children,
-and toggle root delegation tools. Selecting a child directs ordinary composer submission to a
-follow-up task and explicit steering submission to its informational inbox.
+`harness_agent_activity` selects the child's active run before queued follow-ups, or its latest
+run when idle. It returns the most recent entries in timeline order, elapsed milliseconds,
+last accepted provider activity, and approval/input state. Tool entries contain lifecycle,
+failure status, elapsed time, and an opaque call reference. They contain no output. Thought and
+commentary entries retain up to 4000 Unicode characters with an explicit truncation flag. Final
+answers remain on the existing completion-delivery path. The default entry count is five,
+stored as `activity_limit` in `subagents.json`, with per-call overrides bounded to 1–20.
 
-Same-provider children inherit resolved root tuning unless explicitly overridden. Cross-provider
-children resolve the target provider's saved model, reasoning effort, context window, and service
-tier against its independent model catalog. Catalog requests bypass the active root broker lock.
-Rejected or unavailable native steering retains informational messages for the next explicit
-follow-up rather than discarding them or starting idle work.
+`harness_agent_tool_output` resolves a reference containing the session, child, exchange,
+turn, and call identities. The broker validates every ownership boundary before reading.
+References survive child completion and follow-ups. Output reads use zero-based Unicode
+character offsets, default to 8000 characters, and reject limits above 32000. SQLite reads
+bounded UTF-8 byte windows without hydrating unrelated output. Each result reports the current
+call state and next offset. Running calls return available text without waiting or re-execution.
+Metadata-only inspection does not advance the child's last-activity timestamp.
+
+`/agents on` and `/agents off` submit explicit `subagent_tools` values through the same
+configuration path as `/config`. Both commands remain local during active work or child
+timeline selection and never become child prompts. Command completion offers both forms.
+
+`/agents spawn <profile> <text>` admits a fresh child using the named enabled profile. `/agents spawn`
+opens the profile picker and then the task composer. `/agents spawn <profile>` opens that composer's
+task entry directly. Completion lists enabled profile names. Repeated spawns allocate distinct
+instance names such as `reviewer-1` and `reviewer-2`. `/agents` presents Main, Running, and Done
+sections, includes a Profile column and resolved provider/model/thinking/speed, and preserves
+selection across live updates. Its existing message, follow-up, interruption, and navigation
+actions operate on the instance identity.
+
+`AgentProfileStore` owns `stdpath("config")/forge/subagents.json`, beside permissions.json.
+The file is the global source of truth across workspaces and providers. `/agents edit` opens a profile
+picker over `agent.profiles.get`, and `/agents edit <profile>` opens the named profile directly.
+`/agent edit [profile]` shares the same route. The edit picker includes disabled profiles.
+Left/Right toggles the selected profile's Enabled value through a revision-checked save.
+The `Activity entries` row uses the same controls to update the global inspection count.
+Picker value controls share `keymaps.picker.previous_value` (Left and `r`) and
+`keymaps.picker.next_value` (Right and `h`). Settings, profile toggles, model values, and plan
+revisions declare these commands instead of literal keys. Form controls retain their separate
+bindings, and picker aliases apply only where a value action is declared.
+The picker updates in place after success, retaining selection. Pending saves block further
+mutations, reload, and form entry. Failed saves retain the displayed value and report the error,
+including attempts to disable the default profile.
+Selection opens a dedicated full-page form through `shared/form.lua`, which reuses `editable.lua`
+for protected native text regions, `picker/field.lua` for choice values, and the shared command
+specification for save, reload, help, and close. Text and choice edits remain local until one
+`agent.profiles.save` submits the complete form. Confirmed saves clear only the submitted values,
+so edits made while a save is running stay dirty. Failed saves retain all drafts. Reload explicitly
+discards local edits, and closing a dirty form leaves it open. `/config` keeps only the tool toggle.
+Saves validate the complete document,
+check its content revision under a writer lock, then atomically replace the file. External edits
+reload on access. Invalid JSON retains the host's last valid catalog and surfaces a diagnostic.
+A host with no valid catalog rejects spawning until the file is repaired.
+
+Profiles contain a purpose, child instructions, enabled state, provider, model, reasoning effort,
+service tier, and permission mode. The document selects an enabled default profile. Provider
+accepts `inherit` or an explicit provider. Model, thinking, and speed distinguish `inherit` from
+`default`: inheritance copies the root's selection at admission, while default selects the target
+provider's default. Explicit and cross-provider model/effort combinations are checked against the
+provider catalog. Unsupported combinations fail before child identity or capacity is committed.
+Profiles do not infer a substitute model when an inherited model is unavailable on another provider.
+
+The spawn tool accepts only `profile` and `text`, with the configured default used when profile is
+omitted. Its advertised schema includes enabled profiles and their purposes. Provider adapters
+refresh changed tool schemas at the next root turn, retaining the provider conversation. Each
+child persists its resolved profile name, tuning, instructions, and permission ceiling. Editing
+or deleting a profile cannot retune an existing child. Follow-ups reuse this snapshot and the
+child's own history. Effective permissions are the stricter of the snapshot and current root
+mode, and the current root OS access policy remains mandatory. Profiles inherit provider tools
+subject to the existing child exclusion of delegation and root workflow tools.
 
 Child events use the shared `Exchange`, `Turn`, tool-output storage, and incremental document
 pipeline. The broker publishes registered `agent_updated` events for live picker summaries
 and timeline patches for transcript changes. Queued follow-ups cannot replace the active
 exchange's state or control target in the picker.
-Main renders each delegated child through the shared exchange heading and a stable preview of
-its latest thought. Tool activity preserves that preview. Selecting the child renders its full
-ordered message and tool history. Timer patches update child headings with their own metrics.
-The `●` agent heading includes name, provider, model, lifecycle, and elapsed time. The `○` preview
-contains only the latest thought. Enter opens the owned child timeline. Successful spawn calls
-use the agent entry as their presentation, while failed calls retain their tool error rows.
+Main nests each delegated child fold inside its owning exchange's Thought fold, including
+references received after the parent final answer. A running child shows its latest non-final
+thought with the existing `○` renderer and its latest tool heading with the existing tool renderer.
+Tool output stays in the child timeline. Completion replaces the preview with the delegated
+exchange's complete timeline and collapses the child fold. Later explicit expansion persists.
+The fold heading includes the child's name, provider, model, speed suffix, lifecycle, elapsed
+time, and metrics. Timer patches preserve fold metadata. Enter on that first line opens the
+owned child timeline while running or completed, independently of inline fold controls.
+Successful spawn calls use the agent entry as their presentation, while failed calls retain
+their tool error rows. Parent final answers remain outside the parent Thought fold.
 
 Task completion commits the exchange outcome and agent state atomically. Interruption
 cancels active and queued tasks and retains history and inbox content. Cleanup failure retains the
@@ -3105,9 +3167,26 @@ including retained cleanup failures, before changing verification state or final
 Lua adopts the tool toggle after a successful configuration response or its matching active
 configuration event, before refreshing the picker. Rejected and unrelated operations leave the
 displayed value unchanged.
-Completed child tasks ignore replayed completion and late content. Parent continuation
-acknowledges child results after successful provider dispatch and preserves pending results
-when dispatch fails.
+Completed child tasks ignore replayed completion and late content. The broker delivers each
+child report as a compact parent message containing the child path, task ID, status, response,
+and error. Supported active steering runs concurrently with provider polling and suppresses
+user-prompt rendering for child results. Provider acceptance acknowledges delivery. Rejected
+or unsupported delivery remains pending for the next input boundary, including continuation
+of an unfinished delegated exchange. Idle roots wait for explicit input.
+Harness owns waiting when a provider turn ends with unfinished model-delegated children.
+The exchange stays open while provider generation is suspended. After all children owned by
+that exchange settle, Harness starts one continuation with their pending reports. New user
+input resumes the same exchange immediately and leaves children running, including when the
+provider lacks native steering. The root input lane persists across provider-turn boundaries,
+admits at most 32 ordered inputs, and limits each input to 64 KiB. Active native steering
+retains its existing behavior. Unsupported or rejected delivery waits for the next turn boundary.
+Explicit pause, cancellation, and unresolved user decisions prevent automatic continuation.
+
+The root exposes seven management tools without a wait tool. Main retains its existing Working,
+Planning, Implementing, and other activity labels with an independent running-agent count.
+When Main has no active work, the existing spinner shows `Waiting for agents`. Manual children
+can produce that idle status but never schedule a root turn on completion. Child lifecycle and
+transcript events continue to own timeline updates independently.
 
 Child approval events retain their execution owner through persistence and transport. The shared
 permission popup adds `Agent <name> · <provider>` above the existing request details and choices.
@@ -3124,7 +3203,7 @@ Native lifecycle notifications remain diagnostics and cannot create or bind mana
 Cross-provider selection rejects any child provider unable to enforce the root's OS sandbox,
 including Copilot and ACP providers, both at spawn and on later follow-up admission.
 
-Session format 41 hides incompatible session records without deleting them. Preference format 40
+Session format 42 hides incompatible session records without deleting them. Preference format 40
 remains independent of session compatibility. Reopening retains child identities, completed
 outcomes, and provider history, marks unfinished child tasks interrupted, and never replays them
 automatically. Root forking does not transfer live child execution ownership.

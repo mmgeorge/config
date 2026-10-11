@@ -53,10 +53,21 @@ impl AcpBackend {
         capability
     }
 
-    async fn session(&self, mut request: BackendCatalogRequest) -> Result<Arc<AcpSession>> {
+    async fn session(&self, mut request: BackendCatalogRequest, tools: Option<Vec<crate::control_tools::ControlToolDefinition>>) -> Result<Arc<AcpSession>> {
         let runtime_key = request.runtime_key()?;
         let mut session_map = self.session.lock().await;
-        if let Some(session) = session_map.get(&request.runtime_key()?) { return Ok(session.clone()); }
+        if let Some(session) = session_map.get(&runtime_key).cloned() {
+            let changed = if let Some(tools) = &tools {
+                let previous = session.state.tool_definition.read().await;
+                tools.iter().map(|definition|definition.mcp_value()).collect::<Vec<_>>()
+                    != previous.iter().map(|definition|definition.mcp_value()).collect::<Vec<_>>()
+            } else { false };
+            if !changed { return Ok(session); }
+            ensure!(session.state.active.read().await.is_none(), "Tool profile changes require active execution cleanup");
+            request.backend_session_id = Some(session.id.clone());
+            session.transport.shutdown().await?;
+            session_map.remove(&runtime_key);
+        }
         if request.backend_session_id.is_none() {
             request.backend_session_id = self.conversation.lock().await.get(&request.runtime_key()?).cloned();
         }
@@ -65,8 +76,8 @@ impl AcpBackend {
         let state = Arc::new(AcpSessionState::new(self.kind, self.permission.clone()));
         let setting = crate::settings::SettingsStore::open(&self.settings_root)?.get(&request.workspace,&request.harness_session_id,
             if self.kind == BackendKind::Claude {"claude"} else {"antigravity"})?;
-        *state.tool_definition.write().await = crate::control_tools::ControlToolRegistry
-            .definition_list_for_owner(&request.owner()?,setting.desired.subagent_tools.unwrap_or(false));
+        *state.tool_definition.write().await = tools.unwrap_or_else(||crate::control_tools::ControlToolRegistry
+            .definition_list_for_owner(&request.owner().expect("validated runtime owner"),setting.desired.subagent_tools.unwrap_or(false)));
         let control = ControlServer::start(state.clone()).await?;
         let target = if self.kind == BackendKind::Claude { "claudecode" } else { "antigravity-cli" };
         let resources = crate::settings::SessionResources::load(&self.settings_root, &request,
@@ -206,7 +217,7 @@ impl Backend for AcpBackend {
 
     async fn reconcile_settings(&self, request: BackendCatalogRequest, _setting: &crate::settings::PortableSettings) -> Result<()> {
         self.cleanup_execution(&request.runtime_key()?).await?;
-        self.session(request).await?;
+        self.session(request, None).await?;
         Ok(())
     }
 
@@ -337,7 +348,8 @@ impl Backend for AcpBackend {
                 self.cleanup_execution(&request.runtime_key()?).await?;
             }
         }
-        let session = self.session(catalog_request(&request)).await?;
+        let tools = crate::control_tools::ControlToolRegistry.definition_list_for_context(request.control_context.as_ref(),request.owner()?.is_root());
+        let session = self.session(catalog_request(&request), Some(tools)).await?;
         let _turn = session.turn.try_lock().context("ACP session already owns active work")?;
         self.configure(&session, &request).await?;
         session.state.begin(&request, &session.id, sink).await;
@@ -362,7 +374,7 @@ impl Backend for AcpBackend {
     }
 
     async fn model_list(&self, request: BackendRequest) -> Result<Vec<BackendModel>> {
-        let session = self.session(catalog_request(&request)).await?;
+        let session = self.session(catalog_request(&request), None).await?;
         let catalog = session.state.catalog.read().await;
         let model_list = catalog.pointer("/models/availableModels").and_then(Value::as_array)
             .or_else(|| find_option(&catalog, "model").and_then(|option|option["options"].as_array()));
@@ -383,7 +395,7 @@ impl Backend for AcpBackend {
 
     async fn fork(&self, request: BackendForkRequest) -> Result<BackendForkResult> {
         ensure!(self.kind == BackendKind::Claude, "Antigravity does not implement native session fork");
-        let session = self.session(catalog_request(&request.source)).await?;
+        let session = self.session(catalog_request(&request.source), None).await?;
         ensure!(session.initialized.pointer("/agentCapabilities/sessionCapabilities/fork").is_some(), "Claude ACP did not advertise fork");
         let mut configuration = session.configuration.clone();
         configuration["sessionId"] = json!(session.id);
@@ -413,7 +425,8 @@ impl Backend for AcpBackend {
         Ok(())
     }
 
-    async fn steer_session(&self, id: &str, text: String) -> Result<()> {
+    async fn steer_session(&self, id: &str, input: crate::backend::SteeringInput) -> Result<()> {
+        let text = input.text();
         let session = self.session.lock().await.get(id).cloned().context("ACP conversation is not active")?;
         ensure!(self.kind == BackendKind::Claude && session.initialized.pointer("/_meta/steering/supported").and_then(Value::as_bool) == Some(true),
             "ACP agent did not advertise steering support");

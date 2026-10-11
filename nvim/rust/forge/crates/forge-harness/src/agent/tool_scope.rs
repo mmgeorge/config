@@ -1,7 +1,7 @@
 use std::sync::{Arc, atomic::{AtomicU64, Ordering}};
 
 use anyhow::{Context, Result, ensure};
-use serde_json::{Value, json};
+use serde_json::Value;
 use tokio::sync::watch;
 
 use super::{AgentCoordinator, AgentOperation, AgentRequest, AgentSource};
@@ -14,12 +14,12 @@ pub struct AgentToolScope {
     coordinator: Arc<AgentCoordinator>,
     expired: watch::Sender<bool>,
     invocation: AtomicU64,
-    observed_activity: AtomicU64,
     identity: String,
 }
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
     use super::*;
 
     #[tokio::test]
@@ -30,10 +30,18 @@ mod tests {
         assert!(AgentToolScope::new(ExecutionOwner::root("foreign"),"parent".into(),coordinator.clone()).is_err());
         let (scope,lease) = AgentToolScope::new(ExecutionOwner::root("session"),"parent".into(),coordinator.clone()).unwrap();
         assert!(scope.invoke("harness_list_agents",json!({})).await.is_err());
+        assert!(scope.invoke("harness_agent_activity",json!({"target":"child"})).await.is_err());
+        assert!(scope.invoke("harness_agent_tool_output",json!({"call_ref":"foreign"})).await.is_err());
         assert!(coordinator.try_receive().is_none());
         coordinator.set_enabled(true);
         assert!(scope.available());
-        assert!(scope.invoke("harness_spawn_agent",json!({"task_name":"forged","message":"task","execution_owner":{"session_id":"foreign"}})).await.is_err());
+        for limit in [0,21] {
+            assert!(scope.invoke("harness_agent_activity",json!({"target":"child","limit":limit})).await.is_err());
+        }
+        for limit in [0,32001] {
+            assert!(scope.invoke("harness_agent_tool_output",json!({"call_ref":"foreign","limit":limit})).await.is_err());
+        }
+        assert!(scope.invoke("harness_spawn_agent",json!({"profile":"worker","text":"task","execution_owner":{"session_id":"foreign"}})).await.is_err());
         assert!(coordinator.try_receive().is_none());
         drop(lease);
         assert!(!scope.available());
@@ -71,12 +79,13 @@ impl AgentToolScope {
         ensure!(owner.is_root(), "children cannot acquire agent tool authority");
         ensure!(coordinator.owns(&owner), "agent tool authority crosses root session ownership");
         let (expired, _) = watch::channel(false);
-        let observed_activity = AtomicU64::new(coordinator.activity_revision());
-        let scope = Arc::new(Self {owner,parent_exchange_id,coordinator,expired,invocation:AtomicU64::new(0),observed_activity,identity:uuid::Uuid::new_v4().to_string()});
+        let scope = Arc::new(Self {owner,parent_exchange_id,coordinator,expired,invocation:AtomicU64::new(0),identity:uuid::Uuid::new_v4().to_string()});
         Ok((scope.clone(),AgentToolLease(scope)))
     }
 
     pub fn available(&self) -> bool {self.owner.is_root() && !*self.expired.borrow() && self.coordinator.enabled()}
+
+    pub fn profile_schema(&self) -> Option<Value> { self.coordinator.profile_schema() }
 
     pub async fn invoke(&self, name: &str, arguments: Value) -> Result<String> {
         ensure!(self.available(), "agent tools require an enabled authenticated active root turn");
@@ -88,7 +97,17 @@ impl AgentToolScope {
             "harness_followup_task" => AgentOperation::Followup {target:text("target")?,message:text("message")?},
             "harness_interrupt_agent" => AgentOperation::Interrupt {target:text("target")?},
             "harness_list_agents" => AgentOperation::List {prefix:arguments["path_prefix"].as_str().map(str::to_owned)},
-            "harness_wait_agent" => return self.wait(arguments["timeout_ms"].as_u64().unwrap_or(30000)).await,
+            "harness_agent_activity" => {
+                let limit = arguments.get("limit").map(|value| serde_json::from_value::<usize>(value.clone())).transpose()?;
+                if let Some(limit) = limit { super::activity::validate_limit(limit)?; }
+                AgentOperation::Activity {target:text("target")?,limit}
+            }
+            "harness_agent_tool_output" => {
+                let offset = arguments.get("offset").map(|value| serde_json::from_value::<usize>(value.clone())).transpose()?.unwrap_or(0);
+                let limit = arguments.get("limit").map(|value| serde_json::from_value::<usize>(value.clone())).transpose()?.unwrap_or(8000);
+                ensure!((1..=32000).contains(&limit), "output limit must be from 1 to 32000 characters");
+                AgentOperation::ToolOutput {call_ref:text("call_ref")?,offset,limit}
+            }
             _ => anyhow::bail!("unknown agent tool: {name}"),
         };
         let response = self.request(operation).await?;
@@ -107,30 +126,4 @@ impl AgentToolScope {
         }
     }
 
-    async fn wait(&self, timeout_ms: u64) -> Result<String> {
-        ensure!((10000..=3600000).contains(&timeout_ms), "wait timeout must be between 10000 and 3600000 ms");
-        let mut activity = self.coordinator.activity();
-        let mut expired = self.expired.subscribe();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        let timed_out = loop {
-            if !self.coordinator.unreported_result().is_empty()
-                || self.coordinator.activity_revision() != self.observed_activity.load(Ordering::Acquire)
-                || self.coordinator.active_count() == 0 {break false;}
-            tokio::select! {
-                biased;
-                _ = expired.changed() => anyhow::bail!("agent wait interrupted by root turn expiration"),
-                changed = activity.changed() => {changed.context("agent activity owner closed")?; break false;},
-                _ = tokio::time::sleep_until(deadline) => break true,
-            }
-        };
-        ensure!(self.available(), "agent tool context expired or disabled during wait");
-        let observed_activity = self.coordinator.activity_revision();
-        let result = self.coordinator.unreported_result();
-        if !result.is_empty() {
-            self.request(AgentOperation::Report {task_id:result.iter().map(|task|task.id.clone()).collect()}).await?;
-        }
-        self.observed_activity.store(observed_activity, Ordering::Release);
-        Ok(serde_json::to_string(&json!({"timed_out":timed_out,"results":result,"agents":self.coordinator.snapshot(None)
-            .into_iter().map(|(agent,task)|json!({"agent":agent,"latest_task":task})).collect::<Vec<_>>()}))?)
-    }
 }

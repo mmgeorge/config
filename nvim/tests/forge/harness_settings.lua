@@ -61,6 +61,14 @@ local success, failure = xpcall(function()
   assert(not text:find("[←", 1, true), text)
   local options = {}
   for _, option in ipairs(instance.spec.page_list[1].option_list) do options[option.id] = option end
+  for index, option in ipairs(instance.spec.page_list[1].option_list) do
+    if option.id == "logging" then instance.state.selected_index_by_page[instance.spec.page_list[1].id] = index end
+  end
+  vim.fn.maparg("h", "n", false, true).callback()
+  assert(enabled, "h did not toggle the selected setting")
+  vim.fn.maparg("r", "n", false, true).callback()
+  assert(not enabled, "r did not toggle the selected setting")
+  assert(not options["subagent-profiles"], "profile editing belongs to /agents edit")
   local shell = options.shell
   local executable = vim.fn.executable
   vim.fn.executable = function(name) return name == "nu" and 0 or executable(name) end

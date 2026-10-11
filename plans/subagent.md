@@ -4,7 +4,7 @@
 
 Harness will create and manage independent provider conversations for subagents. Providers will execute individual agent turns, while Harness owns delegation, identity, scheduling, communication, cancellation, persistence, and presentation.
 
-This replaces the current parent-mediated implementation. Today, `/spawn` instructs the parent model to invoke its native spawning tool and waits for provider events to identify the resulting child. The existing agent records, timeline rendering, and picker provide reusable foundations.
+This replaces the prior parent-mediated implementation, which instructed the parent model to invoke its native spawning tool and waited for provider events to identify the resulting child. The existing agent records, timeline rendering, and picker provide reusable foundations.
 
 The initial implementation has these fixed decisions:
 
@@ -12,18 +12,18 @@ The initial implementation has these fixed decisions:
 | --- | --- |
 | Providers | Support Codex, Copilot, Claude Code, and Antigravity, including children using a different provider from their parent. |
 | Context | Every newly spawned child starts a fresh provider conversation. No parent-history copying or forking. |
-| Roles | Generic agents only. Do not load native or Rulesync subagent definitions in this version. |
+| Profiles | User-owned global profiles select provider, model, thinking, speed, instructions, and a permission ceiling. Do not load native or Rulesync subagent definitions. |
 | Workspace | Children share the root session's workspace. No worktree creation or automatic change merging. |
 | Concurrency | Permit eight simultaneously active children per root session, excluding the root. |
-| Delegation authority | Only the root can spawn and manage children. Children receive none of the six agent tools. |
-| Tool setting | Model-facing subagent tools default to off. Manual `/spawn` remains available. |
+| Delegation authority | Only the root can spawn and manage children. Children receive none of the seven agent tools. |
+| Tool setting | Model-facing subagent tools default to off. Manual `/agents spawn` remains available. |
 | Native spawning | Disable it for every root and child wherever the provider supports suppression. |
 | Model-delegated completion | Continue the parent's unfinished request automatically to process child results. |
 | Manual completion | Display and save the result without automatically running the main agent. |
 
 Follow-up tasks reuse the child's own conversation. "Fresh context" applies when creating a new agent, not when continuing an existing one.
 
-Automatic `explore` orchestration, plan decomposition, verification-agent selection, custom roles, and nested spawning remain outside this implementation.
+Automatic `explore` orchestration, plan decomposition, verification-agent selection, automatic role selection, and nested spawning remain outside this implementation.
 
 ## 2. Runtime ownership and durable state
 
@@ -62,7 +62,7 @@ Persist, for each child:
 
 Continue using `Delegation`, `Exchange`, and `Turn` for causal relationships and execution history. A reusable child identity must remain distinct from each task performed through it.
 
-Use `/root/<task_name>` as the canonical task path. Require unique task names within a root session. Resolve tool targets by stable ID, canonical path, or an unambiguous task name within that session. Reject cross-session targets.
+Use `/root/<task_name>` as the canonical task path. Allocate unique instance names from the selected profile within a root session. Repeated use of one profile creates independent instances. Resolve tool targets by stable ID, canonical path, or an unambiguous task name within that session. Reject cross-session targets.
 
 ### Admission and lifecycle
 
@@ -95,7 +95,7 @@ Normalize each backend's available events into the existing Harness contracts. D
 
 Apply events to the correct child state before publishing the corresponding UI update. Serialize mutations per child and preserve causal order. Events from siblings may interleave without overwriting each other's timeline state. Repeated delivery must update the existing message or tool call rather than append duplicates, and late events from an ended turn must not reopen that turn or mutate a newer follow-up.
 
-The main timeline derives each child's heading and latest-thought preview from this event-fed state. Tool events update child history and heading metrics without appearing in the main timeline preview. The selected child's full timeline receives its normal live thought, message, and tool updates. Both views must remain current while the root is running, waiting, or idle, without requiring another root model turn or manual refresh.
+The main timeline derives each child's heading, latest non-final thought, and latest tool heading from this event-fed state. Tool output stays out of the running preview. Completion replaces the preview with the delegated task's complete timeline inside an automatically collapsed fold. The selected child's full timeline receives its normal live thought, message, and tool updates. Both views must remain current while the root is running, waiting, or idle, without requiring another root model turn or manual refresh.
 
 Persist child history and terminal outcomes through the existing storage lifecycle so reopening the session reconstructs the same timelines. Preserve the existing handling of transient streaming updates. Elapsed time may use the existing display clock, but child activity must come from execution events rather than polling provider transcripts.
 
@@ -106,8 +106,8 @@ A model-delegated child belongs to the parent exchange that created it. Ending o
 When results arrive:
 
 - Persist the result before publishing its notification.
-- Deliver it to an active wait or queue it for the parent's next safe input boundary.
-- If the parent has stopped generating while delegated work remains, schedule a continuation within the same exchange.
+- Queue one compact, attributed parent message containing the child path, task ID, status, response, and error. Deliver it to an active provider through supported steering without rendering it as a user prompt.
+- If the parent has stopped generating while delegated work remains, keep the exchange open and suspend provider generation. Resume automatically after all model-delegated children for that exchange settle, or immediately when the user submits new input. New input retains the same exchange and leaves children running.
 - Serialize parent turns and coalesce already-available results. Concurrent child completions must not start concurrent parent turns.
 - Include child identity, task, terminal outcome, and final response. Preserve the full child transcript separately.
 
@@ -123,18 +123,19 @@ Register these through the existing Harness control-tool infrastructure, using t
 
 | Tool | Contract |
 | --- | --- |
-| `harness_spawn_agent` | Requires `task_name` and `message`. Accepts optional `provider`, `model`, and `reasoning_effort`. Returns the child identity, canonical task path, and resolved execution selection. |
+| `harness_spawn_agent` | Requires `text` and accepts optional `profile`, defaulting to the configured default profile. The profile owns all tuning. Returns the child identity, canonical task path, profile, and resolved execution selection. |
 | `harness_send_message` | Requires `target` and `message`. Supplies additional information without independently starting a new child turn. Reports whether delivery was queued or accepted by an active provider turn. |
 | `harness_followup_task` | Requires `target` and `message`. Creates another task for an existing child, retaining that child's conversation and provider selection. |
 | `harness_interrupt_agent` | Requires `target`. Stops that child's current work and leaves its identity available for a later explicit follow-up. |
 | `harness_list_agents` | Lists the root and children, optionally filtered by task-path prefix, with lifecycle, provider/model, and latest task outcome. |
-| `harness_wait_agent` | Waits for child activity, completion, user interruption, or timeout. Returns available notifications and results without requiring another retrieval tool. |
+| `harness_agent_activity` | Requires `target`, with optional `limit` from 1–20. Returns recent thoughts and tool metadata, timing and approval state, without tool output or final responses. Selects the active run before queued follow-ups. |
+| `harness_agent_tool_output` | Requires the opaque `call_ref` returned by activity inspection. Reads existing output with zero-based Unicode character `offset` and `limit` (default 8000, maximum 32000). Returns current status, failure flag, total character count, and next offset. Never re-executes a call. |
 
 Do not expose `agent_type` or `fork_turns`.
 
-The six operations reproduce the needed v2 capabilities, not Codex's exact wire format. In particular, `wait_agent` should return available result content directly so every backend can consume it through an ordinary tool response.
+The seven operations expose child management without a model-facing wait tool. Harness owns waiting after a provider turn ends. The broker acknowledges a child report only after the provider accepts it. Unsupported or rejected active delivery retains the report for the next provider input boundary. An unfinished delegated exchange can continue after its provider turn ends. Completion alone never starts an idle root conversation. Pending reports also accompany the next explicit parent input without replaying already delivered reports.
 
-Use Codex's familiar wait bounds: 30 seconds by default, a 10-second minimum, and a one-hour maximum. Waiting must remain asynchronous and cancellable.
+Waiting remains asynchronous and cancellable. A child completion wakes the coordinator without starting another provider turn until all relevant children settle. New user input resumes Main even on providers without native steering. Keep the existing Working, Planning, Implementing, and other activity labels. Append the running-child count independently. Show the existing spinner with `Waiting for agents` only when Main has no active work. Explicit pause, cancellation, and unresolved user decisions take precedence and must not trigger automatic continuation.
 
 ### Message and follow-up semantics
 
@@ -152,12 +153,36 @@ Bind all tool authority to the authenticated caller context. Reject forged calle
 
 ### Fresh sessions and configuration
 
-Resolve selection before launch:
+Resolve an enabled profile from the global `stdpath("config")/forge/subagents.json` before launch.
+The document contains `default_profile`, `activity_limit` (default 5, range 1-20), and a named `profiles` map. Each profile supplies
+`enabled`, `description`, `instructions`, `provider`, `model`, `reasoning_effort`, `service_tier`,
+and `permission_mode`. No duplicate editable profile state belongs in SQLite.
 
-- Without an override, use the parent's provider and resolved model/settings.
-- When another provider is selected, use that provider's configured defaults.
-- When an explicit model changes, resolve its supported reasoning settings rather than copying an incompatible value.
-- Reject unsupported explicit selections with actionable errors. Do not silently substitute a different provider or model.
+- Resolve `inherit` independently against the root configuration at admission.
+- Resolve model/thinking/speed `default` against the selected provider's defaults.
+- Validate explicit and cross-provider model/thinking combinations without silently substituting another model.
+- Persist the profile name, resolved tuning, child instructions, and permission ceiling on the child.
+- Retain that snapshot for follow-ups even if the global profile changes or disappears.
+- Apply the stricter of captured and current root permissions at every launch.
+
+`/agents edit` opens profile selection, and `/agents edit <profile>` opens the named profile.
+`/agents on` and `/agents off` set the persisted `subagent_tools` setting explicitly through
+the same configuration path as `/config`. Repeated commands retain the requested state and
+remain local controls while a child timeline is selected or work is running.
+`/agent edit [profile]` is an alias. Both edit pickers include enabled and disabled profiles.
+Left/Right toggles the selected profile's Enabled value and saves immediately without moving
+the selection. Failed saves retain the previous value. The default profile cannot be disabled
+until another enabled profile becomes the default.
+The final `Open config file` row opens the global `subagents.json` in a normal editable tab
+on Enter. It does not expose profile toggle or delete actions.
+Selecting or creating a profile opens a full-page form using the shared editable-region and
+choice controls used by existing Forge UI. Keep text edits local, cycle choices inline, and save
+the complete form with `:write` or `<C-s>`. Preserve newer edits across asynchronous saves and
+retain drafts after failures. Reload discards local edits. Keep the profile editor out of `/config`.
+The form edits the same JSON file. Validate saves, detect stale revisions,
+and atomically replace the file. Reload external edits on access. Retain the last valid catalog
+and display errors for invalid external edits. A newly started host with no valid catalog rejects
+spawning until repair. Model tool schemas advertise only enabled profile names and purposes.
 
 Children receive normal Harness execution instructions, workspace instructions, selected resources, and the explicit task. They receive no parent transcript, hidden planning conversation, or root plan/goal authority.
 
@@ -184,21 +209,12 @@ Remove native-agent events as a source of managed child identities. Retain ordin
 
 ## 4. User interface, settings, and persistence
 
-### `/spawn`
+### `/agents spawn`
 
-Replace the current native-definition picker with a generic spawn composer using existing picker controls.
-
-Provide:
-
-- Task name.
-- Task message.
-- Provider.
-- Model.
-- Reasoning selection where supported.
-
-Default selections from the current root configuration. Present the actual resolved provider/model and report launch failures in the normal notification and agent-status surfaces.
-
-Support `/spawn` for the composer and `/spawn <task_name> <message>` for direct creation using defaults. Remove the previous interpretation of the first argument as a native role definition.
+Use the existing picker to select an enabled profile, then compose its task text.
+`/agents spawn <profile> <text>` starts directly. `/agents spawn <profile>` opens task entry with that profile
+selected. Completion lists enabled profiles. The parent cannot choose provider, model, thinking,
+or speed through spawn arguments. Repeated spawns create independently named instances.
 
 The command returns control after admission. It must not hold the UI busy until the child finishes.
 
@@ -206,7 +222,7 @@ The command returns control after admission. It must not hold the UI busy until 
 
 Replace the singular `/agent` entry point with `/agents`. Extend the existing picker and timeline selection instead of introducing a separate agent viewer.
 
-Show Main, active children, and finished children. Each child exposes its task name, provider/model, execution state, and latest outcome.
+Show Main, active children, and finished children. Each child exposes its instance name, profile, resolved provider/model/thinking/speed, execution state, and latest outcome.
 
 Provide actions to:
 
@@ -226,29 +242,29 @@ Reuse the existing exchange heading and thought renderer for agent previews. Do 
 
 Each agent entry uses the existing exchange heading format with the agent name, provider, lifecycle, elapsed time, tool metrics, and token metrics. All metrics belong to that child and retain the existing formatting and semantics.
 
-Beneath each running agent's heading, show only its most recent thought using the same UI that renders that content in an ordinary executing exchange. Update the preview in place when a newer thought arrives. Keep the latest thought visible while tools execute, and show no thought preview until the child has emitted one. Do not display tool calls or tool output in the main timeline's agent preview. Tool activity continues to update the heading's existing metrics.
+Beneath each running agent's heading, show its most recent non-final thought and latest tool heading using the ordinary thought and tool renderers. Update each preview in place when newer content arrives. Keep the thought visible while tools execute, and omit it until the child emits one. Do not display tool output or final answers in the running preview. Tool activity continues to update the heading's metrics.
 
-The accepted presentation uses the existing `●` exchange heading and `○` thought rendering. The example values and thought text below are illustrative. Preserve normal wrapping and styling rather than introducing a separate preview format.
+Nest agent folds inside their owning parent Thought fold. Use the existing fold marker, `○` thought rendering, and `•` tool heading. The example values and thought text below are illustrative. Preserve normal wrapping and styling.
 
 ```text
-● Agent parser-review · Codex · Running 6s │ Tools 2s · 3/3 pass │ Tokens 28.3k (0%) -> 136 · 20 tps
-
-  ○ The parser returns early here. I’m checking whether cleanup still runs.
-
-● Agent test-review · Claude Code · Running 9s │ Tools 4s · 4/5 pass │ Tokens 19.2k (42%) -> 284 · 32 tps
-
-  ○ The existing tests cover malformed input, but none exercise cancellation.
+▾ Thought 9s │ Tools 4s · 4/5 pass
+  ▾ Agent parser-review · codex · gpt-6.1-sol ++ · Running 6s │ Tokens 28.3k (0%) -> 136 · 20 tps
+    ○ The parser returns early here. I’m checking whether cleanup still runs.
+    •  0.2s sem.sem_context(...)
+  ▸ Agent test-review · claude · Completed 9s │ Tokens 19.2k (42%) -> 284 · 32 tps
 ```
 
-Enter on the agent heading opens the corresponding child's full timeline. That timeline renders the child's complete history with the ordinary exchange, thought, and tool UI. Preserve existing thought and tool interactions within their rendered content.
+On completion, replace the live preview with the delegated exchange's full timeline, including its prompt, thoughts, tools, and final answer, and automatically collapse the agent fold. Keep normal child Thought and tool folds inside it. Explicit expansion after completion persists across later updates. Keep the parent's final answer outside its Thought fold.
 
-Use the agent entry as the presentation of the spawn operation rather than adding a duplicate raw spawn-tool entry. Reuse this presentation for manually spawned children. Keep the full child transcript available through navigation rather than appending every child event to the main timeline.
+Enter on the first line of the agent fold opens the corresponding child's full timeline, whether running or completed. Fold controls expand and collapse inline content separately. The child timeline includes the agent's complete conversation across follow-ups with the ordinary exchange, thought, and tool UI.
+
+Use the agent entry as the presentation of the spawn operation rather than adding a duplicate raw spawn-tool entry. Reuse this presentation for manually spawned children. Keep completed task history inside its child fold and the complete child conversation available through navigation.
 
 ### `/config` and capability presentation
 
 Add `PortableSettings.subagent_tools: Option<bool>` through the existing revisioned global, workspace, and session settings pipeline. Resolve an unset value to false.
 
-The toggle governs the root's six model-facing tools. It does not govern manual `/spawn`, the existence of the coordinator, or native suppression. Child conversations always receive zero agent tools.
+The toggle governs the root's seven model-facing tools. It does not govern manual `/agents spawn`, the existence of the coordinator, or native suppression. Child conversations always receive zero agent tools.
 
 Refresh root tool exposure through the existing configuration transition machinery. A tool-visibility-only change must preserve admitted children and deliver their eventual results. Reject new hidden tool calls after the change takes effect.
 
@@ -281,7 +297,7 @@ Keep runtime ownership in Rust and reuse the existing Lua presentation. The prin
 | Agent state | `nvim/rust/forge/crates/forge-harness/src/agent/`: add the coordinator, revise agent and delegation state, replace native control capabilities, and remove native catalog discovery from the active path. |
 | Execution ownership | The Harness service, session controller, broker, and backend request types: add agent-scoped runtime ownership and route child operations without reacquiring the active root prompt's broker lock. |
 | Provider adapters | Codex, Copilot, and ACP backends: isolate connection/session maps, apply native suppression, and scope event routing, cancellation, and permissions. |
-| Tool contract | `control_tools/` and ACP's private control server: register the six schemas, dispatch authenticated requests, and filter tool exposure per root/child context and setting. |
+| Tool contract | `control_tools/` and ACP's private control server: register the seven schemas, dispatch authenticated requests, and filter tool exposure per root/child context and setting. |
 | Settings and storage | `settings/settings.rs`, storage records, and session format: persist the toggle and child state, preserve compatible preferences, and hide incompatible sessions. |
 | User interaction | `nvim/lua/forge/views/harness/controller.lua`, `spawn_picker.lua`, and `agent_picker.lua`: replace native-role spawning, add `/agents`, and retain live timeline selection. |
 | Verification and documentation | Existing Rust tests, `nvim/tests/forge/agent_picker.lua`, controller/settings tests, `nvim/lua/forge/docs/architecture.md`, and `nvim/tests/forge/plans/harness-owned-agents.md`: verify the new ownership model and replace obsolete native-fallback guidance. |
@@ -290,8 +306,8 @@ Keep runtime ownership in Rust and reuse the existing Lua presentation. The prin
 
 1. **Establish execution ownership.** Add the coordinator, agent-scoped provider keys, durable task state, and fake-backend tests. Reuse existing records and rendering code.
 2. **Implement generic fresh children.** Support independent conversations and provider selection across all four adapters, with scoped permissions and cancellation.
-3. **Replace orchestration and expose tools.** Route the six tools through the coordinator, implement inboxes and parent continuation, and remove parent-mediated spawning.
-4. **Update the user controls.** Replace the native-role `/spawn` workflow, introduce `/agents`, and add the persisted tool toggle.
+3. **Replace orchestration and expose tools.** Route the seven tools through the coordinator, implement inboxes and parent continuation, and remove parent-mediated spawning.
+4. **Update the user controls.** Replace the native-role `/agents spawn` workflow, introduce `/agents`, and add the persisted tool toggle.
 5. **Complete the cutover.** Remove obsolete native-agent control modes and catalog discovery, update capability reporting, documentation, and tests.
 
 Preserve unrelated in-progress ACP and settings changes. Do not edit generated provider instruction files. Update the architecture document and replace the obsolete native-fallback recommendation in the existing agent design notes.
@@ -315,7 +331,7 @@ Use deterministic fake backends and controlled completion barriers for lifecycle
 - Supported steering reaches the intended active child.
 - Unsupported steering retains the message for the next follow-up.
 - Follow-ups serialize and enforce the queue bound.
-- Child completion during `wait_agent` returns its result.
+- Child completion delivers its result separately exactly once after provider acceptance. An idle parent resumes after all relevant children settle, or on new user input. Cancellation and user-decision boundaries prevent automatic continuation.
 - A stopped parent turn automatically continues its unfinished model-delegated request.
 - Simultaneous results produce serialized, coalesced continuation.
 - Manual child completion never starts a root model turn.
@@ -346,13 +362,14 @@ Use deterministic fake backends and controlled completion barriers for lifecycle
 - Streaming thought updates refresh the same preview, and tool output streams into the child's full timeline without appearing in the main preview.
 - Interleaved sibling events, repeated delivery, and late events preserve ordering and never duplicate content or update another child or a newer turn.
 - Child updates remain visible with the root running, waiting, or idle, and reopening reconstructs the saved child history and outcomes.
-- `/spawn` admission, failure, and completion update `/agents`.
+- `/agents spawn` admission, failure, and completion update `/agents`.
 - Main and child conversations retain correct attribution.
 - Picker selection survives live updates.
 - Agent headings reuse the existing exchange layout and show only that child's metrics.
-- Each running agent previews only its latest thought through the existing renderer and updates in place when a newer thought arrives.
-- Tool execution preserves the latest thought preview, updates heading metrics, and remains inspectable in the child's full timeline.
-- Enter on an agent heading opens the correct child timeline without changing existing thought or tool interactions.
+- Each running agent previews its latest non-final thought and tool heading through the existing renderers, without tool output or final answers.
+- Completion collapses the agent fold over its full task timeline. Explicit expansion after completion persists.
+- Agent folds stay inside the owning parent Thought fold, and the parent's final answer stays outside it.
+- Enter on an agent heading opens the correct child timeline while running or completed without changing fold controls.
 - Messaging, follow-up, individual interruption, and interrupt-all reach the intended targets.
 - Settings survive reopening at the correct scope.
 - Current-format sessions reopen and incompatible sessions remain hidden.
@@ -375,10 +392,10 @@ Run real-provider checks in a temporary workspace with bounded tasks. Report aut
 
 ### Release and completion criteria
 
-Keep model-facing tools disabled by default when the implementation ships. Manual `/spawn` provides the initial inspection path without enabling autonomous delegation.
+Keep model-facing tools disabled by default when the implementation ships. Manual `/agents spawn` provides the initial inspection path without enabling autonomous delegation.
 
 Record child admission, task start, task completion, interruption, cleanup failure, and parent continuation with Harness session, agent, exchange, and turn identity. A missing child outcome, incorrect provider routing, cross-agent cancellation, or duplicate parent continuation fails acceptance.
 
 Do not restore native orchestration as a runtime fallback. If runtime verification fails, keep the replacement unreleased and repair the failing ownership or lifecycle boundary. If the deployed change requires reversal, revert its implementation as a unit and retain stored sessions without deletion, subject to the restored binary's format compatibility rules.
 
-The work is complete when all six tools, `/spawn`, `/agents`, the settings toggle, native-suppression capability reporting, durable child recovery, and parent-result continuation satisfy the automated and runtime checks above. Documentation must describe the Harness-owned model, and no native-agent event may create a managed child identity.
+The work is complete when all seven tools, `/agents spawn`, `/agents`, the settings toggle, native-suppression capability reporting, durable child recovery, and parent-result continuation satisfy the automated and runtime checks above. Documentation must describe the Harness-owned model, and no native-agent event may create a managed child identity.

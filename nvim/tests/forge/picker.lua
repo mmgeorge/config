@@ -548,6 +548,25 @@ local ok, failure = pcall(function()
   assert_equals(active.spec.page_list[1].subtitle, nil, "model picker should omit the instructional subtitle")
   assert_equals(#active.spec.page_list[1].option_list[1].columns, 4,
     "model values should align with the visible headers")
+  local original_reasoning = active.spec.page_list[1].option_list[1].value.picker_reasoning
+  invoke("h")
+  assert_true(active.spec.page_list[1].option_list[1].value.picker_reasoning ~= original_reasoning)
+  invoke("r")
+  assert_equals(active.spec.page_list[1].option_list[1].value.picker_reasoning, original_reasoning)
+  invoke("<Right>")
+  assert_true(active.spec.page_list[1].option_list[1].value.picker_reasoning ~= original_reasoning)
+  invoke("<Left>")
+  assert_equals(active.spec.page_list[1].option_list[1].value.picker_reasoning, original_reasoning)
+  local picker_keymaps = require("forge.infra.config").options.keymaps.picker
+  local previous_value, next_value = picker_keymaps.previous_value, picker_keymaps.next_value
+  picker_keymaps.previous_value, picker_keymaps.next_value = { "b" }, false
+  picker.update(active.spec)
+  invoke("b")
+  assert_true(active.spec.page_list[1].option_list[1].value.picker_reasoning ~= original_reasoning,
+    "picker value bindings ignored the shared configuration")
+  assert_equals(vim.fn.maparg("r", "n", false, true).callback, nil, "update retained the old previous-value alias")
+  assert_equals(vim.fn.maparg("h", "n", false, true).callback, nil, "disabled next-value retained its alias")
+  picker_keymaps.previous_value, picker_keymaps.next_value = previous_value, next_value
   picker.close(false)
 
   picker.open({

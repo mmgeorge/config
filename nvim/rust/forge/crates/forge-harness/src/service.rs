@@ -609,6 +609,7 @@ struct SessionController {
     agent_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
     agent_backend_factory: crate::agent::AgentBackendFactory,
+    parent_input: crate::backend::SteeringLane,
     compaction_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     execution_admission: Arc<Semaphore>,
     control_admission: Arc<Semaphore>,
@@ -645,6 +646,7 @@ impl SessionController {
             agent_task: Mutex::new(None),
             agent_coordinator: broker.agent_coordinator(),
             agent_backend_factory: broker.agent_backend_factory.clone(),
+            parent_input: broker.parent_input.clone(),
             compaction_task: Mutex::new(None),
             execution_admission: Arc::new(Semaphore::new(1)),
             control_admission: Arc::new(Semaphore::new(1)),
@@ -1015,6 +1017,15 @@ async fn route_request(
     if method == HarnessMethod::BackendCapabilities {
         let manifest = controller.backend.capabilities(controller.catalog_request.read().await.clone()).await?;
         message_sink.send_response(Response::success(request.id, manifest)?).await?;
+        return Ok(());
+    }
+    if matches!(method, HarnessMethod::AgentProfilesGet | HarnessMethod::AgentProfilesSave) {
+        let profiles = &controller.agent_backend_factory.profiles;
+        let snapshot = if method == HarnessMethod::AgentProfilesSave {
+            let revision = request.params["expected_revision"].as_str().context("profile save requires expected_revision")?;
+            profiles.save(revision, serde_json::from_value(request.params["document"].clone())?)?
+        } else { profiles.snapshot()? };
+        message_sink.send_response(Response::success(request.id, snapshot)?).await?;
         return Ok(());
     }
     if method == HarnessMethod::AgentModels {
@@ -1702,7 +1713,11 @@ async fn route_control_request(
                 .context("turn.steer requires non-empty text")?
                 .to_owned();
             validate_root_control(request.params.get("target"))?;
-            controller.backend.steer_session(&catalog_request.harness_session_id,text).await?;
+            if controller.parent_input.is_active() {
+                controller.parent_input.steer(text.into()).await?;
+            } else {
+                controller.backend.steer_session(&catalog_request.harness_session_id,text.into()).await?;
+            }
             Some(Response::success(
                 request.id,
                 json!({ "steered": true, "delivery": "direct" }),
@@ -2083,8 +2098,8 @@ mod tests {
             anyhow::bail!("steering must not start another provider request")
         }
 
-        async fn steer_session(&self, session_id: &str, text: String) -> Result<()> {
-            self.request.lock().await.push((session_id.into(), text));
+        async fn steer_session(&self, session_id: &str, input: crate::backend::SteeringInput) -> Result<()> {
+            self.request.lock().await.push((session_id.into(), input.text().to_owned()));
             Ok(())
         }
 
@@ -2116,9 +2131,7 @@ mod tests {
         controller.attach_agents(&sink).await?;
         let admitted = controller.agent_coordinator.sender().request(crate::agent::AgentRequest {
             operation_id:"approval-child".into(),source:crate::agent::AgentSource::User,
-            operation:crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest {
-                task_name:"approval-child".into(),message:"Wait".into(),provider:None,model:None,reasoning_effort:None,
-            }),
+            operation:crate::agent::AgentOperation::Spawn(crate::agent::SpawnAgentRequest { profile: Some("worker".into()), text: "Wait".into() }),
         }).await?;
         let agent_id = admitted["agent"]["id"].as_str().unwrap().to_owned();
         let task_id = admitted["task"]["id"].as_str().unwrap().to_owned();
