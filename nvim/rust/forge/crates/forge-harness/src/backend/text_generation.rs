@@ -224,6 +224,7 @@ mod tests {
 
     fn request() -> BackendCatalogRequest {
         BackendCatalogRequest {
+            execution_owner: None,
             harness_session_id: "recap-test".into(),
             workspace: std::env::current_dir()
                 .unwrap()
@@ -240,6 +241,7 @@ mod tests {
         let mut turn = crate::turn::Turn::new(
             "turn".into(),
             crate::backend::ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "provider-turn".into(),
             },

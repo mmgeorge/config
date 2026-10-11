@@ -101,18 +101,6 @@ impl SteeringLane {
         self.submit(ActiveTurnOperation::Steer, text, None).await
     }
 
-    /// Deliver input to a specific child turn over the active provider process.
-    pub async fn steer_target(&self, text: String, target: SteerTarget) -> Result<()> {
-        self.submit(ActiveTurnOperation::Steer, text, Some(target))
-            .await
-    }
-
-    /// Interrupt a specific child turn without cancelling its parent request.
-    pub async fn interrupt_target(&self, target: SteerTarget) -> Result<()> {
-        self.submit(ActiveTurnOperation::Interrupt, String::new(), Some(target))
-            .await
-    }
-
     /// Interrupt the parent and descendants and wait for terminal provider evidence.
     pub async fn cleanup_execution(&self) -> Result<()> {
         self.submit(ActiveTurnOperation::CleanupExecution, String::new(), None)
@@ -260,13 +248,9 @@ mod test {
         );
         let first = active.receive().await.unwrap();
         assert!(lane.steer("still full".into()).await.is_err());
-        let target = super::SteerTarget {
-            thread_id: "child".into(),
-            turn_id: "turn".into(),
-        };
-        let mut interrupt = Box::pin(lane.interrupt_target(target.clone()));
+        let mut interrupt = Box::pin(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None));
         assert!(futures_util::poll!(interrupt.as_mut()).is_pending());
-        assert!(lane.interrupt_target(target).await.is_err());
+        assert!(lane.submit(super::ActiveTurnOperation::Interrupt,String::new(),None).await.is_err());
         for sequence in 1..super::MAX_STEERING_REQUESTS {
             let command = active.receive().await.unwrap();
             assert_eq!(command.text, sequence.to_string());
@@ -297,12 +281,13 @@ mod test {
                 .is_err()
         );
         assert!(
-            lane.steer_target(
+            lane.submit(
+                super::ActiveTurnOperation::Steer,
                 "text".into(),
-                super::SteerTarget {
+                Some(super::SteerTarget {
                     thread_id: "x".repeat(super::MAX_TARGET_BYTES + 1),
                     turn_id: "turn".into(),
-                }
+                })
             )
             .await
             .is_err()

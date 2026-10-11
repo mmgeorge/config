@@ -6,9 +6,42 @@ local config = require("forge.infra.config")
 local picker = require("forge.views.picker")
 
 local active = nil
+local build_spec
+local stop_timer
 
 ---@param instance table
-local function stop_timer(instance)
+---@param action string
+---@param context table
+local function edit_message(instance, action, context)
+  local run = context.option and context.option.value.run
+  if not run then return end
+  instance.editing = true
+  picker.update({
+    owner = "agent", host = instance.host, initial_input_kind = "other",
+    page_list = { {
+      id = "agent-message", title = (action == "message" and "Message " or "Follow up with ") .. agent_summary.label(run),
+      allow_input = true, input_height = 5, column_headers = { "Action", "Details" },
+      option_list = { { id = action, label = action == "message" and "Informational message" or "Follow-up task",
+        input_kind = "other", detail = action == "message" and "Retained in the inbox. An idle child remains idle."
+          or "Queued for this child's next turn. Retains only its own conversation history." } },
+      footer = "C-s send  q close",
+    } },
+    on_confirm = function(result)
+      if not result.text or result.text:match("^%s*$") then return false end
+      instance.on_action(action, run.id, result.text)
+      instance.editing = false
+      picker.update(build_spec(instance))
+      return false
+    end,
+    on_close = function()
+      stop_timer(instance)
+      if active == instance then active = nil end
+    end,
+  })
+end
+
+---@param instance table
+stop_timer = function(instance)
   if not instance.timer then return end
   instance.timer:stop()
   instance.timer:close()
@@ -52,7 +85,7 @@ end
 
 ---@param instance table
 ---@return table
-local function build_spec(instance)
+build_spec = function(instance)
   local state = instance.state_provider()
   local entries, initial = option_list(state, state.selected_agent_run_id)
   return {
@@ -61,13 +94,23 @@ local function build_spec(instance)
     page_list = {
       {
         id = "agents",
-        title = "Select Timeline",
+        title = "Agents · model tools " .. (state.subagent_tools == true and "On" or "Off"),
         column_headers = { "Timeline", "Status" },
         option_list = entries,
         selected_index = initial,
-        footer = "↑↓ select  Enter switch  q close",
+        footer = "Enter inspect  C-g message  C-f follow up  C-x interrupt  C-a interrupt all  C-t tools  q close",
       },
     },
+    action_list = instance.on_action and {
+      { id = "message", key = "<C-g>", desc = "Send informational message", callback = function(context) edit_message(instance,"message",context) end },
+      { id = "followup", key = "<C-f>", desc = "Queue follow-up task", callback = function(context) edit_message(instance,"followup",context) end },
+      { id = "interrupt", key = "<C-x>", desc = "Interrupt selected child", callback = function(context)
+        local run = context.option and context.option.value.run
+        if run then instance.on_action("interrupt",run.id) end
+      end },
+      { id = "interrupt-all", key = "<C-a>", desc = "Interrupt all children", callback = function() instance.on_action("interrupt_all") end },
+      { id = "tools", key = "<C-t>", desc = "Toggle root model delegation tools", callback = function() instance.on_action("tools") end },
+    } or {},
     on_confirm = function(result)
       stop_timer(instance)
       if active == instance then active = nil end
@@ -84,7 +127,7 @@ end
 
 ---@param instance table
 local function refresh(instance)
-  if active ~= instance or not picker.is_open("agent") then return end
+  if active ~= instance or instance.editing or not picker.is_open("agent") then return end
   picker.update(build_spec(instance))
 end
 
@@ -92,6 +135,7 @@ end
 ---@field host table
 ---@field state_provider fun(): table
 ---@field on_select fun(run_id: string?)
+---@field on_action? fun(action: string, run_id: string?, message: string?)
 ---@field on_close? fun()
 
 ---@param options ForgeAgentPickerOptions
@@ -104,6 +148,7 @@ function AgentPicker.open(options)
     host = options.host,
     state_provider = options.state_provider,
     on_select = options.on_select,
+    on_action = options.on_action,
     on_close = options.on_close,
     timer = vim.uv.new_timer(),
   }

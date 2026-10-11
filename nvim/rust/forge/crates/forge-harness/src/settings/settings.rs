@@ -33,6 +33,8 @@ pub struct PortableSettings {
     pub plan_compact: Option<bool>,
     /// Selects automatic review of execution plan revisions.
     pub plan_auto_approve_revisions: Option<bool>,
+    /// Enables the root's model-facing child tools without restricting manual admission.
+    pub subagent_tools: Option<bool>,
     #[serde(default)]
     /// Records selection by source identity, independent of provider display names.
     pub skill: BTreeMap<String, bool>,
@@ -49,6 +51,7 @@ impl PortableSettings {
         if overriding.plan_permission.is_some() { self.plan_permission = overriding.plan_permission; }
         if overriding.plan_compact.is_some() { self.plan_compact = overriding.plan_compact; }
         if overriding.plan_auto_approve_revisions.is_some() { self.plan_auto_approve_revisions = overriding.plan_auto_approve_revisions; }
+        if overriding.subagent_tools.is_some() { self.subagent_tools = overriding.subagent_tools; }
         self.skill.extend(overriding.skill);
         self.mcp.extend(overriding.mcp);
     }

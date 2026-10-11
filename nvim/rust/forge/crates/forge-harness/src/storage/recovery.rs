@@ -69,13 +69,44 @@ impl SqliteStore {
         };
         for payload in agent {
             let mut agent: crate::agent::Agent = serde_json::from_str(&payload)?;
+            let mut changed = false;
             if agent.state.is_open() && !agent.is_primary() {
                 agent.state = AgentState::Closed;
+                changed = true;
+            }
+            for message in &mut agent.inbox {
+                if message.delivery != crate::agent::MessageDelivery::Attached { continue; }
+                let Some(task_id) = message.task_id.as_ref() else { continue; };
+                let unfinished: bool = transaction.query_row(
+                    "SELECT json_extract(payload,'$.completed_at_ms') IS NULL FROM agent_task_record WHERE id=?1 AND session_id=?2",
+                    params![task_id,session_id], |row| row.get(0)).optional()?.unwrap_or(false);
+                if unfinished {
+                    message.delivery = crate::agent::MessageDelivery::Queued;
+                    message.task_id = None;
+                    changed = true;
+                }
+            }
+            if changed {
                 transaction.execute(
                     "UPDATE agent_run_record SET payload=?2 WHERE id=?1",
                     params![agent.id, serde_json::to_string(&agent)?],
                 )?;
             }
+        }
+        let child_task = {
+            let mut statement = transaction.prepare("SELECT payload FROM agent_task_record WHERE session_id=?1")?;
+            statement.query_map([session_id],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
+        };
+        for payload in child_task {
+            let mut task:crate::agent::AgentTask = serde_json::from_str(&payload)?;
+            if task.completed_at_ms.is_some() {continue;}
+            let observed_at:Option<i64> = transaction.query_row("SELECT json_extract(payload,'$.completed_at_ms') FROM exchange_record WHERE id=?1",
+                [&task.id],|row|row.get(0))?;
+            task.state = ExchangeState::Interrupted;
+            task.completed_at_ms = Some(observed_at.unwrap_or(task.created_at_ms));
+            task.error = Some("Runtime restarted. Inspect completed effects before assigning an explicit follow-up".into());
+            task.parent_reported = true;
+            transaction.execute("UPDATE agent_task_record SET payload=?2 WHERE id=?1",params![task.id,serde_json::to_string(&task)?])?;
         }
         let executions = {
             let mut statement=transaction.prepare("SELECT payload FROM plan_execution_record WHERE session_id=?1")?;

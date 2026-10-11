@@ -23,7 +23,8 @@ function AgentCatalog.run_list(state, active)
   local agent = state.agent
   for _, run in ipairs((agent and agent.run) or {}) do
     local exchange_list = (state.agent.summary or {})[run.id]
-    if agent_summary.is_active(agent_summary.status(run, exchange_list)) == active then
+    if run.source ~= "root" and run.definition ~= "primary"
+      and agent_summary.is_active(agent_summary.status(run, exchange_list)) == active then
       result[#result + 1] = run
     end
   end
@@ -49,13 +50,14 @@ function AgentCatalog.resolve(state, selector)
 
   local match_list = {}
   for _, run in ipairs((agent and agent.run) or {}) do
-    if run.id == selector or agent_summary.label(run):lower() == selector:lower() then
+    if run.source ~= "root" and run.definition ~= "primary"
+      and (run.id == selector or run.task_path == selector or agent_summary.label(run):lower() == selector:lower()) then
       match_list[#match_list + 1] = run
     end
   end
   if #match_list == 1 then return match_list[1] end
   if #match_list > 1 then
-    return nil, ("Multiple child agents match %s. Use /agent or a running-agent alias."):format(selector)
+    return nil, ("Multiple child agents match %s. Use /agents or a running-agent alias."):format(selector)
   end
   return nil, ("No child agent matches %s"):format(selector)
 end

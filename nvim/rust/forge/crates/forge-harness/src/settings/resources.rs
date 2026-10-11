@@ -112,6 +112,7 @@ mod test {
         let mut store = SettingsStore::open(root.path()).unwrap();
         store.configure_catalog(root.path()).unwrap();
         let request = BackendCatalogRequest {
+            execution_owner: None,
             harness_session_id:"session".into(), workspace:workspace.to_string_lossy().into_owned(),
             access:AccessPolicy::default(), execution_mode:PermissionMode::Read, backend_session_id:None,
         };

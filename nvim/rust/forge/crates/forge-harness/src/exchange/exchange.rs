@@ -103,6 +103,27 @@ pub struct Exchange {
 }
 
 impl Exchange {
+    /// Create a causal root record for manual child admission without a root model turn.
+    pub(crate) fn agent_admission(session_id: &str, ordinal: u64, prompt: String, now_ms: i64) -> Self {
+        let delegation = Delegation { id: uuid::Uuid::new_v4().to_string(), child_agent_id: crate::session::HarnessSession::primary_agent_id(session_id),
+            child_exchange_id: uuid::Uuid::new_v4().to_string(), parent_exchange_id: String::new(), parent_turn_id: None,
+            task: prompt, created_at_ms: now_ms };
+        let mut exchange = Self::delegated(session_id, &delegation, ordinal);
+        exchange.lifecycle = Some("agent_admission".into());
+        exchange.state = ExchangeState::Running;
+        exchange
+    }
+
+    /// Append the reserved task identity without allocating a second child exchange.
+    pub(crate) fn append_agent_task(&mut self, task: &crate::agent::AgentTask) -> anyhow::Result<bool> {
+        anyhow::ensure!(task.session_id == self.session_id && task.parent_exchange_id == self.id,
+            "child admission crosses causal ownership");
+        let appended = self.append_delegation(&task.agent_id, &task.operation_id, &task.message, task.created_at_ms)?;
+        if appended && let Some(ExchangeNode::AgentReference { agent }) = self.node_list.last_mut() {
+            agent.child_exchange_id = task.id.clone();
+        }
+        Ok(appended)
+    }
     /// Return the latest readable reasoning summary from the active provider turn.
     pub fn latest_reasoning_summary(&self) -> Option<&str> {
         self.turn
@@ -762,6 +783,7 @@ mod test {
         let mut exchange = interaction();
         exchange.resume(1000).unwrap();
         let address = ProviderAddress {
+            owner: None,
             thread_id: "parent".into(),
             turn_id: "one".into(),
         };
@@ -811,6 +833,7 @@ mod test {
         use crate::backend::{BackendEvent, ProviderAddress};
         let mut exchange = interaction();
         let address = ProviderAddress {
+            owner: None,
             thread_id: "parent".into(),
             turn_id: "turn".into(),
         };
@@ -864,6 +887,7 @@ mod test {
         use crate::backend::{BackendEvent, ProviderAddress};
         let mut exchange = interaction();
         let address = ProviderAddress {
+            owner: None,
             thread_id: "parent".into(),
             turn_id: "turn".into(),
         };
@@ -952,6 +976,7 @@ mod test {
         use crate::turn::{TurnOutcome, TurnState};
         let mut exchange = interaction();
         let address = ProviderAddress {
+            owner: None,
             thread_id: "parent".into(),
             turn_id: "first".into(),
         };
@@ -1051,6 +1076,7 @@ mod test {
         exchange
             .start_turn(
                 ProviderAddress {
+                    owner: None,
                     thread_id: "parent".into(),
                     turn_id: "second".into(),
                 },
@@ -1074,6 +1100,7 @@ mod test {
         let mut exchange = interaction();
         exchange.resume(100).unwrap();
         let address = crate::backend::ProviderAddress {
+            owner: None,
             thread_id: "thread".into(),
             turn_id: "turn".into(),
         };
@@ -1160,6 +1187,7 @@ mod test {
     fn terminal_exchange_cannot_restart() {
         let mut exchange = interaction();
         let address = crate::backend::ProviderAddress {
+            owner: None,
             thread_id: "thread".into(),
             turn_id: "turn".into(),
         };
@@ -1182,6 +1210,7 @@ mod test {
     fn finalization_settles_running_turn_without_changing_completed_turns() {
         let mut exchange = interaction();
         let first = crate::backend::ProviderAddress {
+            owner: None,
             thread_id: "thread".into(),
             turn_id: "first".into(),
         };
@@ -1194,6 +1223,7 @@ mod test {
         exchange
             .start_turn(
                 crate::backend::ProviderAddress {
+                    owner: None,
                     thread_id: "thread".into(),
                     turn_id: "second".into(),
                 },
@@ -1330,6 +1360,7 @@ mod test {
     fn plan_artifact_does_not_affect_provider_turn_lifecycle() {
         let mut interaction = interaction();
         let address = crate::backend::ProviderAddress {
+            owner: None,
             thread_id: "thread".into(),
             turn_id: "turn".into(),
         };

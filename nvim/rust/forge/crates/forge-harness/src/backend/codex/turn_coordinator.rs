@@ -841,6 +841,7 @@ mod test {
         let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
             permission, None, trace, "session".into()).await?;
         let request = BackendRequest {
+            execution_owner: None,
             harness_session_id: "session".into(), workspace,
             input: BackendInput::from_text("plan out a new one"), mode: PromptMode::Chat,
             model: "gpt-5.6-terra".into(), effort: "medium".into(), context_window: None,
@@ -898,6 +899,7 @@ mod test {
         });
         let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read, permission, None, trace, "session".into()).await?;
         let request = BackendRequest {
+            execution_owner: None,
             harness_session_id: "session".into(), workspace, input: BackendInput::from_text("parent"),
             mode: PromptMode::Chat, model: "gpt-5.6-terra".into(), effort: "medium".into(),
             access: Default::default(), context_window: None, service_tier: crate::backend::ServiceTier::Ultrafast, execution_mode: PermissionMode::Read,
@@ -1023,6 +1025,7 @@ mod test {
             )
             .await?;
             let request = BackendRequest {
+                execution_owner: None,
                 harness_session_id: "session".into(),
                 workspace,
                 input: BackendInput::from_text("goal"),
@@ -1093,47 +1096,6 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn child_relay_acknowledges_original_input_only_after_provider_acceptance() {
-        use crate::backend::steering::{SteerTarget, SteeringLane};
-        let lane = SteeringLane::default();
-        let (event_sink, mut event_stream) = crate::backend::events::channel();
-        let mut active = lane.activate(Some(event_sink)).unwrap();
-        let original = "Use \"updated\"\nand preserve newlines";
-        for accepted in [true, false] {
-            let mut request = Box::pin(lane.steer_target(
-                original.into(),
-                SteerTarget {
-                    thread_id: "child".into(),
-                    turn_id: "child-turn".into(),
-                },
-            ));
-            assert!(futures_util::poll!(request.as_mut()).is_pending());
-            let command = active.receive().await.unwrap();
-            let prompt = steering_prompt(&command);
-            let payload: Value =
-                serde_json::from_str(prompt.rsplit_once("\n\n").unwrap().1).unwrap();
-            assert_eq!(
-                payload,
-                json!({"thread_id":"child", "turn_id":"child-turn", "text":original})
-            );
-            assert!(event_stream.try_recv().is_err());
-            command
-                .complete(if accepted {
-                    Ok(())
-                } else {
-                    Err(anyhow::anyhow!("rejected"))
-                })
-                .await;
-            assert_eq!(request.await.is_ok(), accepted);
-            if accepted {
-                let event = event_stream.recv().await.unwrap().unwrap();
-                assert_eq!(event.kind, "steering_input");
-                assert_eq!(event.text.as_deref(), Some(original));
-            }
-            assert!(event_stream.try_recv().is_err());
-        }
-    }
 
     #[tokio::test]
     async fn interruption_requires_exact_terminal_evidence_or_fails_at_deadline() {
@@ -1145,8 +1107,9 @@ mod test {
                 thread_id: "child".into(),
                 turn_id: "turn".into(),
             };
-            let request = tokio::spawn(async move { lane.interrupt_target(target).await });
-            let command = active.receive().await.unwrap();
+            let request = tokio::spawn(async move { lane.cleanup_execution().await });
+            let mut command = active.receive().await.unwrap();
+            command.target = Some(target);
             let now = tokio::time::Instant::now();
             let mut pending = vec![(now + std::time::Duration::from_secs(30), command)];
             let mut completed = HashSet::from([("child".into(), "different-turn".into())]);

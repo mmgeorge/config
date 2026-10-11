@@ -12,11 +12,23 @@ pub struct CatalogCapability {
 /// Carries stable session and workspace identity for out-of-band provider catalogs.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendCatalogRequest {
+    /// Selects one independent agent conversation without changing portable preference scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_owner: Option<super::ExecutionOwner>,
     pub harness_session_id: String,
     pub workspace: String,
     pub access: crate::session::AccessPolicy,
     pub execution_mode: PermissionMode,
     pub backend_session_id: Option<String>,
+}
+
+impl BackendCatalogRequest {
+    /// Resolve the independent catalog runtime without changing portable preference scope.
+    pub fn runtime_key(&self) -> anyhow::Result<String> {Ok(self.owner()?.runtime_key())}
+    /// Validate the connection owner independently of the settings session identity.
+    pub fn owner(&self) -> anyhow::Result<super::ExecutionOwner> {
+        super::ExecutionOwner::resolve(&self.execution_owner, &self.harness_session_id)
+    }
 }
 
 /// Represents either ordinary user text or an explicit provider skill invocation.

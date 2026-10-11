@@ -3,12 +3,16 @@ local AgentSummary = {}
 local tool_render = require("forge.render.harness.tool")
 
 local active_status = {
+  queued = true,
   starting = true,
   running = true,
   finalizing = true,
+  awaiting_input = true,
+  closing = true,
 }
 
 local function execution_status(run, exchange_list)
+  if run.state == "closing" then return "closing" end
   if exchange_list and exchange_list.state then
     return exchange_list.state == "complete" and "completed" or exchange_list.state
   end
@@ -33,7 +37,7 @@ end
 ---@param run table Agent run descriptor table.
 ---@return string label Display label string.
 function AgentSummary.label(run)
-  return run.nickname or run.definition or "agent"
+  return run.task_name or run.nickname or run.definition or "agent"
 end
 
 --- Computes total and failed tool invocation counts across interactions.

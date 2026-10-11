@@ -263,7 +263,7 @@ mod tests {
 
     #[test]
     fn provider_duration_excludes_delivery_delay_and_stays_frozen() {
-        let mut turn = Turn::new("turn".into(), ProviderAddress { thread_id:"thread".into(),turn_id:"turn".into() },1000);
+        let mut turn = Turn::new("turn".into(), ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"turn".into() },1000);
         let event = crate::backend::BackendEvent {
             received_at_ms: None, address:Some(turn.provider().clone()),turn_boundary:None,
             kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":1383,"params":{
@@ -293,6 +293,7 @@ mod tests {
         let mut turn = Turn::new(
             "turn".into(),
             ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
             },
@@ -332,6 +333,7 @@ mod tests {
         let mut turn = Turn::new(
             "local".into(),
             ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "provider".into(),
             },
@@ -381,6 +383,7 @@ mod tests {
         let mut turn = Turn::new(
             "local".into(),
             ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "provider".into(),
             },
@@ -422,6 +425,7 @@ mod tests {
         let mut turn = Turn::new(
             "local".into(),
             ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "execution".into(),
             },
@@ -460,6 +464,7 @@ mod tests {
             let mut turn = Turn::new(
                 "local".into(),
                 ProviderAddress {
+                    owner: None,
                     thread_id: "thread".into(),
                     turn_id: "execution".into(),
                 },
@@ -484,6 +489,7 @@ mod tests {
         let mut turn = Turn::new(
             "local".into(),
             ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "continuation".into(),
             },
@@ -500,6 +506,7 @@ mod tests {
         let mut turn = Turn::new(
             "local".into(),
             ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "provider-turn".into(),
             },

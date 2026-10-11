@@ -2,7 +2,7 @@ mod event_decoder;
 mod compaction;
 mod text_generation;
 
-use crate::agent::{AgentCapability, AgentControlMode};
+use crate::agent::AgentCapability;
 use crate::backend::approval::{
     ApprovalResolution, PermissionCoordinator, permission_from_copilot, protected_target,
 };
@@ -45,6 +45,11 @@ use std::sync::{
 use tokio::sync::{Mutex, mpsc};
 
 const SYSTEM_MESSAGE: &str = super::HARNESS_SYSTEM_MESSAGE;
+
+fn native_agent_exclusions() -> Vec<String> {
+    ["task", "list_agents", "read_agent", "write_agent", "send_inbox"]
+        .into_iter().map(|name| format!("builtin:{name}")).collect()
+}
 
 type SharedCopilotSession = Arc<github_copilot_sdk::session::Session>;
 type CopilotSessionSlot = Arc<Mutex<Option<CopilotSessionBinding>>>;
@@ -204,14 +209,14 @@ impl CopilotBackend {
     }
 
     async fn session(&self, request: &BackendRequest) -> Result<SharedCopilotSession> {
-        let session_slot = self.session_slot(&request.harness_session_id).await;
-        let turn_event = self.turn_event(&request.harness_session_id).await;
+        let session_slot = self.session_slot(&request.runtime_key()?).await;
+        let turn_event = self.turn_event(&request.runtime_key()?).await;
         let mut active_session = session_slot.lock().await;
         let phase = request.control_context.as_ref().and_then(|context| context.execution.as_ref()).map(|execution| execution.phase);
         let revision_tools = phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve);
         if let Some(binding) = active_session.as_mut().filter(|binding| binding.revision_tools == revision_tools) {
             if binding.compaction.is_none() {
-                binding.compaction = self.compaction_subscription_by_harness.lock().await.get(&request.harness_session_id)
+                binding.compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
                     .cloned().map(|subscription| compaction::CompactionMonitor::new(&binding.session, subscription, Arc::clone(&turn_event)));
             }
             let session = &binding.session;
@@ -231,14 +236,15 @@ impl CopilotBackend {
         let client = self.client(&request.workspace).await?;
         let reasoning_effort = Self::reasoning_effort(&client, request).await?;
         let tool_list =
-            self.control_tool_list(self.control_router(&request.harness_session_id).await, phase);
+            self.control_tool_list(self.control_router(&request.runtime_key()?).await, request);
         let system_message = SystemMessageConfig::new()
             .with_mode("append")
             .with_content(SYSTEM_MESSAGE);
         let permission_handler: Arc<dyn PermissionHandler> = Arc::new(CopilotPermissionHandler {
-            context: self.permission_context(&request.harness_session_id).await,
+            context: self.permission_context(&request.runtime_key()?).await,
         });
         let resource_request = BackendCatalogRequest {
+            execution_owner: request.execution_owner.clone(),
             harness_session_id: request.harness_session_id.clone(), workspace: request.workspace.clone(),
             access: request.access.clone(), execution_mode: request.execution_mode,
             backend_session_id: request.backend_session_id.clone(),
@@ -261,6 +267,7 @@ impl CopilotBackend {
         let retained_session_id = active_session.as_ref().map(|binding| binding.session.id().to_string());
         let session = if let Some(session_id) = retained_session_id.as_deref().or(request.backend_session_id.as_deref()) {
             let mut config = ResumeSessionConfig::new(SessionId::new(session_id));
+            config.excluded_tools = Some(native_agent_exclusions());
             config.model = (request.model != "default").then(|| request.model.clone());
             config.reasoning_effort = reasoning_effort.clone();
             config.context_tier = request.context_window.clone();
@@ -285,6 +292,7 @@ impl CopilotBackend {
                 .context("resume Copilot session")?
         } else {
             let mut config = SessionConfig::default();
+            config.excluded_tools = Some(native_agent_exclusions());
             config.model = (request.model != "default").then(|| request.model.clone());
             config.reasoning_effort = reasoning_effort;
             config.context_tier = request.context_window.clone();
@@ -342,7 +350,7 @@ impl CopilotBackend {
                 return Err(error);
             }
         }
-        let compaction = self.compaction_subscription_by_harness.lock().await.get(&request.harness_session_id)
+        let compaction = self.compaction_subscription_by_harness.lock().await.get(&request.runtime_key()?)
             .cloned().map(|subscription| compaction::CompactionMonitor::new(&session, subscription, turn_event));
         *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), revision_tools, compaction, _profile: profile });
         Ok(session)
@@ -369,6 +377,7 @@ impl CopilotBackend {
 
     fn catalog_backend_request(request: &BackendCatalogRequest) -> BackendRequest {
         BackendRequest {
+            execution_owner: request.execution_owner.clone(),
             harness_session_id: request.harness_session_id.clone(),
             workspace: request.workspace.clone(),
             input: BackendInput::from_text(""),
@@ -422,10 +431,10 @@ impl CopilotBackend {
         )
     }
 
-    fn control_tool_list(&self, router: Arc<ControlToolRouter>, phase: Option<crate::plan::PlanPhase>) -> Vec<Tool> {
+    fn control_tool_list(&self, router: Arc<ControlToolRouter>, request: &BackendRequest) -> Vec<Tool> {
         let handler: Arc<dyn ToolHandler> = Arc::new(CopilotControlToolHandler { router });
         ControlToolRegistry
-            .definition_list_for(phase)
+            .definition_list_for_context(request.control_context.as_ref(),request.owner().is_ok_and(|owner|owner.is_root()))
             .into_iter()
             .map(|definition| {
                 Tool::new(definition.name)
@@ -457,14 +466,7 @@ fn capability() -> BackendCapability {
             PermissionMode::Write,
             PermissionMode::Yolo,
         ],
-        agent: AgentCapability {
-            observe: true,
-            catalog: false,
-            spawn: AgentControlMode::ParentMediated,
-            input: AgentControlMode::ParentMediated,
-            interrupt: AgentControlMode::Unsupported,
-            parallel: true,
-        },
+        agent: AgentCapability::default(),
         catalog: CatalogCapability {
             skill: true,
             mcp: true,
@@ -480,8 +482,8 @@ impl Backend for CopilotBackend {
             anyhow::ensure!(setting.skill.is_empty() && setting.mcp.is_empty(), "shared resource selection requires the Forge settings store");
             return Ok(());
         }
-        self.cleanup_execution(&request.harness_session_id).await?;
-        let slot = self.session_slot(&request.harness_session_id).await;
+        self.cleanup_execution(&request.runtime_key()?).await?;
+        let slot = self.session_slot(&request.runtime_key()?).await;
         let mut binding = slot.lock().await;
         if let Some(active) = binding.as_ref() {
             request.backend_session_id = Some(active.session.id().to_string());
@@ -489,7 +491,7 @@ impl Backend for CopilotBackend {
         }
         binding.take();
         drop(binding);
-        self.terminal_monitor.lock().await.remove(&request.harness_session_id);
+        self.terminal_monitor.lock().await.remove(&request.runtime_key()?);
         self.session(&Self::catalog_backend_request(&request)).await?;
         Ok(())
     }
@@ -505,7 +507,7 @@ impl Backend for CopilotBackend {
         result
     }
     async fn terminate_terminal(&self, request: BackendCatalogRequest, id: &str) -> Result<()> {
-        let session = self.active_session(&request.harness_session_id).await
+        let session = self.active_session(&request.runtime_key()?).await
             .context("Copilot session is not attached")?;
         session.rpc().tasks().refresh().await?;
         let inventory = session.rpc().tasks().list().await?;
@@ -514,18 +516,18 @@ impl Backend for CopilotBackend {
             "Background terminal is no longer running");
         let result = session.rpc().tasks().cancel(github_copilot_sdk::rpc::TasksCancelRequest { id: id.into() }).await?;
         anyhow::ensure!(result.cancelled, "Background terminal could not be cancelled");
-        self.terminal_monitor.lock().await.remove(&request.harness_session_id);
+        self.terminal_monitor.lock().await.remove(&request.runtime_key()?);
         Ok(())
     }
 
     async fn background_terminals(&self, request: BackendCatalogRequest) -> Result<super::terminal::TerminalSnapshot> {
-        let session = match self.active_session(&request.harness_session_id).await {
+        let session = match self.active_session(&request.runtime_key()?).await {
             Some(session) => session,
             None if request.backend_session_id.is_some() => self.session(&Self::catalog_backend_request(&request)).await?,
             None => return Ok(super::terminal::TerminalSnapshot { supported: true, terminal: Vec::new() }),
         };
         let mut monitor_store = self.terminal_monitor.lock().await;
-        let monitor = monitor_store.entry(request.harness_session_id)
+        let monitor = monitor_store.entry(request.runtime_key()?)
             .or_insert_with(|| CopilotTerminalMonitor::new(&session));
         if monitor.task.is_finished() || !monitor.session.ptr_eq(&Arc::downgrade(&session)) {
             *monitor = CopilotTerminalMonitor::new(&session);
@@ -583,18 +585,19 @@ impl Backend for CopilotBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
-        let turn_event = self.turn_event(&request.harness_session_id).await;
+        let turn_event = self.turn_event(&request.runtime_key()?).await;
         let _turn_event_guard = turn_event.activate(event_sink.clone())?;
-        self.permission_context(&request.harness_session_id)
+        self.permission_context(&request.runtime_key()?)
             .await
             .configure(
+                request.owner()?,
                 request.execution_mode,
                 request.workspace.clone(),
                 event_sink.clone(),
             )?;
         let session = self.session(&request).await?;
         let mut subscription = session.subscribe();
-        let control_router = self.control_router(&request.harness_session_id).await;
+        let control_router = self.control_router(&request.runtime_key()?).await;
         let control_context = request
             .control_context
             .clone()
@@ -682,7 +685,7 @@ impl Backend for CopilotBackend {
                         self.completed_event_by_harness
                             .lock()
                             .await
-                            .insert(request.harness_session_id.clone(), provider_event.id.clone());
+                            .insert(request.runtime_key()?, provider_event.id.clone());
                         output.provider_checkpoint_id = Some(provider_event.id.clone());
                         break;
                     }
@@ -707,7 +710,7 @@ impl Backend for CopilotBackend {
                     let terminal_error = provider_event.event_type == "session.error"
                         && !provider_event.is_transient_error();
                     if matches!(provider_event.event_type.as_str(), "session.compaction_start" | "session.compaction_complete")
-                        && self.compaction_subscription_by_harness.lock().await.contains_key(&request.harness_session_id) {
+                        && self.compaction_subscription_by_harness.lock().await.contains_key(&request.runtime_key()?) {
                         continue;
                     }
                     decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
@@ -773,7 +776,7 @@ impl Backend for CopilotBackend {
         let id = request.id;
         let request = request.request;
         let session = self.session(&request).await?;
-        let slot = self.session_slot(&request.harness_session_id).await;
+        let slot = self.session_slot(&request.runtime_key()?).await;
         let manual = slot.lock().await.as_ref().and_then(|binding| binding.compaction.as_ref())
             .map(|monitor| Arc::clone(&monitor.manual));
         if let Some(manual) = &manual { manual.lock().await.register(id.clone()); }
@@ -1547,6 +1550,7 @@ impl ToolHandler for CopilotControlToolHandler {
 }
 
 struct CopilotPermissionState {
+    owner: Option<crate::backend::ExecutionOwner>,
     execution_mode: PermissionMode,
     workspace: String,
     event_sink: Option<BackendEventSink>,
@@ -1562,6 +1566,7 @@ impl CopilotPermissionContext {
         Self {
             coordinator,
             state: StandardMutex::new(CopilotPermissionState {
+                owner:None,
                 execution_mode: PermissionMode::Read,
                 workspace: ".".into(),
                 event_sink: None,
@@ -1571,6 +1576,7 @@ impl CopilotPermissionContext {
 
     fn configure(
         &self,
+        owner:crate::backend::ExecutionOwner,
         execution_mode: PermissionMode,
         workspace: String,
         event_sink: Option<BackendEventSink>,
@@ -1580,6 +1586,7 @@ impl CopilotPermissionContext {
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))? =
             CopilotPermissionState {
+                owner:Some(owner),
                 execution_mode,
                 workspace,
                 event_sink,
@@ -1596,15 +1603,16 @@ struct CopilotPermissionHandler {
 impl PermissionHandler for CopilotPermissionHandler {
     async fn handle(
         &self,
-        _session_id: SessionId,
+        session_id: SessionId,
         request_id: RequestId,
         data: PermissionRequestData,
     ) -> PermissionResult {
-        let (execution_mode, workspace, event_sink) = match self.context.state.lock() {
+        let (execution_mode, workspace, event_sink, owner) = match self.context.state.lock() {
             Ok(state) => (
                 state.execution_mode,
                 state.workspace.clone(),
                 state.event_sink.clone(),
+                state.owner.clone(),
             ),
             Err(_) => {
                 return PermissionResult::reject(Some("permission context unavailable".into()));
@@ -1623,7 +1631,7 @@ impl PermissionHandler for CopilotPermissionHandler {
         match self
             .context
             .coordinator
-            .authorize(execution_mode, request, None, event_sink.as_ref())
+            .authorize(execution_mode, request, Some(crate::backend::ProviderAddress {owner,thread_id:session_id.to_string(),turn_id:String::new()}), event_sink.as_ref())
             .await
         {
             Ok(
@@ -1876,6 +1884,7 @@ mod test {
     #[test]
     fn omits_reasoning_effort_for_auto_and_unsupported_models() {
         let mut request = BackendRequest {
+            execution_owner: None,
             harness_session_id: "harness-session".into(),
             workspace: "D:/repo".into(),
             input: BackendInput::from_text("test"),

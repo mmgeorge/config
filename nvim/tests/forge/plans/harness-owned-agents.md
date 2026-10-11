@@ -1,138 +1,202 @@
 # Harness-Owned Agents
 
-## Status
+Forge owns child admission, identity, task queues, cancellation, and result delivery across Codex,
+Copilot, Claude ACP, and Antigravity ACP. The accepted design is [plans/subagent.md](../../../../plans/subagent.md).
+Provider-native orchestration cannot serve as a fallback.
 
-Parked. Do not implement Harness-owned subagents until the backend constraints below have been revisited
-against the versions that Harness actually launches.
+## Ownership contract
 
-## Objective
+Each child starts with a fresh provider conversation in the root workspace. `ExecutionOwner`
+contains the Harness session and agent identifiers. Provider maps and approval requests use that
+owner, while resources and settings use the root session's portable preference scope. Follow-ups
+reuse only the child's native history. Children have no root planning or delegation authority.
 
-Harness-owned agents would give Forge one orchestration model across providers. The Rust broker would
-own child sessions, lifecycle state, event routing, and execution-mode assignment while each backend translates
-that common contract into provider-specific session operations.
+Admission reserves capacity before one transaction writes the agent, parent delegation, queued
+exchange, and task. The root admits at most eight active children. A child serializes follow-ups
+and retains at most 32 pending tasks. Informational messages persist without starting idle work.
+The active root prompt and idle session controller drain one bounded coordinator request channel.
+Model callbacks never reacquire the active prompt's broker lock.
 
-The main agent must see exactly one subagent tool family. Exposing both provider-native delegation tools and
-Harness delegation tools would create competing orchestration planes. The model could spawn children through
-either plane, producing inconsistent permission enforcement, persistence, steering, cancellation, and timeline
-events.
+## Public controls
 
-## Proposed model-visible contract
+`/spawn` uses a task name, message, provider, model, and reasoning effort. `/agents` exposes Main,
+Running, and Done timelines, informational messaging, follow-ups, interruption, and the root tool
+toggle. `subagent_tools` defaults off and persists through Forge's portable settings. Manual
+spawning remains available with the toggle off.
 
-```text
-harness_spawn_agent
-harness_list_agents
-harness_read_agent
-harness_send_agent_input
-harness_wait_agents
-harness_cancel_agent
-harness_close_agent
-```
+The enabled root receives six tools:
 
-`harness_read_agent` would expose a compact progress snapshot to the parent model. Harness timeline rendering
-must consume broker events directly rather than depend on the model polling this tool.
+- `harness_spawn_agent` admits a fresh child task.
+- `harness_send_message` retains information and steers an active child when supported.
+- `harness_followup_task` queues another task on the child's own history.
+- `harness_interrupt_agent` cancels active and queued tasks without deleting history.
+- `harness_list_agents` returns owned identities and their latest tasks.
+- `harness_wait_agent` waits for child activity and returns unreported completed tasks.
 
-## Ownership model
+## Provider and failure boundaries
 
-```text
-Parent model ──calls──▶ Harness agent tools ──route──▶ AgentCoordinator
-                                                     ├─▶ Codex child session
-                                                     ├─▶ Copilot child session
-                                                     └─▶ ACP child session
+Codex sets `agents.enabled=false`. Copilot excludes builtin-qualified native delegation tools.
+Claude ACP disallows `Agent` and `Task`. Antigravity ACP does not expose suppression, and the
+capability menu reports that limitation. Native lifecycle events cannot create managed children.
 
-AgentCoordinator ──owns──▶ child registry, lifecycle, event stream, and execution mode
-```
+A child cannot weaken the root's required sandbox policy. Cleanup failure retains execution
+ownership and its capacity slot for retry. Restart marks unfinished tasks interrupted and does
+not replay queued tasks. Session format compatibility is independent of preference compatibility,
+and hidden incompatible sessions remain stored.
 
-The provider backend would execute children, but `AgentCoordinator` would remain the authoritative owner of
-their IDs, status, execution mode, cancellation, steering, and timeline rendering.
+## Verification evidence
 
-## Why execution modes motivate Harness ownership
+`agent/coordinator_test.rs` covers capacity reservations, duplicate admissions, foreign targets,
+queue limits, interruption, and request delivery. `broker/agent_test.rs` exercises provider routing
+and durable operation receipts through the real broker composition. Broker workflow tests cover
+manual follow-ups and automatic root continuation. Approval tests isolate siblings with identical
+provider request identifiers. Storage tests check atomic admission and restart recovery.
 
-Provider-native children commonly inherit the parent runtime's approval policy and sandbox. That protects the
-parent boundary, but it does not let Harness assign a narrower execution mode to an individual child. A read-only
-explorer and workspace writer therefore cannot receive distinct Harness ceilings when the provider owns their
-lifecycle.
+`agent_picker.lua` checks identity-preserving live selection and the generic spawn composer.
+`harness_owned_agents_real.lua` launches a fresh rebuilt host in a temporary workspace and checks
+manual spawning, idle inbox retention, follow-up history, and optional model delegation. Pass an
+explicit rebuilt binary and configured provider launch descriptors when running outside the
+normal Neovim cache environment. Real-provider authentication failures remain separate from
+automated passes.
 
-Harness-owned child sessions could select the parent's mode or a narrower mode before starting the backend session.
-Every surfaced child approval would pass through the same compiled permission evaluator used by the main Harness
-session. The provider sandbox would still enforce the child's capability ceiling. This prevents a child from gaining
-authority merely because its provider-native parent already holds it.
+### Recorded execution on 2026-10-11
 
-This ownership also gives the UI one place to explain effective authority. The agent picker and child timeline
-could show the assigned mode, while approval requests could identify both the child and the matching permission rule.
-The user-visible result would be predictable least-privilege delegation rather than provider-dependent inheritance.
-The complete mode and permission contract lives in `sandbox.md`.
+Every real run used a fresh Neovim host and temporary workspace. Claude used the installed
+Claude ACP adapter with refreshed OAuth. Antigravity used the installed ACP server with OAuth.
+Codex used `codex app-server`, and Copilot used the embedded Rust SDK with its installed CLI.
+The prompts requested bounded responses without file edits. Tests explicitly disabled the OS
+sandbox before admitting ACP children, preserving the production policy rejection boundary.
 
-## Backend capability findings
+| Root | Child | Model selection | Recorded result |
+| --- | --- | --- | --- |
+| Claude | Claude | Haiku | Manual spawn, idle inbox, retained follow-up, and model delegation passed. |
+| Copilot | Copilot | Haiku | Manual spawn, idle inbox, retained follow-up, and model delegation passed. |
+| Codex | Codex | Advertised default `gpt-6.1-sol` | Manual spawn, idle inbox, retained follow-up, and model delegation passed. |
+| Antigravity | Antigravity | Flash | Manual workflow and model delegation passed in separate fresh runs. |
+| Codex | Claude | Default / Haiku | Manual workflow and model delegation passed. |
+| Claude | Antigravity | Haiku / Flash | Manual workflow and model delegation passed. |
+| Antigravity | Copilot | Flash / Haiku | Manual workflow and model delegation passed. |
+| Copilot | Codex | Haiku / default | Manual workflow, model delegation, two simultaneous children, individual interruption, interrupt-all, a visibility toggle during execution, and reopening cancelled outcomes passed. |
 
-### Codex app-server
+Antigravity initially supplied invalid spawn and wait fields. The private ACP control server
+returned structured field diagnostics, and the root corrected its calls and completed the task.
+These recoverable errors remained visible on the timeline. The tests did not add aliases for
+invalid fields or weaken the six public schemas.
 
-Codex implements native delegation as model-visible collaboration tools backed by internal `AgentControl`
-operations. Its native family includes spawning, waiting, steering, resuming, and closing child threads.
+The fixture bounds host startup at 30 seconds, requests and child tasks at 90 seconds, control
+settlement at 45 seconds, and shutdown and view updates at 10 seconds. Those limits apply to
+each operation. Runs contain multiple bounded operations.
 
-Codex can remove the complete native collaboration bundle by disabling its multi-agent feature flags when the
-app-server starts. It does not currently provide a general per-built-in-tool exclusion mechanism. A future
-Harness-owned implementation should disable every multi-agent feature variant recognized by the launched Codex
-version, then inject only the Harness tool family.
-
-### Copilot SDK
-
-Copilot exposes native delegation through tools such as `task`, `list_agents`, `read_agent`, and `write_agent`.
-Its SDK supports session-level `availableTools` and `excludedTools`, which remove named tools from the model's
-advertised tool set. This provides the cleanest path to replacing native delegation with Harness-owned tools.
-
-Copilot also emits structured subagent lifecycle events. A Harness backend should translate those events into
-the common child event model rather than infer lifecycle state from assistant prose.
-
-### Agy CLI
-
-Agy exposes `invoke_subagent`, `define_subagent`, `send_message`, and `manage_subagents` to the model. Its
-documented `PreToolUse` hook can deny a native delegation call after the model selects it, but no verified CLI or
-ACP option currently removes those built-in tools from the root model's advertised schema.
-
-Denial does not solve orchestration ambiguity because the model still sees two delegation systems and can waste
-a turn selecting the forbidden one. Until Agy exposes real built-in tool filtering, Harness should adapt Agy's
-native children into the common timeline instead of injecting a competing Harness spawn family.
-
-### Generic ACP
-
-ACP does not standardize filtering an agent's internal tool registry. An ACP implementation may expose a
-provider-specific capability, but Harness cannot assume one. Generic ACP should use native orchestration when
-the agent advertises it and otherwise report subagents as unavailable.
-
-## Required backend capability
-
-Each backend should eventually report one explicit orchestration mode:
+The final automated command uses the actual release target directory:
 
 ```text
-harness_owned
-native
-unavailable
+cargo test --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --release --locked -p forge-harness --lib
 ```
 
-- `harness_owned` requires native delegation tools to be absent from the model-visible schema.
-- `native` adapts provider lifecycle events into Harness state and documents provider trust limitations.
-- `unavailable` hides agent commands and spawning tools from the UI and model.
+The command ran in `D:/config/nvim/rust/forge` with a 300-second compilation bound and passed
+873 tests, failed zero tests, and retained 10 ignored tests. Test execution took 15.87 seconds.
+The targeted `child` filter passed 35 tests in 4.73 seconds, including all 16 provider pairings,
+replayed child snapshots, late failed completion during a newer follow-up, persisted provider
+tuning, and heading updates without replacing the latest thought.
+The backend filter passed 157 tests with seven ignored in 4.12 seconds after removing obsolete
+native child-control entry points. The managed replay test additionally verifies that rejected
+steering retains its informational message rather than dropping it.
 
-Harness must never expose native and Harness-owned spawning simultaneously.
+Neovim checks used the installed editor and this command shape with a 30-second bound per test:
 
-## Current recommendation
+```text
+nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l D:/config/nvim/tests/forge/agent_picker.lua
+```
 
-- Use Harness-owned orchestration for Codex only after verifying feature-disable behavior against the bundled
-  app-server version.
-- Use Harness-owned orchestration for Copilot SDK sessions after excluding every native delegation tool.
-- Keep Agy on native orchestration until it supports genuine built-in tool filtering.
-- Gate generic ACP behavior on explicit provider capabilities.
-- Preserve native orchestration as the fallback whenever Harness cannot prove that the competing native tool
-  family has been removed from the model context.
+`agent_picker.lua`, `harness_completion.lua`, `forge_completion.lua`,
+`harness_controller_native.lua`, `harness_settings.lua`, and `harness_timeline_position.lua`
+passed. The controller test's `simulated provider failure` is its expected error-path fixture.
+Automated renderer assertions do not replace the interactive terminal inspection.
 
-## Questions to revisit
+The final release command ran in the same Cargo directory with a 300-second bound:
 
-- Can the launched Codex app-server accept session-scoped feature overrides without changing the user's global
-  configuration?
-- Does each supported Copilot SDK version apply `excludedTools` to every delegation entry point, including fleet
-  mode and automatically inferred custom agents?
-- Has Agy added a root-agent tool allowlist or a way to disable subagent tools before model invocation?
-- Can an ACP capability extension describe native child lifecycle operations and tool filtering without relying
-  on provider names?
-- How should Harness persist the effective mode and permission revision when a child session resumes after a Neovim
-  restart?
+```text
+cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --profile release --bin forge --locked --timings
+```
+
+The build exited zero in 36.66 seconds with no warnings. The rebuilt executable is
+`D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`. Its timing artifact is
+`D:/.cache/nvim/rust-sidecar/forge/build/cargo-timings/cargo-timing-20261011T101515.8753266Z.html`.
+
+The rebuilt binary passed a final Copilot-to-Codex run through Terminal MCP:
+
+```text
+nvim --headless -u NONE -l C:/Users/mattm/AppData/Local/Temp/forge-owned-agents-copilot-codex.lua
+```
+
+The wrapper selected Haiku for Copilot, the advertised default model for Codex, and enabled the
+fixture's model-tool and control checks. It emitted `HARNESS_AGENTS_MANUAL_PASS`,
+`HARNESS_AGENTS_MODEL_PASS`, `HARNESS_AGENTS_CONTROLS_PASS`, and
+`HARNESS_AGENTS_RECOVERY_PASS`, then exited zero. The manual child identity was
+`06fe65a2-563f-4fc5-a11c-537c4132a29f`.
+
+Interactive Terminal MCP inspection used fresh Claude-to-Claude Haiku hosts with the same
+binary. The model run displayed both completed children in the open picker and the root synthesis.
+The manual run left the model tools off and reported the fixture result `pass`. The rendered
+Main view showed `● Agent fresh-child · claude · haiku` headings and `○` thought previews.
+Selecting the child in the picker opened both its original result and retained inbox follow-up.
+Pressing Enter on the first Main agent heading also opened that child's full timeline and
+selected `523632c7-a073-45d1-8296-b67caa609d32`. Terminal screenshots and the selected identity
+confirmed navigation and attribution independently of headless renderer assertions.
+
+Interactive wrappers retain the successful view for 90 seconds and then collect the host.
+The temporary wrapper paths describe this recorded run. The reusable fixture remains
+`nvim/tests/forge/harness_owned_agents_real.lua`, configured through its documented test globals.
+
+### Sanity-check fixes verified on 2026-10-11
+
+Child approval requests, resolution, and cancellation now pass through registered backend events
+to the shared permission popup. The popup labels the requesting child and provider. Its interrupt
+action uses the request owner even when a different timeline is selected. Child failure and
+interruption cancel only that owner's approvals. The service regression exercises a real mock
+runtime, resolves an approval through the control route, observes its wire event, and clears the
+running child before releasing execution ownership.
+
+Live picker summaries use registered `agent_updated` events and retain the running exchange when
+follow-ups are queued. Explicit waits observe manual-child activity and return completed results.
+Interrupted children retain their provider conversation identity. Spawn and follow-up reject
+providers unable to enforce the root sandbox. Clear, rollback, phase completion, and automatic
+verification respect active child ownership. Changing only agent-tool visibility resumes the same
+root exchange, preserving its child-result association.
+
+The following commands ran from `D:/config/nvim/rust/forge` with a 300-second compilation bound:
+
+```text
+cargo test --release --locked --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build -p forge-harness --lib child_
+cargo test --release --locked --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build -p forge-harness --lib
+cargo build --manifest-path Cargo.toml --target-dir D:/.cache/nvim/rust-sidecar/forge/build --profile release --bin forge --locked --timings
+```
+
+All exited zero. The child filter passed 36 tests in 5.35 seconds. The library suite passed 881
+tests with 10 ignored in 17.27 seconds. The release build took 71 seconds and compiled `redb`,
+`forge-status`, `forge-harness`, `forge-github`, `forge-review`, and `forge`. Its artifact is
+`D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`. Its timing report is
+`D:/.cache/nvim/rust-sidecar/forge/build/cargo-timings/cargo-timing-20261011T172138.2764538Z.html`.
+
+The Neovim `agent_picker`, `harness_controller_native`, `harness_completion`, `harness_settings`,
+and `harness_timeline_position` fixtures each exited zero under a 30-second bound. The controller
+fixture's `simulated provider failure` remains expected error-path output. `git diff --check`
+exited zero with line-ending conversion warnings only.
+
+Fresh runtime hosts used the rebuilt executable. The fixture now waits on subscribed live state
+for child transitions and reads a snapshot only after the transition, preventing snapshot polling
+from concealing missing events. These commands ran from `D:/config` under a 120-second bound:
+
+```text
+nvim --headless -u NONE -l D:/config/nvim/tests/forge/harness_owned_agents_real.lua
+nvim --headless -u NONE --cmd "lua vim.g.forge_agent_test_manual = false; vim.g.forge_agent_test_controls = true; vim.g.forge_agent_test_launch = {mock={command={'visible-blocking'},selectable=true}}" -l D:/config/nvim/tests/forge/harness_owned_agents_real.lua
+nvim --headless -u NONE -l C:/Users/mattm/AppData/Local/Temp/forge-owned-agents-copilot-codex.lua
+```
+
+All exited zero. Mock runs passed manual spawn, inbox delivery, follow-up, concurrent execution,
+individual interruption, interrupt-all, and persisted recovery. The real Copilot-to-Codex run
+emitted `HARNESS_AGENTS_MANUAL_PASS`, `HARNESS_AGENTS_MODEL_PASS`,
+`HARNESS_AGENTS_CONTROLS_PASS`, and `HARNESS_AGENTS_RECOVERY_PASS`. Its manual child ID was
+`e7160b30-18bf-471f-90c8-31dca51a8e02`. Approval delivery and popup ownership were verified by
+the service and Neovim regression fixtures. This follow-up did not repeat interactive terminal
+inspection or every provider pairing against live services.

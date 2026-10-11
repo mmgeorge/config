@@ -54,14 +54,19 @@ impl AcpBackend {
     }
 
     async fn session(&self, mut request: BackendCatalogRequest) -> Result<Arc<AcpSession>> {
+        let runtime_key = request.runtime_key()?;
         let mut session_map = self.session.lock().await;
-        if let Some(session) = session_map.get(&request.harness_session_id) { return Ok(session.clone()); }
+        if let Some(session) = session_map.get(&request.runtime_key()?) { return Ok(session.clone()); }
         if request.backend_session_id.is_none() {
-            request.backend_session_id = self.conversation.lock().await.get(&request.harness_session_id).cloned();
+            request.backend_session_id = self.conversation.lock().await.get(&request.runtime_key()?).cloned();
         }
         let has_history = request.backend_session_id.is_some();
         ensure!(!request.access.sandbox, "This ACP adapter cannot enforce Forge's OS sandbox. Disable sandbox explicitly in /config before connecting");
         let state = Arc::new(AcpSessionState::new(self.kind, self.permission.clone()));
+        let setting = crate::settings::SettingsStore::open(&self.settings_root)?.get(&request.workspace,&request.harness_session_id,
+            if self.kind == BackendKind::Claude {"claude"} else {"antigravity"})?;
+        *state.tool_definition.write().await = crate::control_tools::ControlToolRegistry
+            .definition_list_for_owner(&request.owner()?,setting.desired.subagent_tools.unwrap_or(false));
         let control = ControlServer::start(state.clone()).await?;
         let target = if self.kind == BackendKind::Claude { "claudecode" } else { "antigravity-cli" };
         let resources = crate::settings::SessionResources::load(&self.settings_root, &request,
@@ -101,7 +106,8 @@ impl AcpBackend {
         })).collect();
         state.catalog.write().await["mcpResources"] = json!(resource_status);
         if self.kind == BackendKind::Claude {
-            parameter["_meta"] = json!({"claudeCode":{"emitRawSDKMessages":true,"options":{"strictMcpConfig":true}}});
+            parameter["_meta"] = json!({"claudeCode":{"emitRawSDKMessages":true,"options":{
+                "strictMcpConfig":true,"disallowedTools":["Agent","Task"]}}});
             if request.execution_mode != PermissionMode::Yolo {
                 parameter["_meta"]["claudeCode"]["options"]["settings"] = json!({"permissions":{"ask":["*"]}});
             }
@@ -126,9 +132,9 @@ impl AcpBackend {
         let session = Arc::new(AcpSession { id, native_ask:request.execution_mode != PermissionMode::Yolo,
             transport, state, _control: control, turn: Mutex::new(()), initialized, configuration: parameter, _profile:profile });
         if has_history {
-            self.conversation.lock().await.insert(request.harness_session_id.clone(), session.id.clone());
+            self.conversation.lock().await.insert(runtime_key.clone(), session.id.clone());
         }
-        session_map.insert(request.harness_session_id, session.clone());
+        session_map.insert(runtime_key, session.clone());
         Ok(session)
     }
 
@@ -168,12 +174,12 @@ impl AcpBackend {
 #[async_trait]
 impl Backend for AcpBackend {
     async fn setup(&self, request: BackendCatalogRequest, install: bool) -> Result<Value> {
-        ensure!(!self.has_active_turn(&request.harness_session_id).await, "Finish active provider work before setup");
+        ensure!(!self.has_active_turn(&request.runtime_key()?).await, "Finish active provider work before setup");
         let status = if install { self.runtime.install().await? } else { self.runtime.status() };
         let mut result = serde_json::to_value(&status)?;
         result["auth_methods"] = json!([]);
         if !status.available { return Ok(result); }
-        self.cleanup_execution(&request.harness_session_id).await?;
+        self.cleanup_execution(&request.runtime_key()?).await?;
         let state = Arc::new(AcpSessionState::new(self.kind, self.permission.clone()));
         let profile = if self.kind == BackendKind::Antigravity {
             Some(ResourceProfile::antigravity(&self.settings_root, &ResourceProfile::native_home()?, &[])?)
@@ -199,13 +205,13 @@ impl Backend for AcpBackend {
     }
 
     async fn reconcile_settings(&self, request: BackendCatalogRequest, _setting: &crate::settings::PortableSettings) -> Result<()> {
-        self.cleanup_execution(&request.harness_session_id).await?;
+        self.cleanup_execution(&request.runtime_key()?).await?;
         self.session(request).await?;
         Ok(())
     }
 
     async fn authenticate(&self, request: BackendCatalogRequest, method: String) -> Result<()> {
-        ensure!(!self.has_active_turn(&request.harness_session_id).await, "Authentication cannot change during active provider work");
+        ensure!(!self.has_active_turn(&request.runtime_key()?).await, "Authentication cannot change during active provider work");
         let state = Arc::new(AcpSessionState::new(self.kind, self.permission.clone()));
         let profile = if self.kind == BackendKind::Antigravity {
             Some(ResourceProfile::antigravity(&self.settings_root, &ResourceProfile::native_home()?, &[])?)
@@ -221,13 +227,13 @@ impl Backend for AcpBackend {
         let result = transport.request("authenticate", json!({"methodId":method})).await;
         transport.shutdown().await?;
         result?;
-        self.cleanup_execution(&request.harness_session_id).await?;
+        self.cleanup_execution(&request.runtime_key()?).await?;
         Ok(())
     }
 
     async fn capabilities(&self, request: BackendCatalogRequest) -> Result<CapabilityManifest> {
         let mut manifest = CapabilityManifest::from_descriptor(self.descriptor());
-        if let Some(session) = self.session.lock().await.get(&request.harness_session_id).cloned() {
+        if let Some(session) = self.session.lock().await.get(&request.runtime_key()?).cloned() {
             let mut descriptor = self.descriptor();
             descriptor.capability = self.runtime_capability(&session).await;
             let native_fork = descriptor.capability.native_fork;
@@ -310,7 +316,7 @@ impl Backend for AcpBackend {
 
     async fn mcp_list(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
         let mut definition = self.mcp_configuration(request.clone()).await?;
-        if let Some(session) = self.session.lock().await.get(&request.harness_session_id).cloned() {
+        if let Some(session) = self.session.lock().await.get(&request.runtime_key()?).cloned() {
             let catalog = session.state.catalog.read().await;
             for server in &mut definition {
                 if let Some(resource) = catalog["mcpResources"].as_array().into_iter().flatten()
@@ -324,18 +330,18 @@ impl Backend for AcpBackend {
 
     async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<BackendOutput> {
         if self.kind == BackendKind::Claude {
-            let existing = self.session.lock().await.get(&request.harness_session_id).cloned();
+            let existing = self.session.lock().await.get(&request.runtime_key()?).cloned();
             if let Some(existing) = existing
                 && existing.native_ask != (request.execution_mode != PermissionMode::Yolo) {
                 ensure!(existing.state.active.read().await.is_none(), "Permission policy changes require active execution cleanup");
-                self.cleanup_execution(&request.harness_session_id).await?;
+                self.cleanup_execution(&request.runtime_key()?).await?;
             }
         }
         let session = self.session(catalog_request(&request)).await?;
         let _turn = session.turn.try_lock().context("ACP session already owns active work")?;
         self.configure(&session, &request).await?;
         session.state.begin(&request, &session.id, sink).await;
-        self.conversation.lock().await.insert(request.harness_session_id.clone(), session.id.clone());
+        self.conversation.lock().await.insert(request.runtime_key()?, session.id.clone());
         let text = match &request.input {
             BackendInput::Text { text } => text.clone(),
             BackendInput::Skill { name, arguments } => format!("/{name} {arguments}"),
@@ -432,7 +438,7 @@ impl Backend for AcpBackend {
 }
 
 fn catalog_request(request: &BackendRequest) -> BackendCatalogRequest {
-    BackendCatalogRequest { harness_session_id:request.harness_session_id.clone(),workspace:request.workspace.clone(),
+    BackendCatalogRequest { execution_owner: request.execution_owner.clone(), harness_session_id:request.harness_session_id.clone(),workspace:request.workspace.clone(),
         access:request.access.clone(),execution_mode:request.execution_mode,backend_session_id:request.backend_session_id.clone() }
 }
 
@@ -465,7 +471,7 @@ mod test {
             settings.import_operation(revision, SettingScope::Workspace, &workspace, "session", &selected,
                 &format!("import-{revision}"), &json!({"fingerprint":preview.fingerprint}))?;
         }
-        let request = BackendCatalogRequest { harness_session_id:"session".into(), workspace:workspace.clone(),
+        let request = BackendCatalogRequest { execution_owner: None, harness_session_id:"session".into(), workspace:workspace.clone(),
             access:Default::default(), execution_mode:PermissionMode::Read, backend_session_id:None };
         for kind in [BackendKind::Claude, BackendKind::Antigravity] {
             let backend = AcpBackend::new(kind, vec!["fixture-must-not-launch".into()],

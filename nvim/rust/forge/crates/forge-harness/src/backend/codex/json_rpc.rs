@@ -9,7 +9,7 @@ use crate::backend::{
     ToolActivityKind,
 };
 use crate::control_tools::{
-    ControlToolInvocation, ControlToolRuntime, ControlTurnContext, apply_invocation,
+    ControlToolInvocation, ControlToolRegistry, ControlToolRuntime, ControlTurnContext, apply_invocation,
     control_tool_failure_json,
 };
 use crate::plan::{PlanDocument, render_plan};
@@ -224,6 +224,7 @@ pub struct CodexJsonRpc {
     activity_publication: bool,
     trace: Arc<TraceStore>,
     session_id: String,
+    execution_owner: Option<crate::backend::ExecutionOwner>,
 }
 
 impl CodexJsonRpc {
@@ -255,7 +256,13 @@ impl CodexJsonRpc {
             activity_publication: true,
             trace,
             session_id,
+            execution_owner:None,
         })
+    }
+
+    /// Bind provider permission callbacks before starting or resuming a conversation.
+    pub fn set_execution_owner(&mut self, owner: crate::backend::ExecutionOwner) {
+        self.execution_owner = Some(owner);
     }
 
     /// Update request context and reset control-call identity before reusing this process.
@@ -741,8 +748,8 @@ impl CodexJsonRpc {
                     }));
                 }
                 Ok(json!({
-                    "contentItems": [{ "type": "inputText", "text": "Recorded by Forge Harness" }],
-                    "success": true
+                    "contentItems": [{ "type": "inputText", "text": "Unknown Harness dynamic tool" }],
+                    "success": false
                 }))
             }
             _ => Ok(Value::Null),
@@ -760,6 +767,9 @@ impl CodexJsonRpc {
             return Ok(Some(result.message));
         }
         match invocation.name.as_str() {
+            name if crate::control_tools::is_agent_tool(name) => {
+                anyhow::bail!("agent tools require an authenticated active root turn");
+            }
             "harness_plan_phase_done" => {
                 anyhow::bail!("phase completion requires an active execution control context");
             }
@@ -842,6 +852,7 @@ impl CodexJsonRpc {
                 self.execution_mode,
                 request,
                 Some(crate::backend::ProviderAddress {
+                    owner: self.execution_owner.clone(),
                     thread_id: message
                         .pointer("/params/threadId")
                         .and_then(Value::as_str)
@@ -983,7 +994,7 @@ async fn normalize_event_in_workspace(
         &params,
         &["/turnId", "/turn_id", "/turn/id"],
     ))
-    .map(|(thread_id, turn_id)| crate::backend::ProviderAddress { thread_id, turn_id });
+    .map(|(thread_id, turn_id)| crate::backend::ProviderAddress { owner: None, thread_id, turn_id });
     let text = first_text(&params);
     let method_lower = method.to_ascii_lowercase();
     let encoded = params.to_string().to_ascii_lowercase();
@@ -1529,23 +1540,7 @@ fn control_tool_name<'value>(method: &str, value: &'value Value) -> Option<&'val
     ["tool", "name", "toolName", "tool_name"]
         .into_iter()
         .find_map(|key| item.get(key).and_then(Value::as_str))
-        .filter(|name| {
-            matches!(
-                *name,
-                "harness_design_apply_patch"
-                    |
-                "harness_plan_edit"
-                    | "harness_plan_read"
-                    | "harness_plan_submit"
-                    | "harness_plan_phase_done"
-                    | "harness_question_ask"
-                    | "harness_question_answer"
-                    | "harness_question_withdraw"
-                    | "harness_goal_complete"
-                    | "harness_goal_blocked"
-                    | "harness_goal_status"
-            )
-        })
+        .filter(|name| *name == "harness_plan_edit" || ControlToolRegistry.definition_list().iter().any(|definition|definition.name == *name))
 }
 
 fn find_control_arguments(value: &Value, control_name: &str) -> Option<Value> {
@@ -2128,6 +2123,14 @@ fn first_text(value: &Value) -> Option<String> {
 #[cfg(test)]
 mod test {
     #[test]
+    fn every_registered_dynamic_tool_reaches_control_dispatch() {
+        for definition in crate::control_tools::ControlToolRegistry.definition_list() {
+            let request = serde_json::json!({"tool":definition.name,"arguments":{}});
+            let invocation = super::control_invocation("item/tool/call",&request).unwrap().unwrap();
+            assert_eq!(invocation.name,definition.name);
+        }
+    }
+    #[test]
     fn mcp_approval_uses_current_metadata_and_canonical_tool_identity() {
         use super::*;
         let mut context = McpContext::default();
@@ -2683,6 +2686,7 @@ mod test {
         let mut turn = crate::turn::Turn::new(
             "turn".into(),
             crate::backend::ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
             },

@@ -28,7 +28,8 @@ fn broker_fixture() -> (tempfile::TempDir, HarnessBroker) {
             .success()
     );
     let broker = HarnessBroker::initialize(InitializeRequest {
-        config_dir: None,
+        backend_launch_by_provider: Default::default(),
+            config_dir: None,
         data_root: temporary.path().join("data").to_string_lossy().into_owned(),
         permission_file: Some(
             temporary

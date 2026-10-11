@@ -236,6 +236,8 @@ function M.open(state, host)
         configure({ shell = values[(position - 1 + (direction or 1)) % #values + 1] })
       elseif id == "plan-revisions" then
         configure({ plan_auto_approve_revisions = active.plan_auto_approve_revisions == false })
+      elseif id == "subagent-tools" then
+        configure({ subagent_tools = state.subagent_tools ~= true })
       elseif id == "logging" then
         pending = true
         client.request_for(session_id, "trace.configure", { enabled = not status.enabled }, function(result, failure)
@@ -264,6 +266,7 @@ function M.open(state, host)
             { id = "default-write-permission", label = "Default write permission", columns = { "Default write permission", picker_field.render(active.default_write_permission or "write", true), "Applied to new goals and accepted plans" } },
             { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },
+            { id = "subagent-tools", label = "Subagent tools", columns = { "Subagent tools", picker_field.render(state.subagent_tools == true and "On" or "Off",true), "Root model delegation · manual spawning remains available" } },
             { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true)
               or (policy.sandbox and picker_field.render("Disable to connect", true) or "Unsupported"), "OS isolation, independent of approval mode" } },
             { id = "write-access", label = "Write access", columns = { "Write access", picker_field.render(policy.write_access, true), policy.sandbox and "Directories writable inside the sandbox" or "Inactive · sandbox disabled permits full access" } },

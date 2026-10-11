@@ -357,14 +357,14 @@ mod test {
             let snapshot = store.catalog(&workspace, "session", backend)?;
             assert_eq!(snapshot.server.len(), 1);
             assert_eq!(snapshot.settings.desired.mcp.get(&id), Some(&false));
-            let request = crate::backend::BackendCatalogRequest { harness_session_id:"session".into(), workspace:workspace.clone(),
+            let request = crate::backend::BackendCatalogRequest { execution_owner: None, harness_session_id:"session".into(), workspace:workspace.clone(),
                 access:Default::default(), execution_mode:crate::session::PermissionMode::Read, backend_session_id:None };
             assert!(SessionResources::load(root.path(), &request, backend, "test")?.launch.is_empty());
         }
         let mut desired = store.get(&workspace, "session", "claude")?.desired;
         desired.mcp.insert(id, true);
         store.update(1, SettingScope::Workspace, &workspace, "session", &desired)?;
-        let request = crate::backend::BackendCatalogRequest { harness_session_id:"session".into(), workspace:workspace.clone(),
+        let request = crate::backend::BackendCatalogRequest { execution_owner: None, harness_session_id:"session".into(), workspace:workspace.clone(),
             access:Default::default(), execution_mode:crate::session::PermissionMode::Read, backend_session_id:None };
         let launched = SessionResources::load(root.path(), &request, "antigravity", "test")?;
         assert_eq!(launched.launch[0].1["env"]["TOKEN"], "native-token-fixture");

@@ -46,6 +46,8 @@ pub struct ApprovalChoice {
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct ApprovalRequestView {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_owner: Option<crate::backend::ExecutionOwner>,
     pub exchange_id: Option<String>,
     pub turn_id: Option<String>,
     pub provider: String,
@@ -129,7 +131,7 @@ impl PermissionCoordinator {
         &self,
         execution_mode: PermissionMode,
         forced: bool,
-        request: PermissionRequest,
+        mut request: PermissionRequest,
         address: Option<crate::backend::ProviderAddress>,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalResolution> {
@@ -150,8 +152,13 @@ impl PermissionCoordinator {
         if forced && evaluation.pending_target_list.is_empty() {
             evaluation.pending_target_list = request.target_list.clone();
         }
+        let execution_owner = address.as_ref().and_then(|address| address.owner.clone());
+        if let Some(owner) = &execution_owner {
+            request.id = format!("{}:{}:{}", owner.session_id, owner.agent_id, request.id);
+        }
         let id = request.id.clone();
-        let view = approval_view(&request, &evaluation);
+        let mut view = approval_view(&request, &evaluation);
+        view.execution_owner = execution_owner;
         let (sender, receiver) = oneshot::channel();
         self.pending_map
             .lock()
@@ -354,6 +361,21 @@ impl PermissionCoordinator {
         Ok(())
     }
 
+    /// Cancel only approvals owned by the interrupted execution.
+    pub async fn cancel_owner(&self, owner: &crate::backend::ExecutionOwner, event_sink: Option<&BackendEventSink>) -> Result<()> {
+        let pending_list = {
+            let mut pending_map = self.pending_map.lock().map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+            let id_list: Vec<_> = pending_map.iter().filter(|(_, pending)| pending.view.execution_owner.as_ref() == Some(owner))
+                .map(|(id, _)| id.clone()).collect();
+            id_list.into_iter().filter_map(|id| pending_map.remove(&id)).collect::<Vec<_>>()
+        };
+        for pending in pending_list {
+            let _ = pending.response.send(ApprovalResolution::Cancel);
+            Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
+        }
+        Ok(())
+    }
+
     async fn emit_lifecycle(
         event_sink: Option<&BackendEventSink>,
         kind: &str,
@@ -455,6 +477,7 @@ fn approval_view(
 ) -> ApprovalRequestView {
     ApprovalRequestView {
         id: request.id.clone(),
+        execution_owner: None,
         exchange_id: None,
         turn_id: None,
         provider: request.provider.clone(),
@@ -866,6 +889,34 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 mod test {
     use super::*;
     use crate::permissions::store::PermissionStore;
+
+    #[tokio::test]
+    async fn cancelling_one_owned_child_preserves_sibling_approval_with_the_same_provider_id() {
+        let coordinator = PermissionCoordinator::transient(".").unwrap();
+        let (event_sink,mut event_stream) = crate::backend::events::channel();
+        let mut waiter = Vec::new();
+        for agent_id in ["first","second"] {
+            let coordinator = coordinator.clone();
+            let sink = event_sink.clone();
+            let owner = crate::backend::ExecutionOwner {session_id:"root".into(),agent_id:agent_id.into()};
+            waiter.push(tokio::spawn(async move {
+                coordinator.authorize_callback(PermissionMode::Read,true,PermissionRequest {id:"same-provider-id".into(),provider:"test".into(),
+                    reason:None,target_list:vec![PermissionTarget::Command {command:"probe task".into(),shell:None}]},
+                    Some(crate::backend::ProviderAddress {owner:Some(owner),thread_id:"thread".into(),turn_id:"turn".into()}),Some(&sink)).await.unwrap()
+            }));
+            assert_eq!(event_stream.recv().await.unwrap().unwrap().kind,"approval_requested");
+        }
+        assert_eq!(coordinator.pending_list().unwrap().len(),2);
+        coordinator.cancel_owner(&crate::backend::ExecutionOwner {session_id:"root".into(),agent_id:"first".into()},Some(&event_sink)).await.unwrap();
+        assert_eq!(event_stream.recv().await.unwrap().unwrap().kind,"approval_cancelled");
+        assert_eq!(waiter.remove(0).await.unwrap(),ApprovalResolution::Cancel);
+        assert!(!waiter[0].is_finished());
+        let pending = coordinator.pending_list().unwrap();
+        assert_eq!(pending.len(),1);
+        assert_eq!(pending[0].execution_owner.as_ref().unwrap().agent_id,"second");
+        coordinator.cancel_owner(&crate::backend::ExecutionOwner {session_id:"root".into(),agent_id:"second".into()},None).await.unwrap();
+        assert_eq!(waiter.remove(0).await.unwrap(),ApprovalResolution::Cancel);
+    }
 
     fn evaluate_review(request: &PermissionRequest) -> PermissionEvaluation {
         let document = crate::permissions::document::parse_permission_document(

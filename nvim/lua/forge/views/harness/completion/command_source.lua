@@ -4,8 +4,6 @@
 ---@field model_list table[]?
 ---@field model_callback_list (fun(model_list: table[], failure: string?))[]
 local CommandSource = {}
-local agent_catalog = require("forge.views.harness.agent_catalog")
-local agent_summary = require("forge.render.harness.agent_summary")
 local client = require("forge.client")
 local notifications = require("forge.infra.notifications")
 local model_order = require("forge.views.harness.model_order")
@@ -24,8 +22,8 @@ local command_list = {
   { label = "/log clear", detail = "Clear the current session debug log" },
   { label = "/recap", detail = "Summarize the conversation without changing agent history" },
   { label = "/bg", detail = "List and terminate background terminals" },
-  { label = "/agent", detail = "Switch between Main and child-agent timelines", capability = "agent_observe" },
-  { label = "/spawn", detail = "Spawn a child agent", capability = "agent_catalog" },
+  { label = "/agents", detail = "Inspect and manage Main and child-agent timelines" },
+  { label = "/spawn", detail = "Create a fresh Harness-owned child agent" },
   { label = "/plan", detail = "Browse plans, or create a planning task with a prompt" },
   { label = "/task", detail = "List current and previous tasks" },
   { label = "/task new", detail = "Create a Plan, Execute, or Goal task" },
@@ -233,29 +231,6 @@ function CommandSource:get_completions(_, callback)
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end
-  local definition_start = prefix:match("^%s*/spawn%s+()([^%s]*)$")
-  if definition_start then
-    local capability = session.harness.capability or {}
-    if capability.agent and capability.agent.catalog then
-      for _, definition in ipairs((session.harness.agent or {}).definition or {}) do
-        items[#items + 1] = {
-          label = definition.name,
-          filterText = definition.name,
-          detail = definition.description,
-          kind = vim.lsp.protocol.CompletionItemKind.Value,
-          textEdit = {
-            newText = definition.name,
-            range = {
-              start = { line = row, character = definition_start - 1 },
-              ["end"] = { line = row, character = cursor_column },
-            },
-          },
-        }
-      end
-    end
-    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
-    return
-  end
   if prefix:match("^%s*/spawn%s+") then
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
@@ -350,38 +325,6 @@ function CommandSource:get_completions(_, callback)
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end
-  local selector_start = prefix:match("^%s*/agent%s+()([^%s]*)$")
-  if selector_start then
-    local selector_list = { { selector = "main", detail = "Parent conversation" } }
-    for index, run in ipairs(agent_catalog.run_list(session.harness, true)) do
-      if index > 26 then break end
-      selector_list[#selector_list + 1] = {
-        selector = string.char(string.byte("a") + index - 1),
-        detail = agent_summary.label(run) .. " · running child " .. index,
-      }
-    end
-    for _, selector in ipairs(selector_list) do
-      items[#items + 1] = {
-        label = selector.selector,
-        filterText = selector.selector,
-        detail = selector.detail,
-        kind = vim.lsp.protocol.CompletionItemKind.Value,
-        textEdit = {
-          newText = selector.selector,
-          range = {
-            start = { line = row, character = selector_start - 1 },
-            ["end"] = { line = row, character = cursor_column },
-          },
-        },
-      }
-    end
-    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
-    return
-  end
-  if prefix:match("^%s*/agent%s+") then
-    callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
-    return
-  end
   if command_start then
     local parent_command = prefix:match("^%s*(/%S+)%s+")
     for _, command in ipairs(command_list) do
@@ -389,16 +332,7 @@ function CommandSource:get_completions(_, callback)
         goto continue
       end
       local capability = session.harness.capability or {}
-      if command.capability == "agent_observe"
-        and not (capability.agent and capability.agent.observe)
-        and #(((session.harness.agent or {}).run) or {}) == 0
-      then
-        goto continue
-      end
-      if command.capability == "agent_catalog" and not (capability.agent and capability.agent.catalog) then
-        goto continue
-      end
-      if command.capability and command.capability ~= "agent_observe" and command.capability ~= "agent_catalog"
+      if command.capability
         and command.capability ~= "skill_catalog" and command.capability ~= "mcp_catalog"
         and capability[command.capability] ~= true
       then

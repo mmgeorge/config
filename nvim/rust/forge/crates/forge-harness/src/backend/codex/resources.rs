@@ -130,7 +130,7 @@ mod test {
             "selected":{"command":"fixture","env":{"CUSTOM_CREDENTIAL":"selected-secret-fixture"}}
         }}).to_string())?;
         crate::settings::SettingsStore::open(root.path())?.configure_catalog(root.path())?;
-        let request = BackendCatalogRequest { harness_session_id:"session".into(),workspace:root.path().to_string_lossy().into_owned(),
+        let request = BackendCatalogRequest { execution_owner: None, harness_session_id:"session".into(),workspace:root.path().to_string_lossy().into_owned(),
             access:Default::default(),execution_mode:crate::session::PermissionMode::Read,backend_session_id:None };
         let resources = CodexResources::new(root.path(),&request,vec!["unused".into()])?;
         let selected_path = dunce::canonicalize(skill.join("SKILL.md"))?.to_string_lossy().into_owned();

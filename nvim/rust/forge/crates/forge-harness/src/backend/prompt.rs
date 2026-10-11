@@ -66,6 +66,7 @@ mod test {
     #[test]
     fn current_context_replaces_previous_permission_and_does_not_infer_answers_from_text() {
         let mut request = BackendRequest {
+            execution_owner: None,
             harness_session_id: "session".into(),
             workspace: ".".into(),
             input: BackendInput::from_text("Explain the phrase Planning feedback:"),

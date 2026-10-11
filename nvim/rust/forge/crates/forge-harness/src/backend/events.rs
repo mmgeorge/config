@@ -8,6 +8,7 @@ use super::BackendEvent;
 
 #[derive(Clone)]
 pub struct BackendEventSink {
+    owner: Option<super::ExecutionOwner>,
     sender: MessageSender,
     delivery: std::sync::Arc<tokio::sync::Mutex<()>>,
 }
@@ -33,7 +34,7 @@ impl std::error::Error for EventDeliveryFailure {}
 
 pub fn channel() -> (BackendEventSink, BackendEventStream) {
     let (sender, receiver) = outbound::channel();
-    (BackendEventSink { sender, delivery: Default::default() }, BackendEventStream {
+    (BackendEventSink { sender, delivery: Default::default(), owner:None }, BackendEventStream {
         receiver,
         transfer: None,
         pending: None,
@@ -43,8 +44,18 @@ pub fn channel() -> (BackendEventSink, BackendEventStream) {
 }
 
 impl BackendEventSink {
+    /// Bind transport delivery to its authenticated execution owner.
+    pub fn owned(&self, owner: super::ExecutionOwner) -> Self {
+        Self {sender:self.sender.clone(),delivery:self.delivery.clone(),owner:Some(owner)}
+    }
     /// Waits for bounded queue capacity without treating a burst as delivery failure.
     pub async fn send_wait(&self, mut event: BackendEvent) -> Result<(), EventDeliveryFailure> {
+        if let (Some(owner),Some(address)) = (&self.owner,&mut event.address) {
+            if address.owner.as_ref().is_some_and(|observed|observed != owner) {
+                return Err(EventDeliveryFailure(io::Error::other("provider delivery crosses execution ownership")));
+            }
+            address.owner = Some(owner.clone());
+        }
         event.received_at_ms.get_or_insert_with(|| std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64);
         let _delivery = self.delivery.lock().await;

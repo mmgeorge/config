@@ -37,6 +37,7 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@field choice_id string
 
 ---@class ForgeApprovalHost
+---@field owner_label? string
 ---@field transcript_win integer
 ---@field window_list? integer[]
 ---@field control_win? integer
@@ -151,6 +152,7 @@ local function build_spec(instance)
     local content_list = {
       { text = "Any denial rejects the whole request. Saved choices apply only to their listed target.", group = "ForgePickerText" },
     }
+    if host.owner_label then table.insert(content_list, 1, { text = host.owner_label, group = "ForgePickerText" }) end
     for _, item in ipairs(request.item_list) do
       vim.list_extend(content_list, detail_content(item))
       content_list[#content_list + 1] = { text = choice_label(item, instance.selection[item.id]), group = "ForgePickerAnswer" }
@@ -176,6 +178,7 @@ local function build_spec(instance)
         if instance.selection[item.id] == choice then selected_index = index end
       end
       local content_list = detail_content(item)
+      if host.owner_label then table.insert(content_list, 1, { text = host.owner_label, group = "ForgePickerText" }) end
       if request.reason then content_list[#content_list + 1] = { text = "Reason: " .. request.reason, group = "ForgePickerText" } end
       page_list[#page_list + 1] = {
         id = item.id, title = "Review Permission", subtitle = item.title ~= "Run command" and item.title or nil,

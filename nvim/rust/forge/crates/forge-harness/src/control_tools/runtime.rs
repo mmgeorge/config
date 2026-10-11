@@ -12,6 +12,7 @@ use std::sync::Arc;
 /// Carries the broker-owned control state visible to one provider turn.
 #[derive(Clone)]
 pub struct ControlTurnContext {
+    pub agent: Option<Arc<crate::agent::AgentToolScope>>,
     pub mode: PromptMode,
     pub planning_feedback: bool,
     pub check_shell: crate::session::CheckShell,
@@ -53,6 +54,7 @@ impl ControlTurnContext {
     /// Build an inert context for backend calls without broker state.
     pub fn inactive(mode: PromptMode) -> Self {
         Self {
+            agent: None,
             mode,
             planning_feedback: false,
             check_shell: Default::default(),
@@ -124,6 +126,12 @@ impl ControlToolRuntime {
         if matches!(invocation.name.as_str(), "harness_design_apply_patch" | "harness_plan_submit")
             && let Some(execution) = &self.context.execution { execution.require_revision_phase()?; }
         match invocation.name.as_str() {
+            "harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
+            | "harness_list_agents" | "harness_wait_agent" => {
+                let scope = self.context.agent.as_ref().context("agent tools require an authenticated active root turn")?;
+                let message = scope.invoke(&invocation.name,invocation.arguments).await?;
+                Ok(ControlToolResult {invocation:None,message})
+            }
             "harness_plan_phase_done" => {
                 let execution = self.context.execution.as_ref().context("phase completion requires an active execution")?;
                 let request = serde_json::from_value(invocation.arguments.clone())?;
@@ -468,6 +476,7 @@ mod test {
     fn planning_context() -> ControlTurnContext {
         let cache_dir = tempfile::tempdir().unwrap().keep();
         ControlTurnContext {
+            agent: None,
             mode: PromptMode::Plan,
             planning_feedback: false,
             check_shell: Default::default(),

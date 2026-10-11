@@ -415,6 +415,8 @@ impl HarnessBroker {
                 execution.generation += 1;
             }
             ExecutionOperation::Phase(request) => {
+                anyhow::ensure!(self.agent_coordinator.active_count() == 0,
+                    "child execution must settle before completing a plan phase. Wait for or interrupt active children first");
                 anyhow::ensure!(
                     plan.state == PlanState::Accepted,
                     "submit and accept the draft revision before completing a phase"

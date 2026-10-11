@@ -51,6 +51,7 @@ local ok, failure = pcall(function()
     selected_agent_run_id = "run-zeta",
     agent = {
       run = {
+        { id = "root-agent", source = "root", definition = "primary", task_name = "Main", state = "ready" },
         {
           id = "run-zeta",
           definition = "zeta",
@@ -74,6 +75,10 @@ local ok, failure = pcall(function()
         },
       },
       exchange = {},
+      summary = {
+        ["run-zeta"] = { state = "running", tool_count = 2, failed_count = 1 },
+        ["run-done"] = { state = "complete", tool_count = 0, failed_count = 0 },
+      },
     },
     timeline = {
       {
@@ -136,8 +141,9 @@ local ok, failure = pcall(function()
     "the active child timeline should be selected initially")
 
   zeta_interaction.state = "complete"
+  state.agent.summary["run-zeta"].state = "complete"
   zeta_interaction.turn[1].state = { kind = "finished", outcome = "completed" }
-  state.agent.run[1].updated_at_ms = state.agent.run[1].created_at_ms + 12000
+  state.agent.run[2].updated_at_ms = state.agent.run[2].created_at_ms + 12000
   agent_picker.refresh()
   active = picker._state_for_test()
   assert_equals(picker_state.selected_option(active.state, active.spec).value.run.id, "run-zeta",
@@ -156,58 +162,61 @@ local ok, failure = pcall(function()
   invoke("<CR>", "n", active.buf)
   assert_equals(selected_run_id, nil, "Main should clear the selected child timeline")
 
-  local spawned_definition = nil
-  local spawned_prompt = nil
-  local definition_list = {
-    { name = "explorer", description = "Repository explorer" },
-    { name = "worker", description = "Implementation worker" },
-  }
+  local spawned_request
+  local loaded_provider
   assert_true(spawn_picker.open({
     host = { window_list = { origin_win }, control_win = origin_win },
-    definition_list = definition_list,
-    on_spawn = function(definition, prompt)
-      spawned_definition = definition
-      spawned_prompt = prompt
+    provider = "claude",
+    load_models = function(provider, callback)
+      loaded_provider = provider
+      callback({ { id = "test-model", description = "Fixture", reasoning = {}, context_window = {}, is_default = true } })
     end,
-  }), "spawn picker should open its searchable definition list")
+    on_spawn = function(request) spawned_request = request end,
+  }), "generic child composer should open")
   active = picker._state_for_test()
-  assert_true(active.search_win and vim.api.nvim_win_is_valid(active.search_win),
-    "spawn definitions should expose a focused search input")
-  vim.api.nvim_buf_set_lines(active.search_buf, 0, -1, false, { "work" })
-  vim.api.nvim_exec_autocmds("TextChangedI", { buffer = active.search_buf })
-  assert_true(vim.wait(500, function()
-    return #picker_state.page(active.state, active.spec).option_list == 1
-  end, 10), "spawn search should filter agent definitions by name")
-  assert_equals(picker_state.page(active.state, active.spec).option_list[1].label, "worker",
-    "spawn search should retain the matching definition")
-  invoke("<CR>", "i", active.search_buf)
-  active = picker._state_for_test()
-  assert_true(active.input_win and vim.api.nvim_win_is_valid(active.input_win),
-    "selecting a definition should open its attached task input")
-  assert_equals(vim.api.nvim_get_current_win(), active.input_win,
-    "spawn task input should receive focus before Insert mode starts")
-  vim.api.nvim_buf_set_lines(active.input_buf, 0, -1, false, { "Implement the renderer" })
+  assert_true(active.input_win and vim.api.nvim_win_is_valid(active.input_win), "name input should own focus")
+  vim.api.nvim_buf_set_lines(active.input_buf, 0, -1, false, { "review-worker" })
   invoke("<C-s>", "i", active.input_buf)
-  assert_equals(spawned_definition, "worker", "task submission should preserve the filtered definition")
-  assert_equals(spawned_prompt, "Implement the renderer", "task submission should preserve the prompt")
-  assert_equals(vim.api.nvim_get_current_win(), origin_win, "task submission should restore Harness focus")
+  active = picker._state_for_test()
+  assert_equals(picker_state.page(active.state, active.spec).id, "spawn-task")
+  vim.api.nvim_buf_set_lines(active.input_buf, 0, -1, false, { "Inspect the renderer" })
+  invoke("<C-s>", "i", active.input_buf)
+  active = picker._state_for_test()
+  assert_equals(picker_state.page(active.state, active.spec).id, "spawn-provider")
+  invoke("<CR>", "n", active.buf)
+  active = picker._state_for_test()
+  assert_equals(loaded_provider, "claude")
+  invoke("<CR>", "n", active.buf)
+  assert_equals(spawned_request.task_name, "review-worker")
+  assert_equals(spawned_request.message, "Inspect the renderer")
+  assert_equals(spawned_request.provider, "claude")
+  assert_equals(spawned_request.model, "test-model")
+  assert_equals(spawned_request.reasoning_effort, nil, "models without reasoning must omit the override")
+  assert_equals(vim.api.nvim_get_current_win(), origin_win)
 
   assert_true(spawn_picker.open({
     host = { window_list = { origin_win }, control_win = origin_win },
-    definition_list = definition_list,
-    definition_name = "explorer",
-    on_spawn = function() end,
-  }), "an exact /spawn definition should open its task input directly")
+    provider = "claude", task_name = "another-worker",
+    load_models = function() end, on_spawn = function() end,
+  }), "direct task names should skip the name page")
   active = picker._state_for_test()
-  assert_true(active.input_win and vim.api.nvim_win_is_valid(active.input_win),
-    "direct definition selection should skip the search page")
+  assert_equals(picker_state.page(active.state, active.spec).id, "spawn-task")
+  local late_models
   picker.close(true)
-  assert_true(not spawn_picker.open({
+  spawn_picker.open({
     host = { window_list = { origin_win }, control_win = origin_win },
-    definition_list = definition_list,
-    definition_name = "missing",
-    on_spawn = function() end,
-  }), "unknown direct definitions should fail without opening a picker")
+    provider = "claude", task_name = "late-worker",
+    load_models = function(_, callback) late_models = callback end, on_spawn = function() error("closed composer spawned work") end,
+  })
+  active = picker._state_for_test()
+  vim.api.nvim_buf_set_lines(active.input_buf,0,-1,false,{"Deferred model lookup"})
+  invoke("<C-s>","i",active.input_buf)
+  active = picker._state_for_test()
+  invoke("<CR>","n",active.buf)
+  assert_true(late_models ~= nil)
+  picker.close(true)
+  late_models({{id="late-model",reasoning={},context_window={},is_default=true}})
+  assert_true(not picker.is_open("model"),"late model response reopened a closed composer")
 end)
 
 if not ok then

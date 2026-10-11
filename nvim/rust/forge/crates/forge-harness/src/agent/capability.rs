@@ -1,35 +1,22 @@
 use serde::{Deserialize, Serialize};
 
-/// Defines how one backend exposes and controls child agents.
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case")]
-pub enum AgentControlMode {
-    #[default]
-    Unsupported,
-    ParentMediated,
-    Direct,
-}
-
-/// Represents the agent operations available through one backend.
-#[derive(Clone, Debug, Default, Deserialize, Serialize)]
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Reports Harness-owned execution independently of native provider delegation.
 pub struct AgentCapability {
     pub observe: bool,
-    pub catalog: bool,
-    pub spawn: AgentControlMode,
-    pub input: AgentControlMode,
-    pub interrupt: AgentControlMode,
+    pub spawn: bool,
+    pub input: bool,
+    pub interrupt: bool,
     pub parallel: bool,
 }
 
-impl AgentCapability {
-    /// Build the native Codex child-agent contract exposed through app-server.
-    pub fn codex() -> Self {
+impl Default for AgentCapability {
+    fn default() -> Self {
         Self {
             observe: true,
-            catalog: true,
-            spawn: AgentControlMode::ParentMediated,
-            input: AgentControlMode::ParentMediated,
-            interrupt: AgentControlMode::Direct,
+            spawn: true,
+            input: true,
+            interrupt: true,
             parallel: true,
         }
     }

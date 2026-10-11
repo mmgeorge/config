@@ -98,6 +98,9 @@ pub enum PromptMode {
 /// Represents one prompt sent across a backend boundary.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct BackendRequest {
+    /// Separates the agent runtime from its visible root session and settings scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_owner: Option<ExecutionOwner>,
     pub harness_session_id: String,
     pub workspace: String,
     pub input: BackendInput,
@@ -112,6 +115,15 @@ pub struct BackendRequest {
     pub backend_session_id: Option<String>,
     #[serde(skip, default)]
     pub control_context: Option<crate::control_tools::ControlTurnContext>,
+}
+
+impl BackendRequest {
+    /// Resolve the independent runtime without changing the visible settings scope.
+    pub fn runtime_key(&self) -> Result<String> {Ok(self.owner()?.runtime_key())}
+    /// Validate the provider runtime key before admission or cancellation routing.
+    pub fn owner(&self) -> Result<ExecutionOwner> {
+        ExecutionOwner::resolve(&self.execution_owner, &self.harness_session_id)
+    }
 }
 
 /// Represents a streamed backend update normalized for the interaction reducer.
@@ -592,21 +604,6 @@ pub trait Backend: Send + Sync {
         self.steer(text).await
     }
 
-    /// Deliver child input through its owning session using the advertised control mode.
-    async fn steer_target(
-        &self,
-        _session_id: &str,
-        _text: String,
-        _target: SteerTarget,
-    ) -> Result<()> {
-        Err(UnsupportedCapability("native_child_input").into())
-    }
-
-    /// Interrupt one specific provider child turn without cancelling its parent.
-    async fn interrupt_target(&self, _target: SteerTarget) -> Result<()> {
-        Err(UnsupportedCapability("native_child_interrupt").into())
-    }
-
     /// Interrupt the parent and descendants for one session and await terminal evidence.
     async fn cleanup_execution(&self, session_id: &str) -> Result<()>;
 
@@ -745,7 +742,7 @@ impl Backend for MockBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
-        let steering = self.steering_lane(&request.harness_session_id);
+        let steering = self.steering_lane(&request.runtime_key()?);
         let mut active_steering = steering.activate(event_sink.clone())?;
         let mut steering_text_list = Vec::new();
         let event = BackendEvent {
@@ -1235,6 +1232,7 @@ mod test {
             prompt_backend
                 .prompt_stream(
                     BackendRequest {
+                        execution_owner: None,
                         harness_session_id: "harness-session".into(),
                         workspace: ".".into(),
                         input: super::BackendInput::from_text(

@@ -84,7 +84,7 @@ fn capability() -> BackendCapability {
             PermissionMode::Write,
             PermissionMode::Yolo,
         ],
-        agent: crate::agent::AgentCapability::codex(),
+        agent: crate::agent::AgentCapability::default(),
         catalog: CatalogCapability {
             skill: true,
             mcp: true,
@@ -174,6 +174,7 @@ impl CodexBackend {
                 request.harness_session_id.clone(),
             )
             .await?;
+        process.set_execution_owner(request.owner()?);
         let process_duration_ms = process_started.elapsed().as_secs_f64() * 1000.0;
         let initialize_started = Instant::now();
         process.request("initialize", json!({
@@ -197,7 +198,7 @@ impl CodexBackend {
     }
 
     fn catalog_from_request(request: &BackendRequest) -> BackendCatalogRequest {
-        BackendCatalogRequest { harness_session_id:request.harness_session_id.clone(),
+        BackendCatalogRequest { execution_owner: request.execution_owner.clone(), harness_session_id:request.harness_session_id.clone(),
             workspace:request.workspace.clone(), access:request.access.clone(), execution_mode:request.execution_mode,
             backend_session_id:request.backend_session_id.clone() }
     }
@@ -205,9 +206,9 @@ impl CodexBackend {
     async fn resources(&self, request: &BackendCatalogRequest) -> Result<Option<Arc<CodexResources>>> {
         let Some(root) = &self.settings_root else { return Ok(None); };
         let mut resources = self.resource_by_session.lock().await;
-        if let Some(resources) = resources.get(&request.harness_session_id) { return Ok(Some(resources.clone())); }
+        if let Some(resources) = resources.get(&request.runtime_key()?) { return Ok(Some(resources.clone())); }
         let configured = Arc::new(CodexResources::new(root, request, self.command.clone())?);
-        resources.insert(request.harness_session_id.clone(), configured.clone());
+        resources.insert(request.runtime_key()?, configured.clone());
         Ok(Some(configured))
     }
 
@@ -256,7 +257,7 @@ impl CodexBackend {
             .connection_by_session
             .lock()
             .await
-            .get(&request.harness_session_id)
+            .get(&request.runtime_key()?)
             .cloned()
         {
             connection.lock().await.process.set_request_context(
@@ -270,7 +271,7 @@ impl CodexBackend {
         self.connection_by_session
             .lock()
             .await
-            .insert(request.harness_session_id.clone(), Arc::clone(&connection));
+            .insert(request.runtime_key()?, Arc::clone(&connection));
         Ok(connection)
     }
 
@@ -293,6 +294,7 @@ impl CodexBackend {
 
     fn secure_thread(mut params: Value, request: &BackendRequest) -> Value {
         CodexSecurity::new(request.execution_mode, &request.access).apply_thread(&mut params, &request.workspace);
+        params["config"]["agents.enabled"] = json!(false);
         params
     }
 
@@ -324,6 +326,7 @@ impl CodexBackend {
 
     fn catalog_backend_request(request: &BackendCatalogRequest) -> BackendRequest {
         BackendRequest {
+            execution_owner: request.execution_owner.clone(),
             harness_session_id: request.harness_session_id.clone(),
             workspace: request.workspace.clone(),
             input: BackendInput::from_text(""),
@@ -359,7 +362,7 @@ impl CodexBackend {
         mut request: BackendCatalogRequest,
     ) -> Result<Option<(CodexJsonRpc, BackendOutput, String)>> {
         request.backend_session_id = self
-            .active_session_id_for(&request.harness_session_id)
+            .active_session_id_for(&request.runtime_key()?)
             .await
             .or(request.backend_session_id);
         let Some(thread_id) = request.backend_session_id.clone() else {
@@ -787,7 +790,7 @@ impl CodexBackend {
             )
             .await?;
         self.active_turn_by_session.lock().await.insert(
-            request.harness_session_id.clone(),
+            request.runtime_key()?,
             CodexTurnState::Submitted {
                 request: Box::new(request.clone()),
                 thread_id: thread_id.to_owned(),
@@ -869,7 +872,7 @@ impl CodexBackend {
     ) -> Result<(Value, bool, Vec<Value>)> {
         let request_id = process.send_request("turn/start", params).await?;
         self.active_turn_by_session.lock().await.insert(
-            request.harness_session_id.clone(),
+            request.runtime_key()?,
             CodexTurnState::Submitted {
                 request: Box::new(request.clone()),
                 thread_id: thread_id.to_owned(),
@@ -937,12 +940,12 @@ impl Backend for CodexBackend {
             return Ok(());
         }
         let next = Arc::new(CodexResources::new(self.settings_root.as_ref().expect("settings root checked"), &request, self.command.clone())?);
-        self.cleanup_execution(&request.harness_session_id).await?;
-        self.connection_by_session.lock().await.remove(&request.harness_session_id);
-        if let Some(resources) = self.resource_by_session.lock().await.remove(&request.harness_session_id) {
+        self.cleanup_execution(&request.runtime_key()?).await?;
+        self.connection_by_session.lock().await.remove(&request.runtime_key()?);
+        if let Some(resources) = self.resource_by_session.lock().await.remove(&request.runtime_key()?) {
             resources.runtime.shutdown().await?;
         }
-        self.resource_by_session.lock().await.insert(request.harness_session_id.clone(),next);
+        self.resource_by_session.lock().await.insert(request.runtime_key()?,next);
         let backend_request = Self::catalog_backend_request(&request);
         let (mut process,mut output) = self.catalog_process(&request).await?;
         self.load_thread(&mut process,&mut output,&backend_request,true,Vec::new()).await?;
@@ -1069,7 +1072,7 @@ impl Backend for CodexBackend {
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
         let mut active_steering = self
-            .activate_turn_control(&request.harness_session_id, event_sink.clone())
+            .activate_turn_control(&request.runtime_key()?, event_sink.clone())
             .await?;
         let mut output = BackendOutput {
             capability: capability(),
@@ -1094,7 +1097,7 @@ impl Backend for CodexBackend {
                 .then(|| super::mock_plan_document_from_prompt(&request_text))
                 .flatten();
         }
-        let execution_phase = control_context.execution.as_ref().map(|execution| execution.phase);
+        let dynamic_tool_definition = ControlToolRegistry.definition_list_for_context(Some(&control_context),request.owner()?.is_root());
         process.set_control_context(control_context);
         let resolved_model = self.resolve_model(&request, process, &mut output).await?;
         output.runtime.provider = "Codex CLI".into();
@@ -1105,8 +1108,7 @@ impl Backend for CodexBackend {
         } else {
             output.event.push(runtime_event);
         }
-        let dynamic_tool_list = ControlToolRegistry
-            .definition_list_for(execution_phase)
+        let dynamic_tool_list = dynamic_tool_definition
             .into_iter()
             .map(|definition| {
                 json!({
@@ -1213,7 +1215,7 @@ impl Backend for CodexBackend {
                 observed_message_list,
             );
             let completed = if let Some(text) = resume_message {
-                let lane = self.steering_lane(&request.harness_session_id).await;
+                let lane = self.steering_lane(&request.runtime_key()?).await;
                 let (completed, delivered) = tokio::join!(completion, lane.steer(text));
                 delivered.context("deliver instructions to resumed native goal")?;
                 completed?
@@ -1240,14 +1242,14 @@ impl Backend for CodexBackend {
             None
         };
         self.active_turn_by_session.lock().await.insert(
-            request.harness_session_id.clone(),
+            request.runtime_key()?,
             CodexTurnState::Completed,
         );
         if let Some(turn_id) = turn_id {
             self.completed_turn_by_session
                 .lock()
                 .await
-                .insert(request.harness_session_id.clone(), turn_id.clone());
+                .insert(request.runtime_key()?, turn_id.clone());
             output.provider_checkpoint_id = Some(turn_id);
         }
         Ok(output)
@@ -1304,50 +1306,7 @@ impl Backend for CodexBackend {
         self.steering_lane(session_id).await.steer(text).await
     }
 
-    async fn steer_target(
-        &self,
-        session_id: &str,
-        text: String,
-        target: crate::backend::SteerTarget,
-    ) -> Result<()> {
-        self.steering_lane(session_id)
-            .await
-            .steer_target(text, target.clone())
-            .await
-            .with_context(|| {
-                format!(
-                    "Codex could not steer target {}/{}",
-                    target.thread_id, target.turn_id
-                )
-            })
-    }
 
-    async fn interrupt_target(&self, target: crate::backend::SteerTarget) -> Result<()> {
-        let steering_list = self
-            .steering_by_session
-            .lock()
-            .await
-            .values()
-            .cloned()
-            .collect::<Vec<_>>();
-        let mut failure = Vec::new();
-        for steering in steering_list {
-            match steering.interrupt_target(target.clone()).await {
-                Ok(()) => return Ok(()),
-                Err(error) => failure.push(format!("{error:#}")),
-            }
-        }
-        anyhow::ensure!(
-            !failure.is_empty(),
-            "Codex has no active turn for the requested target"
-        );
-        anyhow::bail!(
-            "Codex could not settle target {}/{}: {}",
-            target.thread_id,
-            target.turn_id,
-            failure.join(" | ")
-        )
-    }
 
     async fn cleanup_execution(&self, session_id: &str) -> Result<()> {
         self.steering_lane(session_id)
@@ -1452,7 +1411,7 @@ impl Backend for CodexBackend {
         self.connection_by_session
             .lock()
             .await
-            .remove(&request.harness_session_id);
+            .remove(&request.runtime_key()?);
         Ok(CatalogMutation {
             name: name.to_owned(),
             enabled,
@@ -1536,7 +1495,7 @@ impl Backend for CodexBackend {
         enabled: bool,
     ) -> Result<CatalogMutation> {
         anyhow::ensure!(self.settings_root.is_none(), "Managed MCP selection must use the shared settings operation");
-        let restart_required = self.has_active_turn(&request.harness_session_id).await;
+        let restart_required = self.has_active_turn(&request.runtime_key()?).await;
         let config_name = Self::quoted_config_segment(name);
         let (mut process, mut output) = self.catalog_process(&request).await?;
         let result = process
@@ -1575,7 +1534,7 @@ impl Backend for CodexBackend {
         self.connection_by_session
             .lock()
             .await
-            .remove(&request.harness_session_id);
+            .remove(&request.runtime_key()?);
         Ok(CatalogMutation {
             name: name.to_owned(),
             enabled,
@@ -1779,6 +1738,7 @@ mod test {
             &mut BackendOutput::default(),
             "provider-thread",
             &CodexBackend::catalog_backend_request(&BackendCatalogRequest {
+                execution_owner: None,
                 harness_session_id: "session".into(), workspace: workspace.clone(),
                 access: Default::default(), execution_mode: PermissionMode::Read,
                 backend_session_id: Some("provider-thread".into()),
@@ -1796,6 +1756,7 @@ mod test {
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(30),
             backend.mcp_list(BackendCatalogRequest {
+                execution_owner: None,
                 harness_session_id: "mcp-catalog-test".into(),
                 workspace: std::env::current_dir()
                     .unwrap()
@@ -1838,6 +1799,7 @@ mod test {
     #[test]
     fn forks_without_replaying_provider_turns() {
         let request = BackendRequest {
+            execution_owner: None,
             harness_session_id: "harness-session".into(),
             workspace: "workspace".into(),
             input: BackendInput::from_text(""),
@@ -2085,6 +2047,7 @@ mod test {
                 std::time::Duration::from_secs(2),
                 backend.prompt_stream(
                     BackendRequest {
+                        execution_owner: None,
                         harness_session_id: "session".into(),
                         workspace,
                         input: BackendInput::from_text("new prompt"),
@@ -2267,6 +2230,7 @@ mod test {
                 std::time::Duration::from_secs(2),
                 backend.prompt_stream(
                     BackendRequest {
+                        execution_owner: None,
                         harness_session_id: "session".into(),
                         workspace,
                         input: BackendInput::from_text(if with_message { "/goal resume\n\nAdditional user instructions:\nKeep the original objective and add tests" } else { "/goal resume" }),
@@ -2336,55 +2300,6 @@ mod test {
         Ok(())
     }
 
-    #[tokio::test]
-    async fn targeted_steering_preserves_provider_rejection() {
-        let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
-        let lane = SteeringLane::default();
-        let mut active = lane.activate(None).unwrap();
-        backend
-            .steering_by_session
-            .lock()
-            .await
-            .insert("session".into(), lane);
-        let other_lane = SteeringLane::default();
-        let mut other_active = other_lane.activate(None).unwrap();
-        backend
-            .steering_by_session
-            .lock()
-            .await
-            .insert("other-session".into(), other_lane);
-        let target = crate::backend::SteerTarget {
-            thread_id: "child".into(),
-            turn_id: "turn".into(),
-        };
-        let (result, ()) = tokio::join!(
-            backend.steer_target("session", "hello".into(), target),
-            async {
-                let command = active.receive().await.unwrap();
-                command
-                    .complete(Err(anyhow::anyhow!("provider rejected child steering")))
-                    .await;
-            }
-        );
-        let error = format!("{:#}", result.unwrap_err());
-        assert!(error.contains("child/turn"));
-        assert!(error.contains("provider rejected child steering"));
-        assert!(futures_util::poll!(Box::pin(other_active.receive()).as_mut()).is_pending());
-        let missing = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            backend.steer_target(
-                "missing-session",
-                "correction".into(),
-                crate::backend::SteerTarget {
-                    thread_id: "child".into(),
-                    turn_id: "turn".into(),
-                },
-            ),
-        )
-        .await
-        .expect("missing session must not probe another active session");
-        assert!(format!("{:#}", missing.unwrap_err()).contains("no active turn"));
-    }
 
     #[tokio::test]
     async fn distinguishes_an_unsubmitted_cancel_from_a_completed_turn() {

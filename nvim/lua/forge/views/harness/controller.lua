@@ -121,13 +121,6 @@ local function selected_agent_run(state)
   return nil
 end
 
-local function selected_agent_target(state)
-  local run = selected_agent_run(state)
-  if not run then return nil end
-  local summary = state.agent and state.agent.summary and state.agent.summary[run.id]
-  return summary and type(summary.target) == "table" and summary.target or nil
-end
-
 local function render_queue()
   local state = harness_state()
   local buf = state.composer_buf
@@ -704,6 +697,9 @@ local function on_event(event, payload)
     if payload.operation_id then state.pending_mode = nil end
     local configuration = state.configuration_completion
     if configuration and state.task_operation and payload.operation_id == state.task_operation.id then
+      if state.task_config and type(state.task_config.subagent_tools) == "boolean" then
+        state.subagent_tools = state.task_config.subagent_tools
+      end
       state.configuration_completion = nil
       state.task_config = nil
       configuration.complete(true)
@@ -732,8 +728,22 @@ function M.present_approval(reopen)
   state.dismissed_approval_id = nil
   state.approval_open = true
   state.presented_approval_id = request.id
+  local owner = type(request.execution_owner) == "table" and request.execution_owner or nil
+  local child_id = owner and owner.agent_id ~= (state.session.primary_agent_id or (state.session.id .. ":agent:primary"))
+    and owner.agent_id or nil
+  local owner_label
+  if child_id then
+    local run = vim.iter((state.agent and state.agent.run) or {}):find(function(candidate) return candidate.id == child_id end)
+    local name = run and (run.task_name or run.nickname or run.definition) or child_id
+    local provider = request.provider
+    owner_label = "Agent " .. name .. (provider and (" · " .. provider) or "")
+  end
   require("forge.views.harness.approval").open(request, {
-    interrupt = M.cancel_turn,
+    owner_label = owner_label,
+    interrupt = function()
+      if child_id then M.agent_action("interrupt", child_id)
+      else M.task_transition({ action = "pause" }) end
+    end,
     transcript_win = state.transcript_win,
     window_list = picker_host(state).window_list,
     control_win = picker_host(state).control_win,
@@ -932,67 +942,13 @@ end
 function M.cancel_turn()
   local state = harness_state()
   if state.host_error then M.render() return end
-  if not state.selected_agent_run_id then
-    if state.task_operation and state.task_operation.action == "pause" then return end
-    M.task_transition({ action = "pause" })
+  if state.selected_agent_run_id then
+    M.agent_action("interrupt", state.selected_agent_run_id)
     return
   end
-  if not state.busy and not state.host_error and state.status
-      and (state.status.kind == "finalizing" or state.status.kind == "paused") then
-    if state.cancel_requested then return end
-    state.cancel_requested = true
-    client.request("turn.cancel", {}, function(_, request_error)
-      if state.host_error then return end
-      state.cancel_requested = false
-      if request_error then
-        state.execution_notice = "Saving exchange failed · " .. request_error
-        notifications.error(request_error, "Harness finalization")
-      else
-        state.execution_notice = "Paused"
-      end
-      M.render()
-      synchronize_state()
-    end)
-    return
-  end
-  if not state.busy then
-    state.execution_notice = state.execution_notice or "Paused"
-    M.render()
-    if not state.host_error then synchronize_state() end
-    return
-  end
-  if state.cancel_requested then return end
-  local target = selected_agent_target(state)
-  if state.selected_agent_run_id and not target then
-    notifications.warn("The selected child has no active turn to cancel", "ForgeHarness")
-    return
-  end
-  state.pending_mode = nil
-  state.cancel_requested = true
-  M.refresh_winbar()
-  local restore_prompt = state.capability.native_turn_rollback == true
-    and #(state.queue or {}) == 0
-    and #(state.pending_steer or {}) == 0
-    and composer_text(state.composer_buf) == ""
-  client.request("turn.cancel", { restore_prompt_if_no_output = restore_prompt, target = target }, function(result, request_error)
-    if state.host_error then return end
-    if request_error then
-      state.cancel_requested = false
-      notifications.error(request_error, "Harness cancel")
-      M.refresh_winbar()
-      return
-    end
-    if not (result and result.cancel_requested) then
-      state.cancel_requested = false
-      notifications.warn("The Harness turn already finished", "ForgeHarness")
-      M.refresh_winbar()
-    elseif target then
-      state.cancel_requested = false
-      M.refresh_winbar()
-    end
-  end)
+  if state.task_operation and state.task_operation.action == "pause" then return end
+  M.task_transition({ action = "pause" })
 end
-
 function M.compact()
   if not (harness_state().capability and harness_state().capability.native_compact) then
     notifications.error("The current backend does not support manual context compaction", "ForgeHarness")
@@ -1392,22 +1348,34 @@ end
 ---Request one provider-backed child agent with an explicit definition and task.
 ---@param definition string
 ---@param task string
-function M.spawn_agent(definition, task)
+function M.spawn_agent(task_name, message)
   local state = harness_state()
-  if not (state.capability.agent and state.capability.agent.catalog) then
-    notifications.warn("The current backend does not expose spawnable child agents", "Harness agent")
-    return
-  end
+  local request = type(task_name) == "table" and task_name or { task_name = task_name, message = message }
   if state.presentation then state.presentation.follow_tail() end
-  set_busy(true)
-  client.request("agent.start", { definition = definition, task = task }, function(_, request_error, error_detail)
-    if finish_execution(request_error, error_detail) then return end
+  client.request("agent.start", request, function(_, request_error)
     if request_error then notifications.error(request_error, "Harness agent") end
     synchronize_state(M.drain)
   end)
 end
 
 ---Open the provider-backed child-agent timeline selector.
+---@param action string
+---@param run_id string?
+---@param message string?
+function M.agent_action(action, run_id, message)
+  local state = harness_state()
+  local params = { target = run_id, message = message }
+  if action == "tools" then M.configure({ subagent_tools = state.subagent_tools ~= true }, true) return end
+  if action == "message" or action == "followup" then
+    if not message or message:match("^%s*$") then return end
+  end
+  client.request("agent." .. action, params, function(_, failure)
+    if failure then notifications.error(failure, "Harness child " .. action) return end
+    if message and composer_text(state.composer_buf) == message then set_composer_text(state.composer_buf, "") end
+    synchronize_state()
+  end)
+end
+
 function M.open_agent_picker()
   local state = harness_state()
   require("forge.views.harness.agent_picker").open({
@@ -1416,24 +1384,22 @@ function M.open_agent_picker()
     on_select = function(run_id)
       M.select_agent(run_id and run_id or "main")
     end,
+    on_action = M.agent_action,
   })
 end
 
 ---Open the searchable agent-definition selector and attached task editor.
 ---@param definition_name? string
-function M.open_spawn_picker(definition_name)
+function M.open_spawn_picker(task_name)
   local state = harness_state()
-  if not (state.capability.agent and state.capability.agent.catalog) then
-    notifications.warn("The current backend does not expose spawnable child agents", "Harness agent")
-    return
-  end
-  local opened = require("forge.views.harness.spawn_picker").open({
+  require("forge.views.harness.spawn_picker").open({
     host = picker_host(state),
-    definition_list = (state.agent and state.agent.definition) or {},
-    definition_name = definition_name,
+    task_name = task_name,
+    provider = state.session and state.session.backend or config.options.harness.backend,
+    model = state.session and (state.session.resolved_model or state.session.model),
+    load_models = function(provider, callback) client.request("agent.models", { provider = provider }, callback) end,
     on_spawn = M.spawn_agent,
   })
-  if not opened then notifications.warn("Unknown agent definition: " .. definition_name, "Harness agent") end
 end
 
 function M.open_session_picker()
@@ -1616,7 +1582,7 @@ function M.submit()
     M.present_plan_question(true)
     return
   end
-  if text == "/agent" then
+  if text == "/agents" then
     set_composer_text(state.composer_buf, "")
     M.open_agent_picker()
     return
@@ -1636,14 +1602,14 @@ function M.submit()
     M.open_undo_picker()
     return
   end
-  local agent_selector = text:match("^/agent%s+(%S+)%s*$")
+  local agent_selector = text:match("^/agents%s+(%S+)%s*$")
   if agent_selector then
     set_composer_text(state.composer_buf, "")
     M.select_agent(agent_selector)
     return
-  elseif text:match("^/agent%s+") then
+  elseif text:match("^/agents%s+") then
     set_composer_text(state.composer_buf, "")
-    notifications.warn("Use /agent main, /agent <running alias>, or /agent", "ForgeHarness")
+    notifications.warn("Use /agents main, /agents <task name>, or /agents", "ForgeHarness")
     return
   end
   local spawn_definition, spawn_task = text:match("^/spawn%s+(%S+)%s+(.+)$")
@@ -1659,7 +1625,7 @@ function M.submit()
     return
   elseif text:match("^/spawn%s+") then
     set_composer_text(state.composer_buf, "")
-    notifications.warn("Use /spawn <definition> <task>", "ForgeHarness")
+    notifications.warn("Use /spawn <task_name> <message>", "ForgeHarness")
     return
   end
   if text == "/compact" then
@@ -1737,7 +1703,8 @@ function M.submit()
     return
   end
   if state.selected_agent_run_id then
-    M.steer_submit()
+    prompt_history.record(text)
+    M.agent_action("followup", state.selected_agent_run_id, text)
     return
   end
   if state.task_operation and state.task_operation.state ~= "running" then
@@ -1769,34 +1736,21 @@ local function remove_pending_steer(state, target)
 end
 
 submit_immediate = function(state, text)
-  local selected_run = selected_agent_run(state)
-  local target = selected_agent_target(state)
   if state.selected_agent_run_id then
-    if not selected_run or not target then
-      notifications.warn("The selected child has no active turn to steer", "ForgeHarness")
-      return
-    end
-  else
-    set_composer_text(state.composer_buf, "")
+    M.agent_action("message", state.selected_agent_run_id, text)
+    return
   end
+  set_composer_text(state.composer_buf, "")
   local pending = { text = text }
   recap.clear(state)
   state.pending_steer = state.pending_steer or {}
   state.pending_steer[#state.pending_steer + 1] = pending
   M.refresh_winbar()
-  client.request("turn.steer", { text = text, target = target }, function(_, request_error)
+  client.request("turn.steer", { text = text }, function(_, request_error)
     if request_error then
       remove_pending_steer(state, pending)
-      if selected_run then
-        notifications.warn(request_error, "ForgeHarness")
-      else
-        state.queue[#state.queue + 1] = text
-        notifications.warn("Steering missed the active turn; queued as a follow-up", "ForgeHarness")
-      end
-    else
-      if selected_run and composer_text(state.composer_buf) == text then
-        set_composer_text(state.composer_buf, "")
-      end
+      state.queue[#state.queue + 1] = text
+      notifications.warn("Steering missed the active turn. Queued as a follow-up", "ForgeHarness")
     end
     M.refresh_winbar()
     vim.schedule(M.drain)
@@ -1808,6 +1762,11 @@ function M.steer_submit()
   local state = harness_state()
   local text = composer_text(state.composer_buf)
   if text == "" then return end
+  if state.selected_agent_run_id then
+    prompt_history.record(text)
+    M.agent_action("message", state.selected_agent_run_id, text)
+    return
+  end
   if not state.busy then
     notifications.warn("Harness has no active turn to steer", "ForgeHarness")
     return
@@ -2228,6 +2187,9 @@ configure_now = function(next_config, validate_selection, completed)
       return
     end
     state.session = result
+    if type(next_config.subagent_tools) == "boolean" then
+      state.subagent_tools = next_config.subagent_tools
+    end
     state.configuration_error = nil
     prune_pending_settings(state)
     M.refresh_winbar()
@@ -2364,7 +2326,7 @@ function M.command_set()
   command_set.register(set, "toggle_activity", M.toggle_activity)
   command_set.register(set, "open_artifact", M.open_artifact_picker)
   command_set.register(set, "abort_plan", M.abort_plan)
-  command_set.register(set, "agent", M.open_agent_picker)
+  command_set.register(set, "agents", M.open_agent_picker)
   command_set.register(set, "sessions", M.open_session_picker)
   command_set.register(set, "background", M.open_background_picker)
   command_set.register(set, "open_timeline", M.open_timeline_entry)

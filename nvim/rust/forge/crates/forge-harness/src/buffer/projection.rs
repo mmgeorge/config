@@ -534,11 +534,14 @@ impl TimelineRenderer<'_> {
                 agent,
                 ..
             } => {
-                let task = interaction
-                    .first()
-                    .map(|exchange| exchange.prompt.as_str())
-                    .unwrap_or_default();
-                self.agent_entry(id, run, task, interaction, agent, None, depth)?;
+                if interaction.is_empty() {
+                    self.agent_entry(id,run,"",interaction,agent,None,depth)?;
+                } else {
+                    let children = agent.iter().filter_map(|entry|match entry {
+                        TimelineEntry::AgentLifecycle {id,..} => Some((id.as_str(),entry)),_=>None,
+                    }).collect();
+                    for exchange in interaction {self.interaction(exchange,&children,depth)?;}
+                }
             }
         }
         Ok(())
@@ -716,40 +719,40 @@ impl TimelineRenderer<'_> {
         &mut self,
         id: &str,
         run: &crate::agent::Agent,
-        task: &str,
+        _task: &str,
         interaction: &[Exchange],
-        agent: &[TimelineEntry],
+        _agent: &[TimelineEntry],
         exchange_id: Option<&str>,
         depth: usize,
     ) -> Result<()> {
         ensure!(depth <= 16, "agent transcript nesting exceeds 16 levels");
-        self.literal(
-            id,
-            &agent_summary(
-                run,
-                exchange_id.and_then(|id| interaction.iter().find(|exchange| exchange.id == id)),
-                self.now_ms,
-            ),
+        let exchange = exchange_id.and_then(|id|interaction.iter().find(|exchange|exchange.id == id))
+            .or_else(||interaction.last());
+        let summary = agent_summary(run,exchange,self.now_ms);
+        self.literal(id,&summary,
             Some(TranscriptAction::Agent {
                 run_id: run.id.clone(),
             }),
         )?;
         let section = self.begin_section(2);
-        self.literal(&format!("{id}:task"), &format!("↳ {}", task), None)?;
-        let children: HashMap<_, _> = agent
-            .iter()
-            .filter_map(|entry| match entry {
-                TimelineEntry::AgentLifecycle { id, .. } => Some((id.as_str(), entry)),
-                _ => None,
-            })
-            .collect();
-        for interaction in interaction
-            .iter()
-            .filter(|interaction| exchange_id.is_none_or(|id| interaction.id == id))
-        {
-            self.interaction(interaction, &children, depth + 1)?;
+        if let Some(message) = exchange.and_then(|exchange|exchange.turn.iter().rev().find_map(|turn|
+            turn.messages().iter().rev().find(|message|!message.text().is_empty()
+                && matches!(message.kind(),crate::turn::MessageKind::Assistant | crate::turn::MessageKind::ReasoningSummary)))) {
+            self.markdown(&format!("{id}:thought"),message.text(),MarkdownRole::Commentary)?;
         }
+        let heading = section.start;
         self.finish_section(section, id, false);
+        let heading = &mut self.block[heading];
+        heading.metadata.fold.clear();
+        if let Some(marker) = heading.metadata.layout.as_mut().and_then(|layout|layout.marker.as_mut()) {
+            marker.text = "●".into();
+        }
+        if let Some(node) = heading.metadata.node.as_mut() {
+            node.kind = NodeKind::Exchange;
+            node.lifecycle = if exchange.is_some_and(|exchange|exchange.completed_at_ms.is_some()) {
+                NodeLifecycle::Settled
+            } else {NodeLifecycle::Live};
+        }
         Ok(())
     }
 
@@ -823,6 +826,9 @@ impl TimelineRenderer<'_> {
         agents: &HashMap<&str, &TimelineEntry>,
         depth: usize,
     ) -> Result<()> {
+        if interaction.lifecycle.as_deref() == Some("agent_admission") {
+            return self.content(interaction,agents,depth,&interaction.node_list.iter().collect::<Vec<_>>(),None,MarkdownRole::Response);
+        }
         if depth == 0 && self.leading_separator {
             self.literal(&format!("{}:separator", interaction.id), "", None)?;
         }
@@ -1125,8 +1131,14 @@ impl TimelineRenderer<'_> {
                                     .context("timeline content references a missing tool")?;
                                 let question_control = tool.title.split('(').next().unwrap_or("").trim()
                                     .ends_with("harness_question_ask");
+                                let admitted_spawn = tool.title.split('(').next().unwrap_or("").trim()
+                                    .ends_with("harness_spawn_agent")
+                                    && interaction.node_list.iter().any(|node| matches!(node,
+                                        ExchangeNode::AgentReference { agent }
+                                            if agent.parent_turn_id.as_deref() == Some(turn_id.as_str())));
                                 if !(question_control && question_turn.contains(turn_id.as_str()) && !tool.failed
-                                    && tool.state() == crate::turn::ToolState::Completed) {
+                                    && tool.state() == crate::turn::ToolState::Completed)
+                                    && !(admitted_spawn && !tool.failed && tool.state() == crate::turn::ToolState::Completed) {
                                     calls.push((id, tool));
                                 }
                             }
@@ -1798,28 +1810,22 @@ impl TimelineRenderer<'_> {
 
 fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms: i64) -> String {
     if let Some(exchange) = exchange {
-        use crate::exchange::ExchangeState;
-        let seconds = exchange.elapsed(now_ms) / 1_000;
-        let lifecycle = match exchange.state {
-            ExchangeState::Queued => "queued for",
-            ExchangeState::Running => {
-                if exchange.awaiting_input {
-                    "waiting for"
-                } else {
-                    "running for"
-                }
+        let lifecycle = if run.state == crate::agent::AgentState::Closing { "Closing" } else {
+            match exchange.state {
+                ExchangeState::Queued => "Starting",
+                ExchangeState::Running if exchange.metrics.awaiting_approval() => "Waiting for approval",
+                ExchangeState::Running => "Running",
+                ExchangeState::Finalizing => "Saving exchange",
+                ExchangeState::Complete => "Completed",
+                ExchangeState::Failed => "Failed",
+                ExchangeState::Cancelled => "Cancelled",
+                ExchangeState::Interrupted => "Interrupted",
             }
-            ExchangeState::Finalizing => "finalizing after",
-            ExchangeState::Complete => "completed in",
-            ExchangeState::Failed => "failed after",
-            ExchangeState::Cancelled => "cancelled after",
-            ExchangeState::Interrupted => "interrupted after",
         };
-        return format!(
-            "▸ {}Agent {} {lifecycle} {seconds}s",
-            history_prefix(exchange.disposition),
-            run.label()
-        );
+        let selection = run.selection.as_ref().map(|selection|format!(" · {} · {}",
+            crate::agent::provider_name(selection.provider),selection.model)).unwrap_or_default();
+        let heading = format!("● Agent {}{selection} · {lifecycle} {}s",run.label(),exchange.elapsed(now_ms) / 1000);
+        return exchange_metrics_summary(exchange,now_ms,heading);
     }
 
     use crate::agent::AgentState;
@@ -1838,7 +1844,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
         AgentState::Closing => format!("closing after {elapsed_seconds}s"),
         AgentState::Closed => format!("closed after {elapsed_seconds}s"),
     };
-    format!("▸ Agent {} {lifecycle}", run.label())
+    format!("● Agent {} {lifecycle}", run.label())
 }
 
 fn session_event_text(event: &SessionEventKind) -> String {
@@ -1981,6 +1987,10 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
         "● {}{activity} {duration}s",
         history_prefix(interaction.disposition)
     );
+    exchange_metrics_summary(interaction,now_ms,summary)
+}
+
+fn exchange_metrics_summary(interaction: &Exchange, now_ms: i64, summary: String) -> String {
     let count: usize = interaction.turn.iter().map(|turn| turn.tools().count()).sum();
     let mut sections = vec![summary];
     let compaction: Vec<_> = interaction.node_list.iter().filter_map(|node| {
@@ -2493,7 +2503,7 @@ mod tests {
             exchange.resume(0).unwrap();
             let mut event = BackendEvent {
             received_at_ms: None,
-                address: Some(ProviderAddress { thread_id:"thread".into(), turn_id:"initial".into() }),
+                address: Some(ProviderAddress { owner: None, thread_id:"thread".into(), turn_id:"initial".into() }),
                 turn_boundary: Some(TurnBoundary::Started), kind:"turn_started".into(), text:None,
                 data:serde_json::Value::Null, activity:None, summary:None, task_update:None,
             };
@@ -2651,7 +2661,7 @@ mod tests {
                 }, index as i64).unwrap();
                 let mut event = BackendEvent {
             received_at_ms: None,
-                    address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:format!("turn-{index}") }),
+                    address:Some(ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:format!("turn-{index}") }),
                     turn_boundary:Some(TurnBoundary::Started), kind:"turn_started".into(), text:None,
                     data:serde_json::Value::Null, activity:None,summary:None,task_update:None,
                 };
@@ -2725,7 +2735,7 @@ mod tests {
         exchange.resume(0).unwrap();
         let mut event = BackendEvent {
             received_at_ms: None,
-            address: Some(ProviderAddress { thread_id: "thread".into(), turn_id: "question-turn".into() }),
+            address: Some(ProviderAddress { owner: None, thread_id: "thread".into(), turn_id: "question-turn".into() }),
             turn_boundary: Some(TurnBoundary::Started), kind: "turn_started".into(), text: None,
             data: serde_json::Value::Null, activity: None, summary: None, task_update: None,
         };
@@ -2830,7 +2840,7 @@ mod tests {
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
         exchange.resume(0)?;
-        let address = ProviderAddress { thread_id:"thread".into(), turn_id:"turn".into() };
+        let address = ProviderAddress { owner: None, thread_id:"thread".into(), turn_id:"turn".into() };
         exchange.start_turn(address.clone(), 0)?;
         let mut event = BackendEvent {
             received_at_ms:None, address:Some(address), turn_boundary:None, kind:"tool".into(),
@@ -2905,7 +2915,7 @@ mod tests {
             "attributed_matches_checkpoint":false, "node_list":[]
         })).unwrap();
         exchange.resume(0).unwrap();
-        let address = ProviderAddress { thread_id: "thread".into(), turn_id: "turn".into() };
+        let address = ProviderAddress { owner: None, thread_id: "thread".into(), turn_id: "turn".into() };
         exchange.start_turn(address.clone(), 0).unwrap();
         let mut event = BackendEvent {
             received_at_ms: None,
@@ -3004,6 +3014,7 @@ mod tests {
         let mut event = BackendEvent {
             received_at_ms: None,
             address: Some(ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
             }),
@@ -3212,6 +3223,7 @@ mod tests {
         let mut response = crate::backend::BackendEvent {
             received_at_ms: None,
             address: Some(crate::backend::ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(), turn_id: "turn".into(),
             }),
             turn_boundary: Some(crate::backend::TurnBoundary::Started),
@@ -3255,69 +3267,118 @@ mod tests {
     }
 
     #[test]
-    fn nested_agents_indent_each_ownership_boundary_once() {
-        let nested: Exchange = serde_json::from_value(json!({
+    fn child_preview_keeps_latest_thought_and_inspection_retains_full_history() {
+        let mut nested: Exchange = serde_json::from_value(json!({
             "id":"nested", "session_id":"session", "agent_id":"nested-agent", "ordinal":1,
             "prompt":"Inspect nested work", "kind":"chat", "state":"running", "created_at_ms":0,
             "attributed_matches_checkpoint":false, "node_list":[]
         }))
         .unwrap();
+        nested.resume(0).unwrap();
+        let mut update = crate::backend::BackendEvent {
+            received_at_ms: None,
+            address: Some(crate::backend::ProviderAddress { owner: None,thread_id:"thread".into(),turn_id:"turn".into() }),
+            turn_boundary: Some(crate::backend::TurnBoundary::Started),kind:"turn_started".into(),
+            text:None,data:serde_json::Value::Null,activity:None,summary:None,task_update:None,
+        };
+        nested.observe_turn(&update,0).unwrap();
+        update.turn_boundary = None;
+        update.kind = "assistant_message".into();
+        update.data = json!({"phase":"commentary"});
+        update.text = Some("Earlier child thought".into());
+        nested.observe_turn(&update,1).unwrap();
+        update.data = json!({"phase":"final_answer"});
+        update.text = Some("Latest child thought".into());
+        nested.observe_turn(&update,2).unwrap();
+        update.text = None;
+        update.activity = Some(crate::backend::ToolActivity {
+            id:"call".into(),kind:crate::backend::ToolActivityKind::ToolCall,title:"Child tool".into(),
+            output:Some("Child tool result".into()),output_delta:false,status:Some("completed".into()),change:Default::default(),
+        });
+        nested.observe_turn(&update,3).unwrap();
         let mut parent = nested.clone();
         parent.id = "parent".into();
+        parent.turn.clear();
+        parent.node_list.clear();
+        update.activity = None;
+        update.address.as_mut().unwrap().turn_id = "root-turn".into();
+        update.turn_boundary = Some(crate::backend::TurnBoundary::Started);
+        parent.observe_turn(&update, 0).unwrap();
+        update.turn_boundary = None;
+        update.activity = Some(crate::backend::ToolActivity {
+            id:"spawn-call".into(),kind:crate::backend::ToolActivityKind::ToolCall,
+            title:"harness_spawn_agent(task_name=Nested)".into(),
+            output:Some("SPAWN_PAYLOAD".into()),output_delta:false,status:Some("completed".into()),change:Default::default(),
+        });
+        parent.observe_turn(&update, 1).unwrap();
         parent
             .node_list
             .push(crate::exchange::ExchangeNode::AgentReference {
                 agent: crate::agent::Delegation {
                     id: "delegation".into(),
                     parent_exchange_id: parent.id.clone(),
-                    parent_turn_id: None,
+                    parent_turn_id: Some(parent.turn.last().unwrap().id().to_owned()),
                     child_agent_id: "nested-agent".into(),
                     child_exchange_id: nested.id.clone(),
                     task: "Inspect nested work".into(),
                     created_at_ms: 0,
                 },
             });
-        let projected = project_at(
-            &TimelineEntry::AgentLifecycle {
-                id: "parent-agent".into(),
-                created_at_ms: 0,
-                run: crate::agent::Agent::pending("session", "Parent", "Inspect", 0),
-                exchange: vec![parent],
-                agent: vec![TimelineEntry::AgentLifecycle {
+        let entry = TimelineEntry::Exchange {
+                id: "parent".into(), created_at_ms: 0,exchange:parent,
+                agent_by_id:HashMap::from([("nested-agent".into(),TimelineEntry::AgentLifecycle {
                     id: "nested-agent".into(),
                     created_at_ms: 0,
                     run: crate::agent::Agent::pending("session", "Nested", "Inspect", 0),
-                    exchange: vec![nested],
+                    exchange: vec![nested.clone()],
                     agent: vec![],
-                }],
-            },
+                })]),
+            };
+        let projected = project_at(
+            &entry,
             &WidthProfile::default(),
             0,
         )
         .unwrap();
-        for (identity, spaces) in [
-            ("parent-agent", 0),
-            ("parent:prompt", 2),
-            ("parent:summary", 2),
-            ("delegation", 2),
-            ("nested:prompt", 4),
-            ("nested:summary", 4),
-        ] {
-            let block = projected
-                .entry
-                .block
-                .iter()
-                .find(|block| block.id.0 == identity)
-                .unwrap();
-            let prefix = " ".repeat(block.metadata.layout.as_ref().unwrap().indent - 2);
-            assert_eq!(
-                prefix,
-                " ".repeat(spaces),
-                "incorrect nesting for {identity}"
-            );
+        let text = projected.entry.block.iter().flat_map(|block|block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        assert!(text.contains("Latest child thought"));
+        assert!(!text.contains("Earlier child thought"));
+        assert!(!text.contains("Child tool result"));
+        assert!(!text.contains("harness_spawn_agent"));
+        assert!(!text.contains("SPAWN_PAYLOAD"));
+        let thought = projected.entry.block.iter().find(|block|block.id.0 == "delegation:thought").unwrap();
+        assert!(thought.metadata.layout.as_ref().unwrap().indent > 2);
+        let heading = projected.entry.block.iter().find(|block|block.id.0 == "delegation").unwrap();
+        assert!(heading.text.wire_rows().join("\n").contains("Tools"));
+        assert_eq!(heading.metadata.node.as_ref().unwrap().kind,forge_buffer::node::NodeKind::Exchange);
+        assert!(heading.text.wire_rows().join("\n").contains("Agent Nested · Running"));
+        assert_eq!(heading.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text,"●");
+        assert!(heading.metadata.fold.is_empty(),"agent headings navigate to full child history");
+        let document = forge_buffer::document::BufferDocument::new(
+            forge_buffer::identity::DocumentId("child-preview".into()), projected.entry.block.clone()).unwrap();
+        let refreshed = super::timing_blocks(&entry,&WidthProfile::default(),&document,
+            &Default::default(),&projected.tool).unwrap();
+        let refreshed_heading = refreshed.iter().find(|block|block.id.0 == "delegation").unwrap();
+        assert!(refreshed_heading.text.wire_rows().join("\n").contains("Agent Nested"));
+        assert_eq!(refreshed_heading.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text,"●");
+        assert!(!refreshed.iter().any(|block|block.id.0 == "delegation:thought"),
+            "timers must not replace the retained child thought");
+        let mut failed_entry = entry.clone();
+        if let TimelineEntry::Exchange { exchange,.. } = &mut failed_entry {
+            update.activity.as_mut().unwrap().id = "failed-spawn-call".into();
+            update.activity.as_mut().unwrap().status = Some("failed".into());
+            exchange.observe_turn(&update,2).unwrap();
         }
-        let parent = &projected.entry.block[0];
-        assert_eq!(parent.metadata.fold[0].end.block.0, "nested:summary");
+        let failed = project_at(&failed_entry,&WidthProfile::default(),2).unwrap();
+        assert!(failed.entry.block.iter().flat_map(|block|block.text.wire_rows())
+            .any(|row|row.contains("harness_spawn_agent")),"failed spawn errors must remain inspectable");
+        let inspection = project_at(&TimelineEntry::AgentLifecycle {
+            id:"nested-agent".into(),created_at_ms:0,run:crate::agent::Agent::pending("session","Nested","Inspect",0),
+            exchange:vec![nested],agent:vec![],
+        },&WidthProfile::default(),3).unwrap();
+        let full = inspection.entry.block.iter().flat_map(|block|block.text.wire_rows()).collect::<Vec<_>>().join("\n");
+        assert!(full.contains("Earlier child thought") && full.contains("Latest child thought"));
+        assert!(full.contains("Child tool result"));
     }
 
     #[test]
@@ -3456,6 +3517,7 @@ mod tests {
         let mut event = BackendEvent {
             received_at_ms: None,
             address: Some(ProviderAddress {
+                owner: None,
                 thread_id: "thread".into(),
                 turn_id: "turn".into(),
             }),
@@ -4027,6 +4089,7 @@ mod tests {
         .unwrap();
         exchange.resume(1000).unwrap();
         let address = ProviderAddress {
+            owner: None,
             thread_id: "parent".into(),
             turn_id: "turn".into(),
         };
@@ -4137,7 +4200,7 @@ mod tests {
             "attributed_matches_checkpoint":false, "node_list":[]
         })).unwrap();
         exchange.resume(1000).unwrap();
-        let address = ProviderAddress { thread_id: "parent".into(), turn_id: "turn".into() };
+        let address = ProviderAddress { owner: None, thread_id: "parent".into(), turn_id: "turn".into() };
         exchange.start_turn(address.clone(), 1000).unwrap();
         let mut event = BackendEvent {
             received_at_ms: None,
@@ -4166,7 +4229,7 @@ mod tests {
             "attributed_matches_checkpoint":false, "node_list":[]
         })).unwrap();
         original.resume(1000).unwrap();
-        let address = ProviderAddress { thread_id: "parent".into(), turn_id: "turn".into() };
+        let address = ProviderAddress { owner: None, thread_id: "parent".into(), turn_id: "turn".into() };
         original.start_turn(address.clone(), 1000).unwrap();
         assert_eq!(super::exchange_activity_summary(&original, 4000), "● Working 3s");
         for (usage, expected) in [
@@ -4209,6 +4272,7 @@ mod tests {
         interaction
             .start_turn(
                 crate::backend::ProviderAddress {
+                    owner: None,
                     thread_id: "thread".into(),
                     turn_id: "turn".into(),
                 },

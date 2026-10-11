@@ -20,7 +20,7 @@ pub use catalog::{
     BackendCatalogRequest, BackendInput, CatalogCapability, CatalogMutation, McpDefinition,
     McpStatus, McpToolDefinition, SkillDefinition,
 };
-pub use execution::{ProviderAddress, TurnBoundary};
+pub use execution::{ExecutionOwner, ProviderAddress, TurnBoundary};
 pub use steering::SteerTarget;
 
 mod backend;

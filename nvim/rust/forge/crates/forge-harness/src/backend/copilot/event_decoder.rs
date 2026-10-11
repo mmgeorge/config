@@ -387,7 +387,7 @@ fn address_event(event: &mut BackendEvent, output: &BackendOutput) {
                     })
                 });
             event.address =
-                turn_id.map(|turn_id| crate::backend::ProviderAddress { thread_id, turn_id });
+                turn_id.map(|turn_id| crate::backend::ProviderAddress { owner: None, thread_id, turn_id });
         }
     }
 }

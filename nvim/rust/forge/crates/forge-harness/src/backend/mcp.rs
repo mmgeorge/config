@@ -164,6 +164,7 @@ mod test {
 
     fn request() -> BackendCatalogRequest {
         BackendCatalogRequest {
+            execution_owner: None,
             harness_session_id: "test".into(),
             workspace: ".".into(),
             access: Default::default(),

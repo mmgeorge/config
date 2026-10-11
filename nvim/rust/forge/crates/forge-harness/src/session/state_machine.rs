@@ -550,6 +550,7 @@ mod test {
         exchange
             .start_turn(
                 crate::backend::ProviderAddress {
+                    owner: None,
                     thread_id: "thread".into(),
                     turn_id: "turn".into(),
                 },

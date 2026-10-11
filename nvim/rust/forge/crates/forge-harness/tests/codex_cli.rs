@@ -22,6 +22,7 @@ fn git(workspace: &Path, args: &[&str]) {
 
 fn request(workspace: &Path, mode: PromptMode, text: &str) -> BackendRequest {
     BackendRequest {
+        execution_owner: None,
         harness_session_id: "harness-session".into(),
         workspace: workspace.to_string_lossy().into_owned(),
         input: BackendInput::from_text(text),
@@ -72,6 +73,7 @@ async fn lists_provider_skills_and_complete_mcp_rows() {
     let repository = tempfile::tempdir().unwrap();
     let backend = CodexBackend::new(vec!["codex".into(), "app-server".into()]).unwrap();
     let catalog_request = BackendCatalogRequest {
+        execution_owner: None,
         harness_session_id: "catalog-session".into(),
         workspace: repository.path().to_string_lossy().into_owned(),
         access: Default::default(),
@@ -158,6 +160,7 @@ async fn plans_without_writing_then_executes_and_forks_in_a_temporary_repository
     let (answer_event_sink, mut answer_event_stream) = forge_harness::backend::events::channel();
     let mut answer_future = Box::pin(backend.prompt_stream(
         BackendRequest {
+            execution_owner: None,
             model: "default".into(),
             ..request(
                 repository.path(),
@@ -451,7 +454,8 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
     )
     .unwrap();
     let mut broker = HarnessBroker::initialize(InitializeRequest {
-        config_dir: None,
+        backend_launch_by_provider: Default::default(),
+            config_dir: None,
         data_root: data_root.path().to_string_lossy().into_owned(),
         permission_file: None,
         workspace: repository.path().to_string_lossy().into_owned(),

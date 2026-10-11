@@ -17,6 +17,11 @@ pub(crate) use failure::{
 };
 pub use runtime::{ControlToolResult, ControlToolRuntime, ControlTurnContext};
 
+pub(crate) fn is_agent_tool(name: &str) -> bool {
+    matches!(name,"harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
+        | "harness_list_agents" | "harness_wait_agent")
+}
+
 /// Defines one Harness control tool independently from any provider transport.
 #[derive(Clone, Debug)]
 pub struct ControlToolDefinition {
@@ -44,6 +49,37 @@ impl ControlToolRegistry {
     /// Build the complete provider-neutral control-tool definition list.
     pub fn definition_list(&self) -> Vec<ControlToolDefinition> {
         vec![
+            ControlToolDefinition {
+                name:"harness_spawn_agent",
+                description:"Admit a fresh Harness-owned child with no parent history. Requires a unique task_name. Optional provider, model, and reasoning_effort resolve before admission. Returns its stable identity and execution selection without waiting for completion.",
+                input_schema:strict_object_input_schema(vec![("task_name",json!({"type":"string","minLength":1,"maxLength":64,"pattern":"^[A-Za-z0-9_-]+$"})),("message",string_schema()),
+                    ("provider",json!({"type":"string","enum":["codex","copilot","claude","antigravity"]})),("model",string_schema()),("reasoning_effort",string_schema())],&["task_name","message"]),
+            },
+            ControlToolDefinition {
+                name:"harness_send_message",
+                description:"Supply information to a child by stable ID, canonical path, or task name. Does not start an idle child. Native steering is used only when supported, otherwise information remains in its durable inbox.",
+                input_schema:strict_object_input_schema(vec![("target",string_schema()),("message",string_schema())],&["target","message"]),
+            },
+            ControlToolDefinition {
+                name:"harness_followup_task",
+                description:"Admit another task into an existing child's retained conversation. Serializes busy-child follow-ups with at most 32 pending tasks. Retains the child's provider selection and history.",
+                input_schema:strict_object_input_schema(vec![("target",string_schema()),("message",string_schema())],&["target","message"]),
+            },
+            ControlToolDefinition {
+                name:"harness_interrupt_agent",
+                description:"Interrupt one child and cancel its queued follow-ups. Retains its identity, history, and informational inbox. Execution capacity remains reserved until cleanup settles.",
+                input_schema:strict_object_input_schema(vec![("target",string_schema())],&["target"]),
+            },
+            ControlToolDefinition {
+                name:"harness_list_agents",
+                description:"List Main and Harness-owned children with execution selections, lifecycle, and latest task outcome. Optional path_prefix filters canonical task paths within this root.",
+                input_schema:strict_object_input_schema(vec![("path_prefix",string_schema())],&[]),
+            },
+            ControlToolDefinition {
+                name:"harness_wait_agent",
+                description:"Wait asynchronously for child activity, results, timeout, or root interruption. Returns available final responses and outcomes directly. Default 30000 ms, minimum 10000 ms, maximum 3600000 ms.",
+                input_schema:strict_object_input_schema(vec![("timeout_ms",json!({"type":"integer","minimum":10000,"maximum":3600000}))],&[]),
+            },
             ControlToolDefinition {
                 name: "harness_repository_status",
                 description: "Read bounded Git status for the authenticated active interaction workspace. No Status view is required. Each page is a fresh observation, not a mutation precondition.",
@@ -159,9 +195,26 @@ impl ControlToolRegistry {
     /// Expose plan mutation only while authoring a plan or resolving an execution.
     pub fn definition_list_for(&self, phase: Option<crate::plan::PlanPhase>) -> Vec<ControlToolDefinition> {
         self.definition_list().into_iter().filter(|definition| {
-            !matches!(definition.name, "harness_design_apply_patch" | "harness_plan_submit")
+            !is_agent_tool(definition.name) && (!matches!(definition.name, "harness_design_apply_patch" | "harness_plan_submit")
                 || phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve)
+            )
         }).collect()
+    }
+
+    /// Select tools from authenticated root ownership and current optional-tool authority.
+    pub fn definition_list_for_context(&self, context: Option<&ControlTurnContext>, root: bool) -> Vec<ControlToolDefinition> {
+        let phase = context.and_then(|context|context.execution.as_ref().map(|execution|execution.phase));
+        self.definition_list().into_iter().filter(|definition| {
+            if !root {return definition.name.starts_with("harness_repository_") && context.is_some_and(|context|context.repository.is_some());}
+            if is_agent_tool(definition.name) {return context.and_then(|context|context.agent.as_ref()).is_some_and(|scope|scope.available());}
+            !matches!(definition.name,"harness_design_apply_patch" | "harness_plan_submit") || phase.is_none_or(|phase|phase == crate::plan::PlanPhase::Resolve)
+        }).collect()
+    }
+
+    /// Advertise optional root tools before an ACP transport admits its first turn.
+    pub fn definition_list_for_owner(&self, owner: &crate::backend::ExecutionOwner, agent_tools: bool) -> Vec<ControlToolDefinition> {
+        if !owner.is_root() {return Vec::new();}
+        self.definition_list().into_iter().filter(|definition|!is_agent_tool(definition.name) || agent_tools).collect()
     }
 
     /// Convert the canonical definitions into the MCP tool-list shape.
@@ -222,6 +275,8 @@ pub fn apply_invocation(
             output.question_withdrawal =
                 Some(decode_arguments::<PlanQuestionWithdrawal>(invocation)?);
         }
+        "harness_spawn_agent" | "harness_send_message" | "harness_followup_task" | "harness_interrupt_agent"
+        | "harness_list_agents" | "harness_wait_agent" => {},
         "harness_plan_phase_done" => {},
         "harness_goal_complete" => output.evidence.structured_complete = true,
         "harness_goal_blocked" => output.evidence.structured_blocked = true,

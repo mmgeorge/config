@@ -3041,54 +3041,93 @@ Non-Git WRITE requires an explicit confirmation and permanently displays `NO CHE
 for that session. Git checkpoints include tracked and nonignored untracked files, exclude
 ignored files, and never mutate the index or history during rollback.
 
-Harness subagents follow the same Rust-state and Lua-presentation split. `AgentRegistry` owns
-Codex definition discovery, persistent agent identities, provider thread identity, lifecycle state,
-and transient execution addresses. `Delegation` owns the immutable parent exchange and turn link,
-the task, and the child exchange identity. Every parent or child exchange owns one Git baseline and
-terminal snapshot. Child turns reuse `Exchange`, `Turn`, and the shared Rust timeline projection.
-Definition discovery merges built-ins, `CODEX_HOME/agents`, and workspace `.codex/agents` with
-workspace definitions taking precedence. The home-directory `.codex/agents` path supplies the
-personal fallback when `CODEX_HOME` is unavailable.
+Harness owns child conversations through `AgentCoordinator`. Each root session owns unique task
+names and canonical `/root/<name>` paths, durable `AgentTask` records, informational inboxes,
+follow-up queues, and cancellation signals. `ExecutionOwner` binds every child runtime to its
+Harness session and agent. Provider connection keys include both identifiers, while portable
+settings retain the root session scope. Children use the shared workspace and start with fresh
+provider history. Follow-ups resume only the selected child's native conversation.
 
-Codex collaboration tool status describes the parent tool call, not the child. The JSON-RPC
-normalizer therefore emits one lifecycle update per `agentsStates` entry and uses each child's
-reported status. Only spawn and concrete subagent-activity events may create runs. Wait, input, and
-close events update an already indexed provider thread and cannot manufacture `default` agents.
-Provider spawn events may precede the child thread identifier. `AgentRegistry` resolves that
-two-phase handshake through one unambiguous active run with the same parent interaction, parent
-thread, and turn. It refuses ambiguous sibling matches. Parent thread ownership becomes immutable
-after binding, so later wait events cannot reparent a child or create a cycle. The Codex backend
-also waits for the original parent thread and turn to complete. A child `turn/completed` closes only
-the child timeline and never terminates the parent request.
+Admission reserves one of eight active child slots before committing the agent identity, parent
+`Delegation`, queued child `Exchange`, and task in one SQLite transaction. An operation receipt
+returns the admitted identity on repeated delivery. Rejected admission leaves no orphaned child.
+Each child runs at most one task at a time and retains at most 32 pending follow-ups. Informational
+messages remain in a durable inbox and never start an idle child. An active adapter can steer the
+message into its current turn, otherwise the next follow-up receives the retained message.
 
-`/agent` owns timeline navigation only. Its shared bottom picker presents Main, Running, and Done
-sections, derives each child's elapsed time and tool/failure totals from the same summary component
-as the parent timeline, and refreshes that presentation while it remains open. `/agent main` always
-returns to the parent conversation. Zero-based numeric selectors and alphabetic aliases select only
-running children in label order, so `/agent a` and `/agent 0` target the same first running child
-without letting completed history shift those positions. Choosing any picker row switches timelines
-and restores the window that opened the picker.
+The coordinator's bounded request channel has 64 entries. The active root prompt drains it while
+retaining the broker lock, and the idle session controller drains it between prompts. Provider
+tool callbacks use that channel rather than acquiring the broker lock. Model tool authority is
+bound to a live root turn and parent exchange, expires when the turn ends, and is checked again
+at admission. Children receive no delegation tools or root planning authority.
 
-`/spawn` owns child creation. The no-argument form opens the shared bottom picker with a focused
-fuzzy-search input over provider definitions. Choosing a definition transforms the same picker into
-an attached multiline task input without resizing the Harness split. `/spawn <definition> <task>`
-asks the parent Codex thread to spawn the selected definition because
-app-server exposes child lifecycle events but no direct client spawn RPC. The parent instruction
-requests exactly one spawn with the selected definition and rejects default intermediary agents.
-The Codex launch strategy translates Harness definition names into native identifier form, such as
-`local-code-explorer` to `local_code_explorer`, while preserving the catalog name on the durable run.
-The main timeline nests each run under its spawning interaction, derives `Waiting on N subagents`
-only while the parent has no active thought, and replaces that state when parent work resumes.
-Child runtime, tool totals, failures, and completion remain visible in the collapsed node. Expanding
-the node reveals its immutable thought and response timeline. Provider-nested children follow
-`parent_thread_id`, preserving the actual hierarchy instead of flattening every run beside the parent.
-Selecting a child changes
-both the rendered timeline and composer target. Codex child prompts use the reported thread id,
-while steering and interruption target its active turn id. Copilot exposes streamed child
-lifecycle and timeline observation, but it omits a Harness-owned catalog and direct child control.
-The picker therefore shows observed Copilot children without advertising unsupported spawn or
-interrupt actions.
+The portable `subagent_tools` setting defaults to false. Enabling it exposes exactly
+`harness_spawn_agent`, `harness_send_message`, `harness_followup_task`, `harness_interrupt_agent`,
+`harness_list_agents`, and `harness_wait_agent` to the root model. Manual spawning remains available
+when the setting is disabled. Model-delegated completion enters the owning root exchange's result
+queue. An active wait receives the result, otherwise the broker continues the same exchange to
+process it. Manual child completion does not start root model work. An explicit wait observes
+activity from every child, including manual children, and returns unreported completed tasks.
 
+`/spawn` accepts a unique task name and message. Its composer selects the provider, advertised
+model, and reasoning effort for an independent conversation. `/agents` presents Main, Running,
+and Done sections and preserves the selected identity across live updates. Its actions inspect a
+child timeline, send an informational message, queue a follow-up, interrupt a child or all children,
+and toggle root delegation tools. Selecting a child directs ordinary composer submission to a
+follow-up task and explicit steering submission to its informational inbox.
+
+Same-provider children inherit resolved root tuning unless explicitly overridden. Cross-provider
+children resolve the target provider's saved model, reasoning effort, context window, and service
+tier against its independent model catalog. Catalog requests bypass the active root broker lock.
+Rejected or unavailable native steering retains informational messages for the next explicit
+follow-up rather than discarding them or starting idle work.
+
+Child events use the shared `Exchange`, `Turn`, tool-output storage, and incremental document
+pipeline. The broker publishes registered `agent_updated` events for live picker summaries
+and timeline patches for transcript changes. Queued follow-ups cannot replace the active
+exchange's state or control target in the picker.
+Main renders each delegated child through the shared exchange heading and a stable preview of
+its latest thought. Tool activity preserves that preview. Selecting the child renders its full
+ordered message and tool history. Timer patches update child headings with their own metrics.
+The `●` agent heading includes name, provider, model, lifecycle, and elapsed time. The `○` preview
+contains only the latest thought. Enter opens the owned child timeline. Successful spawn calls
+use the agent entry as their presentation, while failed calls retain their tool error rows.
+
+Task completion commits the exchange outcome and agent state atomically. Interruption
+cancels active and queued tasks and retains history and inbox content. Cleanup failure retains the
+child's capacity slot and adapter for an explicit retry. Runtime cleanup has a 30-second bound.
+Root cancellation, clearing, and access-policy transitions collect child execution before proceeding.
+Admission remains closed for the full collection and transition interval. A later explicit
+follow-up retains its provider and model while inheriting the root's current access policy.
+Tool visibility changes preserve existing child conversations and resume interrupted root work
+within the same exchange. Plan phase completion and automatic checks reject active child execution,
+including retained cleanup failures, before changing verification state or finalizing the goal.
+Lua adopts the tool toggle after a successful configuration response or its matching active
+configuration event, before refreshing the picker. Rejected and unrelated operations leave the
+displayed value unchanged.
+Completed child tasks ignore replayed completion and late content. Parent continuation
+acknowledges child results after successful provider dispatch and preserves pending results
+when dispatch fails.
+
+Child approval events retain their execution owner through persistence and transport. The shared
+permission popup adds `Agent <name> · <provider>` above the existing request details and choices.
+Its interrupt action targets the requesting child independently of the selected timeline.
+Requests queue in the existing popup. Resolution removes that child's blocker, while interruption
+or provider failure cancels only that owner's pending requests. Sibling requests remain pending.
+The broker retains provider conversation identity from addressed events and the adapter's final
+identity lookup, even when the child turn fails or is interrupted.
+
+Codex disables `agents.enabled`, Copilot excludes its builtin-qualified native delegation tools,
+and Claude ACP disallows `Agent` and `Task` on session creation and resumption. Antigravity ACP
+exposes no equivalent native suppression selector, which `/capabilities` reports as unsupported.
+Native lifecycle notifications remain diagnostics and cannot create or bind managed identities.
+Cross-provider selection rejects any child provider unable to enforce the root's OS sandbox,
+including Copilot and ACP providers, both at spawn and on later follow-up admission.
+
+Session format 41 hides incompatible session records without deleting them. Preference format 40
+remains independent of session compatibility. Reopening retains child identities, completed
+outcomes, and provider history, marks unfinished child tasks interrupted, and never replays them
+automatically. Root forking does not transfer live child execution ownership.
 ### Deferred Harness work
 
 - Add task-level diff annotations and feedback cycles now that stable task identity and shared

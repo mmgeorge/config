@@ -1452,7 +1452,7 @@ mod tests {
         let projected_entries = owner.open.as_ref().unwrap().sections.projected_entries;
         for iteration in 0..100 {
             let event = BackendEvent {
-            received_at_ms: None, address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
+            received_at_ms: None, address:Some(ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"active".into() }),
                 turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10+iteration}),
                 summary:None,task_update:None,activity:Some(ToolActivity { id:"tool".into(),kind:ToolActivityKind::Command,
                     title:"Read output".into(),output:Some(format!("new {iteration} 🦀\n")),status:Some("inProgress".into()),
@@ -1495,7 +1495,7 @@ mod tests {
         active["exchange"]["turn"][0]["state"] = serde_json::json!({"kind":"running"});
         let mut exchange: Exchange = serde_json::from_value(active["exchange"].take())?;
         let mut event = BackendEvent {
-            received_at_ms: None, address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
+            received_at_ms: None, address:Some(ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"active".into() }),
             turn_boundary:None,kind:"assistant_message".into(),text:Some("First [link](https://example.com)".into()),
             data:serde_json::json!({"provider_message_id":"message"}),summary:None,task_update:None,activity:None };
         exchange.observe_turn(&event,2)?;
@@ -1542,7 +1542,7 @@ mod tests {
         assert!(opened.transcript.block.iter().map(|block|block.text.row_count()).sum::<usize>() < 30000);
         assert!(!opened.transcript.block.iter().any(|block| block.id.0 == "history-0:turn:1:tool:preview"));
         let event = BackendEvent {
-            received_at_ms: None, address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
+            received_at_ms: None, address:Some(ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"active".into() }),
             turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10}),
             summary:None,task_update:None,activity:Some(ToolActivity { id:"tool".into(),
                 kind:ToolActivityKind::Command,title:"Read output".into(),output:Some("\nseventh\n".into()),
@@ -1583,6 +1583,7 @@ mod tests {
             let mut event = BackendEvent {
             received_at_ms: None,
                 address: Some(ProviderAddress {
+                    owner: None,
                     thread_id: "thread".into(),
                     turn_id: "markdown".into(),
                 }),
@@ -1728,6 +1729,7 @@ mod tests {
         };
         use crate::exchange::{ExchangeKind, ExchangeState};
         let address = ProviderAddress {
+            owner: None,
             thread_id: "thread".into(),
             turn_id: identity.into(),
         };
@@ -1893,7 +1895,7 @@ mod tests {
                 rows,width:WidthProfile::default() } })?;
             let projected = owner.open.as_ref().unwrap().sections.projected_entries;
             let event = BackendEvent { received_at_ms:None,
-                address:Some(ProviderAddress { thread_id:"thread".into(),turn_id:"active".into() }),
+                address:Some(ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"active".into() }),
                 turn_boundary:None,kind:"tool".into(),text:None,data:serde_json::json!({"emittedAtMs":10}),
                 summary:None,task_update:None,activity:Some(ToolActivity { id:"tool".into(),
                     kind:ToolActivityKind::Command,title:"Read output".into(),output:Some(delta),
@@ -2081,6 +2083,11 @@ mod tests {
                             session_id: "session".into(),
                             provider_thread_id: Some(identity.into()),
                             definition: "reviewer".into(),
+                            task_name: "reviewer".into(),
+                            task_path: "/root/reviewer".into(),
+                            source: crate::agent::AgentSource::Model,
+                            selection: None,
+                            inbox: Vec::new(),
                             nickname: None,
                             state: crate::agent::AgentState::Ready,
                             created_at_ms: 0,
@@ -2122,6 +2129,7 @@ mod tests {
             let mut event = BackendEvent {
             received_at_ms: None,
                 address: Some(ProviderAddress {
+                    owner: None,
                     thread_id: "thread".into(),
                     turn_id: "second".into(),
                 }),
@@ -2216,6 +2224,11 @@ mod tests {
                 session_id: "session".into(),
                 provider_thread_id: None,
                 definition: "explorer".into(),
+                task_name: "explorer".into(),
+                task_path: "/root/explorer".into(),
+                source: crate::agent::AgentSource::Model,
+                selection: None,
+                inbox: Vec::new(),
                 nickname: None,
                 state: AgentState::Ready,
                 created_at_ms: 0,

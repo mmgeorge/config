@@ -525,6 +525,10 @@ local function send_harness_initialize(callback, initialize_options)
       end)
     end)
   end
+  local backend_launch_by_provider = {}
+  for provider, backend in pairs(harness_config.backends) do
+    backend_launch_by_provider[provider] = { kind = provider, command = vim.deepcopy(backend.command or {}) }
+  end
   local params = {
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
     config_dir = harness_config.config_dir or vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(
@@ -533,6 +537,7 @@ local function send_harness_initialize(callback, initialize_options)
     workspace = vim.fn.getcwd(),
     client_id = ("nvim-%s-%s"):format(vim.fn.getpid(), vim.uv.hrtime()),
     backend = { kind = descriptor.kind, command = descriptor.command },
+    backend_launch_by_provider = backend_launch_by_provider,
     model = harness_config.model,
     effort = harness_config.effort,
     goal_max_turns = harness_config.goal_max_turns,

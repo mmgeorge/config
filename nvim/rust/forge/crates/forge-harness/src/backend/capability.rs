@@ -87,8 +87,6 @@ impl CapabilityManifest {
             ("effort_selection", "Select reasoning effort", flags.effort_selection, "Choices come from the selected provider"),
             ("fast_mode", "Fast service tier", flags.fast_mode, "Requires provider service-tier support"),
             ("ultrafast_mode", "Ultrafast service tier", flags.ultrafast_mode, "Requires provider service-tier support"),
-            ("agent_observe", "Observe child agents", flags.agent.observe, "Requires structured provider child events"),
-            ("agent_catalog", "Select child agent", flags.agent.catalog, "Requires provider agent discovery"),
             ("skill_catalog", "Select skills", flags.catalog.skill, "Requires an enforceable skill selection"),
             ("mcp_catalog", "Select MCP servers", flags.catalog.mcp, "Requires enforceable server selection"),
         ] {
@@ -116,15 +114,21 @@ impl CapabilityManifest {
                 matches!(descriptor.kind, BackendKind::Claude | BackendKind::Antigravity), "idle",
                 "ACP setup uses provider-advertised sign-in methods and preserves native credentials");
         }
-        add("native_child_input", "Provider", "Deliver child-agent input", false, "provider",
-            !matches!(flags.agent.input,crate::agent::AgentControlMode::Unsupported), "immediate",
-            "Direct or parent-mediated control depends on the adapter");
-        add("native_child_spawn", "Provider", "Start a selected child agent", false, "provider",
-            !matches!(flags.agent.spawn,crate::agent::AgentControlMode::Unsupported), "immediate",
-            "Provider-created children remain observable independently of an explicit spawn API");
-        add("native_child_interrupt", "Provider", "Interrupt one child agent", false, "provider",
-            !matches!(flags.agent.interrupt,crate::agent::AgentControlMode::Unsupported), "immediate",
-            "Root cancellation still collects descendants");
+        for (id,label) in [("agent_observe","Inspect child timelines"),
+            ("agent_spawn","Spawn independent child conversations"),
+            ("agent_followup","Queue child follow-up tasks"),
+            ("agent_message","Persist child informational messages"),
+            ("agent_interrupt","Interrupt one child or all children"),
+            ("agent_cross_provider","Select each child's provider and model")] {
+            add(id,"Harness",label,false,"forge",true,"immediate",
+                "Harness owns child identity, fresh history, task queues, cancellation, and durable outcomes");
+        }
+        add("subagent_tools","Settings","Enable root model delegation tools",false,"forge",true,"server_restart",
+            "Off by default. Manual child spawning remains available and children cannot delegate");
+        add("native_agent_suppression","Provider","Disable provider-native agent tools",false,"provider",
+            descriptor.kind != BackendKind::Antigravity,"session_restart",
+            if descriptor.kind == BackendKind::Antigravity {"Antigravity ACP exposes no native-agent suppression control. Native events cannot create Harness children"}
+            else {"Provider-native agent tools are disabled for session creation and resumption"});
         add("skill_mutation", "Settings", "Apply skill selection", false, "provider", flags.catalog.skill,
             "session_restart", "Forge persists desired selection and verifies the provider result");
         add("native_import", "Settings", "Import native skills and MCP definitions", false, "forge", true,
@@ -137,14 +141,6 @@ impl CapabilityManifest {
             add(id, "Provider", label, false, "provider", flags.catalog.mcp
                 && matches!(descriptor.kind, BackendKind::Codex | BackendKind::Copilot | BackendKind::Mock),
                 "immediate", "ACP accepts configured servers but does not expose their readiness or tool inventory");
-        }
-        if matches!(descriptor.kind, BackendKind::Claude | BackendKind::Antigravity) {
-            for entry in &mut capability {
-                if entry.id == "agent_observe" && flags.agent.observe {
-                    entry.support = Support::Limited;
-                    entry.reason = "Shows advertised child session lifecycles and separate timelines during active prompts. Independent child controls and background observation are unavailable";
-                }
-            }
         }
         if descriptor.kind == BackendKind::Antigravity {
             for entry in &mut capability {
@@ -165,7 +161,7 @@ impl CapabilityManifest {
                 }
             }
         }
-        Self { backend: descriptor.kind, label: descriptor.label, revision: 4, capability,
+        Self { backend: descriptor.kind, label: descriptor.label, revision: 5, capability,
             provider_version:None,availability:"ready",availability_reason:None,notice:Vec::new() }
     }
 }

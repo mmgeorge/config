@@ -51,6 +51,16 @@ pub enum HarnessMethod {
     AgentList,
     #[serde(rename = "agent.start")]
     AgentStart,
+    #[serde(rename = "agent.message")]
+    AgentMessage,
+    #[serde(rename = "agent.followup")]
+    AgentFollowup,
+    #[serde(rename = "agent.interrupt")]
+    AgentInterrupt,
+    #[serde(rename = "agent.interrupt_all")]
+    AgentInterruptAll,
+    #[serde(rename = "agent.models")]
+    AgentModels,
     #[serde(rename = "permissions.open")]
     PermissionsOpen,
     #[serde(rename = "permissions.save")]

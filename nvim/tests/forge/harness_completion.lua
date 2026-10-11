@@ -78,9 +78,11 @@ local ok, failure = xpcall(function()
   session.harness.agent = { run = { { id = "child", definition = "explorer", state = "ready" } }, exchange = {} }
   session.harness.timeline = { { kind = "agent_lifecycle", run = session.harness.agent.run[1],
     exchange = { { id = "child-exchange", agent_id = "child", state = "running", turn = {} } }, agent = {} } }
-  item(complete(commands, "/agent "), "a")
+  item(complete(commands, "/agents"), "/agents")
+  item(complete(commands, "/spawn"), "/spawn")
   session.harness.timeline[1].exchange[1].state = "complete"
-  assert(#complete(commands, "/agent ") == 1, "completed child retained its running alias")
+  item(complete(commands, "/agents"), "/agents")
+  assert(#complete(commands, "/spawn ") == 0, "spawn completion exposed a native role catalog")
   item(complete(commands, "/model "), "fixture-model")
   local effort = complete(commands, "/model fixture-model ")
   assert(#effort == 2)

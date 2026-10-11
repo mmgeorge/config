@@ -46,6 +46,16 @@ pub struct Agent {
     pub provider_thread_id: Option<String>,
     pub definition: String,
     pub nickname: Option<String>,
+    /// Retains the unique generic task name independently of native provider roles.
+    pub task_name: String,
+    /// Resolves stable tool targets inside this root session.
+    pub task_path: String,
+    /// Distinguishes model delegation from manual admission and root ownership.
+    pub source: super::AgentSource,
+    /// Retains independent child tuning and the effective access policy.
+    pub selection: Option<super::AgentSelection>,
+    /// Preserves informational messages across interruption and process restart.
+    pub inbox: Vec<super::AgentMessage>,
     pub state: AgentState,
     pub created_at_ms: i64,
     pub updated_at_ms: i64,
@@ -60,6 +70,11 @@ impl Agent {
             provider_thread_id: None,
             definition: "primary".into(),
             nickname: None,
+            task_name: "Main".into(),
+            task_path: "/root".into(),
+            source: super::AgentSource::Root,
+            selection: None,
+            inbox: Vec::new(),
             state: AgentState::Ready,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -74,6 +89,11 @@ impl Agent {
             provider_thread_id: None,
             definition: definition.into(),
             nickname: None,
+            task_name: definition.into(),
+            task_path: format!("/root/{definition}"),
+            source: super::AgentSource::Model,
+            selection: None,
+            inbox: Vec::new(),
             state: AgentState::Starting,
             created_at_ms: now_ms,
             updated_at_ms: now_ms,
@@ -82,7 +102,7 @@ impl Agent {
 
     /// Return the best stable label for winbar and picker presentation.
     pub fn label(&self) -> &str {
-        self.nickname.as_deref().unwrap_or(&self.definition)
+        &self.task_name
     }
 
     /// Return whether this identity owns the session's primary timeline.

@@ -433,7 +433,7 @@ mod test {
             "attributed_matches_checkpoint":false, "node_list":[]
         }))?;
         exchange.resume(0)?;
-        let address = ProviderAddress { thread_id:"thread".into(), turn_id:"turn".into() };
+        let address = ProviderAddress { owner: None, thread_id:"thread".into(), turn_id:"turn".into() };
         exchange.start_turn(address.clone(), 0)?;
         let mut event = BackendEvent {
             received_at_ms:None, address:Some(address), turn_boundary:None, kind:"tool".into(),

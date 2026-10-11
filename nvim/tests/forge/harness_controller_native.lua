@@ -236,11 +236,16 @@ local success, failure = xpcall(function()
   controller.drain()
   assert(#state.queue == 0 and submitted ~= nil, "idle status did not resume queued input")
   local original_plain_request = client.request
+  local child_request_for = client.request_for
+  client.request_for = function(session_id, method, params, callback)
+    if method == "state.get" then return end
+    return child_request_for(session_id,method,params,callback)
+  end
   local child_request = {}
   client.request = function(method, params, callback)
-    if method == "history.record" then return end
+    if method == "history.record" or method == "state.get" then return end
     child_request[#child_request + 1] = { method = method, params = params }
-    if method == "turn.cancel" then callback({ cancel_requested = true }) end
+    if method == "agent.interrupt" then callback({ status = "interrupting" }) end
   end
   state.busy = true
   state.capability.native_steer = true
@@ -251,16 +256,78 @@ local success, failure = xpcall(function()
   state.timeline = { { kind = "agent_lifecycle", run = state.agent.run[1], exchange = { child_exchange }, agent = {} } }
   state.agent.summary = { child = { state = "running", target = { thread_id = "child-thread", turn_id = "child-turn" } } }
   controller.cancel_turn()
-  assert(child_request[1].method == "turn.cancel" and child_request[1].params.target.thread_id == "child-thread")
+  assert(child_request[1].method == "agent.interrupt" and child_request[1].params.target == "child")
   assert(not state.cancel_requested, "settled child cancellation retained the parent cancellation flag")
   controller.steer_submit()
-  assert(child_request[2].method == "turn.steer" and child_request[2].params.target.turn_id == "child-turn")
+  assert(child_request[2].method == "agent.message" and child_request[2].params.target == "child")
   state.cancel_requested = false
   child_exchange.state = "complete"
   state.agent.summary.child = { state = "complete" }
   controller.cancel_turn()
-  assert(#child_request == 2, "completed-child cancellation fell through to the parent")
+  assert(child_request[#child_request].method == "agent.interrupt" and child_request[#child_request].params.target == "child",
+    "completed-child interruption must remain scoped to the child")
+  state.agent.run[1].task_name = "parser-review"
+  state.agent.run[1].created_at_ms = os.time() * 1000
+  state.agent.summary.child = { state = "running", tool_count = 1, failed_count = 0 }
+  controller.open_agent_picker()
+  local picker = require("forge.views.picker")
+  local picker_state = require("forge.views.picker.state")
+  local picker_instance = picker._state_for_test()
+  assert(picker_state.selected_option(picker_instance.state,picker_instance.spec).value.run.id == "child")
+  local updated_agent = vim.deepcopy(state.agent)
+  updated_agent.summary.child = { state = "running", tool_count = 7, failed_count = 1 }
+  receive("backend_event", {kind="agent_updated",data=updated_agent},"native-controller")
+  picker_instance = picker._state_for_test()
+  local selected = picker_state.selected_option(picker_instance.state,picker_instance.spec)
+  assert(selected.value.run.id == "child" and selected.detail:find("7 tools called (1 failed)",1,true),
+    "live agent events must refresh metrics without changing selection or polling state")
+  picker.close(true)
+  local child_permission = vim.deepcopy(permission)
+  child_permission.id = "child-approval"
+  child_permission.provider = "Codex"
+  child_permission.execution_owner = {session_id="native-controller",agent_id="child"}
+  state.selected_agent_run_id = "different-child"
+  receive("backend_event", {kind="approval_requested",data=child_permission},"native-controller")
+  assert(vim.wait(1000,approval_view.is_open))
+  picker_instance = picker._state_for_test()
+  local approval_page = picker_state.page(picker_instance.state,picker_instance.spec)
+  assert(approval_page.content_list[1].text == "Agent parser-review · Codex",
+    "approval must identify its requesting child")
+  local interrupt_key = require("forge.shared.keymaps").view_keys_for("harness","cancel")[1]
+  vim.fn.maparg(interrupt_key,"n",false,true).callback()
+  assert(child_request[#child_request].params.target == "child",
+    "approval interruption must ignore the selected timeline and target its owner")
+  receive("backend_event", {kind="approval_cancelled",data={id=child_permission.id}},"native-controller")
+  local original_transition = controller.task_transition
+  local root_interruption
+  controller.task_transition = function(action) root_interruption=action end
+  local root_permission = vim.deepcopy(permission)
+  root_permission.id = "root-approval"
+  root_permission.execution_owner = {session_id="native-controller",agent_id="native-controller:agent:primary"}
+  receive("backend_event", {kind="approval_requested",data=root_permission},"native-controller")
+  assert(vim.wait(1000,approval_view.is_open))
+  vim.fn.maparg(interrupt_key,"n",false,true).callback()
+  assert(root_interruption and root_interruption.action == "pause",
+    "root approval interruption must remain root-owned while a child is selected")
+  controller.task_transition = original_transition
+  receive("backend_event", {kind="approval_cancelled",data={id=root_permission.id}},"native-controller")
   client.request = original_plain_request
+  client.request_for = child_request_for
+  state.busy, state.task_operation, state.task_config = true, nil, nil
+  state.subagent_tools = false
+  for _, enabled in ipairs({true,false}) do
+    local applied = nil
+    controller.configure({subagent_tools=enabled},false,function(result)
+      assert(state.subagent_tools == enabled,"configuration callback observed stale subagent tools")
+      applied = result
+    end)
+    local operation_id = state.task_operation.id
+    receive("session_configured", {session=state.session,operation_id="stale-configuration"},"native-controller")
+    assert(applied == nil and state.subagent_tools ~= enabled,"unrelated operation applied pending tools")
+    receive("session_configured", {session=state.session,operation_id=operation_id},"native-controller")
+    assert(applied == true and state.subagent_tools == enabled,"active configuration did not adopt tools")
+    state.task_operation = nil
+  end
   require("forge.views.harness.workspace").release(state)
   state.presentation.close()
   state.presentation = nil

@@ -19,6 +19,7 @@ pub(super) struct AcpSessionState {
     pub(super) output: Mutex<BackendOutput>,
     pub(super) control: Mutex<Option<ControlToolRuntime>>,
     pub(super) catalog: RwLock<Value>,
+    pub(super) tool_definition: RwLock<Vec<crate::control_tools::ControlToolDefinition>>,
     tool: Mutex<HashMap<String, Value>>,
     compaction: Mutex<HashMap<String, Compaction>>,
     children: Mutex<super::children::AcpChildren>,
@@ -27,6 +28,7 @@ pub(super) struct AcpSessionState {
 #[derive(Clone)]
 /// Captures immutable callback routing for the admitted provider turn.
 pub(super) struct ActiveTurn {
+    pub(super) owner: crate::backend::ExecutionOwner,
     pub(super) mode: PermissionMode,
     pub(super) sink: Option<BackendEventSink>,
 }
@@ -34,7 +36,7 @@ pub(super) struct ActiveTurn {
 impl AcpSessionState {
     pub(super) fn new(kind: BackendKind, permission: Arc<PermissionCoordinator>) -> Self {
         Self { kind, permission, active: RwLock::new(None), output: Mutex::new(BackendOutput::default()),
-            control: Mutex::new(None), catalog: RwLock::new(json!({})),
+            control: Mutex::new(None), catalog: RwLock::new(json!({})), tool_definition:RwLock::new(Vec::new()),
             tool: Mutex::new(HashMap::new()), compaction: Mutex::new(HashMap::new()),
             children: Mutex::new(super::children::AcpChildren::default()) }
     }
@@ -46,7 +48,7 @@ impl AcpSessionState {
         *self.children.lock().await = super::children::AcpChildren::new(session_id.into());
         *self.control.lock().await = Some(ControlToolRuntime::new(request.control_context.clone()
             .unwrap_or_else(|| ControlTurnContext::inactive(request.mode))));
-        *self.active.write().await = Some(ActiveTurn { mode: request.execution_mode, sink });
+        *self.active.write().await = Some(ActiveTurn { owner: request.owner().expect("validated ACP request owner"), mode: request.execution_mode, sink });
     }
 
     async fn emit(&self, event: BackendEvent) -> Result<()> {
@@ -79,6 +81,9 @@ impl AcpSessionState {
         let mut approval = event("approval_requested", None, Value::Null);
         ensure!(self.children.lock().await.route(parameter["sessionId"].as_str().unwrap_or_default(), &mut approval),
             "ACP permission request has no active session owner");
+        if let Some(address) = &mut approval.address {address.owner = Some(active.owner.clone());}
+        else {approval.address = Some(crate::backend::ProviderAddress {owner:Some(active.owner.clone()),
+            thread_id:parameter["sessionId"].as_str().unwrap_or_default().into(),turn_id:String::new()});}
         let tool = &parameter["toolCall"];
         let input = &tool["rawInput"];
         let mut target_list = Vec::new();
@@ -274,6 +279,7 @@ impl AcpHandler for AcpSessionState {
 
     async fn request(&self, method: &str, parameter: Value) -> Result<Value> {
         match method {
+            "forge/tools" => Ok(json!({"tools":self.tool_definition.read().await.iter().map(|definition|definition.mcp_value()).collect::<Vec<_>>()})),
             "session/request_permission" => self.authorize(parameter).await,
             "forge/control" => {
                 ensure_active(&self.active).await?;
@@ -282,7 +288,20 @@ impl AcpHandler for AcpSessionState {
                     arguments: parameter.get("arguments").cloned().unwrap_or(json!({})),
                 };
                 let mut control = self.control.lock().await;
-                let result = control.as_mut().context("Harness control called outside an active turn")?.invoke(invocation).await?;
+                let name = invocation.name.clone();
+                let runtime = control.as_mut().context("Harness control called outside an active turn")?;
+                let result = runtime.invoke(invocation.clone()).await;
+                let failure = result.as_ref().err().map(|error|
+                    crate::control_tools::control_tool_failure_json(&invocation,error,runtime.plan_document()));
+                drop(control);
+                let result = match result {
+                    Ok(result) => result,
+                    Err(_) => {
+                        let failure = failure.expect("failed control invocation retains diagnostics");
+                        self.emit(event("error",Some(format!("Harness tool {name} failed: {failure}")),Value::Null)).await?;
+                        return Err(anyhow::anyhow!("{failure}"));
+                    }
+                };
                 if let Some(invocation) = result.invocation {
                     crate::control_tools::apply_invocation(&invocation, &mut *self.output.lock().await)?;
                 }
@@ -363,12 +382,33 @@ mod test {
     use super::*;
 
     #[tokio::test]
+    async fn malformed_agent_tool_returns_field_diagnostics_to_the_model_and_timeline() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let state = AcpSessionState::new(BackendKind::Antigravity,PermissionCoordinator::transient(fixture.path())?);
+        *state.active.write().await = Some(ActiveTurn {
+            owner:crate::backend::ExecutionOwner::root("root"),mode:PermissionMode::Read,sink:None,
+        });
+        *state.control.lock().await = Some(ControlToolRuntime::new(ControlTurnContext::inactive(crate::backend::PromptMode::Chat)));
+        let failure = state.request("forge/control",json!({"name":"harness_spawn_agent",
+            "arguments":{"message":"task","provider":"incorrect"}})).await.unwrap_err();
+        let diagnostic:Value = serde_json::from_str(&failure.to_string())?;
+        assert_eq!(diagnostic["code"],"invalid_arguments");
+        let violation = diagnostic["violation"].as_array().unwrap();
+        assert!(violation.iter().any(|item|item["code"] == "missing_field" && item["message"].as_str().unwrap().contains("task_name")));
+        assert!(violation.iter().any(|item|item["path"] == "provider" && item["code"] == "invalid_value"));
+        let output = state.output.lock().await;
+        assert_eq!(output.event.last().unwrap().kind,"error");
+        assert!(output.event.last().unwrap().text.as_ref().unwrap().contains("task_name"));
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn child_callbacks_preserve_approval_ownership_and_root_metadata() -> Result<()> {
         let fixture = tempfile::tempdir()?;
         let permission = PermissionCoordinator::transient(fixture.path())?;
         let state = Arc::new(AcpSessionState::new(BackendKind::Claude, permission.clone()));
         *state.children.lock().await = super::super::children::AcpChildren::new("root".into());
-        *state.active.write().await = Some(ActiveTurn { mode: PermissionMode::Read, sink: None });
+        *state.active.write().await = Some(ActiveTurn {owner:crate::backend::ExecutionOwner::root("test"), mode: PermissionMode::Read, sink: None });
         state.notification("session/update", json!({"sessionId":"root","update":{
             "sessionUpdate":"subagent_spawned","subagentSessionId":"child"}})).await?;
         for update in [
@@ -414,7 +454,7 @@ mod test {
         let fixture = tempfile::tempdir().unwrap();
         let permission = PermissionCoordinator::transient(fixture.path()).unwrap();
         let state = Arc::new(AcpSessionState::new(BackendKind::Claude, permission.clone()));
-        *state.active.write().await = Some(ActiveTurn { mode:PermissionMode::Yolo,sink:None });
+        *state.active.write().await = Some(ActiveTurn {owner:crate::backend::ExecutionOwner::root("test"), mode:PermissionMode::Yolo,sink:None });
         for (tool, expected) in [
             (json!({"kind":"edit","rawInput":{"TargetFile":"target.txt"}}),
                 ("edit", "target.txt")),
@@ -457,7 +497,7 @@ mod test {
         let state = AcpSessionState::new(BackendKind::Claude, PermissionCoordinator::transient(fixture.path()).unwrap());
         state.notification("session/update", json!({"update":{"sessionUpdate":"available_commands_update","availableCommands":[]}})).await.unwrap();
         assert_eq!(state.catalog.read().await["availableCommands"], json!([]));
-        *state.active.write().await = Some(ActiveTurn { mode: PermissionMode::Read, sink: None });
+        *state.active.write().await = Some(ActiveTurn {owner:crate::backend::ExecutionOwner::root("test"), mode: PermissionMode::Read, sink: None });
         for update in [
             json!({"sessionUpdate":"tool_call","toolCallId":"command-1","title":"Run check","kind":"execute","status":"in_progress"}),
             json!({"sessionUpdate":"tool_call_update","toolCallId":"command-1","status":"completed","content":[{"type":"content","content":{"type":"text","text":"passed"}}]}),
@@ -501,7 +541,7 @@ mod test {
     async fn sparse_tool_completion_preserves_acp_file_diffs() {
         let fixture = tempfile::tempdir().unwrap();
         let state = AcpSessionState::new(BackendKind::Claude, PermissionCoordinator::transient(fixture.path()).unwrap());
-        *state.active.write().await = Some(ActiveTurn { mode:PermissionMode::Write, sink:None });
+        *state.active.write().await = Some(ActiveTurn {owner:crate::backend::ExecutionOwner::root("test"), mode:PermissionMode::Write, sink:None });
         state.notification("session/update", json!({"update":{
             "sessionUpdate":"tool_call","toolCallId":"edit-1","kind":"edit","title":"Edit files",
             "content":[
@@ -532,7 +572,7 @@ mod test {
     async fn raw_tool_completion_preserves_command_output_and_errors() {
         let fixture = tempfile::tempdir().unwrap();
         let state = AcpSessionState::new(BackendKind::Antigravity, PermissionCoordinator::transient(fixture.path()).unwrap());
-        *state.active.write().await = Some(ActiveTurn { mode:PermissionMode::Write, sink:None });
+        *state.active.write().await = Some(ActiveTurn {owner:crate::backend::ExecutionOwner::root("test"), mode:PermissionMode::Write, sink:None });
         for update in [
             json!({"sessionUpdate":"tool_call","toolCallId":"command","kind":"execute","title":"Check","status":"in_progress"}),
             json!({"sessionUpdate":"tool_call_update","toolCallId":"command","status":"completed","content":[],

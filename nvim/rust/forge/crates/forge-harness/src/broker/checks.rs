@@ -5,6 +5,8 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 impl HarnessBroker {
     /// Executes the accepted gate without admitting a model exchange.
     pub(super) async fn run_checks(&mut self) -> Result<Vec<SessionEvent>> {
+        anyhow::ensure!(self.agent_coordinator.active_count() == 0,
+            "child execution must settle before running verification checks. Wait for or interrupt active children first");
         let result = self.run_checks_inner().await;
         if let Err(error) = &result {
             let mut goal = self.active_goal()?;

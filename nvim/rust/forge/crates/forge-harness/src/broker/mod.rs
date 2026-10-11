@@ -8,8 +8,7 @@ pub use fork::{ForkPreparation, prepare_provider_fork};
 pub use new_session::prepare_new_session;
 
 use crate::agent::{
-    Agent, AgentDefinition, AgentExecutionState, AgentLifecycleEvent, AgentRegistry, AgentState,
-    load_codex_agent_catalog,
+    Agent, AgentLifecycleEvent, AgentRegistry, AgentState,
 };
 #[cfg(test)]
 use crate::backend::BackendForkRequest;
@@ -92,6 +91,9 @@ pub struct InitializeRequest {
     pub workspace: String,
     pub client_id: String,
     pub backend: BackendLaunch,
+    #[serde(default)]
+    /// Supplies explicit launch descriptors for cross-provider children.
+    pub backend_launch_by_provider: HashMap<String, BackendLaunch>,
     #[serde(default = "default_model")]
     pub model: String,
     #[serde(default = "default_effort")]
@@ -109,11 +111,13 @@ fn agent_summaries(runs: &[Agent], exchanges: &[Exchange]) -> std::collections::
     runs.iter().map(|run| {
         let owned: Vec<_> = exchanges.iter().filter(|exchange| exchange.agent_id == run.id).collect();
         let tools: Vec<_> = owned.iter().flat_map(|exchange| exchange.turn.iter()).flat_map(|turn|turn.tools()).collect();
-        let latest = owned.last();
+        let latest = owned.iter().rev().find(|exchange| exchange.state == ExchangeState::Running)
+            .or_else(|| owned.last());
         let target = latest.and_then(|exchange| exchange.turn.iter().rev().find(|turn| matches!(turn.state(),crate::turn::TurnState::Running)))
             .map(|turn| serde_json::to_value(turn.provider()).expect("provider address"));
         (run.id.clone(), json!({"state":latest.map(|exchange| serde_json::to_value(exchange.state).expect("exchange state")).unwrap_or_else(|| serde_json::to_value(run.state).expect("agent state")),
-            "tool_count":tools.len(),"failed_count":tools.iter().filter(|tool|tool.failed).count(),"target":target}))
+            "tool_count":tools.len(),"failed_count":tools.iter().filter(|tool|tool.failed).count(),"target":target,
+            "exchange_count":owned.len(),"latest_exchange_id":latest.map(|exchange|exchange.id.as_str())}))
     }).collect()
 }
 
@@ -135,6 +139,7 @@ fn preview_lines(timeline: &[TimelineEntry]) -> Result<Vec<String>> {
 /// Represents the complete client-visible state for one active session.
 #[derive(Clone, Debug, Serialize)]
 pub struct BrokerSnapshot {
+    pub subagent_tools:bool,
     pub runtime_epoch: String,
     pub snapshot_revision: u64,
     pub task_operation: Option<Value>,
@@ -160,10 +165,9 @@ pub struct BrokerSnapshot {
     pub approval: Vec<ApprovalRequestView>,
 }
 
-/// Represents selectable definitions and durable child timelines for one session.
+/// Retains reusable child identities and their durable timelines inside one root.
 #[derive(Clone, Debug, Serialize)]
 pub struct AgentSnapshot {
-    pub definition: Vec<AgentDefinition>,
     pub run: Vec<Agent>,
     pub summary: std::collections::HashMap<String, Value>,
     #[serde(skip)]
@@ -450,19 +454,6 @@ impl ExchangeAdmission {
         }
     }
 
-    fn agent(prompt: String, agent_run_id: String) -> Self {
-        Self {
-            lifecycle: None,
-            plan_event_id: None,
-            prompt,
-            kind: ExchangeKind::Chat,
-            plan_id: None,
-            execution_id: None,
-            goal_id: None,
-            agent_run_id: Some(agent_run_id),
-        }
-    }
-
     fn plan(prompt: String, plan_id: Option<String>, revision: bool) -> Self {
         Self {
             lifecycle: None,
@@ -536,6 +527,10 @@ pub struct HarnessBroker {
     clock: Box<dyn Clock>,
     exchange_runtime: Option<ExchangeRuntime>,
     agent_registry: AgentRegistry,
+    agent_coordinator: Arc<crate::agent::AgentCoordinator>,
+    pub(crate) agent_backend_factory: crate::agent::AgentBackendFactory,
+    child_backend_by_agent: HashMap<String, Arc<dyn Backend>>,
+    diagnostic_native_thread: HashSet<String>,
     child_exchange_runtime_by_agent: HashMap<String, ChildExchangeRuntime>,
     presentation: Arc<std::sync::Mutex<SessionPresentation>>,
     prompt_admission: Option<(forge_buffer::identity::DocumentId, u64)>,
@@ -717,6 +712,14 @@ impl HarnessBroker {
             store.save_owned_session(&session, &request.client_id)?;
         }
         let agent_registry = load_agent_registry(&store, &session.id)?;
+        let agent_coordinator = crate::agent::AgentCoordinator::new(session.id.clone());
+        agent_coordinator.set_enabled(shared.desired.subagent_tools.unwrap_or(false));
+        for task in store.list_agent_task(&session.id)? {
+            let agent = agent_registry.get(&task.agent_id).cloned().context("stored task has no owning child")?;
+            agent_coordinator.retain(agent, task)?;
+        }
+        let agent_backend_factory = crate::agent::AgentBackendFactory::new(request.backend.clone(), request.backend_launch_by_provider.clone(),
+            permission_coordinator.clone(), trace.clone(), data_root.clone());
         let presentation = Arc::new(std::sync::Mutex::new(SessionPresentation::new(
             session.id.clone(),
         )));
@@ -747,6 +750,10 @@ impl HarnessBroker {
             clock,
             exchange_runtime: None,
             agent_registry,
+            agent_coordinator,
+            agent_backend_factory,
+            child_backend_by_agent: HashMap::new(),
+            diagnostic_native_thread: HashSet::new(),
             child_exchange_runtime_by_agent: HashMap::new(),
             presentation,
             prompt_admission: None,
@@ -773,9 +780,15 @@ impl HarnessBroker {
         Arc::clone(&self.backend)
     }
 
+    /// Share root-owned admission without requiring the active provider's broker lock.
+    pub(crate) fn agent_coordinator(&self) -> Arc<crate::agent::AgentCoordinator> {
+        self.agent_coordinator.clone()
+    }
+
     /// Build the stable provider-catalog identity used outside serialized broker dispatch.
     pub fn backend_catalog_request(&self) -> BackendCatalogRequest {
         BackendCatalogRequest {
+            execution_owner: None,
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
             access: self.session.access.clone(),
@@ -799,6 +812,7 @@ impl HarnessBroker {
                 .ok()
         });
         Some(crate::control_tools::ControlTurnContext {
+            agent: None,
             check_shell: self.session.shell,
             mode,
             planning_feedback: mode == PromptMode::Plan
@@ -956,6 +970,7 @@ impl HarnessBroker {
             })
             .collect();
         Ok(BrokerSnapshot {
+            subagent_tools:self.agent_coordinator.enabled(),
             runtime_epoch: self.runtime_epoch.clone(),
             snapshot_revision: self.snapshot_revision.fetch_add(1, Ordering::Relaxed) + 1,
             task_operation: self.store.latest_task_operation(&self.session.id)?
@@ -989,11 +1004,6 @@ impl HarnessBroker {
             active_wait,
             prompt_history: self.store.list_prompt_history()?,
             agent: AgentSnapshot {
-                definition: if self.capability.agent.catalog {
-                    load_codex_agent_catalog(Path::new(&self.session.workspace))?
-                } else {
-                    Vec::new()
-                },
                 summary: agent_summaries(&agent_run_list, &agent_exchange_list),
                 run: agent_run_list,
                 exchange: agent_exchange_list,
@@ -1219,6 +1229,23 @@ impl HarnessBroker {
                 Ok((serde_json::to_value(self.snapshot()?.agent)?, Vec::new()))
             }
             HarnessMethod::AgentStart => self.start_agent(params).await,
+            HarnessMethod::AgentMessage | HarnessMethod::AgentFollowup | HarnessMethod::AgentInterrupt | HarnessMethod::AgentInterruptAll => {
+                let target = ||required_text(&params,"target");
+                let operation = match method {
+                    HarnessMethod::AgentMessage => crate::agent::AgentOperation::Message {target:target()?,message:required_text(&params,"message")?},
+                    HarnessMethod::AgentFollowup => crate::agent::AgentOperation::Followup {target:target()?,message:required_text(&params,"message")?},
+                    HarnessMethod::AgentInterrupt => crate::agent::AgentOperation::Interrupt {target:target()?},
+                    _ => crate::agent::AgentOperation::InterruptAll,
+                };
+                let mut event = Vec::new();
+                let result = self.handle_agent_request(crate::agent::AgentRequest {operation_id:Uuid::new_v4().to_string(),source:crate::agent::AgentSource::User,operation},None,&mut event).await?;
+                Ok((result,event))
+            }
+            HarnessMethod::AgentModels => {
+                let provider = crate::backend::BackendKind::parse(&required_text(&params,"provider")?)?;
+                let model = self.agent_backend_factory.model_list(provider,self.backend_request(BackendInput::from_text(String::new()),PromptMode::Chat)).await?;
+                Ok((serde_json::to_value(model)?,Vec::new()))
+            }
             HarnessMethod::PermissionsOpen => self.open_permission_document(),
             HarnessMethod::PermissionsSave => self.save_permission_document(params),
             HarnessMethod::SessionPermissionMode => self.select_execution_mode(params),
@@ -1626,7 +1653,14 @@ impl HarnessBroker {
                 let task = self.current_task()?;
                 let waiting = task.as_ref().is_some_and(|task| task.status == TaskStatus::Waiting);
                 let resume = action.get("resume").and_then(Value::as_bool).unwrap_or(false);
-                self.pause_task(false).await?;
+                let preserve_exchange = command == "configure" && resume && !waiting
+                    && action.get("config").and_then(Value::as_object).is_some_and(|config| {
+                        config.get("setting_fields").and_then(Value::as_array)
+                            .is_some_and(|fields| !fields.is_empty() && fields.iter().all(|field| field.as_str() == Some("subagent_tools")))
+                            || (config.contains_key("subagent_tools") && config.keys()
+                                .all(|field| matches!(field.as_str(), "subagent_tools" | "validate")))
+                    });
+                if !preserve_exchange { self.pause_task(false).await?; }
                 if command == "configure" { self.configuration_progress("applying").await?; }
                 match command.as_str() {
                     "configure" => { self.configure_session(action.get("config").cloned().context("configuration is required")?).await?; },
@@ -1657,6 +1691,10 @@ impl HarnessBroker {
                         "catalog":self.backend_catalog_request()}),
                     activity: None, summary: None, task_update: None,
                 }, &mut Vec::new()).await?;
+                if preserve_exchange {
+                    self.configuration_progress("resuming").await?;
+                    return self.resume_exchange(json!({"text":"Continue the interrupted request with the updated agent tools. Preserve completed actions and collect outstanding child results."})).await;
+                }
                 if let Some(mut task) = self.current_task()? {
                     task.permission = permission;
                     if permission.is_write_default() { task.last_write_permission = permission; }
@@ -1883,456 +1921,413 @@ impl HarnessBroker {
         }
     }
 
-    async fn start_agent(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        anyhow::ensure!(
-            self.capability.agent.spawn == crate::agent::AgentControlMode::ParentMediated,
-            "the current backend does not support spawning child agents"
-        );
-        let definition = required_text(&params, "definition")?;
-        let task = required_text(&params, "task")?;
-        anyhow::ensure!(
-            load_codex_agent_catalog(Path::new(&self.session.workspace))?
-                .iter()
-                .any(|candidate| candidate.name == definition),
-            "unknown agent definition: {definition}"
-        );
-        let run = Agent::pending(&self.session.id, &definition, &task, self.clock.now_ms());
-        self.store.save_agent_run(&run)?;
-        self.agent_registry.insert(run.clone());
-        self.agent_registry.execution_mut(&run.id).task = task.clone();
-        let prompt = format!(
-            "Call the subagent spawn tool exactly once from this parent turn. Set its agent type exactly to `{definition}` and give that child the task below. Do not spawn a default, intermediary, or coordinator agent. Wait for the selected child to finish, then synthesize its result for the user.\n\n{task}"
-        );
-        let result = self
-            .run_interaction(
-                prompt,
-                PromptMode::Chat,
-                Some(ExchangeAdmission::agent(
-                    format!("/spawn {definition} {task}"),
-                    run.id.clone(),
-                )),
-            )
-            .await;
-        let mut run = self.agent_registry.get(&run.id).cloned().unwrap_or(run);
-        if run.provider_thread_id.is_none() {
-            run.state = crate::agent::AgentState::Closed;
-            run.updated_at_ms = self.clock.now_ms();
-            self.store.save_agent_run(&run)?;
-            self.agent_registry.insert(run.clone());
-        }
-        let (_, mut event) = result?;
-        event.push(self.event(
-            "agent_updated",
-            serde_json::to_value(self.snapshot()?.agent)?,
-        )?);
-        Ok((serde_json::to_value(run)?, event))
+    async fn start_agent(&mut self, mut params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let operation_id = params.as_object_mut().and_then(|params|params.remove("operation_id"))
+            .and_then(|value|value.as_str().map(str::to_owned))
+            .or_else(||self.active_operation_id.clone()).unwrap_or_else(||Uuid::new_v4().to_string());
+        let spawn: crate::agent::SpawnAgentRequest = serde_json::from_value(params)?;
+        let request = crate::agent::AgentRequest { operation_id,
+            source: crate::agent::AgentSource::User, operation: crate::agent::AgentOperation::Spawn(spawn) };
+        let mut event = Vec::new();
+        let result = self.handle_agent_request(request, None, &mut event).await?;
+        Ok((result, event))
     }
 
-    async fn route_agent_backend_event(
-        &mut self,
-        mut parent: Option<&mut Exchange>,
-        backend_event: &BackendEvent,
-        event: &mut Vec<SessionEvent>,
-    ) -> Result<bool> {
-        let thread_id = backend_event
-            .address
-            .as_ref()
-            .map(|address| address.thread_id.as_str())
-            .or_else(|| {
-                backend_event
-                    .data
-                    .pointer("/params/threadId")
-                    .or_else(|| backend_event.data.pointer("/params/thread_id"))
-                    .or_else(|| backend_event.data.pointer("/params/turn/threadId"))
-                    .or_else(|| backend_event.data.pointer("/params/turn/thread_id"))
-                    .and_then(Value::as_str)
-            });
-        let Some(run_id) = thread_id
-            .and_then(|thread_id| self.agent_registry.get_by_thread(thread_id))
-            .map(|run| run.id.clone())
-        else {
-            return Ok(false);
+    async fn handle_agent_request(&mut self, request: crate::agent::AgentRequest, mut parent: Option<&mut Exchange>,
+        event: &mut Vec<SessionEvent>) -> Result<Value> {
+        use crate::agent::{AgentOperation, AgentSource};
+        anyhow::ensure!(request.source != AgentSource::Model || self.agent_coordinator.enabled(), "model-facing subagent tools are disabled");
+        if let Some(task) = self.store.list_agent_task(&self.session.id)?.into_iter().find(|task|task.operation_id == request.operation_id) {
+            let agent = self.agent_coordinator.resolve(&task.agent_id)?;
+            let same_work = match &request.operation {
+                AgentOperation::Spawn(spawn) => task.ordinal == 1 && agent.task_name == spawn.task_name && task.message == spawn.message
+                    && agent.selection.as_ref().is_some_and(|selection|
+                        spawn.provider.as_deref().is_none_or(|provider|provider == crate::agent::provider_name(selection.provider))
+                        && spawn.model.as_deref().is_none_or(|model|model == selection.model)
+                        && spawn.reasoning_effort.as_deref().is_none_or(|effort|effort == selection.reasoning_effort)),
+                AgentOperation::Followup {target,message} => task.ordinal > 1 && task.message == *message
+                    && self.agent_coordinator.resolve(target)?.id == agent.id,
+                _ => false,
+            };
+            anyhow::ensure!(same_work && task.source == request.source
+                && parent.as_deref().is_none_or(|parent|task.parent_exchange_id == parent.id),
+                "operation identity was reused for different child work");
+            return Ok(json!({"agent":agent,"task":task,"status":"admitted","replayed":true}));
+        }
+        match &request.operation {
+            AgentOperation::List { prefix } => {
+                let mut entry = Vec::new();
+                if prefix.as_deref().is_none_or(|prefix|"/root".starts_with(prefix)) {
+                    entry.push(json!({"agent":Agent::primary(&self.session.id, self.session.created_at_ms),"latest_task":null}));
+                }
+                entry.extend(self.agent_coordinator.snapshot(prefix.as_deref()).into_iter().map(|(agent, task)|json!({"agent":agent,"latest_task":task})));
+                return Ok(json!({"agents":entry}));
+            }
+            AgentOperation::Report { task_id } => {
+                anyhow::ensure!(request.source == AgentSource::Model, "only the authenticated root can acknowledge child results");
+                for id in task_id {
+                    let mut task = self.agent_coordinator.task(id).context("result task is not owned by this root")?;
+                    anyhow::ensure!(task.session_id == self.session.id && task.completed_at_ms.is_some(),
+                        "result acknowledgment crosses session ownership or precedes completion");
+                    task.parent_reported = true;
+                    self.store.save_agent_task(&task)?;
+                    self.agent_coordinator.retain(self.agent_coordinator.resolve(&task.agent_id)?,task)?;
+                }
+                return Ok(json!({"reported":task_id}));
+            }
+            AgentOperation::Message { target, message } => {
+                anyhow::ensure!(!message.trim().is_empty() && message.len() <= 256 * 1024, "informational message must contain 1 to 262144 bytes");
+                let mut agent = self.agent_coordinator.resolve(target)?;
+                let id = request.operation_id.clone();
+                if let Some(existing) = agent.inbox.iter().find(|message|message.id == id) {
+                    anyhow::ensure!(existing.message == *message,"operation identity was reused for a different informational message");
+                    return Ok(serde_json::to_value(existing)?);
+                }
+                let mut delivery = crate::agent::MessageDelivery::Queued;
+                if let Some(backend) = self.child_backend_by_agent.get(&agent.id)
+                    && backend.descriptor().capability.native_steer
+                    && backend.has_active_turn(&crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()}.runtime_key()).await {
+                    match backend.steer_session(&crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()}.runtime_key(), message.clone()).await {
+                        Ok(()) => delivery = crate::agent::MessageDelivery::Steered,
+                        Err(error) => self.trace.record(&self.session.id,"agent.message_queued",json!({
+                            "agent_id":agent.id,"reason":"steering_not_accepted","error":format!("{error:#}")})),
+                    }
+                }
+                let message = crate::agent::AgentMessage { id, ordinal: agent.inbox.last().map_or(1, |message|message.ordinal+1),
+                    message: message.clone(), delivery, task_id: None, created_at_ms: self.clock.now_ms() };
+                agent.inbox.push(message.clone());
+                self.store.save_agent_run(&agent)?;
+                if let Some(task) = self.agent_coordinator.snapshot(None).into_iter().find(|(candidate,_)|candidate.id == agent.id).and_then(|(_,task)|task) {
+                    self.agent_coordinator.retain(agent.clone(), task)?;
+                }
+                self.agent_registry.insert(agent);
+                return Ok(serde_json::to_value(message)?);
+            }
+            AgentOperation::Interrupt { target } => {
+                self.interrupt_managed_agent(target, event).await?;
+                return Ok(json!({"status":"interrupting","target":target}));
+            }
+            AgentOperation::InterruptAll => {
+                for (agent, _) in self.agent_coordinator.snapshot(None) { self.interrupt_managed_agent(&agent.id, event).await?; }
+                return Ok(json!({"status":"interrupting"}));
+            }
+            AgentOperation::Spawn(_) | AgentOperation::Followup { .. } => {}
+        }
+        let mut admitted_parent = if let Some(parent) = parent.as_deref() { parent.clone() }
+            else { Exchange::agent_admission(&self.session.id, self.store.next_exchange_ordinal(&self.session.id)?, "Child task admission".into(), self.clock.now_ms()) };
+        let admission = match &request.operation {
+            AgentOperation::Spawn(spawn) => {
+                let mut root = self.backend_request(BackendInput::from_text(String::new()), PromptMode::Chat);
+                if root.model == "default" && let Some(model) = &self.session.resolved_model {root.model = model.clone();}
+                let selection = self.agent_backend_factory.resolve(&root,
+                    crate::backend::BackendKind::parse(&self.session.backend)?, spawn).await?;
+                self.agent_coordinator.reserve_spawn(&request, spawn, selection, &admitted_parent.id, self.clock.now_ms())?
+            }
+            AgentOperation::Followup { target, message } => self.agent_coordinator.reserve_followup(&request, target, message, &admitted_parent.id, self.clock.now_ms())?,
+            _ => unreachable!(),
         };
-        if backend_event.kind == "usage"
-            && !self.child_exchange_runtime_by_agent.contains_key(&run_id)
-        {
-            if let Some(address) = backend_event.address.as_ref()
-                && let Some(mut exchange) = self
-                    .store
-                    .list_agent_exchange(&run_id)?
-                    .into_iter()
-                    .find(|exchange| exchange.turn.iter().any(|turn| turn.provider() == address))
-            {
-                exchange.observe_turn(backend_event, self.clock.now_ms())?;
-                self.store.save_exchange(&exchange)?;
-                self.emit_live(
-                    BackendEvent {
-            received_at_ms: None,
-                        address: None,
-                        turn_boundary: None,
-                        kind: "agent_timeline_updated".into(),
-                        text: None,
-                        data: json!({"run_id": run_id, "interaction": exchange, "active": null}),
-                        activity: None,
-                        summary: None,
-                        task_update: None,
-                    },
-                    event,
-                )
-                .await?;
-            }
-            return Ok(true);
-        }
-        let parent_agent_id = self
-            .agent_registry
-            .execution(&run_id)
-            .and_then(|execution| execution.parent_thread_id.as_deref())
-            .and_then(|thread| self.agent_registry.get_by_thread(thread))
-            .map(|agent| agent.id.clone());
-        if let Some(parent_agent_id) = parent_agent_id
-            && parent.as_ref().map(|exchange| exchange.agent_id.as_str())
-                != Some(parent_agent_id.as_str())
-        {
-            let mut owner = self
-                .child_exchange_runtime_by_agent
-                .remove(&parent_agent_id)
-                .context("nested child event has no active parent exchange")?;
-            let result = Box::pin(self.route_agent_backend_event(
-                Some(&mut owner.exchange),
-                backend_event,
-                event,
-            ))
-            .await;
-            self.child_exchange_runtime_by_agent
-                .insert(parent_agent_id, owner);
-            return result;
-        }
-        let now_ms = self.clock.now_ms();
-        if backend_event.kind == "turn_started" {
-            if let Some(address) = &backend_event.address {
-                let previous = self.store.list_agent_exchange(&run_id)?;
-                if previous.iter().any(|record| {
-                    record.turn.iter().any(|turn| {
-                        turn.provider() == address
-                            && turn.state() != crate::turn::TurnState::Running
-                    })
-                }) {
-                    return Ok(true);
-                }
-            }
-            let turn_id = backend_event
-                .address
-                .as_ref()
-                .map(|address| address.turn_id.clone())
-                .or_else(|| {
-                    backend_event
-                        .data
-                        .pointer("/params/turn/id")
-                        .and_then(Value::as_str)
-                        .map(str::to_owned)
-                });
-            if let Some(parent) = parent.as_deref_mut() {
-                let latest = parent.node_list.iter().rev().find_map(|node| match node {
-                    ExchangeNode::AgentReference { agent } if agent.child_agent_id == run_id => {
-                        Some(agent)
-                    }
-                    _ => None,
-                });
-                let needs_delegation = match latest {
-                    None => true,
-                    Some(delegation) => {
-                        self.store
-                            .list_agent_exchange(&run_id)?
-                            .iter()
-                            .any(|record| {
-                                record.id == delegation.child_exchange_id
-                                    && record.completed_at_ms.is_some()
-                            })
-                    }
-                };
-                if needs_delegation {
-                    let invocation_id = turn_id
-                        .as_deref()
-                        .context("child start requires a provider turn identity")?;
-                    let task = self
-                        .agent_registry
-                        .execution(&run_id)
-                        .map(|execution| execution.task.clone())
-                        .context("child start references an unknown agent execution")?;
-                    parent.append_delegation(&run_id, invocation_id, &task, now_ms)?;
-                    self.store.save_exchange(parent)?;
-                }
-            }
-            self.agent_registry.execution_mut(&run_id).active_turn_id = turn_id;
-            if let Some(run) = self.agent_registry.get_mut(&run_id) {
-                run.state = AgentState::Ready;
-                run.updated_at_ms = now_ms;
-                self.store.save_agent_run(run)?;
-            }
-        }
-        if backend_event.kind == "turn_completed" {
-            if let Some(address) = &backend_event.address {
-                if self
-                    .agent_registry
-                    .execution(&run_id)
-                    .and_then(|execution| execution.active_turn_id.as_deref())
-                    != Some(address.turn_id.as_str())
-                {
-                    return Ok(true);
-                }
-            }
-            if let Some(mut runtime) = self.child_exchange_runtime_by_agent.remove(&run_id) {
-                runtime.exchange.observe_turn(backend_event, now_ms)?;
-                let outcome = match backend_event.turn_boundary {
-                    Some(crate::backend::TurnBoundary::Finished { outcome }) => outcome,
-                    _ => crate::turn::TurnOutcome::Completed,
-                };
-                finish_synthetic_turn(
-                    &mut runtime.exchange,
-                    runtime.synthetic_turn.as_ref(),
-                    outcome,
-                    now_ms,
-                )?;
-                let state = match outcome {
-                    crate::turn::TurnOutcome::Completed => ExchangeState::Complete,
-                    crate::turn::TurnOutcome::Failed => ExchangeState::Failed,
-                    crate::turn::TurnOutcome::Cancelled => ExchangeState::Cancelled,
-                    crate::turn::TurnOutcome::Interrupted => ExchangeState::Interrupted,
-                };
-                runtime.exchange.finish(state, now_ms)?;
+        let persisted = (|| -> Result<()> {
+            admitted_parent.append_agent_task(&admission.task)?;
+            self.store.admit_agent_task(&admission.agent, &admission.task, &admitted_parent)
+        })();
+        if let Err(error) = persisted { self.agent_coordinator.reject(&request.operation_id); return Err(error); }
+        let launch = self.agent_coordinator.commit(&admission)?;
+        self.agent_registry.insert(admission.agent.clone());
+        if let Some(parent) = parent.as_deref_mut() { *parent = admitted_parent; }
+        else { admitted_parent.finish(ExchangeState::Complete, self.clock.now_ms())?; self.store.save_exchange(&admitted_parent)?; }
+        self.trace.record(&self.session.id,"agent.admitted",json!({"agent_id":admission.agent.id,"exchange_id":admission.task.id,"parent_exchange_id":admission.task.parent_exchange_id,"source":admission.task.source}));
+        let result = json!({"agent":admission.agent,"task":admission.task,"status":"admitted"});
+        if launch && admission.launch { self.launch_managed_agent(admission, event).await?; }
+        self.publish_agent_state(event).await?;
+        Ok(result)
+    }
+
+    async fn publish_agent_state(&mut self, event: &mut Vec<SessionEvent>) -> Result<()> {
+        let snapshot = self.snapshot()?;
+        self.emit_backend_event(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,
+            kind:"agent_updated".into(),text:None,data:serde_json::to_value(snapshot.agent)?,
+            activity:None,summary:None,task_update:None},event).await?;
+        let patch = self.presentation.lock().map_err(|_|anyhow::anyhow!("session presentation lock poisoned"))?
+            .reconcile(snapshot.timeline)?;
+        self.emit_timeline_patch(patch,event).await
+    }
+
+    async fn cancel_agent_approvals(&mut self, owner: &crate::backend::ExecutionOwner,
+        event: &mut Vec<SessionEvent>) -> Result<()> {
+        let pending = self.permission_coordinator.pending_list()?.into_iter()
+            .filter(|approval|approval.execution_owner.as_ref() == Some(owner)).collect::<Vec<_>>();
+        self.permission_coordinator.cancel_owner(owner,None).await?;
+        for approval in pending {
+            if let Some(runtime) = self.child_exchange_runtime_by_agent.get_mut(&owner.agent_id) {
+                runtime.exchange.observe_blocker(format!("approval:{}",approval.id),false,self.clock.now_ms());
                 self.store.save_exchange(&runtime.exchange)?;
             }
-            self.agent_registry.execution_mut(&run_id).active_turn_id = None;
-            if let Some(run) = self.agent_registry.get_mut(&run_id) {
-                run.updated_at_ms = now_ms;
-                self.store.save_agent_run(run)?;
-            }
-            self.emit_live(
-                BackendEvent {
-            received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "agent_updated".into(),
-                    text: None,
-                    data: serde_json::to_value(self.snapshot()?.agent)?,
-                    activity: None,
-                    summary: None,
-                    task_update: None,
-                },
-                event,
-            )
-            .await?;
-            return Ok(true);
+            self.emit_backend_event(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,
+                kind:"approval_cancelled".into(),text:None,data:serde_json::to_value(approval)?,
+                activity:None,summary:None,task_update:None},event).await?;
         }
-        let mut runtime = match self.child_exchange_runtime_by_agent.remove(&run_id) {
+        Ok(())
+    }
+
+    async fn interrupt_managed_agent(&mut self, target: &str, event: &mut Vec<SessionEvent>) -> Result<()> {
+        let agent = self.agent_coordinator.resolve(target)?;
+        let owner = crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:agent.id.clone()};
+        let cancelled = self.agent_coordinator.interrupt(target)?;
+        self.cancel_agent_approvals(&owner,event).await?;
+        for mut task in cancelled {
+            task.state = ExchangeState::Cancelled;
+            task.completed_at_ms = Some(self.clock.now_ms());
+            if let Some(mut exchange) = self.store.load_exchange(&task.id)? {
+                exchange.finish(ExchangeState::Cancelled,self.clock.now_ms())?;
+                self.store.complete_agent_task(&agent, &task, &exchange)?;
+            }
+            self.agent_coordinator.retain(agent.clone(), task)?;
+        }
+        if let Some(mut task) = self.agent_coordinator.cleanup_task(&agent.id) {
+            let backend = self.child_backend_by_agent.get(&agent.id).cloned()
+                .context("child cleanup obligation has no retained provider adapter")?;
+            tokio::time::timeout(std::time::Duration::from_secs(30),async {
+                backend.cancel_session(&owner.runtime_key()).await?;
+                backend.cleanup_execution(&owner.runtime_key()).await?;
+                backend.shutdown().await
+            }).await.context("child cleanup retry exceeded 30 seconds")??;
+            let mut agent = agent.clone();
+            agent.state = AgentState::Ready;
+            agent.updated_at_ms = self.clock.now_ms();
+            task.error = None;
+            let mut exchange = self.store.load_exchange(&task.id)?.context("child cleanup exchange missing")?;
+            exchange.finalization_error = None;
+            self.store.complete_agent_task(&agent,&task,&exchange)?;
+            self.agent_registry.insert(agent.clone());
+            self.agent_coordinator.retain(agent,task.clone())?;
+            self.agent_coordinator.settled(&owner.agent_id,&task.id,false)?;
+            self.child_backend_by_agent.remove(&owner.agent_id);
+        }
+        self.publish_agent_state(event).await?;
+        Ok(())
+    }
+
+    async fn launch_managed_agent(&mut self, mut admission: crate::agent::AgentAdmission, event: &mut Vec<SessionEvent>) -> Result<()> {
+        let owner = crate::backend::ExecutionOwner {session_id:self.session.id.clone(),agent_id:admission.agent.id.clone()};
+        let prepared = (|| -> Result<_> {
+            if let Some(selection) = admission.agent.selection.as_mut() {
+                selection.access = self.session.access.clone();
+                selection.execution_mode = self.session.execution_mode;
+            }
+            let mut message = admission.task.message.clone();
+            for incoming in admission.agent.inbox.iter_mut().filter(|message|message.delivery == crate::agent::MessageDelivery::Queued) {
+                message.push_str(&format!("\n\nAdditional information:\n{}",incoming.message));
+                incoming.delivery = crate::agent::MessageDelivery::Attached;
+                incoming.task_id = Some(admission.task.id.clone());
+            }
+            let request = self.agent_backend_factory.request(&self.backend_request(BackendInput::from_text(String::new()),PromptMode::Chat), &admission.agent,message)?;
+            let backend = self.agent_backend_factory.build(admission.agent.selection.as_ref().context("child selection missing")?.provider)?;
+            let cancellation = self.agent_coordinator.cancellation(&admission.agent.id,&admission.task.id)?;
+            self.store.save_agent_run(&admission.agent)?;
+            self.agent_registry.insert(admission.agent.clone());
+            self.agent_coordinator.retain(admission.agent.clone(),admission.task.clone())?;
+            self.child_backend_by_agent.insert(admission.agent.id.clone(),backend.clone());
+            Ok(crate::agent::AgentRuntime {backend,request,task_id:admission.task.id.clone(),cancellation,sender:self.agent_coordinator.sender()})
+        })();
+        match prepared {
+            Ok(runtime) => {
+                let sender = self.agent_coordinator.sender();
+                let task_id = admission.task.id;
+                tokio::spawn(async move {
+                    if let Err(error) = runtime.run().await {
+                        let _ = sender.send(crate::agent::AgentCommand::Completed {owner,task_id,output:Err(error),cleanup_error:Some("child event delivery or cleanup failed".into())}).await;
+                    }
+                });
+            }
+            Err(error) => self.complete_managed_agent(owner,admission.task.id,Err(error),None,event).await?,
+        }
+        Ok(())
+    }
+
+    /// Drain owned mutations through the active prompt or idle controller, never both concurrently.
+    pub(crate) async fn drain_agent_commands(&mut self, mut parent: Option<&mut Exchange>) -> Result<Vec<SessionEvent>> {
+        let mut event = Vec::new();
+        while let Some(command) = self.agent_coordinator.try_receive() {
+            match command {
+                crate::agent::AgentCommand::Request {request,authority,response} => {
+                    if response.is_closed() {continue;}
+                    let authenticated = if request.source == crate::agent::AgentSource::Model {
+                        authority.as_ref().is_some_and(|authority| !*authority.expired.borrow()
+                            && authority.owner == crate::backend::ExecutionOwner::root(&self.session.id)
+                            && parent.as_deref().is_some_and(|parent|parent.id == authority.parent_exchange_id))
+                    } else {authority.is_none()};
+                    let result = if authenticated {
+                        self.handle_agent_request(request,parent.as_deref_mut(),&mut event).await
+                    } else {Err(anyhow::anyhow!("agent request has no active authenticated root authority"))};
+                    let _ = response.send(result);
+                }
+                crate::agent::AgentCommand::Event {owner,task_id,event:backend_event} => {
+                    self.observe_managed_agent(owner,&task_id,backend_event,&mut event).await?;
+                }
+                crate::agent::AgentCommand::Completed {owner,task_id,output,cleanup_error} => {
+                    Box::pin(self.complete_managed_agent(owner,task_id,output,cleanup_error,&mut event)).await?;
+                }
+            }
+        }
+        Ok(event)
+    }
+
+    async fn observe_managed_agent(&mut self, owner: crate::backend::ExecutionOwner, task_id: &str, mut backend_event: BackendEvent,
+        event: &mut Vec<SessionEvent>) -> Result<()> {
+        anyhow::ensure!(owner.session_id == self.session.id && !owner.is_root(),"child event crosses execution ownership");
+        anyhow::ensure!(backend_event.address.as_ref().and_then(|address|address.owner.as_ref())
+            .is_none_or(|event_owner|event_owner == &owner),"child provider event has a different execution owner");
+        let mut task = self.agent_coordinator.task(task_id).context("child event has no admitted task")?;
+        anyhow::ensure!(task.agent_id == owner.agent_id,"child event has a different task owner");
+        if task.completed_at_ms.is_some() { return Ok(()); }
+        if backend_event.kind == "agent_lifecycle" {
+            self.apply_agent_lifecycle(&backend_event,Some(&task.parent_exchange_id),event).await?;
+            return Ok(());
+        }
+        if backend_event.address.as_ref().is_some_and(|address|self.diagnostic_native_thread.contains(&address.thread_id)) {
+            return Ok(());
+        }
+        let provider_thread_id = if backend_event.kind == "agent_conversation_resolved" {
+            backend_event.data["thread_id"].as_str()
+        } else { backend_event.address.as_ref().map(|address|address.thread_id.as_str()) };
+        if let Some(provider_thread_id) = provider_thread_id.filter(|id|!id.is_empty()) {
+            let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
+            if agent.provider_thread_id.as_deref() != Some(provider_thread_id) {
+                agent.provider_thread_id = Some(provider_thread_id.to_owned());
+                self.store.save_agent_run(&agent)?;
+                self.agent_registry.insert(agent.clone());
+                self.agent_coordinator.retain(agent,task.clone())?;
+            }
+        }
+        if backend_event.kind == "agent_conversation_resolved" { return Ok(()); }
+        if backend_event.kind == "runtime_resolved" {
+            let resolved: crate::backend::BackendRuntime = serde_json::from_value(backend_event.data)?;
+            let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
+            if let Some(model) = resolved.model.filter(|model|!model.is_empty())
+                && let Some(selection) = agent.selection.as_mut() {
+                selection.model = model;
+            }
+            self.store.save_agent_run(&agent)?;
+            self.agent_registry.insert(agent.clone());
+            self.agent_coordinator.retain(agent,task)?;
+            return self.publish_agent_state(event).await;
+        }
+        if backend_event.kind == "approval_requested" {
+            let id = backend_event.data["id"].as_str().context("child approval has no identity")?;
+            if !self.permission_coordinator.pending_list()?.iter().any(|approval|approval.id == id) {return Ok(());}
+        }
+        if task.state == ExchangeState::Queued {
+            task.state = ExchangeState::Running;
+            self.store.save_agent_task(&task)?;
+            self.agent_coordinator.retain(self.agent_coordinator.resolve(&owner.agent_id)?,task.clone())?;
+            self.trace.record(&self.session.id,"agent.started",json!({"agent_id":owner.agent_id,"exchange_id":task_id}));
+        }
+        anyhow::ensure!(self.child_exchange_runtime_by_agent.get(&owner.agent_id)
+            .is_none_or(|runtime|runtime.exchange.id == task_id),"late child event cannot update a newer task");
+        let mut runtime = match self.child_exchange_runtime_by_agent.remove(&owner.agent_id) {
             Some(runtime) => runtime,
             None => {
-                if backend_event.kind != "turn_started" {
-                    return Ok(true);
-                }
-                anyhow::ensure!(
-                    self.agent_registry.get(&run_id).is_some(),
-                    "child event references an unknown agent run"
-                );
-                let delegation = parent
-                    .and_then(|parent| {
-                        parent.node_list.iter().rev().find_map(|node| match node {
-                            ExchangeNode::AgentReference { agent }
-                                if agent.child_agent_id == run_id =>
-                            {
-                                Some(agent)
-                            }
-                            _ => None,
-                        })
-                    })
-                    .context("child execution has no owning delegation")?;
-                let mut interaction = self
-                    .store
-                    .list_agent_exchange(&run_id)?
-                    .into_iter()
-                    .find(|exchange| exchange.id == delegation.child_exchange_id)
-                    .context("delegation has no durable child exchange")?;
-                anyhow::ensure!(
-                    interaction.state == ExchangeState::Queued,
-                    "child execution requires its admitted queued exchange"
-                );
-                interaction.state = ExchangeState::Running;
-                interaction.resume(now_ms)?;
-                ChildExchangeRuntime {
-                    synthetic_turn: None,
-                    task: TaskTracker::default(),
-                    exchange: interaction,
-                }
+                let mut exchange = self.store.load_exchange(task_id)?.context("child task exchange missing")?;
+                if exchange.completed_at_ms.is_some() { return Ok(()); }
+                exchange.state = ExchangeState::Running;
+                exchange.resume(self.clock.now_ms())?;
+                ChildExchangeRuntime {exchange,synthetic_turn:None,task:TaskTracker::default()}
             }
         };
-        let mut canonical_event = backend_event.clone();
-        admit_addressless_turn(
-            &mut runtime.exchange,
-            &mut runtime.synthetic_turn,
-            &mut canonical_event,
-            now_ms,
-        )?;
-        if !runtime.exchange.observe_turn(&canonical_event, now_ms)? {
-            self.child_exchange_runtime_by_agent.insert(run_id, runtime);
-            return Ok(true);
+        if backend_event.kind == "approval_requested" {
+            let id = backend_event.data["id"].as_str().context("child approval has no identity")?;
+            let turn = runtime.exchange.turn.iter().rev().find(|turn|turn.state() == crate::turn::TurnState::Running);
+            let approval = self.permission_coordinator.bind_owner(id,&runtime.exchange.id,turn.map(|turn|turn.id()))?;
+            runtime.exchange.observe_blocker(format!("approval:{id}"),true,self.clock.now_ms());
+            backend_event.data = serde_json::to_value(approval)?;
+        } else if matches!(backend_event.kind.as_str(),"approval_resolved" | "approval_cancelled") {
+            if let Some(id) = backend_event.data["id"].as_str() { runtime.exchange.observe_blocker(format!("approval:{id}"),false,self.clock.now_ms()); }
+        } else if let Some(compaction) = backend_event.compaction()? {
+            runtime.exchange.observe_compaction(compaction,backend_event.observed_at_ms(self.clock.now_ms()));
+        } else {
+            admit_addressless_turn(&mut runtime.exchange,&mut runtime.synthetic_turn,&mut backend_event,self.clock.now_ms())?;
+            runtime.exchange.observe_turn(&backend_event,self.clock.now_ms())?;
+            if let Some(update) = &backend_event.task_update { runtime.task.replace(update); runtime.exchange.task = Some(runtime.task.snapshot().clone()); }
+            if backend_event.address.is_some() { attribute_provider_tool(&mut runtime.exchange,&mut runtime.task,&backend_event)?; }
         }
-        if let Some(update) = canonical_event.task_update.as_ref() {
-            runtime.task.replace(update);
-            runtime.exchange.task = Some(runtime.task.snapshot().clone());
+        if backend_event.tool_output_delta().is_some() { self.store.save_tool_output_delta(&runtime.exchange,&backend_event)?; }
+        else { self.store.save_exchange(&runtime.exchange)?; }
+        self.child_exchange_runtime_by_agent.insert(owner.agent_id,runtime);
+        if matches!(backend_event.kind.as_str(),"approval_requested" | "approval_resolved" | "approval_cancelled") {
+            self.emit_backend_event(backend_event,event).await?;
         }
-        if canonical_event.address.is_some() {
-            attribute_provider_tool(&mut runtime.exchange, &mut runtime.task, &canonical_event)?;
-        }
-        if canonical_event.tool_output_delta().is_some() {
-            self.store.save_tool_output_delta(&runtime.exchange,&canonical_event)?;
-        } else { self.store.save_exchange(&runtime.exchange)?; }
-        let incremental = if canonical_event.tool_output_delta().is_some() {
-            self.presentation.lock().map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .append_tool_output(&runtime.exchange,&canonical_event)?
-        } else if canonical_event.message_delta().is_some() {
-            self.presentation.lock().map_err(|_| anyhow::anyhow!("session presentation lock poisoned"))?
-                .update_message(&runtime.exchange,&canonical_event)?
-        } else { None };
-        if let Some(patch) = incremental {
-            self.emit_backend_event(canonical_event,event).await?;
-            self.emit_timeline_patch(patch,event).await?;
-            self.child_exchange_runtime_by_agent.insert(run_id,runtime);
-            return Ok(true);
-        }
-        self.emit_live(
-            BackendEvent {
-            received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "agent_timeline_updated".into(),
-                text: None,
-                data: json!({
-                    "run_id": run_id,
-                    "interaction": runtime.exchange,
-                    "active": null,
-                }),
-                activity: None,
-                summary: None,
-                task_update: None,
-            },
-            event,
-        )
-        .await?;
-        self.child_exchange_runtime_by_agent.insert(run_id, runtime);
-        Ok(true)
+        self.publish_agent_state(event).await?;
+        self.agent_coordinator.notify_activity();
+        Ok(())
     }
+
+    async fn complete_managed_agent(&mut self, owner: crate::backend::ExecutionOwner, task_id: String,
+        output: Result<crate::backend::BackendOutput>, cleanup_error: Option<String>, event: &mut Vec<SessionEvent>) -> Result<()> {
+        let mut task = self.agent_coordinator.task(&task_id).context("child completion has no admitted task")?;
+        anyhow::ensure!(owner.session_id == self.session.id && task.agent_id == owner.agent_id,"child completion crosses execution ownership");
+        if task.completed_at_ms.is_some() { return Ok(()); }
+        self.cancel_agent_approvals(&owner,event).await?;
+        let mut agent = self.agent_coordinator.resolve(&owner.agent_id)?;
+        let interrupted = self.agent_coordinator.cancellation(&owner.agent_id,&task_id).is_ok_and(|cancel|*cancel.borrow());
+        task.state = if interrupted {ExchangeState::Cancelled} else if output.is_err() || cleanup_error.is_some() {ExchangeState::Failed} else {ExchangeState::Complete};
+        task.error = cleanup_error.clone().or_else(||output.as_ref().err().map(|error|format!("{error:#}")));
+        task.completed_at_ms = Some(self.clock.now_ms());
+        if let Ok(output) = &output { agent.provider_thread_id = output.backend_session_id.clone().or(agent.provider_thread_id); }
+        let runtime = self.child_exchange_runtime_by_agent.remove(&owner.agent_id);
+        let mut exchange = if let Some(mut runtime) = runtime {
+            let outcome = match task.state {ExchangeState::Complete=>crate::turn::TurnOutcome::Completed,
+                ExchangeState::Cancelled=>crate::turn::TurnOutcome::Cancelled,_=>crate::turn::TurnOutcome::Failed};
+            finish_synthetic_turn(&mut runtime.exchange,runtime.synthetic_turn.as_ref(),outcome,self.clock.now_ms())?;
+            runtime.exchange
+        } else {self.store.load_exchange(&task_id)?.context("child completion exchange missing")?};
+        exchange.finish(task.state,self.clock.now_ms())?;
+        exchange.finalization_error = cleanup_error.clone();
+        if exchange.turn.is_empty() {
+            for message in agent.inbox.iter_mut().filter(|message|message.task_id.as_deref() == Some(task_id.as_str())
+                && message.delivery == crate::agent::MessageDelivery::Attached) {
+                message.delivery = crate::agent::MessageDelivery::Queued;
+                message.task_id = None;
+            }
+        }
+        let assistant_message:Vec<_> = exchange.turn.iter().flat_map(|turn|turn.messages())
+            .filter(|message|message.kind() == crate::turn::MessageKind::Assistant).collect();
+        let final_message:Vec<_> = assistant_message.iter().filter(|message|
+            message.delivery() == crate::turn::MessageDelivery::Final).collect();
+        task.final_response = Some(if final_message.is_empty() {
+            assistant_message.last().map(|message|message.text().to_owned()).unwrap_or_default()
+        } else {final_message.iter().map(|message|message.text()).collect::<Vec<_>>().join("\n\n")});
+        agent.state = if cleanup_error.is_some() {AgentState::Closing} else {AgentState::Ready};
+        agent.updated_at_ms = self.clock.now_ms();
+        self.store.complete_agent_task(&agent, &task, &exchange)?;
+        self.agent_registry.insert(agent.clone());
+        self.agent_coordinator.retain(agent.clone(),task.clone())?;
+        let next = self.agent_coordinator.settled(&owner.agent_id,&task_id,cleanup_error.is_some())?;
+        if cleanup_error.is_none() {self.child_backend_by_agent.remove(&owner.agent_id);}
+        self.trace.record(&self.session.id,"agent.completed",json!({"agent_id":owner.agent_id,"exchange_id":task_id,"state":task.state,"cleanup_error":cleanup_error}));
+        self.publish_agent_state(event).await?;
+        if let Some(next) = next {Box::pin(self.launch_managed_agent(next,event)).await?;}
+        Ok(())
+    }
+
 
     async fn apply_agent_lifecycle(
         &mut self,
         backend_event: &BackendEvent,
-        parent_exchange_id: Option<&str>,
-        event: &mut Vec<SessionEvent>,
+        _parent_exchange_id: Option<&str>,
+        _event: &mut Vec<SessionEvent>,
     ) -> Result<Option<Agent>> {
         let lifecycle: AgentLifecycleEvent = serde_json::from_value(backend_event.data.clone())?;
-        let spawn_operation = lifecycle.operation.eq_ignore_ascii_case("spawnAgent");
-        let activity_operation = lifecycle.operation.eq_ignore_ascii_case("agentActivity")
-            || lifecycle.operation.eq_ignore_ascii_case("subAgentActivity");
-        let existing_id = lifecycle
-            .provider_thread_id
-            .as_deref()
-            .and_then(|thread_id| self.agent_registry.get_by_thread(thread_id))
-            .map(|run| run.id.clone())
-            .or_else(|| {
-                if !spawn_operation && !activity_operation {
-                    return None;
-                }
-                self.agent_registry
-                    .resolve_unbound(
-                        parent_exchange_id,
-                        lifecycle.parent_thread_id.as_deref(),
-                        lifecycle.turn_id.as_deref(),
-                    )
-                    .map(|run| run.id.clone())
-            });
-        let can_create = (spawn_operation || activity_operation || lifecycle.starts_child)
-            && lifecycle.provider_thread_id.is_some();
-        if existing_id.is_none() && !can_create {
-            return Ok(None);
+        if let Some(thread) = lifecycle.provider_thread_id {
+            self.diagnostic_native_thread.insert(thread);
         }
-        let mut run = existing_id
-            .as_deref()
-            .and_then(|run_id| self.agent_registry.get(run_id))
-            .cloned()
-            .unwrap_or_else(|| {
-                Agent::pending(
-                    &self.session.id,
-                    lifecycle.definition.as_deref().unwrap_or("default"),
-                    lifecycle.task.as_deref().unwrap_or_default(),
-                    self.clock.now_ms(),
-                )
-            });
-        let parent_thread_id = lifecycle.parent_thread_id.clone();
-        let task = lifecycle.task.clone().filter(|task| !task.is_empty());
-        run.provider_thread_id = lifecycle.provider_thread_id.or(run.provider_thread_id);
-        if let Some(definition) = lifecycle.definition {
-            run.definition = definition;
-        }
-        run.nickname = lifecycle.nickname.or(run.nickname);
-        run.state = match lifecycle.status {
-            AgentExecutionState::Starting => AgentState::Starting,
-            AgentExecutionState::Closed => AgentState::Closed,
-            _ => AgentState::Ready,
-        };
-        run.updated_at_ms = self.clock.now_ms();
-        self.store.save_agent_run(&run)?;
-        self.agent_registry.insert(run.clone());
-        let execution = self.agent_registry.execution_mut(&run.id);
-        if execution.parent_exchange_id.is_none() {
-            execution.parent_exchange_id = parent_exchange_id.map(str::to_owned);
-        }
-        if execution.parent_thread_id.is_none() {
-            execution.parent_thread_id = parent_thread_id;
-        }
-        if let Some(task) = task {
-            execution.task = task;
-        }
-        let queued_outcome = match lifecycle.status {
-            AgentExecutionState::Completed => Some(ExchangeState::Complete),
-            AgentExecutionState::Failed => Some(ExchangeState::Failed),
-            AgentExecutionState::Interrupted | AgentExecutionState::Closed => {
-                Some(ExchangeState::Interrupted)
-            }
-            _ => None,
-        };
-        if let Some(outcome) = queued_outcome {
-            for mut exchange in self.store.list_agent_exchange(&run.id)? {
-                if exchange.state == ExchangeState::Queued {
-                    exchange.finish(outcome, self.clock.now_ms())?;
-                    self.store.save_exchange(&exchange)?;
-                }
-            }
-        }
-        self.emit_live(
-            BackendEvent {
-            received_at_ms: None,
-                address: None,
-                turn_boundary: None,
-                kind: "agent_updated".into(),
-                text: None,
-                data: serde_json::to_value(self.snapshot()?.agent)?,
-                activity: None,
-                summary: None,
-                task_update: None,
-            },
-            event,
-        )
-        .await?;
-        Ok(Some(run))
+        self.trace.record(&self.session.id, "agent.native_diagnostic", backend_event.data.clone());
+        Ok(None)
     }
 
     fn record_prompt_history(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
-        let text = required_text(&params, "text")?;
-        self.store
-            .record_prompt_history(&text, self.clock.now_ms())?;
-        Ok((
-            serde_json::to_value(self.store.list_prompt_history()?)?,
-            Vec::new(),
-        ))
+        let text = required_text(&params,"text")?;
+        self.store.record_prompt_history(&text,self.clock.now_ms())?;
+        Ok((serde_json::to_value(self.store.list_prompt_history()?)?,Vec::new()))
     }
 
     async fn list_backend_model(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
@@ -4319,6 +4314,96 @@ Planning continuation: turn {} of {}.",
         interaction: &mut Exchange,
         event: &mut Vec<SessionEvent>,
     ) -> Result<crate::backend::BackendOutput> {
+        let mut continuation_count = 0;
+        let mut aggregate:Option<crate::backend::BackendOutput> = None;
+        let mut continuation_result:Vec<crate::agent::AgentTask> = Vec::new();
+        loop {
+            if self.turn_cancellation.requested.load(Ordering::Acquire) {
+                return Err(anyhow::Error::new(TurnCancelled));
+            }
+            let output = self.prompt_provider_with_timeline(request.clone(),interaction,event).await?;
+            for mut task in continuation_result.drain(..) {
+                task.parent_reported = true;
+                self.store.save_agent_task(&task)?;
+                self.agent_coordinator.retain(self.agent_coordinator.resolve(&task.agent_id)?,task)?;
+            }
+            if let Some(runtime) = &mut self.exchange_runtime {
+                finish_synthetic_turn(interaction,runtime.synthetic_turn.as_ref(),crate::turn::TurnOutcome::Completed,self.clock.now_ms())?;
+                runtime.synthetic_turn = None;
+                self.store.save_exchange(interaction)?;
+            }
+            let user_decision = output.plan_question.is_some() || output.question_withdrawal.is_some()
+                || output.plan_submit.is_some() || output.control_error.is_some() || output.evidence.structured_blocked
+                || interaction.awaiting_input;
+            request.backend_session_id = output.backend_session_id.clone().or(request.backend_session_id);
+            aggregate = Some(if let Some(mut aggregate) = aggregate {
+                aggregate.event.extend(output.event.clone());
+                aggregate.backend_session_id = output.backend_session_id.clone().or(aggregate.backend_session_id);
+                aggregate.provider_checkpoint_id = output.provider_checkpoint_id.or(aggregate.provider_checkpoint_id);
+                aggregate.plan_edit.extend(output.plan_edit);
+                aggregate.design_patch.extend(output.design_patch);
+                aggregate.plan_deviation.extend(output.plan_deviation);
+                aggregate.plan_task_report.extend(output.plan_task_report);
+                aggregate.plan_read = output.plan_read.or(aggregate.plan_read);
+                aggregate.question_answer = output.question_answer.or(aggregate.question_answer);
+                aggregate.question_withdrawal = output.question_withdrawal.or(aggregate.question_withdrawal);
+                aggregate.structured_plan |= output.structured_plan;
+                aggregate.evidence.workspace_changed |= output.evidence.workspace_changed;
+                aggregate.evidence.tool_called |= output.evidence.tool_called;
+                aggregate.evidence.native_state = output.evidence.native_state.or(aggregate.evidence.native_state);
+                aggregate.evidence.structured_complete |= output.evidence.structured_complete;
+                aggregate.evidence.structured_blocked |= output.evidence.structured_blocked;
+                aggregate.metrics.context_usage = output.metrics.context_usage.or(aggregate.metrics.context_usage);
+                aggregate.metrics.native_compact_update = output.metrics.native_compact_update.or(aggregate.metrics.native_compact_update);
+                aggregate.capability = output.capability;
+                aggregate.runtime = output.runtime.clone();
+                aggregate.plan_question = output.plan_question;
+                aggregate.plan_submit = output.plan_submit;
+                aggregate.control_error = output.control_error;
+                aggregate
+            } else {output});
+            if user_decision {break;}
+            let mut revision = self.agent_coordinator.subscribe();
+            let mut continuation_input = None;
+            while self.agent_coordinator.has_unresolved_task(&interaction.id) {
+                if self.turn_cancellation.requested.load(Ordering::Acquire) {
+                    return Err(anyhow::Error::new(TurnCancelled));
+                }
+                event.extend(self.drain_agent_commands(Some(interaction)).await?);
+                let result = self.agent_coordinator.pending_result(&interaction.id);
+                if !result.is_empty() {
+                    anyhow::ensure!(continuation_count < self.goal_max_turns,"child-result continuation reached the session turn limit");
+                    continuation_count += 1;
+                    let input = format!("Continue this same request using the following Harness-owned child results. Each result retains its child identity, task, outcome, and response. The full transcripts remain separate. Synthesize the results and complete the original request when its required work is settled.\n\n{}",
+                        serde_json::to_string(&result)?);
+                    continuation_result = result;
+                    continuation_input = Some(BackendInput::from_text(input));
+                    self.trace.record(&self.session.id,"agent.parent_continuation",json!({"agent_id":self.session.primary_agent_id,"exchange_id":interaction.id,"turn":continuation_count}));
+                    break;
+                }
+                if !self.agent_coordinator.has_unresolved_task(&interaction.id) {break;}
+                tokio::select! {
+                    biased;
+                    _ = self.turn_cancellation.cancelled() => return Err(anyhow::Error::new(TurnCancelled)),
+                    changed = revision.changed() => {changed.context("agent coordinator closed while parent awaits results")?;}
+                }
+            }
+            if let Some(input) = continuation_input {request.input = input;} else {break;}
+        }
+        aggregate.context("provider returned no parent output")
+    }
+
+    async fn prompt_provider_with_timeline(
+        &mut self,
+        mut request: BackendRequest,
+        interaction: &mut Exchange,
+        event: &mut Vec<SessionEvent>,
+    ) -> Result<crate::backend::BackendOutput> {
+        let (agent_scope, _agent_lease) = crate::agent::AgentToolScope::new(crate::backend::ExecutionOwner::root(&self.session.id),
+            interaction.id.clone(),self.agent_coordinator.clone())?;
+        if let Some(context) = &mut request.control_context {context.agent = Some(agent_scope);}
+        let mut agent_revision = self.agent_coordinator.subscribe();
+        event.extend(self.drain_agent_commands(Some(interaction)).await?);
         let mut runtime = self
             .exchange_runtime
             .take()
@@ -4327,6 +4412,7 @@ Planning continuation: turn {} of {}.",
         let cancellation = Arc::clone(&self.turn_cancellation);
         let mut cleanup = cancellation.cleanup.subscribe();
         let (backend_event_sink, mut backend_event_stream) = crate::backend::events::channel();
+        let backend_event_sink = backend_event_sink.owned(request.owner()?);
         let (execution_sender, mut execution_receiver) = tokio::sync::mpsc::channel::<crate::plan::execution::ExecutionControl>(1);
         let execution = self.store.list_plan_execution(&self.session.id)?.into_iter()
             .find(|execution| Some(execution.goal_id.as_str()) == self.session.goal_id.as_deref() && execution.state == PlanExecutionState::Active);
@@ -4353,6 +4439,10 @@ Planning continuation: turn {} of {}.",
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => break Err(anyhow::Error::new(TurnCancelled)),
+                    changed = agent_revision.changed() => {
+                        changed.context("agent coordinator closed during root execution")?;
+                        event.extend(self.drain_agent_commands(Some(interaction)).await?);
+                    }
                     control = execution_receiver.recv() => {
                         if let Some(control) = control {
                             while let Ok(backend_event) = backend_event_stream.try_recv() {
@@ -4512,7 +4602,7 @@ Planning continuation: turn {} of {}.",
         if outcome.is_err()
             && let Err(error) = self
                 .permission_coordinator
-                .cancel_all(self.event_sink.as_ref())
+                .cancel_owner(&crate::backend::ExecutionOwner::root(&self.session.id), self.event_sink.as_ref())
                 .await
         {
             outcome = Err(error).context("clear pending approval requests");
@@ -4721,6 +4811,17 @@ Planning continuation: turn {} of {}.",
         mut backend_event: BackendEvent,
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
+        if backend_event.address.as_ref().and_then(|address| address.owner.as_ref())
+            .is_some_and(|owner| owner != &crate::backend::ExecutionOwner::root(&self.session.id)) {
+            self.trace.record(&self.session.id,"provider.event.rejected",json!({
+                "event_type":backend_event.kind,"code":"foreign_execution_owner",
+            }));
+            return Ok(());
+        }
+        if backend_event.kind == "error" {
+            self.emit_backend_event(backend_event,event).await?;
+            return Ok(());
+        }
         if backend_event.kind == "runtime_resolved" {
             let resolved: crate::backend::BackendRuntime =
                 serde_json::from_value(backend_event.data.clone())?;
@@ -4804,7 +4905,15 @@ Planning continuation: turn {} of {}.",
             }));
         }
         if backend_event.kind == "approval_requested" {
-            let owner = if let Some(address) = backend_event.address.as_ref() {
+            let execution_owner = backend_event.address.as_ref().and_then(|address|address.owner.as_ref());
+            if let Some(owner) = execution_owner {
+                anyhow::ensure!(owner.session_id == self.session.id, "approval crosses session ownership");
+            }
+            let owner = if let Some(execution_owner) = execution_owner {
+                if execution_owner.is_root() { &mut *interaction }
+                else { &mut self.child_exchange_runtime_by_agent.get_mut(&execution_owner.agent_id)
+                    .context("approval refers to an inactive child execution")?.exchange }
+            } else if let Some(address) = backend_event.address.as_ref() {
                 if interaction
                     .turn
                     .iter()
@@ -4833,7 +4942,9 @@ Planning continuation: turn {} of {}.",
                     && backend_event
                         .address
                         .as_ref()
-                        .is_none_or(|address| turn.provider() == address)
+                        .is_none_or(|address| turn.provider() == address
+                            || (execution_owner.is_some() && address.turn_id.is_empty()
+                                && turn.provider().thread_id == address.thread_id))
             });
             let id = backend_event
                 .data
@@ -4914,95 +5025,16 @@ Planning continuation: turn {} of {}.",
             return Ok(());
         }
         if backend_event.kind == "agent_lifecycle" {
-            runtime.retraction_eligible = false;
-            let lifecycle: AgentLifecycleEvent =
-                serde_json::from_value(backend_event.data.clone())?;
-            let parent_agent_id = lifecycle
-                .parent_thread_id
-                .as_deref()
-                .and_then(|thread| self.agent_registry.get_by_thread(thread))
-                .filter(|agent| !agent.is_primary())
-                .map(|agent| agent.id.clone());
-            if lifecycle.starts_child
-                && let Some(parent_agent_id) = parent_agent_id
-            {
-                let mut owner = self
-                    .child_exchange_runtime_by_agent
-                    .remove(&parent_agent_id)
-                    .context("nested delegation has no active parent exchange")?;
-                let result: Result<()> = async {
-                    if let Some(child) = self
-                        .apply_agent_lifecycle(&backend_event, Some(&owner.exchange.id), event)
-                        .await?
-                    {
-                        let task = self
-                            .agent_registry
-                            .execution(&child.id)
-                            .map(|execution| execution.task.clone())
-                            .unwrap_or_default();
-                        owner.exchange.append_delegation(
-                            &child.id,
-                            "spawn",
-                            &task,
-                            self.clock.now_ms(),
-                        )?;
-                        self.store.save_exchange(&owner.exchange)?;
-                    }
-                    Ok(())
-                }
-                .await;
-                self.child_exchange_runtime_by_agent
-                    .insert(parent_agent_id, owner);
-                result?;
-                return Ok(());
-            }
-            if lifecycle.starts_child {
-                let now_ms = self.clock.now_ms();
-                if let Some(run) = self
-                    .apply_agent_lifecycle(&backend_event, Some(&interaction.id), event)
-                    .await?
-                {
-                    let task = self
-                        .agent_registry
-                        .execution(&run.id)
-                        .map(|execution| execution.task.clone())
-                        .unwrap_or_default();
-                    let appended =
-                        interaction.append_delegation(&run.id, "spawn", &task, now_ms)?;
-                    if appended {
-                        self.store.save_exchange(interaction)?;
-                        self.emit_live_interaction(
-                            BackendEvent {
-            received_at_ms: None,
-                                address: None,
-                                turn_boundary: None,
-                                kind: "timeline_node_updated".into(),
-                                text: None,
-                                data: json!({
-                                    "exchange_id": interaction.id,
-                                    "node": interaction.node_list.last(),
-                                }),
-                                activity: None,
-                                summary: None,
-                                task_update: None,
-                            },
-                            interaction,
-                            event,
-                        )
-                        .await?;
-                    }
-                }
-            } else {
-                self.apply_agent_lifecycle(&backend_event, Some(&interaction.id), event)
-                    .await?;
-            }
+            self.apply_agent_lifecycle(&backend_event, Some(&interaction.id), event).await?;
             return Ok(());
         }
-        if self
-            .route_agent_backend_event(Some(interaction), &backend_event, event)
-            .await?
-        {
-            runtime.retraction_eligible = false;
+        if backend_event.address.as_ref().is_some_and(|address|
+            address.owner.as_ref().is_some_and(|owner| owner != &crate::backend::ExecutionOwner::root(&self.session.id))
+                || self.diagnostic_native_thread.contains(&address.thread_id)
+                || self.agent_registry.get_by_thread(&address.thread_id).is_some_and(|agent| !agent.is_primary())) {
+            self.trace.record(&self.session.id,"provider.event.rejected",json!({
+                "event_type":backend_event.kind,"code":"foreign_or_native_child_execution",
+            }));
             return Ok(());
         }
         if self.route_settled_parent_event(interaction, &backend_event, event).await? {
@@ -6677,6 +6709,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn prepare_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        anyhow::ensure!(self.agent_coordinator.active_count() == 0,
+            "child execution must settle before workspace rollback");
         let exchange_id = required_text(&params, "exchange_id")?;
         let exchange_id = self
             .store
@@ -6766,6 +6800,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     async fn apply_rollback(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        anyhow::ensure!(self.agent_coordinator.active_count() == 0,
+            "child execution must settle before workspace rollback");
         let preview_id = required_text(&params, "preview_id")?;
         let objects = self.store.objects.clone();
         let session_id = self.session.id.clone();
@@ -7005,7 +7041,6 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             exchange: interaction,
             timeline,
             agent: AgentSnapshot {
-                definition: Vec::new(),
                 summary: agent_summaries(&agent_run_list, &agent_exchange_list),
                 run: agent_run_list,
                 exchange: agent_exchange_list,
@@ -7279,9 +7314,12 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         configured.plan_executor = plan_executor;
         configured.plan_compact = plan_compact;
         if let Some(enabled) = params.get("plan_auto_approve_revisions").and_then(Value::as_bool) { configured.plan_auto_approve_revisions = enabled; }
+        let subagent_tools = params.get("subagent_tools").and_then(Value::as_bool);
+        let delegation_registry_changed = subagent_tools.is_some_and(|enabled|enabled != self.agent_coordinator.enabled());
         if let Some(access) = access { configured.access = access; }
         if let Some(selection) = resource_selection {
             self.backend.reconcile_settings(BackendCatalogRequest {
+                execution_owner: None,
                 harness_session_id:configured.id.clone(),workspace:configured.workspace.clone(),
                 access:configured.access.clone(),execution_mode:configured.execution_mode,
                 backend_session_id:configured.backend_session_id.clone(),
@@ -7304,11 +7342,16 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             if params.get("plan_permission").is_some() { portable.plan_permission = self.session.plan_permission; changed = true; }
             if params.get("plan_compact").is_some() { portable.plan_compact = Some(self.session.plan_compact); changed = true; }
             if params.get("plan_auto_approve_revisions").is_some() { portable.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions); changed = true; }
+            if let Some(enabled) = subagent_tools {portable.subagent_tools = Some(enabled);changed = true;}
             let revision = if changed { settings.update(snapshot.revision,crate::settings::SettingScope::Global,&self.session.workspace,&self.session.id,&portable)? } else { snapshot.revision };
             if update_model_preference || params.get("service_tier").is_some() || params.get("plan_executor_enabled").is_some() {
                 settings.save_provider(revision,&self.session.backend,&json!({"model":self.session.model,"effort":self.session.effort,
                     "context_window":self.session.context_window,"service_tier":self.session.service_tier,"plan_executor":self.session.plan_executor}))?;
             }
+        }
+        if let Some(enabled) = subagent_tools {self.agent_coordinator.set_enabled(enabled);}
+        if delegation_registry_changed && params.get("settings_revision").is_none() {
+            self.backend.cleanup_execution(&self.session.id).await?;
         }
         Ok((
             serde_json::to_value(&self.session)?,
@@ -7510,6 +7553,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
 
     fn backend_request(&self, input: BackendInput, mode: PromptMode) -> BackendRequest {
         BackendRequest {
+            execution_owner: None,
             harness_session_id: self.session.id.clone(),
             workspace: self.session.workspace.clone(),
             input,
@@ -7660,6 +7704,7 @@ fn admit_addressless_turn(
     }
     let address = synthetic_turn
         .get_or_insert_with(|| crate::backend::ProviderAddress {
+            owner: None,
             thread_id: format!("harness:{}", exchange.agent_id),
             turn_id: format!("{}:provider:{}", exchange.id, exchange.turn.len() + 1),
         })
@@ -7809,6 +7854,108 @@ fn default_goal_max_turns() -> u32 {
 
 #[cfg(test)]
 mod test {
+    use crate::agent::AgentExecutionState;
+    include!("agent_test.rs");
+    async fn settle_managed_children(broker: &mut HarnessBroker) -> Result<Vec<SessionEvent>> {
+        let mut revision = broker.agent_coordinator.subscribe();
+        let mut event = Vec::new();
+        tokio::time::timeout(std::time::Duration::from_secs(5),async {
+            loop {
+                event.extend(broker.drain_agent_commands(None).await?);
+                if broker.agent_coordinator.active_count() == 0 {return Ok::<_,anyhow::Error>(());}
+                revision.changed().await.context("child lane closed")?;
+            }
+        }).await.context("managed child did not settle within five seconds")??;
+        Ok(event)
+    }
+
+    #[tokio::test]
+    async fn manual_child_admission_streams_and_followup_reuses_only_child_history() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(),data.path(),false);
+        broker.session.backend_session_id = Some("root-history".into());
+        assert!(!broker.agent_coordinator.enabled());
+        let (admitted,_) = broker.start_agent(json!({"task_name":"review","message":"CHILD_FIRST"})).await?;
+        let agent_id = admitted["agent"]["id"].as_str().context("admission has no child identity")?.to_owned();
+        assert_eq!(admitted["status"],"admitted");
+        let event = settle_managed_children(&mut broker).await?;
+        assert!(event.iter().any(|event|event.event == "document_changed" || event.payload["kind"] == "document_changed"),
+            "child events did not update the shared document: {:?}",event.iter().map(|event|(&event.event,&event.payload["kind"])).collect::<Vec<_>>());
+        let child = broker.agent_coordinator.resolve(&agent_id)?;
+        assert!(child.provider_thread_id.is_some());
+        assert_ne!(child.provider_thread_id.as_deref(),Some("root-history"));
+        assert_eq!(broker.session.backend_session_id.as_deref(),Some("root-history"));
+        let exchange = broker.store.list_agent_exchange(&agent_id)?;
+        assert_eq!(exchange.len(),1);
+        assert_eq!(exchange[0].state,ExchangeState::Complete);
+        assert!(exchange[0].turn.iter().flat_map(|turn|turn.messages()).any(|message|message.text().contains("CHILD_FIRST")));
+        let sender = broker.agent_coordinator.sender();
+        let request = crate::agent::AgentRequest {operation_id:"followup".into(),source:crate::agent::AgentSource::User,
+            operation:crate::agent::AgentOperation::Followup {target:agent_id.clone(),message:"CHILD_SECOND".into()}};
+        let response = tokio::spawn(async move {sender.request(request).await});
+        tokio::task::yield_now().await;
+        broker.drain_agent_commands(None).await?;
+        assert_eq!(response.await??["agent"]["id"],agent_id);
+        settle_managed_children(&mut broker).await?;
+        let exchange = broker.store.list_agent_exchange(&agent_id)?;
+        assert_eq!(exchange.len(),2);
+        assert!(exchange.iter().all(|exchange|exchange.state == ExchangeState::Complete));
+        assert_eq!(broker.agent_coordinator.snapshot(None).len(),1);
+        assert_eq!(broker.store.list_agent_task(&broker.session.id)?.len(),2);
+        Ok(())
+    }
+
+    struct DelegatingRootBackend {turn:AtomicU64}
+
+    #[async_trait::async_trait]
+    impl Backend for DelegatingRootBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {crate::backend::BackendDescriptor {kind:crate::backend::BackendKind::Mock,
+            label:"Mock".into(),capability:crate::backend::mock_capability()}}
+        async fn shutdown(&self) -> Result<()> {Ok(())}
+        async fn has_active_turn(&self,_session_id:&str) -> bool {true}
+        async fn cancel_session(&self,_session_id:&str) -> Result<()> {Ok(())}
+        async fn cleanup_execution(&self,_session_id:&str) -> Result<()> {Ok(())}
+        async fn active_session_id_for(&self,_session_id:&str) -> Option<String> {Some("parent-history".into())}
+        async fn prompt_stream(&self,request:BackendRequest,sink:Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+            let turn = self.turn.fetch_add(1,Ordering::AcqRel);
+            if turn == 0 {
+                let scope = request.control_context.as_ref().and_then(|context|context.agent.as_ref()).context("root has no authenticated agent lane")?;
+                let response = scope.invoke("harness_spawn_agent",json!({"task_name":"child","message":"CHILD_RESULT"})).await?;
+                assert!(response.contains("admitted"));
+            } else {
+                anyhow::ensure!(turn == 1,"parent continuation duplicated");
+                anyhow::ensure!(request.backend_session_id.as_deref() == Some("parent-history"),"parent lost its conversation");
+                anyhow::ensure!(matches!(&request.input,BackendInput::Text {text} if text.contains("CHILD_RESULT") && text.contains("final_response")),"parent continuation omitted child result");
+            }
+            if let Some(sink) = sink {sink.send_wait(BackendEvent {received_at_ms:None,address:None,turn_boundary:None,kind:"assistant_message".into(),
+                text:Some(if turn == 0 {"Waiting for child"} else {"SYNTHESIZED_RESULT"}.into()),data:Value::Null,activity:None,summary:None,task_update:None}).await?;}
+            Ok(crate::backend::BackendOutput {backend_session_id:Some("parent-history".into()),capability:self.descriptor().capability,..Default::default()})
+        }
+    }
+
+    #[tokio::test]
+    async fn model_child_completes_through_the_active_root_lane_and_continues_the_same_exchange() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(),data.path(),false);
+        let backend = Arc::new(DelegatingRootBackend {turn:AtomicU64::new(0)});
+        broker.backend = backend.clone();
+        broker.agent_coordinator.set_enabled(true);
+        tokio::time::timeout(std::time::Duration::from_secs(5),broker.run_interaction("Root request".into(),PromptMode::Chat,
+            Some(ExchangeAdmission::chat("Root request".into())))).await??;
+        assert_eq!(backend.turn.load(Ordering::Acquire),2);
+        let exchange = broker.store.list_exchange(&broker.session.id)?;
+        assert_eq!(exchange.len(),1);
+        assert_eq!(exchange[0].state,ExchangeState::Complete);
+        assert!(exchange[0].turn.iter().flat_map(|turn|turn.messages()).any(|message|message.text().contains("SYNTHESIZED_RESULT")));
+        let task = broker.store.list_agent_task(&broker.session.id)?;
+        assert_eq!(task.len(),1);
+        assert!(task[0].parent_reported);
+        assert_eq!(task[0].parent_exchange_id,exchange[0].id);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn access_configuration_is_atomic_persistent_and_independent_of_approvals() {
         let repository = repository();
@@ -8186,6 +8333,7 @@ mod test {
         std::fs::write(repository.path().join("lib.rs"),"pub struct Existing;\n").unwrap();
         let data = tempfile::tempdir().unwrap();
         let initialize = InitializeRequest {
+            backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root:data.path().to_string_lossy().into_owned(),permission_file:None,
             workspace:repository.path().to_string_lossy().into_owned(),client_id:"design-test".into(),
@@ -8238,6 +8386,7 @@ mod test {
         broker.pause_goal().await.unwrap();
         assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Checking);
         let mut resumed = InitializeRequest {
+            backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
             workspace:repository.path().to_string_lossy().into_owned(), client_id:"design-test".into(),
@@ -8422,6 +8571,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(InitializeRequest {
+            backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
             workspace:repository.path().to_string_lossy().into_owned(), client_id:"guard-test".into(),
@@ -8521,7 +8671,8 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
                 workspace:repository.path().to_string_lossy().into_owned(), client_id:"revision-test".into(),
                 backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:None, new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
@@ -8722,6 +8873,7 @@ mod test {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
             let address = crate::backend::ProviderAddress {
+                owner: None,
                 thread_id: "semantic-execution".into(), turn_id: format!("phase-{turn}"),
             };
             sink.as_ref().unwrap().send_wait(BackendEvent {
@@ -8950,7 +9102,8 @@ mod test {
             let data = tempfile::tempdir().unwrap();
             let mut broker = HarnessBroker::initialize_with_clock(
                 InitializeRequest {
-                    config_dir: None,
+                    backend_launch_by_provider: Default::default(),
+            config_dir: None,
                     data_root: data.path().to_string_lossy().into_owned(),
                     permission_file: None,
                     workspace: repository.path().to_string_lossy().into_owned(),
@@ -9004,7 +9157,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -9118,6 +9272,7 @@ mod test {
             let mut event = BackendEvent {
             received_at_ms: None,
                 address: Some(crate::backend::ProviderAddress {
+                    owner: None,
                     thread_id: "restart-thread".into(),
                     turn_id: format!("turn-{invocation}"),
                 }),
@@ -10627,7 +10782,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
@@ -10666,7 +10822,8 @@ mod test {
         drop(broker);
         let next = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
@@ -10790,7 +10947,8 @@ mod test {
     ) -> HarnessBroker {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data_root.to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.to_string_lossy().into_owned(),
@@ -10863,7 +11021,7 @@ mod test {
     }
 
     #[tokio::test]
-    async fn explicit_native_spawn_flags_create_durable_agent_identity() {
+    async fn explicit_native_spawn_flags_cannot_create_durable_agent_identity() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -10878,18 +11036,16 @@ mod test {
         let spawned = broker.apply_agent_lifecycle(&BackendEvent { received_at_ms:None,
             address:None, turn_boundary:None, kind:"agent_lifecycle".into(), text:None,
             data:serde_json::to_value(lifecycle).unwrap(), activity:None, summary:None, task_update:None },
-            Some("parent-exchange"), &mut events).await.unwrap().unwrap();
+            Some("parent-exchange"), &mut events).await.unwrap();
         let saved = broker.store.list_agent_run(&broker.session.id).unwrap();
         let child = saved.iter().filter(|agent| !agent.is_primary()).collect::<Vec<_>>();
-        assert_eq!(child.len(), 1);
-        assert_eq!(child[0].id, spawned.id);
-        assert_eq!(child[0].provider_thread_id.as_deref(), Some("native-child"));
-        assert_eq!(broker.agent_registry.execution(&spawned.id).unwrap().parent_exchange_id.as_deref(), Some("parent-exchange"));
-        assert!(!events.is_empty());
+        assert!(spawned.is_none());
+        assert!(child.is_empty());
+        assert!(events.is_empty());
     }
 
     #[tokio::test]
-    async fn subagent_activity_binds_the_pending_explicit_run() {
+    async fn native_subagent_activity_cannot_bind_a_managed_identity() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
@@ -10943,59 +11099,9 @@ mod test {
                 .and_then(|execution| execution.parent_exchange_id.as_deref()),
             Some("parent-interaction")
         );
-        assert_eq!(
-            run_list[0].provider_thread_id.as_deref(),
-            Some("child-thread")
-        );
+        assert!(run_list[0].provider_thread_id.is_none());
     }
 
-    #[tokio::test]
-    async fn child_turn_completion_preserves_history_without_accepting_input() {
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let mut run = Agent::pending(&broker.session.id, "explorer", "inspect Bevy", 100);
-        run.provider_thread_id = Some("child-thread".into());
-        run.state = AgentState::Ready;
-        broker.store.save_agent_run(&run).unwrap();
-        broker.agent_registry.insert(run.clone());
-        let mut event = Vec::new();
-
-        let routed = broker
-            .route_agent_backend_event(
-                None,
-                &BackendEvent {
-            received_at_ms: None,
-                    address: None,
-                    turn_boundary: None,
-                    kind: "turn_completed".into(),
-                    text: None,
-                    data: json!({
-                        "params": {
-                            "threadId": "child-thread",
-                            "turn": { "id": "child-turn", "status": "completed" }
-                        }
-                    }),
-                    activity: None,
-                    summary: None,
-                    task_update: None,
-                },
-                &mut event,
-            )
-            .await
-            .unwrap();
-
-        let completed = broker.agent_registry.get(&run.id).unwrap();
-        assert!(routed);
-        assert_eq!(completed.state, AgentState::Ready);
-        assert!(
-            broker
-                .agent_registry
-                .execution(&run.id)
-                .and_then(|execution| execution.active_turn_id.as_deref())
-                .is_none()
-        );
-    }
 
     #[tokio::test]
     async fn publishes_and_persists_resolved_model_before_provider_turn_starts() {
@@ -11056,6 +11162,7 @@ mod test {
         let mut provider = BackendEvent {
             received_at_ms: None,
             address: Some(ProviderAddress {
+                owner: None,
                 thread_id: "parent".into(),
                 turn_id: "native".into(),
             }),
@@ -11122,7 +11229,7 @@ mod test {
             BackendEvent::from_compaction(unrelated, None), &mut events).await.unwrap();
         assert_eq!(exchange.node_list.len(), 3);
         broker.process_backend_event(&mut runtime, &mut exchange, BackendEvent {
-            received_at_ms: Some(300), address: Some(ProviderAddress { thread_id:"parent".into(), turn_id:"native".into() }),
+            received_at_ms: Some(300), address: Some(ProviderAddress { owner: None, thread_id:"parent".into(), turn_id:"native".into() }),
             turn_boundary: Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Interrupted }),
             kind:"turn_completed".into(), text:None, data:Value::Null, activity:None, summary:None, task_update:None,
         }, &mut events).await.unwrap();
@@ -11266,352 +11373,8 @@ mod test {
         );
     }
 
-    #[tokio::test]
-    async fn late_child_usage_updates_only_its_settled_owner_and_deduplicates_replay() {
-        use crate::backend::ProviderAddress;
-        use crate::backend::usage::{TokenUsage, UsageUpdate};
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let mut child = Agent::pending(&broker.session.id, "explorer", "inspect", 1);
-        child.provider_thread_id = Some("child-thread".into());
-        broker.store.save_agent_run(&child).unwrap();
-        broker.agent_registry.insert(child.clone());
-        let address = ProviderAddress {
-            thread_id: "child-thread".into(),
-            turn_id: "child-turn".into(),
-        };
-        let mut child_exchange =
-            completed_interaction("child-exchange", &broker.session.id, Vec::new());
-        child_exchange.agent_id = child.id.clone();
-        child_exchange.state = ExchangeState::Running;
-        child_exchange.completed_at_ms = None;
-        child_exchange.resume(1000).unwrap();
-        child_exchange.start_turn(address.clone(), 1000).unwrap();
-        child_exchange.turn[0]
-            .finish(crate::turn::TurnOutcome::Completed, 2000)
-            .unwrap();
-        child_exchange
-            .finish(ExchangeState::Complete, 2000)
-            .unwrap();
-        broker.store.save_exchange(&child_exchange).unwrap();
-        let mut parent = completed_interaction("parent", &broker.session.id, Vec::new());
-        let parent_before = serde_json::to_value(&parent).unwrap();
-        let event = BackendEvent {
-            received_at_ms: None,
-            address: Some(address),
-            turn_boundary: None,
-            kind: "usage".into(),
-            text: None,
-            data: serde_json::to_value(UsageUpdate {
-                id: "call".into(),
-                usage: TokenUsage {
-                    input: Some(1000),
-                    cached_input: Some(900),
-                    reasoning: Some(100),
-                    output: Some(200),
-                },
-                cumulative: None,
-                cumulative_total: None,
-            })
-            .unwrap(),
-            activity: None,
-            summary: None,
-            task_update: None,
-        };
-        let mut emitted = Vec::new();
-        for _ in 0..2 {
-            assert!(
-                broker
-                    .route_agent_backend_event(Some(&mut parent), &event, &mut emitted)
-                    .await
-                    .unwrap()
-            );
-        }
-        assert_eq!(serde_json::to_value(parent).unwrap(), parent_before);
-        let stored = broker
-            .store
-            .list_agent_exchange(&child.id)
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(stored.usage().input, Some(1000));
-        assert_eq!(stored.state, ExchangeState::Complete);
-        assert_eq!(stored.duration_ms, child_exchange.duration_ms);
-        assert_eq!(stored.completed_at_ms, child_exchange.completed_at_ms);
-        assert!(
-            !broker
-                .child_exchange_runtime_by_agent
-                .contains_key(&child.id)
-        );
-        drop(broker);
-        let store = SqliteStore::open(data.path()).unwrap();
-        let mut reloaded = store.list_agent_exchange(&child.id).unwrap().pop().unwrap();
-        let retained = serde_json::to_value(&stored).unwrap();
-        assert_eq!(serde_json::to_value(&reloaded).unwrap(), retained);
-        reloaded.observe_turn(&event, 90_000).unwrap();
-        assert_eq!(serde_json::to_value(&reloaded).unwrap(), retained);
-        let rendered = crate::buffer::projection::project(
-            &TimelineEntry::Exchange {
-                id: reloaded.id.clone(),
-                created_at_ms: reloaded.created_at_ms,
-                exchange: reloaded,
-                agent_by_id: std::collections::HashMap::new(),
-            },
-            &forge_buffer::width::WidthProfile::default(),
-            false,
-            &std::collections::HashMap::new(),
-            &std::collections::HashMap::new(),
-        )
-        .unwrap();
-        let summary = rendered
-            .entry
-            .block
-            .iter()
-            .find(|block| block.id.0 == "child-exchange:summary")
-            .unwrap();
-        assert_eq!(
-            summary.text.wire_rows().join("").split_whitespace().collect::<Vec<_>>().join(" "),
-            "● Thought 1s │ Tokens 1.0k (90%) -> 200 · 200 tps"
-        );
-    }
 
-    #[tokio::test]
-    async fn nested_child_start_uses_its_parent_exchange_delegation() {
-        use crate::backend::{ProviderAddress, TurnBoundary};
-        let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let mut broker = planning_question_broker(repository.path(), data.path(), false);
-        let mut child = Agent::pending(&broker.session.id, "explorer", "inspect", 1);
-        child.provider_thread_id = Some("child-thread".into());
-        let mut grandchild = Agent::pending(&broker.session.id, "reviewer", "review", 2);
-        grandchild.provider_thread_id = Some("grandchild-thread".into());
-        for agent in [&child, &grandchild] {
-            broker.store.save_agent_run(agent).unwrap();
-            broker.agent_registry.insert(agent.clone());
-        }
-        broker
-            .agent_registry
-            .execution_mut(&grandchild.id)
-            .parent_thread_id = child.provider_thread_id.clone();
-        broker.agent_registry.execution_mut(&child.id).task = "inspect".into();
-        broker.agent_registry.execution_mut(&grandchild.id).task = "review".into();
-        let mut primary = completed_interaction("primary", &broker.session.id, Vec::new());
-        primary.state = ExchangeState::Running;
-        primary.completed_at_ms = None;
-        let mut event = BackendEvent {
-            received_at_ms: None,
-            address: Some(ProviderAddress {
-                thread_id: "child-thread".into(),
-                turn_id: "child-turn".into(),
-            }),
-            turn_boundary: Some(TurnBoundary::Started),
-            kind: "turn_started".into(),
-            text: None,
-            data: json!({}),
-            activity: None,
-            summary: None,
-            task_update: None,
-        };
-        let mut emitted = Vec::new();
-        broker
-            .route_agent_backend_event(Some(&mut primary), &event, &mut emitted)
-            .await
-            .unwrap();
-        let primary_before = serde_json::to_value(&primary).unwrap();
-        event.address = Some(ProviderAddress {
-            thread_id: "grandchild-thread".into(),
-            turn_id: "grandchild-turn".into(),
-        });
-        broker
-            .route_agent_backend_event(Some(&mut primary), &event, &mut emitted)
-            .await
-            .unwrap();
-        assert_eq!(serde_json::to_value(&primary).unwrap(), primary_before);
-        let owner = &broker.child_exchange_runtime_by_agent[&child.id].exchange;
-        let links = referenced_child_exchange_list(owner);
-        assert_eq!(links.len(), 1);
-        assert_eq!(links[0].0, grandchild.id);
-        let record = broker
-            .store
-            .list_agent_exchange(&grandchild.id)
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(record.id, links[0].1);
-        assert_eq!(record.prompt, "review");
-        assert!(record.checkpoint_before.is_none());
-        assert!(
-            broker
-                .store
-                .require_settled_exchange_tree(&broker.session.id, &[primary.id.clone()])
-                .is_err()
-        );
-        let mut settled_primary = primary.clone();
-        settled_primary
-            .finish(ExchangeState::Complete, 300)
-            .unwrap();
-        broker.store.save_exchange(&settled_primary).unwrap();
-        assert!(
-            broker
-                .store
-                .require_settled_exchange_tree(&broker.session.id, &[primary.id.clone()])
-                .is_err()
-        );
-        for agent_id in [&child.id, &grandchild.id] {
-            let mut exchange = broker
-                .store
-                .list_agent_exchange(agent_id)
-                .unwrap()
-                .pop()
-                .unwrap();
-            exchange.finish(ExchangeState::Cancelled, 300).unwrap();
-            broker.store.save_exchange(&exchange).unwrap();
-        }
-        broker
-            .store
-            .require_settled_exchange_tree(&broker.session.id, &[primary.id.clone()])
-            .unwrap();
 
-        assert_eq!(
-            broker
-                .store
-                .checkpoint_owner(&broker.session.id, &record.id)
-                .unwrap(),
-            primary.id
-        );
-        assert!(
-            broker
-                .store
-                .checkpoint_owner("another-session", &record.id)
-                .is_err()
-        );
-        broker
-            .store
-            .record_rollback(&broker.session.id, &[primary.id.clone()])
-            .unwrap();
-        for agent_id in [&child.id, &grandchild.id] {
-            let exchange = broker
-                .store
-                .list_agent_exchange(agent_id)
-                .unwrap()
-                .pop()
-                .unwrap();
-            assert_eq!(
-                exchange.disposition,
-                crate::exchange::HistoryDisposition::RolledBack
-            );
-            assert_eq!(exchange.state, ExchangeState::Cancelled);
-        }
-        let stored_owner = broker
-            .store
-            .list_agent_exchange(&child.id)
-            .unwrap()
-            .pop()
-            .unwrap();
-        assert_eq!(referenced_child_exchange_list(&stored_owner), links);
-        broker.child_exchange_runtime_by_agent.remove(&child.id);
-        event.address.as_mut().unwrap().turn_id = "missing-parent".into();
-        assert!(
-            broker
-                .route_agent_backend_event(Some(&mut primary), &event, &mut emitted)
-                .await
-                .is_err()
-        );
-        assert_eq!(serde_json::to_value(&primary).unwrap(), primary_before);
-    }
-
-    #[tokio::test]
-    async fn child_reuse_creates_a_new_exchange_and_replayed_start_cannot_reopen_history() {
-        use crate::backend::{ProviderAddress, TurnBoundary};
-        use crate::turn::TurnOutcome;
-        for (outcome, state) in [
-            (TurnOutcome::Completed, ExchangeState::Complete),
-            (TurnOutcome::Failed, ExchangeState::Failed),
-            (TurnOutcome::Cancelled, ExchangeState::Cancelled),
-            (TurnOutcome::Interrupted, ExchangeState::Interrupted),
-        ] {
-            let repository = repository();
-            let data = tempfile::tempdir().unwrap();
-            let mut broker = planning_question_broker(repository.path(), data.path(), false);
-            let mut child = Agent::pending(&broker.session.id, "explorer", "first task", 1);
-            child.provider_thread_id = Some("child-thread".into());
-            broker.store.save_agent_run(&child).unwrap();
-            broker.agent_registry.insert(child.clone());
-            let mut parent = completed_interaction("parent", &broker.session.id, Vec::new());
-            parent.state = ExchangeState::Running;
-            parent.completed_at_ms = None;
-            parent
-                .append_delegation(&child.id, "spawn", "first task", 1)
-                .unwrap();
-            broker.store.save_exchange(&parent).unwrap();
-            let mut event = BackendEvent {
-            received_at_ms: None,
-                address: Some(ProviderAddress {
-                    thread_id: "child-thread".into(),
-                    turn_id: "first".into(),
-                }),
-                turn_boundary: Some(TurnBoundary::Started),
-                kind: "turn_started".into(),
-                text: None,
-                data: json!({}),
-                activity: None,
-                summary: None,
-                task_update: None,
-            };
-            let mut emitted = Vec::new();
-            broker
-                .route_agent_backend_event(Some(&mut parent), &event, &mut emitted)
-                .await
-                .unwrap();
-            broker
-                .route_agent_backend_event(Some(&mut parent), &event, &mut emitted)
-                .await
-                .unwrap();
-            assert_eq!(parent.node_list.len(), 1);
-            event.kind = "turn_completed".into();
-            event.turn_boundary = Some(TurnBoundary::Finished { outcome });
-            broker
-                .route_agent_backend_event(Some(&mut parent), &event, &mut emitted)
-                .await
-                .unwrap();
-            let first = broker.store.list_agent_exchange(&child.id).unwrap()[0].clone();
-            assert_eq!(
-                first.state, state,
-                "child exchange must retain its provider outcome"
-            );
-            assert_eq!(
-                first.turn[0].state(),
-                crate::turn::TurnState::Finished { outcome }
-            );
-            event.kind = "turn_started".into();
-            event.turn_boundary = Some(TurnBoundary::Started);
-            broker
-                .route_agent_backend_event(Some(&mut parent), &event, &mut emitted)
-                .await
-                .unwrap();
-            assert_eq!(
-                parent.node_list.len(),
-                1,
-                "replayed terminal turn created a new delegation"
-            );
-            broker.agent_registry.execution_mut(&child.id).task = "second task".into();
-            event.address.as_mut().unwrap().turn_id = "second".into();
-            broker
-                .route_agent_backend_event(Some(&mut parent), &event, &mut emitted)
-                .await
-                .unwrap();
-            let records = broker.store.list_agent_exchange(&child.id).unwrap();
-            assert_eq!(records.len(), 2);
-            assert_ne!(records[0].id, records[1].id);
-            assert_eq!(records[0].completed_at_ms, first.completed_at_ms);
-            assert_eq!(records[1].prompt, "second task");
-            let links = referenced_child_exchange_list(&parent);
-            assert_eq!(links.len(), 2);
-            assert_eq!(links[0].1, records[0].id);
-            assert_eq!(links[1].1, records[1].id);
-        }
-    }
 
     #[tokio::test]
     async fn shares_prompt_history_across_repository_sessions() {
@@ -11710,7 +11473,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -11909,6 +11673,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let initialize = |client_id: &str, name: &str| InitializeRequest {
+            backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
             permission_file: None,
@@ -11949,6 +11714,7 @@ mod test {
         let other_workspace = repository();
         let data = tempfile::tempdir().unwrap();
         let mut request = InitializeRequest {
+            backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
             permission_file: None,
@@ -11999,7 +11765,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let initialize =
             |client_id: &str, lease_conflict_action: Option<String>| InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12145,7 +11912,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12248,7 +12016,8 @@ mod test {
         drop(broker);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12300,7 +12069,8 @@ mod test {
         let resumed_session_id = session["id"].as_str().expect("new session id").to_owned();
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12346,6 +12116,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let request = InitializeRequest {
+            backend_launch_by_provider: Default::default(),
             config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
             permission_file: None,
@@ -12395,7 +12166,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12452,7 +12224,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12524,7 +12297,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12554,6 +12328,7 @@ mod test {
         exchange
             .start_turn(
                 crate::backend::ProviderAddress {
+                    owner: None,
                     thread_id: "main-thread".into(),
                     turn_id: "unfinished-turn".into(),
                 },
@@ -12567,7 +12342,8 @@ mod test {
 
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13364,63 +13140,32 @@ mod test {
 
 
     #[tokio::test]
-    async fn rejected_agent_spawns_preserve_names_and_close_unbound_identities() {
+    async fn rejected_agent_admissions_preserve_names_without_orphaned_identity() -> Result<()> {
         let repository = repository();
-        let data = tempfile::tempdir().unwrap();
-        let definition_directory = repository.path().join(".codex/agents");
-        std::fs::create_dir_all(&definition_directory).unwrap();
-        std::fs::write(
-            definition_directory.join("manual-code-explorer.toml"),
-            "description = \"Read-only test explorer\"\n",
-        ).unwrap();
-        let mut broker = HarnessBroker::initialize_with_clock(
-            InitializeRequest {
-                config_dir: None,
-                data_root: data.path().to_string_lossy().into_owned(),
-                permission_file: None,
-                workspace: repository.path().to_string_lossy().into_owned(),
-                client_id: "agent-spawn-test".into(),
-                backend: BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
-                model: "mock-model".into(),
-                effort: "medium".into(),
-                session_id: None,
-                new_session_name: None,
-                goal_max_turns: 20,
-                lease_conflict_action: None,
-            },
-            Box::new(FixedClock(100)),
-        ).unwrap();
-        let params = json!({"definition": "manual-code-explorer", "task": "Inspect tests"});
-        broker.capability.agent.spawn = crate::agent::AgentControlMode::ParentMediated;
-        let (run, event) = broker.start_agent(params.clone()).await.unwrap();
-        assert_eq!(run["state"], "closed");
-        assert!(event.iter().any(|event| event.event == "agent_updated"));
-        let exchange = broker.store.list_exchange(&broker.session.id).unwrap();
-        let rendered = serde_json::to_string(&exchange).unwrap();
-        assert!(rendered.contains("type exactly to `manual-code-explorer`"));
-        assert!(rendered.contains("/spawn manual-code-explorer Inspect tests"));
-        assert!(!rendered.contains("manual_code_explorer"));
-        let recovered_backend = broker.backend.clone();
-        broker.backend = Arc::new(FailingBackend);
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        for params in [
+            json!({"task_name":"bad name","message":"Inspect tests"}),
+            json!({"task_name":"worker","message":"Inspect tests","provider":"unknown"}),
+            json!({"task_name":"worker","message":"Inspect tests","model":"unavailable-model"}),
+        ] {
+            assert!(broker.start_agent(params).await.is_err());
+            assert!(broker.agent_registry.list().is_empty());
+            assert!(broker.store.list_agent_task(&broker.session.id)?.is_empty());
+            assert_eq!(broker.agent_coordinator.active_count(), 0);
+        }
+        let params = json!({"task_name":"manual-code-explorer","message":"Inspect tests"});
+        let (admitted, _) = broker.start_agent(params.clone()).await?;
+        assert_eq!(admitted["agent"]["task_name"], "manual-code-explorer");
+        settle_managed_children(&mut broker).await?;
         assert!(broker.start_agent(params).await.is_err());
-        let stored = broker.store.list_agent_run(&broker.session.id).unwrap();
-        let registry = crate::agent::AgentRegistry::from_run_list(stored);
-        assert!(registry.list().iter().all(|agent| agent.state == crate::agent::AgentState::Closed));
-        assert!(registry.resolve_unbound(None, None, None).is_none());
-        assert!(broker.store.list_exchange(&broker.session.id).unwrap().iter()
-            .flat_map(|exchange| &exchange.turn)
-            .all(|turn| !matches!(turn.state(), crate::turn::TurnState::Running)));
-        broker.backend = recovered_backend;
-        let recovery = broker.dispatch(Request {
-            id: 2,
-            method: "prompt.submit".into(),
-            params: json!({ "text": "Continue after the failed child request" }),
-        }).await;
-        assert!(recovery.response.error().is_none(), "{:?}", recovery.response.error());
-        let exchange = broker.store.list_exchange(&broker.session.id).unwrap();
-        assert_eq!(exchange.last().unwrap().state, ExchangeState::Complete);
+        assert_eq!(broker.agent_registry.list().len(), 1);
+        let task = broker.store.list_agent_task(&broker.session.id)?;
+        assert_eq!(task.len(), 1);
+        assert_eq!(task[0].state, ExchangeState::Complete);
+        assert_eq!(broker.agent_coordinator.active_count(), 0);
+        Ok(())
     }
-
     struct NativeSettlementBackend {
         inner: Arc<dyn Backend>,
         state: GoalState,
@@ -13455,7 +13200,7 @@ mod test {
             use crate::backend::usage::{TokenUsage, UsageUpdate};
             let sink = sink.unwrap();
             for ordinal in 1..=2 {
-                let address = ProviderAddress { thread_id: "native-goal-thread".into(), turn_id: format!("turn-{ordinal}") };
+                let address = ProviderAddress { owner: None, thread_id: "native-goal-thread".into(), turn_id: format!("turn-{ordinal}") };
                 let mut event = BackendEvent {
                     received_at_ms: None, address: Some(address.clone()),
                     turn_boundary: Some(TurnBoundary::Started), kind: "turn_started".into(),
@@ -13616,7 +13361,8 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = || InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(), permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "native-settlement-test".into(),
@@ -13668,7 +13414,8 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = || InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13740,7 +13487,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13787,7 +13535,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13830,7 +13579,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13902,7 +13652,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
@@ -13939,7 +13690,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -14015,7 +13767,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -14090,7 +13843,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -14116,6 +13870,7 @@ mod test {
             let mut turn = crate::turn::Turn::new(
                 format!("{id}:turn:1"),
                 crate::backend::ProviderAddress {
+                    owner: None,
                     thread_id: child_run_id.into(),
                     turn_id: format!("{id}:provider"),
                 },
@@ -14189,7 +13944,8 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
-                config_dir: None,
+                backend_launch_by_provider: Default::default(),
+            config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),

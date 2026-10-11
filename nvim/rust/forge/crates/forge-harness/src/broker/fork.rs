@@ -99,6 +99,7 @@ pub fn prepare_provider_fork(
 
     let backend_request = BackendForkRequest {
         source: BackendRequest {
+            execution_owner: None,
             harness_session_id: source.id,
             workspace: source.workspace,
             input: BackendInput::from_text(""),

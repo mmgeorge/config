@@ -96,7 +96,7 @@ async fn respond(reader: &mut BufReader<tokio::net::TcpStream>, request: Value, 
         "initialize" => Ok(json!({"protocolVersion":"2025-03-26", "capabilities":{"tools":{}},
             "serverInfo":{"name":"forge-harness-control","version":"1"}})),
         "ping" => Ok(json!({})),
-        "tools/list" => Ok(json!({"tools":crate::control_tools::ControlToolRegistry.mcp_tool_list()})),
+        "tools/list" => handler.request("forge/tools",json!({})).await,
         "tools/call" => {
             match handler.request("forge/control", request["params"].clone()).await {
                 Ok(value) => Ok(json!({"content":[{"type":"text","text":serde_json::to_string(&value)?}]})),

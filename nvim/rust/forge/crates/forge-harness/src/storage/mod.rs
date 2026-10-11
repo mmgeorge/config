@@ -19,7 +19,8 @@ use std::fs;
 use std::path::Path;
 use std::time::Duration;
 
-const SESSION_FORMAT_VERSION: u32 = 40;
+const SESSION_FORMAT_VERSION: u32 = 41;
+const PREFERENCE_FORMAT_VERSION: u32 = 40;
 
 /// Stores one session with the exact durable format that produced it.
 #[derive(Deserialize, Serialize)]
@@ -264,6 +265,19 @@ impl SqliteStore {
                 payload TEXT NOT NULL,
                 FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE
             );
+            CREATE TABLE IF NOT EXISTS agent_task_record (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL,
+                agent_id TEXT NOT NULL,
+                operation_id TEXT NOT NULL,
+                ordinal INTEGER NOT NULL,
+                payload TEXT NOT NULL,
+                FOREIGN KEY(session_id) REFERENCES session_record(id) ON DELETE CASCADE,
+                FOREIGN KEY(agent_id) REFERENCES agent_run_record(id) ON DELETE CASCADE,
+                FOREIGN KEY(id) REFERENCES exchange_record(id) ON DELETE CASCADE,
+                UNIQUE(session_id, operation_id),
+                UNIQUE(agent_id, ordinal)
+            );
 
             CREATE TABLE IF NOT EXISTS session_event_record (
                 id TEXT PRIMARY KEY,
@@ -274,32 +288,6 @@ impl SqliteStore {
             "#,
         )?;
         tool_output::initialize(&mut connection)?;
-        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
-        let obsolete = {
-            let mut statement=transaction.prepare("SELECT id FROM session_record WHERE coalesce(json_extract(payload,'$.format_version'),0) <> 40")?;
-            statement.query_map([],|row|row.get::<_,String>(0))?.collect::<rusqlite::Result<Vec<_>>>()?
-        };
-        let mut reset_owners=Vec::new();
-        for id in obsolete {
-            let directory=data_root.join("session-owner");
-            fs::create_dir_all(&directory)?;
-            let owner=fs::OpenOptions::new().create(true).truncate(false).read(true).write(true)
-                .open(directory.join(format!("{}.lock",crate::plan::digest(id.as_bytes()))))?;
-            anyhow::ensure!(owner.try_lock().is_ok(),"Close existing Harness hosts before resetting incompatible sessions");
-            reset_owners.push(owner);
-        }
-        let removed = transaction.execute("DELETE FROM session_record WHERE coalesce(json_extract(payload,'$.format_version'),0) <> 40", [])?;
-        transaction.execute("UPDATE preference_record SET payload=json_set(payload,'$.format_version',40)", [])?;
-        transaction.commit()?;
-        if removed > 0 { eprintln!("checks.format_reset sessions={removed}"); }
-
-        // Old complete-file checkpoints cannot be interpreted as Git overlays.
-        // Session cascades retain preferences, prompt history, and provider-owned files.
-        let removed = connection.execute(
-            "DELETE FROM session_record WHERE id IN (SELECT session_id FROM checkpoint_record WHERE json_type(payload, '$.deleted') IS NOT 'array')",
-            [],
-        )?;
-        if removed != 0 { eprintln!("checkpoint.format_reset sessions={removed}"); }
         Ok(Self {
             connection,
             session_lock: Default::default(),
@@ -318,7 +306,7 @@ impl SqliteStore {
             "SELECT payload FROM preference_record WHERE workspace = ?1 AND backend = ?2",
             params![workspace, backend],
         )?;
-        let Some(payload) = payload.filter(|payload| payload["format_version"] == SESSION_FORMAT_VERSION) else {
+        let Some(payload) = payload.filter(|payload| payload["format_version"] == PREFERENCE_FORMAT_VERSION) else {
             return Ok(None);
         };
         Ok(Some(serde_json::from_value(payload["preference"].clone())?))
@@ -334,7 +322,7 @@ impl SqliteStore {
         self.connection.execute(
             "INSERT INTO preference_record(workspace, backend, payload) VALUES(?1, ?2, ?3) \
              ON CONFLICT(workspace, backend) DO UPDATE SET payload=excluded.payload",
-            params![workspace, backend, encode(&serde_json::json!({"format_version":SESSION_FORMAT_VERSION,"preference":preference}))?],
+            params![workspace, backend, encode(&serde_json::json!({"format_version":PREFERENCE_FORMAT_VERSION,"preference":preference}))?],
         )?;
         Ok(())
     }
@@ -469,6 +457,12 @@ impl SqliteStore {
         let transaction = self
             .connection
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::write_exchange(&transaction, interaction)?;
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn write_exchange(transaction: &rusqlite::Transaction<'_>, interaction: &Exchange) -> Result<()> {
         let belongs: bool = transaction.query_row(
             "SELECT EXISTS(SELECT 1 FROM agent_run_record WHERE id=?1 AND session_id=?2)",
             params![interaction.agent_id, interaction.session_id],
@@ -522,8 +516,73 @@ impl SqliteStore {
                 params![child.id, child.session_id, child.agent_id, ordinal, encode(&child)?],
             )?;
         }
+        Ok(())
+    }
+
+    /// Commit a child identity, causal delegation, exchange, and task before dispatch.
+    pub fn admit_agent_task(&mut self, agent: &Agent, task: &crate::agent::AgentTask, parent: &Exchange) -> Result<()> {
+        anyhow::ensure!(agent.session_id == task.session_id && parent.session_id == task.session_id,
+            "agent admission crosses session ownership");
+        anyhow::ensure!(agent.id == task.agent_id && parent.id == task.parent_exchange_id,
+            "agent admission has inconsistent causal ownership");
+        anyhow::ensure!(!agent.is_primary() && parent.agent_id == crate::session::HarnessSession::primary_agent_id(&parent.session_id), "only the root can delegate child work");
+        anyhow::ensure!(parent.node_list.iter().any(|node| matches!(node,
+            crate::exchange::ExchangeNode::AgentReference { agent: delegation }
+                if delegation.child_agent_id == agent.id && delegation.child_exchange_id == task.id)),
+            "agent task has no matching parent delegation");
+        let transaction = self.connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        let conflict: bool = transaction.query_row(
+            "SELECT EXISTS(SELECT 1 FROM agent_run_record WHERE session_id=?1 AND id!=?2 AND json_extract(payload,'$.task_name')=?3)",
+            params![agent.session_id, agent.id, agent.task_name], |row| row.get(0))?;
+        anyhow::ensure!(!conflict, "task name is already admitted in this session: {}", agent.task_name);
+        let written = transaction.execute(
+            "INSERT INTO agent_run_record(id,session_id,payload) VALUES(?1,?2,?3) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE agent_run_record.session_id=excluded.session_id",
+            params![agent.id, agent.session_id, encode(agent)?])?;
+        anyhow::ensure!(written == 1, "agent cannot change its owning session");
+        Self::write_exchange(&transaction, parent)?;
+        Self::write_agent_task(&transaction, task)?;
         transaction.commit()?;
         Ok(())
+    }
+
+    /// Commits one child's durable outcome without exposing a partially completed task.
+    pub fn complete_agent_task(&mut self, agent: &Agent, task: &crate::agent::AgentTask, exchange: &Exchange) -> Result<()> {
+        anyhow::ensure!(agent.session_id == task.session_id && exchange.session_id == task.session_id
+            && agent.id == task.agent_id && exchange.agent_id == task.agent_id && exchange.id == task.id,
+            "child completion crosses execution ownership");
+        anyhow::ensure!(task.completed_at_ms.is_some() && exchange.state == task.state,
+            "child completion has inconsistent task and exchange outcomes");
+        let transaction = self.connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+        Self::write_exchange(&transaction, exchange)?;
+        Self::write_agent_task(&transaction, task)?;
+        let written = transaction.execute(
+            "UPDATE agent_run_record SET payload=?1 WHERE id=?2 AND session_id=?3",
+            params![encode(agent)?, agent.id, agent.session_id])?;
+        anyhow::ensure!(written == 1, "child completion has no admitted identity");
+        transaction.commit()?;
+        Ok(())
+    }
+
+    fn write_agent_task(connection: &rusqlite::Connection, task: &crate::agent::AgentTask) -> Result<()> {
+        let belongs: bool = connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM exchange_record WHERE id=?1 AND session_id=?2 AND agent_id=?3)",
+            params![task.id, task.session_id, task.agent_id], |row| row.get(0))?;
+        anyhow::ensure!(belongs, "task exchange does not belong to its agent and session");
+        let written = connection.execute(
+            "INSERT INTO agent_task_record(id,session_id,agent_id,operation_id,ordinal,payload) VALUES(?1,?2,?3,?4,?5,?6) ON CONFLICT(id) DO UPDATE SET payload=excluded.payload WHERE agent_task_record.session_id=excluded.session_id AND agent_task_record.agent_id=excluded.agent_id AND agent_task_record.operation_id=excluded.operation_id AND agent_task_record.ordinal=excluded.ordinal",
+            params![task.id, task.session_id, task.agent_id, task.operation_id, task.ordinal as i64, encode(task)?])?;
+        anyhow::ensure!(written == 1, "task cannot change its execution ownership or admission identity");
+        Ok(())
+    }
+
+    /// Persist a task outcome without changing its admission identity.
+    pub fn save_agent_task(&mut self, task: &crate::agent::AgentTask) -> Result<()> {
+        Self::write_agent_task(&self.connection, task)
+    }
+
+    /// Restore ordered task outcomes within one visible root session.
+    pub fn list_agent_task(&self, session_id: &str) -> Result<Vec<crate::agent::AgentTask>> {
+        self.list_payload("SELECT payload FROM agent_task_record WHERE session_id=?1 ORDER BY rowid", [session_id])
     }
 
     /// Remove one provisional interaction after its provider turn is retracted.
@@ -1115,20 +1174,69 @@ mod test {
     use super::*;
 
     #[test]
-    fn legacy_checkpoint_sessions_are_reset_without_removing_preferences_or_prompt_history() -> Result<()> {
+    fn child_admission_is_atomic_and_reopening_retains_outcomes_without_replay() -> Result<()> {
+        use crate::agent::{AgentSource,AgentTask};
+        let temporary = tempfile::tempdir()?;
+        let mut store = SqliteStore::open(temporary.path())?;
+        store.save_session(&session("session","D:/work"))?;
+        store.save_agent_run(&Agent::primary("session",0))?;
+        let mut agent = Agent::pending("session","review","review",1);
+        let mut parent = Exchange::agent_admission("session",1,"manual spawn".into(),1);
+        let task = AgentTask {id:"child-task".into(),session_id:"session".into(),agent_id:agent.id.clone(),operation_id:"operation".into(),
+            ordinal:1,source:AgentSource::User,parent_exchange_id:parent.id.clone(),message:"review".into(),state:crate::exchange::ExchangeState::Queued,
+            final_response:None,error:None,parent_reported:false,created_at_ms:1,completed_at_ms:None};
+        parent.append_agent_task(&task)?;
+        agent.inbox.push(crate::agent::AgentMessage {
+            id:"retained-information".into(),ordinal:1,message:"Inspect this after recovery".into(),
+            delivery:crate::agent::MessageDelivery::Attached,task_id:Some(task.id.clone()),created_at_ms:1,
+        });
+        store.admit_agent_task(&agent,&task,&parent)?;
+        assert_eq!(store.list_agent_task("session")?.len(),1);
+        assert_eq!(store.list_agent_exchange(&agent.id)?.len(),1);
+        let other = Agent::pending("session","different","another task",2);
+        let mut invalid_task = task.clone();
+        invalid_task.id = "invalid-task".into();
+        invalid_task.agent_id = other.id.clone();
+        let mut invalid_parent = Exchange::agent_admission("session",2,"manual spawn".into(),2);
+        invalid_task.parent_exchange_id = invalid_parent.id.clone();
+        invalid_parent.append_agent_task(&invalid_task)?;
+        assert!(store.admit_agent_task(&other,&invalid_task,&invalid_parent).is_err());
+        assert!(store.load_exchange("invalid-task")?.is_none());
+        assert!(store.load_exchange(&invalid_parent.id)?.is_none());
+        assert!(!store.list_agent_run("session")?.iter().any(|agent|agent.id == other.id));
+        drop(store);
+        let mut reopened = SqliteStore::open(temporary.path())?;
+        reopened.interrupt_detached_execution("session")?;
+        let restored = reopened.list_agent_task("session")?;
+        assert_eq!(restored[0].state,crate::exchange::ExchangeState::Interrupted);
+        assert!(restored[0].parent_reported);
+        assert!(restored[0].completed_at_ms.is_some());
+        assert_eq!(reopened.list_agent_exchange(&agent.id)?[0].state,crate::exchange::ExchangeState::Interrupted);
+        let restored_agent = reopened.list_agent_run("session")?.into_iter().find(|candidate|candidate.id == agent.id).unwrap();
+        assert_eq!(restored_agent.inbox[0].delivery,crate::agent::MessageDelivery::Queued);
+        assert_eq!(restored_agent.inbox[0].task_id,None);
+        assert_eq!(restored_agent.inbox[0].message,"Inspect this after recovery");
+        Ok(())
+    }
+
+    #[test]
+    fn startup_retains_hidden_legacy_sessions_and_their_checkpoint_records() -> Result<()> {
         let directory = tempfile::tempdir()?;
         let mut store = SqliteStore::open(directory.path())?;
         store.save_session(&session("legacy", "D:/work"))?;
+        store.connection.execute("UPDATE session_record SET payload=json_set(payload,'$.format_version',40) WHERE id='legacy'", [])?;
         store.connection.execute("INSERT INTO checkpoint_record(id,session_id,payload) VALUES('old','legacy','{}')", [])?;
         store.connection.execute("INSERT INTO preference_record(workspace,backend,payload) VALUES('D:/work','mock','{}')", [])?;
         store.connection.execute("INSERT INTO prompt_history_record(text,created_at_ms) VALUES('keep',1)", [])?;
         drop(store);
         let store = SqliteStore::open(directory.path())?;
         let count = |table: &str| -> Result<i64> { Ok(store.connection.query_row(&format!("SELECT COUNT(*) FROM {table}"), [], |row| row.get(0))?) };
-        assert_eq!(count("session_record")?, 0);
-        assert_eq!(count("checkpoint_record")?, 0);
+        assert_eq!(count("session_record")?, 1);
+        assert_eq!(count("checkpoint_record")?, 1);
         assert_eq!(count("preference_record")?, 1);
         assert_eq!(count("prompt_history_record")?, 1);
+        assert!(store.list_session(None)?.is_empty());
+        assert!(store.load_session("legacy")?.is_none());
         Ok(())
     }
 
@@ -1145,7 +1253,7 @@ mod test {
             "awaiting_input":false,"duration_ms":0,"metrics":{},"comment":[],
             "attributed_matches_checkpoint":false
         }))?;
-        let address = ProviderAddress { thread_id:"thread".into(),turn_id:"provider-turn".into() };
+        let address = ProviderAddress { owner: None, thread_id:"thread".into(),turn_id:"provider-turn".into() };
         exchange.start_turn(address.clone(),1)?;
         let mut event = BackendEvent {
             received_at_ms: None, address:Some(address),turn_boundary:None,kind:"tool".into(),
@@ -1597,6 +1705,9 @@ mod test {
             )
             .unwrap();
         store.save_session(&session("current", "D:/work")).unwrap();
+
+        drop(store);
+        let store = SqliteStore::open(temporary.path()).unwrap();
 
         assert!(store.load_session("outdated").unwrap().is_none());
         assert!(store.load_session("future").unwrap().is_none());

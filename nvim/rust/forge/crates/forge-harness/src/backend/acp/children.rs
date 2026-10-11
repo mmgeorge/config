@@ -43,7 +43,7 @@ impl AcpChildren {
             }
             ensure!(self.child.contains_key(id) || self.child.len() < 256, "ACP prompt exceeds 256 child sessions");
             self.child.insert(id.into(), ChildExecution {
-                address: ProviderAddress { thread_id: id.into(), turn_id: format!("acp-child:{}", uuid::Uuid::new_v4()) },
+                address: ProviderAddress { owner: None, thread_id: id.into(), turn_id: format!("acp-child:{}", uuid::Uuid::new_v4()) },
                 parent: parent.into(), closed: false,
             });
             (AgentExecutionState::Running, TurnBoundary::Started)

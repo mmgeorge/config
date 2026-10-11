@@ -48,6 +48,7 @@ function HarnessSnapshot.apply(state, result)
     require("forge.views.harness.recap").clear(state)
   end
   state.capability = result.capability or {}
+  state.subagent_tools = result.subagent_tools == true
   state.timeline_revision = result.timeline_revision or 0
   state.status = result.status or { kind = "idle" }
   state.artifact = vim.deepcopy(result.artifact or {})

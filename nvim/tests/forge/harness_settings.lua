@@ -98,7 +98,7 @@ local success, failure = xpcall(function()
   instance.spec.action_list[1].callback({ option = logging })
   assert(not enabled and not require("forge.infra.perf").enabled("harness"))
   assert(options["native-import"].id == "native-import")
-  assert(#instance.spec.page_list[1].option_list == 11)
+  assert(options["subagent-tools"].id == "subagent-tools")
   local provider = options["provider"]
   assert(provider.id == "provider" and provider.columns[2] == "Codex CLI")
   instance.spec.action_list[1].callback({ option = provider })
