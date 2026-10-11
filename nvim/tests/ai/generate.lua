@@ -133,7 +133,7 @@ local function test_gemini_generate()
   local request = requests[1]
   assert_eq(request.method, "POST", "gemini method")
   assert_true(
-    request.url:find("models/gemini-3.5-flash:generateContent", 1, true) ~= nil,
+    request.url:find("models/gemini-3.8-flash:generateContent", 1, true) ~= nil,
     "gemini url mismatch: " .. request.url
   )
   assert_eq(request.headers["x-goog-api-key"], "gemini-test-key", "gemini api key header")
@@ -142,7 +142,7 @@ local function test_gemini_generate()
   assert_eq(body.systemInstruction.parts[1].text, "You write commit messages.", "gemini system instruction")
   assert_eq(body.contents[1].role, "user", "gemini user role")
   assert_eq(body.contents[1].parts[1].text, "diff content", "gemini prompt text")
-  assert_eq(body.generationConfig.thinkingConfig.thinkingLevel, "minimal", "gemini3 thinking=minimal should map to thinkingLevel minimal")
+  assert_eq(body.generationConfig.thinkingConfig.thinkingLevel, "low", "gemini3 minimal should use the lowest supported thinking level")
 end
 
 local function test_gemini_thinking_budget()

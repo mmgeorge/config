@@ -13,6 +13,7 @@ local prompt_history = require("forge.views.harness.prompt_history")
 local provider_picker = require("forge.views.harness.provider_picker")
 local context_status = require("forge.views.harness.context_status")
 local model_picker = require("forge.views.harness.model_picker")
+local model_pins = require("forge.views.harness.model_pins")
 local snapshot = require("forge.views.harness.snapshot")
 local picker = require("forge.views.picker")
 local question_presentation = require("forge.views.harness.question_presentation")
@@ -1950,11 +1951,18 @@ end
 function M.select_model(on_confirm)
   on_confirm = type(on_confirm) == "function" and on_confirm or M.configure
   local state = harness_state()
+  local backend = state.session and state.session.backend or config.options.harness.backend
+  local session_id = state.session and state.session.id
+  local function is_current()
+    return harness_state() == state and state.session and state.session.id == session_id
+      and state.session.backend == backend
+  end
   if state.capability.model_selection ~= true then
     notifications.warn("The current backend does not support model selection", "ForgeHarness")
     return
   end
   local function open_model_picker(model_list)
+    if not is_current() then return end
     if type(model_list) ~= "table" or #model_list == 0 then
       local current = harness_state().session and harness_state().session.model or config.options.harness.model
       picker.open({
@@ -1979,20 +1987,26 @@ function M.select_model(on_confirm)
     model_picker.open({
       host = picker_host(state),
       model_list = model_list,
+      backend = backend,
+      is_current = is_current,
       current_model = state.session and (state.session.resolved_model or state.session.model),
       on_confirm = on_confirm,
     })
   end
-  local backend = state.session and state.session.backend
-  if state.model_backend == backend and type(state.model_list) == "table" then
-    open_model_picker(state.model_list)
-    return
-  end
-  client.request("backend.models", {}, function(model_list, request_error)
-    if request_error then notifications.error(request_error, "Harness model") return end
-    state.model_backend = backend
-    state.model_list = vim.deepcopy(model_list or {})
-    open_model_picker(state.model_list)
+  model_pins.refresh(backend, function(_, pin_error)
+    if pin_error then notifications.error("Failed to load Harness model pins: " .. pin_error, "Harness model") return end
+    if not is_current() then return end
+    if state.model_backend == backend and type(state.model_list) == "table" then
+      open_model_picker(state.model_list)
+      return
+    end
+    client.request("backend.models", {}, function(model_list, request_error)
+      if request_error then notifications.error(request_error, "Harness model") return end
+      if not is_current() then return end
+      state.model_backend = backend
+      state.model_list = vim.deepcopy(model_list or {})
+      open_model_picker(state.model_list)
+    end)
   end)
 end
 

@@ -2,6 +2,10 @@ local ModelPicker = {}
 
 local picker = require("forge.views.picker")
 local picker_field = require("forge.views.picker.field")
+local model_order = require("forge.views.harness.model_order")
+local model_pins = require("forge.views.harness.model_pins")
+local notifications = require("forge.infra.notifications")
+local lifetime = 0
 
 local function format_token_count(token_count)
   if not token_count then return nil end
@@ -122,9 +126,25 @@ local function model_detail(model, active_field, layout)
   return table.concat(segment_list, "  ")
 end
 
----@param options table
+---@class ForgeHarnessModelPickerOptions
+---@field host table
+---@field model_list ForgeHarnessModel[]
+---@field backend? string
+---@field current_model? string
+---@field is_current? fun(): boolean
+---@field on_confirm fun(config: {model: string, effort: string?, context_window: string|userdata})
+
+---@param options ForgeHarnessModelPickerOptions
 function ModelPicker.open(options)
-  local model_list = options.model_list
+  local source_model_list = vim.deepcopy(options.model_list)
+  local backend = options.backend or "codex"
+  local pinned_id_set = model_pins.get(backend) or {}
+  local model_list = model_order.order(source_model_list, backend, pinned_id_set)
+  lifetime = lifetime + 1
+  local owner = "harness-model-" .. lifetime
+  local function is_current()
+    return picker.is_open(owner) and (not options.is_current or options.is_current())
+  end
   for _, model in ipairs(model_list) do initialize_model(model) end
   local selected_model_id = options.current_model
   if not find_model(model_list, selected_model_id) then
@@ -155,7 +175,8 @@ function ModelPicker.open(options)
     for index, model in ipairs(model_list) do
       if model.id == selected_model_id then selected_index = index end
       local active = model.id == selected_model_id and active_field(model) or nil
-      local columns = { model.id }
+      local model_label = (pinned_id_set[model.id] and "* " or "  ") .. model.id
+      local columns = { model_label }
       if layout.reasoning.width > 0 then
         columns[#columns + 1] = picker_field.render(model.picker_reasoning, active == "reasoning", layout.reasoning)
       end
@@ -166,13 +187,14 @@ function ModelPicker.open(options)
       columns[#columns + 1] = model.description or ""
       option_list[#option_list + 1] = {
         id = model.id,
-        label = model.id,
+        label = model_label,
         detail = model_detail(model, active, layout),
         columns = columns,
         value = model,
       }
     end
     local spec = {
+      owner = owner,
       host = options.host,
       page_list = {
         {
@@ -181,7 +203,7 @@ function ModelPicker.open(options)
           column_headers = column_headers,
           option_list = option_list,
           selected_index = selected_index,
-          footer = "↑↓ model  ←→ value  Tab field  Enter confirm  q close",
+          footer = "↑↓ model  ←→ value  Tab field  p pin/unpin  Enter confirm  q close",
         },
       },
       on_change = function(context)
@@ -189,10 +211,11 @@ function ModelPicker.open(options)
         if model and selected_model_id ~= model.id then
           selected_model_id = model.id
           active_field(model)
-          vim.schedule(function() if api then api.update(build_spec()) end end)
+          vim.schedule(function() if api and is_current() then api.update(build_spec()) end end)
         end
       end,
       on_confirm = function(result)
+        if not is_current() then return end
         local model = result.option.value
         options.on_confirm({
           model = model.id,
@@ -202,6 +225,22 @@ function ModelPicker.open(options)
       end,
     }
     spec.action_list = {
+      {
+        key = "p",
+        id = "toggle-pin",
+        callback = function()
+          if not is_current() then return end
+          local model = find_model(model_list, selected_model_id)
+          if not model then return end
+          model_pins.set(backend, model.id, not pinned_id_set[model.id], function(next_pin_set, failure)
+            if failure then notifications.error("Failed to pin Harness model: " .. failure, "Harness model") return end
+            if not is_current() then return end
+            pinned_id_set = next_pin_set or {}
+            model_list = model_order.order(source_model_list, backend, pinned_id_set)
+            api.update(build_spec())
+          end)
+        end,
+      },
       {
         key = "<Tab>",
         id = "next-field",

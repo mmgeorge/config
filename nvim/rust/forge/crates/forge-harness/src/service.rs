@@ -763,6 +763,26 @@ async fn route_request(
     method: HarnessMethod,
     message_sink: &MessageSender,
 ) -> Result<()> {
+    if matches!(method, HarnessMethod::BackendModelPins | HarnessMethod::BackendModelPin) {
+        let data_root = PathBuf::from(&registry.initialize.data_root);
+        let parameter = request.params;
+        let identifier_list = tokio::task::spawn_blocking(move || -> Result<Vec<String>> {
+            let backend = parameter.get("backend").and_then(Value::as_str)
+                .context("model pin request requires backend")?;
+            let mut store = crate::storage::model_pin::ModelPinStore::open(&data_root)?;
+            if method == HarnessMethod::BackendModelPins {
+                store.load(backend)
+            } else {
+                let model = parameter.get("model").and_then(Value::as_str)
+                    .context("backend.model_pin requires model")?;
+                let pinned = parameter.get("pinned").and_then(Value::as_bool)
+                    .context("backend.model_pin requires pinned")?;
+                store.set(backend, model, pinned)
+            }
+        }).await.context("model pin storage task failed")??;
+        message_sink.send_response(Response::success(request.id, identifier_list)?).await?;
+        return Ok(());
+    }
     if matches!(
         method,
         HarnessMethod::TraceStatus
@@ -1575,6 +1595,31 @@ async fn run_lease_heartbeat(
 mod tests {
     use super::*;
     use forge_diff::cache::CacheLimits;
+
+    #[tokio::test]
+    async fn model_pins_bypass_the_active_provider_broker_lock() {
+        let fixture = tempfile::tempdir().unwrap();
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await.unwrap();
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await.unwrap();
+        let controller = registry.resolve(&session_id).await.unwrap();
+        let broker = controller.broker.lock().await;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        for (method, parameter) in [
+            ("backend.model_pin", json!({"backend":"copilot", "model":"pinned-model", "pinned":true})),
+            ("backend.model_pins", json!({"backend":"copilot"})),
+        ] {
+            tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()),
+                Request { id: 2, method: method.into(), params: parameter }, &sink))
+                .await.expect("pins must not wait for provider execution").unwrap();
+            let frame = output.recv().await.unwrap().unwrap();
+            let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
+            assert_eq!(value["result"], json!(["pinned-model"]));
+        }
+        drop(broker);
+        service.shutdown(Duration::from_secs(1)).await.unwrap();
+    }
 
     #[tokio::test]
     async fn revision_review_controls_bypass_the_waiting_provider_broker_lock() {

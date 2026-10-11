@@ -2,12 +2,14 @@
 ---@class ForgeHarnessCommandSource
 ---@field model_backend string?
 ---@field model_list table[]?
----@field model_callback_list (fun(model_list: table[]))[]
+---@field model_callback_list (fun(model_list: table[], failure: string?))[]
 local CommandSource = {}
 local agent_catalog = require("forge.views.harness.agent_catalog")
 local agent_summary = require("forge.render.harness.agent_summary")
 local client = require("forge.client")
 local notifications = require("forge.infra.notifications")
+local model_order = require("forge.views.harness.model_order")
+local model_pins = require("forge.views.harness.model_pins")
 local provider_catalog = require("forge.views.harness.provider_catalog")
 local session = require("forge.session")
 
@@ -134,8 +136,25 @@ end
 ---@param callback fun(model_list: table[])
 function CommandSource:request_model_list(callback)
   local backend = session.harness.session and session.harness.session.backend or "active"
+  local state = session.harness
+  local session_id = state.session and state.session.id
+  local function deliver(model_list, model_error)
+    if model_error then callback({}) return end
+    local function ordered(pinned_id_set, failure)
+      if failure then
+        notifications.error("Failed to complete Harness model pins: " .. failure, "ForgeHarness")
+        callback({})
+        return
+      end
+      if session.harness ~= state or not state.session or state.session.id ~= session_id
+        or state.session.backend ~= backend then callback({}) return end
+      callback(model_order.order(model_list, backend, pinned_id_set))
+    end
+    local pinned_id_set = model_pins.get(backend)
+    if pinned_id_set then ordered(pinned_id_set) else model_pins.refresh(backend, ordered) end
+  end
   if session.harness.model_backend == backend and type(session.harness.model_list) == "table" then
-    callback(session.harness.model_list)
+    deliver(session.harness.model_list)
     return
   end
   if self.model_backend ~= backend then
@@ -144,17 +163,22 @@ function CommandSource:request_model_list(callback)
     self.model_callback_list = {}
   end
   if self.model_list then
-    callback(self.model_list)
+    deliver(self.model_list)
     return
   end
-  self.model_callback_list[#self.model_callback_list + 1] = callback
+  self.model_callback_list[#self.model_callback_list + 1] = deliver
   if #self.model_callback_list > 1 then return end
+  local request_callback_list = self.model_callback_list
   client.request("backend.models", {}, function(model_list, request_error)
-    local callback_list = self.model_callback_list
-    self.model_callback_list = {}
+    local callback_list = request_callback_list
+    if self.model_callback_list == request_callback_list then self.model_callback_list = {} end
     if request_error then
       notifications.error("Failed to complete Harness model: " .. request_error, "ForgeHarness")
-      for _, pending_callback in ipairs(callback_list) do pending_callback({}) end
+      for _, pending_callback in ipairs(callback_list) do pending_callback({}, request_error) end
+      return
+    end
+    if session.harness ~= state or not state.session or state.session.id ~= session_id or state.session.backend ~= backend then
+      for _, pending_callback in ipairs(callback_list) do pending_callback({}, "stale model catalog") end
       return
     end
     self.model_list = type(model_list) == "table" and model_list or {}
@@ -287,7 +311,7 @@ function CommandSource:get_completions(_, callback)
   if model_start then
     self:request_model_list(function(model_list)
       local model_completion_list = {}
-      for _, model in ipairs(model_list or {}) do
+      for index, model in ipairs(model_list or {}) do
         model_completion_list[#model_completion_list + 1] = value_completion(
           model.id,
           model.description or model.label or "Backend model",
@@ -295,6 +319,7 @@ function CommandSource:get_completions(_, callback)
           model_start - 1,
           cursor_column
         )
+        model_completion_list[#model_completion_list].sortText = ("%06d"):format(index)
       end
       callback({ items = model_completion_list, is_incomplete_backward = false, is_incomplete_forward = false })
     end)

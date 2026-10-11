@@ -27,6 +27,10 @@ pub enum HarnessMethod {
     TraceSessionClear,
     #[serde(rename = "backend.models")]
     BackendModels,
+    #[serde(rename = "backend.model_pins")]
+    BackendModelPins,
+    #[serde(rename = "backend.model_pin")]
+    BackendModelPin,
     #[serde(rename = "agent.list")]
     AgentList,
     #[serde(rename = "agent.start")]

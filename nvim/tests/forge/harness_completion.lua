@@ -50,6 +50,7 @@ local ok, failure = xpcall(function()
   session.harness.model_backend = "codex"
   session.harness.model_list = { { id = "fixture-model", reasoning = { "low", "high" } } }
   client.request = function(method, _, callback)
+    if method == "backend.model_pins" then callback({}) return end
     assert(method == "backend.skills", "unexpected completion request " .. method)
     vim.schedule(function()
       callback({ { name = "fixture-skill", enabled = true, user_invocable = true } })

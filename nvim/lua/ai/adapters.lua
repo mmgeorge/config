@@ -12,16 +12,16 @@ function M.get()
     return {
       chat = {
         name = "gemini",
-        model = "gemini-3-pro-preview",
+        model = "gemini-3.1-pro-preview",
       },
       inline = {
         name = "gemini",
-        model = "gemini-3-flash-preview",
+        model = "gemini-3.8-flash",
       },
       cmd = "gemini",
-      commit = "gemini3,thinking=minimal",
-      pr_create = "gemini3,thinking=minimal",
-      inline_edit = "gemini3,thinking=minimal",
+      commit = "gemini3-lite,thinking=minimal",
+      pr_create = "gemini3,thinking=low",
+      inline_edit = "gemini3,thinking=low",
     }
   end
 

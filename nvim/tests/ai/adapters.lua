@@ -20,8 +20,8 @@ end
 
 local ok, err = xpcall(function()
   local gemini = load_with_gemini_key("test-key")
-  assert_eq(gemini.commit, "gemini3,thinking=minimal", "gemini commit default")
-  assert_eq(gemini.pr_create, "gemini3,thinking=minimal", "gemini PR create default")
+  assert_eq(gemini.commit, "gemini3-lite,thinking=minimal", "gemini commit default")
+  assert_eq(gemini.pr_create, "gemini3,thinking=low", "gemini PR create default")
 
   local fallback = load_with_gemini_key(nil)
   assert_eq(fallback.commit, "copilot,model=gpt-4.1", "fallback commit default")

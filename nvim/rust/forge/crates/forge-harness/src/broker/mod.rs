@@ -1192,6 +1192,9 @@ impl HarnessBroker {
                 Vec::new(),
             )),
             HarnessMethod::BackendModels => self.list_backend_model().await,
+            HarnessMethod::BackendModelPins | HarnessMethod::BackendModelPin => {
+                anyhow::bail!("model pins require the service coordinator")
+            }
             HarnessMethod::AgentList => {
                 Ok((serde_json::to_value(self.snapshot()?.agent)?, Vec::new()))
             }

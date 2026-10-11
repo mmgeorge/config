@@ -1980,6 +1980,28 @@ Lua receives the catalog. `views/harness/model_picker.lua` therefore owns only p
 state, field cycling, and presentation order. Copilot maps the selected context tier into native
 session creation and `set_model`, while Codex exposes only the controls returned by app-server.
 
+`views/harness/model_order.lua` applies one ordering pipeline to the model picker and
+model completion. Copilot orders Auto first, then Claude, GPT, and Gemini with descending
+numeric versions. Equal Claude versions use Opus, Sonnet, and Haiku order. Other equal-version
+variants use identifier order, and unrecognized models retain provider order at the end.
+Codex and other backends preserve provider order. A stable partition then puts pinned models
+first without a separate section, retaining each backend's order within both groups. Lua keeps
+the original catalog unchanged so unpinning restores provider order exactly.
+
+Rust's `ModelPinStore` persists backend-wide membership in the `model_pin` table of the Harness
+SQLite database, independently of workspace preferences, session leases, and session formats.
+`backend.model_pins` reads membership, and `backend.model_pin` sets one explicit pin state
+idempotently. The service runs pin storage outside the provider broker lock, allowing changes
+during active execution without configuring or contacting the provider. Unavailable model IDs
+remain pinned in storage but produce no synthetic catalog entries.
+
+The picker refreshes persisted pins when opened and exposes `p` to pin or unpin its highlighted
+model. The inline `*` marker and row order change only after storage acknowledgement. The shared
+Lua pin cache serializes writes per backend and rejects reads superseded by acknowledged writes.
+Picker updates preserve the current model identity and edited reasoning/context fields. Closing
+or replacing the picker invalidates UI callbacks without undoing committed pins. Storage failures
+retain the previous presentation and report the request error.
+
 `BackendInput` distinguishes ordinary text from explicit skill invocation before either provider
 sees the prompt. `SkillDefinition` normalizes discovery and enabled state, while each `McpDefinition`
 owns its tool inventory so callers never issue a second tool-list operation against the backend.

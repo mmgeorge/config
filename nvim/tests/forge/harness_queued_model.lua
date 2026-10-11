@@ -7,6 +7,7 @@ local history = require("forge.views.harness.prompt_history")
 local notifications = require("forge.infra.notifications")
 local requests, rejected, selection = {}, {}, nil
 client.request = function(method, params, callback)
+  if method == "backend.model_pins" then callback({}) return end
   requests[#requests + 1] = { method = method, params = params, callback = callback }
 end
 history.record = function() end

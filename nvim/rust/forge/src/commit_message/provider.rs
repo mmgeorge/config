@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 
 use super::{GenerationPermit, ModelSpec};
 
-const SYSTEM: &str = "You are a factual Conventional Commit message generator. Return only the commit message, without code fences or explanations. Use <type>: <description>, imperative mood, lowercase first letter, no final period, maximum 50 characters. Describe concrete changes, not benefits or intentions. Default to no body. Never add a body for chore commits. If essential API, behavior, migration, or test facts require a body, use at most two lines wrapped at 72 characters.";
+const SYSTEM: &str = "You are a factual Conventional Commit message generator. Return only the commit message, without code fences or explanations. Use <type>: <description>, imperative mood, lowercase first letter, no final period, maximum 50 characters. Describe concrete changes, not benefits or intentions. Default to no body. Never add a body for chore commits. If essential API, behavior, migration, or test facts require a body, write one or two concise sentences, never more than two sentences, wrapped at 72 characters.";
 
 pub async fn generate(
     client: &Client,

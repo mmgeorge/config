@@ -24,11 +24,11 @@ local M = {
 ---@type table<string, AIPreset>
 M.presets = {
   ["gemini3"] = {
-    model = "gemini-3.5-flash",
-    thinking = { minimal = "minimal", low = "low", medium = "medium", high = "high", max = "high" },
+    model = "gemini-3.8-flash",
+    thinking = { minimal = "low", low = "low", medium = "medium", high = "high", max = "high" },
   },
   ["gemini3-lite"] = {
-    model = "gemini-3.1-flash-lite",
+    model = "gemini-3.5-flash-lite",
     thinking = { minimal = "minimal", low = "low", medium = "medium", high = "high", max = "high" },
   },
   ["gemini2.5"] = {

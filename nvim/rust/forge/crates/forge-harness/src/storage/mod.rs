@@ -1,4 +1,5 @@
 pub mod objects;
+pub(crate) mod model_pin;
 mod ownership;
 mod recovery;
 mod tool_output;
