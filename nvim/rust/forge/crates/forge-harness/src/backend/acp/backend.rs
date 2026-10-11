@@ -299,7 +299,7 @@ impl Backend for AcpBackend {
             if self.kind == BackendKind::Claude { "claude" } else { "antigravity" })?;
         let target = if self.kind == BackendKind::Claude { "claudecode" } else { "antigravity-cli" };
         Ok(catalog.skill
-            .into_iter().filter(|skill|skill.targets.is_empty() || skill.targets.iter().any(|candidate|candidate == target))
+            .into_iter().filter(|skill|crate::settings::ResourceCatalog::supports_target(&skill.targets, target))
             .map(|skill|SkillDefinition {
                 resource_id:Some(skill.id.clone()),
                 enabled:catalog.settings.desired.skill.get(&skill.id) != Some(&false),
@@ -315,7 +315,7 @@ impl Backend for AcpBackend {
             if self.kind == BackendKind::Claude { "claude" } else { "antigravity" })?;
         let target = if self.kind == BackendKind::Claude { "claudecode" } else { "antigravity-cli" };
         Ok(catalog.server
-            .into_iter().filter(|server|server.targets.is_empty() || server.targets.iter().any(|candidate|candidate == target))
+            .into_iter().filter(|server|crate::settings::ResourceCatalog::supports_target(&server.targets, target))
             .map(|server| {
                 let enabled = catalog.settings.desired.mcp.get(&server.id) != Some(&false);
                 McpDefinition { resource_id:Some(server.id),name:server.name,transport:server.transport,enabled,
@@ -471,11 +471,11 @@ mod test {
         std::fs::create_dir(&workspace)?;
         let server_source = fixture.path().join("native.json");
         std::fs::write(&server_source, json!({"mcpServers":{"imported-server":{
-            "command":"fixture-must-not-launch","env":{"TOKEN":"native-credential-fixture"}
+            "command":"fixture-must-not-launch","targets":["*"],"env":{"TOKEN":"native-credential-fixture"}
         }}}).to_string())?;
         let skill_source = fixture.path().join("native-skill");
         std::fs::create_dir(&skill_source)?;
-        std::fs::write(skill_source.join("SKILL.md"), "---\nname: imported-skill\ndescription: Imported skill\n---\nPrivate instructions")?;
+        std::fs::write(skill_source.join("SKILL.md"), "---\nname: imported-skill\ndescription: Imported skill\ntargets: ['*']\n---\nPrivate instructions")?;
         let workspace = workspace.to_string_lossy().into_owned();
         let mut settings = SettingsStore::open(fixture.path())?;
         for (revision, kind, source) in [(0, ImportKind::Mcp, &server_source), (1, ImportKind::Skills, &skill_source)] {

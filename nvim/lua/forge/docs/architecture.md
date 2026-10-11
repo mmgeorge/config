@@ -2215,7 +2215,7 @@ Codex activity classification reads the top-level item type rather than searchin
 payload text. Errors, messages, reasoning, plans, compaction, review transitions, and native
 child lifecycle items remain separate from tools. Every other typed `item/started` or `item/completed`
 with a nonempty item ID becomes a tool activity, including `webSearch` search and page-open
-operations. Known web actions use `Search web`, `Open web`, and `Find in page` titles with
+operations. Known web actions use `Web Search`, `Open web`, and `Find in page` titles with
 their query, target, and additional-query count. Before Codex supplies an action, the title is
 `Web Search`, with the query appended when available. Later events replace that pending title
 with the specific action. Unknown actions retain the fallback title. Native sleeps use `Wait`

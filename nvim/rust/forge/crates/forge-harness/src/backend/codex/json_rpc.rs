@@ -2050,7 +2050,7 @@ fn web_tool_title(item: &Value) -> Option<String> {
             let remaining = queries.len() - 1;
             let suffix = if remaining == 0 { String::new() }
                 else { format!(" · +{remaining} {}", if remaining == 1 { "query" } else { "queries" }) };
-            compact_tool_title(&format!("Search web · {first}{suffix}"))
+            compact_tool_title(&format!("Web Search · {first}{suffix}"))
         }
         "openPage" => {
             let url = url.or_else(|| item.get("query").and_then(Value::as_str)
@@ -3229,7 +3229,7 @@ mod test {
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         for (id, action, expected_title) in [
             ("search-1", json!({ "type": "search", "queries": ["engine documentation", "engine pricing"] }),
-                "Search web · engine documentation · +1 query"),
+                "Web Search · engine documentation · +1 query"),
             ("open-1", json!({ "type": "openPage", "url": "https://example.com/docs" }), "Open web · example.com/docs"),
             ("find-1", json!({ "type": "findInPage", "url": "https://example.com/docs", "pattern": "royalty" }),
                 "Find in page · \"royalty\" · example.com/docs"),
@@ -3289,9 +3289,9 @@ mod test {
             (json!({"type":"webSearch", "query":"", "action":null, "results":null}), Some("Web Search")),
             (json!({"type":"webSearch"}), Some("Web Search")),
             (json!({"type":"webSearch", "query":"documentation", "action":null}), Some("Web Search · documentation")),
-            (json!({"type":"webSearch", "action":{"type":"search","query":"documentation"}}), Some("Search web · documentation")),
-            (json!({"type":"webSearch", "query":"documentation", "action":{"type":"search","query":null}}), Some("Search web · documentation")),
-            (json!({"type":"webSearch", "action":{"type":"search","queries":["one","two","three"]}}), Some("Search web · one · +2 queries")),
+            (json!({"type":"webSearch", "action":{"type":"search","query":"documentation"}}), Some("Web Search · documentation")),
+            (json!({"type":"webSearch", "query":"documentation", "action":{"type":"search","query":null}}), Some("Web Search · documentation")),
+            (json!({"type":"webSearch", "action":{"type":"search","queries":["one","two","three"]}}), Some("Web Search · one · +2 queries")),
             (json!({"type":"webSearch", "query":"https://example.com", "action":{"type":"openPage","url":null}}), Some("Open web · example.com")),
             (json!({"type":"webSearch", "action":{"type":"other"}}), None),
             (json!({"type":"webSearch", "action":{"type":"search","queries":[]}}), None),

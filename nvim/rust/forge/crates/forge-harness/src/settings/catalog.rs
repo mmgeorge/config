@@ -133,6 +133,11 @@ impl ServerResource {
 pub(crate) struct ResourceCatalog;
 
 impl ResourceCatalog {
+    /// Accept empty targets, the all-provider `*`, or an exact provider target name.
+    pub(crate) fn supports_target(targets: &[String], target: &str) -> bool {
+        targets.is_empty() || targets.iter().any(|candidate| candidate == "*" || candidate == target)
+    }
+
     /// Parse bounded global and workspace skill sources without importing generated files.
     pub(crate) fn skills(config_dir: Option<&Path>, workspace: &Path) -> Result<Vec<SkillResource>> {
         let mut pending = Vec::new();
