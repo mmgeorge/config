@@ -246,6 +246,8 @@ impl TimelineProjector {
         project_agent_tree(&mut result, agent_run_list, agent_exchange_list);
         for event in session_event_list {
             if matches!(&event.detail, SessionEventKind::Renamed { .. }) { continue; }
+            if matches!(&event.detail, SessionEventKind::Compaction { compaction }
+                if compaction.state == crate::backend::CompactionState::Running) { continue; }
             result.push(TimelineEntry::SessionEvent {
                 id: event.id.clone(),
                 created_at_ms: event.created_at_ms,

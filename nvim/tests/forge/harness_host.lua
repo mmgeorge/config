@@ -72,11 +72,20 @@ local success, failure = xpcall(function()
   assert(vim.wait(3000, function() return cleared_status ~= nil end, 10))
   assert(cleared_status.enabled and cleared_status.path == log_status.path)
   assert(not vim.tbl_contains(vim.fn.readfile(log_status.path), prompt_record), "prior session trace survived clear")
+  local compaction_status = {}
+  local unsubscribe_compaction = client.subscribe(function(event, payload, session_id)
+    if event == "document_changed" and session_id == state.session.id and payload.status then
+      compaction_status[#compaction_status + 1] = payload.status.kind
+    end
+  end)
   controller.compact()
   assert(vim.wait(5000, function()
     local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
     return #errors > 0 or (text:find("Context compacted", 1, true) and not state.task_operation)
   end, 10), "manual compaction did not render in the native timeline")
+  unsubscribe_compaction()
+  assert(vim.tbl_contains(compaction_status, "compacting"), "native host never published Compacting status")
+  assert(compaction_status[#compaction_status] == "idle", "native host retained Compacting after completion")
   assert(#errors == 0, table.concat(errors, "\n"))
   local compaction_row
   for row, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do

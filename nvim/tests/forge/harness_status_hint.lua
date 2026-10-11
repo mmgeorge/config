@@ -282,5 +282,30 @@ assert(interrupt_mark[1] == 1, "interrupt hint did not return to the status head
 assert(#vim.api.nvim_buf_get_extmark_by_id(details.buffer, namespace, 3, {}) == 0)
 hint.clear(details.buffer)
 buffer.close(details)
+local compacting = buffer.open("compaction-status", {})
+assert(buffer.apply_snapshot(compacting, {
+  document = compacting.document, revision = 0, block = { {
+    id = "status", text = { "", "Compacting" },
+    metadata = { status = { row = 1, animated = true }, target = {}, decoration = {}, fold = {}, editable_region = {} },
+  } },
+}).kind == "Applied")
+hint.render(compacting, command_set, 120)
+local compaction_mark = vim.api.nvim_buf_get_extmark_by_id(compacting.buffer, namespace, 1, { details = true })
+assert(compaction_mark[1] == 1 and compaction_mark[3].sign_text, "compaction status has no spinner")
+assert(vim.wait(500, function()
+  local current = vim.api.nvim_buf_get_extmark_by_id(compacting.buffer, namespace, 1, { details = true })
+  return current[3].sign_text ~= compaction_mark[3].sign_text
+end, 20), "compaction spinner did not animate")
+assert(buffer.apply_snapshot(compacting, {
+  document = compacting.document, revision = 1, block = { {
+    id = "compaction-event", text = { "Context compacted" },
+    metadata = { target = {}, decoration = {}, fold = {}, editable_region = {} },
+  } },
+}).kind == "Applied")
+hint.render(compacting, command_set, 120)
+assert(#vim.api.nvim_buf_get_extmarks(compacting.buffer, namespace, 0, -1, {}) == 0,
+  "completed compaction retained a spinner")
+hint.clear(compacting.buffer)
+buffer.close(compacting)
 print("harness status hint passed")
 vim.cmd("qa!")

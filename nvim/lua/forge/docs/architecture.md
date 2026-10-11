@@ -2543,8 +2543,9 @@ Completion replaces that node's state without moving it or creating assistant te
 Terminal replays cannot reopen the record. Later notifications can fill missing result fields
 without replacing confirmed evidence. A foreground provider turn ending before compaction
 confirmation records an unconfirmed outcome rather than leaving an active indicator indefinitely.
-The shared renderer projects a collapsed compaction
-row whose details expose the actual summary and reported metrics. Absent provider fields remain
+While compaction runs, the shared renderer shows `Compacting` with the existing status spinner
+and suppresses its history row. A terminal outcome restores the ordinary workflow status and
+projects a collapsed compaction event whose details expose the actual summary and reported metrics. Absent provider fields remain
 absent, and Codex rows explicitly report unavailable summary text when opened. Exchange headers
 retain compaction counts and active, failed, or unconfirmed counts while activity details are folded.
 
@@ -5592,7 +5593,7 @@ The Rust status projection commits text with `BlockMetadata.status`, containing
 its block-relative row, animation flag, and optional Working, Question, or Review
 hint context. The buffer contract validates that the row exists. Lua reads this
 metadata from the committed sequence, never from label text or target suffixes.
-Active labels are Working, Planning, Revising plan, Implementing, Verifying,
+Active labels are Working, Planning, Revising plan, Compacting, Implementing, Verifying,
 Resolving, and Saving exchange. Completed headings retain Planned, Implemented,
 Verified, and Resolved. Idle has no status row.
 

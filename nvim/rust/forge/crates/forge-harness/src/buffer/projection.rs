@@ -407,6 +407,7 @@ impl TimelineRenderer<'_> {
                 let text = match status {
                     SessionPhase::Idle => String::new(),
                     SessionPhase::Paused => "Paused".into(),
+                    SessionPhase::Compacting => "Compacting".into(),
                     SessionPhase::Finalizing { error, .. } => error.as_ref().map_or_else(
                         || "Saving exchange".into(),
                         |error| format!("Saving exchange failed · {error}"),
@@ -456,6 +457,7 @@ impl TimelineRenderer<'_> {
                     block.metadata.status = Some(StatusPresentation {
                         row: 1,
                         animated: matches!(status, SessionPhase::Working { .. }
+                            | SessionPhase::Compacting
                             | SessionPhase::RetryingPlanGeneration { .. } | SessionPhase::WaitingForAgent { .. }
                             | SessionPhase::Finalizing { error: None, .. }),
                         hint: match status {
@@ -1324,9 +1326,8 @@ impl TimelineRenderer<'_> {
 
     fn compaction(&mut self, id: &str, compaction: &crate::backend::Compaction) -> Result<()> {
         use crate::backend::CompactionState;
-        let start = self.block.len();
         let label = match compaction.state {
-            CompactionState::Running => "Compacting context",
+            CompactionState::Running => return Ok(()),
             CompactionState::Completed => "Context compacted",
             CompactionState::Failed => "Context compaction failed",
             CompactionState::Unconfirmed => "Context compaction completion unconfirmed",
@@ -1393,15 +1394,10 @@ impl TimelineRenderer<'_> {
         }
         if let Some(summary) = &compaction.result.summary_content {
             self.markdown(&format!("{id}:summary"), summary, MarkdownRole::Detail)?;
-        } else if compaction.state != CompactionState::Running {
-            self.literal(&format!("{id}:summary"), "The provider did not expose a compacted summary.", None)?;
         } else {
-            self.literal(&format!("{id}:pending"), "Waiting for provider completion.", None)?;
+            self.literal(&format!("{id}:summary"), "The provider did not expose a compacted summary.", None)?;
         }
         self.finish_section(section, id, true);
-        if compaction.state == CompactionState::Running {
-            self.block[start].metadata.status = Some(StatusPresentation { row: 0, animated: true, hint: None });
-        }
         Ok(())
     }
 
@@ -2038,6 +2034,10 @@ mod tests {
         };
         exchange.observe_compaction(compaction.clone(), 1000);
         let id = exchange.node_list[0].id().to_owned();
+        let running = TimelineEntry::Exchange { id: "exchange".into(), created_at_ms: 0,
+            exchange: exchange.clone(), agent_by_id: HashMap::new() };
+        let projected = project_at(&running, &WidthProfile::default(), 1500)?;
+        assert!(!projected.entry.block.iter().any(|block| block.id.0 == id));
         exchange.append_input(crate::exchange::InputIntent::Steering, "Continue".into(), 1500)?;
         let mut completed = compaction.clone();
         completed.state = CompactionState::Completed;
@@ -3577,6 +3577,7 @@ mod tests {
         use forge_buffer::block::StatusHint;
         let cases = [
             (SessionPhase::Paused, "Paused", false, None),
+            (SessionPhase::Compacting, "Compacting", true, None),
             (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: None }, "Saving exchange", true, None),
             (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: Some("locked".into()) }, "Saving exchange failed · locked", false, None),
             (SessionPhase::WaitingForAgent { agent_count: 2 }, "Waiting for 2 agents", true, Some(StatusHint::Working)),

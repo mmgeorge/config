@@ -889,12 +889,18 @@ impl HarnessBroker {
                 .cloned()
         });
         let active_wait = self.active_wait_projection.clone();
+        let session_event_list = self.store.list_session_event(&self.session.id)?;
         let mut status = crate::session::state_machine::SessionPhase::resolve(
             active_plan.as_ref(),
             active_wait.as_ref(),
             interaction.last(),
         );
         if let Some(execution) = goal_execution.as_ref() { Self::execution_status(&mut status, execution); }
+        if session_event_list.iter().any(|event| matches!(&event.detail,
+            SessionEventKind::Compaction { compaction }
+                if compaction.state == crate::backend::CompactionState::Running)) {
+            status = crate::session::state_machine::SessionPhase::Compacting;
+        }
         self.record_plan_trace(
             "status_projected",
             json!({ "session_id": self.session.id, "status": status }),
@@ -914,7 +920,7 @@ impl HarnessBroker {
             resolution_list: self.store.list_plan_resolution(&self.session.id)?,
             agent_run_list: agent_run_list.clone(),
             agent_exchange_list: agent_exchange_list.clone(),
-            session_event_list: self.store.list_session_event(&self.session.id)?,
+            session_event_list,
             plan_file: &self.plan_file,
         })?;
         if status.visible() {
@@ -11251,6 +11257,11 @@ mod test {
             .await;
 
         assert!(compacted.response.error().is_none());
+        let statuses = compacted.event.iter().filter(|event| event.event == "document_changed")
+            .filter_map(|event| event.payload.pointer("/status/kind").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(statuses, ["compacting", "idle"]);
+        assert!(timeline_text(&broker.snapshot().unwrap()).contains("Context compacted"));
         assert_eq!(
             broker
                 .session
@@ -11274,6 +11285,27 @@ mod test {
         let SessionEventKind::Compaction { compaction } = &records[0].detail else { panic!("compaction record missing") };
         assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
         assert!(compaction.manual);
+        for (state, heading) in [
+            (crate::backend::CompactionState::Running, None),
+            (crate::backend::CompactionState::Failed, Some("Context compaction failed")),
+            (crate::backend::CompactionState::Unconfirmed, Some("Context compaction completion unconfirmed")),
+            (crate::backend::CompactionState::Completed, Some("Context compacted")),
+        ] {
+            let mut record = records[0].clone();
+            let SessionEventKind::Compaction { compaction } = &mut record.detail else { unreachable!() };
+            compaction.state = state;
+            broker.store.save_session_event(&record).unwrap();
+            let snapshot = broker.snapshot().unwrap();
+            let text = timeline_text(&snapshot);
+            if let Some(heading) = heading {
+                assert!(matches!(snapshot.status, crate::session::state_machine::SessionPhase::Idle));
+                assert!(text.contains(heading));
+            } else {
+                assert!(matches!(snapshot.status, crate::session::state_machine::SessionPhase::Compacting));
+                assert!(!snapshot.timeline.iter().any(|entry| matches!(entry, TimelineEntry::SessionEvent { .. })));
+                assert!(text.contains("Compacting"));
+            }
+        }
 
         let mut exchange = broker.store.list_exchange(&broker.session.id).unwrap().remove(0);
         let automatic = crate::backend::Compaction {
@@ -11284,6 +11316,11 @@ mod test {
         exchange.observe_compaction(automatic.clone(), 200);
         let position = exchange.node_list.len() - 1;
         broker.store.save_exchange(&exchange).unwrap();
+        let running = broker.snapshot().unwrap();
+        assert!(matches!(running.status, crate::session::state_machine::SessionPhase::Compacting));
+        let running_text = timeline_text(&running);
+        assert!(running_text.contains("Compacting"));
+        assert!(!running_text.contains("Compacting context"));
         let mut completion = automatic;
         completion.state = crate::backend::CompactionState::Completed;
         completion.result.summary_content = Some("Retain the original constraints.".into());
@@ -11315,6 +11352,8 @@ mod test {
         assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
         assert_eq!(compaction.result.summary_content.as_deref(), Some("Retain the original constraints."));
         assert_eq!(broker.store.list_session_event(&broker.session.id).unwrap().len(), 1);
+        assert!(matches!(broker.snapshot().unwrap().status,
+            crate::session::state_machine::SessionPhase::Working { .. }));
     }
 
     #[tokio::test]

@@ -110,6 +110,7 @@ pub enum SessionPhase {
     #[default]
     Idle,
     Paused,
+    Compacting,
     Finalizing {
         exchange_id: String,
         error: Option<String>,
@@ -164,6 +165,12 @@ impl SessionPhase {
         active_wait: Option<&ActiveWait>,
         exchange: Option<&Exchange>,
     ) -> Self {
+        if exchange.is_some_and(|exchange| exchange.node_list.iter().any(|node| {
+            matches!(node, crate::exchange::ExchangeNode::Compaction { compaction, .. }
+                if compaction.state == crate::backend::CompactionState::Running)
+        })) {
+            return Self::Compacting;
+        }
         let executing = exchange.is_some_and(|exchange| {
             exchange.state == ExchangeState::Running && exchange.execution_started_at_ms.is_some()
         });
@@ -372,6 +379,25 @@ mod test {
                 reasoning_summary: None,
             }
         );
+    }
+
+    #[test]
+    fn compaction_restores_workflow_status_after_every_terminal_outcome() {
+        for state in [crate::backend::CompactionState::Completed,
+            crate::backend::CompactionState::Failed, crate::backend::CompactionState::Unconfirmed] {
+            let mut exchange = exchange();
+            let original = SessionPhase::resolve(None, None, Some(&exchange));
+            let mut compaction = crate::backend::Compaction {
+                id: "compaction".into(), thread_id: "provider".into(),
+                state: crate::backend::CompactionState::Running, manual: false,
+                started_at_ms: None, completed_at_ms: None, result: Default::default(),
+            };
+            exchange.observe_compaction(compaction.clone(), 50);
+            assert_eq!(SessionPhase::resolve(None, None, Some(&exchange)), SessionPhase::Compacting);
+            compaction.state = state;
+            exchange.observe_compaction(compaction, 60);
+            assert_eq!(SessionPhase::resolve(None, None, Some(&exchange)), original);
+        }
     }
 
     #[test]

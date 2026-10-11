@@ -175,6 +175,9 @@ impl HarnessBroker {
         status: &mut crate::session::state_machine::SessionPhase,
         execution: &PlanExecutionRecord,
     ) {
+        if matches!(status, crate::session::state_machine::SessionPhase::Compacting) {
+            return;
+        }
         if execution.phase == crate::plan::PlanPhase::Checking && execution.state == crate::plan::PlanExecutionState::Active {
             if let Some(run) = execution.check_runs.last().filter(|run| run.state == crate::plan::checks::CheckState::Running) {
                 *status = crate::session::state_machine::SessionPhase::Working {
