@@ -47,6 +47,8 @@ pub fn prepare_new_session(
         plan_executor: preference.as_ref().map_or(source.plan_executor, |value| value.plan_executor.clone()),
         plan_compact: preference.as_ref().map_or(source.plan_compact, |value| value.plan_compact),
         plan_auto_approve_revisions: preference.as_ref().map_or(source.plan_auto_approve_revisions, |value| value.plan_auto_approve_revisions),
+        approval_timeout: source.approval_timeout,
+        answer_timeout: source.answer_timeout,
         context_window: preference.as_ref().and_then(|value| value.model_setting.get(&value.model))
             .and_then(|setting| setting.context_window.clone()).or(source.context_window),
         service_tier: source.service_tier,

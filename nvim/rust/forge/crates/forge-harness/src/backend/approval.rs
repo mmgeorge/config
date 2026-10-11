@@ -7,15 +7,15 @@ use crate::permissions::document::{
     CATEGORY_WEBFETCH, PermissionDecision,
 };
 use crate::permissions::matcher::{
-    PendingCommand, PermissionEvaluation, PermissionRequest, PermissionTarget,
+    CommandParseError, PendingCommand, PermissionEvaluation, PermissionRequest, PermissionTarget,
 };
 use crate::permissions::shell::{self, CommandHighlight, CommandShell};
 use crate::permissions::store::PermissionStore;
-use crate::session::PermissionMode;
+use crate::session::{InputDeadline, InputTimeout, PermissionMode, ResolutionSource};
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
@@ -31,6 +31,8 @@ pub enum ApprovalResolution {
     DenyOnce,
     DenyExact,
     DenyBroad,
+    /// Rejects an expired request without recording a persistent rule.
+    TimedOut,
     Cancel,
 }
 
@@ -53,6 +55,12 @@ pub struct ApprovalRequestView {
     pub provider: String,
     pub reason: Option<String>,
     pub item_list: Vec<ApprovalItem>,
+    /// Captures the original deadline independently of the active window.
+    #[serde(default)]
+    pub deadline: Option<InputDeadline>,
+    /// Distinguishes automatic rejection from an explicit user decision.
+    #[serde(default)]
+    pub resolution_source: ResolutionSource,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -87,13 +95,32 @@ pub struct ApprovalAnswer {
 }
 
 struct PendingApproval {
+    token: Uuid,
     view: ApprovalRequestView,
     response: oneshot::Sender<ApprovalResolution>,
+}
+
+struct PendingRegistration<'registry> {
+    registry: &'registry Mutex<BTreeMap<String, PendingApproval>>,
+    id: String,
+    token: Uuid,
+}
+
+impl Drop for PendingRegistration<'_> {
+    fn drop(&mut self) {
+        if let Ok(mut pending) = self.registry.lock()
+            && pending.get(&self.id).is_some_and(|entry| entry.token == self.token)
+        {
+            pending.remove(&self.id);
+        }
+    }
 }
 
 pub struct PermissionCoordinator {
     pending_map: Mutex<BTreeMap<String, PendingApproval>>,
     store: Arc<RwLock<PermissionStore>>,
+    timeout_by_session: Mutex<BTreeMap<String, (InputTimeout, InputTimeout)>>,
+    feedback_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, String>>,
 }
 
 impl PermissionCoordinator {
@@ -101,7 +128,39 @@ impl PermissionCoordinator {
         Self {
             pending_map: Mutex::new(BTreeMap::new()),
             store,
+            timeout_by_session: Mutex::new(BTreeMap::new()),
+            feedback_by_owner: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// Configure future requests without extending any pending deadline.
+    pub fn configure_timeout(&self, session_id: &str, timeout: InputTimeout) -> Result<()> {
+        self.timeout_by_session.lock().map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
+            .entry(session_id.to_owned()).or_default().0 = timeout.validate()?;
+        Ok(())
+    }
+
+    /// Publish both future-input settings without touching pending requests.
+    pub fn configure_input_timeouts(&self, session_id: &str, approval: InputTimeout, answer: InputTimeout) -> Result<()> {
+        self.timeout_by_session.lock().map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
+            .insert(session_id.to_owned(), (approval.validate()?, answer.validate()?));
+        Ok(())
+    }
+
+    /// Read the current settings for one session independently of active provider work.
+    pub fn input_timeouts(&self, session_id: &str) -> Result<(InputTimeout, InputTimeout)> {
+        Ok(self.timeout_by_session.lock().map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
+            .get(session_id).copied().unwrap_or_default())
+    }
+
+    /// Consume one owner's automatic-rejection guidance at its next continuation boundary.
+    pub fn take_timeout_feedback(&self, owner: &crate::backend::ExecutionOwner) -> Result<Option<String>> {
+        Ok(self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?.remove(owner))
+    }
+
+    /// Check whether one owner needs a serialized continuation after denial.
+    pub fn has_timeout_feedback(&self, owner: &crate::backend::ExecutionOwner) -> Result<bool> {
+        Ok(self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?.contains_key(owner))
     }
 
     pub fn store(&self) -> Arc<RwLock<PermissionStore>> {
@@ -135,15 +194,12 @@ impl PermissionCoordinator {
         address: Option<crate::backend::ProviderAddress>,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalResolution> {
-        if execution_mode == PermissionMode::Yolo && !forced {
-            return Ok(ApprovalResolution::AllowOnce);
-        }
         let mut evaluation = self
             .store
             .read()
             .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
             .compiled()
-            .evaluate(execution_mode, &request);
+            .evaluate(execution_mode, &request)?;
         match evaluation.decision {
             PermissionDecision::Allow if !forced => return Ok(ApprovalResolution::AllowOnce),
             PermissionDecision::Deny => return Ok(ApprovalResolution::DenyOnce),
@@ -159,22 +215,32 @@ impl PermissionCoordinator {
         let id = request.id.clone();
         let mut view = approval_view(&request, &evaluation);
         view.execution_owner = execution_owner;
-        let (sender, receiver) = oneshot::channel();
-        self.pending_map
-            .lock()
-            .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?
-            .insert(
+        let timeout = self.timeout_by_session.lock().map_err(|_| anyhow::anyhow!("approval timeout lock poisoned"))?
+            .get(view.execution_owner.as_ref().map(|owner| owner.session_id.as_str()).unwrap_or_default())
+            .copied().unwrap_or_default().0;
+        let now_ms = i64::try_from(std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH)?.as_millis())?;
+        view.deadline = timeout.deadline(now_ms)?;
+        let expires = tokio::time::Instant::now() + timeout.duration();
+        let (sender, mut receiver) = oneshot::channel();
+        let token = Uuid::new_v4();
+        {
+            let mut pending = self.pending_map.lock().map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
+            anyhow::ensure!(!pending.contains_key(&id), "approval request {id} is already pending");
+            pending.insert(
                 id.clone(),
                 PendingApproval {
+                    token,
                     view: view.clone(),
                     response: sender,
                 },
             );
+        }
+        let _registration = PendingRegistration { registry: &self.pending_map, id: id.clone(), token };
         if let Some(event_sink) = event_sink {
             event_sink
                 .send_wait(BackendEvent {
                     received_at_ms: None,
-                    address,
+                    address: address.clone(),
                     turn_boundary: None,
                     kind: "approval_requested".into(),
                     text: None,
@@ -185,9 +251,28 @@ impl PermissionCoordinator {
                 })
                 .await?;
         }
-        receiver
-            .await
-            .with_context(|| format!("approval request {id} was cancelled"))
+        let expiry = async {
+            if timeout.amount == 0 { std::future::pending::<()>().await; }
+            tokio::time::sleep_until(expires).await;
+        };
+        tokio::select! {
+            result = &mut receiver => result.with_context(|| format!("approval request {id} was cancelled")),
+            () = expiry => {
+                let pending = self.pending_map.lock().map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?.remove(&id);
+                if let Some(mut pending) = pending {
+                    pending.view.resolution_source = ResolutionSource::Timeout;
+                    if let Some(owner) = &pending.view.execution_owner {
+                        self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?
+                            .insert(owner.clone(), format!("Approval {} was automatically rejected because its timeout expired. The user may be unavailable. Continue conservatively within existing permissions, avoid repeating the denied request, and request additional permissions only when essential.", pending.view.id));
+                    }
+                    Self::emit_lifecycle(event_sink, "approval_resolved", &pending.view).await?;
+                    Ok(ApprovalResolution::TimedOut)
+                } else {
+                    // A manual resolver already owns the terminal decision and its persistence.
+                    receiver.await.with_context(|| format!("approval request {id} was cancelled"))
+                }
+            }
+        }
     }
 
     /// Attach canonical execution ownership before publishing or snapshotting an approval.
@@ -196,14 +281,12 @@ impl PermissionCoordinator {
         id: &str,
         exchange_id: &str,
         turn_id: Option<&str>,
-    ) -> Result<ApprovalRequestView> {
+    ) -> Result<Option<ApprovalRequestView>> {
         let mut pending = self
             .pending_map
             .lock()
             .map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
-        let approval = pending
-            .get_mut(id)
-            .context("approval request is no longer pending")?;
+        let Some(approval) = pending.get_mut(id) else { return Ok(None); };
         anyhow::ensure!(
             approval
                 .view
@@ -222,7 +305,7 @@ impl PermissionCoordinator {
             "approval cannot change its owning turn"
         );
         approval.view.turn_id = turn_id.map(str::to_owned);
-        Ok(approval.view.clone())
+        Ok(Some(approval.view.clone()))
     }
 
     pub async fn resolve(
@@ -239,6 +322,8 @@ impl PermissionCoordinator {
             let pending = pending_map
                 .get(approval_id)
                 .with_context(|| format!("approval request is no longer pending: {approval_id}"))?;
+            anyhow::ensure!(!pending.view.deadline.as_ref().is_some_and(|deadline| deadline.expired(0)),
+                "approval request timed out: {approval_id}");
             anyhow::ensure!(
                 answer_list.len() == pending.view.item_list.len(),
                 "every approval item requires one answer"
@@ -266,7 +351,8 @@ impl PermissionCoordinator {
                     .with_context(|| format!("unknown approval choice: {choice_id}"))?;
                 match choice.resolution {
                     ApprovalResolution::Cancel => resolution = ApprovalResolution::Cancel,
-                    ApprovalResolution::DenyOnce
+                    ApprovalResolution::TimedOut
+                    | ApprovalResolution::DenyOnce
                     | ApprovalResolution::DenyExact
                     | ApprovalResolution::DenyBroad
                         if resolution != ApprovalResolution::Cancel =>
@@ -345,6 +431,7 @@ impl PermissionCoordinator {
     }
 
     pub async fn cancel_all(&self, event_sink: Option<&BackendEventSink>) -> Result<()> {
+        self.feedback_by_owner.lock().map_err(|_| anyhow::anyhow!("approval feedback lock poisoned"))?.clear();
         let pending_list = {
             let mut pending_map = self
                 .pending_map
@@ -363,6 +450,7 @@ impl PermissionCoordinator {
 
     /// Cancel only approvals owned by the interrupted execution.
     pub async fn cancel_owner(&self, owner: &crate::backend::ExecutionOwner, event_sink: Option<&BackendEventSink>) -> Result<()> {
+        self.take_timeout_feedback(owner)?;
         let pending_list = {
             let mut pending_map = self.pending_map.lock().map_err(|_| anyhow::anyhow!("approval registry lock poisoned"))?;
             let id_list: Vec<_> = pending_map.iter().filter(|(_, pending)| pending.view.execution_owner.as_ref() == Some(owner))
@@ -477,6 +565,8 @@ fn approval_view(
 ) -> ApprovalRequestView {
     ApprovalRequestView {
         id: request.id.clone(),
+        deadline: None,
+        resolution_source: ResolutionSource::User,
         execution_owner: None,
         exchange_id: None,
         turn_id: None,
@@ -622,7 +712,7 @@ pub fn permission_from_provider(
     method: &str,
     message: &Value,
     workspace: &str,
-) -> PermissionRequest {
+) -> Result<PermissionRequest> {
     let params = message.get("params").unwrap_or(&Value::Null);
     let id = format!("approval-{}", Uuid::new_v4());
     let provider = "Codex CLI";
@@ -645,33 +735,7 @@ pub fn permission_from_provider(
             target: format!("{server}/{tool}"),
         }]
     } else if method.contains("commandExecution") || method == "terminal/create" {
-        let mut shell = provider_shell(params);
-        let command = params
-            .get("command")
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or_else(|| {
-                let arguments = params
-                    .get("args")
-                    .or_else(|| params.get("command"))?
-                    .as_array()?;
-                let arguments = arguments
-                    .iter()
-                    .map(Value::as_str)
-                    .collect::<Option<Vec<_>>>()?
-                    .into_iter()
-                    .map(str::to_owned)
-                    .collect::<Vec<_>>();
-                if let Some((marker, interpreter)) =
-                    crate::permissions::command::shell_script_argument(&arguments)
-                {
-                    shell = Some(interpreter);
-                    Some(arguments[marker + 1].clone())
-                } else {
-                    Some(arguments.join(" "))
-                }
-            })
-            .unwrap_or_else(|| encoded.clone());
+        let (command, shell) = provider_command(params, method.contains("commandExecution"))?;
         vec![PermissionTarget::Command { command, shell }]
     } else if method.contains("fileChange") || method == "fs/write_text_file" {
         let path = provider_path(params).unwrap_or_else(|| workspace.into());
@@ -686,12 +750,54 @@ pub fn permission_from_provider(
             target: method.into(),
         }]
     };
-    PermissionRequest {
+    Ok(PermissionRequest {
         id,
         provider: provider.into(),
         reason,
         target_list,
+    })
+}
+
+/// Recovers provider arguments before applying the selected shell's quoting rules.
+fn provider_command(params: &Value, uses_argv_serialization: bool) -> Result<(String, Option<CommandShell>)> {
+    let parse_error = || CommandParseError {
+        shell: provider_shell(params).unwrap_or(CommandShell::Unknown),
+    };
+    let command = params.get("command");
+    let arguments = if let Some(arguments) = params
+        .get("args")
+        .filter(|arguments| arguments.is_array())
+        .or_else(|| command.filter(|command| command.is_array()))
+        .and_then(Value::as_array)
+    {
+        let mut arguments = arguments
+            .iter()
+            .map(|argument| argument.as_str().map(str::to_owned))
+            .collect::<Option<Vec<_>>>()
+            .ok_or_else(parse_error)?;
+        if let Some(executable) = command.and_then(Value::as_str) {
+            arguments.insert(0, executable.to_owned());
+        }
+        arguments
+    } else if let Some(command) = command.and_then(Value::as_str) {
+        if !uses_argv_serialization {
+            return Ok((command.to_owned(), provider_shell(params)));
+        }
+        shlex::split(command).ok_or_else(parse_error)?
+    } else {
+        return Err(parse_error().into());
+    };
+    if arguments.is_empty() || arguments[0].is_empty() {
+        return Err(parse_error().into());
     }
+    if let Some((marker, shell)) =
+        crate::permissions::command::shell_script_argument(&arguments)
+    {
+        return Ok((arguments[marker + 1].clone(), Some(shell)));
+    }
+    let command = shlex::try_join(arguments.iter().map(String::as_str))
+        .map_err(|_| parse_error())?;
+    Ok((command, Some(CommandShell::Bash)))
 }
 
 /// Normalize one Copilot SDK permission callback into the Harness permission model.
@@ -870,7 +976,7 @@ pub fn codex_response(message: &Value, resolution: ApprovalResolution) -> Value 
     }
     json!({ "decision": match resolution {
         ApprovalResolution::AllowOnce | ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad => "accept",
-        ApprovalResolution::DenyOnce | ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad => "decline",
+        ApprovalResolution::DenyOnce | ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad | ApprovalResolution::TimedOut => "decline",
         ApprovalResolution::Cancel => "cancel",
     }})
 }
@@ -887,6 +993,107 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn shell_parse_errors_never_open_approval_or_change_permission_rules() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("permissions.json");
+        std::fs::write(&path, r#"{"permission":{"bash":{"*":"allow"}}}"#).unwrap();
+        let before = std::fs::read(&path).unwrap();
+        let store = PermissionStore::load(&path, directory.path()).unwrap();
+        let coordinator = PermissionCoordinator::new(Arc::new(RwLock::new(store)));
+        let (sink, mut stream) = crate::backend::events::channel();
+        for mode in [PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo] {
+            for forced in [false, true] {
+                let request = PermissionRequest {
+                    id: "parse-error".into(), provider: "test".into(), reason: None,
+                    target_list: vec![PermissionTarget::Command {
+                        command: "probe 'unfinished".into(),
+                        shell: Some(crate::permissions::shell::CommandShell::PowerShell),
+                    }],
+                };
+                let failure = tokio::time::timeout(std::time::Duration::from_secs(1),
+                    coordinator.authorize_callback(mode, forced, request, None, Some(&sink)))
+                    .await.unwrap().unwrap_err();
+                assert!(failure.downcast_ref::<crate::permissions::matcher::CommandParseError>().is_some());
+                assert!(failure.to_string().contains("shell_command_parse_error"));
+                assert!(failure.to_string().contains("split independent operations"));
+                assert!(coordinator.pending_list().unwrap().is_empty());
+                assert!(stream.try_recv().is_err());
+            }
+            let corrected = PermissionRequest {
+                id: "parse-error".into(), provider: "test".into(), reason: None,
+                target_list: vec![PermissionTarget::Command {
+                    command: "probe corrected".into(),
+                    shell: Some(crate::permissions::shell::CommandShell::PowerShell),
+                }],
+            };
+            assert_eq!(coordinator.authorize(mode, corrected, None, Some(&sink)).await.unwrap(), ApprovalResolution::AllowOnce);
+        }
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
+
+    #[tokio::test]
+    async fn input_timeout_rejects_once_without_rules_and_preserves_other_owners() {
+        use super::*;
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(RwLock::new(PermissionStore::load(directory.path().join("permissions.json"), directory.path()).unwrap()));
+        let before = std::fs::read(directory.path().join("permissions.json")).unwrap();
+        let coordinator = Arc::new(PermissionCoordinator::new(store));
+        coordinator.configure_timeout("expired", InputTimeout { amount: 1, unit: crate::session::TimeoutUnit::S }).unwrap();
+        coordinator.configure_timeout("waiting", InputTimeout { amount: 0, unit: crate::session::TimeoutUnit::M }).unwrap();
+        let (sink, mut stream) = crate::backend::events::channel();
+        let mut tasks = Vec::new();
+        for session in ["expired", "waiting"] {
+            let owner = crate::backend::ExecutionOwner::root(session);
+            let coordinator = coordinator.clone();
+            let sink = sink.clone();
+            tasks.push(tokio::spawn(async move {
+                coordinator.authorize(PermissionMode::Read, PermissionRequest {
+                    id: "same-id".into(), provider: "test".into(), reason: None,
+                    target_list: vec![PermissionTarget::Command { command: "echo timeout".into(), shell: None }],
+                }, Some(crate::backend::ProviderAddress { owner: Some(owner), thread_id: session.into(), turn_id: "turn".into() }), Some(&sink)).await.unwrap()
+            }));
+        }
+        for _ in 0..2 { assert_eq!(stream.recv().await.unwrap().unwrap().kind, "approval_requested"); }
+        let pending = coordinator.pending_list().unwrap();
+        let original = pending.iter().find(|view| view.execution_owner.as_ref().unwrap().session_id == "expired").unwrap();
+        let original_deadline = original.deadline.as_ref().unwrap().expires_at_ms;
+        coordinator.configure_timeout("expired", InputTimeout { amount: 5, unit: crate::session::TimeoutUnit::H }).unwrap();
+        assert_eq!(coordinator.pending_list().unwrap().iter().find(|view| view.id == original.id).unwrap().deadline.as_ref().unwrap().expires_at_ms, original_deadline);
+        let expired = tokio::time::timeout(std::time::Duration::from_secs(3), stream.recv()).await.unwrap().unwrap().unwrap();
+        assert_eq!(expired.data["resolution_source"], "timeout");
+        assert_eq!(tasks.remove(0).await.unwrap(), ApprovalResolution::TimedOut);
+        assert_eq!(codex_response(&json!({"method":"item/commandExecution/requestApproval"}), ApprovalResolution::TimedOut)["decision"], "decline");
+        let pending = coordinator.pending_list().unwrap();
+        assert_eq!(pending.len(), 1);
+        assert!(pending[0].deadline.is_none());
+        assert!(coordinator.has_timeout_feedback(&crate::backend::ExecutionOwner::root("expired")).unwrap());
+        assert!(!coordinator.has_timeout_feedback(&crate::backend::ExecutionOwner::root("waiting")).unwrap());
+        assert_eq!(std::fs::read(directory.path().join("permissions.json")).unwrap(), before);
+        coordinator.cancel_owner(&crate::backend::ExecutionOwner::root("waiting"), None).await.unwrap();
+        assert_eq!(tasks.remove(0).await.unwrap(), ApprovalResolution::Cancel);
+        assert!(coordinator.pending_list().unwrap().is_empty());
+        assert!(coordinator.resolve(&original.id, &[], None).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn input_timeout_registration_is_removed_when_provider_wait_is_dropped() {
+        let coordinator = PermissionCoordinator::transient(".").unwrap();
+        let (sink, mut stream) = crate::backend::events::channel();
+        let provider = coordinator.clone();
+        let waiter = tokio::spawn(async move {
+            provider.authorize_callback(PermissionMode::Read, true, PermissionRequest {
+                id: "abandoned".into(), provider: "test".into(), reason: None,
+                target_list: vec![PermissionTarget::Command { command: "probe".into(), shell: None }],
+            }, None, Some(&sink)).await
+        });
+        stream.recv().await.unwrap().unwrap();
+        assert_eq!(coordinator.pending_list().unwrap().len(), 1);
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        assert!(coordinator.pending_list().unwrap().is_empty());
+    }
+
     use super::*;
     use crate::permissions::store::PermissionStore;
 
@@ -924,7 +1131,7 @@ mod test {
         )
         .unwrap();
         crate::permissions::matcher::CompiledPermissionDocument::compile(document, ".")
-            .evaluate(PermissionMode::Write, request)
+            .evaluate(PermissionMode::Write, request).unwrap()
     }
 
     #[test]
@@ -1206,7 +1413,7 @@ mod test {
                     "params": { "args": [executable, "-c", script] }
                 }),
                 ".",
-            );
+            ).unwrap();
             assert_eq!(
                 request.target_list,
                 vec![PermissionTarget::Command {
@@ -1230,6 +1437,108 @@ mod test {
                     shell: Some(shell)
                 }]
             );
+        }
+    }
+
+    #[test]
+    fn codex_transport_quoting_preserves_shell_scripts_and_approval_targets() {
+        let source = r#"rg -n "timeline|markdown|table|wrap" C:\Users\mattm\.codex\memories\MEMORY.md"#;
+        let rendered = r#""C:\\Program Files\\PowerShell\\7\\pwsh.exe" -Command "rg -n \"timeline|markdown|table|wrap\" C:\\Users\\mattm\\.codex\\memories\\MEMORY.md""#;
+        let request = permission_from_provider(
+            "item/commandExecution/requestApproval",
+            &json!({"params": {"command": rendered,
+                "commandActions": [{"type":"unknown", "command":"misleading summary"}],
+                "proposedExecpolicyAmendment": ["unrelated"]}}),
+            ".",
+        ).unwrap();
+        assert_eq!(request.target_list, vec![PermissionTarget::Command {
+            command: source.into(), shell: Some(CommandShell::PowerShell),
+        }]);
+        let parsed = normalize_command_in(source, CommandShell::PowerShell);
+        assert!(!parsed.ambiguous);
+        assert_eq!(parsed.invocation_list.len(), 1);
+        assert_eq!(parsed.invocation_list[0].token_list, [
+            "rg", "-n", "timeline|markdown|table|wrap", r"C:\Users\mattm\.codex\memories\MEMORY.md",
+        ]);
+        let rules = json!({"permission":{"bash":{"*":"ask", "rg *":"allow"}}});
+        let compiled = crate::permissions::matcher::CompiledPermissionDocument::compile(
+            crate::permissions::document::parse_permission_document(&rules.to_string()).unwrap(), ".",
+        );
+        let evaluation = compiled.evaluate(PermissionMode::Write, &request).unwrap();
+        assert_eq!(evaluation.decision, PermissionDecision::Allow);
+        assert!(evaluation.pending_target_list.is_empty());
+    }
+
+    #[test]
+    fn codex_transport_roundtrips_quoting_for_every_supported_shell() {
+        for (executable, shell) in [
+            (r"C:\Program Files\PowerShell\7\pwsh.exe", CommandShell::PowerShell),
+            (r"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe", CommandShell::PowerShell),
+            ("/usr/bin/pwsh", CommandShell::PowerShell),
+            ("/bin/sh", CommandShell::Bash),
+            ("/bin/bash", CommandShell::Bash),
+            ("/bin/zsh", CommandShell::Zsh),
+            ("/opt/homebrew/bin/nu", CommandShell::Nushell),
+            (r"C:\Program Files\nu\bin\nu.exe", CommandShell::Nushell),
+        ] {
+            for source in [
+                r#"probe "timeline|markdown|table|wrap""#,
+                r#"probe 'one; two & three | four'"#,
+                r#"probe "" 'café 世界' 'C:\space path\file.txt'"#,
+                "probe first\nprobe second",
+                "probe 'quote\" and $value and `tick and \\path'",
+            ] {
+                let arguments = [executable, "-c", source];
+                let rendered = shlex::try_join(arguments).unwrap();
+                for params in [json!({"command":rendered}), json!({"args":arguments})] {
+                    let request = permission_from_provider(
+                        "item/commandExecution/requestApproval", &json!({"params":params}), ".",
+                    ).unwrap();
+                    assert_eq!(request.target_list, vec![PermissionTarget::Command {
+                        command: source.into(), shell: Some(shell),
+                    }]);
+                    let parsed = normalize_command_in(source, shell);
+                    assert!(!parsed.ambiguous, "{shell:?}: {source}: {parsed:?}");
+                    let expected = if source.contains('\n') { 2 } else { 1 };
+                    assert_eq!(parsed.invocation_list.len(), expected, "{shell:?}: {source}");
+                    assert!(parsed.invocation_list.iter().all(|command| command.command_name == "probe"));
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn provider_argv_preserves_literal_arguments_without_a_shell_launcher() {
+        let arguments = ["rg", "-n", "a|b;$(probe)", "", r"C:\space path\file.txt"];
+        for params in [
+            json!({"command":shlex::try_join(arguments).unwrap()}),
+            json!({"command":arguments}),
+            json!({"command":"rg", "args":&arguments[1..]}),
+        ] {
+            let request = permission_from_provider(
+                "item/commandExecution/requestApproval", &json!({"params":params}), ".",
+            ).unwrap();
+            let PermissionTarget::Command {command, shell} = &request.target_list[0] else { panic!() };
+            let parsed = normalize_command_in(command, shell.unwrap());
+            assert!(!parsed.ambiguous, "{command}: {parsed:?}");
+            assert_eq!(parsed.invocation_list.len(), 1);
+            assert_eq!(parsed.invocation_list[0].token_list, arguments);
+        }
+    }
+
+    #[test]
+    fn invalid_provider_transport_returns_parse_errors() {
+        for params in [
+            json!({"command":"pwsh -c 'unfinished"}),
+            json!({"command":""}),
+            json!({"args":[]}),
+            json!({"args":["pwsh", "-c", 42]}),
+            json!({"command":"rg\u{0}tail"}),
+        ] {
+            let error = permission_from_provider(
+                "item/commandExecution/requestApproval", &json!({"params":params}), ".",
+            ).unwrap_err();
+            assert!(error.downcast_ref::<CommandParseError>().is_some(), "{error:#}");
         }
     }
 
@@ -1339,7 +1648,7 @@ mod test {
         assert_eq!(event.kind, "approval_requested");
         let owned = coordinator
             .bind_owner("approval-one", "child-exchange", Some("child-turn"))
-            .unwrap();
+            .unwrap().unwrap();
         assert_eq!(owned.exchange_id.as_deref(), Some("child-exchange"));
         let snapshot = coordinator.pending_list().unwrap();
         assert_eq!(snapshot[0].exchange_id, owned.exchange_id);
@@ -1515,28 +1824,27 @@ mod test {
     }
 
     #[test]
-    fn ambiguous_review_marks_the_entire_original_command() {
-        let source = "ForEach-Object { probe x";
+    fn comma_argument_review_marks_each_command_in_the_original_script() {
+        let source = "probe one,two | probe three,four; probe five,six";
         let target = PermissionTarget::Command {
             command: source.into(),
             shell: Some(CommandShell::PowerShell),
         };
         let request = PermissionRequest {
-            id: "ambiguous".into(),
+            id: "comma-arguments".into(),
             provider: "test".into(),
             reason: None,
             target_list: vec![target.clone()],
         };
         let view = approval_view(&request, &evaluate_review(&request));
-        assert_eq!(
-            view.item_list[0].command_list[0].focus_range_list,
-            vec![0..source.len()]
-        );
-        assert!(
-            view.item_list[0]
-                .choice_list
-                .iter()
-                .all(|choice| choice.rule_list.is_empty())
-        );
+        assert_eq!(view.item_list.len(), 3);
+        for (item, command) in view.item_list.iter().zip([
+            "probe one,two", "probe three,four", "probe five,six",
+        ]) {
+            let start = source.find(command).unwrap();
+            assert_eq!(item.command_list[0].source, source);
+            assert_eq!(item.command_list[0].focus_range_list, vec![start..start + command.len()]);
+            assert!(item.choice_list.iter().any(|choice| !choice.rule_list.is_empty()));
+        }
     }
 }

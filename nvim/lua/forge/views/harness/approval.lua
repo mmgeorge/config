@@ -30,6 +30,8 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@class ForgeApprovalRequest
 ---@field id string
 ---@field reason? string
+---@field deadline? {expires_at_ms: number}
+---@field resolution_source? 'user'|'timeout'
 ---@field item_list ForgeApprovalItem[]
 
 ---@class ForgeApprovalAnswer
@@ -192,6 +194,7 @@ local function build_spec(instance)
   end
   return {
     owner = "approval", action_list = actions,
+    deadline = request.deadline,
     host = {
       window_list = host.window_list or { host.transcript_win },
       control_win = host.control_win or host.transcript_win,

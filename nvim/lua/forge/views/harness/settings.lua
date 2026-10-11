@@ -2,6 +2,7 @@ local M = {}
 local client = require("forge.client")
 local picker = require("forge.views.picker")
 local picker_field = require("forge.views.picker.field")
+local duration = require("forge.views.harness.duration")
 local notifications = require("forge.infra.notifications")
 local log_buffer_by_path = {}
 local log_revision_by_buffer = {}
@@ -165,24 +166,26 @@ end
 ---@param state ForgeHarnessPresentationState
 ---@param host table
 function M.open(state, host)
+  if not state.session then return end
   local session_id = state.session.id
   request(session_id, "trace.status", {}, function(status)
-    if state.session.id ~= session_id then return end
+    if not state.session or state.session.id ~= session_id then return end
     local pending = false
-    local active = state.session
+    local active = assert(state.session)
     local cli = active.provider_label or ({ codex = "Codex CLI", copilot = "Copilot CLI" })[active.backend] or active.backend
     local build_spec
+    local timeout_focus = { approval_timeout = "amount", answer_timeout = "amount" }
     local access = require("forge.views.harness.access")
     local function configure(params, completed)
-      if state.session.id ~= session_id then return end
+      if not state.session or state.session.id ~= session_id then return end
       pending = true
       local session = require("forge.session")
       local previous = session.harness
       session.activate_harness(state)
       require("forge.views.harness.controller").configure(params, false, function(applied)
         pending = false
-        if state.session.id ~= session_id then return end
-        active = state.session
+        if not state.session or state.session.id ~= session_id then return end
+        active = assert(state.session)
         if completed then completed(applied) end
         if picker.is_open("harness-config") then picker.update(build_spec()) end
       end)
@@ -194,6 +197,10 @@ function M.open(state, host)
     local function toggle(context, direction)
       if pending or not context.option then return end
       local id = context.option.id
+      if timeout_focus[id] then
+        configure({ [id] = duration.change(duration.value(active[id]), timeout_focus[id], direction or 1) })
+        return
+      end
       if id == "sandbox" or id == "write-access" or id == "windows-sandbox" then
         local policy = access.policy(active)
         local supported = active.backend == "codex" or active.backend == "mock"
@@ -262,6 +269,8 @@ function M.open(state, host)
           id = "config", title = "Configuration", subtitle = "CLI: " .. (cli or "Unknown"),
           column_headers = { "Setting", "Value", "Description" },
           option_list = {
+            { id = "approval_timeout", label = "Approval timeout", columns = { "Approval timeout", duration.render(duration.value(active.approval_timeout), timeout_focus.approval_timeout), "Automatically reject unanswered approvals · 0 disables" } },
+            { id = "answer_timeout", label = "Answer timeout", columns = { "Answer timeout", duration.render(duration.value(active.answer_timeout), timeout_focus.answer_timeout), "Automatically answer questions using recommended defaults · 0 disables" } },
             { id = "shell", label = "Shell", columns = { "Shell", picker_field.render(active.shell == "nushell" and "Nushell" or "System", true), "Accepted checks run locally · Nushell available when installed" } },
             { id = "default-write-permission", label = "Default write permission", columns = { "Default write permission", picker_field.render(active.default_write_permission or "write", true), "Applied to new goals and accepted plans" } },
             { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
@@ -278,13 +287,35 @@ function M.open(state, host)
             { id = "native-import", label = "Import native configuration", columns = { "Import native configuration", "Preview / select", "Import skills or MCP definitions into Forge settings" } },
             provider_setup,
           },
-          footer = "←→ change setting  Enter change/select provider  q close",
+          footer = "←→ change setting  Tab amount/unit  Enter edit/select  q close",
         } },
         action_list = {
           { id = "previous-value", command = "previous_value", callback = function(context) toggle(context, -1) end },
           { id = "next-value", command = "next_value", callback = function(context) toggle(context, 1) end },
+          { key = "<Tab>", modes = { "n", "i" }, desc = "Select timeout amount or unit", callback = function(context)
+            local id = context.option and context.option.id
+            if not timeout_focus[id] or pending then return end
+            timeout_focus[id] = timeout_focus[id] == "amount" and "unit" or "amount"
+            picker.update(build_spec())
+          end },
         },
         on_confirm = function(result)
+          local id = result.option.id
+          if timeout_focus[id] and timeout_focus[id] == "amount" then
+            if pending then return false end
+            vim.ui.input({ prompt = result.option.label .. " amount (0 = Off): ", default = tostring(duration.value(active[id]).amount) }, function(text)
+              if text == nil then return end
+              local amount = tonumber(text)
+              if not text:match("^%d+$") or not amount or amount > 4294967295 then
+                notifications.error("Enter a whole number from 0 to 4294967295", "Harness timeout")
+                return
+              end
+              local value = duration.value(active[id])
+              value.amount = amount
+              configure({ [id] = value })
+            end)
+            return false
+          end
           if result.option.id == "native-import" then
             require("forge.views.harness.native_import").open(state, host)
             return false

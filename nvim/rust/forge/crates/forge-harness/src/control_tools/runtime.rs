@@ -744,11 +744,11 @@ mod test {
             question: "Which scope?".into(),
             options: vec![
                 crate::plan::PlanQuestionOption {
-                    label: "Narrow".into(),
+                    recommended: false, label: "Narrow".into(),
                     description: "Keep it narrow.".into(),
                 },
                 crate::plan::PlanQuestionOption {
-                    label: "Broad".into(),
+                    recommended: false, label: "Broad".into(),
                     description: "Expand it.".into(),
                 },
             ],

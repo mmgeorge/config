@@ -62,7 +62,10 @@ pub struct CommandHighlight {
 
 fn parse_tree(command: &str, shell: CommandShell) -> Option<Tree> {
     let language = shell.grammar()?;
-    if command.trim().is_empty() || command.len() > 65_536 {
+    // The pinned Zsh grammar treats escaped newlines as command boundaries.
+    if command.trim().is_empty() || command.len() > 65_536
+        || (shell == CommandShell::Zsh && command.contains("\\\n"))
+    {
         return None;
     }
     let mut parser = Parser::new();
@@ -166,16 +169,19 @@ pub(super) fn parse(command: &str, shell: CommandShell) -> CommandNormalization 
         result.ambiguous = true;
         return result;
     };
-    if tree.root_node().has_error() {
-        result.ambiguous = true;
-        return result;
-    }
     let mut pending = vec![(tree.root_node(), 0)];
     let mut visited = 0;
     let mut validated_structure = false;
     while let Some((node, depth)) = pending.pop() {
         visited += 1;
-        if depth > 64 || visited > 8192 || unsupported(node, command, shell) {
+        if depth > 64
+            || visited > 8192
+            || node.is_error()
+            || (node.is_missing()
+                && !(shell == CommandShell::PowerShell
+                    && powershell_array_separator(node, command)))
+            || unsupported(node, command, shell)
+        {
             result.ambiguous = true;
             break;
         }
@@ -216,13 +222,66 @@ pub(super) fn parse(command: &str, shell: CommandShell) -> CommandNormalization 
             CommandShell::Unknown => false,
         };
         let mut cursor = node.walk();
-        let children = node.named_children(&mut cursor).collect::<Vec<_>>();
+        let children = node.children(&mut cursor).collect::<Vec<_>>();
         pending.extend(children.into_iter().rev().map(|child| (child, depth + 1)));
     }
     if result.invocation_list.is_empty() && !validated_structure {
         result.ambiguous = true;
     }
     result
+}
+
+// The pinned grammar inserts a missing space before comma-prefixed bare array values.
+// Accept only adjacent literal arguments so recovery cannot conceal executable syntax.
+fn powershell_array_separator(node: Node<'_>, source: &str) -> bool {
+    if node.kind() != " " {
+        return false;
+    }
+    let Some(separator) = node.parent().filter(|parent| {
+        parent.kind() == "command_argument_sep"
+            && parent
+                .parent()
+                .is_some_and(|parent| parent.kind() == "command_elements")
+    }) else {
+        return false;
+    };
+    let Some(previous) = separator.prev_named_sibling() else {
+        return false;
+    };
+    let Some(next) = separator.next_named_sibling() else {
+        return false;
+    };
+    let literal = |node: Node<'_>| {
+        let token = text(node, source);
+        let token = token.strip_prefix(',').unwrap_or(token);
+        node.kind() == "generic_token"
+            && !token.is_empty()
+            && !token.chars().any(|character| {
+                character.is_whitespace()
+                    || matches!(
+                        character,
+                        ',' | '$'
+                            | '`'
+                            | '\''
+                            | '"'
+                            | '('
+                            | ')'
+                            | '{'
+                            | '}'
+                            | '['
+                            | ']'
+                            | '@'
+                            | '|'
+                            | '&'
+                            | ';'
+                    )
+            })
+    };
+    previous.end_byte() == separator.start_byte()
+        && separator.end_byte() == next.start_byte()
+        && text(next, source).starts_with(',')
+        && literal(previous)
+        && literal(next)
 }
 
 // The pinned grammar confuses a leading ForEach-Object with the foreach keyword.

@@ -501,6 +501,7 @@ impl HarnessService {
                     .cloned()
                     .collect();
                 for controller in controller_list {
+                    if let Some(task) = controller.timeout_task.lock().await.take() { task.abort(); }
                     controller.plan_review.close_all()?;
                     *controller.mcp_discovery.lock().await = Default::default();
                     controller.cancellation.request(false);
@@ -606,6 +607,7 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    timeout_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     agent_coordinator: Arc<crate::agent::AgentCoordinator>,
     agent_backend_factory: crate::agent::AgentBackendFactory,
@@ -643,6 +645,7 @@ impl SessionController {
     fn new(broker: HarnessBroker) -> Arc<Self> {
         let catalog_request = broker.backend_catalog_request();
         Arc::new(Self {
+            timeout_task: Mutex::new(None),
             agent_task: Mutex::new(None),
             agent_coordinator: broker.agent_coordinator(),
             agent_backend_factory: broker.agent_backend_factory.clone(),
@@ -663,6 +666,7 @@ impl SessionController {
     }
 
     async fn attach_compaction(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
+        self.attach_timeout(message_sink).await;
         self.attach_agents(message_sink).await?;
         let mut task = self.compaction_task.lock().await;
         if task.is_some() { return Ok(()); }
@@ -687,6 +691,58 @@ impl SessionController {
             }
         }));
         Ok(())
+    }
+
+    async fn attach_timeout(self: &Arc<Self>, message_sink: &MessageSender) {
+        let mut task = self.timeout_task.lock().await;
+        if task.is_some() { return; }
+        let controller = Arc::downgrade(self);
+        let message_sink = message_sink.clone();
+        *task = Some(tokio::spawn(async move {
+            let mut active_deadline = None;
+            let mut interval = tokio::time::interval(Duration::from_millis(250));
+            interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+            loop {
+                interval.tick().await;
+                let Some(controller) = controller.upgrade() else { return; };
+                let Ok(_admission) = controller.execution_admission.try_acquire() else { continue; };
+                let Ok(mut broker) = controller.broker.try_lock() else { continue; };
+                let session_id = controller.catalog_request.read().await.harness_session_id.clone();
+                let result = async {
+                    if let Some(request) = broker.expire_input(&mut active_deadline)? {
+                        if request.method == "question.continue" {
+                            message_sink.send_event(SessionEvent { session_id: session_id.clone(), event: "question_answered".into(),
+                                payload: json!({"resolution_source":"timeout"}) }).await?;
+                        }
+                        let (root, owner, client_id) = broker.lease_identity();
+                        let (stop, stopped) = tokio::sync::oneshot::channel();
+                        let heartbeat = tokio::spawn(run_lease_heartbeat(root, owner, client_id, stopped));
+                        let dispatch = async {
+                            let mut continuing = dispatch_task_attempt(&mut broker, &session_id, request, &message_sink, Arc::clone(&controller.catalog_request)).await?;
+                            while continuing {
+                                continuing = dispatch_task_attempt(&mut broker, &session_id,
+                                    Request { id: 0, method: "goal.continue".into(), params: json!({}) },
+                                    &message_sink, Arc::clone(&controller.catalog_request)).await?;
+                            }
+                            Ok::<(), anyhow::Error>(())
+                        }.await;
+                        let _ = stop.send(());
+                        heartbeat.await.context("input timeout lease task failed")?;
+                        dispatch?;
+                    }
+                    Ok::<(), anyhow::Error>(())
+                }.await;
+                drop(broker);
+                match result {
+                    Ok(()) => {},
+                    Err(error) if error.is::<crate::broker::TurnCancelled>() => {},
+                    Err(error) => {
+                        let _ = message_sink.send_event(SessionEvent { session_id, event: "backend_event".into(),
+                            payload: json!({"kind":"error","text":format!("Input timeout failed: {error:#}")}) }).await;
+                    }
+                }
+            }
+        }));
     }
 
     async fn attach_agents(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
@@ -717,6 +773,7 @@ impl SessionController {
 
 impl Drop for SessionController {
     fn drop(&mut self) {
+        if let Some(task) = self.timeout_task.get_mut().take() { task.abort(); }
         if let Some(task) = self.agent_task.get_mut().take() { task.abort(); }
         if let Some(task) = self.compaction_task.get_mut().take() { task.abort(); }
     }
@@ -914,6 +971,28 @@ async fn route_request(
     }
     let controller = registry.resolve(&session_id).await?;
     controller.attach_compaction(message_sink).await?;
+    if method == HarnessMethod::InputTimeoutConfigure {
+        let catalog = controller.catalog_request.read().await.clone();
+        let mut settings = crate::settings::SettingsStore::open(PathBuf::from(&registry.initialize.data_root).as_path())?;
+        let snapshot = settings.get(&catalog.workspace, &session_id, &registry.initialize.backend.kind)?;
+        let mut desired = settings.layer_settings(crate::settings::SettingScope::Global, &catalog.workspace, &session_id)?;
+        ensure!(request.params.as_object().is_some_and(|fields| !fields.is_empty()
+            && fields.keys().all(|field| matches!(field.as_str(), "approval_timeout" | "answer_timeout"))),
+            "input timeout configuration accepts only approval_timeout and answer_timeout");
+        if let Some(value) = request.params.get("approval_timeout") {
+            desired.approval_timeout = Some(serde_json::from_value::<crate::session::InputTimeout>(value.clone())?.validate()?);
+        }
+        if let Some(value) = request.params.get("answer_timeout") {
+            desired.answer_timeout = Some(serde_json::from_value::<crate::session::InputTimeout>(value.clone())?.validate()?);
+        }
+        settings.update(snapshot.revision, crate::settings::SettingScope::Global, &catalog.workspace, &session_id, &desired)?;
+        let effective = settings.get(&catalog.workspace, &session_id, &registry.initialize.backend.kind)?.desired;
+        let approval = effective.approval_timeout.unwrap_or_default();
+        let answer = effective.answer_timeout.unwrap_or_default();
+        controller.permission.configure_input_timeouts(&session_id, approval, answer)?;
+        message_sink.send_response(Response::success(request.id, json!({"approval_timeout":approval,"answer_timeout":answer}))?).await?;
+        return Ok(());
+    }
     if matches!(method, HarnessMethod::SettingsGet | HarnessMethod::SettingsUpdate | HarnessMethod::SettingsReset
         | HarnessMethod::SettingsImportPreview | HarnessMethod::SettingsImportApply
         | HarnessMethod::BackendSkillsSetEnabled | HarnessMethod::BackendMcpSetEnabled) {
@@ -1837,6 +1916,34 @@ async fn run_lease_heartbeat(
 mod tests {
     use super::*;
     use forge_diff::cache::CacheLimits;
+
+    #[tokio::test]
+    async fn input_timeout_settings_do_not_interrupt_a_busy_session() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let execution = controller.execution_admission.acquire().await?;
+        let broker = controller.broker.lock().await;
+        let (sink, _output) = forge_protocol::outbound::channel();
+        tokio::time::timeout(Duration::from_secs(2), service.dispatch(Some(session_id.clone()), Request {
+            id:2, method:"session.input_timeouts".into(),
+            params:json!({"approval_timeout":{"amount":2,"unit":"s"},"answer_timeout":{"amount":0,"unit":"m"}}),
+        }, &sink)).await??;
+        let (approval, answer) = controller.permission.input_timeouts(&session_id)?;
+        assert_eq!(approval.amount, 2);
+        assert_eq!(answer.amount, 0);
+        assert!(controller.execution_admission.try_acquire().is_err());
+        assert_eq!(broker.snapshot()?.session.approval_timeout, approval);
+        drop(broker);
+        drop(execution);
+        let settings = crate::settings::SettingsStore::open(fixture.path().join("data").as_path())?;
+        assert_eq!(settings.get(&fixture.path().to_string_lossy(), &session_id, "mock")?.desired.answer_timeout, Some(answer));
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn settings_application_orders_progress_and_retains_value_free_timeline() -> Result<()> {

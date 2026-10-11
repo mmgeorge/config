@@ -1755,6 +1755,7 @@ mod tests {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            approval_resolution: Vec::new(),
             disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 0,

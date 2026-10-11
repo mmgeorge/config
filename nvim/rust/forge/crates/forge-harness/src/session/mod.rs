@@ -3,6 +3,8 @@ use serde::{Deserialize, Serialize};
 
 mod access;
 mod shell;
+mod timeout;
+pub use timeout::{InputDeadline, InputTimeout, ResolutionSource, TimeoutUnit};
 pub use shell::CheckShell;
 pub use access::{AccessPolicy, WindowsSandbox, WriteAccess};
 pub mod continuation;
@@ -136,6 +138,12 @@ pub struct HarnessSession {
     #[serde(default = "auto_approve_revisions")]
     pub plan_auto_approve_revisions: bool,
     #[serde(default)]
+    /// Limits each pending approval independently.
+    pub approval_timeout: InputTimeout,
+    #[serde(default)]
+    /// Limits one complete question set.
+    pub answer_timeout: InputTimeout,
+    #[serde(default)]
     pub context_window: Option<String>,
     #[serde(default)]
     pub service_tier: crate::backend::ServiceTier,
@@ -187,6 +195,12 @@ pub struct HarnessPreference {
     pub plan_compact: bool,
     #[serde(default = "auto_approve_revisions")]
     pub plan_auto_approve_revisions: bool,
+    #[serde(default)]
+    /// Limits each pending approval independently.
+    pub approval_timeout: InputTimeout,
+    #[serde(default)]
+    /// Limits one complete question set.
+    pub answer_timeout: InputTimeout,
 }
 
 /// Selects the model used after a plan is accepted.

@@ -389,7 +389,8 @@
       ".": "allow"
     },
     "mcp": {
-      "*": "ask"
+      "*": "ask",
+      "sem/*": "allow"
     },
     "read": {
       "*": "allow"

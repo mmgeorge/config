@@ -444,6 +444,7 @@ pub fn plan_question_input_schema() -> Value {
                                 "type": "object",
                                 "properties": {
                                     "label": { "type": "string" },
+                                    "recommended": { "type": "boolean" },
                                     "description": { "type": "string" }
                                 },
                                 "required": ["label", "description"],

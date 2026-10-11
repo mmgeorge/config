@@ -375,7 +375,7 @@ mod tests {
                     header: "Goal".into(),
                     question: "Which migration goal?".into(),
                     options: vec![crate::plan::PlanQuestionOption {
-                        label: "Rust learning".into(),
+                        recommended: false, label: "Rust learning".into(),
                         description: "Learn Rust ownership".into(),
                     }],
                     allow_freeform: true,

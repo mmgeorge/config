@@ -641,6 +641,10 @@ local function on_event(event, payload)
     end
     schedule_render()
   elseif event == "question_answered" then
+    if state.plan_question_open then
+      require("forge.views.harness.plan_question").close()
+      state.plan_question_open = false
+    end
     state.active_elicitation = nil
     question_presentation.reset(state)
     synchronize_state()
@@ -2217,6 +2221,26 @@ end
 ---@param completed? fun(applied: boolean)
 function M.configure(next_config, validate_selection, completed)
   local state = harness_state()
+  local timeout_only = next(next_config) ~= nil
+  for field in pairs(next_config) do
+    if field ~= "approval_timeout" and field ~= "answer_timeout" then timeout_only = false end
+  end
+  if timeout_only then
+    local session_id = state.session.id
+    client.request_for(session_id, "session.input_timeouts", next_config, function(result, failure)
+      if failure then
+        report_configuration_error(failure)
+        if completed then completed(false) end
+        return
+      end
+      if state.session.id == session_id then
+        state.session.approval_timeout = result.approval_timeout
+        state.session.answer_timeout = result.answer_timeout
+      end
+      if completed then completed(true) end
+    end)
+    return
+  end
   if state.busy or state.task_operation then
     state.pending_config, state.pending_config_validate = nil, false
     local requested = vim.tbl_extend("force", state.task_config or {}, next_config, { validate = validate_selection == true })

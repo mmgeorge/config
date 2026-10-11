@@ -9,6 +9,8 @@ use crate::backend::{Backend, BackendEvent, BackendOutput, BackendRequest, Execu
 /// Runs one child turn without retaining a broker, storage, or presentation lock.
 pub struct AgentRuntime {
     pub backend: Arc<dyn Backend>,
+    /// Shares timeout feedback without crossing child conversation ownership.
+    pub permission: Arc<crate::backend::approval::PermissionCoordinator>,
     pub request: BackendRequest,
     pub task_id: String,
     pub cancellation: watch::Receiver<bool>,
@@ -21,11 +23,12 @@ impl AgentRuntime {
         anyhow::ensure!(!owner.is_root(), "child runtime cannot own the root conversation");
         let (event_sink, mut event_stream) = crate::backend::events::channel();
         let event_sink = event_sink.owned(owner.clone());
-        let request = self.request.clone();
+        let mut request = self.request.clone();
         let mut stream_open = true;
         let mut cancelled = *self.cancellation.borrow();
-        let mut output = async {
-            let prompt = self.backend.prompt_stream(request, Some(event_sink));
+        let mut output = loop {
+          let result = async {
+            let prompt = self.backend.prompt_stream(request.clone(), Some(event_sink.clone()));
             tokio::pin!(prompt);
             loop {
                 if cancelled {break Err(anyhow::anyhow!("child task interrupted before dispatch"));}
@@ -48,7 +51,14 @@ impl AgentRuntime {
                     else => break Err(anyhow::anyhow!("child task interrupted before dispatch")),
                 }
             }
-        }.await;
+          }.await;
+          if cancelled || result.is_err() { break result; }
+          let Some(feedback) = self.permission.take_timeout_feedback(&owner)? else { break result; };
+          if let Ok(output) = &result {
+              if output.backend_session_id.is_some() { request.backend_session_id = output.backend_session_id.clone(); }
+          }
+          request.input = crate::backend::BackendInput::from_text(feedback);
+        };
         let runtime_key = self.request.runtime_key()?;
         let retained = match tokio::time::timeout(std::time::Duration::from_secs(2),self.backend.active_session_id_for(&runtime_key)).await {
             Ok(retained) => retained,

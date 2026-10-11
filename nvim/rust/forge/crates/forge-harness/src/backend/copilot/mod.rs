@@ -1644,6 +1644,7 @@ impl PermissionHandler for CopilotPermissionHandler {
                 | ApprovalResolution::AllowExact
                 | ApprovalResolution::AllowBroad,
             ) => PermissionResult::approve_once(),
+            Ok(ApprovalResolution::TimedOut) => PermissionResult::reject(Some("Approval automatically rejected because its timeout expired. The user may be unavailable. Continue conservatively within existing permissions and avoid repeating the denied request.".into())),
             Ok(_) => PermissionResult::reject(None),
             Err(error) => PermissionResult::reject(Some(format!("{error:#}"))),
         }

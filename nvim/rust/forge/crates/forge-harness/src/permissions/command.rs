@@ -194,16 +194,27 @@ fn shell_tokens(command: &str, shell: CommandShell) -> Result<Vec<ShellToken>> {
     let mut started = false;
     let mut characters = command.char_indices().peekable();
     while let Some((offset, character)) = characters.next() {
+        if quote.is_none() {
+            let next = characters.peek().map(|(_, character)| *character);
+            anyhow::ensure!(
+                !(matches!(shell, CommandShell::Bash | CommandShell::Zsh)
+                    && character == '$' && matches!(next, Some('\'' | '"')))
+                && !(shell == CommandShell::PowerShell
+                    && ((character == '@' && matches!(next, Some('\'' | '"')))
+                        || matches!(character, '‘' | '’' | '“' | '”')))
+                && !(shell == CommandShell::Nushell && !started && character == 'r' && next == Some('#')),
+                "unsupported shell string encoding"
+            );
+        }
         if !started && !character.is_whitespace() {
             current.range.start = offset;
         }
         if let Some(active) = quote {
             if character == active {
                 if shell == CommandShell::PowerShell
-                    && active == '\''
                     && characters
                         .peek()
-                        .is_some_and(|(_, character)| *character == '\'')
+                        .is_some_and(|(_, character)| *character == active)
                 {
                     let (final_offset, final_character) = characters.next().unwrap();
                     current.append(character, offset..final_offset + final_character.len_utf8());
@@ -211,15 +222,17 @@ fn shell_tokens(command: &str, shell: CommandShell) -> Result<Vec<ShellToken>> {
                     quote = None;
                 }
             } else if (shell == CommandShell::PowerShell && active == '"' && character == '`')
-                || (shell != CommandShell::PowerShell
+                || (matches!(shell, CommandShell::Bash | CommandShell::Zsh)
                     && active == '"'
                     && character == '\\'
                     && characters
                         .peek()
-                        .is_some_and(|(_, next)| matches!(next, '"' | '\\' | '$' | '`')))
+                        .is_some_and(|(_, next)| matches!(next, '"' | '\\' | '$' | '`' | '\n')))
+                || (shell == CommandShell::Nushell && active == '"' && character == '\\')
             {
-                if let Some((final_offset, next)) = characters.next() {
-                    current.append(next, offset..final_offset + next.len_utf8());
+                let (decoded, end) = decode_shell_escape(&mut characters, shell, false)?;
+                if let Some(decoded) = decoded {
+                    current.append(decoded, offset..end);
                 }
             } else {
                 current.append(character, offset..offset + character.len_utf8());
@@ -233,8 +246,9 @@ fn shell_tokens(command: &str, shell: CommandShell) -> Result<Vec<ShellToken>> {
         } else if (shell == CommandShell::PowerShell && character == '`')
             || (matches!(shell, CommandShell::Bash | CommandShell::Zsh) && character == '\\')
         {
-            if let Some((final_offset, next)) = characters.next() {
-                current.append(next, offset..final_offset + next.len_utf8());
+            let (decoded, end) = decode_shell_escape(&mut characters, shell, !started)?;
+            if let Some(decoded) = decoded {
+                current.append(decoded, offset..end);
                 started = true;
             }
         } else if character.is_whitespace() {
@@ -254,6 +268,56 @@ fn shell_tokens(command: &str, shell: CommandShell) -> Result<Vec<ShellToken>> {
         result.push(current);
     }
     Ok(result)
+}
+
+fn decode_shell_escape(
+    characters: &mut std::iter::Peekable<std::str::CharIndices<'_>>,
+    shell: CommandShell,
+    at_word_boundary: bool,
+) -> Result<(Option<char>, usize)> {
+    let (offset, character) = characters.next().ok_or_else(|| anyhow::anyhow!("unfinished shell escape"))?;
+    let mut end = offset + character.len_utf8();
+    if character == '\n' && (matches!(shell, CommandShell::Bash | CommandShell::Zsh)
+        || (shell == CommandShell::PowerShell && at_word_boundary)) {
+        return Ok((None, end));
+    }
+    if shell == CommandShell::PowerShell && at_word_boundary && character == '\r'
+        && characters.peek().is_some_and(|(_, character)| *character == '\n')
+    {
+        let (offset, _) = characters.next().unwrap();
+        return Ok((None, offset + 1));
+    }
+    if matches!(shell, CommandShell::Bash | CommandShell::Zsh) {
+        return Ok((Some(character), end));
+    }
+    let decoded = match character {
+        '0' => '\0',
+        'a' => '\u{7}',
+        'b' => '\u{8}',
+        'e' => '\u{1b}',
+        'f' => '\u{c}',
+        'n' => '\n',
+        'r' => '\r',
+        't' => '\t',
+        'v' if shell == CommandShell::PowerShell => '\u{b}',
+        'u' => {
+            anyhow::ensure!(characters.next().is_some_and(|(_, character)| character == '{'), "invalid Unicode shell escape");
+            let mut digits = String::new();
+            loop {
+                let (offset, character) = characters.next().ok_or_else(|| anyhow::anyhow!("unfinished Unicode shell escape"))?;
+                end = offset + character.len_utf8();
+                if character == '}' { break; }
+                anyhow::ensure!(character.is_ascii_hexdigit() && digits.len() < 6, "invalid Unicode shell escape");
+                digits.push(character);
+            }
+            u32::from_str_radix(&digits, 16).ok().and_then(char::from_u32)
+                .ok_or_else(|| anyhow::anyhow!("invalid Unicode shell escape"))?
+        }
+        character if shell == CommandShell::PowerShell || matches!(character,
+            '\\' | '"' | '\'' | '/' | '(' | ')' | '{' | '}' | '$' | '^' | '#' | '|' | '~') => character,
+        _ => anyhow::bail!("invalid Nushell escape"),
+    };
+    Ok((Some(decoded), end))
 }
 
 pub fn normalize_command(command: &str) -> CommandNormalization {

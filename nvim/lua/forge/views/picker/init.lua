@@ -44,6 +44,21 @@ local function title_chunks(instance, width)
     { counter, "ForgePickerHint" },
   }
   local right = page.header_right or instance.spec.header_right
+  local deadline = instance.spec.deadline
+  if type(deadline) == "table" and type(deadline.expires_at_ms) == "number" then
+    if instance.deadline_ms ~= deadline.expires_at_ms then
+      instance.deadline_ms = deadline.expires_at_ms
+      instance.deadline_origin = vim.uv.hrtime()
+      local seconds, microseconds = vim.uv.gettimeofday()
+      instance.deadline_remaining = math.max(0, deadline.expires_at_ms - seconds * 1000 - microseconds / 1000)
+    end
+    local seconds = math.max(0, math.ceil((instance.deadline_remaining - (vim.uv.hrtime() - instance.deadline_origin) / 1000000) / 1000))
+    if seconds >= 3600 then
+      right = ("%d:%02d:%02d"):format(math.floor(seconds / 3600), math.floor(seconds / 60) % 60, seconds % 60)
+    else
+      right = ("%02d:%02d"):format(math.floor(seconds / 60), seconds % 60)
+    end
+  end
   if right and right ~= "" then
     local left_width = vim.fn.strdisplaywidth("  " .. title .. " " .. counter)
     local available = math.max(0, width - left_width - 3)
@@ -58,6 +73,23 @@ local function title_chunks(instance, width)
     end
   end
   return chunks
+end
+
+local function update_deadline_timer(instance)
+  if type(instance.spec.deadline) ~= "table" then
+    if instance.timer then instance.timer:stop() instance.timer:close() instance.timer = nil end
+    instance.deadline_ms = nil
+    return
+  end
+  if instance.timer then return end
+  instance.timer = vim.uv.new_timer()
+  vim.uv.update_time()
+  instance.timer:start(1000, 1000, vim.schedule_wrap(function()
+    if active == instance and valid_window(instance.win) then
+      local width = vim.api.nvim_win_get_width(instance.win)
+      vim.api.nvim_win_set_config(instance.win, { title = title_chunks(instance, width), title_pos = "left" })
+    end
+  end))
 end
 
 local function input_footer()
@@ -575,6 +607,7 @@ function Picker.open(spec)
   }
   instance.buf, instance.win = picker_window.open(spec.host, width, height, title_chunks(instance, width), origin)
   active = instance
+  update_deadline_timer(instance)
   render_view(instance)
   install_keymaps(instance)
   vim.api.nvim_clear_autocmds({ group = resize_group })
@@ -607,6 +640,7 @@ function Picker.update(spec)
   clear_modal_keymaps(active)
   local previous_state = active.state
   active.spec = spec
+  update_deadline_timer(active)
   local next_state = picker_state.new(spec)
   next_state.selected_index_by_page = previous_state.selected_index_by_page
   next_state.selected_set_by_page = previous_state.selected_set_by_page
@@ -651,6 +685,7 @@ end
 function Picker.close(notify)
   local instance = active
   if not instance then return end
+  if instance.timer then instance.timer:stop() instance.timer:close() instance.timer = nil end
   set_picker_cursor_hidden(instance, false)
   active = nil
   vim.api.nvim_clear_autocmds({ group = resize_group })

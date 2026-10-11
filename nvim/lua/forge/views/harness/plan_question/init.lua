@@ -79,6 +79,7 @@ local function build_spec(elicitation, host)
   local initial_page = question and math.min((elicitation.current_index or 0) + 1, #pages) or 1
   return {
     owner = "plan_question",
+    deadline = elicitation.deadline,
     host = {
       window_list = host.window_list or { host.transcript_win },
       control_win = host.control_win or host.transcript_win,

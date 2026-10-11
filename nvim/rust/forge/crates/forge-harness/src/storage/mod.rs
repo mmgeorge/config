@@ -1340,6 +1340,8 @@ mod test {
             plan_executor: Default::default(),
             plan_compact: false,
             plan_auto_approve_revisions: true,
+            approval_timeout: Default::default(),
+            answer_timeout: Default::default(),
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: Default::default(),
@@ -1420,6 +1422,7 @@ mod test {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            approval_resolution: Vec::new(),
             disposition: HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 10,
@@ -1507,6 +1510,7 @@ mod test {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            approval_resolution: Vec::new(),
             disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 3,
@@ -1656,6 +1660,8 @@ mod test {
             plan_executor: Default::default(),
             plan_compact: false,
             plan_auto_approve_revisions: true,
+            approval_timeout: Default::default(),
+            answer_timeout: Default::default(),
         };
         store
             .save_preference("D:/work", "codex", &preference)

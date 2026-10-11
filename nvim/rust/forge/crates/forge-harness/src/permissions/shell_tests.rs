@@ -36,9 +36,15 @@ fn check_matrix(shell: CommandShell, fixture_list: &[&str]) {
                 shell: Some(shell),
             }],
         };
-        let allowed = policy("allow", "allow").evaluate(PermissionMode::Write, &request);
-        let denied = policy("allow", "deny").evaluate(PermissionMode::Write, &request);
-        let asked = policy("allow", "ask").evaluate(PermissionMode::Write, &request);
+        let allowed = policy("allow", "allow")
+            .evaluate(PermissionMode::Write, &request)
+            .unwrap();
+        let denied = policy("allow", "deny")
+            .evaluate(PermissionMode::Write, &request)
+            .unwrap();
+        let asked = policy("allow", "ask")
+            .evaluate(PermissionMode::Write, &request)
+            .unwrap();
         if parsed.ambiguous || allowed.decision != PermissionDecision::Allow
             || denied.decision != PermissionDecision::Deny || asked.decision != PermissionDecision::Ask
             || asked.pending_target_list.is_empty()
@@ -70,16 +76,19 @@ fn reject_matrix(shell: CommandShell, fixture_list: &[&str]) {
                 shell: Some(shell),
             }],
         };
-        let result = policy("allow", "allow").evaluate(PermissionMode::Write, &request);
-        if result.decision != PermissionDecision::Ask
-            || result.pending_target_list != request.target_list
-        {
-            failure_list.push((*source).to_owned());
+        for mode in [
+            PermissionMode::Read,
+            PermissionMode::Write,
+            PermissionMode::Yolo,
+        ] {
+            if policy("allow", "allow").evaluate(mode, &request).is_ok() {
+                failure_list.push(format!("{mode:?}: {source}"));
+            }
         }
     }
     assert!(
         failure_list.is_empty(),
-        "{shell:?} permitted unresolved syntax: {failure_list:?}"
+        "{shell:?} accepted unresolved syntax: {failure_list:?}"
     );
 }
 
@@ -123,6 +132,65 @@ fn powershell_commands_nested_in_every_supported_construct_obey_policy() {
 }
 
 #[test]
+fn powershell_comma_arguments_keep_independent_permissions_and_source_ranges() {
+    let source = "Get-ChildItem D:/.local/share/nvim/forge,D:/.cache/nvim/forge -ErrorAction SilentlyContinue |\n  Select-Object FullName,LastWriteTime;\n  rg -n 'markdown|wrap|table|timeline|database' .agents/rules/forge.md .agents/rules/nvim.md";
+    let parsed = normalize_command_in(source, CommandShell::PowerShell);
+    assert!(!parsed.ambiguous, "{parsed:?}");
+    assert_eq!(parsed.invocation_list.len(), 3);
+    for invocation in &parsed.invocation_list {
+        assert_eq!(&source[invocation.source_range.clone()], invocation.source,);
+        for decision in ["ask", "deny"] {
+            let mut rules = serde_json::json!({"*": "allow"});
+            rules[format!("{} *", invocation.command_name)] = decision.into();
+            let document = serde_json::json!({"permission": {"bash": rules}});
+            let compiled = CompiledPermissionDocument::compile(
+                parse_permission_document(&document.to_string()).unwrap(),
+                ".",
+            );
+            let request = PermissionRequest {
+                id: "comma-arguments".into(),
+                provider: "test".into(),
+                reason: None,
+                target_list: vec![PermissionTarget::Command {
+                    command: source.into(),
+                    shell: Some(CommandShell::PowerShell),
+                }],
+            };
+            let result = compiled.evaluate(PermissionMode::Write, &request).unwrap();
+            assert_eq!(
+                result.decision,
+                if decision == "ask" {
+                    PermissionDecision::Ask
+                } else {
+                    PermissionDecision::Deny
+                }
+            );
+            if decision == "ask" {
+                assert_eq!(
+                    result.pending_target_list,
+                    vec![PermissionTarget::Command {
+                        command: invocation.source.clone(),
+                        shell: Some(CommandShell::PowerShell),
+                    }]
+                );
+            }
+        }
+    }
+    check_matrix(
+        CommandShell::PowerShell,
+        &[
+            "CHECK one,two,three",
+            "CHECK -Path D:/one,D:/two -ErrorAction Stop",
+            "CHECK café,世界",
+            "CHECK 'one','two'",
+            "CHECK one,two | CHECK three,four; CHECK five,six",
+            "if ($true) { CHECK one,two } else { CHECK three,four }",
+            "CHECK one,two; Write-Output $(CHECK nested)",
+        ],
+    );
+}
+
+#[test]
 fn powershell_unresolved_execution_never_inherits_an_allow_rule() {
     reject_matrix(
         CommandShell::PowerShell,
@@ -148,6 +216,13 @@ fn powershell_unresolved_execution_never_inherits_an_allow_rule() {
             "do { probe } while (",
             "pwsh -EncodedCommand cAByAG8AYgBlAA==",
             "fish -c 'probe'",
+            "probe one,two; & $command value",
+            "probe one,two; Invoke-Expression $code",
+            "probe one,two; probe 'unfinished",
+            "probe one,two > file",
+            "probe one,",
+            "probe one,,two",
+            "probe one,two; if ($true) { probe value",
         ],
     );
 }
@@ -384,7 +459,10 @@ fn wrapper_denials_and_body_denials_cannot_be_bypassed() {
             ".",
         );
         assert_eq!(
-            compiled.evaluate(PermissionMode::Write, &request).decision,
+            compiled
+                .evaluate(PermissionMode::Write, &request)
+                .unwrap()
+                .decision,
             PermissionDecision::Allow
         );
         let document =
@@ -394,7 +472,10 @@ fn wrapper_denials_and_body_denials_cannot_be_bypassed() {
             ".",
         );
         assert_eq!(
-            compiled.evaluate(PermissionMode::Write, &request).decision,
+            compiled
+                .evaluate(PermissionMode::Write, &request)
+                .unwrap()
+                .decision,
             PermissionDecision::Deny
         );
     }
@@ -423,7 +504,10 @@ fn powershell_foreach_ranges_are_expressions_and_only_loop_commands_need_permiss
             ".",
         );
         assert_eq!(
-            compiled.evaluate(PermissionMode::Write, &request).decision,
+            compiled
+                .evaluate(PermissionMode::Write, &request)
+                .unwrap()
+                .decision,
             PermissionDecision::Allow
         );
     }
@@ -431,16 +515,46 @@ fn powershell_foreach_ranges_are_expressions_and_only_loop_commands_need_permiss
 
 #[test]
 fn shell_quote_decoding_preserves_policy_arguments() {
+    let mut failure_list = Vec::new();
     for (shell, source, expected) in [
         (CommandShell::PowerShell, "probe 'it''s data'", "it's data"),
         (CommandShell::PowerShell, "probe \"a`\"b\"", "a\"b"),
+        (CommandShell::PowerShell, "probe \"a\"\"b\"", "a\"b"),
+        (CommandShell::PowerShell, "probe \"a`nb`t\"", "a\nb\t"),
+        (CommandShell::PowerShell, "probe \"a`u{1f980}b\"", "a🦀b"),
+        (CommandShell::PowerShell, "probe \"a`\nb\"", "a\nb"),
+        (CommandShell::PowerShell, "probe 'a`nb\\path'", "a`nb\\path"),
+        (CommandShell::PowerShell, "probe \"\"", ""),
         (CommandShell::Bash, "probe 'it'\\''s data'", "it's data"),
+        (CommandShell::Bash, "probe a\\\nb", "ab"),
+        (CommandShell::Bash, "probe \"a\\\nb\"", "ab"),
+        (CommandShell::Bash, "probe \"a\\qb\"", "a\\qb"),
+        (CommandShell::Bash, "probe \"a\\\"b\"", "a\"b"),
+        (CommandShell::Bash, "probe a\\|b", "a|b"),
+        (CommandShell::Bash, "probe ''", ""),
         (CommandShell::Zsh, "probe 'it'\\''s data'", "it's data"),
+        (CommandShell::Zsh, "probe \"a\\qb\"", "a\\qb"),
+        (CommandShell::Zsh, "probe \"a\\\"b\"", "a\"b"),
+        (CommandShell::Zsh, "probe a\\|b", "a|b"),
+        (CommandShell::Zsh, "probe ''", ""),
         (CommandShell::Nushell, "probe `a path`", "a path"),
+        (CommandShell::Nushell, "probe \"a\\nb\\t\"", "a\nb\t"),
+        (CommandShell::Nushell, "probe \"a\\u{1f980}b\"", "a🦀b"),
+        (CommandShell::Nushell, "probe 'a\\nb'", "a\\nb"),
+        (CommandShell::Nushell, "probe \"a\\\"b\"", "a\"b"),
+        (CommandShell::Nushell, "probe ''", ""),
     ] {
+        let decoded = super::super::command::shell_token_list(source, shell).unwrap();
+        assert_eq!(decoded[1], expected, "{shell:?}: {source}");
         let parsed = normalize_command_in(source, shell);
-        assert!(!parsed.ambiguous, "{source}");
-        assert_eq!(parsed.invocation_list[0].token_list[1], expected);
+        if parsed.ambiguous {
+            failure_list.push(format!("{shell:?}: {source}"));
+            continue;
+        }
+        if parsed.invocation_list[0].token_list[1] != expected {
+            failure_list.push(format!("{shell:?}: {source}: {parsed:?}"));
+            continue;
+        }
         let pattern =
             super::super::command::exact_command_pattern(&parsed.invocation_list[0]).unwrap();
         assert_eq!(
@@ -448,6 +562,33 @@ fn shell_quote_decoding_preserves_policy_arguments() {
             parsed.invocation_list[0].token_list
         );
         assert_eq!(parsed.invocation_list[0].source, source);
+    }
+    assert!(failure_list.is_empty(), "{}", failure_list.join("\n"));
+}
+
+#[test]
+fn unhandled_string_encodings_fail_closed_instead_of_losing_quoting() {
+    reject_matrix(CommandShell::Bash, &["probe $'a\\nb'", "probe $\"translated\""]);
+    reject_matrix(CommandShell::Zsh, &["probe $'a\\nb'", "probe a\\\nb", "probe \"a\\\nb\""]);
+    reject_matrix(CommandShell::PowerShell, &[
+        "probe @'\na|b\n'@", "probe “a|b”", "probe a`|b", "probe a`\nb",
+    ]);
+    reject_matrix(CommandShell::Nushell, &[
+        "probe r#'a|b'#", "probe \"a\\qb\"", "probe \"a\\u{110000}b\"",
+    ]);
+}
+
+#[test]
+fn lexical_escapes_remain_exact_when_the_grammar_rejects_the_script() {
+    for (shell, source, expected) in [
+        (CommandShell::PowerShell, "probe a`|b", "a|b"),
+        (CommandShell::PowerShell, "probe a`\nb", "a\nb"),
+        (CommandShell::Zsh, "probe a\\\nb", "ab"),
+        (CommandShell::Zsh, "probe \"a\\\nb\"", "ab"),
+    ] {
+        let tokens = super::super::command::shell_token_list(source, shell).unwrap();
+        assert_eq!(tokens, ["probe", expected]);
+        assert!(normalize_command_in(source, shell).ambiguous);
     }
 }
 

@@ -78,6 +78,9 @@ pub struct Exchange {
     pub attributed_diff_text: Option<String>,
     pub checkpoint_diff_text: Option<String>,
     pub attributed_matches_checkpoint: bool,
+    /// Retains terminal approvals and their response source after the picker closes.
+    #[serde(default)]
+    pub approval_resolution: Vec<crate::backend::approval::ApprovalRequestView>,
     pub created_at_ms: i64,
     pub completed_at_ms: Option<i64>,
     pub node_list: Vec<ExchangeNode>,
@@ -157,6 +160,7 @@ impl Exchange {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            approval_resolution: Vec::new(),
             created_at_ms: delegation.created_at_ms,
             completed_at_ms: None,
             node_list: Vec::new(),
@@ -740,6 +744,23 @@ pub struct ExchangeComment {
 mod test {
     use super::*;
 
+    #[test]
+    fn input_timeout_approval_provenance_survives_exchange_serialization() {
+        let mut exchange = interaction();
+        exchange.approval_resolution.push(serde_json::from_value(serde_json::json!({
+            "id":"timed-out", "provider":"test", "exchange_id":exchange.id, "turn_id":null,
+            "reason":"Inspect source", "item_list":[], "deadline":{"expires_at_ms":1000},
+            "resolution_source":"timeout"
+        })).unwrap());
+        let encoded = serde_json::to_value(&exchange).unwrap();
+        let restored: Exchange = serde_json::from_value(encoded.clone()).unwrap();
+        assert_eq!(restored.approval_resolution[0].resolution_source, crate::session::ResolutionSource::Timeout);
+        assert_eq!(restored.approval_resolution[0].deadline.as_ref().unwrap().expires_at_ms, 1000);
+        let mut legacy = encoded;
+        legacy.as_object_mut().unwrap().remove("approval_resolution");
+        assert!(serde_json::from_value::<Exchange>(legacy).unwrap().approval_resolution.is_empty());
+    }
+
     fn interaction() -> Exchange {
         Exchange {
             lifecycle: None,
@@ -762,6 +783,7 @@ mod test {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            approval_resolution: Vec::new(),
             disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 1,

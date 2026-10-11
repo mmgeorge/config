@@ -119,6 +119,10 @@ pub enum HarnessMethod {
     QuestionAsk,
     #[serde(rename = "question.continue")]
     QuestionContinue,
+    #[serde(rename = "approval.continue")]
+    ApprovalContinue,
+    #[serde(rename = "session.input_timeouts")]
+    InputTimeoutConfigure,
     #[serde(rename = "goal.set")]
     GoalSet,
     #[serde(rename = "goal.pause")]

@@ -2210,6 +2210,16 @@ printed before rendering. MCP payload details stop at the Codex transport bounda
 `ToolActivity`, `Turn`, and the Rust timeline projection represent every provider action as a
 generic tool.
 
+Codex activity classification reads the top-level item type rather than searching serialized
+payload text. Errors, messages, reasoning, plans, compaction, review transitions, and native
+child lifecycle items remain separate from tools. Every other typed `item/started` or `item/completed`
+with a nonempty item ID becomes a tool activity, including `webSearch` search and page-open
+operations. Unknown activity types use their provider type as the fallback title and retain the
+complete completed item as JSON output. The provider thread, turn, and item IDs correlate live
+updates with durable records. Main and child timelines, activity summaries, and
+`harness_agent_tool_output` consume those same records without provider-specific rendering.
+Missing IDs or untyped payloads cannot create fallback tool records.
+
 `trace::TraceStore` owns opt-in protocol diagnostics independently from timeline persistence.
 The persisted global preference overrides the initial `harness_logging` default. `/log on`,
 `/log off`, and the `/config` Logging toggle use the same service routes and also set Lua
@@ -2919,7 +2929,7 @@ permission document remains outside provider write authority, including shell co
 The command permission category displays as `shell` while retaining the Rulesync `bash` storage key.
 The matcher splits recognized compound shell requests into distinct command targets and omits targets
 already allowed by policy. Each remaining target owns one picker page with its own exact and broad
-choices. Ambiguous command text remains one target and offers only one-time allow, deny, or cancellation.
+choices. Ambiguous command text returns a parse error without opening the picker.
 Each command approval item retains its complete script payload, shell identity, syntax captures,
 and byte ranges for the executable occurrences covered by its choices. Quoted copies of a command
 do not contribute approval ranges. Nested launcher decoding maps those ranges back through quoting
@@ -2934,6 +2944,16 @@ executed command or stored permission pattern.
 PageUp and PageDown scroll long details independently of the decision list. The visible line range
 indicates remaining content. Exact choices refer to the highlighted command instead of repeating it.
 Shell analysis uses pinned PowerShell, bash, zsh, and Nushell syntax trees without executing source.
+Codex command approval text encodes an argument vector with POSIX `shlex` quoting on every platform.
+The provider boundary decodes that transport with `shlex`, retaining structured argument vectors
+when available. A recognized launcher supplies its exact script argument and shell identity to
+analysis. Direct executable arguments are quoted as POSIX literals for analysis without execution.
+Malformed transport returns the same parse error as malformed shell syntax. Display summaries and
+suggested policy prefixes never supply executable source. This boundary applies identically on
+Windows, Linux, and macOS, including Windows paths and Unix shell executable paths.
+The transport format follows Codex's `shlex_join` in
+[`bespoke_event_handling.rs`](https://github.com/openai/codex/blob/main/codex-rs/app-server/src/bespoke_event_handling.rs),
+using the matching [`shlex` codec](https://docs.rs/shlex/2.0.1/shlex/) rather than host-shell escaping.
 Provider shell metadata and explicit shell launchers select the grammar. Unqualified commands use
 PowerShell on Windows and the configured login shell on macOS, with zsh as the platform default.
 Recognized callback builtins such as PowerShell `ForEach-Object` and `Where-Object`, and Nushell
@@ -2941,21 +2961,59 @@ Recognized callback builtins such as PowerShell `ForEach-Object` and `Where-Obje
 policy. An explicit denial of a callback builtin still rejects the request. Control-flow bodies,
 conditions, substitutions, and static nested shell invocations contribute their own command targets.
 Dynamic command names, code evaluation, unrecognized callback consumers, definitions, redirections,
-and parser errors require one-time review. Analysis stops at 64 KiB, 8,192 visited nodes, 64 tree
-levels, 16 nested shell invocations, or the parser's 25 ms progress deadline and requests review.
+and parser errors return `shell_command_parse_error` to the provider without creating an approval.
+The error directs the agent to simplify the command or split independent operations while keeping
+pipelines intact. This validation also applies to YOLO and mandatory provider callbacks.
+Unsupported string forms such as ANSI-C quoting, PowerShell here-strings, and Nushell raw strings
+return errors. Escaped newlines in Zsh also return errors because the pinned grammar can turn the
+continued word into another executable. These limitations never produce partial approval targets.
+The PowerShell parser accepts the pinned grammar's
+missing-space recovery only between adjacent literal comma-separated arguments, preserving the
+original command spans and checking each executable independently. Every other missing or error
+node rejects the call. Analysis stops at 64 KiB, 8,192 visited nodes, 64 tree
+levels, 16 nested shell invocations, or the parser's 25 ms progress deadline and returns the same error.
 The picker stages decisions locally, then presents a review page. Submission requires one answer for
 every item and atomically persists the selected rules before releasing the original provider request.
 Any denial rejects the complete provider operation. Reject all discards staged choices. Conflicting
 rules or incomplete, duplicate, or unknown answers leave the request pending without changing policy.
 In `permission.bash`, `"*"` supplies the lowest-priority decision for a recognized command.
 More specific command rules override it. Without a matching rule, commands ask for approval.
-Empty or ambiguous command text also asks, even when `"*"` allows other commands.
+Empty or ambiguous command text returns a parse error, even when `"*"` allows other commands.
 
 Approval requests bypass the timeline reducer and stream directly into the controller. Resolution
 and cancellation emit matching lifecycle events keyed by approval ID, so the controller removes the
 request, closes its float, clears the winbar status, and presents the next queued request atomically.
 Cancelling a turn drains the coordinator before provider teardown, preventing abandoned requests
 from reappearing through a later state snapshot.
+
+`/config` exposes independent approval and answer timeouts, each defaulting to ten minutes.
+Each duration retains an amount and a seconds, minutes, or hours unit. Zero disables expiry.
+The `session.input_timeouts` route persists global portable settings and updates the shared
+session settings without interrupting provider execution. Existing deadlines retain their
+original duration. Session and workspace overrides retain their normal precedence.
+
+Rust creates an approval deadline when the permission coordinator registers the request.
+The waiting provider future owns the timer, so a hidden or closed picker cannot suspend it.
+Expiry removes the whole request atomically, returns a native one-time denial, and records
+`resolution_source: timeout` without writing any staged permission rule. The owning provider
+receives conservative continuation guidance. Copilot also receives the explanation in its
+denial response. Other adapters receive it at their next serialized continuation boundary.
+Child continuations retain their original execution owner and cancellation channel.
+
+Question sets retain one deadline across navigation, confirmed answers, and clarification.
+The session controller checks deadlines outside the provider request lane and resumes expired
+sets through the existing streamed dispatch and execution admission. It preserves confirmed
+answers, selects each unanswered question's first recommended option or first supplied option,
+and skips questions without options. Structured recommendation metadata and the existing
+`(Recommended)` label convention normalize to the same choice. Automatic answers retain their
+source in history and model feedback. Plan acceptance and execution-access selection never
+receive an answer deadline. Recovery restores the remaining interval from the stored expiry
+timestamp, then uses monotonic time while the host remains alive.
+
+Both pickers use the shared header countdown. A picker-owned timer updates only its title,
+leaving the input buffer, cursor, selection, and scroll position intact. Closing the picker
+releases this display timer without changing the Rust deadline. Session shutdown cancels the
+controller task before releasing provider and lease ownership.
 
 Read, Write, and YOLO select approval handling. Read asks before edits and untrusted
 commands, Write applies saved permission rules, and YOLO skips approval prompts. These
@@ -2969,7 +3027,7 @@ confirms deletion, and marks covered paths. Full scope and disabled sandbox reta
 but make it inactive. Disabling the sandbox removes OS write restrictions, so the write-scope
 selector remains stored but inactive. Copilot does not expose these isolation controls.
 
-Configuration uses the same interrupt/finalize/resume transition as approval changes. The
+Other configuration uses the same interrupt/finalize/resume transition as approval changes. The
 broker validates and canonicalizes directory paths before committing settings. Provider
 failures remain visible through the existing failed-operation state. Updated session and
 preference envelopes hide incompatible earlier formats without deleting their records.

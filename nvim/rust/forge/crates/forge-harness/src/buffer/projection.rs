@@ -649,7 +649,8 @@ impl TimelineRenderer<'_> {
                         .trim()
                         .trim_start_matches("- ")
                         .replace("\n- ", ", ");
-                    format!("● You answered: {answer}")
+                    if answer.contains("[automatic timeout]") { format!("● Automatic timeout: {answer}") }
+                    else { format!("● You answered: {answer}") }
                 } else if question {
                     format!("▸ {label}")
                 } else {
@@ -1481,8 +1482,9 @@ impl TimelineRenderer<'_> {
                     group.resolved || index + 1 < branch.clarification.len())?;
             }
             if let Some(answer) = &branch.answer {
+                let label = if branch.source == crate::session::ResolutionSource::Timeout { "Automatic timeout" } else { "You answered" };
                 let mut block = TranscriptRenderer::new(&self.content_width())?.literal(
-                    BlockId(format!("{id}:answer")), &format!("● You answered: {answer}"), 2)?;
+                    BlockId(format!("{id}:answer")), &format!("● {label}: {answer}"), 2)?;
                 TranscriptRenderer::heading_marker(&mut block, "ForgeHarnessPrompt");
                 block.metadata.decoration.push(Decoration {
                     range: TextRange { start: TextPosition { row: 0, column: 0 },
@@ -2578,7 +2580,7 @@ mod tests {
                 });
                 exchange.append_question_input(InputIntent::Answer, "Game format: 2D arena survival".into(), QuestionInput {
                     set_id:"format".into(), question_id:None, answer:vec![crate::plan::PlanQuestionAnswer {
-                        question_id:"game".into(), response:crate::plan::PlanQuestionResponse::Selected {
+                        source: crate::session::ResolutionSource::User, question_id:"game".into(), response:crate::plan::PlanQuestionResponse::Selected {
                             option:"2D arena survival".into(), feedback:None,
                         },
                     }],
@@ -2712,7 +2714,7 @@ mod tests {
                 exchange.observe_turn(&event,index as i64).unwrap();
             }
             let selected = crate::plan::PlanQuestionAnswer {
-                question_id:"scope".into(), response:crate::plan::PlanQuestionResponse::Selected {
+                source: crate::session::ResolutionSource::User, question_id:"scope".into(), response:crate::plan::PlanQuestionResponse::Selected {
                     option:"Rust CLI".into(),feedback:None,
                 },
             };
@@ -2797,7 +2799,7 @@ mod tests {
         let question = crate::plan::PlanQuestionSet {
             id: "scope-set".into(), questions: vec![crate::plan::PlanQuestion {
                 id: "scope".into(), header: "Migration scope".into(), question: "What should the replacement demonstrate?".into(),
-                options: vec![crate::plan::PlanQuestionOption { label: "Rust CLI".into(), description: "Replace the demo".into() }],
+                options: vec![crate::plan::PlanQuestionOption { recommended: false, label: "Rust CLI".into(), description: "Replace the demo".into() }],
                 allow_freeform: true,
             }],
         };

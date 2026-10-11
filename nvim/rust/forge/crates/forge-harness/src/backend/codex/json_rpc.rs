@@ -835,7 +835,7 @@ impl CodexJsonRpc {
         method: &str,
         message: &Value,
     ) -> Result<ApprovalResolution> {
-        let request = permission_from_provider(method, message, &self.workspace);
+        let request = permission_from_provider(method, message, &self.workspace)?;
         let protected = {
             let store = self.permission_coordinator.store();
             let store = store
@@ -1129,17 +1129,17 @@ async fn normalize_event_in_workspace(
         return;
     }
     let control_tool = control_tool_name(method, &params);
-    let tool_event = is_tool_lifecycle_event(&method_lower, &encoded);
+    let tool_event = is_tool_lifecycle_event(&method_lower, &params);
     let plan_event = method_lower.contains("plan");
     let reasoning_event = method_lower.contains("reason") || encoded.contains("\"thought\"");
     let reasoning_summary_event = method_lower == "item/reasoning/summarytextdelta";
     let assistant_event = method_lower.contains("agentmessage");
     let error_event = method_lower.contains("error") || encoded.contains("\"type\":\"error\"");
-    let kind = if error_event {
-        "error"
-    } else if tool_event {
+    let kind = if tool_event {
         output.evidence.tool_called = true;
         "tool"
+    } else if error_event {
+        "error"
     } else if plan_event {
         "plan"
     } else if reasoning_summary_event {
@@ -1514,15 +1514,25 @@ fn usage_update(params: &Value) -> Option<crate::backend::usage::UsageUpdate> {
     })
 }
 
-fn is_tool_lifecycle_event(method_lower: &str, encoded: &str) -> bool {
-    method_lower.contains("tool")
-        || method_lower.contains("commandexecution")
-        || method_lower.contains("filechange")
-        || encoded.contains("\"command_execution\"")
-        || encoded.contains("\"type\":\"commandexecution\"")
-        || encoded.contains("\"type\":\"dynamictoolcall\"")
-        || encoded.contains("\"type\":\"filechange\"")
-        || encoded.contains("\"type\":\"mcptoolcall\"")
+fn is_tool_lifecycle_event(method_lower: &str, params: &Value) -> bool {
+    let envelope = params.get("update").unwrap_or(params);
+    let item = envelope.get("item").unwrap_or(envelope);
+    let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    match item_type.to_ascii_lowercase().as_str() {
+        "usermessage" | "agentmessage" | "reasoning" | "plan" | "contextcompaction"
+        | "enteredreviewmode" | "exitedreviewmode" | "collabagenttoolcall"
+        | "subagentactivity" | "error" => false,
+        "commandexecution" | "command_execution" | "filechange" | "file_change"
+        | "dynamictoolcall" | "mcptoolcall" => true,
+        _ if !item_type.is_empty()
+            && matches!(method_lower, "item/started" | "item/completed") => {
+            item.get("id").and_then(Value::as_str).is_some_and(|id| !id.is_empty())
+        }
+        _ => method_lower.starts_with("item/")
+            && (method_lower.contains("tool")
+                || method_lower.contains("commandexecution")
+                || method_lower.contains("filechange")),
+    }
 }
 
 fn control_tool_name<'value>(method: &str, value: &'value Value) -> Option<&'value str> {
@@ -1783,6 +1793,9 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
     } else {
         ToolActivityKind::ToolCall
     };
+    let generic_item = kind == ToolActivityKind::ToolCall
+        && !item_type.is_empty()
+        && !matches!(item_type.as_str(), "mcptoolcall" | "dynamictoolcall");
     let title = mcp_tool_title(item)
         .or_else(|| {
             [
@@ -1802,30 +1815,40 @@ fn normalize_tool_activity(method: &str, params: &Value, workspace: &str) -> Opt
         .unwrap_or_else(|| match kind {
             ToolActivityKind::Command => "command".into(),
             ToolActivityKind::FileChange => "file changes".into(),
+            ToolActivityKind::ToolCall if generic_item => item.get("type")
+                .and_then(tool_title)
+                .unwrap_or_else(|| "tool".into()),
             ToolActivityKind::ToolCall => "tool".into(),
         });
-    let output = mcp_tool_output(item)
-        .or_else(|| {
-            item.get("contentItems")
-                .and_then(first_text)
-                .map(strip_ansi_escapes::strip_str)
-        })
-        .or_else(|| {
-            item.get("aggregatedOutput")
-                .or_else(|| item.get("aggregated_output"))
-                .or_else(|| item.get("output"))
-                .or_else(|| envelope.get("output"))
-                .or_else(|| envelope.get("delta"))
-                .or_else(|| envelope.get("message"))
-                .and_then(Value::as_str)
-                .map(strip_ansi_escapes::strip_str)
-                .or_else(|| {
-                    envelope
-                        .get("content")
-                        .and_then(first_text)
-                        .map(strip_ansi_escapes::strip_str)
-                })
-        });
+    let output = if generic_item {
+        method_lower.ends_with("/completed")
+            .then(|| serde_json::to_string_pretty(item).ok())
+            .flatten()
+            .map(strip_ansi_escapes::strip_str)
+    } else {
+        mcp_tool_output(item)
+            .or_else(|| {
+                item.get("contentItems")
+                    .and_then(first_text)
+                    .map(strip_ansi_escapes::strip_str)
+            })
+            .or_else(|| {
+                item.get("aggregatedOutput")
+                    .or_else(|| item.get("aggregated_output"))
+                    .or_else(|| item.get("output"))
+                    .or_else(|| envelope.get("output"))
+                    .or_else(|| envelope.get("delta"))
+                    .or_else(|| envelope.get("message"))
+                    .and_then(Value::as_str)
+                    .map(strip_ansi_escapes::strip_str)
+                    .or_else(|| {
+                        envelope
+                            .get("content")
+                            .and_then(first_text)
+                            .map(strip_ansi_escapes::strip_str)
+                    })
+            })
+    };
     let status = item
         .get("status")
         .or_else(|| envelope.get("status"))
@@ -2122,6 +2145,46 @@ fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn shell_parse_errors_reach_provider_and_corrected_calls_reuse_connection() -> Result<()> {
+        use super::*;
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            let failure: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(failure["id"], 1);
+            assert!(failure["error"]["message"].as_str().unwrap().contains("shell_command_parse_error"));
+            assert!(failure.get("result").is_none());
+            let inner_failure: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(inner_failure["id"], 2);
+            assert!(inner_failure["error"]["message"].as_str().unwrap().contains("shell_command_parse_error"));
+            let corrected: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+            assert_eq!(corrected["id"], 3);
+            assert_eq!(corrected["result"]["decision"], "accept");
+        });
+        let coordinator = PermissionCoordinator::transient(&workspace)?;
+        let (sink, mut stream) = crate::backend::events::channel();
+        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Yolo,
+            coordinator.clone(), Some(sink), Arc::new(TraceStore::open(fixture.path())?), "session".into()).await?;
+        for (id, command, accepted) in [
+            (1, "pwsh -c 'unfinished".to_owned(), false),
+            (2, shlex::try_join(["pwsh", "-c", "probe 'unfinished"]).unwrap(), false),
+            (3, shlex::try_join(["pwsh", "-c", r#"probe "timeline|markdown|table|wrap""#]).unwrap(), true),
+        ] {
+            let message = json!({"id":id, "method":"item/commandExecution/requestApproval",
+                "params":{"threadId":"thread","turnId":"turn","command":command,"shell":"powershell"}});
+            assert_eq!(process.respond_to_provider_request(&message).await?, accepted);
+            assert!(coordinator.pending_list()?.is_empty());
+            assert!(stream.try_recv().is_err());
+        }
+        tokio::time::timeout(Duration::from_secs(2), server).await??;
+        Ok(())
+    }
+
     #[test]
     fn every_registered_dynamic_tool_reaches_control_dispatch() {
         for definition in crate::control_tools::ControlToolRegistry.definition_list() {
@@ -2149,7 +2212,7 @@ mod test {
         let mut normalized = request.clone();
         context.normalize(&mut normalized);
         assert_eq!(normalized["params"]["meta"]["codex_approval_kind"], "mcp_tool_call");
-        assert_eq!(permission_from_provider("mcpServer/elicitation/request", &normalized, ".").target_list,
+        assert_eq!(permission_from_provider("mcpServer/elicitation/request", &normalized, ".").unwrap().target_list,
             vec![crate::permissions::matcher::PermissionTarget::Mcp { target:"shared-server/verify".into() }]);
         let mut completed = started.clone();
         completed["method"] = json!("item/completed");
@@ -3091,6 +3154,99 @@ mod test {
         assert_eq!(completed.id, "command-completed-with-different-provider-id");
         assert_eq!(completed.status.as_deref(), Some("completed"));
         assert!(!activity.output_delta);
+    }
+
+    #[tokio::test]
+    async fn codex_builtin_activity_preserves_web_results_in_child_turns() -> Result<()> {
+        let address = crate::backend::ProviderAddress {
+            owner: None,
+            thread_id: "child-thread".into(),
+            turn_id: "child-turn".into(),
+        };
+        let mut turn = crate::turn::Turn::new("child-turn".into(), address.clone(), 0);
+        let mut output = BackendOutput::default();
+        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        for (id, action) in [
+            ("search-1", json!({ "type": "search", "queries": ["engine documentation"] })),
+            ("open-1", json!({ "type": "openPage", "url": "https://example.com/docs" })),
+        ] {
+            let result = json!({
+                "type": "webSearch", "id": id, "query": "engine documentation",
+                "action": action,
+                "results": [{ "type": "text_result", "title": "Documentation",
+                    "url": "https://example.com/docs", "snippet": "Tool documentation" }]
+            });
+            for (method, item, now_ms) in [
+                ("item/started", json!({ "type": "webSearch", "id": id,
+                    "query": "", "action": null, "results": null }), 1000),
+                ("item/completed", result.clone(), 2000),
+            ] {
+                normalize_event(&json!({ "method": method, "params": {
+                    "threadId": "child-thread", "turnId": "child-turn", "item": item,
+                    "startedAtMs": 1000,
+                    "completedAtMs": (method == "item/completed").then_some(now_ms)
+                }}), &mut output, Some(&event_sink)).await;
+                let event = event_stream.try_recv()?;
+                assert_eq!(event.kind, "tool");
+                assert_eq!(event.address.as_ref(), Some(&address));
+                turn.record_tool_event(&event, now_ms)?;
+            }
+            let tool = turn.tools().find(|tool| tool.id == id).expect("persisted web activity");
+            assert_eq!(tool.title, "webSearch");
+            assert_eq!(tool.status, "completed");
+            assert_eq!(tool.started_at_ms, Some(1000));
+            assert_eq!(tool.completed_at_ms, Some(2000));
+            assert_eq!(serde_json::from_str::<Value>(&tool.output)?, result);
+        }
+        assert_eq!(output.event.len(), 2);
+        assert_eq!(turn.tools().count(), 2);
+        assert!(output.evidence.tool_called);
+        let restored: crate::turn::Turn = serde_json::from_value(serde_json::to_value(&turn)?)?;
+        assert_eq!(restored.tools().count(), 2);
+        assert!(restored.tools().all(|tool| tool.output.contains("Tool documentation")));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn codex_builtin_activity_preserves_unknown_types_and_terminal_status() {
+        for status in ["completed", "failed", "cancelled"] {
+            let mut output = BackendOutput::default();
+            let item = json!({ "type": "futureBuiltin", "id": "future-1", "status": status,
+                "result": { "type": "error", "message": "structured result", "items": [1, 2] }
+            });
+            normalize_event(&json!({ "method": "item/completed", "params": {
+                "item": item
+            }}), &mut output, None).await;
+            assert_eq!(output.event.len(), 1);
+            assert_eq!(output.event[0].kind, "tool");
+            let activity = output.event[0].activity.as_ref().unwrap();
+            assert_eq!(activity.title, "futureBuiltin");
+            assert_eq!(activity.status.as_deref(), Some(status));
+            assert_eq!(serde_json::from_str::<Value>(activity.output.as_deref().unwrap()).unwrap(), item);
+            assert!(output.evidence.tool_called);
+        }
+    }
+
+    #[tokio::test]
+    async fn codex_builtin_activity_excludes_non_tools_and_nested_payload_types() {
+        let mut output = BackendOutput::default();
+        for item_type in ["userMessage", "agentMessage", "reasoning", "plan",
+            "enteredReviewMode", "exitedReviewMode", "collabAgentToolCall", "subAgentActivity"] {
+            normalize_event(&json!({ "method": "item/completed", "params": {
+                "item": { "type": item_type, "id": "non-tool", "text": "Tool documentation",
+                    "payload": { "type": "mcpToolCall", "tool": "nested" } }
+            }}), &mut output, None).await;
+        }
+        for params in [
+            json!({ "item": { "type": "futureBuiltin" } }),
+            json!({ "item": { "type": "futureBuiltin", "id": "" } }),
+            json!({ "item": { "id": "untyped", "payload": { "type": "mcpToolCall" } } }),
+        ] {
+            normalize_event(&json!({ "method": "item/completed", "params": params }),
+                &mut output, None).await;
+        }
+        assert!(!output.evidence.tool_called);
+        assert!(output.event.iter().all(|event| event.activity.is_none()));
     }
 
     #[tokio::test]

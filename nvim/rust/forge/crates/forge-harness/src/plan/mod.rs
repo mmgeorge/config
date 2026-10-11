@@ -171,6 +171,9 @@ pub struct PlanLifecycleRecord {
 /// Represents one selectable answer for a planning question.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanQuestionOption {
+    #[serde(default)]
+    /// Marks the provider-recommended default for automatic answering.
+    pub recommended: bool,
     pub label: String,
     pub description: String,
 }
@@ -306,6 +309,9 @@ impl PlanGeneration {
 /// Associates one durable response with its planning question.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanQuestionAnswer {
+    #[serde(default)]
+    /// Records whether the user or an elapsed deadline supplied this response.
+    pub source: crate::session::ResolutionSource,
     pub question_id: String,
     pub response: PlanQuestionResponse,
 }
@@ -319,6 +325,12 @@ pub struct PlanQuestionWithdrawal {
 /// Tracks an unresolved planning decision set across answers and clarification turns.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct PlanElicitation {
+    #[serde(default)]
+    /// Retains the original deadline across navigation and host recovery.
+    pub deadline: Option<crate::session::InputDeadline>,
+    #[serde(default)]
+    /// Records automatic submission even when every answer was already confirmed.
+    pub resolution_source: crate::session::ResolutionSource,
     pub question_set: PlanQuestionSet,
     pub revision: u32,
     #[serde(default)]
@@ -356,7 +368,7 @@ impl PlanAcceptance {
                     .iter()
                     .copied()
                     .map(|mode| PlanQuestionOption {
-                        label: execution_mode_option_label(mode).into(),
+                        recommended: false, label: execution_mode_option_label(mode).into(),
                         description: execution_mode_option_description(mode).into(),
                     })
                     .collect(),
@@ -424,10 +436,37 @@ const fn execution_mode_option_description(mode: PermissionMode) -> &'static str
 }
 
 impl PlanElicitation {
+    /// Capture the question-set deadline once, excluding explicit plan acceptance.
+    pub fn start_timeout(&mut self, timeout: crate::session::InputTimeout, now_ms: i64) -> Result<()> {
+        if self.question_set.id != "plan-acceptance" {
+            self.deadline = timeout.deadline(now_ms)?;
+        }
+        Ok(())
+    }
+
+    /// Preserve confirmed responses and fill only unanswered questions before automatic submission.
+    pub fn expire(&mut self) -> Result<()> {
+        anyhow::ensure!(self.question_set.id != "plan-acceptance", "plan acceptance requires user confirmation");
+        for question in self.question_set.questions.clone() {
+            if self.answer.iter().any(|answer| answer.question_id == question.id) { continue; }
+            let selected = question.options.iter().find(|option| option.recommended).or_else(|| question.options.first());
+            let response = selected.map_or(PlanQuestionResponse::Skipped, |option| PlanQuestionResponse::Selected {
+                option: option.label.clone(), feedback: None,
+            });
+            self.answer(&question.id, response)?;
+            self.answer.last_mut().expect("committed timeout answer").source = crate::session::ResolutionSource::Timeout;
+        }
+        self.resolution_source = crate::session::ResolutionSource::Timeout;
+        self.deadline = None;
+        Ok(())
+    }
+
     /// Build unresolved elicitation state from a normalized provider question set.
     pub fn new(question_set: PlanQuestionSet) -> Self {
         Self {
             question_set,
+            deadline: None,
+            resolution_source: crate::session::ResolutionSource::User,
             revision: 1,
             answer: Vec::new(),
             current_index: 0,
@@ -509,7 +548,7 @@ impl PlanElicitation {
         self.answer
             .retain(|answer| answer.question_id != question_id);
         self.answer.push(PlanQuestionAnswer {
-            question_id: question_id.to_owned(),
+            source: crate::session::ResolutionSource::User, question_id: question_id.to_owned(),
             response,
         });
         self.current_index = self
@@ -557,7 +596,11 @@ impl PlanElicitation {
                     "[intentionally unanswered; continue with best judgment]".into()
                 }
             };
-            line_list.push(format!("- {}: {value}", question.header));
+            let provenance = if answer.is_some_and(|answer| answer.source == crate::session::ResolutionSource::Timeout) { " [automatic timeout]" } else { "" };
+            line_list.push(format!("- {}{provenance}: {value}", question.header));
+        }
+        if self.resolution_source == crate::session::ResolutionSource::Timeout {
+            line_list.insert(0, "The question set timed out. The user may be unavailable. Harness preserved confirmed answers and automatically selected defaults or skipped questions without options. Automatic responses are not user answers. Continue conservatively using available context and existing permissions.".into());
         }
         line_list.join("\n")
     }
@@ -622,7 +665,8 @@ impl PlanQuestionSet {
                     || (2..=maximum_option_count).contains(&question.options.len()),
                 "structured planning questions require two or three choices, or four for plan acceptance"
             );
-            for option in &question.options {
+            for option in &mut question.options {
+                option.recommended |= option.label.to_ascii_lowercase().contains("(recommended)");
                 anyhow::ensure!(
                     !option.label.trim().is_empty() && !option.description.trim().is_empty(),
                     "planning question choices require labels and descriptions"
@@ -1130,6 +1174,35 @@ pub fn digest(content: &[u8]) -> String {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn input_timeout_preserves_confirmed_answers_and_marks_automatic_fallbacks() {
+        use crate::session::ResolutionSource;
+        let questions: PlanQuestionSet = serde_json::from_value(serde_json::json!({"id":"choices","questions":[
+            {"id":"confirmed","header":"Confirmed","question":"Which format?","options":[{"label":"A","description":"A"},{"label":"B","description":"B"}]},
+            {"id":"default","header":"Default","question":"Which option?","options":[{"label":"First","description":"First"},{"label":"Second (Recommended)","description":"Second"}]},
+            {"id":"freeform","header":"Freeform","question":"What name?","options":[]}
+        ]})).unwrap();
+        let mut elicitation = PlanElicitation::new(questions.normalize().unwrap());
+        elicitation.answer("confirmed", PlanQuestionResponse::Selected { option:"B".into(), feedback:Some("keep note".into()) }).unwrap();
+        elicitation.expire().unwrap();
+        assert_eq!(elicitation.answer[0].source, ResolutionSource::User);
+        assert!(matches!(&elicitation.answer[0].response, PlanQuestionResponse::Selected {feedback:Some(note),..} if note == "keep note"));
+        assert!(matches!(&elicitation.answer[1].response, PlanQuestionResponse::Selected {option,..} if option == "Second (Recommended)"));
+        assert_eq!(elicitation.answer[1].source, ResolutionSource::Timeout);
+        assert_eq!(elicitation.answer[2].response, PlanQuestionResponse::Skipped);
+        assert!(elicitation.current_question().is_none());
+        assert!(elicitation.feedback().contains("not user answers"));
+        assert!(elicitation.feedback().contains("[automatic timeout]"));
+        let mut fallback = PlanElicitation::new(elicitation.question_set.clone());
+        fallback.question_set.questions[1].options[1].recommended = false;
+        fallback.expire().unwrap();
+        assert!(matches!(&fallback.answer[1].response, PlanQuestionResponse::Selected {option,..} if option == "First"));
+        let mut acceptance = PlanAcceptance::new("digest".into(), &[PermissionMode::Read, PermissionMode::Write]).unwrap();
+        acceptance.elicitation.start_timeout(Default::default(), 0).unwrap();
+        assert!(acceptance.elicitation.deadline.is_none());
+        assert!(acceptance.elicitation.expire().is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -1710,11 +1783,11 @@ mod test {
                 question: "Which migration?".into(),
                 options: vec![
                     PlanQuestionOption {
-                        label: "Staged".into(),
+                        recommended: false, label: "Staged".into(),
                         description: "Support both formats.".into(),
                     },
                     PlanQuestionOption {
-                        label: "Immediate".into(),
+                        recommended: false, label: "Immediate".into(),
                         description: "Replace immediately.".into(),
                     },
                 ],
@@ -1812,11 +1885,11 @@ mod test {
                     question: "Which migration?".into(),
                     options: vec![
                         PlanQuestionOption {
-                            label: "Staged".into(),
+                            recommended: false, label: "Staged".into(),
                             description: "Support both formats.".into(),
                         },
                         PlanQuestionOption {
-                            label: "Immediate".into(),
+                            recommended: false, label: "Immediate".into(),
                             description: "Replace immediately.".into(),
                         },
                     ],
@@ -1862,7 +1935,7 @@ mod test {
     #[test]
     fn replaces_questions_and_preserves_only_valid_answers() {
         let option = |label: &str| PlanQuestionOption {
-            label: label.into(),
+            recommended: false, label: label.into(),
             description: format!("Use {label}"),
         };
         let question = |id: &str, options: Vec<PlanQuestionOption>, allow_freeform| PlanQuestion {
@@ -1961,7 +2034,7 @@ mod test {
                 header: "Migration".into(),
                 question: "Which migration?".into(),
                 options: vec![PlanQuestionOption {
-                    label: "Staged".into(),
+                    recommended: false, label: "Staged".into(),
                     description: "Preserve compatibility.".into(),
                 }],
                 allow_freeform: true,

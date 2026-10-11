@@ -149,7 +149,7 @@ impl RepositoryToolScope {
                 reason: None,
                 target_list: vec![PermissionTarget::Read { path: path.into() }],
             },
-        );
+        )?;
         ensure!(
             evaluation.decision == PermissionDecision::Allow,
             "active policy does not authorize repository path inspection"
@@ -185,7 +185,7 @@ impl RepositoryToolScope {
                                 .into()
                         }]
                     }
-                )
+                )?
                 .decision
                 == PermissionDecision::Allow,
             "active policy does not authorize repository inspection"

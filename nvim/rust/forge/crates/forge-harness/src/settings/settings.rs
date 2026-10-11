@@ -33,6 +33,10 @@ pub struct PortableSettings {
     pub plan_compact: Option<bool>,
     /// Selects automatic review of execution plan revisions.
     pub plan_auto_approve_revisions: Option<bool>,
+    /// Overrides the duration of future approval requests.
+    pub approval_timeout: Option<crate::session::InputTimeout>,
+    /// Overrides the duration of future question sets.
+    pub answer_timeout: Option<crate::session::InputTimeout>,
     /// Enables the root's model-facing child tools without restricting manual admission.
     pub subagent_tools: Option<bool>,
     #[serde(default)]
@@ -52,6 +56,8 @@ impl PortableSettings {
         if overriding.plan_compact.is_some() { self.plan_compact = overriding.plan_compact; }
         if overriding.plan_auto_approve_revisions.is_some() { self.plan_auto_approve_revisions = overriding.plan_auto_approve_revisions; }
         if overriding.subagent_tools.is_some() { self.subagent_tools = overriding.subagent_tools; }
+        if overriding.approval_timeout.is_some() { self.approval_timeout = overriding.approval_timeout; }
+        if overriding.answer_timeout.is_some() { self.answer_timeout = overriding.answer_timeout; }
         self.skill.extend(overriding.skill);
         self.mcp.extend(overriding.mcp);
     }
@@ -64,6 +70,8 @@ impl PortableSettings {
         if let Some(permission) = self.plan_permission { session.plan_permission = Some(permission); }
         if let Some(enabled) = self.plan_compact { session.plan_compact = enabled && native_compact; }
         if let Some(enabled) = self.plan_auto_approve_revisions { session.plan_auto_approve_revisions = enabled; }
+        if let Some(timeout) = self.approval_timeout { session.approval_timeout = timeout.validate()?; }
+        if let Some(timeout) = self.answer_timeout { session.answer_timeout = timeout.validate()?; }
         Ok(())
     }
 }
@@ -303,6 +311,8 @@ impl SettingsStore {
 
     fn write_layer(&mut self, expected_revision: u64, scope: SettingScope, workspace: &str, session: &str,
         setting: &PortableSettings, receipt: Option<(&str,&Value)>, imported: &[super::ImportedResource]) -> Result<SettingsMutation> {
+        if let Some(timeout) = setting.approval_timeout { timeout.validate()?; }
+        if let Some(timeout) = setting.answer_timeout { timeout.validate()?; }
         if let Some(access) = &setting.access { access.clone().validate()?; }
         if let Some(shell) = setting.shell { shell.executable()?; }
         if let Some(permission) = setting.default_write_permission {

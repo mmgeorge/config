@@ -645,6 +645,8 @@ impl HarnessBroker {
                             plan_executor: preference.as_ref().map_or_else(Default::default, |value| value.plan_executor.clone()),
                             plan_compact: preference.as_ref().is_some_and(|value| value.plan_compact),
                             plan_auto_approve_revisions: preference.as_ref().is_none_or(|value| value.plan_auto_approve_revisions),
+                            approval_timeout: Default::default(),
+                            answer_timeout: Default::default(),
                             context_window: None,
                             service_tier: preference.as_ref().map(|value| value.service_tier).unwrap_or_default(),
                             access: preference.as_ref().map(|value| value.access.clone()).unwrap_or_default(),
@@ -685,6 +687,7 @@ impl HarnessBroker {
         if created_session {
             shared.apply_provider_defaults(&mut session)?;
         }
+        permission_coordinator.configure_input_timeouts(&session.id, session.approval_timeout, session.answer_timeout)?;
         store.lock_session(&session.id)?;
         store.save_session(&session)?;
         if store
@@ -854,6 +857,8 @@ impl HarnessBroker {
 
     /// Build the initial snapshot returned by the initialize response.
     pub fn snapshot(&self) -> Result<BrokerSnapshot> {
+        let mut session = self.session.clone();
+        (session.approval_timeout, session.answer_timeout) = self.permission_coordinator.input_timeouts(&session.id)?;
         let goal = self
             .session
             .goal_id
@@ -986,7 +991,7 @@ impl HarnessBroker {
                 .filter(|operation| !matches!(operation.state.as_str(), "failed" | "cancelled" | "completed" | "superseded")
                     || operation.exchange_id.as_deref() == interaction.last().map(|exchange| exchange.id.as_str()))
                 .map(|operation| operation.view()),
-            session: self.session.clone(),
+            session,
             task: self.store.list_task(&self.session.id)?,
             exchange: interaction,
             capability: self.capability.clone(),
@@ -1290,6 +1295,8 @@ impl HarnessBroker {
             HarnessMethod::QuestionSkip => self.skip_question(params),
             HarnessMethod::QuestionAsk => self.ask_question(params).await,
             HarnessMethod::QuestionContinue => self.continue_question().await,
+            HarnessMethod::ApprovalContinue => self.continue_after_approval_timeout().await,
+            HarnessMethod::InputTimeoutConfigure => anyhow::bail!("input timeout settings require the service coordinator"),
             HarnessMethod::GoalSet => self.set_goal(params).await,
             HarnessMethod::GoalPause => self.pause_goal().await,
             HarnessMethod::GoalResume => self.resume_goal(None, None).await,
@@ -1697,6 +1704,8 @@ impl HarnessBroker {
                     effective.plan_permission = self.session.plan_permission;
                     effective.plan_compact = Some(self.session.plan_compact);
                     effective.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions);
+                    effective.approval_timeout = Some(self.session.approval_timeout);
+                    effective.answer_timeout = Some(self.session.answer_timeout);
                     settings.confirm_application(&self.session.id, operation, revision, effective)?;
                 }
                 self.emit_backend_event(BackendEvent {
@@ -2162,7 +2171,7 @@ impl HarnessBroker {
             self.agent_registry.insert(admission.agent.clone());
             self.agent_coordinator.retain(admission.agent.clone(),admission.task.clone())?;
             self.child_backend_by_agent.insert(admission.agent.id.clone(),backend.clone());
-            Ok(crate::agent::AgentRuntime {backend,request,task_id:admission.task.id.clone(),cancellation,sender:self.agent_coordinator.sender()})
+            Ok(crate::agent::AgentRuntime {backend,permission:self.permission_coordinator.clone(),request,task_id:admission.task.id.clone(),cancellation,sender:self.agent_coordinator.sender()})
         })();
         match prepared {
             Ok(runtime) => {
@@ -2272,11 +2281,15 @@ impl HarnessBroker {
         if backend_event.kind == "approval_requested" {
             let id = backend_event.data["id"].as_str().context("child approval has no identity")?;
             let turn = runtime.exchange.turn.iter().rev().find(|turn|turn.state() == crate::turn::TurnState::Running);
-            let approval = self.permission_coordinator.bind_owner(id,&runtime.exchange.id,turn.map(|turn|turn.id()))?;
+            let Some(approval) = self.permission_coordinator.bind_owner(id,&runtime.exchange.id,turn.map(|turn|turn.id()))? else {
+                self.child_exchange_runtime_by_agent.insert(owner.agent_id, runtime);
+                return Ok(());
+            };
             runtime.exchange.observe_blocker(format!("approval:{id}"),true,self.clock.now_ms());
             backend_event.data = serde_json::to_value(approval)?;
         } else if matches!(backend_event.kind.as_str(),"approval_resolved" | "approval_cancelled") {
             if let Some(id) = backend_event.data["id"].as_str() { runtime.exchange.observe_blocker(format!("approval:{id}"),false,self.clock.now_ms()); }
+            runtime.exchange.approval_resolution.push(serde_json::from_value(backend_event.data.clone())?);
         } else if let Some(compaction) = backend_event.compaction()? {
             runtime.exchange.observe_compaction(compaction,backend_event.observed_at_ms(self.clock.now_ms()));
         } else {
@@ -3303,7 +3316,7 @@ impl HarnessBroker {
         )?;
         self.store.save_exchange(&interaction)?;
         let prompt = format!(
-            "The user answered the pending Harness questions. Harness already recorded these answers and resolved the question set. Do not call harness_question_answer or harness_question_withdraw for it. Continue the original request using these responses and the current task context.\n\n{feedback}"
+            "Harness resolved the pending questions and recorded their response sources. Do not call harness_question_answer or harness_question_withdraw for this set. Continue the original request using the responses and current task context.\n\n{feedback}"
         );
         let (value, mut event) = if interaction.kind == ExchangeKind::Chat && interaction.plan_id.is_some()
             && interaction.plan_id.is_some() {
@@ -3323,6 +3336,69 @@ impl HarnessBroker {
             )?,
         );
         Ok((value, event))
+    }
+
+    async fn continue_after_approval_timeout(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
+        let owner = crate::backend::ExecutionOwner::root(&self.session.id);
+        let latest = self.store.list_exchange(&self.session.id)?.pop();
+        if let Some(goal) = self.current_goal()?
+            && latest.as_ref().is_some_and(|exchange| exchange.goal_id.as_deref() == Some(goal.id.as_str())) {
+            if goal.state == GoalState::Active {
+                return self.continue_goal().await;
+            }
+            self.permission_coordinator.take_timeout_feedback(&owner)?;
+            return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
+        }
+        let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? else {
+            return Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()));
+        };
+        if let Some(exchange) = latest.as_ref()
+            && matches!(exchange.kind, ExchangeKind::PlanDraft | ExchangeKind::PlanRevision)
+        {
+            let mut admission = ExchangeAdmission::plan(String::new(), exchange.plan_id.clone(), exchange.kind == ExchangeKind::PlanRevision);
+            admission.lifecycle = Some(WorkflowActivity::from_exchange(exchange).event(LifecycleAction::Continued));
+            self.run_planning_interaction(feedback, Some(admission)).await
+        } else {
+            let mut admission = ExchangeAdmission::chat(String::new());
+            admission.lifecycle = Some(WorkflowActivity::Working.event(LifecycleAction::Continued));
+            self.run_interaction(feedback, PromptMode::Chat, Some(admission)).await
+        }
+    }
+
+    /// Resolve expired input only while holding the owning session's execution admission.
+    pub(crate) fn expire_input(
+        &mut self,
+        active_deadline: &mut Option<(String, crate::session::InputDeadline)>,
+    ) -> Result<Option<Request>> {
+        if self.turn_cancellation.requested.load(Ordering::Acquire) { return Ok(None); }
+        let mut plan = if self.active_plan_awaits_input()? { Some(self.active_elicitation_plan()?) } else { None };
+        let mut interaction = if plan.is_none() { self.find_active_interaction_elicitation()? } else { None };
+        let elicitation = plan.as_mut().and_then(|plan| plan.elicitation.as_mut())
+            .or_else(|| interaction.as_mut().and_then(|exchange| exchange.elicitation.as_mut()));
+        if let Some(elicitation) = elicitation {
+            if let Some(deadline) = &elicitation.deadline {
+                let identity = format!("{}:{}", elicitation.question_set.id, deadline.expires_at_ms);
+                if active_deadline.as_ref().is_none_or(|(current, _)| current != &identity) {
+                    let mut deadline = deadline.clone();
+                    deadline.restore(self.clock.now_ms());
+                    *active_deadline = Some((identity, deadline));
+                }
+                if active_deadline.as_ref().is_some_and(|(_, deadline)| deadline.expired(self.clock.now_ms())) {
+                    elicitation.expire()?;
+                    if let Some(plan) = &plan { self.store.save_plan(plan)?; }
+                    if let Some(interaction) = &interaction { self.store.save_exchange(interaction)?; }
+                    *active_deadline = None;
+                    return Ok(Some(Request { id: 0, method: "question.continue".into(), params: json!({}) }));
+                }
+            } else { *active_deadline = None; }
+            return Ok(None);
+        }
+        *active_deadline = None;
+        let owner = crate::backend::ExecutionOwner::root(&self.session.id);
+        if !self.active_plan_has_acceptance()? && self.permission_coordinator.has_timeout_feedback(&owner)? {
+            return Ok(Some(Request { id: 0, method: "approval.continue".into(), params: json!({}) }));
+        }
+        Ok(None)
     }
 
     fn active_elicitation_plan(&self) -> Result<PlanRecord> {
@@ -3661,6 +3737,13 @@ Planning continuation: turn {} of {}.",
         }
 
         let mut backend_request = self.backend_request(input, mode);
+        let owner = crate::backend::ExecutionOwner::root(&self.session.id);
+        if let Some(feedback) = self.permission_coordinator.take_timeout_feedback(&owner)? {
+            match &mut backend_request.input {
+                BackendInput::Text { text } => *text = format!("{feedback}\n\n{text}"),
+                BackendInput::Skill { arguments, .. } => *arguments = format!("{feedback}\n\n{arguments}"),
+            }
+        }
         let policy = self
             .permission_store
             .read()
@@ -4071,7 +4154,11 @@ Planning continuation: turn {} of {}.",
                 if let Some(question) = plan.question_ledger.unresolved(question) {
                     match plan.elicitation.as_mut() {
                         Some(elicitation) => elicitation.replace_question_set(question.clone()),
-                        None => plan.elicitation = Some(PlanElicitation::new(question.clone())),
+                        None => {
+                            let mut elicitation = PlanElicitation::new(question.clone());
+                            elicitation.start_timeout(self.permission_coordinator.input_timeouts(&self.session.id)?.1, self.clock.now_ms())?;
+                            plan.elicitation = Some(elicitation);
+                        },
                     }
                     PlanStateMachine::apply(
                         &mut plan,
@@ -4129,7 +4216,9 @@ Planning continuation: turn {} of {}.",
                 }
                 if !self.replace_active_elicitation(question.clone(), &mut event)? {
                     interaction.awaiting_input = true;
-                    interaction.elicitation = Some(PlanElicitation::new(question.clone()));
+                    let mut elicitation = PlanElicitation::new(question.clone());
+                    elicitation.start_timeout(self.permission_coordinator.input_timeouts(&self.session.id)?.1, self.clock.now_ms())?;
+                    interaction.elicitation = Some(elicitation);
                     self.store.save_exchange(&interaction)?;
                     event.push(self.event(
                         "question",
@@ -5201,6 +5290,8 @@ Planning continuation: turn {} of {}.",
             }));
         }
         if backend_event.kind == "approval_requested" {
+            let request_id = backend_event.data["id"].as_str().context("approval request omitted its id")?;
+            if !self.permission_coordinator.pending_list()?.iter().any(|approval| approval.id == request_id) { return Ok(()); }
             let execution_owner = backend_event.address.as_ref().and_then(|address|address.owner.as_ref());
             if let Some(owner) = execution_owner {
                 anyhow::ensure!(owner.session_id == self.session.id, "approval crosses session ownership");
@@ -5247,11 +5338,11 @@ Planning continuation: turn {} of {}.",
                 .get("id")
                 .and_then(Value::as_str)
                 .context("approval request omitted its id")?;
-            let approval = self.permission_coordinator.bind_owner(
+            let Some(approval) = self.permission_coordinator.bind_owner(
                 id,
                 &owner.id,
                 turn.map(|turn| turn.id()),
-            )?;
+            )? else { return Ok(()); };
             owner.observe_blocker(format!("approval:{id}"), true, self.clock.now_ms());
             self.store.save_exchange(owner)?;
             backend_event.data = serde_json::to_value(approval)?;
@@ -5264,15 +5355,19 @@ Planning continuation: turn {} of {}.",
         ) {
             let approval: ApprovalRequestView = serde_json::from_value(backend_event.data.clone())?;
             let now_ms = self.clock.now_ms();
-            if approval.exchange_id.as_deref() == Some(interaction.id.as_str()) {
+            if approval.exchange_id.as_deref() == Some(interaction.id.as_str())
+                || (approval.exchange_id.is_none() && approval.execution_owner.as_ref().is_none_or(|owner| owner.is_root())) {
                 interaction.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
+                interaction.approval_resolution.push(approval.clone());
                 self.store.save_exchange(interaction)?;
             } else if let Some(owner) = self
                 .child_exchange_runtime_by_agent
                 .values_mut()
-                .find(|owner| approval.exchange_id.as_deref() == Some(owner.exchange.id.as_str()))
+                .find(|owner| approval.exchange_id.as_deref() == Some(owner.exchange.id.as_str())
+                    || (approval.exchange_id.is_none() && approval.execution_owner.as_ref().is_some_and(|identity| identity.agent_id == owner.exchange.agent_id)))
             {
                 owner.exchange.observe_blocker(format!("approval:{}", approval.id), false, now_ms);
+                owner.exchange.approval_resolution.push(approval.clone());
                 self.store.save_exchange(&owner.exchange)?;
             }
             self.emit_live(backend_event, event).await?;
@@ -5821,6 +5916,7 @@ Planning continuation: turn {} of {}.",
                 attributed_diff_text: None,
                 checkpoint_diff_text: None,
                 attributed_matches_checkpoint: false,
+                approval_resolution: Vec::new(),
                 disposition: crate::exchange::HistoryDisposition::Current,
                 turn: Vec::new(),
                 created_at_ms: now_ms,
@@ -7459,6 +7555,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             params["plan_permission"] = serde_json::to_value(settings.desired.plan_permission)?;
             params["plan_compact"] = json!(settings.desired.plan_compact.unwrap_or(false) && self.capability.native_compact);
             params["plan_auto_approve_revisions"] = json!(settings.desired.plan_auto_approve_revisions.unwrap_or(true));
+            params["approval_timeout"] = serde_json::to_value(settings.desired.approval_timeout.unwrap_or_default())?;
+            params["answer_timeout"] = serde_json::to_value(settings.desired.answer_timeout.unwrap_or_default())?;
             let desired = serde_json::to_value(&settings.desired)?;
             for (key, value) in desired.as_object().context("settings must be an object")? {
                 if !value.is_null() && key != "skill" && key != "mcp" && key != "plan_compact" { params[key] = value.clone(); }
@@ -7466,6 +7564,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             resource_selection = Some(settings.desired);
         }
         let mut configured = self.session.clone();
+        (configured.approval_timeout, configured.answer_timeout) = self.permission_coordinator.input_timeouts(&self.session.id)?;
         let access = params.get("access")
             .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
             .transpose()?.map(crate::session::AccessPolicy::validate).transpose()?;
@@ -7485,6 +7584,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         if let Some(value) = params.get("plan_permission") {
             configured.plan_permission = serde_json::from_value(value.clone())?;
         }
+        if let Some(value) = params.get("approval_timeout") { configured.approval_timeout = serde_json::from_value::<crate::session::InputTimeout>(value.clone())?.validate()?; }
+        if let Some(value) = params.get("answer_timeout") { configured.answer_timeout = serde_json::from_value::<crate::session::InputTimeout>(value.clone())?.validate()?; }
         let requested_service_tier = params.get("service_tier")
             .map(|value| serde_json::from_value::<crate::backend::ServiceTier>(value.clone()))
             .transpose()?;
@@ -7625,7 +7726,11 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             }, &selection).await?;
         }
         let previous = std::mem::replace(&mut self.session, configured);
-        if let Err(error) = self.save_session() { self.session = previous; return Err(error); }
+        self.permission_coordinator.configure_input_timeouts(&self.session.id, self.session.approval_timeout, self.session.answer_timeout)?;
+        if let Err(error) = self.save_session() {
+            self.permission_coordinator.configure_input_timeouts(&previous.id, previous.approval_timeout, previous.answer_timeout)?;
+            self.session = previous; return Err(error);
+        }
         let update_model_preference = requested_model.is_some()
             || requested_effort.is_some()
             || params.get("context_window").is_some();
@@ -7641,6 +7746,8 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             if params.get("plan_permission").is_some() { portable.plan_permission = self.session.plan_permission; changed = true; }
             if params.get("plan_compact").is_some() { portable.plan_compact = Some(self.session.plan_compact); changed = true; }
             if params.get("plan_auto_approve_revisions").is_some() { portable.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions); changed = true; }
+            if params.get("approval_timeout").is_some() { portable.approval_timeout = Some(self.session.approval_timeout); changed = true; }
+            if params.get("answer_timeout").is_some() { portable.answer_timeout = Some(self.session.answer_timeout); changed = true; }
             if let Some(enabled) = subagent_tools {portable.subagent_tools = Some(enabled);changed = true;}
             let revision = if changed { settings.update(snapshot.revision,crate::settings::SettingScope::Global,&self.session.workspace,&self.session.id,&portable)? } else { snapshot.revision };
             if update_model_preference || params.get("service_tier").is_some() || params.get("plan_executor_enabled").is_some() {
@@ -7877,6 +7984,7 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
     }
 
     fn save_session(&mut self) -> Result<()> {
+        (self.session.approval_timeout, self.session.answer_timeout) = self.permission_coordinator.input_timeouts(&self.session.id)?;
         let now_ms = self.clock.now_ms();
         self.session.acquire_lease(&self.client_id, now_ms)?;
         self.session.updated_at_ms = now_ms;
@@ -8075,6 +8183,8 @@ fn preference_for_session(
         plan_executor: session.plan_executor.clone(),
         plan_compact: session.plan_compact,
         plan_auto_approve_revisions: session.plan_auto_approve_revisions,
+        approval_timeout: session.approval_timeout,
+        answer_timeout: session.answer_timeout,
     }
 }
 
@@ -9311,6 +9421,7 @@ mod test {
             attributed_diff_text: None,
             checkpoint_diff_text: None,
             attributed_matches_checkpoint: false,
+            approval_resolution: Vec::new(),
             disposition: crate::exchange::HistoryDisposition::Current,
             turn: Vec::new(),
             created_at_ms: 1,
@@ -10444,11 +10555,11 @@ mod test {
                     question: "Which migration should the implementation use?".into(),
                     options: vec![
                         crate::plan::PlanQuestionOption {
-                            label: "Staged".into(),
+                            recommended: false, label: "Staged".into(),
                             description: "Preserve compatibility temporarily.".into(),
                         },
                         crate::plan::PlanQuestionOption {
-                            label: "Immediate".into(),
+                            recommended: false, label: "Immediate".into(),
                             description: "Replace the old format now.".into(),
                         },
                     ],
@@ -10469,18 +10580,18 @@ mod test {
                 let mut replacement = question_set();
                 replacement.questions[0].options = vec![
                     crate::plan::PlanQuestionOption {
-                        label: "Safe".into(),
+                        recommended: false, label: "Safe".into(),
                         description: "Retain compatibility.".into(),
                     },
                     crate::plan::PlanQuestionOption {
-                        label: "Fast".into(),
+                        recommended: false, label: "Fast".into(),
                         description: "Prefer immediate cleanup.".into(),
                     },
                 ];
                 output.plan_question = Some(replacement);
             } else if request_text.contains("User follow-up:\nuse staged") {
                 output.question_answer = Some(PlanQuestionAnswer {
-                    question_id: "migration".into(),
+                    source: crate::session::ResolutionSource::User, question_id: "migration".into(),
                     response: PlanQuestionResponse::Selected {
                         option: "Staged".into(),
                         feedback: None,
@@ -10492,7 +10603,7 @@ mod test {
                 });
             } else if request_text.contains("Pending planning questions withdrawn")
                 || request_text.contains("Planning feedback:\n- Migration: Staged")
-                || request_text.contains("The user answered the pending Harness questions")
+                || request_text.contains("Harness resolved the pending questions")
             {
                 if self.fail_withdrawal_continuation
                     && request_text.contains("Pending planning questions withdrawn")
@@ -10562,11 +10673,11 @@ mod test {
                         question: "Which migration should the implementation use?".into(),
                         options: vec![
                             crate::plan::PlanQuestionOption {
-                                label: "Staged".into(),
+                                recommended: false, label: "Staged".into(),
                                 description: "Preserve compatibility temporarily.".into(),
                             },
                             crate::plan::PlanQuestionOption {
-                                label: "Immediate".into(),
+                                recommended: false, label: "Immediate".into(),
                                 description: "Replace the old format now.".into(),
                             },
                         ],
@@ -10755,11 +10866,11 @@ mod test {
                     question: text.into(),
                     options: vec![
                         crate::plan::PlanQuestionOption {
-                            label: "Staged".into(),
+                            recommended: false, label: "Staged".into(),
                             description: "Support both formats temporarily.".into(),
                         },
                         crate::plan::PlanQuestionOption {
-                            label: "Immediate".into(),
+                            recommended: false, label: "Immediate".into(),
                             description: "Remove the old format now.".into(),
                         },
                     ],
@@ -11159,6 +11270,8 @@ mod test {
             plan_executor: Default::default(),
             plan_compact: false,
             plan_auto_approve_revisions: true,
+            approval_timeout: Default::default(),
+            answer_timeout: Default::default(),
             context_window: None,
             service_tier: crate::backend::ServiceTier::Standard,
             access: Default::default(),
@@ -11201,6 +11314,8 @@ mod test {
                 plan_executor: Default::default(),
                 plan_compact: false,
                 plan_auto_approve_revisions: true,
+                approval_timeout: Default::default(),
+                answer_timeout: Default::default(),
             }),
         );
         assert_eq!(preference.model_setting.len(), 2);
@@ -11764,6 +11879,29 @@ mod test {
         let rendered = timeline_text(&broker.snapshot().unwrap());
         assert!(rendered.contains("Questions · 1/1 answered"));
         assert!(rendered.contains("You answered: Staged"));
+    }
+
+    #[tokio::test]
+    async fn input_timeout_resumes_durable_questions_once_without_a_view() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), true);
+        let result = broker.dispatch(Request { id:1, method:"prompt.submit".into(),
+            params:json!({"text":"prompt me with a multiple-choice question"}) }).await;
+        assert!(result.response.error().is_none());
+        let mut interaction = broker.find_active_interaction_elicitation().unwrap().unwrap();
+        interaction.elicitation.as_mut().unwrap().deadline = Some(serde_json::from_value(json!({"expires_at_ms":-1})).unwrap());
+        broker.store.save_exchange(&interaction).unwrap();
+        let mut deadline = None;
+        let request = broker.expire_input(&mut deadline).unwrap().expect("overdue request");
+        assert_eq!(request.method, "question.continue");
+        let result = broker.dispatch(request).await;
+        assert!(result.response.error().is_none(), "{:?}", result.response.error());
+        assert!(broker.find_active_interaction_elicitation().unwrap().is_none());
+        assert!(broker.expire_input(&mut deadline).unwrap().is_none());
+        let saved = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert!(saved.iter().flat_map(|exchange| &exchange.node_list).any(|node| matches!(node,
+            ExchangeNode::ExchangeInput { prompt } if prompt.text.contains("[automatic timeout]"))));
     }
 
     #[tokio::test]

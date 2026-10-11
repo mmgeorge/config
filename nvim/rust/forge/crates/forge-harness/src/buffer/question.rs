@@ -25,6 +25,7 @@ pub(super) struct QuestionBranch<'exchange> {
     pub question: &'exchange PlanQuestion,
     pub clarification: Vec<Clarification<'exchange>>,
     pub answer: Option<String>,
+    pub source: crate::session::ResolutionSource,
 }
 
 /// Retains a clarification and provider content until the next interaction boundary.
@@ -85,6 +86,7 @@ impl<'exchange> QuestionHistory<'exchange> {
                             question,
                             clarification: Vec::new(),
                             answer: None,
+                            source: crate::session::ResolutionSource::User,
                         })
                         .collect(),
                     clarification: Vec::new(),
@@ -130,6 +132,7 @@ impl<'exchange> QuestionHistory<'exchange> {
                             .find(|branch| branch.question.id == answer.question_id)
                         {
                             branch.answer = Some(response_text(&answer.response));
+                            branch.source = answer.source;
                         }
                     }
                 }
@@ -206,6 +209,8 @@ impl<'exchange> QuestionHistory<'exchange> {
                     return history;
                 }
                 for branch in &mut group.branch {
+                    branch.source = elicitation.answer.iter().find(|answer| answer.question_id == branch.question.id)
+                        .map_or(crate::session::ResolutionSource::User, |answer| answer.source);
                     branch.answer = elicitation
                         .answer
                         .iter()
