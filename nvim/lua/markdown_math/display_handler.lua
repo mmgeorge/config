@@ -92,6 +92,7 @@ end
 ---@param buffer integer
 ---@return string[]?
 local function convert(input, buffer)
+  if not input:find("%S") then return nil end
   local cached = output_cache[input]
   if type(cached) == "table" then return cached end
   if cached == false then return nil end

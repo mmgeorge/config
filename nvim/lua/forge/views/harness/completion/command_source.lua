@@ -26,7 +26,6 @@ local command_list = {
   { label = "/agents on", detail = "Enable subagent tools" },
   { label = "/agents off", detail = "Disable subagent tools" },
   { label = "/agents edit", detail = "Edit global subagent profiles" },
-  { label = "/agent edit", detail = "Edit global subagent profiles" },
   { label = "/agents spawn", detail = "Create a fresh child from a profile" },
   { label = "/plan", detail = "Browse plans, or create a planning task with a prompt" },
   { label = "/task", detail = "List current and previous tasks" },
@@ -235,7 +234,7 @@ function CommandSource:get_completions(_, callback)
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end
-  local edit_start = prefix:match("^%s*/agents?%s+edit%s+()([^%s]*)$")
+  local edit_start = prefix:match("^%s*/agents%s+edit%s+()([^%s]*)$")
   local spawn_start = prefix:match("^%s*/agents%s+spawn%s+()([^%s]*)$")
   local profile_action, profile_start = edit_start and "edit" or "spawn", edit_start or spawn_start
   if profile_start then
@@ -252,7 +251,7 @@ function CommandSource:get_completions(_, callback)
     end)
     return
   end
-  if prefix:match("^%s*/agents%s+spawn%s+") or prefix:match("^%s*/agents?%s+edit%s+") then
+  if prefix:match("^%s*/agents%s+spawn%s+") or prefix:match("^%s*/agents%s+edit%s+") then
     callback({ items = items, is_incomplete_backward = false, is_incomplete_forward = false })
     return
   end

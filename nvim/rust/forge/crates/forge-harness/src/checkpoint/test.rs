@@ -3,6 +3,44 @@ use crate::storage::SqliteStore;
 use std::collections::BTreeSet;
 
 #[tokio::test]
+async fn reuses_unchanged_checkpoint_and_detects_external_dirty_edits() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(data.path()).unwrap();
+    let repositories = Arc::new(RepositoryStore::default());
+    let checkpoint = GitCheckpoint::new(repository.path());
+    let original = checkpoint.capture(&store.objects, &repositories, "reuse", 1).await.unwrap();
+    fs::write(repository.path().join("ignored.tmp"), "ignored").unwrap();
+    let reused = checkpoint.capture(&store.objects, &repositories, "reuse", 2).await.unwrap();
+    assert_eq!(reused.id, original.id);
+    assert_eq!(reused.created_at_ms, 1);
+
+    let path = repository.path().join("tracked.txt");
+    fs::write(&path, "first!\n").unwrap();
+    let dirty = checkpoint.capture(&store.objects, &repositories, "reuse", 3).await.unwrap();
+    let modified = fs::metadata(&path).unwrap().modified().unwrap();
+    fs::write(&path, "second\n").unwrap();
+    fs::File::options().write(true).open(&path).unwrap()
+        .set_times(fs::FileTimes::new().set_modified(modified)).unwrap();
+    let edited = checkpoint.capture(&store.objects, &repositories, "reuse", 4).await.unwrap();
+    assert_ne!(edited.id, dirty.id, "same-length edits with restored mtime must invalidate reuse");
+    let captured = edited.file.iter().find(|file|file.path == "tracked.txt").unwrap();
+    assert_eq!(store.objects.get(&captured.object_id, 100).unwrap().unwrap(), b"second\n");
+
+    fs::write(repository.path().join("new.txt"), "external").unwrap();
+    let added = checkpoint.capture(&store.objects, &repositories, "reuse", 5).await.unwrap();
+    assert_ne!(added.id, edited.id);
+    fs::remove_file(path).unwrap();
+    let removed = checkpoint.capture(&store.objects, &repositories, "reuse", 6).await.unwrap();
+    assert!(removed.deleted.contains(&"tracked.txt".to_owned()));
+    git(repository.path(), &["add", "."]);
+    git(repository.path(), &["commit", "-qm", "external changes"]);
+    let committed = checkpoint.capture(&store.objects, &repositories, "reuse", 7).await.unwrap();
+    assert_ne!(committed.head, removed.head);
+    assert_ne!(committed.id, removed.id);
+}
+
+#[tokio::test]
 async fn capture_waits_for_each_repository_scope_before_reading() {
     use std::task::Poll;
     use std::time::Duration;
@@ -201,7 +239,7 @@ async fn capture_from_nested_path_uses_the_canonical_worktree() {
 }
 
 #[tokio::test]
-async fn admitted_capture_rejects_cancellation_and_invalidation_before_native_work() {
+async fn admitted_capture_honors_cancellation_but_accepts_repository_invalidation() {
     let repository = repository();
     let data = tempfile::tempdir().unwrap();
     let store = SqliteStore::open(data.path()).unwrap();
@@ -221,7 +259,7 @@ async fn admitted_capture_rejects_cancellation_and_invalidation_before_native_wo
                 .unwrap();
         }
         let objects = store.objects.clone();
-        let error = repositories
+        let result = repositories
             .reads
             .submit(capture.input_bytes, move |cancellation| {
                 capture
@@ -230,21 +268,15 @@ async fn admitted_capture_rejects_cancellation_and_invalidation_before_native_wo
             })
             .unwrap()
             .finish()
-            .await
-            .unwrap_err();
-        assert!(error.to_string().contains(if invalidate {
-            "invalidation"
+            .await;
+        if invalidate {
+            assert!(result.is_ok(), "repository invalidation must not fail capture: {result:?}");
         } else {
-            "cancelled"
-        }));
+            assert!(result.unwrap_err().to_string().contains("cancelled"));
+            assert!(store.objects.get(&crate::plan::digest(b"before\n"), 4096).is_err());
+        }
         assert_eq!(repositories.writes.usage().operations, 0);
         assert_eq!(repositories.writes.usage().input_bytes, 0);
-        assert!(
-            store
-                .objects
-                .get(&crate::plan::digest(b"before\n"), 4096)
-                .is_err()
-        );
     }
 }
 
@@ -384,6 +416,88 @@ fn cancelled_queued_capture_keeps_admission_and_does_not_acquire_objects() {
                 .is_err()
         );
     });
+}
+
+#[test]
+fn capture_keeps_read_content_without_retrying_after_a_later_edit() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(repository.path());
+    let path = repository.path().join("tracked.txt");
+    fs::write(&path, b"first capture\n").unwrap();
+    let identity = crate::plan::digest(b"first capture\n");
+    let mut changed = false;
+    let record = checkpoint.capture_native(&store.objects, "session", 1, || {
+        if !changed && store.objects.get(&identity, 4096).is_ok() {
+            fs::write(&path, b"settled capture\n")?;
+            changed = true;
+        }
+        Ok(())
+    }).unwrap();
+    assert!(changed);
+    let captured = record.file.iter().find(|file| file.path == "tracked.txt").unwrap();
+    assert_eq!(store.objects.get(&captured.object_id, 4096).unwrap().unwrap(), b"first capture\n");
+    assert!(checkpoint.cache.lock().unwrap().is_none());
+    let current = checkpoint.capture_native(&store.objects, "session", 2, || Ok(())).unwrap();
+    assert_ne!(current.id, record.id);
+    let captured = current.file.iter().find(|file| file.path == "tracked.txt").unwrap();
+    assert_eq!(store.objects.get(&captured.object_id, 4096).unwrap().unwrap(), b"settled capture\n");
+    let reused = checkpoint.capture_native(&store.objects, "session", 3, || Ok(())).unwrap();
+    assert_eq!(reused.id, current.id);
+    assert_eq!(reused.created_at_ms, 2);
+}
+
+#[test]
+fn capture_accepts_an_index_refresh_without_changing_staging() {
+    let repository = repository();
+    let data = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(repository.path());
+    fs::write(repository.path().join("tracked.txt"), b"changed\n").unwrap();
+    let identity = crate::plan::digest(b"changed\n");
+    let index = repository.path().join(".git/index");
+    let original = fs::read(&index).unwrap();
+    let modified = fs::metadata(&index).unwrap().modified().unwrap();
+    let mut refreshed = false;
+    let record = checkpoint.capture_native(&store.objects, "session", 1, || {
+        if !refreshed && store.objects.get(&identity, 4096).is_ok() {
+            fs::File::options().write(true).open(&index)?.set_times(
+                fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
+            )?;
+            refreshed = true;
+        }
+        Ok(())
+    }).unwrap();
+    assert!(refreshed);
+    assert_eq!(fs::read(index).unwrap(), original);
+    assert!(record.file.iter().any(|file| file.path == "tracked.txt"));
+}
+
+#[test]
+fn capture_reads_the_current_version_of_a_clean_file_changed_before_its_turn() {
+    let repository = repository();
+    let later = repository.path().join("z-later.txt");
+    fs::write(&later, b"old\n").unwrap();
+    git(repository.path(), &["add", "z-later.txt"]);
+    git(repository.path(), &["commit", "-qm", "later file"]);
+    let data = tempfile::tempdir().unwrap();
+    let store = SqliteStore::open(data.path()).unwrap();
+    let checkpoint = GitCheckpoint::new(repository.path());
+    fs::write(repository.path().join("tracked.txt"), b"first\n").unwrap();
+    let identity = crate::plan::digest(b"first\n");
+    let mut changed = false;
+    let record = checkpoint.capture_native(&store.objects, "session", 1, || {
+        if !changed && store.objects.get(&identity, 4096).is_ok() {
+            fs::write(&later, b"current version\n")?;
+            changed = true;
+        }
+        Ok(())
+    }).unwrap();
+    assert!(changed);
+    let captured = record.file.iter().find(|file| file.path == "z-later.txt").unwrap();
+    assert_eq!(store.objects.get(&captured.object_id, 4096).unwrap().unwrap(), b"current version\n");
+    assert!(checkpoint.cache.lock().unwrap().is_none());
 }
 
 #[test]

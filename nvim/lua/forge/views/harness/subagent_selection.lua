@@ -117,17 +117,4 @@ function Selection:cycle(values, field, direction, done)
   else client.request_for(root.id, "agent.models", { provider = provider }, apply) end
 end
 
----Shows the current parent value without replacing the persisted inherit sentinel.
----@param field string
----@param value string
----@return string
-function Selection:label(field, value)
-  if value ~= "inherit" then return value end
-  local root = self.state.session
-  if not root then return value end
-  local resolved = ({ provider = root.backend, model = root.resolved_model or root.model,
-    reasoning_effort = root.effort or "default", service_tier = root.service_tier or "default" })[field]
-  return resolved and ("inherit (" .. resolved .. ")") or value
-end
-
 return Selection

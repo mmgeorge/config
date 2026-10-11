@@ -61,7 +61,7 @@ impl CodexResources {
         let mut skill: Vec<_> = discovered.iter().filter_map(|skill|skill.path.as_ref())
             .map(|path|json!({"path":path,"enabled":false})).collect();
         skill.extend(self.catalog.selected_skill.iter().map(|skill|json!({"path":skill.source,"enabled":true})));
-        let config = json!({"mcp_servers":server,"plugins":plugin,
+        let config = json!({"mcp_servers":server,"plugins":plugin,"hooks":native.pointer("/config/hooks").filter(|value|value.is_object()).cloned().unwrap_or(json!({})),
             "skills":{"bundled":{"enabled":false},"config":skill}});
         *configured = Some(config.clone());
         Ok(config)

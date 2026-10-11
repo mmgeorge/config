@@ -20,7 +20,7 @@ local catalog_by_provider = {
   claude = { capability = {}, models = {} },
 }
 local snapshot = { path = "global/forge/subagents.json", revision = "1", document = {
-  default_profile = "worker", activity_limit = 5, profiles = {
+  default_profile = "worker", profiles = {
     worker = { enabled = true, description = "Implement", instructions = "Worker instructions", provider = "inherit",
       model = "inherit", reasoning_effort = "inherit", service_tier = "inherit", permission_mode = "inherit" },
     reviewer = { enabled = true, description = "Review", instructions = "Reviewer instructions", provider = "inherit",
@@ -98,14 +98,50 @@ local succeeded, failure = xpcall(function()
   local host = { window_list = { window }, control_win = window }
   require("forge.views.harness.subagent_profiles").open(state, host)
   local option_list = picker._state_for_test().spec.page_list[1].option_list
-  assert(#option_list == 5, "profile picker must include disabled profiles, activity settings, and config access")
-  assert(option_list[1].id == "disabled" and option_list[1].columns[2] == "← Off →")
-  assert(option_list[#option_list].label == "Open config file" and not option_list[#option_list].value,
-    "config access must be the final non-profile option")
+  assert(#option_list == 3, "profile picker must contain only profiles, including disabled profiles")
+  assert(option_list[1].id == "disabled" and option_list[1].columns[2] == "←No→")
+  assert(vim.trim(picker._state_for_test().spec.page_list[1].column_headers[2]) == "Enable")
+  local baseline_position_list
+  for _, width in ipairs({ 90, 100, 123 }) do
+    local page = picker._state_for_test().spec.page_list[1]
+    local frame = require("forge.views.picker.layout").build(page, 1, width, {})
+    local heading, profile_row
+    for _, line in ipairs(frame.lines) do
+      if line:find("Profile", 1, true) and line:find("Provider", 1, true) then heading = line end
+      if line:find("disabled", 1, true) then profile_row = line end
+    end
+    assert(heading and profile_row, "profile table did not render")
+    assert(not profile_row:find("…", 1, true), "profile values must fit at width " .. width)
+    assert(not profile_row:find("(", 1, true), "inherit label includes the resolved parent value")
+    local search_start = 1
+    local column_position_list = {}
+    for _, label in ipairs({ "Provider", "Model", "Thinking", "Speed" }) do
+      local heading_start = assert(heading:find(label, 1, true))
+      local value_start, value_end = profile_row:find("inherit", search_start, true)
+      assert(value_start and value_end, "inherit label was truncated at width " .. width)
+      assert(vim.fn.strdisplaywidth(heading:sub(1, heading_start - 1))
+        == vim.fn.strdisplaywidth(profile_row:sub(1, value_start - 1)), label .. " column is misaligned")
+      column_position_list[#column_position_list + 1] = vim.fn.strdisplaywidth(heading:sub(1, heading_start - 1))
+      search_start = value_end + 1
+    end
+    baseline_position_list = baseline_position_list or column_position_list
+    assert(vim.deep_equal(column_position_list, baseline_position_list), "extra width must not spread the columns")
+  end
   select("reviewer")
   assert(not picker.is_open("subagent-profiles"))
   assert(vim.api.nvim_get_current_tabpage() ~= origin_tab, "form did not open a full page")
   assert(#vim.api.nvim_tabpage_list_wins(0) == 1 and vim.bo.filetype == "ForgeForm")
+  local form_lines = vim.api.nvim_buf_get_lines(current_form.buffer, 0, -1, false)
+  assert(form_lines[1] == "reviewer", "form must start with the Name field")
+  assert(#form_lines == #current_form.fields + 1, "form retained header or spacer rows")
+  local label_style = vim.api.nvim_get_hl(0, { name = "ForgeFormLabel", link = false })
+  assert(label_style.fg == 0xffffff and label_style.bold, "form labels must be white and bold")
+  for index, field in ipairs(current_form.fields) do
+    local mark = vim.api.nvim_buf_get_extmark_by_id(current_form.buffer, current_form.namespace, field.mark, { details = true })
+    assert(mark[1] == index - 1, "form rows must be consecutive")
+    assert(mark[3].virt_text[1][1] == field.label .. ": " and mark[3].virt_text[1][2] == "ForgeFormLabel")
+    if field.choices then assert(mark[3].virt_text[2][2] == "Normal", "choice value inherited label styling") end
+  end
   if vim.g.forge_profile_form_interactive then return end
   focus("model")
   assert(not vim.bo.modifiable, "choice value allowed native text edits")
@@ -181,10 +217,10 @@ local succeeded, failure = xpcall(function()
   press_arrow("r", "disabled")
   assert(snapshot.document.profiles.disabled.enabled and saves == before_toggle + 1)
   assert(picker._state_for_test() == instance, "toggle reopened the picker")
-  assert(instance.spec.page_list[1].option_list[1].columns[2] == "← On →")
+  assert(instance.spec.page_list[1].option_list[1].columns[2] == "←Yes→")
   press_arrow("h", "disabled")
   assert(not snapshot.document.profiles.disabled.enabled and saves == before_toggle + 2)
-  assert(instance.spec.page_list[1].option_list[1].columns[2] == "← Off →")
+  assert(instance.spec.page_list[1].option_list[1].columns[2] == "←No→")
   press_arrow("<Right>", "reviewer")
   assert(snapshot.document.profiles.reviewer.enabled and saves == before_toggle + 2)
   assert(errors[#errors]:find("Default profile must be enabled"))
@@ -194,7 +230,7 @@ local succeeded, failure = xpcall(function()
   local first_pending = pending_save
   press_arrow("<Right>", "worker")
   select("worker")
-  select("config:" .. snapshot.path)
+  action("open-config")
   action("reload")
   assert(picker.is_open("subagent-profiles") and pending_save == first_pending,
     "pending toggle allowed another operation")
@@ -205,20 +241,12 @@ local succeeded, failure = xpcall(function()
   assert(not snapshot.document.profiles.worker.enabled)
   assert(instance.state.selected_index_by_page["subagent-profiles"] == 3,
     "toggle lost the selected profile")
-  assert(instance.spec.page_list[1].option_list[3].columns[2] == "← Off →")
+  assert(instance.spec.page_list[1].option_list[3].columns[2] == "←No→")
   delayed_save = false
 
-  press_arrow("<Right>", "activity-limit")
-  assert(snapshot.document.activity_limit == 6, "activity entry limit did not persist")
-  press_arrow("r", "activity-limit")
-  assert(snapshot.document.activity_limit == 5, "shared previous-value key did not decrease the limit")
-  snapshot.document.activity_limit = 20
-  action("reload")
-  local before_limit = saves
-  press_arrow("h", "activity-limit")
-  assert(snapshot.document.activity_limit == 20 and saves == before_limit, "activity entry limit exceeded 20")
-  select("activity-limit")
-  assert(picker.is_open("subagent-profiles"), "activity setting opened the config file")
+  for _, option in ipairs(instance.spec.page_list[1].option_list) do
+    assert(option.value, "unexpected non-profile menu option")
+  end
 
   picker.close()
   require("forge.views.harness.subagent_profiles").open(state, host)
@@ -314,21 +342,12 @@ local succeeded, failure = xpcall(function()
   vim.fn.writefile({ config_text }, config_path)
   snapshot.path = config_path
   require("forge.views.harness.subagent_profiles").open(state, host)
-  local config_picker = picker._state_for_test()
-  local config_option = config_picker.spec.page_list[1].option_list[#config_picker.spec.page_list[1].option_list]
   local before_open = saves
-  for _, entry in ipairs(config_picker.spec.action_list) do
-    if entry.id == "previous-value" or entry.id == "next-value" or entry.id == "delete" then
-      entry.callback({ option = config_option })
-    end
-  end
-  assert(saves == before_open, "config option was treated as a profile")
-  config_picker.state.selected_index_by_page["subagent-profiles"] = #config_picker.spec.page_list[1].option_list
-  for _, mapping in ipairs(vim.api.nvim_buf_get_keymap(config_picker.buf, "n")) do
-    if mapping.lhs == "<CR>" then mapping.callback() break end
-  end
-  assert(not picker.is_open("subagent-profiles"), "config selection left the picker open")
-  assert(vim.api.nvim_buf_get_name(0) == vim.fn.fnamemodify(config_path, ":p"), "config selection opened the wrong file")
+  assert(vim.fn.maparg("oc", "n", false, true).buffer == 1, "config hotkey must be local to the picker")
+  vim.api.nvim_feedkeys("oc", "xt", false)
+  assert(not picker.is_open("subagent-profiles"), "config hotkey left the picker open")
+  assert(saves == before_open, "config hotkey mutated a profile")
+  assert(vim.api.nvim_buf_get_name(0) == vim.fn.fnamemodify(config_path, ":p"), "config hotkey opened the wrong file")
   assert(vim.api.nvim_get_current_tabpage() ~= origin_tab, "config did not open in its own tab")
   assert(vim.bo.buftype == "" and vim.bo.modifiable and not vim.bo.readonly)
   assert(vim.api.nvim_buf_get_lines(0, 0, 1, false)[1] == config_text, "config contents changed on open")

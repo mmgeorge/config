@@ -6,7 +6,6 @@ use sha2::{Digest, Sha256};
 
 fn inherit() -> String { "inherit".into() }
 fn enabled() -> bool { true }
-fn activity_limit() -> usize { 5 }
 
 /// Defines user-owned child behavior independently of model-supplied task text.
 #[derive(Clone, Debug, Deserialize, Serialize)]
@@ -43,9 +42,6 @@ impl Default for AgentProfile {
 #[serde(deny_unknown_fields)]
 pub struct AgentProfileDocument {
     pub default_profile: String,
-    #[serde(default = "activity_limit")]
-    /// Default number of recent entries returned by child activity inspection.
-    pub activity_limit: usize,
     pub profiles: BTreeMap<String, AgentProfile>,
 }
 
@@ -59,13 +55,12 @@ impl Default for AgentProfileDocument {
         ].into_iter().map(|(name, description, instructions)| (name.into(), AgentProfile {
             description: description.into(), instructions: instructions.into(), ..Default::default()
         })).collect();
-        Self { default_profile: "worker".into(), activity_limit: activity_limit(), profiles }
+        Self { default_profile: "worker".into(), profiles }
     }
 }
 
 impl AgentProfileDocument {
     pub fn validate(&self) -> Result<()> {
-        super::activity::validate_limit(self.activity_limit)?;
         ensure!(self.profiles.len() <= 64, "at most 64 subagent profiles are supported");
         ensure!(self.profiles.get(&self.default_profile).is_some_and(|profile| profile.enabled),
             "default_profile must name an enabled profile");

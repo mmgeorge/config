@@ -41,12 +41,65 @@ pub struct CheckpointInventory {
     pub base: BTreeMap<String, BaseFile>,
     /// Path and whether Git's index proves it unchanged from the base.
     pub candidate: BTreeMap<String, bool>,
-    /// Working-file observations used to reject concurrent capture changes.
+    /// Working-file observations used to recheck clean candidates before capture.
     pub observation: BTreeMap<String, crate::snapshot::WorktreeStamp>,
-    /// Index version sampled without hashing file contents.
-    pub index: crate::snapshot::IndexStamp,
     /// Case-sensitive baseline names replaced by differently cased directory entries.
     pub missing: BTreeSet<String>,
+}
+
+impl CheckpointInventory {
+    /// Rechecks whether a candidate still matches the clean version observed during discovery.
+    pub fn unchanged(&self, root: &Path, path: &str) -> Result<bool> {
+        if self.candidate.get(path) != Some(&true) {
+            return Ok(false);
+        }
+        let current = crate::snapshot::read_worktree_stamp(
+            root,
+            &crate::RepositoryPath::new(path_bytes(path)?)?,
+        )?;
+        Ok(self.observation.get(path) == Some(&current))
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Identifies a worktree using native Git status and metadata for its changed paths.
+pub struct CheckpointSignature {
+    status: Vec<u8>,
+    index: Option<(u64, std::time::SystemTime)>,
+    observation: Vec<crate::snapshot::WorktreeStamp>,
+}
+
+/// Checks checkpoint reuse without enumerating committed trees or creating checkpoint objects.
+///
+/// Runs a bounded, read-only Git status under the caller's repository admission. HEAD,
+/// index identity, untracked paths, and metadata of already-dirty files all participate.
+pub fn signature(root: &Path, check: &mut dyn FnMut() -> Result<()>) -> Result<CheckpointSignature> {
+    let repository = gix::open(root)?;
+    let index = match std::fs::metadata(repository.index_path()) {
+        Ok(metadata) => Some((metadata.len(), metadata.modified()?)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) => return Err(error.into()),
+    };
+    let output = crate::command::read_command(
+        std::process::Command::new("git").current_dir(root).args([
+            "--no-optional-locks", "status", "--porcelain=v2", "-z", "--branch",
+            "--untracked-files=all", "--ignore-submodules=none", "--no-renames",
+        ]),
+        crate::command::CommandLimits {
+            stdout_bytes: 32 * 1024 * 1024,
+            stderr_bytes: 64 * 1024,
+            timeout: std::time::Duration::from_secs(20),
+        },
+        &mut *check,
+    )?;
+    ensure!(output.status.success(), "checkpoint status failed: {}", String::from_utf8_lossy(&output.stderr));
+    let paths = crate::snapshot::parse_porcelain_v2(&output.stdout, repository.object_hash(), 32 * 1024 * 1024, 250_000)?;
+    let mut observation = Vec::with_capacity(paths.len());
+    for path in paths {
+        check()?;
+        observation.push(crate::snapshot::read_worktree_stamp(root, &path.path)?);
+    }
+    Ok(CheckpointSignature { status: output.stdout, index, observation })
 }
 
 /// Reads existing trees and eligible paths without writing any Git object, ref, or index.
@@ -92,9 +145,9 @@ pub fn inventory(
             );
         }
     }
-    let index_stamp = crate::snapshot::read_index_stamp(&repository.index_path(), check)?;
     let index = repository.index_or_empty()?;
     let mut candidate: BTreeMap<_, _> = base.keys().map(|path| (path.clone(), false)).collect();
+    let mut observation = BTreeMap::new();
     let options = repository.stat_options()?;
     for entry in index.entries() {
         check()?;
@@ -112,6 +165,10 @@ pub fn inventory(
             }
             continue;
         }
+        observation.insert(path.clone(), crate::snapshot::read_worktree_stamp(
+            root,
+            &crate::RepositoryPath::new(path_bytes(&path)?)?,
+        )?);
         let native = root.join(native_path(&path)?);
         let skipped = entry
             .flags
@@ -198,28 +255,23 @@ pub fn inventory(
             }
         }
     }
-    let mut observation = BTreeMap::new();
-    for path in candidate.keys() {
+    for (path, clean) in &mut candidate {
         check()?;
-        observation.insert(
-            path.clone(),
-            crate::snapshot::read_worktree_stamp(
-                root,
-                &crate::RepositoryPath::new(path_bytes(path)?)?,
-            )?,
-        );
+        let current = crate::snapshot::read_worktree_stamp(
+            root,
+            &crate::RepositoryPath::new(path_bytes(path)?)?,
+        )?;
+        if observation.get(path).is_some_and(|previous| previous != &current) {
+            *clean = false;
+        }
+        observation.insert(path.clone(), current);
     }
-    ensure!(
-        index_stamp == crate::snapshot::read_index_stamp(&repository.index_path(), check)?,
-        "index changed during checkpoint discovery"
-    );
     Ok(CheckpointInventory {
         head: head.clone(),
         tree: head.map(|_| tree.to_string()),
         base,
         candidate,
         observation,
-        index: index_stamp,
         missing,
     })
 }

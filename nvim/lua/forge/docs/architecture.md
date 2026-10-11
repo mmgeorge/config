@@ -749,8 +749,9 @@ bound to the transcript document lifetime. Rust tracks submission admission with
 composer document. A `prompt_submission` acceptance clears only the unchanged captured draft.
 Retraction restores its exact rows only while the cleared buffer retains its changedtick.
 Newer typing survives both transitions. Rejection retains the draft, and closing or replacing
-the presentation invalidates late transitions. Plan preparation and Git checkpoint capture still
-precede acceptance.
+the presentation invalidates late transitions. Plan preparation precedes acceptance. Git checkpoint
+acquisition starts asynchronously when the exchange is admitted and does not delay acceptance or
+the initial timeline projection.
 
 Rust projects the semantic timeline and its synthetic bottom status from the same session-scoped durable owners.
 `ExchangeLayout` keeps provider activity in the summary fold and renders generated artifacts,
@@ -3134,8 +3135,8 @@ run when idle. It returns the most recent entries in timeline order, elapsed mil
 last accepted provider activity, and approval/input state. Tool entries contain lifecycle,
 failure status, elapsed time, and an opaque call reference. They contain no output. Thought and
 commentary entries retain up to 4000 Unicode characters with an explicit truncation flag. Final
-answers remain on the existing completion-delivery path. The default entry count is five,
-stored as `activity_limit` in `subagents.json`, with per-call overrides bounded to 1–20.
+answers remain on the existing completion-delivery path. The tool defaults to five entries,
+with per-call overrides bounded to 1–20.
 
 `harness_agent_tool_output` resolves a reference containing the session, child, exchange,
 turn, and call identities. The broker validates every ownership boundary before reading.
@@ -3160,10 +3161,16 @@ actions operate on the instance identity.
 `AgentProfileStore` owns `stdpath("config")/forge/subagents.json`, beside permissions.json.
 The file is the global source of truth across workspaces and providers. `/agents edit` opens a profile
 picker over `agent.profiles.get`, and `/agents edit <profile>` opens the named profile directly.
-`/agent edit [profile]` shares the same route. The edit picker includes disabled profiles.
-Tab selects Enabled, Provider, Model, Thinking, or Speed on the selected profile. Left/Right
+The edit picker includes disabled profiles.
+`oc` closes the picker and opens the global configuration file in a new tab.
+Tab selects Enable, Provider, Model, Thinking, or Speed on the selected profile. Left/Right
 cycles that field through a revision-checked save.
-The `Activity entries` row uses the same controls to update the global inspection count.
+Inherited fields display only `inherit`. Editable column headers reserve the same arrow
+padding as their values, and the Purpose column shrinks first when space is limited.
+Columns fit their longest header or value with compact arrow gutters. Additional window
+width does not spread the columns.
+The full-page profile form keeps its title in the winbar and starts its body at Name.
+Field rows are consecutive, with white bold labels and multiline instruction editing.
 Picker value controls share `keymaps.picker.previous_value` (Left and `r`) and
 `keymaps.picker.next_value` (Right and `h`). Settings, profile toggles, model values, and plan
 revisions declare these commands instead of literal keys. Form controls retain their separate
@@ -3941,7 +3948,7 @@ reads before releasing scopes. A restore error remains uncertain because filesys
 have partially completed. Existing interaction-state updates run only after restoration succeeds.
 
 Checkpoint rollback now runs its file acquisition, Git subprocess calls, and restoration on a
-blocking worker. Other checkpoint capture and diff callers still execute synchronously. Temporary
+blocking worker. Checkpoint capture and diff callers use the shared read pool described below. Temporary
 content buffers and SQLite decoding are not covered by the metadata reservation.
 Per-target durable outcomes, permission integration, process termination, and recovery remain
 incomplete. This first writer integration does not establish shared ownership for all writers.
@@ -4342,8 +4349,9 @@ does not complete the Harness migration gate.
 
 ## 54. Checkpoint capture admission
 
-Every broker capture path awaits `GitCheckpoint::capture` on the host's shared blocking read pool.
-This includes initial and final captures for normal interactions and child-agent turns. Git queries,
+Every broker capture path runs `GitCheckpoint::capture` on the host's shared blocking read pool.
+Initial acquisition belongs to the exchange runtime and runs concurrently with provider reasoning.
+Final capture awaits that baseline before comparing normal interactions and child-agent turns. Git queries,
 workspace file acquisition, object publication, and checkpoint manifest hashing execute outside
 the broker executor. Discovery resolves the canonical worktree before capture admits repository
 scopes. The request charges its retained workspace path and session identity before acquisition
@@ -4356,9 +4364,25 @@ Source metadata includes file identity and change time where the operating syste
 it. File replacement invalidates cached identities. The content and baseline caches retain
 at most 65,536 entries each. Reopening a host rebuilds those caches from current metadata.
 
-Initial interaction startup persists its checkpoint before publishing the provider turn.
-Admission and acquisition failures leave a visible finalization error. Capture diagnostics
-report candidate and override counts, cache hits, file bytes read, and elapsed milliseconds.
+Initial interaction startup publishes prompt acceptance and the timeline before checkpoint completion.
+The broker persists the baseline before releasing the exchange's tool barrier. Codex uses a temporary
+PreToolUse command that invokes `forge checkpoint-wait`, while Copilot uses its session pre-tool hook.
+Harness control tools await the same barrier. Providers without a pre-tool hook wait before the model
+request starts, after prompt acceptance. A resumed Codex thread with existing background terminals
+also waits before inference because terminal stdin bypasses its pre-tool hook. Missing barrier files, acquisition failures, and a 25-second
+barrier deadline deny tool execution. Cancellation keeps a failed barrier closed. Finalization also
+collects acquisition when the model finishes without calling a tool.
+If initial acquisition fails, finalization can retry after the obstruction clears. The closed
+barrier prevents provider edits, so recovery records the current workspace as both boundaries
+without replaying the provider request.
+
+Each broker retains one checkpoint cache across exchanges. A bounded native Git porcelain status
+checks HEAD, index identity, and tracked or untracked changes. Metadata and file identities detect
+repeated edits to already-dirty files. A matching observation reuses the previous durable record
+without tree enumeration, file copying, or manifest reconstruction. Cache misses perform and verify
+the complete capture. Ignored file edits do not invalidate reuse. Repository coordination and native
+command cancellation apply to both paths. Capture diagnostics report reuse or candidate and override
+counts, cache hits, file bytes read, and elapsed milliseconds.
 
 ## 55. Bounded checkpoint command output
 

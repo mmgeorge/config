@@ -379,8 +379,6 @@ local success, failure = xpcall(function()
     { "/agents on", { "tools", true, true } },
     { "/agents off", { "tools", false, true } },
     { "/agents off", { "tools", false, true } },
-    { "/agent edit", { "edit" } },
-    { "/agent edit reviewer", { "edit", "reviewer" } },
     { "/agents edit", { "edit" } },
     { "/agents edit reviewer", { "edit", "reviewer" } },
     { "/agents spawn reviewer Inspect parser", { "spawn", "reviewer", "Inspect parser" } },
@@ -394,6 +392,14 @@ local success, failure = xpcall(function()
     assert(vim.deep_equal(routed, command[2]), "incorrect route for " .. command[1])
     assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "")
     assert(#state.queue == 1 and state.queue[1] == "keep queued work", "agent command was queued as a prompt")
+  end
+  for _, text in ipairs({ "/agent edit", "/agent edit reviewer" }) do
+    routed = {}
+    vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { text })
+    controller.submit()
+    assert(vim.tbl_isempty(routed), "singular agent command must not route")
+    assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == text)
+    assert(#state.queue == 1 and state.queue[1] == "keep queued work", "singular agent command was queued")
   end
   profiles.open, controller.spawn_agent, controller.open_spawn_picker = original_profile_open, original_spawn, original_spawn_picker
   controller.open_agent_picker, controller.select_agent = original_agents, original_select

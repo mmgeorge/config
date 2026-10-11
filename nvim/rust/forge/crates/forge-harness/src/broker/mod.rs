@@ -205,11 +205,21 @@ pub struct ActiveElicitation {
 }
 
 struct ExchangeRuntime {
+    checkpoint: Option<crate::checkpoint::CheckpointTask>,
+    tool_gate: Option<crate::checkpoint::ToolGate>,
     exchange_id: String,
     synthetic_turn: Option<crate::backend::ProviderAddress>,
     task: TaskTracker,
     retraction_eligible: bool,
     active_wait: Option<ActiveWait>,
+}
+
+impl Drop for ExchangeRuntime {
+    fn drop(&mut self) {
+        if let Some(gate) = &self.tool_gate {
+            let _ = gate.complete(Err("exchange ended before checkpoint persistence".into()));
+        }
+    }
 }
 
 struct ChildExchangeRuntime {
@@ -500,6 +510,7 @@ impl ExchangeAdmission {
 
 /// Coordinates backend turns, durable state, plan review, goals, and interaction checkpoints.
 pub struct HarnessBroker {
+    checkpoint: Option<GitCheckpoint>,
     active_operation_id: Option<String>,
     runtime_epoch: String,
     snapshot_revision: AtomicU64,
@@ -736,6 +747,7 @@ impl HarnessBroker {
             runtime_epoch: Uuid::new_v4().to_string(),
             snapshot_revision: AtomicU64::new(0),
             repositories: Arc::clone(&runtime.repositories),
+            checkpoint: match &workspace_kind { WorkspaceKind::Git(workspace) => Some(GitCheckpoint::new(workspace)), _ => None },
             diff: Arc::clone(&runtime.diff),
             store,
             plan_file: PlanFileStore::new(&data_root, &session.workspace),
@@ -821,6 +833,7 @@ impl HarnessBroker {
                 .ok()
         });
         Some(crate::control_tools::ControlTurnContext {
+            checkpoint: self.exchange_runtime.as_ref().and_then(|runtime| runtime.tool_gate.clone()),
             agent: None,
             check_shell: self.session.shell,
             mode,
@@ -1977,8 +1990,7 @@ impl HarnessBroker {
         }
         match &request.operation {
             AgentOperation::Activity { target, limit } => {
-                let settings = self.agent_backend_factory.profiles.snapshot()?;
-                let limit = limit.unwrap_or(settings.document.activity_limit);
+                let limit = limit.unwrap_or(5);
                 let (agent, task) = self.agent_coordinator.inspection(target)?;
                 let saved;
                 let exchange = if let Some(runtime) = self.child_exchange_runtime_by_agent.get(&agent.id)
@@ -1989,9 +2001,8 @@ impl HarnessBroker {
                 };
                 let awaiting_approval = self.permission_coordinator.pending_list()?.iter().any(|approval|
                     approval.execution_owner.as_ref().is_some_and(|owner|owner.agent_id == agent.id && owner.session_id == self.session.id));
-                let mut result = serde_json::to_value(crate::agent::AgentActivity::capture(
+                let result = serde_json::to_value(crate::agent::AgentActivity::capture(
                     &agent,&task,exchange,limit,self.clock.now_ms(),awaiting_approval)?)?;
-                if let Some(warning) = settings.error {result["warning"] = warning.into();}
                 return Ok(result);
             }
             AgentOperation::ToolOutput { call_ref, offset, limit } => {
@@ -4393,20 +4404,19 @@ Planning continuation: turn {} of {}.",
         now_ms: i64,
     ) -> Result<()> {
         self.require_restore_recovered()?;
-        if let WorkspaceKind::Git(workspace) = &self.workspace_kind {
-            let checkpoint = GitCheckpoint::new(workspace)
-                .capture(
-                    &self.store.objects,
-                    &self.repositories,
-                    &self.session.id,
-                    now_ms,
-                )
-                .await?;
-            self.store.save_checkpoint(&checkpoint)?;
-            interaction.checkpoint_before = Some(checkpoint.id.clone());
-        }
+        let tool_gate = self.checkpoint.as_ref().map(|_| crate::checkpoint::ToolGate::new()).transpose()?;
+        let checkpoint = self.checkpoint.clone().map(|checkpoint| {
+            let objects = self.store.objects.clone();
+            let repositories = Arc::clone(&self.repositories);
+            let session_id = self.session.id.clone();
+            crate::checkpoint::CheckpointTask(tokio::spawn(async move {
+                checkpoint.capture(&objects, &repositories, &session_id, now_ms).await
+            }))
+        });
         self.active_wait_projection = None;
         self.exchange_runtime = Some(ExchangeRuntime {
+            checkpoint,
+            tool_gate,
             exchange_id: interaction.id.clone(),
             synthetic_turn: None,
             task: interaction
@@ -4420,9 +4430,42 @@ Planning continuation: turn {} of {}.",
         Ok(())
     }
 
+    fn finish_initial_checkpoint(
+        &mut self,
+        runtime: &mut ExchangeRuntime,
+        interaction: &mut Exchange,
+        result: Result<crate::checkpoint::CheckpointRecord>,
+    ) -> Result<()> {
+        runtime.checkpoint.take();
+        let saved = result.and_then(|checkpoint| {
+            interaction.checkpoint_before = Some(checkpoint.id.clone());
+            self.store.save_checkpoint_exchange(&checkpoint, interaction)?;
+            if let Some(execution_id) = interaction.execution_id.as_deref()
+                && let Some(mut execution) = self.store.load_plan_execution(execution_id)?
+                && execution.baseline_checkpoint.is_none()
+            {
+                execution.baseline_checkpoint = Some(checkpoint.id);
+                self.store.save_plan_execution(&execution)?;
+            }
+            Ok(())
+        });
+        if let Some(gate) = &runtime.tool_gate {
+            gate.complete(saved.as_ref().map(|_| ()).map_err(|error|format!("{error:#}")))?;
+        }
+        saved
+    }
+
+    async fn collect_initial_checkpoint(&mut self, runtime: &mut ExchangeRuntime, interaction: &mut Exchange) -> Result<()> {
+        let Some(task) = runtime.checkpoint.as_mut() else { return Ok(()); };
+        let result = (&mut task.0).await.context("checkpoint worker failed").and_then(|result|result);
+        self.finish_initial_checkpoint(runtime, interaction, result)
+    }
+
     fn resume_exchange_runtime(&mut self, interaction: &Exchange) -> Result<()> {
         self.require_restore_recovered()?;
         self.exchange_runtime = Some(ExchangeRuntime {
+            checkpoint: None,
+            tool_gate: None,
             exchange_id: interaction.id.clone(),
             synthetic_turn: None,
             task: interaction
@@ -4767,6 +4810,7 @@ Planning continuation: turn {} of {}.",
         scan_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
         scan_interval.tick().await;
         let mut stream_open = true;
+        let mut checkpoint_failed = false;
         let mut pending_revision: Option<(
             tokio::sync::oneshot::Sender<Result<Value>>,
             crate::plan::revision_review::RevisionReviewWait,
@@ -4774,6 +4818,9 @@ Planning continuation: turn {} of {}.",
         let delivery_sink = self.event_sink.clone();
         let outcome = {
             let prompt = async move {
+                if !backend.checkpoint_tool_gate()
+                    && let Some(gate) = request.control_context.as_ref().and_then(|context| context.checkpoint.as_ref())
+                { gate.wait().await?; }
                 backend
                     .prompt_stream(request, Some(backend_event_sink))
                     .await
@@ -4783,6 +4830,17 @@ Planning continuation: turn {} of {}.",
                 tokio::select! {
                     biased;
                     () = cancellation.cancelled() => break Err(anyhow::Error::new(TurnCancelled)),
+                    result = async {
+                        match runtime.checkpoint.as_mut() {
+                            Some(task) => (&mut task.0).await.context("checkpoint worker failed").and_then(|result|result),
+                            None => std::future::pending().await,
+                        }
+                    } => {
+                        if let Err(error) = self.finish_initial_checkpoint(&mut runtime, interaction, result) {
+                            checkpoint_failed = true;
+                            break Err(error);
+                        }
+                    }
                     input = parent_input.receive(), if user_delivery.is_empty() && deferred_input.is_empty() => {
                         let input = input.context("parent input receiver closed")?;
                         if self.backend.descriptor().capability.native_steer {
@@ -4944,6 +5002,15 @@ Planning continuation: turn {} of {}.",
                 }
             }
         };
+        if outcome.is_err() && let Some(gate) = &runtime.tool_gate {
+            gate.complete(Err("provider turn ended before checkpoint admission completed".into()))?;
+        }
+        let outcome = if let Some(task) = runtime.checkpoint.as_mut() {
+            let result = (&mut task.0).await.context("checkpoint worker failed").and_then(|result|result);
+            let saved = self.finish_initial_checkpoint(&mut runtime, interaction, result);
+            checkpoint_failed |= saved.is_err();
+            saved.and(outcome)
+        } else { outcome };
         while !result_delivery.is_empty() {
             tokio::select! {
                 biased;
@@ -4993,7 +5060,7 @@ Planning continuation: turn {} of {}.",
             outcome = Err(error).context("clear pending approval requests");
         }
         if outcome.as_ref().is_err_and(|error| {
-            error.downcast_ref::<TurnCancelled>().is_some()
+            checkpoint_failed || error.downcast_ref::<TurnCancelled>().is_some()
                 || error
                     .downcast_ref::<crate::backend::events::EventDeliveryFailure>()
                     .is_some()
@@ -5070,6 +5137,12 @@ Planning continuation: turn {} of {}.",
         interaction.begin_finalization(outcome, self.clock.now_ms())?;
         self.store.save_exchange(interaction)?;
         let result: Result<Option<String>> = async {
+            if self.exchange_runtime.as_ref().is_some_and(|runtime| runtime.exchange_id == interaction.id && runtime.checkpoint.is_some()) {
+                let mut runtime = self.exchange_runtime.take().expect("checked runtime");
+                let saved = self.collect_initial_checkpoint(&mut runtime, interaction).await;
+                self.exchange_runtime = Some(runtime);
+                saved?;
+            }
             let descendants: Vec<_> = referenced_child_exchange_list(interaction)
                 .into_iter()
                 .map(|(_, id)| id)
@@ -5077,7 +5150,7 @@ Planning continuation: turn {} of {}.",
             self.store
                 .require_settled_exchange_tree(&self.session.id, &descendants)?;
 
-            let WorkspaceKind::Git(workspace) = &self.workspace_kind else {
+            let WorkspaceKind::Git(_) = &self.workspace_kind else {
                 let mut changes = crate::exchange::ProviderDiffBuilder::default();
                 self.visit_provider_exchanges(interaction, |exchange| changes.record(exchange))?;
                 interaction.attributed_diff_text = changes.finish();
@@ -5085,7 +5158,7 @@ Planning continuation: turn {} of {}.",
                 interaction.finish(outcome, self.clock.now_ms())?;
                 return Ok(None);
             };
-            let checkpoint = GitCheckpoint::new(workspace)
+            let checkpoint = self.checkpoint.as_ref().context("Git checkpoint adapter is missing")?
                 .capture(
                     &self.store.objects,
                     &self.repositories,
@@ -5093,13 +5166,14 @@ Planning continuation: turn {} of {}.",
                     self.clock.now_ms(),
                 )
                 .await?;
-            let before = interaction
-                .checkpoint_before
-                .as_deref()
-                .map(|id| self.store.load_checkpoint(id))
-                .transpose()?
-                .flatten()
-                .context("interaction before checkpoint is missing")?;
+            let before = if let Some(identity) = interaction.checkpoint_before.as_deref() {
+                self.store.load_checkpoint(identity)?.context("interaction before checkpoint is missing")?
+            } else {
+                anyhow::ensure!(outcome != ExchangeState::Complete, "completed interaction has no initial checkpoint");
+                // A failed initial barrier never released tools. Recovery preserves the current workspace.
+                interaction.checkpoint_before = Some(checkpoint.id.clone());
+                checkpoint.clone()
+            };
             self.populate_interaction_change_diffs(interaction, &before, &checkpoint)
                 .await?;
             let mut settled = interaction.clone();
@@ -5631,6 +5705,7 @@ Planning continuation: turn {} of {}.",
                 crate::turn::TurnOutcome::Failed => ExchangeState::Failed,
             },
         };
+        self.collect_initial_checkpoint(runtime, interaction).await?;
         self.capture_final_checkpoint(interaction, outcome).await?;
         let (mut continuation, _, boundary_event) = self.interaction_for_turn("", true, self.clock.now_ms()).await?;
         event.extend(boundary_event);
@@ -5639,7 +5714,9 @@ Planning continuation: turn {} of {}.",
         continuation.goal_id.clone_from(&interaction.goal_id);
         continuation.task.clone_from(&interaction.task);
         self.start_exchange_runtime(&mut continuation, self.clock.now_ms()).await?;
-        *runtime = self.exchange_runtime.take().context("continuation runtime is missing")?;
+        let mut continuation_runtime = self.exchange_runtime.take().context("continuation runtime is missing")?;
+        self.collect_initial_checkpoint(&mut continuation_runtime, &mut continuation).await?;
+        *runtime = continuation_runtime;
         runtime.retraction_eligible = false;
         self.store.save_exchange(&continuation)?;
         *interaction = continuation;
@@ -8263,6 +8340,115 @@ fn default_goal_max_turns() -> u32 {
 
 #[cfg(test)]
 mod test {
+    struct CheckpointBackend {
+        started: Arc<tokio::sync::Notify>,
+        tool_ran: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    #[async_trait::async_trait]
+    impl Backend for CheckpointBackend {
+        fn checkpoint_tool_gate(&self) -> bool { true }
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock,
+                label: "Checkpoint fixture".into(), capability: crate::backend::mock_capability() }
+        }
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+        async fn has_active_turn(&self, _: &str) -> bool { false }
+        async fn cleanup_execution(&self, _: &str) -> Result<()> { Ok(()) }
+        async fn cancel_session(&self, _: &str) -> Result<()> { Ok(()) }
+        async fn active_session_id_for(&self, _: &str) -> Option<String> { None }
+        async fn prompt_stream(&self, request: BackendRequest, _sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
+            self.started.notify_one();
+            request.control_context.as_ref().and_then(|context|context.checkpoint.as_ref())
+                .context("fixture requires a checkpoint barrier")?.wait().await?;
+            self.tool_ran.store(true, Ordering::SeqCst);
+            std::fs::write(Path::new(&request.workspace).join("seed.txt"), "tool changed workspace\n")?;
+            Ok(crate::backend::BackendOutput::default())
+        }
+    }
+
+    #[tokio::test]
+    async fn checkpoint_does_not_delay_prompt_admission_but_blocks_first_tool() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let started = Arc::new(tokio::sync::Notify::new());
+        let tool_ran = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let document = forge_buffer::identity::DocumentId("checkpoint-transcript".into());
+        {
+            let mut presentation = broker.presentation.lock().unwrap();
+            presentation.open(document.clone(), forge_buffer::identity::ViewId("checkpoint-view".into()),
+                forge_buffer::width::WidthProfile::default())?;
+            presentation.begin_submission(&document, 1, "Capture before my first tool")?;
+        }
+        broker.prompt_admission = Some((document, 1));
+        let (sink, mut stream) = crate::backend::events::channel();
+        broker.event_sink = Some(sink);
+        broker.backend = Arc::new(CheckpointBackend { started: started.clone(), tool_ran: tool_ran.clone() });
+        let repositories = broker.repositories.clone();
+        let handle = repositories.open(repository.path().to_owned()).await?.context("fixture repository")?;
+        let operation = repositories.writes.admit(vec![forge_git::mutation::MutationScope::WorktreeFiles(
+            handle.identity.worktree.clone().context("fixture worktree")?)], 0)?;
+        let held = repositories.writes.start(operation)?.context("fixture mutation admission")?;
+        let session_id = broker.session.id.clone();
+        let observe = async {
+            tokio::time::timeout(std::time::Duration::from_secs(2), started.notified()).await?;
+            let mut accepted = false;
+            let mut projected = false;
+            while let Ok(event) = stream.try_recv() {
+                accepted |= event.kind == "prompt_submission" && event.data["state"] == "accepted";
+                projected |= event.kind == "document_changed";
+            }
+            assert!(accepted, "composer acceptance waited for checkpoint capture");
+            assert!(projected, "timeline did not project before checkpoint capture");
+            let store = SqliteStore::open(data.path())?;
+            let exchange = store.list_exchange(&session_id)?;
+            assert_eq!(exchange.len(), 1);
+            assert_eq!(exchange[0].prompt, "Capture before my first tool");
+            assert!(exchange[0].checkpoint_before.is_none());
+            assert!(!tool_ran.load(Ordering::SeqCst));
+            assert_eq!(std::fs::read_to_string(repository.path().join("seed.txt"))?, "seed\n");
+            held.finish(forge_git::mutation::OperationCompletion::Completed)?;
+            repositories.writes.take_receipt(operation);
+            Ok::<_, anyhow::Error>(())
+        };
+        let (result, observed) = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::join!(broker.run_interaction("Capture before my first tool".into(), PromptMode::Chat,
+                Some(ExchangeAdmission::chat("Capture before my first tool".into()))), observe)
+        }).await?;
+        observed?;
+        result?;
+        assert!(tool_ran.load(Ordering::SeqCst));
+        let exchange = broker.store.list_exchange(&session_id)?.pop().context("completed fixture exchange")?;
+        let before = broker.store.load_checkpoint(exchange.checkpoint_before.as_deref().context("before id")?)?.context("before checkpoint")?;
+        assert!(!before.file.iter().any(|file|file.path == "seed.txt"));
+        let after = broker.store.load_checkpoint(exchange.checkpoint_after.as_deref().context("after id")?)?.context("after checkpoint")?;
+        assert!(after.file.iter().any(|file|file.path == "seed.txt"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn initial_checkpoint_failure_can_finalize_without_replaying_provider_work() -> Result<()> {
+        let repository = repository();
+        let data = tempfile::tempdir()?;
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let occupied: Vec<_> = (0..4).map(|_|broker.repositories.reads.submit(0, |_|Ok(())).unwrap()).collect();
+        let error = broker.run_interaction("blocked acquisition".into(), PromptMode::Chat,
+            Some(ExchangeAdmission::chat("blocked acquisition".into()))).await.unwrap_err();
+        assert!(format!("{error:#}").contains("capacity is full"));
+        let failed = broker.store.list_exchange(&broker.session.id)?;
+        assert_eq!(failed.len(), 1);
+        assert_eq!(failed[0].state, ExchangeState::Finalizing);
+        assert!(failed[0].checkpoint_before.is_none());
+        for task in occupied { task.finish().await?; }
+        broker.retry_finalization().await?;
+        let settled = broker.store.list_exchange(&broker.session.id)?;
+        assert_eq!(settled[0].state, ExchangeState::Failed);
+        assert_eq!(settled[0].checkpoint_before, settled[0].checkpoint_after);
+        assert!(settled[0].turn.is_empty());
+        Ok(())
+    }
+
     use crate::agent::AgentExecutionState;
     include!("agent_test.rs");
     async fn settle_managed_children(broker: &mut HarnessBroker) -> Result<Vec<SessionEvent>> {
@@ -10042,6 +10228,9 @@ mod test {
                 .start_exchange_runtime(&mut exchange, 100)
                 .await
                 .unwrap();
+            let mut runtime = broker.exchange_runtime.take().unwrap();
+            broker.collect_initial_checkpoint(&mut runtime, &mut exchange).await.unwrap();
+            broker.exchange_runtime = Some(runtime);
             std::fs::write(repository.path().join("seed.txt"), content).unwrap();
             broker
                 .capture_final_checkpoint(&mut exchange, ExchangeState::Complete)
@@ -11529,6 +11718,8 @@ mod test {
         exchange.completed_at_ms = None;
         let mut runtime = ExchangeRuntime {
             exchange_id: exchange.id.clone(),
+            checkpoint: None,
+            tool_gate: None,
             synthetic_turn: None,
             task: TaskTracker::default(),
             retraction_eligible: true,
@@ -11567,6 +11758,8 @@ mod test {
         exchange.state = ExchangeState::Running;
         exchange.completed_at_ms = None;
         let mut runtime = ExchangeRuntime {
+            checkpoint: None,
+            tool_gate: None,
             exchange_id: exchange.id.clone(),
             synthetic_turn: None,
             task: TaskTracker::default(),
@@ -12034,6 +12227,7 @@ mod test {
         broker.store.save_exchange(&current).unwrap();
         let mut runtime = ExchangeRuntime {
             exchange_id:current.id.clone(), synthetic_turn:None, task:TaskTracker::default(),
+            checkpoint:None, tool_gate:None,
             retraction_eligible:true, active_wait:None,
         };
         let (sink, mut stream) = crate::backend::events::channel();
@@ -14234,11 +14428,12 @@ mod test {
             .interaction_for_turn("not started", true, 300)
             .await
             .unwrap();
-        let error = broker
-            .start_exchange_runtime(&mut rejected, 300)
-            .await
-            .unwrap_err();
+        broker.start_exchange_runtime(&mut rejected, 300).await.unwrap();
+        let mut runtime = broker.exchange_runtime.take().unwrap();
+        let captured = (&mut runtime.checkpoint.as_mut().unwrap().0).await.unwrap();
+        let error = broker.finish_initial_checkpoint(&mut runtime, &mut rejected, captured).unwrap_err();
         assert!(error.to_string().contains("capacity is full"));
+        assert!(runtime.tool_gate.as_ref().unwrap().wait().await.is_err());
         assert!(rejected.checkpoint_before.is_none());
         assert!(broker.exchange_runtime.is_none());
         assert!(

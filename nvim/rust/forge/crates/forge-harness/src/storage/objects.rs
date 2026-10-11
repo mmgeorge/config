@@ -17,7 +17,8 @@ pub struct ObjectStore {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
-struct FileStamp {
+/// Identifies captured source bytes across replacement and metadata-preserving edits.
+pub(crate) struct FileStamp {
     length: u64,
     modified: std::time::SystemTime,
     created: Option<std::time::SystemTime>,
@@ -26,6 +27,16 @@ struct FileStamp {
     identity: Option<(u32, u64, i64)>,
     #[cfg(unix)]
     identity: (u64, u64, u32, i64, i64),
+}
+
+/// Records acquired bytes and whether their source version remains reusable.
+pub(crate) struct FileCapture {
+    /// Content override, absent when the bytes match the Git baseline.
+    pub object_id: Option<String>,
+    /// Whether an existing content acquisition supplied the result.
+    pub reused: bool,
+    /// Source version for caching, absent when the file changed during its read.
+    pub stamp: Option<FileStamp>,
 }
 
 impl ObjectStore {
@@ -73,14 +84,15 @@ impl ObjectStore {
         self.publish(temporary, object_id)
     }
 
-    /// Acquires uncertain content once and publishes only deviations from the Git baseline.
+    /// Reads current bytes to EOF once and publishes only deviations from the Git baseline.
+    /// Concurrent edits disable reuse rather than failing the capture.
     pub(crate) fn capture_file(
         &self,
         source: &Path,
         root: &Path,
         baseline: Option<&forge_git::checkpoint::BaseFile>,
         check: &mut dyn FnMut() -> Result<()>,
-    ) -> Result<(Option<String>, bool)> {
+    ) -> Result<FileCapture> {
         let stamp = source_stamp(source)?;
         let baseline_key = baseline
             .map(serde_json::to_string)
@@ -95,19 +107,32 @@ impl ObjectStore {
             && previous == &stamp
             && (*unchanged || self.path(identity)?.is_file())
         {
-            return Ok(((!unchanged).then(|| identity.clone()), true));
+            return Ok(FileCapture {
+                object_id: (!unchanged).then(|| identity.clone()),
+                reused: true,
+                stamp: Some(stamp),
+            });
         }
         let mut input = fs::File::open(source)?;
-        ensure!(
-            stamp == handle_stamp(&input)?,
-            "checkpoint source changed before acquisition"
-        );
+        let opened = handle_stamp(&input)?;
         let mut temporary = tempfile::NamedTempFile::new_in(self.root.as_ref())?;
-        let identity = copy_checked(&mut input, &mut temporary, stamp.length, check)?;
-        ensure!(
-            stamp == handle_stamp(&input)? && stamp == source_stamp(source)?,
-            "checkpoint source changed during acquisition"
-        );
+        let mut digest = Sha256::new();
+        let mut buffer = [0; 64 * 1024];
+        loop {
+            check()?;
+            let length = match input.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(length) => length,
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error.into()),
+            };
+            temporary.write_all(&buffer[..length])?;
+            digest.update(&buffer[..length]);
+        }
+        let identity = hex::encode(digest.finalize());
+        let reusable = stamp == opened
+            && handle_stamp(&input).is_ok_and(|current| current == opened)
+            && source_stamp(source).is_ok_and(|current| current == opened);
         let unchanged = match baseline {
             Some(baseline) => self.matches_baseline(root, baseline, &identity)?,
             None => false,
@@ -122,8 +147,16 @@ impl ObjectStore {
         if cache.len() >= 65536 {
             cache.clear();
         }
-        cache.insert(cache_key, (stamp, identity.clone(), unchanged));
-        Ok(((!unchanged).then_some(identity), false))
+        if reusable {
+            cache.insert(cache_key, (stamp.clone(), identity.clone(), unchanged));
+        } else {
+            cache.remove(&cache_key);
+        }
+        Ok(FileCapture {
+            object_id: (!unchanged).then_some(identity),
+            reused: false,
+            stamp: reusable.then_some(stamp),
+        })
     }
 
     /// Compares a captured identity with an immutable Git blob without repeatedly reading that blob.
@@ -337,7 +370,8 @@ fn file_stamp(metadata: &fs::Metadata) -> Result<FileStamp> {
     })
 }
 
-fn source_stamp(path: &Path) -> Result<FileStamp> {
+/// Reads file identity and timestamps, rejecting missing or nonregular sources.
+pub(crate) fn source_stamp(path: &Path) -> Result<FileStamp> {
     ensure!(
         fs::symlink_metadata(path)?.is_file(),
         "checkpoint source is no longer a regular file"
@@ -421,6 +455,36 @@ fn copy_checked(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn capture_reads_changed_file_bytes_without_retrying_or_reusing_an_uncertain_version() {
+        for content in [b"x".as_slice(), b"longer current content".as_slice(), b"other".as_slice()] {
+            let directory = tempfile::tempdir().unwrap();
+            let store = ObjectStore::open(directory.path()).unwrap();
+            let source = directory.path().join("source");
+            fs::write(&source, b"first").unwrap();
+            let modified = fs::metadata(&source).unwrap().modified().unwrap();
+            let mut changed = false;
+            let captured = store.capture_file(&source, directory.path(), None, &mut || {
+                if !changed {
+                    fs::write(&source, content)?;
+                    fs::File::options().write(true).open(&source)?.set_times(
+                        fs::FileTimes::new().set_modified(modified + std::time::Duration::from_secs(1)),
+                    )?;
+                    changed = true;
+                }
+                Ok(())
+            }).unwrap();
+            assert!(changed);
+            assert!(captured.stamp.is_none());
+            assert_eq!(store.get(&captured.object_id.unwrap(), 4096).unwrap().unwrap(), content);
+            let settled = store.capture_file(&source, directory.path(), None, &mut || Ok(())).unwrap();
+            assert!(!settled.reused);
+            assert!(settled.stamp.is_some());
+            let reused = store.capture_file(&source, directory.path(), None, &mut || Ok(())).unwrap();
+            assert!(reused.reused);
+        }
+    }
 
     #[test]
     fn concurrent_publication_retains_one_complete_object() {

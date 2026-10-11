@@ -1594,14 +1594,14 @@ function M.submit()
     M.configure({ subagent_tools = agent_tools_action == "on" }, true)
     return
   end
-  local edit_profile = text:match("^/agents?%s+edit%s+(%S+)%s*$")
-  if text:match("^/agents?%s+edit%s*$") or edit_profile then
+  local edit_profile = text:match("^/agents%s+edit%s+(%S+)%s*$")
+  if text:match("^/agents%s+edit%s*$") or edit_profile then
     set_composer_text(state.composer_buf, "")
     require("forge.views.harness.subagent_profiles").open(state, picker_host(state), edit_profile)
     return
-  elseif text:match("^/agents?%s+edit%s+") then
+  elseif text:match("^/agents%s+edit%s+") then
     set_composer_text(state.composer_buf, "")
-    notifications.warn("Use /agent edit or /agent edit <profile>", "ForgeHarness")
+    notifications.warn("Use /agents edit or /agents edit <profile>", "ForgeHarness")
     return
   end
   if text == "/agents" then

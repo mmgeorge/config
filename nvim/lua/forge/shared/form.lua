@@ -18,7 +18,6 @@ local notifications = require("forge.infra.notifications")
 
 ---@class ForgeFormOptions
 ---@field title string
----@field subtitle string
 ---@field fields ForgeFormField[]
 ---@field save fun(values: table<string, string>, done: fun(failure?: string))
 ---@field reload fun(done: fun(values: table<string, string>?, failure?: string))
@@ -81,12 +80,15 @@ function Form:refresh()
     if field.multiline then row = row - 1 end
     local dirty = values[field.id] ~= self.baseline[field.id]
     local label = field.label .. (dirty and "*: " or ": ")
+    local chunks = { { label, "ForgeFormLabel" } }
     if field.choices then
-      label = label .. field_renderer.render(field.format and field.format(field.value) or field.value, selected == field)
+      chunks[#chunks + 1] = {
+        field_renderer.render(field.format and field.format(field.value) or field.value, selected == field), "Normal",
+      }
     end
     vim.api.nvim_buf_set_extmark(self.buffer, self.namespace, row, 0, {
       id = field.mark, right_gravity = false,
-      virt_text = { { label, "ForgeStatusLabel" } }, virt_text_pos = field.multiline and "overlay" or "inline",
+      virt_text = chunks, virt_text_pos = field.multiline and "overlay" or "inline",
     })
   end
   vim.bo[self.buffer].modifiable = editing == true
@@ -101,7 +103,7 @@ function Form:replace(values)
   editable.detach(self.editable)
   self.editable = editable.new("form:" .. self.buffer)
   self.baseline = vim.deepcopy(values)
-  local lines, anchor = { self.options.title, self.options.subtitle, "" }, {}
+  local lines, anchor = {}, {}
   vim.api.nvim_buf_clear_namespace(self.buffer, self.namespace, 0, -1)
   for _, field in ipairs(self.fields) do
     field.value = values[field.id]
@@ -115,7 +117,6 @@ function Form:replace(values)
         finish = { row = #lines - 1, column = #rows[#rows] } }
     end
     field.row = field.multiline and start - 1 or start
-    lines[#lines + 1] = ""
   end
   vim.bo[self.buffer].modifiable = true
   vim.api.nvim_buf_set_lines(self.buffer, 0, -1, false, lines)

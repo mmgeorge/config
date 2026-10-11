@@ -17,6 +17,14 @@ local buffer = vim.api.nvim_create_buf(false, true)
 vim.api.nvim_set_current_buf(buffer)
 vim.bo[buffer].filetype = "ForgeHarness"
 vim.b[buffer].forge_native_document = true
+local empty_source = { "# Empty math", "", "$$", "   ", "$$", "", "$ $" }
+vim.api.nvim_buf_set_lines(buffer, 0, -1, false, empty_source)
+require("forge.render.harness.markdown").render(buffer, vim.api.nvim_get_current_win(), {
+  { first0 = 0, after0 = #empty_source },
+})
+vim.wait(200, function() return calls > 0 end, 5)
+assert(calls == 0, "empty math launched a converter process")
+assert(vim.deep_equal(vim.api.nvim_buf_get_lines(buffer, 0, -1, false), empty_source))
 local source = { "# Math", "" }
 for index = 1, 8 do vim.list_extend(source, { "$$", "x_" .. index, "$$", "" }) end
 source[2] = "Inline $x_9$ remains rendered."

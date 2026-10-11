@@ -17,15 +17,31 @@ use forge_diff::workers::WorkPriority;
 use forge_git::coordinator::AdmissionGuard;
 use forge_git::mutation::{MutationScope, OperationCompletion, OperationId};
 use forge_git::read_pool::{BlockingReadPool, ReadCancellation};
-use forge_git::repository::{RepositoryGeneration, RepositoryState};
+use forge_git::repository::RepositoryState;
 use forge_git::store::RepositoryStore;
 
 use super::manifest::ResolvedFile;
 use super::manifest::{CheckpointFile, CheckpointRecord};
 use super::restore::{RestoreJournal, RestorePreview};
-/// Owns Git-backed worktree checkpoint capture and safe rollback.
+
+#[derive(Clone)]
+/// Owns Git-backed capture and a single reusable checkpoint for one worktree.
 pub struct GitCheckpoint {
     workspace: PathBuf,
+    cache: Arc<std::sync::Mutex<Option<CachedCheckpoint>>>,
+}
+
+struct CachedCheckpoint {
+    signature: forge_git::checkpoint::CheckpointSignature,
+    record: CheckpointRecord,
+    source: Vec<(PathBuf, crate::storage::objects::FileStamp)>,
+}
+
+impl CachedCheckpoint {
+    fn unchanged(&self) -> bool {
+        self.source.iter().all(|(path, stamp)| crate::storage::objects::source_stamp(path)
+            .is_ok_and(|current| current == *stamp))
+    }
 }
 
 struct CheckpointCapture {
@@ -33,8 +49,8 @@ struct CheckpointCapture {
     session_id: String,
     now_ms: i64,
     input_bytes: usize,
+    #[cfg(test)]
     repository: Arc<RepositoryState>,
-    generation: RepositoryGeneration,
     // Dispose copied inputs before acknowledging their retained-byte receipt.
     admission: CaptureAdmission,
 }
@@ -82,10 +98,6 @@ impl CheckpointCapture {
                 .context("checkpoint capture has no admission")?
                 .cancellation_requested(),
             "checkpoint capture cancelled"
-        );
-        anyhow::ensure!(
-            self.generation == self.repository.generation(),
-            "checkpoint capture was superseded by repository invalidation"
         );
         Ok(())
     }
@@ -290,6 +302,7 @@ impl GitCheckpoint {
     pub fn new(workspace: impl Into<PathBuf>) -> Self {
         Self {
             workspace: workspace.into(),
+            cache: Arc::default(),
         }
     }
 
@@ -299,7 +312,8 @@ impl GitCheckpoint {
 }
 
 impl GitCheckpoint {
-    /// Captures tracked and nonignored files under shared repository scopes and blocking admission.
+    /// Captures each tracked or nonignored file as it is read under shared repository admission.
+    /// Concurrent workspace edits do not require a globally consistent snapshot or a retry.
     ///
     /// Discovery resolves the canonical worktree before admitting its index, file, and shared-ref
     /// scopes. Capacity and closure errors reject before checkpoint file acquisition. Observed
@@ -338,13 +352,14 @@ impl GitCheckpoint {
             .open(self.workspace.clone())
             .await?
             .context("checkpoint repository is missing")?;
-        let checkpoint = Self::new(
-            repository
+        let checkpoint = Self {
+            workspace: repository
                 .identity
                 .worktree_root
                 .clone()
                 .context("checkpoint requires a worktree")?,
-        );
+            cache: Arc::clone(&self.cache),
+        };
         let input_bytes = checkpoint
             .workspace
             .capacity()
@@ -358,7 +373,7 @@ impl GitCheckpoint {
             session_id,
             now_ms,
             input_bytes,
-            generation: repository.generation(),
+            #[cfg(test)]
             repository,
             admission: CaptureAdmission {
                 repositories: Arc::clone(&repositories),
@@ -367,7 +382,6 @@ impl GitCheckpoint {
             },
         };
         capture.admission.guard = Some(repositories.writes.wait_start(operation)?.await?);
-        capture.generation = capture.repository.generation();
         Ok(capture)
     }
 
@@ -380,18 +394,28 @@ impl GitCheckpoint {
     ) -> Result<CheckpointRecord> {
         check()?;
         let started = std::time::Instant::now();
+        let signature = forge_git::checkpoint::signature(&self.workspace, &mut check)?;
+        if let Some(previous) = self.cache.lock().map_err(|_| anyhow::anyhow!("checkpoint cache poisoned"))?.as_ref()
+            && previous.signature == signature && previous.record.session_id == session_id && previous.unchanged()
+        {
+            check()?;
+            eprintln!("checkpoint.reuse duration_ms={}", started.elapsed().as_millis());
+            return Ok(previous.record.clone());
+        }
         let inventory = forge_git::checkpoint::inventory(&self.workspace, &mut check)?;
         let mut file = Vec::new();
         let mut deleted = Vec::new();
         let mut hits = 0usize;
         let mut bytes = 0u64;
-        for (relative, clean) in &inventory.candidate {
+        let mut source = Vec::new();
+        let mut reusable = true;
+        for relative in inventory.candidate.keys() {
             check()?;
             if inventory.missing.contains(relative) {
                 deleted.push(relative.clone());
                 continue;
             }
-            if *clean {
+            if inventory.unchanged(&self.workspace, relative)? {
                 continue;
             }
             let path = self.file_path(relative)?;
@@ -454,9 +478,26 @@ impl GitCheckpoint {
                     false,
                 )
             } else {
-                objects
-                    .capture_file(&path, &self.workspace, base, &mut check)
-                    .with_context(|| format!("capture checkpoint source {}", path.display()))?
+                let captured = match objects.capture_file(&path, &self.workspace, base, &mut check) {
+                    Ok(captured) => captured,
+                    Err(error) if error.downcast_ref::<std::io::Error>()
+                        .is_some_and(|error| error.kind() == std::io::ErrorKind::NotFound)
+                        && fs::symlink_metadata(&path).is_err_and(|error| error.kind() == std::io::ErrorKind::NotFound) => {
+                            if inventory.base.contains_key(relative) {
+                                deleted.push(relative.clone());
+                            }
+                            reusable = false;
+                            continue;
+                        }
+                    Err(error) => return Err(error)
+                        .with_context(|| format!("capture checkpoint source {}", path.display())),
+                };
+                if let Some(stamp) = captured.stamp {
+                    source.push((path.clone(), stamp));
+                } else {
+                    reusable = false;
+                }
+                (captured.object_id, captured.reused)
             };
             if reused {
                 hits += 1;
@@ -473,11 +514,6 @@ impl GitCheckpoint {
             });
         }
         check()?;
-        let verified = forge_git::checkpoint::inventory(&self.workspace, &mut check)?;
-        anyhow::ensure!(
-            inventory == verified,
-            "workspace changed during checkpoint capture"
-        );
         let head = inventory.head.unwrap_or_else(|| "UNBORN".into());
         let checkout = inventory
             .base
@@ -496,7 +532,7 @@ impl GitCheckpoint {
             bytes,
             started.elapsed().as_millis()
         );
-        Ok(CheckpointRecord {
+        let record = CheckpointRecord {
             id: crate::plan::digest(&manifest),
             session_id: session_id.into(),
             workspace: self.workspace.to_string_lossy().into_owned(),
@@ -506,7 +542,13 @@ impl GitCheckpoint {
             deleted,
             checkout,
             created_at_ms: now_ms,
-        })
+        };
+        let verified_signature = forge_git::checkpoint::signature(&self.workspace, &mut check)?;
+        let cached = CachedCheckpoint { signature, record: record.clone(), source };
+        let cached = (reusable && cached.signature == verified_signature && cached.unchanged())
+            .then_some(cached);
+        *self.cache.lock().map_err(|_| anyhow::anyhow!("checkpoint cache poisoned"))? = cached;
+        Ok(record)
     }
 
     /// Write a target checkpoint after validating the expected current checkpoint.

@@ -315,10 +315,10 @@ in place. Ctrl-S cleared the dirty markers, and q returned to profile selection.
 uses a mocked profile service and does not write the user's global catalog. No Rust source or
 compiled input changed in this follow-up, so the existing rebuilt host remains the runtime artifact.
 
-### Profile picker aliases and Enabled toggles verified on 2026-10-11
+### Profile picker aliases and Enable toggles verified on 2026-10-11
 
-`/agent edit [profile]` now shares the `/agents edit [profile]` route and completion. Both
-pickers include disabled profiles. Left/Right toggles Enabled through an immediate revision-checked
+`/agents edit [profile]` provides profile editing and completion. The picker
+includes disabled profiles. Left/Right toggles Enable through an immediate revision-checked
 save and updates the existing picker without changing its selected profile. The default profile
 must remain enabled. Failed saves preserve the displayed state, and pending saves prevent another
 mutation, reload, or form entry.
@@ -341,11 +341,11 @@ visual inspection or change Rust source.
 
 ### Open profile configuration verified on 2026-10-11
 
-The edit picker ends with `Open config file`. Enter closes the picker and opens the global
-catalog in a normal editable tab. Profile enable/disable and delete actions ignore that row.
+The edit picker contains only profiles. `oc` closes the picker and opens the global
+catalog in a normal editable tab. Pending saves block the hotkey.
 
 `nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/subagent_profiles.lua`
-exited zero in 0.39 seconds. The test exercises the real Enter mapping, opens a temporary
+exited zero. The test exercises the real `oc` mapping, opens a temporary
 catalog whose path contains spaces, verifies editable buffer contents and a separate tab, and
 removes the fixture. The user's global catalog remains untouched.
 
@@ -537,9 +537,8 @@ validates root, child, exchange, turn, and tool ownership. Reads remain valid af
 and never execute the tool again. Output pagination preserves Unicode and NUL characters
 across stored chunks. Provider activity timestamps remain unchanged by inspection.
 
-The global `activity_limit` defaults to five entries and accepts 1–20. `/agents edit` exposes
-an `Activity entries` row using the shared Left/Right and `r`/`h` controls. Each call can override
-the entry count. Thoughts retain up to 4000 characters. Tool output pages default to 8000
+The activity tool defaults to five entries, and each call can override the count within 1–20.
+Thoughts retain up to 4000 characters. Tool output pages default to 8000
 characters and accept up to 32000. The supervision timer and execution timeout are unchanged.
 
 Final Cargo commands ran from `D:/config/nvim/rust/forge` with 120-second process limits:
@@ -573,7 +572,7 @@ binary.
 
 ### Profile tuning controls verified on 2026-10-11
 
-`/agents edit` cycles Enabled, Provider, Model, Thinking, and Speed with Tab selecting
+`/agents edit` cycles Enable, Provider, Model, Thinking, and Speed with Tab selecting
 one field and the shared picker value bindings changing it. Enter still opens the full-page
 profile editor. Both views use the same catalog-based selection rules. A provider change
 selects its first advertised model and resets unsupported thinking or speed to default.

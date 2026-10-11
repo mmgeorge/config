@@ -152,14 +152,14 @@ async fn agent_activity_omits_output_and_pages_stable_owned_calls_across_followu
     let repeated = query_child(&mut broker,AgentOperation::Activity {target:admission.agent.id.clone(),limit:Some(1)}).await?;
     assert_eq!(repeated["last_activity_at_ms"],json!(last_activity),"inspection must not count as child activity");
 
-    let settings = broker.agent_backend_factory.profiles.snapshot()?;
-    let mut document = settings.document;
-    document.activity_limit = 2;
-    broker.agent_backend_factory.profiles.save(&settings.revision,document.clone())?;
-    let compact = query_child(&mut broker,AgentOperation::Activity {target:admission.agent.id.clone(),limit:None}).await?;
+    let compact = query_child(&mut broker,AgentOperation::Activity {target:admission.agent.id.clone(),limit:Some(2)}).await?;
     assert_eq!(compact["entries"].as_array().unwrap().len(),2);
-    document.activity_limit = 21;
-    assert!(document.validate().is_err());
+    let expanded = query_child(&mut broker,AgentOperation::Activity {target:admission.agent.id.clone(),limit:Some(20)}).await?;
+    assert_eq!(expanded["entries"].as_array().unwrap().len(),7);
+    assert_eq!(expanded["has_more"],false);
+    let default = query_child(&mut broker,AgentOperation::Activity {target:admission.agent.id.clone(),limit:None}).await?;
+    assert_eq!(default["entries"].as_array().unwrap().len(),5);
+    assert!(query_child(&mut broker,AgentOperation::Activity {target:admission.agent.id.clone(),limit:Some(21)}).await.is_err());
     assert!(query_child(&mut broker,AgentOperation::Activity {target:admission.agent.id.clone(),limit:Some(0)}).await.is_err());
 
     let followup_request = crate::agent::AgentRequest {operation_id:"inspection-followup".into(),source:crate::agent::AgentSource::User,

@@ -243,6 +243,9 @@ impl CopilotBackend {
         let permission_handler: Arc<dyn PermissionHandler> = Arc::new(CopilotPermissionHandler {
             context: self.permission_context(&request.runtime_key()?).await,
         });
+        let checkpoint_hooks = Arc::new(CopilotCheckpointHooks {
+            context: self.permission_context(&request.runtime_key()?).await,
+        });
         let resource_request = BackendCatalogRequest {
             execution_owner: request.execution_owner.clone(),
             harness_session_id: request.harness_session_id.clone(), workspace: request.workspace.clone(),
@@ -296,7 +299,7 @@ impl CopilotBackend {
                 "workspace":request.workspace, "streaming":true, "enable_config_discovery":resources.is_none(), "enable_skills":true,
             }));
             client
-                .resume_session(config.with_permission_handler(permission_handler))
+                .resume_session(config.with_permission_handler(permission_handler).with_hooks(checkpoint_hooks))
                 .await
                 .context("resume Copilot session")?
         } else {
@@ -321,7 +324,7 @@ impl CopilotBackend {
                 "workspace":request.workspace, "streaming":true, "enable_config_discovery":resources.is_none(), "enable_skills":true,
             }));
             client
-                .create_session(config.with_permission_handler(permission_handler))
+                .create_session(config.with_permission_handler(permission_handler).with_hooks(checkpoint_hooks))
                 .await
                 .context("create Copilot session")?
         };
@@ -486,6 +489,8 @@ fn capability() -> BackendCapability {
 
 #[async_trait]
 impl Backend for CopilotBackend {
+    fn checkpoint_tool_gate(&self) -> bool { true }
+
     async fn reconcile_settings(&self, mut request: BackendCatalogRequest, setting: &crate::settings::PortableSettings) -> Result<()> {
         if self.settings_root.is_none() {
             anyhow::ensure!(setting.skill.is_empty() && setting.mcp.is_empty(), "shared resource selection requires the Forge settings store");
@@ -604,6 +609,9 @@ impl Backend for CopilotBackend {
                 request.workspace.clone(),
                 event_sink.clone(),
             )?;
+        self.permission_context(&request.runtime_key()?).await.state.lock()
+            .map_err(|_|anyhow::anyhow!("Copilot permission context lock poisoned"))?.checkpoint =
+            request.control_context.as_ref().and_then(|context|context.checkpoint.clone());
         let session = self.session(&request).await?;
         let mut subscription = session.subscribe();
         let control_router = self.control_router(&request.runtime_key()?).await;
@@ -1555,6 +1563,7 @@ impl ToolHandler for CopilotControlToolHandler {
 }
 
 struct CopilotPermissionState {
+    checkpoint: Option<crate::checkpoint::ToolGate>,
     owner: Option<crate::backend::ExecutionOwner>,
     execution_mode: PermissionMode,
     workspace: String,
@@ -1571,6 +1580,7 @@ impl CopilotPermissionContext {
         Self {
             coordinator,
             state: StandardMutex::new(CopilotPermissionState {
+                checkpoint: None,
                 owner:None,
                 execution_mode: PermissionMode::Read,
                 workspace: ".".into(),
@@ -1591,6 +1601,7 @@ impl CopilotPermissionContext {
             .lock()
             .map_err(|_| anyhow::anyhow!("Copilot permission context lock poisoned"))? =
             CopilotPermissionState {
+                checkpoint: None,
                 owner:Some(owner),
                 execution_mode,
                 workspace,
@@ -1602,6 +1613,32 @@ impl CopilotPermissionContext {
 
 struct CopilotPermissionHandler {
     context: Arc<CopilotPermissionContext>,
+}
+
+struct CopilotCheckpointHooks {
+    context: Arc<CopilotPermissionContext>,
+}
+
+#[async_trait]
+impl github_copilot_sdk::hooks::SessionHooks for CopilotCheckpointHooks {
+    async fn on_pre_tool_use(
+        &self,
+        _input: github_copilot_sdk::hooks::PreToolUseInput,
+        _context: github_copilot_sdk::hooks::HookContext,
+    ) -> Option<github_copilot_sdk::hooks::PreToolUseOutput> {
+        let checkpoint = self.context.state.lock().map(|state|state.checkpoint.clone())
+            .map_err(|_|anyhow::anyhow!("Copilot checkpoint context lock poisoned"));
+        let result = match checkpoint {
+            Ok(Some(gate)) => gate.wait().await,
+            Ok(None) => Ok(()),
+            Err(error) => Err(error),
+        };
+        result.err().map(|error|github_copilot_sdk::hooks::PreToolUseOutput {
+            permission_decision: Some("deny".into()),
+            permission_decision_reason: Some(format!("{error:#}")),
+            ..Default::default()
+        })
+    }
 }
 
 #[async_trait]

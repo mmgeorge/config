@@ -5,12 +5,13 @@ local picker_field = require("forge.views.picker.field")
 local form = require("forge.shared.form")
 local selection = require("forge.views.harness.subagent_selection")
 local notifications = require("forge.infra.notifications")
+local column_layout = { compact = true }
 
 local field_list = {
   { "name", "Name" }, { "description", "Purpose" },
   { "provider", "Provider" }, { "model", "Model" }, { "reasoning_effort", "Thinking" },
   { "service_tier", "Speed" }, { "permission_mode", "Permissions" },
-  { "enabled", "Enabled" }, { "default", "Default profile" }, { "instructions", "Instructions" },
+  { "enabled", "Enable" }, { "default", "Default profile" }, { "instructions", "Instructions" },
 }
 
 ---@param name string
@@ -18,8 +19,8 @@ local field_list = {
 ---@return table<string, string>
 local function values_for(name, document)
   local profile = document.profiles[name] or { description = "", instructions = "" }
-  local values = { name = name, enabled = profile.enabled == false and "Off" or "On",
-    default = document.default_profile == name and "On" or "Off" }
+  local values = { name = name, enabled = profile.enabled == false and "No" or "Yes",
+    default = document.default_profile == name and "Yes" or "No" }
   for _, field in ipairs(field_list) do
     if values[field[1]] == nil then values[field[1]] = profile[field[1]] or "inherit" end
   end
@@ -47,7 +48,7 @@ function Profiles.open(state, host, selected_name)
     local choices = {
       provider = {}, model = {}, reasoning_effort = {}, service_tier = {},
       permission_mode = { "inherit", "read", "write", "yolo" },
-      enabled = { "On", "Off" }, default = { "Off", "On" },
+      enabled = { "Yes", "No" }, default = { "No", "Yes" },
     }
     for _, field in ipairs(field_list) do
       local id = field[1]
@@ -59,10 +60,9 @@ function Profiles.open(state, host, selected_name)
             if not current() then done(nil, "Harness session changed. Reopen the profile editor") return end
             done(patch, failure)
           end)
-        end or nil,
-        format = choices[id] and #choices[id] == 0 and function(value) return tuning:label(id, value) end or nil }
+        end or nil }
     end
-    form.open({ title = "Subagent profile", subtitle = snapshot.path, fields = fields,
+    form.open({ title = "Subagent profile", fields = fields,
       save = function(edited, done)
         if not current() then done("Harness session changed. Reopen the profile editor") return end
         if edited.name ~= original_name and snapshot.document.profiles[edited.name] then
@@ -73,10 +73,10 @@ function Profiles.open(state, host, selected_name)
         for _, field in ipairs(field_list) do
           if field[1] ~= "name" and field[1] ~= "default" then profile[field[1]] = edited[field[1]] end
         end
-        profile.enabled = edited.enabled == "On"
+        profile.enabled = edited.enabled == "Yes"
         if original_name ~= "" then document.profiles[original_name] = nil end
         document.profiles[edited.name] = profile
-        if edited.default == "On" then document.default_profile = edited.name
+        if edited.default == "Yes" then document.default_profile = edited.name
         elseif document.default_profile == original_name then
           done("Select another default profile before clearing this default") return
         end
@@ -119,12 +119,6 @@ function Profiles.open(state, host, selected_name)
   end
   local function change_value(context, direction)
     if saving then return end
-    if context.option and context.option.id == "activity-limit" then
-      local document = vim.deepcopy(snapshot.document)
-      document.activity_limit = math.max(1, math.min(20, (document.activity_limit or 5) + direction))
-      if document.activity_limit ~= (snapshot.document.activity_limit or 5) then save_list(document) end
-      return
-    end
     local name = context.option and context.option.value
     if not name then return end
     local document = vim.deepcopy(snapshot.document)
@@ -148,35 +142,32 @@ function Profiles.open(state, host, selected_name)
     for name, profile in pairs(snapshot.document.profiles) do
       local columns = { name }
       for _, field in ipairs(toggle_fields) do
-        local value = field == "enabled" and (profile.enabled and "On" or "Off") or tuning:label(field, profile[field])
-        columns[#columns + 1] = picker_field.render(value, (active_field[name] or "enabled") == field)
+        local value = field == "enabled" and (profile.enabled and "Yes" or "No") or profile[field]
+        columns[#columns + 1] = picker_field.render(value, (active_field[name] or "enabled") == field, column_layout)
       end
       columns[#columns + 1] = snapshot.document.default_profile == name and "Default" or profile.description
       entries[#entries + 1] = { id = name, label = name, value = name, columns = columns }
     end
     table.sort(entries, function(left, right) return left.label < right.label end)
-    entries[#entries + 1] = { id = "activity-limit", label = "Activity entries",
-      columns = { "Activity entries", picker_field.render(tostring(snapshot.document.activity_limit or 5), true),
-        "", "", "", "", "Recent entries returned to Main (1–20)" } }
-    entries[#entries + 1] = { id = "config:" .. snapshot.path, label = "Open config file",
-      columns = { "Open config file", "", "", "", "", "", snapshot.path } }
+    local headers = { "Profile", "Enable", "Provider", "Model", "Thinking", "Speed", "Purpose" }
+    for column = 2, 6 do headers[column] = picker_field.render(headers[column], false, column_layout) end
     local spec = { owner = "subagent-profiles", host = host,
       page_list = { { id = "subagent-profiles", title = "Subagent profiles", subtitle = snapshot.error or snapshot.path,
-        column_headers = { "Profile", "Enabled", "Provider", "Model", "Thinking", "Speed", "Purpose" }, option_list = entries,
-        footer = "←→ change value  Tab field  Enter edit  C-a add  C-x delete  C-r reload  q close" } },
+        column_headers = headers, flexible_column = 7, option_list = entries,
+        footer = "←→ change value  Tab field  Enter edit  oc config  C-a add  C-x delete  C-r reload  q close" } },
       on_confirm = function(result)
         if saving then return false end
-        if result.option.id == "activity-limit" then return false
-        elseif result.option.value then show_profile(result.option.value)
-        else
-          picker.close()
-          local opened, failure = pcall(vim.cmd, "tabedit " .. vim.fn.fnameescape(snapshot.path))
-          if not opened then notifications.error(failure, "Subagent profiles") end
-        end
+        show_profile(result.option.value)
         return false
       end,
       on_close = function() active = false end,
       action_list = {
+        { id = "open-config", key = "oc", desc = "Open config file", callback = function()
+          if saving then return end
+          picker.close()
+          local opened, failure = pcall(vim.cmd, "tabedit " .. vim.fn.fnameescape(snapshot.path))
+          if not opened then notifications.error(failure, "Subagent profiles") end
+        end },
         { id = "next-field", key = "<Tab>", callback = function(context)
           local name = context.option and context.option.value
           if not name or saving then return end

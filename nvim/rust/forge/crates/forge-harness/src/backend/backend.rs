@@ -465,6 +465,9 @@ pub struct BackendModel {
 /// Requires session lifecycle ownership and provides explicit failures for optional operations.
 #[async_trait]
 pub trait Backend: Send + Sync {
+    /// Reports whether every local tool waits on the request's checkpoint barrier.
+    fn checkpoint_tool_gate(&self) -> bool { false }
+
     /// Inspect or explicitly install the selected provider runtime without creating a conversation.
     async fn setup(&self, _request: BackendCatalogRequest, _install: bool) -> Result<Value> {
         Err(UnsupportedCapability("runtime_setup").into())

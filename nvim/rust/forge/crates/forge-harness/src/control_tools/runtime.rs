@@ -12,6 +12,7 @@ use std::sync::Arc;
 /// Carries the broker-owned control state visible to one provider turn.
 #[derive(Clone)]
 pub struct ControlTurnContext {
+    pub checkpoint: Option<crate::checkpoint::ToolGate>,
     pub agent: Option<Arc<crate::agent::AgentToolScope>>,
     pub mode: PromptMode,
     pub planning_feedback: bool,
@@ -54,6 +55,7 @@ impl ControlTurnContext {
     /// Build an inert context for backend calls without broker state.
     pub fn inactive(mode: PromptMode) -> Self {
         Self {
+            checkpoint: None,
             agent: None,
             mode,
             planning_feedback: false,
@@ -115,6 +117,7 @@ impl ControlToolRuntime {
         mut invocation: ControlToolInvocation,
         mut output: BackendOutput,
     ) -> Result<ControlToolResult> {
+        if let Some(checkpoint) = &self.context.checkpoint { checkpoint.wait().await?; }
         let identity = serde_json::to_string(&invocation)?;
         if let Some((completed, message)) = &self.completion && completed == &identity {
             return Ok(ControlToolResult { invocation: None, message: message.clone() });
@@ -476,6 +479,7 @@ mod test {
     fn planning_context() -> ControlTurnContext {
         let cache_dir = tempfile::tempdir().unwrap().keep();
         ControlTurnContext {
+            checkpoint: None,
             agent: None,
             mode: PromptMode::Plan,
             planning_feedback: false,

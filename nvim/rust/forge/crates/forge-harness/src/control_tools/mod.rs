@@ -76,7 +76,7 @@ impl ControlToolRegistry {
             },
             ControlToolDefinition {
                 name:"harness_agent_activity",
-                description:"Inspect a child's active run, or its latest run when idle. Returns chronological recent thoughts (up to 4000 characters each) and tool metadata with stable call_ref values, without tool output. Includes elapsed time, last activity, and approval state. Omit limit to use the global activity limit (default 5). Does not message or restart the child.",
+                description:"Inspect a child's active run, or its latest run when idle. Returns chronological recent thoughts (up to 4000 characters each) and tool metadata with stable call_ref values, without tool output. Includes elapsed time, last activity, and approval state. Defaults to 5 entries. Pass limit (1–20) to request a different count. Does not message or restart the child.",
                 input_schema:strict_object_input_schema(vec![("target",string_schema()),
                     ("limit",json!({"type":"integer","minimum":1,"maximum":20}))],&["target"]),
             },

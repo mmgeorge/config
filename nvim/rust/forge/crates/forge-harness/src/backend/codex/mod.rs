@@ -221,6 +221,18 @@ impl CodexBackend {
             }
             parameter["config"] = config;
         }
+        if let Some(gate) = request.control_context.as_ref().and_then(|context|context.checkpoint.as_ref()) {
+            if parameter.pointer("/config/hooks").is_none() {
+                let native = process.request("config/read", json!({"cwd":request.workspace,"includeLayers":false}), output).await?;
+                parameter["config"]["hooks"] = native.pointer("/config/hooks").filter(|value|value.is_object()).cloned().unwrap_or(json!({}));
+            }
+            let hooks = parameter["config"]["hooks"].as_object_mut().context("Codex hooks configuration is not an object")?;
+            if hooks.get("PreToolUse").is_none_or(Value::is_null) { hooks.insert("PreToolUse".into(), json!([])); }
+            let pre_tool = hooks.entry("PreToolUse").or_insert_with(||json!([]))
+                .as_array_mut().context("Codex PreToolUse configuration is not an array")?;
+            if !gate.ready() { pre_tool.push(gate.hook()?); }
+            parameter["config"]["features.hooks"] = json!(true);
+        }
         Ok(parameter)
     }
 
@@ -934,6 +946,8 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
+    fn checkpoint_tool_gate(&self) -> bool { true }
+
     async fn reconcile_settings(&self, request: BackendCatalogRequest, setting: &crate::settings::PortableSettings) -> Result<()> {
         if self.settings_root.is_none() {
             anyhow::ensure!(setting.skill.is_empty() && setting.mcp.is_empty(), "Codex resource configuration requires the Forge settings store");
@@ -1120,6 +1134,18 @@ impl Backend for CodexBackend {
             })
             .collect::<Vec<_>>();
         let thread_id = self.load_thread(process, &mut output, &request, false, dynamic_tool_list).await?;
+        if request.backend_session_id.is_some()
+            && let Some(gate) = request.control_context.as_ref().and_then(|context| context.checkpoint.as_ref())
+            && !gate.ready()
+        {
+            // Existing exec sessions accept stdin without running Codex's PreToolUse hook.
+            let terminals = process.request("thread/backgroundTerminals/list",
+                json!({"threadId":thread_id,"limit":1}), &mut output).await
+                .and_then(|value| super::terminal::TerminalSnapshot::parse(&value, false));
+            if !terminals.as_ref().is_ok_and(|snapshot| snapshot.terminal.is_empty()) {
+                gate.wait().await?;
+            }
+        }
         output.backend_session_id = Some(thread_id.clone());
         let mut prompt = request_text.clone();
         if request.mode == PromptMode::GoalContinuation {
@@ -1636,6 +1662,50 @@ impl Backend for CodexBackend {
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[tokio::test]
+    async fn checkpoint_hook_preserves_user_hooks_and_disappears_when_ready() -> Result<()> {
+        use futures_util::{SinkExt, StreamExt};
+        let fixture = tempfile::tempdir()?;
+        let workspace = fixture.path().to_string_lossy().into_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
+        let endpoint = format!("ws://{}", listener.local_addr()?);
+        let server = tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.unwrap();
+            let mut socket = tokio_tungstenite::accept_async(stream).await.unwrap();
+            for pending in [true, false] {
+                let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "config/read");
+                let result = json!({"config":{"hooks":{"PreToolUse":[{"matcher":"user", "hooks":[
+                    {"type":"command","command":"user-hook"}]}], "PostToolUse":null}}});
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":result}).to_string().into())).await.unwrap();
+                let request: Value = serde_json::from_str(socket.next().await.unwrap().unwrap().to_text().unwrap()).unwrap();
+                assert_eq!(request["method"], "thread/start");
+                let hooks = request["params"]["config"]["hooks"]["PreToolUse"].as_array().unwrap();
+                assert_eq!(hooks.len(), if pending { 2 } else { 1 });
+                assert_eq!(hooks[0]["hooks"][0]["command"], "user-hook");
+                if pending { assert!(hooks[1]["hooks"][0]["command"].as_str().unwrap().contains(" checkpoint-wait ")); }
+                assert_eq!(request["params"]["config"]["features.hooks"], true);
+                socket.send(tokio_tungstenite::tungstenite::Message::Text(json!({"id":request["id"],"result":{"thread":{"id":"checkpoint-thread"}}}).to_string().into())).await.unwrap();
+            }
+        });
+        let backend = CodexBackend::new(vec!["unused".into()])?;
+        let mut request = CodexBackend::catalog_backend_request(&BackendCatalogRequest {
+            execution_owner:None, harness_session_id:"checkpoint".into(), workspace:workspace.clone(),
+            access:Default::default(), execution_mode:PermissionMode::Read, backend_session_id:None,
+        });
+        let gate = crate::checkpoint::ToolGate::new()?;
+        let mut context = crate::control_tools::ControlTurnContext::inactive(PromptMode::Chat);
+        context.checkpoint = Some(gate.clone());
+        request.control_context = Some(context);
+        let mut process = CodexJsonRpc::connect(&endpoint, &workspace, PermissionMode::Read,
+            PermissionCoordinator::transient(&workspace)?, None, Arc::new(TraceStore::open(fixture.path())?), "checkpoint".into()).await?;
+        backend.load_thread(&mut process, &mut BackendOutput::default(), &request, true, Vec::new()).await?;
+        gate.complete(Ok(()))?;
+        backend.load_thread(&mut process, &mut BackendOutput::default(), &request, true, Vec::new()).await?;
+        server.await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn loads_a_thread_before_using_a_secondary_terminal_connection() -> Result<()> {
