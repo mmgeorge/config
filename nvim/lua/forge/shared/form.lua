@@ -11,6 +11,8 @@ local notifications = require("forge.infra.notifications")
 ---@field multiline? boolean
 ---@field readonly? boolean
 ---@field choices? string[]|fun(values: table<string, string>, done: fun(values: string[]?, failure?: string))
+---@field cycle? fun(values: table<string, string>, direction: integer, done: fun(patch: table<string, string>?, failure?: string))
+---@field format? fun(value: string): string
 ---@field mark? integer
 ---@field row? integer
 
@@ -80,7 +82,7 @@ function Form:refresh()
     local dirty = values[field.id] ~= self.baseline[field.id]
     local label = field.label .. (dirty and "*: " or ": ")
     if field.choices then
-      label = label .. field_renderer.render(field.value, selected == field)
+      label = label .. field_renderer.render(field.format and field.format(field.value) or field.value, selected == field)
     end
     vim.api.nvim_buf_set_extmark(self.buffer, self.namespace, row, 0, {
       id = field.mark, right_gravity = false,
@@ -141,6 +143,7 @@ function Form:save()
     end
   end
   local captured = editable.capture_draft(self.editable)
+  self.generation = self.generation + 1
   self.pending = true
   self:refresh()
   self.options.save(values, function(failure)
@@ -174,15 +177,22 @@ function Form:cycle(direction)
   if not field or not field.choices or self.pending then return end
   self.generation = self.generation + 1
   local generation, values = self.generation, self:values()
-  local function choose(choices, failure)
-    if not self.active or generation ~= self.generation or self:selected() ~= field
+  local function apply(patch, failure)
+    if not self.active or self.pending or generation ~= self.generation or self:selected() ~= field
       or not vim.deep_equal(values, self:values()) then return end
     if failure then notifications.error(failure, self.options.title) return end
+    for _, candidate in ipairs(self.fields) do
+      if patch and patch[candidate.id] ~= nil and candidate.choices then candidate.value = patch[candidate.id] end
+    end
+    self:refresh()
+  end
+  if field.cycle then field.cycle(values, direction, apply) return end
+  local function choose(choices, failure)
+    if failure then apply(nil, failure) return end
     if not choices or #choices == 0 then return end
     local position = direction > 0 and 0 or 1
     for index, value in ipairs(choices) do if value == field.value then position = index break end end
-    field.value = choices[(position - 1 + direction) % #choices + 1]
-    self:refresh()
+    apply({ [field.id] = choices[(position - 1 + direction) % #choices + 1] })
   end
   if type(field.choices) == "function" then field.choices(values, choose) else choose(field.choices) end
 end

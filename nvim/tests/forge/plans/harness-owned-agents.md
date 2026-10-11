@@ -569,3 +569,41 @@ and a 60-second limit. It exited zero with 204 repository diagnostics and none i
 profile-picker file. `git diff --check` exited zero with a 30-second limit. No live-provider or
 manual graphical verification was performed. Existing hosts require a restart for the rebuilt
 binary.
+
+
+### Profile tuning controls verified on 2026-10-11
+
+`/agents edit` cycles Enabled, Provider, Model, Thinking, and Speed with Tab selecting
+one field and the shared picker value bindings changing it. Enter still opens the full-page
+profile editor. Both views use the same catalog-based selection rules. A provider change
+selects its first advertised model and resets unsupported thinking or speed to default.
+Compatible inheritance remains symbolic and shows its current parent value. Catalog errors,
+empty results, stale replies, and failed saves retain the previous complete selection.
+
+The `agent.models` response now contains `models` and `capability` from one adapter. The
+service test verifies that this response still bypasses an occupied parent broker, and the
+fresh-host fixture consumes the response before spawning and following up with a child.
+
+All commands below exited zero:
+
+- `cargo test --release --locked --target-dir D:/.cache/nvim/rust-sidecar/forge/build -p forge-harness --lib child_model_catalog_bypasses_the_active_root_broker_lock`
+  ran with a 120-second limit. Compilation took 42.50 seconds and the test passed in 0.08 seconds.
+- `cargo test --release --locked --target-dir D:/.cache/nvim/rust-sidecar/forge/build -p forge-harness --lib`
+  ran with a 120-second limit. 892 tests passed and 10 were ignored in 16.76 seconds.
+- `cargo build --release --locked --target-dir D:/.cache/nvim/rust-sidecar/forge/build --bin forge --timings`
+  ran with a 120-second limit. It compiled forge-harness and forge in 40.85 seconds and produced
+  `D:/.cache/nvim/rust-sidecar/forge/build/release/forge.exe`.
+  The report is `D:/.cache/nvim/rust-sidecar/forge/build/cargo-timings/cargo-timing-20261011T192601.1013513Z.html`.
+- `nvim --headless -u NONE --cmd "set rtp+=D:/config/nvim" -l nvim/tests/forge/subagent_profiles.lua`
+  passed in 0.10 seconds with a 30-second limit. Coverage includes both editors, provider-order
+  selection, dependent resets, unsupported choices, failed and empty catalogs, and late replies.
+- The same Neovim command with `picker.lua`, `picker_buffer_lock.lua`,
+  `harness_owned_agents_real.lua`, and `client_initialize_host.lua` passed with 30-second limits.
+  The fresh-host child fixture took 0.60 seconds and initialization took 0.26 seconds.
+- `lua-language-server --check D:/config/nvim/lua/forge --configpath D:/config/nvim/.luarc.json --checklevel=Warning --logpath D:/tmp/forge-profile-check-final`
+  ran with a 30-second limit. It reported 204 existing diagnostics outside the changed modules.
+- `git diff --check` passed with a 15-second limit.
+
+These checks use a mock provider and headless Neovim. They do not establish live-provider
+availability or manual terminal rendering. Existing Neovim hosts require a restart to adopt
+the rebuilt executable.

@@ -3103,7 +3103,8 @@ actions operate on the instance identity.
 The file is the global source of truth across workspaces and providers. `/agents edit` opens a profile
 picker over `agent.profiles.get`, and `/agents edit <profile>` opens the named profile directly.
 `/agent edit [profile]` shares the same route. The edit picker includes disabled profiles.
-Left/Right toggles the selected profile's Enabled value through a revision-checked save.
+Tab selects Enabled, Provider, Model, Thinking, or Speed on the selected profile. Left/Right
+cycles that field through a revision-checked save.
 The `Activity entries` row uses the same controls to update the global inspection count.
 Picker value controls share `keymaps.picker.previous_value` (Left and `r`) and
 `keymaps.picker.next_value` (Right and `h`). Settings, profile toggles, model values, and plan
@@ -3112,6 +3113,18 @@ bindings, and picker aliases apply only where a value action is declared.
 The picker updates in place after success, retaining selection. Pending saves block further
 mutations, reload, and form entry. Failed saves retain the displayed value and report the error,
 including attempts to disable the default profile.
+`subagent_selection.lua` owns the tuning choices shared by the picker and full-page editor.
+`agent.models` returns `{models, capability}` from one child adapter, preserving provider model
+order. Each editor caches successful catalogs by provider until reload or close. A provider change
+selects its first advertised model. Provider and model changes retain compatible thinking and
+speed, otherwise resetting the field to `default`. Thinking choices follow the selected model,
+and speed choices follow the provider's `fast_mode` and `ultrafast_mode` capabilities. Inherit
+choices remain available when the current parent value is compatible, with that value displayed
+beside the sentinel. Spawn-time validation still applies when parent settings or providers change.
+Catalog failures and empty catalogs leave all profile values unchanged. The picker saves the
+complete dependent change once and blocks other mutations until it finishes. The shared form
+accepts an asynchronous field patch only while the form, field, generation, and captured draft
+still match. Save, reload, close, and newer edits invalidate late patches.
 Selection opens a dedicated full-page form through `shared/form.lua`, which reuses `editable.lua`
 for protected native text regions, `picker/field.lua` for choice values, and the shared command
 specification for save, reload, help, and close. Text and choice edits remain local until one

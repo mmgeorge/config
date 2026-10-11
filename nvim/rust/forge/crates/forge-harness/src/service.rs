@@ -1032,7 +1032,7 @@ async fn route_request(
         let provider = request.params["provider"].as_str().context("child model catalog requires provider")?;
         let provider = crate::backend::BackendKind::parse(provider)?;
         let catalog = controller.catalog_request.read().await.clone();
-        let models = controller.agent_backend_factory.model_list(provider,crate::backend::BackendRequest {
+        let models = controller.agent_backend_factory.catalog(provider,crate::backend::BackendRequest {
             execution_owner:catalog.execution_owner,harness_session_id:catalog.harness_session_id,workspace:catalog.workspace,
             input:crate::backend::BackendInput::from_text(String::new()),mode:crate::backend::PromptMode::Chat,
             model:"default".into(),effort:"default".into(),context_window:None,service_tier:Default::default(),
@@ -1988,7 +1988,9 @@ mod tests {
             let value: Value = serde_json::from_slice(frame.bytes()).unwrap();
             if value["id"] == 2 {
                 assert!(value["error"].is_null(), "{value}");
-                assert!(value["result"].as_array().is_some_and(|models| !models.is_empty()), "{value}");
+                assert!(value["result"]["models"].as_array().is_some_and(|models| !models.is_empty()), "{value}");
+                assert_eq!(value["result"]["capability"]["fast_mode"], true, "{value}");
+                assert_eq!(value["result"]["capability"]["ultrafast_mode"], true, "{value}");
                 break;
             }
         }

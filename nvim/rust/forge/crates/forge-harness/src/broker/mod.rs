@@ -1252,7 +1252,7 @@ impl HarnessBroker {
             }
             HarnessMethod::AgentModels => {
                 let provider = crate::backend::BackendKind::parse(&required_text(&params,"provider")?)?;
-                let model = self.agent_backend_factory.model_list(provider,self.backend_request(BackendInput::from_text(String::new()),PromptMode::Chat)).await?;
+                let model = self.agent_backend_factory.catalog(provider,self.backend_request(BackendInput::from_text(String::new()),PromptMode::Chat)).await?;
                 Ok((serde_json::to_value(model)?,Vec::new()))
             }
             HarnessMethod::AgentProfilesGet => Ok((serde_json::to_value(self.agent_backend_factory.profiles.snapshot()?)?, Vec::new())),

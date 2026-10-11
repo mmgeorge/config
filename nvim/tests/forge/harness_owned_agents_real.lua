@@ -56,7 +56,7 @@ local function request(method,params)
 end
 local function model_for(provider,pattern)
   if not pattern then return nil end
-  local models = request("agent.models",{provider=provider})
+  local models = request("agent.models",{provider=provider}).models
   for _,model in ipairs(models) do
     if pattern == "default" and model.is_default then return model.id end
     if model.id:lower():find(pattern:lower(),1,true) then return model.id end
@@ -90,6 +90,9 @@ local succeeded,failure = xpcall(function()
   if root_model then request("session.configure",{model=root_model}) end
   local initial = request("state.get")
   assert(initial.subagent_tools == false,"delegation must default off")
+  local catalog = request("agent.models", {provider=backend})
+  assert(type(catalog.models) == "table" and #catalog.models > 0, "child catalog omitted models")
+  assert(type(catalog.capability.fast_mode) == "boolean", "child catalog omitted speed capabilities")
   if vim.g.forge_agent_test_settings then
     local picker = require("forge.views.picker")
     local function config_picker()

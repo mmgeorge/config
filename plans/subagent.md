@@ -170,8 +170,14 @@ and `permission_mode`. No duplicate editable profile state belongs in SQLite.
 the same configuration path as `/config`. Repeated commands retain the requested state and
 remain local controls while a child timeline is selected or work is running.
 `/agent edit [profile]` is an alias. Both edit pickers include enabled and disabled profiles.
-Left/Right toggles the selected profile's Enabled value and saves immediately without moving
-the selection. Failed saves retain the previous value. The default profile cannot be disabled
+Tab selects Enabled, Provider, Model, Thinking, or Speed. Left/Right (also r/h in pickers)
+cycles the selected field and saves immediately without moving the profile selection. Provider
+changes select the first available model in provider order. Provider/model changes retain valid
+thinking and speed or reset them to default. Thinking choices come from the model catalog, and
+speed choices come from provider capabilities. Keep compatible inherit choices with resolved
+parent values visible. Apply the same dependency rules in the full-page editor. Failed or empty
+catalog loads leave all fields unchanged. Save dependent changes atomically and reject stale
+callbacks. Failed saves retain the previous value. The default profile cannot be disabled
 until another enabled profile becomes the default.
 The final `Open config file` row opens the global `subagents.json` in a normal editable tab
 on Enter. It does not expose profile toggle or delete actions.

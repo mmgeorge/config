@@ -3,6 +3,7 @@ local client = require("forge.client")
 local picker = require("forge.views.picker")
 local picker_field = require("forge.views.picker.field")
 local form = require("forge.shared.form")
+local selection = require("forge.views.harness.subagent_selection")
 local notifications = require("forge.infra.notifications")
 
 local field_list = {
@@ -34,29 +35,9 @@ function Profiles.open(state, host, selected_name)
   local snapshot, show_list, show_profile
   local active, saving = true, false
   local function current() return active and state.session and state.session.id == session_id end
-  local function model_values(field, values, done)
-    local provider = values.provider == "inherit" and state.session.backend or values.provider
-    client.request_for(session_id, "agent.models", { provider = provider }, function(models, failure)
-      if failure then done(nil, failure) return end
-      local choices = { "inherit", "default" }
-      if field == "model" then
-        for _, model in ipairs(models) do
-          if not vim.tbl_contains(choices, model.id) then choices[#choices + 1] = model.id end
-        end
-      else
-        local selected = values.model == "inherit" and (state.session.resolved_model or state.session.model) or values.model
-        for _, model in ipairs(models) do
-          if model.id == selected or (selected == "default" and model.is_default) then
-            for _, effort in ipairs(model.reasoning or {}) do
-              if not vim.tbl_contains(choices, effort) then choices[#choices + 1] = effort end
-            end
-            break
-          end
-        end
-      end
-      done(choices)
-    end)
-  end
+  local tuning = selection.new(state)
+  local active_field = {}
+  local toggle_fields = { "enabled", "provider", "model", "reasoning_effort", "service_tier" }
   show_profile = function(name)
     if saving then return end
     picker.close(false)
@@ -64,16 +45,22 @@ function Profiles.open(state, host, selected_name)
     local values = values_for(name, snapshot.document)
     local fields = {}
     local choices = {
-      provider = { "inherit", "codex", "copilot", "claude", "antigravity" },
-      service_tier = { "inherit", "default", "fast", "ultrafast" },
+      provider = {}, model = {}, reasoning_effort = {}, service_tier = {},
       permission_mode = { "inherit", "read", "write", "yolo" },
       enabled = { "On", "Off" }, default = { "Off", "On" },
-      model = function(selected, done) model_values("model", selected, done) end,
-      reasoning_effort = function(selected, done) model_values("reasoning_effort", selected, done) end,
     }
     for _, field in ipairs(field_list) do
-      fields[#fields + 1] = { id = field[1], label = field[2], value = values[field[1]],
-        multiline = field[1] == "instructions", choices = choices[field[1]] }
+      local id = field[1]
+      fields[#fields + 1] = { id = id, label = field[2], value = values[id],
+        multiline = id == "instructions", choices = choices[id],
+        cycle = choices[id] and #choices[id] == 0 and function(selected, direction, done)
+          if not current() then done(nil, "Harness session changed. Reopen the profile editor") return end
+          tuning:cycle(selected, id, direction, function(patch, failure)
+            if not current() then done(nil, "Harness session changed. Reopen the profile editor") return end
+            done(patch, failure)
+          end)
+        end or nil,
+        format = choices[id] and #choices[id] == 0 and function(value) return tuning:label(id, value) end or nil }
     end
     form.open({ title = "Subagent profile", subtitle = snapshot.path, fields = fields,
       save = function(edited, done)
@@ -108,6 +95,7 @@ function Profiles.open(state, host, selected_name)
           if not current() then done(nil, "Harness session changed while reloading the profile") return end
           if failure or result.error then done(nil, failure or result.error) return end
           snapshot = result
+          tuning.catalog = {}
           if original_name ~= "" and not result.document.profiles[original_name] then
             done(nil, "Profile no longer exists: " .. original_name) return
           end
@@ -140,26 +128,42 @@ function Profiles.open(state, host, selected_name)
     local name = context.option and context.option.value
     if not name then return end
     local document = vim.deepcopy(snapshot.document)
-    document.profiles[name].enabled = not document.profiles[name].enabled
-    save_list(document)
+    local field = active_field[name] or "enabled"
+    if field == "enabled" then
+      document.profiles[name].enabled = not document.profiles[name].enabled
+      save_list(document)
+      return
+    end
+    saving = true
+    tuning:cycle(values_for(name, document), field, direction, function(patch, failure)
+      saving = false
+      if not current() or not picker.is_open("subagent-profiles") then return end
+      if failure then notifications.error(failure, "Subagent profiles") return end
+      for key, value in pairs(patch) do document.profiles[name][key] = value end
+      if not vim.deep_equal(document, snapshot.document) then save_list(document) end
+    end)
   end
   show_list = function()
     local entries = {}
     for name, profile in pairs(snapshot.document.profiles) do
-      entries[#entries + 1] = { id = name, label = name, value = name,
-        columns = { name, picker_field.render(profile.enabled and "On" or "Off", true), profile.provider, profile.model,
-          snapshot.document.default_profile == name and "Default" or profile.description } }
+      local columns = { name }
+      for _, field in ipairs(toggle_fields) do
+        local value = field == "enabled" and (profile.enabled and "On" or "Off") or tuning:label(field, profile[field])
+        columns[#columns + 1] = picker_field.render(value, (active_field[name] or "enabled") == field)
+      end
+      columns[#columns + 1] = snapshot.document.default_profile == name and "Default" or profile.description
+      entries[#entries + 1] = { id = name, label = name, value = name, columns = columns }
     end
     table.sort(entries, function(left, right) return left.label < right.label end)
     entries[#entries + 1] = { id = "activity-limit", label = "Activity entries",
       columns = { "Activity entries", picker_field.render(tostring(snapshot.document.activity_limit or 5), true),
-        "", "", "Recent entries returned to Main (1–20)" } }
+        "", "", "", "", "Recent entries returned to Main (1–20)" } }
     entries[#entries + 1] = { id = "config:" .. snapshot.path, label = "Open config file",
-      columns = { "Open config file", "", "", "", snapshot.path } }
+      columns = { "Open config file", "", "", "", "", "", snapshot.path } }
     local spec = { owner = "subagent-profiles", host = host,
       page_list = { { id = "subagent-profiles", title = "Subagent profiles", subtitle = snapshot.error or snapshot.path,
-        column_headers = { "Profile", "Enabled", "Provider", "Model", "Purpose" }, option_list = entries,
-        footer = "←→ change value  Enter edit  C-a add  C-x delete  C-r reload  q close" } },
+        column_headers = { "Profile", "Enabled", "Provider", "Model", "Thinking", "Speed", "Purpose" }, option_list = entries,
+        footer = "←→ change value  Tab field  Enter edit  C-a add  C-x delete  C-r reload  q close" } },
       on_confirm = function(result)
         if saving then return false end
         if result.option.id == "activity-limit" then return false
@@ -173,6 +177,13 @@ function Profiles.open(state, host, selected_name)
       end,
       on_close = function() active = false end,
       action_list = {
+        { id = "next-field", key = "<Tab>", callback = function(context)
+          local name = context.option and context.option.value
+          if not name or saving then return end
+          local index = vim.fn.index(toggle_fields, active_field[name] or "enabled") + 1
+          active_field[name] = toggle_fields[index % #toggle_fields + 1]
+          show_list()
+        end },
         { id = "previous-value", command = "previous_value", callback = function(context) change_value(context, -1) end },
         { id = "next-value", command = "next_value", callback = function(context) change_value(context, 1) end },
         { id = "add", key = "<C-a>", callback = function() show_profile("") end },
@@ -191,6 +202,7 @@ function Profiles.open(state, host, selected_name)
             if not current() then return end
             if failure then notifications.error(failure, "Subagent profiles") return end
             snapshot = result
+            tuning.catalog = {}
             show_list()
           end)
         end },

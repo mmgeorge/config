@@ -37,7 +37,8 @@ impl AgentBackendFactory {
         Ok(Arc::from(crate::backend::build(launch, self.permission.clone(), self.trace.clone(), self.settings_root.clone())?))
     }
 
-    pub async fn model_list(&self, provider: BackendKind, mut request: BackendRequest) -> Result<Vec<crate::backend::BackendModel>> {
+    /// Loads selectable models and capability constraints from the same child adapter.
+    pub async fn catalog(&self, provider: BackendKind, mut request: BackendRequest) -> Result<AgentModelCatalog> {
         ensure!(request.owner()?.is_root(), "child model catalogs require root session ownership");
         request.input = BackendInput::from_text(String::new());
         request.model = "default".into();
@@ -45,13 +46,14 @@ impl AgentBackendFactory {
         request.backend_session_id = None;
         request.control_context = None;
         let backend = self.build(provider)?;
+        let capability = backend.descriptor().capability;
         let model = tokio::time::timeout(std::time::Duration::from_secs(30),backend.model_list(request)).await
             .context("child model catalog exceeded 30 seconds");
         let cleanup = tokio::time::timeout(std::time::Duration::from_secs(30),backend.shutdown()).await
             .context("child model catalog cleanup exceeded 30 seconds");
         let model = model??;
         cleanup??;
-        Ok(model)
+        Ok(AgentModelCatalog { models: model, capability })
     }
 
     #[cfg(test)]
@@ -79,7 +81,7 @@ impl AgentBackendFactory {
         if profile.model != "inherit" || profile.reasoning_effort != "inherit" || !same_provider {
             ensure!(same_provider || profile.model != "inherit" || root.model != "default",
                 "profile {} inherits an unresolved model from another provider. Select a model or default explicitly", selection.profile);
-            let model_list = self.model_list(provider,root.clone()).await?;
+            let model_list = self.catalog(provider,root.clone()).await?.models;
             let model = if selection.model == "default" {
                 model_list.iter().find(|model|model.is_default).or_else(||model_list.first())
             } else { model_list.iter().find(|model|model.id == selection.model) }
@@ -111,6 +113,15 @@ impl AgentBackendFactory {
             context_window: selection.context_window.clone(), service_tier: selection.service_tier, access: root.access.clone(),
             execution_mode: narrow_permission(root.execution_mode, selection.execution_mode), backend_session_id: agent.provider_thread_id.clone(), control_context: None })
     }
+}
+
+#[derive(serde::Serialize)]
+/// Couples a provider's model list with the constraints used by profile editors.
+pub struct AgentModelCatalog {
+    /// Preserves the order advertised by the provider.
+    pub models: Vec<crate::backend::BackendModel>,
+    /// Controls which tuning options the provider accepts.
+    pub capability: crate::backend::BackendCapability,
 }
 
 fn narrow_permission(root: crate::session::PermissionMode, selected: crate::session::PermissionMode) -> crate::session::PermissionMode {

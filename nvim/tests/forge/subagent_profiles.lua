@@ -7,6 +7,18 @@ local original_request, original_open, original_notify = client.request_for, for
 local current_form, pending_save, pending_models
 local delayed_save, delayed_models = false, false
 local errors, saves = {}, 0
+local model_failure
+local catalog_by_provider = {
+  codex = { capability = { fast_mode = true, ultrafast_mode = true }, models = {
+    { id = "fixture-model", reasoning = { "low", "high" }, default_reasoning = "low", is_default = true },
+    { id = "simple-model", reasoning = {} },
+  } },
+  copilot = { capability = { fast_mode = false, ultrafast_mode = false }, models = {
+    { id = "copilot-first", reasoning = { "medium" }, default_reasoning = "medium" },
+    { id = "copilot-default", reasoning = {}, is_default = true },
+  } },
+  claude = { capability = {}, models = {} },
+}
 local snapshot = { path = "global/forge/subagents.json", revision = "1", document = {
   default_profile = "worker", activity_limit = 5, profiles = {
     worker = { enabled = true, description = "Implement", instructions = "Worker instructions", provider = "inherit",
@@ -16,7 +28,7 @@ local snapshot = { path = "global/forge/subagents.json", revision = "1", documen
   },
 } }
 snapshot.document.profiles.disabled = vim.tbl_extend("force", snapshot.document.profiles.reviewer, { enabled = false })
-local state = { session = { id = "profiles", backend = "codex", model = "fixture-model" } }
+local state = { session = { id = "profiles", backend = "codex", model = "fixture-model", effort = "high", service_tier = "fast" } }
 vim.notify = function(message) errors[#errors + 1] = message end
 form.open = function(options) current_form = original_open(options) return current_form end
 client.request_for = function(session_id, method, params, callback)
@@ -37,9 +49,8 @@ client.request_for = function(session_id, method, params, callback)
     end
     if delayed_save then pending_save = complete else complete() end
   elseif method == "agent.models" then
-    assert(params.provider == "codex")
     if delayed_models then pending_models = callback
-    else callback({ { id = "fixture-model", reasoning = { "low", "high" }, is_default = true } }) end
+    else callback(vim.deepcopy(catalog_by_provider[params.provider]), model_failure) end
   else error("unexpected profile request: " .. method) end
 end
 
@@ -209,14 +220,94 @@ local succeeded, failure = xpcall(function()
   select("activity-limit")
   assert(picker.is_open("subagent-profiles"), "activity setting opened the config file")
 
+  picker.close()
+  require("forge.views.harness.subagent_profiles").open(state, host)
   select("worker")
   focus("model")
   delayed_models = true
   current_form:cycle(1)
   current_form:close()
-  pending_models({ { id = "late", reasoning = {} } })
+  pending_models(catalog_by_provider.codex)
   assert(picker.is_open("subagent-profiles"), "late catalog callback reopened the form")
   picker.close()
+
+  delayed_models = false
+  local worker = snapshot.document.profiles.worker
+  worker.provider, worker.model, worker.reasoning_effort, worker.service_tier = "codex", "fixture-model", "high", "ultrafast"
+  require("forge.views.harness.subagent_profiles").open(state, host)
+  instance = picker._state_for_test()
+  action("next-field", "worker")
+  local before_provider = saves
+  press_arrow("h", "worker")
+  worker = snapshot.document.profiles.worker
+  assert(worker.provider == "copilot" and worker.model == "copilot-first",
+    "provider change must select the first advertised model, not the default model")
+  assert(worker.reasoning_effort == "default" and worker.service_tier == "default",
+    "provider change retained unsupported thinking or speed")
+  assert(saves == before_provider + 1, "dependent changes were not saved atomically")
+  action("next-field", "worker")
+  press_arrow("h", "worker")
+  assert(snapshot.document.profiles.worker.model == "copilot-default", "model column did not cycle")
+  action("next-field", "worker")
+  press_arrow("h", "worker")
+  assert(snapshot.document.profiles.worker.reasoning_effort == "default", "non-reasoning model offered thinking")
+  action("next-field", "worker")
+  press_arrow("h", "worker")
+  assert(snapshot.document.profiles.worker.service_tier == "default", "unsupported provider offered fast speed")
+
+  select("worker")
+  focus("provider")
+  local before_empty = current_form:values()
+  current_form:cycle(1)
+  assert(vim.deep_equal(current_form:values(), before_empty) and errors[#errors]:find("No models available"),
+    "empty catalog changed the profile")
+  model_failure = "catalog offline"
+  current_form:cycle(1)
+  assert(vim.deep_equal(current_form:values(), before_empty) and errors[#errors]:find("catalog offline"))
+  model_failure = nil
+  current_form:cycle(-1)
+  assert(current_form:values().provider == "codex" and current_form:values().model == "fixture-model")
+  focus("reasoning_effort")
+  current_form:cycle(1)
+  current_form:cycle(1)
+  assert(current_form:values().reasoning_effort == "high")
+  focus("model")
+  current_form:cycle(1)
+  assert(current_form:values().model == "simple-model" and current_form:values().reasoning_effort == "default",
+    "model change retained unsupported thinking")
+  focus("reasoning_effort")
+  current_form:cycle(1)
+  assert(current_form:values().reasoning_effort == "default", "incompatible inherited thinking was offered")
+  focus("service_tier")
+  current_form:cycle(1)
+  assert(current_form:values().service_tier == "fast")
+  focus("provider")
+  current_form:cycle(1)
+  assert(current_form:values().service_tier == "default", "full-page editor retained unsupported speed")
+
+  delayed_models = true
+  current_form:cycle(1)
+  local stale_catalog = pending_models
+  edit("instructions", "Newer draft during catalog lookup")
+  stale_catalog({ capability = {}, models = { { id = "claude-first", reasoning = {} } } })
+  assert(current_form:values().provider == "copilot" and current_form:values().instructions == "Newer draft during catalog lookup",
+    "late catalog response overwrote newer form edits")
+  current_form:reload()
+  current_form:close()
+  picker.close()
+
+  require("forge.views.harness.subagent_profiles").open(state, host)
+  instance = picker._state_for_test()
+  action("next-field", "worker")
+  local before_late = saves
+  press_arrow("h", "worker")
+  local pending_provider = pending_models
+  press_arrow("h", "worker")
+  assert(pending_models == pending_provider, "pending provider switch admitted another mutation")
+  picker.close()
+  pending_provider({ capability = {}, models = { { id = "claude-first", reasoning = {} } } })
+  assert(saves == before_late and not picker.is_open("subagent-profiles"), "closed picker saved a late provider switch")
+  delayed_models = false
 
   local config_path = vim.fn.tempname() .. " subagents.json"
   local config_text = vim.json.encode(snapshot.document)
