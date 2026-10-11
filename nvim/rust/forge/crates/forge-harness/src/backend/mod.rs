@@ -1,5 +1,7 @@
 pub mod approval;
 mod catalog;
+mod compaction;
+pub use compaction::{BackendCompactionRequest, Compaction, CompactionCapability, CompactionContext, CompactionCost, CompactionResult, CompactionState, CompactionTokenCost, CompactionUsage};
 pub(crate) mod mcp;
 pub mod codex;
 pub mod copilot;
@@ -65,7 +67,11 @@ pub struct BackendDescriptor {
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct BackendCapability {
     pub native_fork: bool,
+    /// Supports an explicit provider compaction request.
     pub native_compact: bool,
+    #[serde(default)]
+    /// Describes observable compaction evidence independently of manual request support.
+    pub compaction: CompactionCapability,
     pub native_steer: bool,
     pub native_turn_rollback: bool,
     pub native_goal: bool,
@@ -146,6 +152,21 @@ pub struct BackendEvent {
 }
 
 impl BackendEvent {
+    /// Decode the provider-neutral compaction lifecycle payload.
+    pub(crate) fn compaction(&self) -> Result<Option<Compaction>> {
+        if self.kind != "compaction" { return Ok(None); }
+        Ok(Some(serde_json::from_value(self.data.clone())?))
+    }
+
+    /// Publish one typed compaction update through the shared event transport.
+    pub(crate) fn from_compaction(compaction: Compaction, address: Option<ProviderAddress>) -> Self {
+        Self {
+            received_at_ms: None, address, turn_boundary: None,
+            kind: "compaction".into(), text: None,
+            data: serde_json::to_value(compaction).expect("compaction is JSON serializable"),
+            activity: None, summary: None, task_update: None,
+        }
+    }
     pub(crate) fn tool_output_delta(&self) -> Option<&str> {
         if self.turn_boundary.is_some() || self.summary.is_some() || self.task_update.is_some()
             || self.text.is_some() { return None; }
@@ -554,8 +575,13 @@ pub trait Backend: Send + Sync {
     }
 
     /// Compact provider-owned conversation history when the backend advertises support.
-    async fn compact(&self, _request: BackendRequest) -> Result<BackendOutput> {
+    async fn compact(&self, _request: BackendCompactionRequest) -> Result<BackendOutput> {
         anyhow::bail!("backend does not support context compaction")
+    }
+
+    /// Subscribe once to session compaction that can outlive an active provider turn.
+    async fn compaction_stream(&self, _session_id: &str) -> Result<Option<events::BackendEventStream>> {
+        Ok(None)
     }
 
     /// Append user input to the active provider turn when native steering is available.
@@ -1095,8 +1121,19 @@ impl Backend for MockBackend {
         Ok(true)
     }
 
-    async fn compact(&self, request: BackendRequest) -> Result<BackendOutput> {
+    async fn compact(&self, request: BackendCompactionRequest) -> Result<BackendOutput> {
+        let compaction = Compaction {
+            id: request.id, thread_id: request.request.backend_session_id.clone().unwrap_or_default(),
+            state: CompactionState::Completed, manual:true, started_at_ms:None, completed_at_ms:None,
+            result: CompactionResult {
+                summary_content: Some("Mock compacted context preserves the conversation constraints.".into()),
+                pre_compaction_tokens: Some(80_000), post_compaction_tokens: Some(20_000),
+                tokens_removed: Some(60_000), ..Default::default()
+            },
+        };
+        let request = request.request;
         Ok(BackendOutput {
+            event: vec![BackendEvent::from_compaction(compaction, None)],
             backend_session_id: request.backend_session_id,
             capability: mock_capability(),
             runtime: BackendRuntime {
@@ -1148,6 +1185,7 @@ fn mock_capability() -> BackendCapability {
     BackendCapability {
         native_fork: true,
         native_compact: true,
+        compaction: CompactionCapability { lifecycle: true, background: false, summary: true, metrics: true },
         native_steer: true,
         native_turn_rollback: true,
         native_goal: true,

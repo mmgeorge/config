@@ -935,6 +935,22 @@ async fn normalize_event_in_workspace(
     if method_lower == "turn/moderationmetadata" {
         return;
     }
+    if matches!(method_lower.as_str(), "item/started" | "item/completed")
+        && params.pointer("/item/type").and_then(Value::as_str) == Some("contextCompaction")
+    {
+        let Some(id) = params.pointer("/item/id").and_then(Value::as_str) else { return; };
+        let Some(thread_id) = pointer_string(&params, &["/threadId", "/thread_id"]) else { return; };
+        let event = BackendEvent::from_compaction(crate::backend::Compaction {
+            id: id.to_owned(), thread_id,
+            state: if method_lower == "item/started" { crate::backend::CompactionState::Running }
+                else { crate::backend::CompactionState::Completed },
+            manual: false, started_at_ms: None, completed_at_ms: None,
+            result: crate::backend::CompactionResult::default(),
+        }, address);
+        if let Some(event_sink) = event_sink { let _ = event_sink.send_wait(event.clone()).await; }
+        append_output_event(output, event);
+        return;
+    }
     if let Some(event) = normalize_message(method, &params, address.clone(), output) {
         if let Some(event_sink) = event_sink {
             let _ = event_sink.send_wait(event.clone()).await;
@@ -1516,6 +1532,18 @@ fn control_invocation(method: &str, value: &Value) -> Result<Option<ControlToolI
 }
 
 fn append_output_event(output: &mut BackendOutput, event: BackendEvent) {
+    if let Some(compaction) = event.compaction().ok().flatten() {
+        if let Some(previous) = output.event.iter_mut().find(|previous| {
+            previous.compaction().ok().flatten().is_some_and(|existing|
+                existing.id == compaction.id && existing.thread_id == compaction.thread_id)
+        }) {
+            if previous.compaction().ok().flatten().is_some_and(|existing|
+                existing.state == crate::backend::CompactionState::Running) {
+                *previous = event;
+            }
+            return;
+        }
+    }
     if matches!(
         event.kind.as_str(),
         "assistant_message" | "reasoning_summary"
@@ -2043,6 +2071,22 @@ fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn compaction_lifecycle_is_neither_assistant_text_nor_a_tool() {
+        let mut output = super::BackendOutput::default();
+        for method in ["item/started", "item/completed", "item/started", "item/completed"] {
+            super::normalize_event(&serde_json::json!({
+                "method":method, "params":{"threadId":"thread", "turnId":"turn",
+                    "item":{"type":"contextCompaction","id":"compact"}}
+            }), &mut output, None).await;
+        }
+        assert_eq!(output.event.len(), 1);
+        let compaction = output.event[0].compaction().unwrap().unwrap();
+        assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
+        assert_eq!(compaction.result.summary_content, None);
+        assert!(output.event[0].activity.is_none());
+        assert!(output.event[0].text.is_none());
+    }
 
     #[tokio::test]
     async fn passive_catalog_connection_does_not_answer_broadcast_controls() -> anyhow::Result<()> {

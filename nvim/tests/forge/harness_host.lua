@@ -72,6 +72,30 @@ local success, failure = xpcall(function()
   assert(vim.wait(3000, function() return cleared_status ~= nil end, 10))
   assert(cleared_status.enabled and cleared_status.path == log_status.path)
   assert(not vim.tbl_contains(vim.fn.readfile(log_status.path), prompt_record), "prior session trace survived clear")
+  controller.compact()
+  assert(vim.wait(5000, function()
+    local text = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+    return #errors > 0 or (text:find("Context compacted", 1, true) and not state.task_operation)
+  end, 10), "manual compaction did not render in the native timeline")
+  assert(#errors == 0, table.concat(errors, "\n"))
+  local compaction_row
+  for row, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
+    if line:find("Context compacted", 1, true) then
+      assert(not compaction_row, "manual compaction created duplicate rows")
+      assert(line:find("manual", 1, true), "manual origin missing from compaction row")
+      compaction_row = row
+    end
+  end
+  assert(compaction_row, "compaction row missing")
+  local collapsed = table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+  assert(not collapsed:find("Mock compacted context", 1, true), "compaction details did not default to collapsed")
+  vim.api.nvim_set_current_win(state.transcript_win)
+  vim.api.nvim_win_set_cursor(state.transcript_win, { compaction_row, 0 })
+  controller.toggle_activity()
+  assert(vim.wait(3000, function()
+    return table.concat(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false), "\n")
+      :find("Mock compacted context preserves the conversation constraints.", 1, true) ~= nil
+  end, 10), "expanding compaction did not expose its generated summary")
   assert(vim.bo[state.composer_buf].modifiable and not vim.bo[state.transcript_buf].modifiable)
   local previous = state.transcript_win
   vim.api.nvim_set_current_win(previous)
@@ -105,6 +129,11 @@ local success, failure = xpcall(function()
   assert(#errors == 0, table.concat(errors, "\n"))
   assert(vim.api.nvim_buf_get_lines(state.composer_buf, 0, -1, false)[1] == "draft survives collected host")
   assert(require("forge.infra.perf").enabled("harness"), "saved logging preference lost on restart")
+  local compaction_count = 0
+  for _, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
+    if line:find("Context compacted", 1, true) then compaction_count = compaction_count + 1 end
+  end
+  assert(compaction_count == 1, "compaction timeline history did not survive host restart")
   local initialized = vim.system({ "git", "init", workspace }, { text = true }):wait(10000)
   assert(initialized.code == 0, initialized.stderr)
   vim.api.nvim_buf_set_lines(state.composer_buf, 0, -1, false, { "/plan build the feature" })

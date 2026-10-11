@@ -1,4 +1,5 @@
 mod event_decoder;
+mod compaction;
 mod text_generation;
 
 use crate::agent::{AgentCapability, AgentControlMode};
@@ -51,6 +52,7 @@ type CopilotSessionSlot = Arc<Mutex<Option<CopilotSessionBinding>>>;
 struct CopilotSessionBinding {
     session: SharedCopilotSession,
     revision_tools: bool,
+    compaction: Option<compaction::CompactionMonitor>,
 }
 
 /// Retains terminal observations after the prompt event subscription ends.
@@ -116,6 +118,7 @@ enum ProviderShutdown {
 pub struct CopilotBackend {
     trace: Arc<crate::trace::TraceStore>,
     terminal_monitor: Mutex<HashMap<String, CopilotTerminalMonitor>>,
+    compaction_subscription_by_harness: Mutex<HashMap<String, compaction::CompactionSubscription>>,
     command: Vec<String>,
     client: Mutex<Option<Client>>,
     client_start_count: AtomicU64,
@@ -146,6 +149,7 @@ impl CopilotBackend {
         Ok(Self {
             trace,
             terminal_monitor: Mutex::new(HashMap::new()),
+            compaction_subscription_by_harness: Mutex::new(HashMap::new()),
             command,
             client: Mutex::new(None),
             client_start_count: AtomicU64::new(0),
@@ -197,10 +201,15 @@ impl CopilotBackend {
 
     async fn session(&self, request: &BackendRequest) -> Result<SharedCopilotSession> {
         let session_slot = self.session_slot(&request.harness_session_id).await;
+        let turn_event = self.turn_event(&request.harness_session_id).await;
         let mut active_session = session_slot.lock().await;
         let phase = request.control_context.as_ref().and_then(|context| context.execution.as_ref()).map(|execution| execution.phase);
         let revision_tools = phase.is_none_or(|phase| phase == crate::plan::PlanPhase::Resolve);
-        if let Some(binding) = active_session.as_ref().filter(|binding| binding.revision_tools == revision_tools) {
+        if let Some(binding) = active_session.as_mut().filter(|binding| binding.revision_tools == revision_tools) {
+            if binding.compaction.is_none() {
+                binding.compaction = self.compaction_subscription_by_harness.lock().await.get(&request.harness_session_id)
+                    .cloned().map(|subscription| compaction::CompactionMonitor::new(&binding.session, subscription, Arc::clone(&turn_event)));
+            }
             let session = &binding.session;
             if request.model != "default" {
                 let client = self.client(&request.workspace).await?;
@@ -270,7 +279,9 @@ impl CopilotBackend {
                 .context("create Copilot session")?
         };
         let session = Arc::new(session);
-        *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), revision_tools });
+        let compaction = self.compaction_subscription_by_harness.lock().await.get(&request.harness_session_id)
+            .cloned().map(|subscription| compaction::CompactionMonitor::new(&session, subscription, turn_event));
+        *active_session = Some(CopilotSessionBinding { session: Arc::clone(&session), revision_tools, compaction });
         Ok(session)
     }
 
@@ -367,7 +378,8 @@ impl CopilotBackend {
 fn capability() -> BackendCapability {
     BackendCapability {
         native_fork: true,
-        native_compact: false,
+        native_compact: true,
+        compaction: super::CompactionCapability { lifecycle: true, background: true, summary: true, metrics: true },
         native_steer: true,
         native_turn_rollback: false,
         native_goal: false,
@@ -445,6 +457,10 @@ impl Backend for CopilotBackend {
     async fn shutdown(&self) -> Result<()> {
         self.closed.store(true, Ordering::Release);
         self.terminal_monitor.lock().await.clear();
+        for slot in self.session_slot_by_harness.lock().await.values() {
+            if let Some(binding) = slot.lock().await.as_mut() { binding.compaction.take(); }
+        }
+        self.compaction_subscription_by_harness.lock().await.clear();
         let mut shutdown = self.shutdown.lock().await;
         if matches!(*shutdown, ProviderShutdown::Idle) {
             let client = self.client.lock().await.clone();
@@ -607,6 +623,10 @@ impl Backend for CopilotBackend {
                     }
                     let terminal_error = provider_event.event_type == "session.error"
                         && !provider_event.is_transient_error();
+                    if matches!(provider_event.event_type.as_str(), "session.compaction_start" | "session.compaction_complete")
+                        && self.compaction_subscription_by_harness.lock().await.contains_key(&request.harness_session_id) {
+                        continue;
+                    }
                     decoder.decode(&provider_event, &mut output, event_sink.as_ref()).await;
                     if request.mode == PromptMode::ExecutePlan && !execution_turn_stopped {
                         let call_id = provider_event.data.get("toolCallId").and_then(Value::as_str);
@@ -664,6 +684,49 @@ impl Backend for CopilotBackend {
             }
         }
         Ok(output)
+    }
+
+    async fn compact(&self, request: super::BackendCompactionRequest) -> Result<BackendOutput> {
+        let id = request.id;
+        let request = request.request;
+        let session = self.session(&request).await?;
+        let slot = self.session_slot(&request.harness_session_id).await;
+        let manual = slot.lock().await.as_ref().and_then(|binding| binding.compaction.as_ref())
+            .map(|monitor| Arc::clone(&monitor.manual));
+        if let Some(manual) = &manual { manual.lock().await.register(id.clone()); }
+        let result = match session.rpc().history().compact().await.context("compact Copilot history") {
+            Ok(result) => result,
+            Err(error) => {
+                if let Some(manual) = &manual { manual.lock().await.finish(&id); }
+                return Err(error);
+            }
+        };
+        if let Some(manual) = &manual { manual.lock().await.finish(&id); }
+        let data = serde_json::to_value(&result)?;
+        let compaction = crate::backend::Compaction {
+            id, thread_id: session.id().to_string(),
+            state: if result.success { crate::backend::CompactionState::Completed }
+                else { crate::backend::CompactionState::Failed },
+            manual: true, started_at_ms: None, completed_at_ms: None,
+            result: serde_json::from_value(data)?,
+        };
+        let context_usage = compaction.result.context_window.as_ref().and_then(|context| {
+            context.current_tokens.zip(context.token_limit)
+                .and_then(|(used, size)| crate::session::ContextUsage::reported(used, size))
+        });
+        Ok(BackendOutput {
+            backend_session_id: Some(session.id().to_string()), capability: capability(),
+            runtime: crate::backend::BackendRuntime { provider: "Copilot CLI".into(), model: None },
+            event: vec![BackendEvent::from_compaction(compaction, None)],
+            metrics: crate::backend::TurnMetrics { context_usage, ..Default::default() },
+            ..BackendOutput::default()
+        })
+    }
+
+    async fn compaction_stream(&self, session_id: &str) -> Result<Option<super::events::BackendEventStream>> {
+        let (sink, stream) = super::events::channel();
+        self.compaction_subscription_by_harness.lock().await.insert(session_id.to_owned(), compaction::CompactionSubscription::new(sink));
+        Ok(Some(stream))
     }
 
     async fn fork(&self, request: BackendForkRequest) -> Result<crate::backend::BackendForkResult> {
@@ -1579,13 +1642,13 @@ mod test {
     use super::*;
 
     #[test]
-    fn descriptor_exposes_only_stable_native_capabilities() {
+    fn descriptor_exposes_supported_native_capabilities() {
         let backend = CopilotBackend::new(Vec::new()).unwrap();
         let descriptor = backend.descriptor();
         assert_eq!(descriptor.kind, BackendKind::Copilot);
         assert!(descriptor.capability.native_steer);
         assert!(descriptor.capability.native_fork);
-        assert!(!descriptor.capability.native_compact);
+        assert!(descriptor.capability.native_compact);
         assert!(descriptor.capability.agent.observe);
     }
 

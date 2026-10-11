@@ -21,6 +21,7 @@ impl CopilotEventDecoder {
         event_sink: Option<&BackendEventSink>,
     ) {
         if provider_event.agent_id.is_none()
+            && !provider_event.event_type.starts_with("session.compaction_")
             && let Some(model) = string_field(&provider_event.data, &["model"])
             && !model.is_empty()
             && output.runtime.model.as_ref() != Some(&model)
@@ -29,6 +30,51 @@ impl CopilotEventDecoder {
             publish(output.runtime.resolved_event(), output, event_sink).await;
         }
         match provider_event.event_type.as_str() {
+            "session.compaction_start" | "session.compaction_complete" => {
+                let thread_id = provider_event.agent_id.clone().or_else(|| output.backend_session_id.clone());
+                let Some(thread_id) = thread_id else { return; };
+                let complete = provider_event.event_type == "session.compaction_complete";
+                let id = if complete {
+                    output.event.iter().rev()
+                        .find(|event| event.kind == "compaction"
+                            && event.data.get("provider_event_id").and_then(Value::as_str) == Some(provider_event.id.as_str()))
+                        .and_then(|event| event.compaction().ok().flatten()).map(|compaction| compaction.id)
+                        .or_else(|| output.event.iter().rev().filter_map(|event| event.compaction().ok().flatten())
+                        .find(|compaction| compaction.thread_id == thread_id
+                            && compaction.state == crate::backend::CompactionState::Running)
+                        .map(|compaction| compaction.id))
+                        .unwrap_or_else(|| provider_event.id.clone())
+                } else { provider_event.id.clone() };
+                let result = serde_json::from_value(provider_event.data.clone());
+                let mut result: crate::backend::CompactionResult = match result {
+                    Ok(result) => result,
+                    Err(error) => {
+                        self.publish_text("error", Some(format!("Invalid Copilot compaction result: {error}")),
+                            provider_event, output, event_sink).await;
+                        return;
+                    }
+                };
+                if !complete {
+                    result.before_context = Some(crate::backend::CompactionContext {
+                        conversation_tokens: result.conversation_tokens.take(),
+                        system_tokens: result.system_tokens.take(),
+                        tool_definitions_tokens: result.tool_definitions_tokens.take(),
+                        ..Default::default()
+                    });
+                }
+                let compaction = crate::backend::Compaction {
+                    id, thread_id,
+                    state: if !complete { crate::backend::CompactionState::Running }
+                        else if provider_event.data.get("success").and_then(Value::as_bool) == Some(true) {
+                            crate::backend::CompactionState::Completed
+                        } else { crate::backend::CompactionState::Failed },
+                    manual: provider_event.data.get("customInstructions").is_some(),
+                    started_at_ms: None, completed_at_ms: None, result,
+                };
+                let mut event = BackendEvent::from_compaction(compaction, None);
+                event.data["provider_event_id"] = Value::String(provider_event.id.clone());
+                publish(event, output, event_sink).await;
+            }
             "assistant.turn_start" | "assistant.turn_end" => {
                 publish(
                     BackendEvent {
@@ -345,6 +391,29 @@ async fn publish(
     event_sink: Option<&BackendEventSink>,
 ) {
     address_event(&mut event, output);
+    if let Some(compaction) = event.compaction().ok().flatten() {
+        if let Some(previous) = output.event.iter_mut().find(|previous| {
+            previous.compaction().ok().flatten().is_some_and(|existing|
+                existing.id == compaction.id && existing.thread_id == compaction.thread_id)
+        }) {
+            if let Some(event_sink) = event_sink { let _ = event_sink.send_wait(event.clone()).await; }
+            if previous.compaction().ok().flatten().is_some_and(|existing|
+                existing.state == crate::backend::CompactionState::Running) {
+                if let Some(existing) = previous.compaction().ok().flatten() {
+                    let provider_event_id = event.data.get("provider_event_id").cloned();
+                    let mut retained = compaction;
+                    retained.result.before_context = existing.result.before_context;
+                    retained.result.model = retained.result.model.or(existing.result.model);
+                    event.data = serde_json::to_value(retained).unwrap_or(event.data.clone());
+                    if let Some(provider_event_id) = provider_event_id {
+                        event.data["provider_event_id"] = provider_event_id;
+                    }
+                }
+                *previous = event;
+            }
+            return;
+        }
+    }
     if let Some(activity) = event.activity.as_ref()
         && let Some(previous) = output.event.iter_mut().find(|previous| {
             previous.activity.as_ref().is_some_and(|existing| {
@@ -587,6 +656,40 @@ fn unsigned_field(value: &Value, field_list: &[&str]) -> Option<u64> {
 mod test {
     use super::*;
     use serde_json::json;
+
+    #[tokio::test]
+    async fn compaction_retains_summary_failure_and_identity_across_replays() {
+        let decoder = CopilotEventDecoder;
+        let mut output = BackendOutput { backend_session_id: Some("root".into()), ..Default::default() };
+        let start = event("session.compaction_start", json!({"model":"summary-model", "conversationTokens":100}));
+        let complete = event("session.compaction_complete", json!({
+            "success":false, "error":"summary request failed", "summaryContent":"Retain the contract.",
+            "preCompactionTokens":100, "postCompactionTokens":40, "tokensRemoved":60,
+            "messagesRemoved":0, "compactionTokensUsed":{"inputTokens":100,"outputTokens":20,"cacheReadTokens":0,
+                "copilotUsage":{"totalNanoAiu":1.5,"tokenDetails":[{"tokenType":"input","tokenCount":100}]}}
+        }));
+        for update in [&start, &complete, &complete, &start] {
+            decoder.decode(update, &mut output, None).await;
+        }
+        assert_eq!(output.event.len(), 1);
+        let compaction = output.event[0].compaction().unwrap().unwrap();
+        assert_eq!(compaction.id, start.id);
+        assert_eq!(compaction.state, crate::backend::CompactionState::Failed);
+        assert_eq!(compaction.result.summary_content.as_deref(), Some("Retain the contract."));
+        assert_eq!(compaction.result.error.as_deref(), Some("summary request failed"));
+        assert_eq!(compaction.result.messages_removed, Some(0));
+        assert_eq!(compaction.result.model.as_deref(), Some("summary-model"));
+        assert_eq!(compaction.result.before_context.unwrap().conversation_tokens, Some(100));
+        assert_eq!(output.event[0].data["provider_event_id"], complete.id);
+        let usage = compaction.result.compaction_tokens_used.unwrap();
+        assert_eq!(usage.cached_input, Some(0));
+        assert_eq!(usage.billing.unwrap().total_nano_aiu, Some(1.5));
+        let mut orphan = event("session.compaction_complete", json!({"success":true}));
+        orphan.id = "other-operation".into();
+        decoder.decode(&orphan, &mut output, None).await;
+        assert_eq!(output.event.len(), 2);
+        assert_eq!(output.event[1].compaction().unwrap().unwrap().result.pre_compaction_tokens, None);
+    }
 
     fn event(event_type: &str, data: Value) -> SessionEvent {
         SessionEvent {

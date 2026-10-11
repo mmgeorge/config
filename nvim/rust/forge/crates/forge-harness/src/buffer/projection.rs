@@ -388,6 +388,10 @@ impl TimelineRenderer<'_> {
             }
             TimelineEntry::Checks { run, .. } => self.checks(run)?,
             TimelineEntry::SessionEvent { id, event, .. } => {
+                if let SessionEventKind::Compaction { compaction } = &event.detail {
+                    self.compaction(id, compaction)?;
+                    return Ok(());
+                }
                 let text = format!("◇ {}", session_event_text(&event.detail));
                 let action = match &event.detail {
                     SessionEventKind::Forked {
@@ -1047,6 +1051,7 @@ impl TimelineRenderer<'_> {
                 continue;
             }
             match node {
+                ExchangeNode::Compaction { id, compaction } => self.compaction(id, compaction)?,
                 ExchangeNode::TurnContent { id, turn_id, item } => {
                     let turn = interaction
                         .turn
@@ -1313,6 +1318,89 @@ impl TimelineRenderer<'_> {
                     )?
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn compaction(&mut self, id: &str, compaction: &crate::backend::Compaction) -> Result<()> {
+        use crate::backend::CompactionState;
+        let start = self.block.len();
+        let label = match compaction.state {
+            CompactionState::Running => "Compacting context",
+            CompactionState::Completed => "Context compacted",
+            CompactionState::Failed => "Context compaction failed",
+            CompactionState::Unconfirmed => "Context compaction completion unconfirmed",
+        };
+        let mut heading = format!("◇ {label}");
+        if compaction.manual { heading.push_str(" · manual"); }
+        if let (Some(before), Some(after)) = (compaction.result.pre_compaction_tokens, compaction.result.post_compaction_tokens) {
+            heading.push_str(&format!(" · {} → {} tokens", token_display(before), token_display(after)));
+        }
+        if let (Some(started), Some(completed)) = (compaction.started_at_ms, compaction.completed_at_ms) {
+            heading.push_str(&format!(" · {}s", completed.saturating_sub(started).max(0) / 1_000));
+        }
+        self.literal(id, &heading, None)?;
+        let section = self.begin_section(2);
+        let mut details = Vec::new();
+        if let Some(model) = &compaction.result.model { details.push(format!("Compaction model: `{model}`")); }
+        if let Some(instructions) = &compaction.result.custom_instructions { details.push(format!("Focus instructions: {instructions}")); }
+        if let Some(status) = compaction.result.status_code { details.push(format!("HTTP status: {status}")); }
+        if let Some(request) = &compaction.result.request_id { details.push(format!("Request ID: `{request}`")); }
+        if let Some(request) = &compaction.result.service_request_id { details.push(format!("Service request ID: `{request}`")); }
+        if let Some(error) = &compaction.result.error { details.push(format!("Failure: {error}")); }
+        if let Some(count) = compaction.result.tokens_removed { details.push(format!("Tokens removed: {count}")); }
+        if let Some(count) = compaction.result.messages_removed { details.push(format!("Messages removed: {count}")); }
+        if let Some(count) = compaction.result.pre_compaction_messages_length { details.push(format!("Messages before compaction: {count}")); }
+        if let Some(count) = compaction.result.checkpoint_number { details.push(format!("Checkpoint: {count}")); }
+        if let Some(path) = &compaction.result.checkpoint_path { details.push(format!("Checkpoint path: `{path}`")); }
+        if let Some(usage) = &compaction.result.compaction_tokens_used {
+            if let Some(cost) = &usage.billing {
+                if let Some(total) = cost.total_nano_aiu { details.push(format!("Provider cost: {total} nano-AI units")); }
+                for category in cost.token_details.as_deref().unwrap_or_default() {
+                    let name = category.token_type.as_deref().unwrap_or("unspecified");
+                    if let Some(count) = category.token_count { details.push(format!("Billed {name} tokens: {count}")); }
+                    if let Some(count) = category.batch_size { details.push(format!("Billing {name} batch size: {count}")); }
+                    if let Some(count) = category.cost_per_batch { details.push(format!("Billing {name} cost per batch: {count}")); }
+                }
+            }
+            if let Some(model) = &usage.model { details.push(format!("Compaction request model: `{model}`")); }
+            if let Some(duration) = usage.duration_ms { details.push(format!("Compaction request duration: {duration} ms")); }
+            for (name, count) in [("Compaction input tokens", usage.input), ("Compaction output tokens", usage.output), ("Compaction cached input tokens", usage.cached_input)] {
+                if let Some(count) = count { details.push(format!("{name}: {count}")); }
+            }
+            if let Some(count) = usage.cache_write_tokens { details.push(format!("Compaction cache write tokens: {count}")); }
+        }
+        if let Some(context) = &compaction.result.before_context {
+            for (name, count) in [("Conversation tokens before compaction", context.conversation_tokens),
+                ("System tokens before compaction", context.system_tokens),
+                ("Tool definition tokens before compaction", context.tool_definitions_tokens)] {
+                if let Some(count) = count { details.push(format!("{name}: {count}")); }
+            }
+        }
+        let context = compaction.result.context_window.as_ref();
+        for (name, count) in [
+            ("Conversation tokens", compaction.result.conversation_tokens.or_else(|| context.and_then(|context| context.conversation_tokens))),
+            ("System tokens", compaction.result.system_tokens.or_else(|| context.and_then(|context| context.system_tokens))),
+            ("Tool definition tokens", compaction.result.tool_definitions_tokens.or_else(|| context.and_then(|context| context.tool_definitions_tokens))),
+            ("Context tokens", context.and_then(|context| context.current_tokens)),
+            ("Context capacity", context.and_then(|context| context.token_limit)),
+            ("Retained messages", context.and_then(|context| context.messages_length)),
+        ] {
+            if let Some(count) = count { details.push(format!("{name}: {count}")); }
+        }
+        if !details.is_empty() {
+            self.markdown(&format!("{id}:metrics"), &details.join("\n\n"), MarkdownRole::Detail)?;
+        }
+        if let Some(summary) = &compaction.result.summary_content {
+            self.markdown(&format!("{id}:summary"), summary, MarkdownRole::Detail)?;
+        } else if compaction.state != CompactionState::Running {
+            self.literal(&format!("{id}:summary"), "The provider did not expose a compacted summary.", None)?;
+        } else {
+            self.literal(&format!("{id}:pending"), "Waiting for provider completion.", None)?;
+        }
+        self.finish_section(section, id, true);
+        if compaction.state == CompactionState::Running {
+            self.block[start].metadata.status = Some(StatusPresentation { row: 0, animated: true, hint: None });
         }
         Ok(())
     }
@@ -1749,6 +1837,7 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
 
 fn session_event_text(event: &SessionEventKind) -> String {
     match event {
+        SessionEventKind::Compaction { .. } => "Context compaction".into(),
         SessionEventKind::Renamed { name } if name.is_empty() => "Session name cleared".into(),
         SessionEventKind::Renamed { name } => format!("Session renamed to {name}"),
         SessionEventKind::Forked {
@@ -1883,6 +1972,19 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     );
     let count: usize = interaction.turn.iter().map(|turn| turn.tools().count()).sum();
     let mut sections = vec![summary];
+    let compaction: Vec<_> = interaction.node_list.iter().filter_map(|node| {
+        if let ExchangeNode::Compaction { compaction, .. } = node { Some(compaction) } else { None }
+    }).collect();
+    if !compaction.is_empty() {
+        let mut label = format!("Compactions {}", compaction.len());
+        for (state, name) in [(crate::backend::CompactionState::Running, "active"),
+            (crate::backend::CompactionState::Failed, "failed"),
+            (crate::backend::CompactionState::Unconfirmed, "unconfirmed")] {
+            let count = compaction.iter().filter(|compaction| compaction.state == state).count();
+            if count > 0 { label.push_str(&format!(" · {count} {name}")); }
+        }
+        sections.push(label);
+    }
     if count > 0 {
         let passed = interaction.turn.iter().flat_map(|turn| turn.tools())
             .filter(|tool| tool.state() == crate::turn::ToolState::Completed && !tool.failed).count();
@@ -1920,6 +2022,51 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compaction_keeps_its_position_summary_and_fold_after_reload() -> anyhow::Result<()> {
+        use super::*;
+        use crate::backend::{Compaction, CompactionResult, CompactionState};
+        let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+            "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
+            "prompt":"Work", "state":"running", "created_at_ms":0,
+            "attributed_matches_checkpoint":false, "node_list":[]
+        }))?;
+        let compaction = Compaction {
+            id: "operation".into(), thread_id: "provider".into(), state: CompactionState::Running,
+            manual: false, started_at_ms: None, completed_at_ms: None,
+            result: CompactionResult::default(),
+        };
+        exchange.observe_compaction(compaction.clone(), 1000);
+        let id = exchange.node_list[0].id().to_owned();
+        exchange.append_input(crate::exchange::InputIntent::Steering, "Continue".into(), 1500)?;
+        let mut completed = compaction.clone();
+        completed.state = CompactionState::Completed;
+        completed.result.summary_content = Some("Preserve **the API contract**.\n\nKeep the regression test.".into());
+        completed.result.pre_compaction_tokens = Some(1000);
+        completed.result.post_compaction_tokens = Some(400);
+        completed.result.messages_removed = Some(0);
+        exchange.observe_compaction(completed, 3000);
+        exchange.observe_compaction(compaction, 4000);
+        let restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
+        assert_eq!(restored.node_list.len(), 2);
+        assert_eq!(restored.node_list[0].id(), id);
+        let entry = TimelineEntry::Exchange { id:"exchange".into(), created_at_ms:0,
+            exchange:restored, agent_by_id:HashMap::new() };
+        let projected = project_at(&entry, &WidthProfile::default(), 5000)?;
+        let activity = projected.entry.block.iter().find(|block| block.id.0 == "exchange:summary").unwrap();
+        assert!(activity.text.row(0).unwrap().contains("Compactions 1"));
+        let header = projected.entry.block.iter().find(|block| block.id.0 == id).unwrap();
+        assert!(header.text.row(0).unwrap().contains("Context compacted"));
+        assert!(header.text.row(0).unwrap().contains("2s"));
+        assert!(header.metadata.status.is_none());
+        assert!(header.metadata.node.as_ref().is_some_and(|node| node.default_display == NodeDisplay::Heading));
+        let summary = projected.entry.block.iter().find(|block| block.id.0 == format!("{id}:summary")).unwrap();
+        assert!(summary.text.wire_rows().join("\n").contains("Keep the regression test."));
+        let metrics = projected.entry.block.iter().find(|block| block.id.0 == format!("{id}:metrics")).unwrap();
+        assert!(metrics.text.wire_rows().join("\n").contains("Messages removed: 0"));
+        Ok(())
+    }
+
     #[test]
     fn verification_groups_keep_checks_and_declaration_diffs_separate() -> anyhow::Result<()> {
         use super::*;

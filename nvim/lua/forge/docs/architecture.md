@@ -2527,10 +2527,43 @@ No transcript-copy fallback exists.
 
 Provider token-usage notifications normalize into durable `ContextUsage` session state. The
 Harness winbar renders the remaining percentage and total window at its right edge without
-adding timeline entries. Codex uses app-server `thread/compact/start` for `/compact`. Copilot's
-SDK compacts automatically but exposes no manual compaction request, so its capability omits
-`/compact`. Compaction never creates a user interaction, and unsupported backends omit the command
-instead of receiving a synthetic summarization prompt.
+adding timeline entries for usage changes. `Compaction` defines provider context replacement as a
+separate lifecycle with an operation identity, conversation identity, observed start and completion,
+terminal outcome, and optional `CompactionResult`. `CompactionCapability` describes lifecycle,
+background execution, summary, and metrics availability independently of `native_compact`, which
+gates manual requests.
+Codex normalizes `contextCompaction` item start and completion without inventing summary text or
+token counts. Copilot normalizes `session.compaction_start` and `session.compaction_complete`,
+including supplied summary text, token and message counts, checkpoint metadata, and compaction
+model usage, duration, context composition, request identities, and optional billing evidence.
+The generated summary is distinct from the provider's complete retained context.
+
+Each automatic operation owns one `ExchangeNode::Compaction` at its first observed position.
+Completion replaces that node's state without moving it or creating assistant text or a tool call.
+Terminal replays cannot reopen the record. Later notifications can fill missing result fields
+without replacing confirmed evidence. A foreground provider turn ending before compaction
+confirmation records an unconfirmed outcome rather than leaving an active indicator indefinitely.
+The shared renderer projects a collapsed compaction
+row whose details expose the actual summary and reported metrics. Absent provider fields remain
+absent, and Codex rows explicitly report unavailable summary text when opened. Exchange headers
+retain compaction counts and active, failed, or unconfirmed counts while activity details are folded.
+
+Copilot's session subscription remains alive after prompt completion through `Backend::compaction_stream`.
+That subscription owns normalization across turns and SDK session rebinding. It delivers active
+notifications through the turn's existing event sink and also retains the session delivery lane.
+Foreground prompt readers skip these raw notifications to prevent independent operation identities.
+The session controller serializes those notifications through the broker and updates the original
+exchange record when one exists. Notifications with no exchange owner use a durable session event.
+The controller emits document revisions through the normal atomic presentation boundary. Provider
+shutdown ends the subscription, and controller disposal cancels its consumer task.
+
+Codex uses app-server `thread/compact/start` for `/compact`. Copilot uses the installed SDK's
+experimental `session.history.compact` RPC. Manual requests persist one `SessionEventKind::Compaction`
+before provider admission, retain the result or failure afterward, and never create a user exchange.
+`BackendCompactionRequest` carries the manual row identity into the provider adapter. Copilot's
+monitor correlates the native lifecycle with that identity and enriches the same row when native
+notifications provide more detail than the RPC result. Unsupported backends omit the command instead of receiving a synthetic
+summarization prompt.
 
 Codex publishes every tool lifecycle update to the owning turn. Tool records merge only by
 provider address and call ID, never by tool name or arguments. Repeating a control call with

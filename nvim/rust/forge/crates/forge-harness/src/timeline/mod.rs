@@ -16,6 +16,8 @@ mod planning;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventKind {
+    /// Retains an explicitly requested compaction without creating a user exchange.
+    Compaction { compaction: crate::backend::Compaction },
     Renamed {
         name: String,
     },

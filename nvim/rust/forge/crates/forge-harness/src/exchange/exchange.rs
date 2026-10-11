@@ -186,6 +186,33 @@ impl Exchange {
         Ok(())
     }
 
+    /// Retain one compaction at its first observed position and merge terminal evidence.
+    pub(crate) fn observe_compaction(&mut self, compaction: crate::backend::Compaction, now_ms: i64) {
+        if let Some(ExchangeNode::Compaction { compaction: existing, .. }) = self.node_list.iter_mut().find(|node| {
+            matches!(node, ExchangeNode::Compaction { compaction: existing, .. }
+                if existing.id == compaction.id && existing.thread_id == compaction.thread_id)
+        }) {
+            existing.observe(compaction, now_ms);
+        } else {
+            self.close_running_messages();
+            self.node_list.push(ExchangeNode::Compaction {
+                id: format!("{}:compaction:{}:{}", self.id, compaction.thread_id, compaction.id),
+                compaction: compaction.observed(now_ms),
+            });
+        }
+    }
+
+    /// Stop active compaction presentation when its provider execution ends without confirmation.
+    pub(crate) fn unconfirm_compaction(&mut self, thread_id: &str, now_ms: i64) {
+        for node in &mut self.node_list {
+            if let ExchangeNode::Compaction { compaction, .. } = node
+                && compaction.thread_id == thread_id && compaction.state == crate::backend::CompactionState::Running {
+                compaction.state = crate::backend::CompactionState::Unconfirmed;
+                compaction.completed_at_ms = Some(now_ms);
+            }
+        }
+    }
+
     /// Route provider lifecycle and tool provenance before accepting presentation content.
     pub(crate) fn observe_turn(
         &mut self,
@@ -896,6 +923,7 @@ mod test {
             .node_list
             .iter()
             .map(|node| match node {
+                ExchangeNode::Compaction { .. } => "compaction",
                 ExchangeNode::TurnContent { .. } => "content",
                 ExchangeNode::AgentReference { .. } => "agent",
                 ExchangeNode::ExchangeInput { .. } => "steering",

@@ -64,6 +64,7 @@ fn capability() -> BackendCapability {
     BackendCapability {
         native_fork: true,
         native_compact: true,
+        compaction: super::CompactionCapability { lifecycle: true, background: false, summary: false, metrics: false },
         native_steer: true,
         native_turn_rollback: true,
         native_goal: true,
@@ -1345,7 +1346,8 @@ impl Backend for CodexBackend {
         }
     }
 
-    async fn compact(&self, request: BackendRequest) -> Result<BackendOutput> {
+    async fn compact(&self, request: super::BackendCompactionRequest) -> Result<BackendOutput> {
+        let request = request.request;
         let thread_id = request
             .backend_session_id
             .clone()
@@ -1383,8 +1385,8 @@ impl Backend for CodexBackend {
             .and_then(Value::as_str)
             .unwrap_or_default();
         anyhow::ensure!(
-            !status.eq_ignore_ascii_case("failed"),
-            "Codex compaction failed: {completed}"
+            status.eq_ignore_ascii_case("completed"),
+            "Codex compaction did not complete: {completed}"
         );
         output.runtime.provider = "Codex CLI".into();
         Ok(output)

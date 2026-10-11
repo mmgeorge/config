@@ -6,6 +6,8 @@ use serde::{Deserialize, Serialize};
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ExchangeNode {
+    /// Retains provider context replacement separately from model text and tool calls.
+    Compaction { id: String, compaction: crate::backend::Compaction },
     ImplementationReport {
         id: String,
         reference: crate::plan::implementation_report::ImplementationReportRef,
@@ -40,6 +42,7 @@ pub enum ExchangeNode {
 impl ExchangeNode {
     pub fn id(&self) -> &str {
         match self {
+            Self::Compaction { id, .. } => id,
             Self::ImplementationReport { id, .. } => id,
             Self::QuestionPresented { id, .. } => id,
             Self::PlanEvent { event } => &event.id,

@@ -596,6 +596,7 @@ impl HarnessService {
 
 /// Owns one session's serialized state machine and out-of-band control lanes.
 struct SessionController {
+    compaction_task: Mutex<Option<tokio::task::JoinHandle<()>>>,
     execution_admission: Arc<Semaphore>,
     control_admission: Arc<Semaphore>,
     plan_review: Arc<crate::plan::review_document::PlanReviewStore>,
@@ -628,6 +629,7 @@ impl SessionController {
     fn new(broker: HarnessBroker) -> Arc<Self> {
         let catalog_request = broker.backend_catalog_request();
         Arc::new(Self {
+            compaction_task: Mutex::new(None),
             execution_admission: Arc::new(Semaphore::new(1)),
             control_admission: Arc::new(Semaphore::new(1)),
             plan_review: Arc::clone(&broker.plan_review),
@@ -640,6 +642,38 @@ impl SessionController {
             permission: broker.permission_coordinator(),
             broker: Mutex::new(broker),
         })
+    }
+
+    async fn attach_compaction(self: &Arc<Self>, message_sink: &MessageSender) -> Result<()> {
+        let mut task = self.compaction_task.lock().await;
+        if task.is_some() { return Ok(()); }
+        let session_id = self.catalog_request.read().await.harness_session_id.clone();
+        let Some(mut stream) = self.backend.compaction_stream(&session_id).await? else { return Ok(()); };
+        let controller = Arc::downgrade(self);
+        let message_sink = message_sink.clone();
+        *task = Some(tokio::spawn(async move {
+            let result: Result<()> = async {
+                while let Some(event) = stream.recv().await? {
+                    let Some(controller) = controller.upgrade() else { return Ok(()); };
+                    let events = controller.broker.lock().await.observe_external_compaction(event)?;
+                    for event in events { message_sink.send_event(event).await?; }
+                }
+                Ok(())
+            }.await;
+            if let Err(error) = result {
+                let _ = message_sink.send_event(SessionEvent {
+                    session_id, event: "backend_event".into(),
+                    payload: json!({"kind":"error", "text":format!("Compaction subscription failed: {error:#}")}),
+                }).await;
+            }
+        }));
+        Ok(())
+    }
+}
+
+impl Drop for SessionController {
+    fn drop(&mut self) {
+        if let Some(task) = self.compaction_task.get_mut().take() { task.abort(); }
     }
 }
 
@@ -834,6 +868,7 @@ async fn route_request(
         return route_new_session(registry, session_id, request, message_sink).await;
     }
     let controller = registry.resolve(&session_id).await?;
+    controller.attach_compaction(message_sink).await?;
     if method == HarnessMethod::Health {
         message_sink.send_control_wait(Message::Response(Response::success(request.id,
             json!({"session_id":session_id,"responsive":true}))?)).await?;

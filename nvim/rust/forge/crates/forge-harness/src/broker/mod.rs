@@ -4692,6 +4692,56 @@ Planning continuation: turn {} of {}.",
             self.emit_backend_event(backend_event, event).await?;
             return Ok(());
         }
+        if let Some(compaction) = backend_event.compaction()? {
+            let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
+            let previous_owner = self.compaction_exchange_owner(&compaction)?;
+            let owns_other_exchange = previous_owner.as_ref().is_some_and(|owner|
+                owner.id != interaction.id && !self.child_exchange_runtime_by_agent.values()
+                    .any(|child| child.exchange.id == owner.id));
+            let owns_session_event = self.store.list_session_event(&self.session.id)?.iter().any(|record|
+                matches!(&record.detail, SessionEventKind::Compaction { compaction: existing }
+                    if existing.id == compaction.id && existing.thread_id == compaction.thread_id));
+            if owns_other_exchange || owns_session_event {
+                self.retain_external_compaction(compaction, now_ms)?;
+                let patch = self.reconcile_timeline()?;
+                self.emit_timeline_patch(patch, event).await?;
+                return Ok(());
+            }
+            let child_id = self.agent_registry.get_by_thread(&compaction.thread_id)
+                .map(|agent| agent.id.clone())
+                .filter(|id| self.child_exchange_runtime_by_agent.contains_key(id))
+                .or_else(|| self.child_exchange_runtime_by_agent.iter().find(|(_, child)| {
+                child.exchange.turn.iter().any(|turn| turn.provider().thread_id == compaction.thread_id)
+            }).map(|(id, _)| id.clone()));
+            if let Some(child_id) = child_id {
+                let mut child = self.child_exchange_runtime_by_agent.remove(&child_id)
+                    .context("compaction owner disappeared")?;
+                child.exchange.observe_compaction(compaction, now_ms);
+                let result = async {
+                    self.store.save_exchange(&child.exchange)?;
+                    self.emit_live_interaction(backend_event, &child.exchange, event).await
+                }.await;
+                self.child_exchange_runtime_by_agent.insert(child_id, child);
+                result?;
+            } else if self.session.backend_session_id.as_deref() == Some(compaction.thread_id.as_str())
+                || interaction.turn.iter().any(|turn| turn.provider().thread_id == compaction.thread_id)
+            {
+                runtime.retraction_eligible = false;
+                interaction.observe_compaction(compaction, now_ms);
+                self.store.save_exchange(interaction)?;
+                self.emit_live_interaction(backend_event, interaction, event).await?;
+            }
+            return Ok(());
+        }
+        if !self.capability.compaction.background
+            && matches!(backend_event.turn_boundary, Some(crate::backend::TurnBoundary::Finished { .. }))
+            && let Some(address) = &backend_event.address {
+            let now_ms = backend_event.observed_at_ms(self.clock.now_ms());
+            interaction.unconfirm_compaction(&address.thread_id, now_ms);
+            for child in self.child_exchange_runtime_by_agent.values_mut() {
+                child.exchange.unconfirm_compaction(&address.thread_id, now_ms);
+            }
+        }
         if let Some(received) = backend_event.received_at_ms {
             self.trace.record(&self.session.id,"broker.provider.dequeued",json!({
                 "event_type":backend_event.kind,
@@ -7161,6 +7211,57 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         ))
     }
 
+    /// Resolve persisted ownership across primary and child-agent exchanges.
+    fn compaction_exchange_owner(&self, compaction: &crate::backend::Compaction) -> Result<Option<Exchange>> {
+        let mut exchange_list = self.store.list_exchange(&self.session.id)?;
+        for agent in self.store.list_agent_run(&self.session.id)? {
+            exchange_list.extend(self.store.list_agent_exchange(&agent.id)?);
+        }
+        Ok(exchange_list.into_iter().find(|exchange| {
+            exchange.node_list.iter().any(|node| matches!(node,
+                ExchangeNode::Compaction { compaction: existing, .. }
+                    if existing.id == compaction.id && existing.thread_id == compaction.thread_id))
+        }))
+    }
+
+    /// Merge active and background notifications into their persisted timeline owner.
+    fn retain_external_compaction(&mut self, compaction: crate::backend::Compaction, now_ms: i64) -> Result<()> {
+        self.save_session()?;
+        if let Some(mut exchange) = self.compaction_exchange_owner(&compaction)? {
+            exchange.observe_compaction(compaction, now_ms);
+            self.store.save_exchange(&exchange)?;
+        } else {
+            let existing = self.store.list_session_event(&self.session.id)?.into_iter().find(|record| {
+                matches!(&record.detail, SessionEventKind::Compaction { compaction: existing }
+                    if existing.id == compaction.id && existing.thread_id == compaction.thread_id)
+            });
+            let record = if let Some(mut record) = existing {
+                if let SessionEventKind::Compaction { compaction: existing } = &mut record.detail {
+                    existing.observe(compaction, now_ms);
+                }
+                record
+            } else {
+                SessionEventRecord {
+                    id: format!("{}:compaction:{}:{}", self.session.id, compaction.thread_id, compaction.id),
+                    session_id: self.session.id.clone(), created_at_ms: now_ms,
+                    detail: SessionEventKind::Compaction { compaction: compaction.observed(now_ms) },
+                }
+            };
+            self.store.save_session_event(&record)?;
+        }
+        Ok(())
+    }
+
+    /// Retain session notifications after provider execution has released the broker.
+    pub(crate) fn observe_external_compaction(&mut self, event: BackendEvent) -> Result<Vec<SessionEvent>> {
+        let Some(compaction) = event.compaction()? else {
+            return Ok(vec![self.event("backend_event", serde_json::to_value(event)?)?]);
+        };
+        self.retain_external_compaction(compaction, event.observed_at_ms(self.clock.now_ms()))?;
+        let patch = self.reconcile_timeline()?;
+        Ok(if patch.is_empty() { Vec::new() } else { vec![self.event("document_changed", patch.notification())?] })
+    }
+
     async fn compact_session(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
         anyhow::ensure!(
             self.capability.native_compact,
@@ -7170,10 +7271,54 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
             self.session.backend_session_id.is_some(),
             "current session has no provider conversation to compact"
         );
-        let output = self
+        let now_ms = self.clock.now_ms();
+        let mut compaction = crate::backend::Compaction {
+            id: Uuid::new_v4().to_string(),
+            thread_id: self.session.backend_session_id.clone().expect("validated provider conversation"),
+            state: crate::backend::CompactionState::Running,
+            manual: true, started_at_ms: Some(now_ms), completed_at_ms: None,
+            result: crate::backend::CompactionResult::default(),
+        };
+        let mut record = SessionEventRecord {
+            id: format!("{}:compaction:{}", self.session.id, compaction.id),
+            session_id: self.session.id.clone(), created_at_ms: now_ms,
+            detail: SessionEventKind::Compaction { compaction: compaction.clone() },
+        };
+        self.store.save_session_event(&record)?;
+        let mut event = Vec::new();
+        let patch = self.reconcile_timeline()?;
+        self.emit_timeline_patch(patch, &mut event).await?;
+        let result = self
             .backend
-            .compact(self.backend_request(BackendInput::from_text(""), PromptMode::Chat))
-            .await?;
+            .compact(crate::backend::BackendCompactionRequest {
+                id: compaction.id.clone(),
+                request: self.backend_request(BackendInput::from_text(""), PromptMode::Chat),
+            })
+            .await;
+        compaction.completed_at_ms = Some(self.clock.now_ms());
+        let output = match result {
+            Ok(output) => output,
+            Err(error) => {
+                compaction.state = crate::backend::CompactionState::Failed;
+                compaction.result.error = Some(format!("{error:#}"));
+                record.detail = SessionEventKind::Compaction { compaction };
+                self.store.save_session_event(&record)?;
+                let patch = self.reconcile_timeline()?;
+                self.emit_timeline_patch(patch, &mut event).await?;
+                return Err(error);
+            }
+        };
+        let observed = output.event.iter().rev().find_map(|event| event.compaction().ok().flatten());
+        if let Some(observed) = observed {
+            compaction.state = observed.state;
+            compaction.result = observed.result;
+        } else {
+            compaction.state = crate::backend::CompactionState::Completed;
+        }
+        let failed = compaction.state == crate::backend::CompactionState::Failed;
+        let failure = compaction.result.error.clone().unwrap_or_else(|| "Provider compaction failed".into());
+        record.detail = SessionEventKind::Compaction { compaction };
+        self.store.save_session_event(&record)?;
         self.capability = output.capability.clone();
         self.session.native_fork = output.capability.native_fork;
         self.session.native_compact = output.capability.native_compact;
@@ -7191,9 +7336,13 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         }
         self.save_session()?;
         let snapshot = self.snapshot()?;
+        let patch = self.reconcile_timeline()?;
+        self.emit_timeline_patch(patch, &mut event).await?;
+        anyhow::ensure!(!failed, "{failure}");
+        event.push(self.event("context_compacted", serde_json::to_value(&snapshot)?)?);
         Ok((
             serde_json::to_value(&snapshot)?,
-            vec![self.event("context_compacted", serde_json::to_value(snapshot)?)?],
+            event,
         ))
     }
 
@@ -10034,7 +10183,7 @@ mod test {
         assert_eq!(broker.session.effort, "low");
         broker.session.backend_session_id = Some("mock-session".into());
         let (_, events) = broker.compact_session().await.unwrap();
-        assert_eq!(events[0].event, "context_compacted");
+        assert!(events.iter().any(|event| event.event == "context_compacted"));
         assert_eq!(broker.session.effort, "low");
         let preference = broker.store.load_preference(&broker.session.workspace, "mock").unwrap().unwrap();
         assert_eq!(preference.effort, "low");
@@ -10457,6 +10606,42 @@ mod test {
         let persisted = broker.store.list_exchange(&broker.session.id).unwrap();
         assert_eq!(persisted[0].node_list.len(), 2);
         assert!(!runtime.retraction_eligible);
+        let compaction = crate::backend::Compaction {
+            id: "native-compaction".into(), thread_id: "parent".into(),
+            state: crate::backend::CompactionState::Running, manual: false,
+            started_at_ms: None, completed_at_ms: None, result: Default::default(),
+        };
+        let mut notification = BackendEvent::from_compaction(compaction.clone(), None);
+        notification.received_at_ms = Some(200);
+        broker.process_backend_event(&mut runtime, &mut exchange, notification, &mut events).await.unwrap();
+        let position = exchange.node_list.len() - 1;
+        let original_id = exchange.node_list[position].id().to_owned();
+        let mut unrelated = compaction.clone();
+        unrelated.thread_id = "unrelated".into();
+        broker.process_backend_event(&mut runtime, &mut exchange,
+            BackendEvent::from_compaction(unrelated, None), &mut events).await.unwrap();
+        assert_eq!(exchange.node_list.len(), 3);
+        broker.process_backend_event(&mut runtime, &mut exchange, BackendEvent {
+            received_at_ms: Some(300), address: Some(ProviderAddress { thread_id:"parent".into(), turn_id:"native".into() }),
+            turn_boundary: Some(TurnBoundary::Finished { outcome: crate::turn::TurnOutcome::Interrupted }),
+            kind:"turn_completed".into(), text:None, data:Value::Null, activity:None, summary:None, task_update:None,
+        }, &mut events).await.unwrap();
+        let ExchangeNode::Compaction { compaction: pending, .. } = &exchange.node_list[position] else { panic!("compaction row missing") };
+        assert_eq!(pending.state, crate::backend::CompactionState::Unconfirmed);
+        let mut completed = compaction;
+        completed.state = crate::backend::CompactionState::Completed;
+        completed.result.summary_content = Some("Retain the original task.".into());
+        let mut notification = BackendEvent::from_compaction(completed, None);
+        notification.received_at_ms = Some(400);
+        broker.process_backend_event(&mut runtime, &mut exchange, notification, &mut events).await.unwrap();
+        let ExchangeNode::Compaction { compaction: completed, .. } = &exchange.node_list[position] else { panic!("compaction position changed") };
+        assert_eq!(completed.state, crate::backend::CompactionState::Completed);
+        assert_eq!(completed.started_at_ms, Some(200));
+        assert_eq!(completed.completed_at_ms, Some(400));
+        assert_eq!(exchange.node_list[position].id(), original_id);
+        assert_eq!(exchange.turn.len(), 1);
+        assert_eq!(exchange.turn[0].messages().len(), 1);
+        assert_eq!(exchange.turn[0].tools().count(), 1);
     }
 
     #[tokio::test]
@@ -11083,7 +11268,53 @@ mod test {
                 .len(),
             interaction_count
         );
-        assert_eq!(compacted.event[0].event, "context_compacted");
+        assert!(compacted.event.iter().any(|event| event.event == "context_compacted"));
+        let records = broker.store.list_session_event(&broker.session.id).unwrap();
+        assert_eq!(records.len(), 1);
+        let SessionEventKind::Compaction { compaction } = &records[0].detail else { panic!("compaction record missing") };
+        assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
+        assert!(compaction.manual);
+
+        let mut exchange = broker.store.list_exchange(&broker.session.id).unwrap().remove(0);
+        let automatic = crate::backend::Compaction {
+            id: "background".into(), thread_id: broker.session.backend_session_id.clone().unwrap(),
+            state: crate::backend::CompactionState::Running, manual:false,
+            started_at_ms:None, completed_at_ms:None, result:Default::default(),
+        };
+        exchange.observe_compaction(automatic.clone(), 200);
+        let position = exchange.node_list.len() - 1;
+        broker.store.save_exchange(&exchange).unwrap();
+        let mut completion = automatic;
+        completion.state = crate::backend::CompactionState::Completed;
+        completion.result.summary_content = Some("Retain the original constraints.".into());
+        let update = BackendEvent::from_compaction(completion, None);
+        let mut current = completed_interaction("next-compaction-exchange", &broker.session.id, Vec::new());
+        current.ordinal = interaction_count as u64 + 1;
+        current.state = ExchangeState::Running;
+        current.completed_at_ms = None;
+        broker.store.save_exchange(&current).unwrap();
+        let mut runtime = ExchangeRuntime {
+            exchange_id:current.id.clone(), synthetic_turn:None, task:TaskTracker::default(),
+            retraction_eligible:true, active_wait:None,
+        };
+        let (sink, mut stream) = crate::backend::events::channel();
+        broker.event_sink = Some(sink);
+        let mut events = Vec::new();
+        broker.process_backend_event(&mut runtime, &mut current, update.clone(), &mut events).await.unwrap();
+        assert!(current.node_list.is_empty(), "background completion entered the next exchange");
+        let notification = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv())
+            .await.expect("cross-turn compaction patch was not delivered").unwrap().unwrap();
+        assert_eq!(notification.kind, "document_changed");
+        assert!(events.is_empty());
+        broker.event_sink = None;
+        assert!(broker.observe_external_compaction(update.clone()).unwrap().is_empty());
+        assert!(broker.observe_external_compaction(update).unwrap().is_empty());
+        let restored = broker.store.list_exchange(&broker.session.id).unwrap();
+        assert_eq!(restored.len(), interaction_count + 1);
+        let ExchangeNode::Compaction { compaction, .. } = &restored[0].node_list[position] else { panic!("original compaction position lost") };
+        assert_eq!(compaction.state, crate::backend::CompactionState::Completed);
+        assert_eq!(compaction.result.summary_content.as_deref(), Some("Retain the original constraints."));
+        assert_eq!(broker.store.list_session_event(&broker.session.id).unwrap().len(), 1);
     }
 
     #[tokio::test]
