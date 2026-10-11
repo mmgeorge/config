@@ -118,7 +118,8 @@ impl SyntaxLanguage {
             _ => None,
         }
     }
-    pub(crate) fn grammar(self) -> Language {
+    /// Returns the vendored grammar for syntax analysis outside the highlighting service.
+    pub fn grammar(self) -> Language {
         unsafe extern "C" {
             fn tree_sitter_rust() -> *const ();
             fn tree_sitter_typescript() -> *const ();

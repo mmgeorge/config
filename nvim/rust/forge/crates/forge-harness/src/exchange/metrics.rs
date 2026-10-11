@@ -26,6 +26,9 @@ pub struct ExchangeMetrics {
     pub reported_output_tokens: Option<u64>,
     /// Response-time estimate captured with the latest admitted usage report.
     pub reported_response_ms: Option<u64>,
+    /// Resume intent belongs to the live permission coordinator and cannot survive a host restart.
+    #[serde(skip)]
+    pub(crate) approval_resume: bool,
     tool: BTreeSet<String>,
     blocker: BTreeSet<String>,
     sample: BTreeSet<String>,
@@ -39,6 +42,11 @@ struct UsageCursor {
 }
 
 impl ExchangeMetrics {
+    /// Reports whether any permission request still suspends this exchange.
+    pub(crate) fn awaiting_approval(&self) -> bool {
+        self.blocker.iter().any(|id| id.starts_with("approval:"))
+    }
+
     /// Retains the latest active elapsed coordinate without counting offline time.
     pub(crate) fn observe_elapsed(&mut self, elapsed_ms: u64) {
         self.observed_elapsed_ms = self.observed_elapsed_ms.max(elapsed_ms);
@@ -72,13 +80,17 @@ impl ExchangeMetrics {
         self.blocker.clear();
         self.close_tools(elapsed_ms);
         self.tool.clear();
+        self.approval_resume = false;
     }
 
     /// Returns tool occupancy including currently running calls, when timing is complete.
     pub fn tool_ms(&self, elapsed_ms: u64) -> Option<u64> {
-        self.timing_complete.then(|| self.tool_duration_ms.saturating_add(
-            self.tool_started_ms.map_or(0, |started| elapsed_ms.saturating_sub(started)),
-        ))
+        self.timing_complete.then(|| {
+            self.tool_duration_ms.saturating_add(
+                self.tool_started_ms
+                    .map_or(0, |started| elapsed_ms.saturating_sub(started)),
+            )
+        })
     }
 
     /// Captures both operands together so throughput stays fixed between usage reports.
@@ -90,7 +102,9 @@ impl ExchangeMetrics {
 
     fn close_tools(&mut self, elapsed_ms: u64) {
         if let Some(started) = self.tool_started_ms.take() {
-            self.tool_duration_ms = self.tool_duration_ms.saturating_add(elapsed_ms.saturating_sub(started));
+            self.tool_duration_ms = self
+                .tool_duration_ms
+                .saturating_add(elapsed_ms.saturating_sub(started));
         }
     }
 
@@ -176,6 +190,7 @@ impl Default for ExchangeMetrics {
             tool_started_ms: None,
             reported_output_tokens: None,
             reported_response_ms: None,
+            approval_resume: false,
             tool: BTreeSet::new(),
             blocker: BTreeSet::new(),
             sample: BTreeSet::new(),

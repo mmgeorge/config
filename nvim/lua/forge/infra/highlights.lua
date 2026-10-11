@@ -95,6 +95,7 @@ function M.setup()
   vim.api.nvim_set_hl(0, "ForgePickerText", { fg = header_fg })
   vim.api.nvim_set_hl(0, "ForgePickerQuestion", { fg = palette.white })
   vim.api.nvim_set_hl(0, "ForgePickerAnswer", { fg = palette.light_blue })
+  vim.api.nvim_set_hl(0, "ForgePermissionTarget", { underline = true, sp = palette.light_blue })
   vim.api.nvim_set_hl(0, "ForgeHiddenCursor", {
     fg = palette.black,
     bg = palette.black,

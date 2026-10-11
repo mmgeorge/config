@@ -1,4 +1,3 @@
-use super::command::normalize_command;
 use super::document::{
     PermissionDecision, PermissionDocument, default_permission_document, parse_permission_document,
     serialize_permission_document, set_permission_rule,
@@ -66,12 +65,11 @@ impl PermissionStore {
 
     pub fn set_rule_list(
         &mut self,
-        rule_list: &[(String, String)],
-        decision: PermissionDecision,
+        rule_list: &[(String, String, PermissionDecision)],
     ) -> Result<()> {
         let mut document: PermissionDocument = self.compiled.document.clone();
-        for (category, pattern) in rule_list {
-            set_permission_rule(&mut document, category, pattern, decision)?;
+        for (category, pattern, decision) in rule_list {
+            set_permission_rule(&mut document, category, pattern, *decision)?;
         }
         self.save(&serialize_permission_document(&document)?)
     }
@@ -93,8 +91,8 @@ impl PermissionStore {
         path == protected
     }
 
-    pub fn protects_command(&self, command: &str) -> bool {
-        normalize_command(command)
+    pub fn protects_command_in(&self, command: &str, shell: super::shell::CommandShell) -> bool {
+        super::command::normalize_command_in(command, shell)
             .invocation_list
             .iter()
             .any(|invocation| {
@@ -156,10 +154,7 @@ mod test {
         assert!(store.save("not json").is_err());
         assert_eq!(fs::read_to_string(&path).unwrap(), original);
         store
-            .set_rule_list(
-                &[("bash".into(), "git commit".into())],
-                PermissionDecision::Deny,
-            )
+            .set_rule_list(&[("bash".into(), "git commit".into(), PermissionDecision::Deny)])
             .unwrap();
         assert_eq!(
             store.compiled().document.permission["bash"]["git commit"],

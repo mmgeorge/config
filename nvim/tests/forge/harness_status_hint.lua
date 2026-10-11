@@ -8,6 +8,7 @@ local command_set = commands.new()
 commands.register(command_set, "open_artifact", function() end)
 commands.register(command_set, "cancel", function() end)
 commands.register(command_set, "background", function() end)
+commands.register(command_set, "reopen_question", function() end)
 local original = vim.deepcopy(config.options.keymaps.harness.open_artifact)
 local original_cancel = vim.deepcopy(config.options.keymaps.harness.cancel)
 local namespace = vim.api.nvim_create_namespace("ForgeHarnessStatusHint")
@@ -99,7 +100,7 @@ vim.wait(150, function() return false end, 25)
 assert(vim.deep_equal(stopped, vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })),
   "stopped host retained its animation timer")
 transcript.status_notice = nil
-transcript.status_notice = { text = "Waiting for your approval", animated = false, waiting = true }
+transcript.status_notice = require("forge.views.harness.health").notice({ approval = { { id = "pending" } } })
 for _ = 1, 3 do
   hint.render(transcript, command_set, 120)
   local waiting = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
@@ -107,6 +108,14 @@ for _ = 1, 3 do
   assert(waiting[1][4].virt_text[1][1]:find("Waiting for your approval", 1, true))
   assert(waiting[1][4].virt_text[1][2] == "ForgeStatusHint", "approval wait used failure styling")
 end
+local permission_key = config.options.keymaps.harness.reopen_question
+for _, key in ipairs({ "oe", "<F8>" }) do
+  config.options.keymaps.harness.reopen_question = key
+  assert(displayed():find(key .. " review permission", 1, true), "permission wait ignored configured binding")
+end
+config.options.keymaps.harness.reopen_question = false
+assert(not displayed():find("review permission", 1, true), "disabled permission binding retained its hint")
+config.options.keymaps.harness.reopen_question = permission_key
 transcript.status_notice = { text = "Connection lost", animated = false, failed = true }
 hint.render(transcript, command_set, 120)
 local failed = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
@@ -264,7 +273,7 @@ hint.render(details, command_set, 100)
 local spinner_mark = vim.api.nvim_buf_get_extmark_by_id(details.buffer, namespace, 1, { details = true })
 assert(spinner_mark[1] == 1, "details moved the spinner off the status heading")
 local terminal_mark = vim.api.nvim_buf_get_extmark_by_id(details.buffer, namespace, 3, { details = true })
-assert(terminal_mark[1] == 5 and terminal_mark[3].virt_lines_above,
+assert(terminal_mark[1] == 3 and terminal_mark[3].virt_lines_above,
   "terminal footer must remain outside the collapsed implementation section")
 details.background_terminals.terminal = {}
 hint.render(details, command_set, 100)

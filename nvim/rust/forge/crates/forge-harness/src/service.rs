@@ -1377,14 +1377,15 @@ async fn route_control_request(
                 .get("approval_id")
                 .and_then(Value::as_str)
                 .context("approval.resolve requires approval_id")?;
-            let choice_id = request
+            let answer_list = request
                 .params
-                .get("choice_id")
-                .and_then(Value::as_str)
-                .context("approval.resolve requires choice_id")?;
+                .get("answer_list")
+                .context("approval.resolve requires answer_list")?;
+            let answer_list: Vec<crate::backend::approval::ApprovalAnswer> =
+                serde_json::from_value(answer_list.clone())?;
             let approval = controller
                 .permission
-                .resolve(approval_id, choice_id, None)
+                .resolve(approval_id, &answer_list, None)
                 .await?;
             Some(Response::success(
                 request.id,

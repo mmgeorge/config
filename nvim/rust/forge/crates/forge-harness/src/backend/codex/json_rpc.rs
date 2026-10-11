@@ -1867,6 +1867,18 @@ fn tool_title(value: &Value) -> Option<String> {
     match value {
         Value::String(title) => compact_tool_title(title),
         Value::Array(part_list) => {
+            let arguments = part_list.iter().map(Value::as_str).collect::<Option<Vec<_>>>()?;
+            let interpreter = crate::permissions::shell::CommandShell::from_executable(arguments.first()?);
+            if interpreter != crate::permissions::shell::CommandShell::Unknown {
+                if let Some(marker) = arguments.iter().position(|argument| matches!(argument.to_ascii_lowercase().as_str(),
+                    "-command" | "--commands" | "-c" | "-lc" | "-ic" | "-lic"))
+                    && let Some(script) = arguments.get(marker + 1)
+                    && marker + 2 == arguments.len()
+                {
+                    let display = crate::permissions::command::display_command(script, interpreter);
+                    return compact_tool_title(&display.source);
+                }
+            }
             let title = part_list
                 .iter()
                 .filter_map(Value::as_str)
@@ -3320,6 +3332,15 @@ mod test {
         .await;
         assert!(output.event.is_empty());
         assert!(event_stream.try_recv().is_err());
+    }
+
+    #[test]
+    fn argv_command_titles_hide_launchers_without_losing_script_boundaries() {
+        for (executable, marker) in [("C:\\Program Files\\PowerShell\\7\\pwsh.exe","-Command"),
+            ("/bin/bash","-lc"),("/bin/zsh","-ic"),("/opt/homebrew/bin/nu","--commands")] {
+            assert_eq!(tool_title(&json!([executable,marker,"probe 'a path'; probe λ"])).as_deref(),
+                Some("probe 'a path'; probe λ"));
+        }
     }
 
     #[test]

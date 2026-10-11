@@ -1,18 +1,22 @@
 use crate::backend::{BackendEvent, BackendEventSink};
 use crate::permissions::command::{
-    broad_command_pattern, exact_command_pattern, normalize_command,
+    broad_command_pattern, exact_command_pattern, normalize_command_in,
 };
 use crate::permissions::document::{
     CATEGORY_BASH, CATEGORY_EDIT, CATEGORY_ELEVATE, CATEGORY_MCP, CATEGORY_READ, CATEGORY_TOOL,
     CATEGORY_WEBFETCH, PermissionDecision,
 };
-use crate::permissions::matcher::{PermissionRequest, PermissionTarget};
+use crate::permissions::matcher::{
+    PendingCommand, PermissionEvaluation, PermissionRequest, PermissionTarget,
+};
+use crate::permissions::shell::{self, CommandHighlight, CommandShell};
 use crate::permissions::store::PermissionStore;
 use crate::session::PermissionMode;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::collections::BTreeMap;
+use std::ops::Range;
 use std::path::Path;
 use std::sync::{Arc, Mutex, RwLock};
 use tokio::sync::oneshot;
@@ -45,10 +49,39 @@ pub struct ApprovalRequestView {
     pub exchange_id: Option<String>,
     pub turn_id: Option<String>,
     pub provider: String,
+    pub reason: Option<String>,
+    pub item_list: Vec<ApprovalItem>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// One unapproved target with choices scoped to that target.
+pub struct ApprovalItem {
+    pub id: String,
     pub title: String,
     pub detail: String,
-    pub reason: Option<String>,
+    /// Full source commands containing this target, with all matching executable occurrences.
+    pub command_list: Vec<ApprovalCommand>,
     pub choice_list: Vec<ApprovalChoice>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// Preserves command context and source coordinates for formatting and scoped approval markers.
+pub struct ApprovalCommand {
+    /// Retains the complete script payload with shell launchers removed for presentation.
+    pub source: String,
+    /// Selects the language of the retained source.
+    pub shell: CommandShell,
+    /// Locates only executable occurrences covered by this item's choices.
+    pub focus_range_list: Vec<Range<usize>>,
+    /// Colors the original source independently of its approval markers.
+    pub highlight_list: Vec<CommandHighlight>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+/// An explicit choice for one item in a pending approval request.
+pub struct ApprovalAnswer {
+    pub item_id: String,
+    pub choice_id: String,
 }
 
 struct PendingApproval {
@@ -103,7 +136,7 @@ impl PermissionCoordinator {
             PermissionDecision::Ask => {}
         }
         let id = request.id.clone();
-        let view = approval_view(&request);
+        let view = approval_view(&request, &evaluation);
         let (sender, receiver) = oneshot::channel();
         self.pending_map
             .lock()
@@ -173,10 +206,10 @@ impl PermissionCoordinator {
     pub async fn resolve(
         &self,
         approval_id: &str,
-        choice_id: &str,
+        answer_list: &[ApprovalAnswer],
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalRequestView> {
-        let (pending, choice) = {
+        let (pending, resolution, rule_list) = {
             let mut pending_map = self
                 .pending_map
                 .lock()
@@ -184,13 +217,72 @@ impl PermissionCoordinator {
             let pending = pending_map
                 .get(approval_id)
                 .with_context(|| format!("approval request is no longer pending: {approval_id}"))?;
-            let choice = pending
-                .view
-                .choice_list
-                .iter()
-                .find(|choice| choice.id == choice_id)
-                .cloned()
-                .with_context(|| format!("unknown approval choice: {choice_id}"))?;
+            anyhow::ensure!(
+                answer_list.len() == pending.view.item_list.len(),
+                "every approval item requires one answer"
+            );
+            let mut answer_map = BTreeMap::new();
+            for answer in answer_list {
+                anyhow::ensure!(
+                    answer_map
+                        .insert(&answer.item_id, &answer.choice_id)
+                        .is_none(),
+                    "duplicate approval item: {}",
+                    answer.item_id
+                );
+            }
+            let mut resolution = ApprovalResolution::AllowOnce;
+            let mut rule_map = BTreeMap::new();
+            for item in &pending.view.item_list {
+                let choice_id = answer_map
+                    .get(&item.id)
+                    .with_context(|| format!("missing approval item: {}", item.id))?;
+                let choice = item
+                    .choice_list
+                    .iter()
+                    .find(|choice| &choice.id == *choice_id)
+                    .with_context(|| format!("unknown approval choice: {choice_id}"))?;
+                match choice.resolution {
+                    ApprovalResolution::Cancel => resolution = ApprovalResolution::Cancel,
+                    ApprovalResolution::DenyOnce
+                    | ApprovalResolution::DenyExact
+                    | ApprovalResolution::DenyBroad
+                        if resolution != ApprovalResolution::Cancel =>
+                    {
+                        resolution = ApprovalResolution::DenyOnce
+                    }
+                    _ => {}
+                }
+                let decision = match choice.resolution {
+                    ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad => {
+                        Some(PermissionDecision::Allow)
+                    }
+                    ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad => {
+                        Some(PermissionDecision::Deny)
+                    }
+                    _ => None,
+                };
+                if let Some(decision) = decision {
+                    for rule in &choice.rule_list {
+                        if let Some(previous) = rule_map.insert(rule.clone(), decision) {
+                            anyhow::ensure!(
+                                previous == decision,
+                                "conflicting approval decisions for {} {}",
+                                rule.0,
+                                rule.1
+                            );
+                        }
+                    }
+                }
+            }
+            let rule_list = if resolution == ApprovalResolution::Cancel {
+                Vec::new()
+            } else {
+                rule_map
+                    .into_iter()
+                    .map(|((category, pattern), decision)| (category, pattern, decision))
+                    .collect()
+            };
             anyhow::ensure!(
                 !pending.response.is_closed(),
                 "provider no longer waits for approval {approval_id}"
@@ -198,30 +290,21 @@ impl PermissionCoordinator {
             let pending = pending_map
                 .remove(approval_id)
                 .expect("validated approval must remain pending while locked");
-            (pending, choice)
+            (pending, resolution, rule_list)
         };
-        let persistent_decision = match choice.resolution {
-            ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad => {
-                Some(PermissionDecision::Allow)
-            }
-            ApprovalResolution::DenyExact | ApprovalResolution::DenyBroad => {
-                Some(PermissionDecision::Deny)
-            }
-            _ => None,
-        };
-        let persisted = match persistent_decision {
-            Some(decision) => self
-                .store
+        let persisted = if !rule_list.is_empty() {
+            self.store
                 .write()
                 .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
-                .set_rule_list(&choice.rule_list, decision),
-            None => Ok(()),
+                .set_rule_list(&rule_list)
+        } else {
+            Ok(())
         };
         if let Err(error) = persisted {
             Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
             return Err(error);
         }
-        if pending.response.send(choice.resolution).is_err() {
+        if pending.response.send(resolution).is_err() {
             Self::emit_lifecycle(event_sink, "approval_cancelled", &pending.view).await?;
             anyhow::bail!("provider no longer waits for approval {approval_id}");
         }
@@ -264,7 +347,7 @@ impl PermissionCoordinator {
         if let Some(event_sink) = event_sink {
             let _ = event_sink
                 .send_wait(BackendEvent {
-            received_at_ms: None,
+                    received_at_ms: None,
                     address: None,
                     turn_boundary: None,
                     kind: kind.into(),
@@ -280,55 +363,56 @@ impl PermissionCoordinator {
     }
 }
 
-fn target_rule_list(request: &PermissionRequest, broad: bool) -> Vec<(String, String)> {
+fn target_rule_list(target: &PermissionTarget, broad: bool) -> Vec<(String, String)> {
     let mut rule_list = Vec::new();
-    for target in &request.target_list {
-        match target {
-            PermissionTarget::Command { command } => {
-                let normalization = normalize_command(command);
-                for invocation in &normalization.invocation_list {
-                    let pattern = if broad {
-                        broad_command_pattern(invocation)
-                    } else {
-                        exact_command_pattern(invocation)
-                    };
-                    if let Some(pattern) = pattern {
-                        rule_list.push((CATEGORY_BASH.into(), pattern));
-                    }
+    match target {
+        PermissionTarget::Command { command, shell } => {
+            let normalization = normalize_command_in(command, shell.unwrap_or_default());
+            if normalization.ambiguous {
+                return rule_list;
+            }
+            for invocation in &normalization.invocation_list {
+                let pattern = if broad {
+                    broad_command_pattern(invocation)
+                } else {
+                    exact_command_pattern(invocation)
+                };
+                if let Some(pattern) = pattern {
+                    rule_list.push((CATEGORY_BASH.into(), pattern));
                 }
             }
-            PermissionTarget::Read { path } => rule_list.push((
-                CATEGORY_READ.into(),
-                if broad { ".".into() } else { path.clone() },
-            )),
-            PermissionTarget::Write { path } => rule_list.push((
-                CATEGORY_EDIT.into(),
-                if broad { ".".into() } else { path.clone() },
-            )),
-            PermissionTarget::Network { target } => rule_list.push((
-                CATEGORY_WEBFETCH.into(),
-                if broad { "*".into() } else { target.clone() },
-            )),
-            PermissionTarget::Mcp { target } => rule_list.push((
-                CATEGORY_MCP.into(),
-                if broad {
-                    target
-                        .split('/')
-                        .next()
-                        .map_or_else(|| "*".into(), |server| format!("{server}/*"))
-                } else {
-                    target.clone()
-                },
-            )),
-            PermissionTarget::Elevate { target } => rule_list.push((
-                CATEGORY_ELEVATE.into(),
-                if broad { "*".into() } else { target.clone() },
-            )),
-            PermissionTarget::Tool { target } => rule_list.push((
-                CATEGORY_TOOL.into(),
-                if broad { "*".into() } else { target.clone() },
-            )),
         }
+        PermissionTarget::Read { path } => rule_list.push((
+            CATEGORY_READ.into(),
+            if broad { ".".into() } else { path.clone() },
+        )),
+        PermissionTarget::Write { path } => rule_list.push((
+            CATEGORY_EDIT.into(),
+            if broad { ".".into() } else { path.clone() },
+        )),
+        PermissionTarget::Network { target } => rule_list.push((
+            CATEGORY_WEBFETCH.into(),
+            if broad { "*".into() } else { target.clone() },
+        )),
+        PermissionTarget::Mcp { target } => rule_list.push((
+            CATEGORY_MCP.into(),
+            if broad {
+                target
+                    .split('/')
+                    .next()
+                    .map_or_else(|| "*".into(), |server| format!("{server}/*"))
+            } else {
+                target.clone()
+            },
+        )),
+        PermissionTarget::Elevate { target } => rule_list.push((
+            CATEGORY_ELEVATE.into(),
+            if broad { "*".into() } else { target.clone() },
+        )),
+        PermissionTarget::Tool { target } => rule_list.push((
+            CATEGORY_TOOL.into(),
+            if broad { "*".into() } else { target.clone() },
+        )),
     }
     rule_list.sort();
     rule_list.dedup();
@@ -350,29 +434,50 @@ fn display_rule_list(rule_list: &[(String, String)]) -> String {
         .join(", ")
 }
 
-fn approval_view(request: &PermissionRequest) -> ApprovalRequestView {
-    let (title, detail) = request.target_list.first().map_or_else(
-        || ("Provider permission".into(), String::new()),
-        |target| match target {
-            PermissionTarget::Command { command } => ("Run command".into(), command.clone()),
-            PermissionTarget::Read { path } => ("Read path".into(), path.clone()),
-            PermissionTarget::Write { path } => ("Write path".into(), path.clone()),
-            PermissionTarget::Network { target } => ("Access network".into(), target.clone()),
-            PermissionTarget::Mcp { target } => ("Call MCP tool".into(), target.clone()),
-            PermissionTarget::Elevate { target } => ("Elevate process".into(), target.clone()),
-            PermissionTarget::Tool { target } => ("Call provider tool".into(), target.clone()),
-        },
-    );
-    let exact_rule_list = target_rule_list(request, false);
-    let broad_rule_list = target_rule_list(request, true);
+fn approval_view(
+    request: &PermissionRequest,
+    evaluation: &PermissionEvaluation,
+) -> ApprovalRequestView {
     ApprovalRequestView {
         id: request.id.clone(),
         exchange_id: None,
         turn_id: None,
         provider: request.provider.clone(),
+        reason: request.reason.clone(),
+        item_list: evaluation
+            .pending_target_list
+            .iter()
+            .enumerate()
+            .map(|(index, target)| {
+                let mut item = approval_item(target, index);
+                item.command_list = command_context(&evaluation.pending_command_list, target);
+                item
+            })
+            .collect(),
+    }
+}
+
+fn approval_item(target: &PermissionTarget, index: usize) -> ApprovalItem {
+    let (title, detail) = match target {
+        PermissionTarget::Command { command, shell } => (
+            "Run command".into(),
+            crate::permissions::command::display_command(command, shell.unwrap_or_default()).source,
+        ),
+        PermissionTarget::Read { path } => ("Read path".into(), path.clone()),
+        PermissionTarget::Write { path } => ("Write path".into(), path.clone()),
+        PermissionTarget::Network { target } => ("Access network".into(), target.clone()),
+        PermissionTarget::Mcp { target } => ("Call MCP tool".into(), target.clone()),
+        PermissionTarget::Elevate { target } => ("Elevate process".into(), target.clone()),
+        PermissionTarget::Tool { target } => ("Call provider tool".into(), target.clone()),
+    };
+    let exact_rule_list = target_rule_list(target, false);
+    let broad_rule_list = target_rule_list(target, true);
+    let persistent = !exact_rule_list.is_empty();
+    let mut item = ApprovalItem {
+        id: index.to_string(),
         title,
         detail,
-        reason: request.reason.clone(),
+        command_list: Vec::new(),
         choice_list: vec![
             ApprovalChoice {
                 id: "allow_once".into(),
@@ -418,12 +523,61 @@ fn approval_view(request: &PermissionRequest) -> ApprovalRequestView {
             },
             ApprovalChoice {
                 id: "cancel".into(),
-                label: "Cancel request".into(),
+                label: "Reject all".into(),
                 resolution: ApprovalResolution::Cancel,
                 rule_list: Vec::new(),
             },
         ],
+    };
+    if !persistent {
+        item.choice_list.retain(|choice| {
+            matches!(
+                choice.resolution,
+                ApprovalResolution::AllowOnce
+                    | ApprovalResolution::DenyOnce
+                    | ApprovalResolution::Cancel
+            )
+        });
     }
+    item
+}
+
+fn command_context(
+    pending_list: &[PendingCommand],
+    target: &PermissionTarget,
+) -> Vec<ApprovalCommand> {
+    let mut result: Vec<ApprovalCommand> = Vec::new();
+    for pending in pending_list
+        .iter()
+        .filter(|pending| pending.target == *target)
+    {
+        let display = crate::permissions::command::display_command(&pending.source, pending.shell);
+        let Some(focus) = display.project_range(&pending.source_range) else {
+            continue;
+        };
+        if let Some(context) = result
+            .iter_mut()
+            .find(|context| context.source == display.source && context.shell == display.shell)
+        {
+            context.focus_range_list.push(focus);
+        } else {
+            result.push(ApprovalCommand {
+                highlight_list: shell::highlights(&display.source, display.shell),
+                source: display.source,
+                shell: display.shell,
+                focus_range_list: vec![focus],
+            });
+        }
+    }
+    result
+}
+
+fn provider_shell(params: &Value) -> Option<CommandShell> {
+    params
+        .get("shell")
+        .or_else(|| params.get("shellPath"))
+        .and_then(Value::as_str)
+        .map(CommandShell::from_executable)
 }
 
 pub fn permission_from_provider(
@@ -453,24 +607,34 @@ pub fn permission_from_provider(
             target: format!("{server}/{tool}"),
         }]
     } else if method.contains("commandExecution") || method == "terminal/create" {
+        let mut shell = provider_shell(params);
         let command = params
             .get("command")
             .and_then(Value::as_str)
             .map(str::to_owned)
             .or_else(|| {
-                params
+                let arguments = params
                     .get("args")
-                    .and_then(Value::as_array)
-                    .map(|argument_list| {
-                        argument_list
-                            .iter()
-                            .filter_map(Value::as_str)
-                            .collect::<Vec<_>>()
-                            .join(" ")
-                    })
+                    .or_else(|| params.get("command"))?
+                    .as_array()?;
+                let arguments = arguments
+                    .iter()
+                    .map(Value::as_str)
+                    .collect::<Option<Vec<_>>>()?
+                    .into_iter()
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>();
+                if let Some((marker, interpreter)) =
+                    crate::permissions::command::shell_script_argument(&arguments)
+                {
+                    shell = Some(interpreter);
+                    Some(arguments[marker + 1].clone())
+                } else {
+                    Some(arguments.join(" "))
+                }
             })
             .unwrap_or_else(|| encoded.clone());
-        vec![PermissionTarget::Command { command }]
+        vec![PermissionTarget::Command { command, shell }]
     } else if method.contains("fileChange") || method == "fs/write_text_file" {
         let path = provider_path(params).unwrap_or_else(|| workspace.into());
         vec![PermissionTarget::Write { path }]
@@ -513,6 +677,7 @@ pub fn permission_from_copilot(
                 .and_then(Value::as_str)
                 .unwrap_or(&encoded)
                 .to_owned(),
+            shell: provider_shell(&params),
         }],
         "write" => vec![PermissionTarget::Write {
             path: provider_path(&params).unwrap_or_else(|| workspace.into()),
@@ -531,17 +696,23 @@ pub fn permission_from_copilot(
         "mcp" => vec![PermissionTarget::Mcp {
             target: {
                 let tool = params
-                .get("toolName")
-                .or_else(|| params.get("tool_name"))
-                .or_else(|| params.get("name"))
-                .and_then(Value::as_str)
-                .unwrap_or("*");
-                params.get("serverName").and_then(Value::as_str)
+                    .get("toolName")
+                    .or_else(|| params.get("tool_name"))
+                    .or_else(|| params.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("*");
+                params
+                    .get("serverName")
+                    .and_then(Value::as_str)
                     .map_or_else(|| tool.to_owned(), |server| format!("{server}/{tool}"))
             },
         }],
         "custom-tool" | "hook" => vec![PermissionTarget::Tool {
-            target: params.get("toolName").and_then(Value::as_str).unwrap_or(kind).to_owned(),
+            target: params
+                .get("toolName")
+                .and_then(Value::as_str)
+                .unwrap_or(kind)
+                .to_owned(),
         }],
         _ => normalize_permission_payload(&params, &encoded),
     };
@@ -591,6 +762,7 @@ fn normalize_permission_payload(params: &Value, encoded: &str) -> Vec<Permission
                     .get("rawInput")
                     .map(Value::to_string)
                     .unwrap_or_else(|| title.into()),
+                shell: provider_shell(params),
             }],
             "fetch" => vec![PermissionTarget::Network {
                 target: title.into(),
@@ -668,7 +840,9 @@ pub fn codex_response(message: &Value, resolution: ApprovalResolution) -> Value 
 pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) -> bool {
     request.target_list.iter().any(|target| match target {
         PermissionTarget::Write { path } => store.protects(Path::new(path)),
-        PermissionTarget::Command { command } => store.protects_command(command),
+        PermissionTarget::Command { command, shell } => {
+            store.protects_command_in(command, shell.unwrap_or_default())
+        }
         _ => false,
     })
 }
@@ -678,26 +852,61 @@ mod test {
     use super::*;
     use crate::permissions::store::PermissionStore;
 
+    fn evaluate_review(request: &PermissionRequest) -> PermissionEvaluation {
+        let document = crate::permissions::document::parse_permission_document(
+            r#"{"permission":{"bash":{"*":"allow","probe *":"ask","git *":"ask","whoami *":"ask"}}}"#,
+        )
+        .unwrap();
+        crate::permissions::matcher::CompiledPermissionDocument::compile(document, ".")
+            .evaluate(PermissionMode::Write, request)
+    }
+
     #[test]
     fn unwraps_copilot_permission_notifications_before_matching_policy() {
         let request = permission_from_copilot(
-            "shell-one".into(), "unknown",
+            "shell-one".into(),
+            "unknown",
             json!({"permissionRequest": {
                 "kind":"shell", "fullCommandText":"Write-Output audit", "intention":"Run audit"
-            }, "requestId":"shell-one"}), "D:/repo",
+            }, "requestId":"shell-one"}),
+            "D:/repo",
         );
-        assert_eq!(request.target_list, vec![PermissionTarget::Command {
-            command: "Write-Output audit".into(),
-        }]);
+        assert_eq!(
+            request.target_list,
+            vec![PermissionTarget::Command {
+                command: "Write-Output audit".into(),
+                shell: None
+            }]
+        );
         assert_eq!(request.reason.as_deref(), Some("Run audit"));
-        let mcp = permission_from_copilot("mcp".into(), "unknown", json!({
-            "permissionRequest":{"kind":"mcp", "serverName":"github", "toolName":"search"}
-        }), "D:/repo");
-        assert_eq!(mcp.target_list, vec![PermissionTarget::Mcp { target: "github/search".into() }]);
-        let custom = permission_from_copilot("custom".into(), "unknown", json!({
-            "permissionRequest":{"kind":"custom-tool", "toolName":"harness_question_ask", "toolDescription":"Ask a question"}
-        }), "D:/repo");
-        assert_eq!(custom.target_list, vec![PermissionTarget::Tool { target: "harness_question_ask".into() }]);
+        let mcp = permission_from_copilot(
+            "mcp".into(),
+            "unknown",
+            json!({
+                "permissionRequest":{"kind":"mcp", "serverName":"github", "toolName":"search"}
+            }),
+            "D:/repo",
+        );
+        assert_eq!(
+            mcp.target_list,
+            vec![PermissionTarget::Mcp {
+                target: "github/search".into()
+            }]
+        );
+        let custom = permission_from_copilot(
+            "custom".into(),
+            "unknown",
+            json!({
+                "permissionRequest":{"kind":"custom-tool", "toolName":"harness_question_ask", "toolDescription":"Ask a question"}
+            }),
+            "D:/repo",
+        );
+        assert_eq!(
+            custom.target_list,
+            vec![PermissionTarget::Tool {
+                target: "harness_question_ask".into()
+            }]
+        );
         assert_eq!(custom.reason.as_deref(), Some("Ask a question"));
     }
 
@@ -740,19 +949,273 @@ mod test {
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: "git status --short".into(),
+                shell: None,
             }],
         };
-        let view = approval_view(&request);
+        let view = approval_view(&request, &evaluate_review(&request));
         assert!(
-            view.choice_list[1]
+            view.item_list[0].choice_list[1]
                 .rule_list
                 .contains(&("bash".into(), "git status --short".into()))
         );
         assert!(
-            view.choice_list[2]
+            view.item_list[0].choice_list[2]
                 .rule_list
                 .contains(&("bash".into(), "git *".into()))
         );
+    }
+
+    #[tokio::test]
+    async fn reviews_only_unapproved_commands_and_persists_each_selected_scope() {
+        let directory = tempfile::tempdir().unwrap();
+        let mut permission_store =
+            PermissionStore::load(directory.path().join("permissions.json"), "D:/repo").unwrap();
+        permission_store
+            .set_rule_list(&[
+                (
+                    "bash".into(),
+                    "Get-Location".into(),
+                    PermissionDecision::Allow,
+                ),
+                (
+                    "bash".into(),
+                    "Get-ChildItem *".into(),
+                    PermissionDecision::Allow,
+                ),
+            ])
+            .unwrap();
+        let original = permission_store.open().1;
+        let store = Arc::new(RwLock::new(permission_store));
+        let coordinator = Arc::new(PermissionCoordinator::new(Arc::clone(&store)));
+        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let waiting_coordinator = Arc::clone(&coordinator);
+        let waiting = tokio::spawn(async move {
+            waiting_coordinator.authorize(PermissionMode::Read, PermissionRequest {
+                id: "versions".into(), provider: "test".into(), reason: None,
+                target_list: vec![PermissionTarget::Command {
+                    command: r#""C:/Program Files/PowerShell/7/pwsh.exe" -Command 'Get-Location; Get-ChildItem -Force; rustc --version; cargo --version; rustup show active-toolchain; rustc --version'"#.into(), shell: None
+                }],
+            }, None, Some(&event_sink)).await.unwrap()
+        });
+        let event = event_stream.recv().await.unwrap().unwrap();
+        let view: ApprovalRequestView = serde_json::from_value(event.data).unwrap();
+        assert_eq!(
+            view.item_list
+                .iter()
+                .map(|item| item.detail.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "rustc --version",
+                "cargo --version",
+                "rustup show active-toolchain"
+            ]
+        );
+        assert_eq!(
+            view.item_list[0].choice_list[1].label,
+            "Always allow exact: shell rustc --version"
+        );
+        assert_eq!(
+            view.item_list[0].choice_list[2].rule_list,
+            vec![("bash".into(), "rustc *".into())]
+        );
+        assert!(!waiting.is_finished());
+        let answer_list = vec![
+            ApprovalAnswer {
+                item_id: "0".into(),
+                choice_id: "allow_exact".into(),
+            },
+            ApprovalAnswer {
+                item_id: "1".into(),
+                choice_id: "deny_exact".into(),
+            },
+            ApprovalAnswer {
+                item_id: "2".into(),
+                choice_id: "allow_once".into(),
+            },
+        ];
+        assert!(
+            coordinator
+                .resolve("versions", &answer_list[..1], None)
+                .await
+                .is_err()
+        );
+        let mut duplicate = answer_list.clone();
+        duplicate[2].item_id = "1".into();
+        assert!(
+            coordinator
+                .resolve("versions", &duplicate, None)
+                .await
+                .is_err()
+        );
+        let mut unknown = answer_list.clone();
+        unknown[1].choice_id = "allow_everything".into();
+        assert!(
+            coordinator
+                .resolve("versions", &unknown, None)
+                .await
+                .is_err()
+        );
+        assert_eq!(store.read().unwrap().open().1, original);
+        assert_eq!(coordinator.pending_list().unwrap().len(), 1);
+        coordinator
+            .resolve("versions", &answer_list, None)
+            .await
+            .unwrap();
+        assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyOnce);
+        let rules = store.read().unwrap().compiled();
+        let command_rules = &rules.document.permission["bash"];
+        assert_eq!(command_rules["rustc --version"], PermissionDecision::Allow);
+        assert_eq!(command_rules["cargo --version"], PermissionDecision::Deny);
+        assert_eq!(command_rules["Get-Location"], PermissionDecision::Allow);
+        assert_eq!(command_rules["Get-ChildItem *"], PermissionDecision::Allow);
+        assert!(!command_rules.contains_key("rustup show active-toolchain"));
+        assert!(!command_rules.contains_key("rustc *"));
+    }
+
+    #[test]
+    fn ambiguous_commands_never_offer_partial_persistent_rules() {
+        let item = approval_item(
+            &PermissionTarget::Command {
+                command: "cargo --version; & $secret".into(),
+                shell: None,
+            },
+            0,
+        );
+        assert_eq!(item.detail, "cargo --version; & $secret");
+        assert_eq!(
+            item.choice_list
+                .iter()
+                .map(|choice| choice.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["allow_once", "deny_once", "cancel"]
+        );
+    }
+
+    #[test]
+    fn permission_context_shows_only_the_script_and_marks_the_loop_command() {
+        let request = PermissionRequest { id:"loop".into(),provider:"test".into(),reason:None,
+            target_list:vec![PermissionTarget::Command {
+                command:r#""C:\Program Files\PowerShell\7\pwsh.exe" -Command 'foreach ($iteration in 1..1) { whoami.exe /groups }'"#.into(),
+                shell:Some(CommandShell::PowerShell),
+            }] };
+        let view = approval_view(&request, &evaluate_review(&request));
+        assert_eq!(view.item_list.len(), 1);
+        let item = &view.item_list[0];
+        assert_eq!(item.detail, "whoami.exe /groups");
+        let command = &item.command_list[0];
+        assert_eq!(
+            command.source,
+            "foreach ($iteration in 1..1) { whoami.exe /groups }"
+        );
+        assert_eq!(
+            &command.source[command.focus_range_list[0].clone()],
+            "whoami.exe /groups"
+        );
+        assert!(
+            item.choice_list
+                .iter()
+                .all(|choice| !choice.label.contains("1..1"))
+        );
+    }
+
+    #[test]
+    fn retains_shell_identity_and_argv_script_boundaries() {
+        for (executable, script, shell) in [
+            (
+                "pwsh",
+                "1 | ForEach-Object { probe $_ }",
+                CommandShell::PowerShell,
+            ),
+            (
+                "/bin/bash",
+                "for x in one; do probe $x; done",
+                CommandShell::Bash,
+            ),
+            ("/bin/zsh", "repeat 2 probe x", CommandShell::Zsh),
+            ("nu", "[1] | each {|x| probe $x }", CommandShell::Nushell),
+        ] {
+            let request = permission_from_provider(
+                "item/commandExecution/requestApproval",
+                &json!({
+                    "params": { "args": [executable, "-c", script] }
+                }),
+                ".",
+            );
+            assert_eq!(
+                request.target_list,
+                vec![PermissionTarget::Command {
+                    command: script.into(),
+                    shell: Some(shell)
+                }]
+            );
+            assert!(!normalize_command_in(script, shell).ambiguous);
+            let request = permission_from_copilot(
+                "id".into(),
+                "shell",
+                json!({
+                    "fullCommandText": script, "shell": executable
+                }),
+                ".",
+            );
+            assert_eq!(
+                request.target_list,
+                vec![PermissionTarget::Command {
+                    command: script.into(),
+                    shell: Some(shell)
+                }]
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_does_not_persist_staged_choices() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = Arc::new(RwLock::new(
+            PermissionStore::load(directory.path().join("permissions.json"), "D:/repo").unwrap(),
+        ));
+        let original = store.read().unwrap().open().1;
+        let coordinator = Arc::new(PermissionCoordinator::new(Arc::clone(&store)));
+        let (event_sink, mut event_stream) = crate::backend::events::channel();
+        let waiting_coordinator = Arc::clone(&coordinator);
+        let waiting = tokio::spawn(async move {
+            waiting_coordinator
+                .authorize(
+                    PermissionMode::Read,
+                    PermissionRequest {
+                        id: "cancel-versions".into(),
+                        provider: "test".into(),
+                        reason: None,
+                        target_list: vec![PermissionTarget::Command {
+                            command: "rustc --version; cargo --version".into(),
+                            shell: None,
+                        }],
+                    },
+                    None,
+                    Some(&event_sink),
+                )
+                .await
+                .unwrap()
+        });
+        event_stream.recv().await.unwrap().unwrap();
+        coordinator
+            .resolve(
+                "cancel-versions",
+                &[
+                    ApprovalAnswer {
+                        item_id: "0".into(),
+                        choice_id: "allow_exact".into(),
+                    },
+                    ApprovalAnswer {
+                        item_id: "1".into(),
+                        choice_id: "cancel".into(),
+                    },
+                ],
+                None,
+            )
+            .await
+            .unwrap();
+        assert_eq!(waiting.await.unwrap(), ApprovalResolution::Cancel);
+        assert_eq!(store.read().unwrap().open().1, original);
     }
 
     #[tokio::test]
@@ -768,6 +1231,7 @@ mod test {
             reason: Some("inspect repository".into()),
             target_list: vec![PermissionTarget::Command {
                 command: "rg TODO src".into(),
+                shell: None,
             }],
         };
         let (event_sink, mut event_stream) = crate::backend::events::channel();
@@ -799,10 +1263,17 @@ mod test {
                 .is_err()
         );
         coordinator
-            .resolve("approval-one", "allow_broad", Some(&event_sink))
+            .resolve(
+                "approval-one",
+                &[ApprovalAnswer {
+                    item_id: "0".into(),
+                    choice_id: "allow_broad".into(),
+                }],
+                Some(&event_sink),
+            )
             .await
             .unwrap();
-        assert_eq!(waiting.await.unwrap(), ApprovalResolution::AllowBroad);
+        assert_eq!(waiting.await.unwrap(), ApprovalResolution::AllowOnce);
         let resolved = event_stream.recv().await.unwrap().unwrap();
         assert_eq!(resolved.kind, "approval_resolved");
         let source = store.read().unwrap().open().1;
@@ -829,6 +1300,7 @@ mod test {
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: "rg TODO src".into(),
+                            shell: None,
                         }],
                     },
                     None,
@@ -842,10 +1314,17 @@ mod test {
             "approval_requested"
         );
         coordinator
-            .resolve("approval-deny", "deny_broad", Some(&event_sink))
+            .resolve(
+                "approval-deny",
+                &[ApprovalAnswer {
+                    item_id: "0".into(),
+                    choice_id: "deny_broad".into(),
+                }],
+                Some(&event_sink),
+            )
             .await
             .unwrap();
-        assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyBroad);
+        assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyOnce);
         assert_eq!(
             store.read().unwrap().compiled().document.permission["bash"]["rg *"],
             PermissionDecision::Deny
@@ -868,6 +1347,7 @@ mod test {
                         reason: None,
                         target_list: vec![PermissionTarget::Command {
                             command: "rg TODO".into(),
+                            shell: None,
                         }],
                     },
                     None,
@@ -887,5 +1367,89 @@ mod test {
         );
         assert_eq!(waiting.await.unwrap(), ApprovalResolution::Cancel);
         assert!(coordinator.pending_list().unwrap().is_empty());
+    }
+    #[test]
+    fn command_review_preserves_full_context_and_only_marks_executable_occurrences() {
+        for (shell, source) in [
+            (
+                CommandShell::PowerShell,
+                "Write-Output 'probe x'; ForEach-Object { probe x; probe x }",
+            ),
+            (
+                CommandShell::Bash,
+                "printf '%s' 'probe x'; for entry in one; do probe x; probe x; done",
+            ),
+            (
+                CommandShell::Zsh,
+                "print 'probe x'; repeat 2 { probe x; probe x; }",
+            ),
+            (
+                CommandShell::Nushell,
+                "print 'probe x'; [1] | each {|entry| probe x; probe x }",
+            ),
+        ] {
+            let request = PermissionRequest {
+                id: "context".into(),
+                provider: "test".into(),
+                reason: None,
+                target_list: vec![PermissionTarget::Command {
+                    command: source.into(),
+                    shell: Some(shell),
+                }],
+            };
+            let view = approval_view(&request, &evaluate_review(&request));
+            let item = &view.item_list[0];
+            assert_eq!(item.detail, "probe x");
+            assert_eq!(item.command_list.len(), 1, "{shell:?}");
+            let context = &item.command_list[0];
+            assert_eq!(context.source, source);
+            assert_eq!(context.focus_range_list.len(), 2, "{shell:?}");
+            for range in &context.focus_range_list {
+                assert_eq!(&source[range.clone()], "probe x");
+                assert_ne!(
+                    range.start,
+                    source.find("probe x").unwrap(),
+                    "quoted data cannot become an approval marker"
+                );
+            }
+            assert!(
+                context
+                    .highlight_list
+                    .iter()
+                    .any(|capture| capture.group == "ForgeHarnessCommand")
+            );
+            let exact = item
+                .choice_list
+                .iter()
+                .find(|choice| choice.id == "allow_exact")
+                .unwrap();
+            assert_eq!(exact.rule_list, vec![("bash".into(), "probe x".into())]);
+        }
+    }
+
+    #[test]
+    fn ambiguous_review_marks_the_entire_original_command() {
+        let source = "ForEach-Object { probe x";
+        let target = PermissionTarget::Command {
+            command: source.into(),
+            shell: Some(CommandShell::PowerShell),
+        };
+        let request = PermissionRequest {
+            id: "ambiguous".into(),
+            provider: "test".into(),
+            reason: None,
+            target_list: vec![target.clone()],
+        };
+        let view = approval_view(&request, &evaluate_review(&request));
+        assert_eq!(
+            view.item_list[0].command_list[0].focus_range_list,
+            vec![0..source.len()]
+        );
+        assert!(
+            view.item_list[0]
+                .choice_list
+                .iter()
+                .all(|choice| choice.rule_list.is_empty())
+        );
     }
 }

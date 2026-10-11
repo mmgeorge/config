@@ -2,9 +2,10 @@ vim.loader.enable(false)
 local clock, generation, tick = 0, 1
 local original_now, original_defer = vim.uv.now, vim.defer_fn
 local original_client = package.loaded["forge.client"]
-local state = { session = { id = "session" }, busy = true, last_provider_progress = 0,
+local state = { session = { id = "session" }, busy = true,
   approval = { { id = "approval" } }, status = { kind = "working" } }
 local refresh_count = 0
+local responsive = true
 local success, failure = xpcall(function()
   vim.uv.now = function() return clock end
   vim.defer_fn = function(callback) tick = callback end
@@ -12,7 +13,7 @@ local success, failure = xpcall(function()
     host_generation = function() return generation end,
     request_for = function(_, method, _, callback)
       assert(method == "health.get")
-      callback({}, nil)
+      if responsive then callback({}, nil) end
     end,
   }
   package.loaded["forge.views.harness.health"] = nil
@@ -22,31 +23,33 @@ local success, failure = xpcall(function()
     for _ = 1, count do clock = clock + 2000 tick() end
   end
   advance(30)
-  assert(state.wait_notice == nil, "approval wait triggered provider inactivity")
   assert(health.notice(state).text == "Waiting for your approval")
+  assert(health.notice(state).waiting and health.notice(state).hint == "permission")
   state.approval_open = false
   advance(15)
   assert(health.notice(state).text == "Waiting for your approval", "closing the picker resolved the approval")
   state.approval = {}
-  advance(14)
-  assert(health.notice(state) == nil, "approval time counted toward resumed inactivity")
-  advance(1)
-  assert(health.notice(state).text:find("Waiting for provider or tool", 1, true))
+  advance(150)
+  assert(health.notice(state) == nil, "provider silence must not replace the native status")
   for _, kind in ipairs({ "awaiting_input", "awaiting_plan_review" }) do
     state.status.kind = kind
     advance(30)
-    assert(state.wait_notice == nil and health.notice(state) == nil)
+    assert(health.notice(state) == nil)
   end
   state.status.kind = "working"
   state.active_elicitation = { id = "question" }
   advance(30)
-  assert(state.wait_notice == nil)
+  assert(health.notice(state) == nil)
   state.active_elicitation = nil
   advance(15)
-  assert(state.wait_notice ~= nil)
+  assert(health.notice(state) == nil)
   state.busy = false
   advance(1)
-  assert(state.wait_notice == nil and health.notice(state) == nil)
+  assert(health.notice(state) == nil)
+  responsive = false
+  advance(6)
+  assert(health.notice(state).text == "Connection unresponsive — task status unknown",
+    "host heartbeat failure must remain visible")
   local previous_refreshes = refresh_count
   generation = 2
   state.busy = true

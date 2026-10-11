@@ -70,6 +70,45 @@ local success, failure = xpcall(function()
   assert(state.goal == nil and state.active_elicitation == nil, "reject snapshot retained nullable state")
   client.request_for = original_state_request
   assert(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)[1] == "Native transcript")
+  local approval_view = require("forge.views.harness.approval")
+  local permission = { id = "navigation", item_list = { {
+    id = "command", title = "Run command", detail = "whoami.exe /groups", command_list = {},
+    choice_list = { { id = "allow_once", label = "Allow once" }, { id = "cancel", label = "Reject all" } },
+  } } }
+  local pending_snapshot
+  local snapshot_request = client.request_for
+  local function approval_snapshot(pending)
+    return { session = state.session, approval = pending, status = { kind = "working" } }
+  end
+  client.request_for = function(session_id, method, params, callback)
+    if method == "state.get" then pending_snapshot = callback return end
+    return snapshot_request(session_id, method, params, callback)
+  end
+  receive("state_invalidated", {}, "native-controller")
+  local stale_snapshot = pending_snapshot
+  receive("backend_event", { kind = "approval_requested", data = permission }, "native-controller")
+  assert(vim.wait(1000, approval_view.is_open), "approval did not open")
+  stale_snapshot(approval_snapshot({}))
+  assert(#state.approval == 1 and pending_snapshot ~= stale_snapshot,
+    "a snapshot captured before approval erased the pending request")
+  pending_snapshot(approval_snapshot({ permission }))
+  vim.fn.maparg("q", "n", false, true).callback()
+  assert(not approval_view.is_open() and #state.approval == 1, "q must only dismiss the approval window")
+  vim.api.nvim_set_current_win(state.transcript_win)
+  local timeline_window = vim.api.nvim_get_current_win()
+  receive("state_invalidated", {}, "native-controller")
+  pending_snapshot(approval_snapshot({ permission }))
+  vim.wait(30, function() return false end)
+  assert(not approval_view.is_open() and vim.api.nvim_get_current_win() == timeline_window,
+    "snapshot refresh reopened a dismissed approval and stole timeline focus")
+  local notice = require("forge.views.harness.health").notice(state)
+  assert(notice.text == "Waiting for your approval" and notice.waiting and notice.hint == "permission")
+  controller.reopen_question()
+  assert(approval_view.is_open(), "explicit reopen must restore the pending approval")
+  vim.fn.maparg("q", "n", false, true).callback()
+  receive("backend_event", { kind = "approval_cancelled", data = { id = permission.id } }, "native-controller")
+  assert(#state.approval == 0 and not state.dismissed_approval_id)
+  client.request_for = snapshot_request
   assert(vim.wo[state.transcript_win].breakindent, "native attachment discarded Harness continuation indentation")
   assert(vim.wo[state.composer_win].winbar:find("submit", 1, true), "composer has no submit hint")
   state.session.name = "Parser 100% coverage"
@@ -258,5 +297,8 @@ if state.working_timer then state.working_timer:stop() state.working_timer:close
 client.request_for, client.subscribe, client.host_generation = original_request, original_subscribe, original_generation
 client.host_accepting = original_accepting
 package.loaded["blink.cmp"] = original_completion
-assert(success, failure)
+if not success then
+  print(failure)
+  vim.cmd("cquit 1")
+end
 print("harness_controller_native: passed")

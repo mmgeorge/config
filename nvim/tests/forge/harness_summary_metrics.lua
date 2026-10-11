@@ -66,6 +66,13 @@ local ok, failure = pcall(function()
   assert_equals(summary({ now_ms = 12000 }), "▾ Working 8s │ Tools 5s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1433 tps")
   exchange.execution_started_at_ms = vim.NIL
   assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1433 tps")
+  exchange.kind = "plan_draft"
+  for _, now_ms in ipairs({ 90000, 900000 }) do
+    assert_equals(summary({ now_ms = now_ms }), "▾ Planning paused 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1433 tps")
+  end
+  exchange.execution_started_at_ms = 900000
+  assert_equals(summary({ now_ms = 902000 }), "▾ Planning 8s │ Tools 5s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1433 tps")
+  exchange.kind, exchange.execution_started_at_ms = "chat", vim.NIL
   exchange.metrics.request_count = 0
   assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ Tools 3s · 0/1 pass │ Tokens 76.0k -> 4.2k · 1433 tps")
   exchange.metrics = { timing_complete = true, request_count = 0 }

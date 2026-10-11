@@ -80,7 +80,7 @@ end
 ---@param now_ms? number
 ---@return table[]
 function M.heading_lines(tool, width, indent, now_ms)
-  local title = tool.kind == "command" and M.display_command(tool.title or "command") or (tool.title or "tool")
+  local title = tool.kind == "command" and require("forge.render.harness.command").display(tool.title or "command", tool.shell) or (tool.title or "tool")
   title = title:gsub("%s+", " ")
   local prefix = (indent or "") .. "• " .. tool_duration(tool, now_ms) .. " "
   local text = truncate_heading(prefix .. title, width)
@@ -91,18 +91,6 @@ function M.heading_lines(tool, width, indent, now_ms)
     command_offset = tool.kind == "command" and math.min(#prefix, #text) or nil,
     title_fragment = tool.kind == "tool_call" and fragment or nil,
   } }
-end
-
---- Strips outer PowerShell command-line wrappers to display the underlying command.
----@param title string Raw command line string.
----@return string command Cleaned display command.
-function M.display_command(title)
-  local command = title:match("[Pp][Oo][Ww][Ee][Rr][Ss][Hh][Ee][Ll][^%s]*.-%s%-Command%s+(.+)$")
-    or title:match("[Pp][Ww][Ss][Hh][^%s]*.-%s%-Command%s+(.+)$")
-  if not command then return title end
-  local quote = command:sub(1, 1)
-  if (quote == '"' or quote == "'") and command:sub(-1) == quote then command = command:sub(2, -2) end
-  return (command:gsub('\\"', '"'))
 end
 
 --- Checks if a tool descriptor represents a failed or cancelled execution state.
@@ -122,7 +110,7 @@ end
 function M.heading(tool, now_ms)
   local kind = tool.kind or "tool_call"
   local duration = tool_duration(tool, now_ms)
-  local title = kind == "command" and M.display_command(tool.title or "command") or (tool.title or "tool")
+  local title = kind == "command" and require("forge.render.harness.command").display(tool.title or "command", tool.shell) or (tool.title or "tool")
   return ("• %s %s"):format(duration, title)
 end
 
@@ -251,7 +239,7 @@ function M.foldtext_chunks(tool, indent, visible_text, now_ms)
     return chunk_list
   end
 
-  local command = M.display_command(tool.title or "command")
+    local command = require("forge.render.harness.command").display(tool.title or "command", tool.shell)
   local chunk_list = {
     { prefix:sub(1, -2), bullet_group },
     { " " .. duration .. " ", "Normal" },

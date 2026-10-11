@@ -720,8 +720,11 @@ updates never shift command columns.
 Tool group headings sum the observed runtimes of their calls, including overlapping calls.
 An unavailable call duration suppresses the total. Each output view retains its group identity
 so timer updates can refresh the group heading without scanning or replacing output bodies.
-Pending approvals and user questions suspend provider-inactivity notices. Approval waits use
-informational styling and remain pending when their picker closes. Controller renders and
+Provider silence does not replace the native activity or waiting status. Approval waits use
+informational styling and remain pending when their picker closes. Dismissing an approval keeps
+it closed across snapshots until the user reopens it or that request resolves. Approval lifecycle
+events invalidate any snapshot already in flight before it can overwrite newer pending state.
+Controller renders and
 presentation callbacks share status-hint selection so updates cannot alternate between a
 wait notice and the underlying activity. Connection and execution failures retain precedence.
 
@@ -2531,9 +2534,13 @@ failed attempts and calls still in progress, remain outside this observed comple
 
 Running, paused, and completed headers share the layout
 `Planning 120s │ Tools 12s · 20/21 pass │ Tokens 820.0k -> 7.0k · 65 tps`.
-The outer duration includes tools, approvals, and delegated waits within active execution and
-freezes across explicit pauses. The Tools section counts tool-only wall time, taking the union
-of overlapping calls and capping outstanding intervals at interruption or completion.
+The outer duration includes tools and delegated waits within active execution and freezes
+across user-input and permission waits. The first pending permission freezes its owning
+exchange's execution clock. The last decision resumes it only if execution remains eligible.
+Closing the permission window leaves the clock frozen. Explicit pauses, finalization, and
+host restarts discard the live coordinator's resume intent. The Tools section counts tool
+time in that same active clock, taking the union of overlapping calls and capping outstanding
+intervals at interruption or completion.
 Tool time uses milliseconds below one second and rounded tenths of a second thereafter,
 omitting a zero fractional digit. The outer duration remains whole seconds. The pass numerator
 counts successful completed calls only. Running, failed, interrupted, and cancelled calls remain
@@ -2552,7 +2559,7 @@ of tool, approval, and delegated waits. Their quotient supplies approximate effe
 rounded to whole tokens per second. Both operands stay fixed until the next report, so ongoing
 requests cannot lower the displayed rate before reporting their tokens. Provider and transport
 overhead remain in this estimate. Throughput appears only when generated tokens and a valid,
-positive duration are available. Elapsed and active tool time tick independently. Tool time appears
+positive duration are available. Elapsed and active tool time both freeze during permission waits. Tool time appears
 after a tool is recorded and only while its timing is complete.
 Both renderers omit unavailable token categories, unknown cache percentages, and zero request or
 tool counts. Reported zero token counts and zero cache-hit percentages remain visible. Separators
@@ -2684,6 +2691,37 @@ gives every surfaced provider request to one `PermissionCoordinator`. `allow` pr
 `deny` rejects immediately, and `ask` blocks the provider response on the Harness approval float.
 Persistent approval choices atomically replace exact or broad JSON rules with allow or deny. The
 permission document remains outside provider write authority, including shell commands that name it.
+The command permission category displays as `shell` while retaining the Rulesync `bash` storage key.
+The matcher splits recognized compound shell requests into distinct command targets and omits targets
+already allowed by policy. Each remaining target owns one picker page with its own exact and broad
+choices. Ambiguous command text remains one target and offers only one-time allow, deny, or cancellation.
+Each command approval item retains its complete script payload, shell identity, syntax captures,
+and byte ranges for the executable occurrences covered by its choices. Quoted copies of a command
+do not contribute approval ranges. Nested launcher decoding maps those ranges back through quoting
+and escapes into the script payload. Approval details, timeline headings, folds, check labels, and
+background-terminal labels omit the shell executable and invocation flags. The popup omits the
+redundant command-action subtitle.
+The display formatter indents blocks while preserving a source-to-display byte map. The shared
+picker maps syntax captures and approval underlines through formatting, UTF-8 wrapping, and its
+viewport. The underline adds no foreground color, so shell syntax remains visible. Long details
+initially reveal the current approval target. None of these display transformations changes the
+executed command or stored permission pattern.
+PageUp and PageDown scroll long details independently of the decision list. The visible line range
+indicates remaining content. Exact choices refer to the highlighted command instead of repeating it.
+Shell analysis uses pinned PowerShell, bash, zsh, and Nushell syntax trees without executing source.
+Provider shell metadata and explicit shell launchers select the grammar. Unqualified commands use
+PowerShell on Windows and the configured login shell on macOS, with zsh as the platform default.
+Recognized callback builtins such as PowerShell `ForEach-Object` and `Where-Object`, and Nushell
+`each`, `par-each`, `where`, `filter`, `reduce`, `any`, and `all`, require every nested command to pass
+policy. An explicit denial of a callback builtin still rejects the request. Control-flow bodies,
+conditions, substitutions, and static nested shell invocations contribute their own command targets.
+Dynamic command names, code evaluation, unrecognized callback consumers, definitions, redirections,
+and parser errors require one-time review. Analysis stops at 64 KiB, 8,192 visited nodes, 64 tree
+levels, 16 nested shell invocations, or the parser's 25 ms progress deadline and requests review.
+The picker stages decisions locally, then presents a review page. Submission requires one answer for
+every item and atomically persists the selected rules before releasing the original provider request.
+Any denial rejects the complete provider operation. Reject all discards staged choices. Conflicting
+rules or incomplete, duplicate, or unknown answers leave the request pending without changing policy.
 In `permission.bash`, `"*"` supplies the lowest-priority decision for a recognized command.
 More specific command rules override it. Without a matching rule, commands ask for approval.
 Empty or ambiguous command text also asks, even when `"*"` allows other commands.
@@ -5442,8 +5480,8 @@ restarts cannot replace an earlier verification result.
 
 Health requests use reserved admission and output scheduling independently of the broker
 execution lock. The UI sends at most one outstanding health request per conversation. Ten
-seconds without a response shows connection uncertainty. Thirty seconds without provider
-activity shows an explicit wait without failing or repeating work. Bulk output remains bounded,
+seconds without a response shows connection uncertainty. Provider inactivity adds no replacement
+status or elapsed counter. Bulk output remains bounded,
 and control frames receive priority between complete output frames.
 
 Snapshots are scoped to their originating conversation, host generation, runtime epoch, and
@@ -5503,8 +5541,8 @@ Active labels are Working, Planning, Revising plan, Implementing, Verifying,
 Resolving, and Saving exchange. Completed headings retain Planned, Implemented,
 Verified, and Resolved. Idle has no status row.
 
-`health.notice` resolves local failures before user approval waits and provider
-inactivity. User decisions display a static `◷` sign for review, approval, and
+`health.notice` resolves local failures before user approval waits and otherwise preserves the
+native status. User decisions display a static `◷` sign for review, approval, and
 answer waits. Failures and pauses do not animate. The timeline has one marker column. It selects native status signs only on the
 committed status row and window-local timeline markers on other rows. The sign
 column stays enabled without rendering a second copy of prompt or event markers. Provider/tool waits,

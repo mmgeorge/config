@@ -258,14 +258,6 @@ local function status_text()
       group = "ForgeStatusLabel",
     }
   end
-  if #(state.approval or {}) > 0 then
-    local reopen_key = keymaps.view_keys_for("harness", "reopen_question")[1]
-    local reopen_hint = reopen_key and (" (press " .. reopen_key .. ")") or ""
-    segment_list[#segment_list + 1] = {
-      text = " • Approval requested" .. reopen_hint,
-      group = "ForgeHarnessWrite",
-    }
-  end
   if busy ~= "" then
     segment_list[#segment_list + 1] = { text = busy, group = "ForgeStatusLabel" }
   end
@@ -430,6 +422,9 @@ end
 
 ---@param state table
 local function reconcile_approval_presentation(state)
+  if state.dismissed_approval_id and not vim.iter(state.approval or {}):any(function(approval)
+    return approval.id == state.dismissed_approval_id
+  end) then state.dismissed_approval_id = nil end
   local presented_id = state.presented_approval_id
   if not presented_id then return end
   local still_pending = vim.iter(state.approval or {}):any(function(approval)
@@ -551,7 +546,7 @@ local function on_event(event, payload)
     state.configuring, state.configuration_debounce = false, false
     if state.configuration_completion then state.configuration_completion.complete(false) end
     state.configuration_completion, state.task_config = nil, nil
-    state.approval, state.active_wait = {}, nil
+    state.approval, state.active_wait, state.dismissed_approval_id = {}, nil, nil
     state.ready = false
     if state.presentation and state.presentation.terminals then state.presentation.terminals.close() end
     set_busy(false)
@@ -567,7 +562,6 @@ local function on_event(event, payload)
   if event == "document_changed" then
     if payload.session_id ~= (state.session and state.session.id) then return end
     if payload.revision < (state.timeline_revision or 0) then return end
-    state.last_provider_progress, state.wait_notice = vim.uv.now(), nil
     state.timeline_revision = payload.revision
     if payload.status then state.status = payload.status end
     if state.status.kind ~= "awaiting_input" and state.plan_question_open then
@@ -581,7 +575,6 @@ local function on_event(event, payload)
     schedule_render()
   elseif event == "backend_event" then
     if require("forge.event_contract").route("backend", payload.kind) == "ignore" then return end
-    state.last_provider_progress, state.wait_notice = vim.uv.now(), nil
     if payload.kind == "turn_started" then
       recap.clear(state)
     elseif payload.kind == "execution_state" then
@@ -595,18 +588,22 @@ local function on_event(event, payload)
     elseif payload.kind == "prompt_submission" then
       if state.presentation then state.presentation.receive(payload) end
     elseif payload.kind == "approval_requested" then
+      if state.state_sync_pending then state.state_sync_again = true end
       local request = payload.data or payload
       state.approval = state.approval or {}
       if not vim.iter(state.approval):any(function(approval) return approval.id == request.id end) then
         state.approval[#state.approval + 1] = request
       end
       M.refresh_winbar()
+      render_status_hint(state)
       vim.schedule(M.present_approval)
     elseif payload.kind == "approval_resolved" or payload.kind == "approval_cancelled" then
+      if state.state_sync_pending then state.state_sync_again = true end
       local request = payload.data or payload
       remove_approval(state, request.id)
       reconcile_approval_presentation(state)
       M.refresh_winbar()
+      render_status_hint(state)
       if #state.approval > 0 then vim.schedule(M.present_approval) end
     elseif payload.kind == "agent_updated" then
       state.agent = vim.deepcopy(payload.data or payload)
@@ -729,10 +726,13 @@ local function on_event(event, payload)
   end
 end
 
-function M.present_approval()
+---@param reopen? boolean
+function M.present_approval(reopen)
   local state = harness_state()
   local request = state.approval and state.approval[1]
   if state.approval_open or not request then return end
+  if not reopen and state.dismissed_approval_id == request.id then return end
+  state.dismissed_approval_id = nil
   state.approval_open = true
   state.presented_approval_id = request.id
   require("forge.views.harness.approval").open(request, {
@@ -740,10 +740,10 @@ function M.present_approval()
     transcript_win = state.transcript_win,
     window_list = picker_host(state).window_list,
     control_win = picker_host(state).control_win,
-    resolve = function(approval_id, choice_id, callback)
+    resolve = function(approval_id, answer_list, callback)
       client.request("approval.resolve", {
         approval_id = approval_id,
-        choice_id = choice_id,
+        answer_list = answer_list,
       }, function(_, request_error)
         if request_error then
           notifications.error(request_error, "Harness approval")
@@ -762,6 +762,9 @@ function M.present_approval()
     closed = function()
       state.approval_open = false
       state.presented_approval_id = nil
+      state.dismissed_approval_id = vim.iter(state.approval or {}):any(function(approval)
+        return approval.id == request.id
+      end) and request.id or nil
       M.refresh_winbar()
     end,
   })
@@ -855,7 +858,7 @@ end
 function M.reopen_question()
   local state = harness_state()
   if #(state.approval or {}) > 0 then
-    M.present_approval()
+    M.present_approval(true)
     return
   end
   if not (state.active_elicitation and state.active_elicitation.elicitation) then
@@ -1456,7 +1459,7 @@ function M.open_background_picker()
     end
     local options = {}
     for _, terminal in ipairs(inventory.terminal or {}) do
-      options[#options + 1] = { label = terminal.command:gsub("%s+", " "), detail = "Terminal " .. terminal.id, value = terminal.id }
+      options[#options + 1] = { label = require("forge.render.harness.command").display(terminal.command):gsub("%s+", " "), detail = "Terminal " .. terminal.id, value = terminal.id }
     end
     open_choice_picker(state, "Terminate Background Terminal", nil, options, function(id)
       if not current() then return end
@@ -2097,7 +2100,6 @@ function M.task_transition(action, submitted_text, completed)
       state.configuration_completion = nil
     end
   end
-  state.last_provider_progress, state.wait_notice = vim.uv.now(), nil
   local current = task_control.current(state)
   if action.action == "resume" and current and current.status == "running"
     and (not action.task_id or action.task_id == current.id) then

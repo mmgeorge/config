@@ -328,7 +328,9 @@ fn tool_body_rows(profile: &WidthProfile, text: &str, branch: bool) -> Result<Ve
 
 /// Formats a bounded display title without changing the retained provider call.
 fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str) -> Result<String> {
-    let title = if kind == "command" { shell_command(title) } else { title };
+    let display = matches!(kind, "command" | "check").then(||
+        crate::permissions::command::display_command(title, crate::permissions::shell::CommandShell::default()));
+    let title = display.as_ref().map_or(title, |display| display.source.as_str());
     let normalized = title.split_whitespace().collect::<Vec<_>>().join(" ");
     let full = if kind == "check" { format!("▸ {normalized} · {}",duration.trim()) } else { format!("• {duration} {normalized}") };
     if profile.cells(&full, 0)? <= profile.columns {
@@ -364,47 +366,6 @@ fn tool_heading(profile: &WidthProfile, kind: &str, title: &str, duration: &str)
         best = candidate;
     }
     Ok(best)
-}
-
-/// Removes recognized shell launchers only when their command switch is present.
-fn shell_command(title: &str) -> &str {
-    let title = title.trim();
-    let (executable, mut remaining) = shell_token(title);
-    let executable = executable.rsplit(['/', '\\']).next().unwrap_or(executable).to_ascii_lowercase();
-    let powershell = matches!(executable.as_str(), "pwsh" | "pwsh.exe" | "powershell" | "powershell.exe");
-    let posix = matches!(executable.as_str(), "sh" | "bash" | "zsh" | "fish");
-    if !powershell && !posix { return title; }
-    while !remaining.is_empty() {
-        let (argument, tail) = shell_token(remaining);
-        if (powershell && argument.eq_ignore_ascii_case("-command"))
-            || (posix && matches!(argument, "-c" | "-lc" | "-ic")) {
-            let command = tail.trim();
-            if command.is_empty() { return title; }
-            if let Some(quote) = command.chars().next().filter(|value| matches!(value, '\'' | '"')) {
-                if command.len() >= 2 && command.ends_with(quote) {
-                    return &command[1..command.len() - 1];
-                }
-            }
-            return command;
-        }
-        if !matches!(argument.to_ascii_lowercase().as_str(), "-noprofile" | "-nologo" | "-noninteractive" | "-l") {
-            return title;
-        }
-        remaining = tail;
-    }
-    title
-}
-
-/// Separates a launcher argument while retaining the command payload verbatim.
-fn shell_token(text: &str) -> (&str, &str) {
-    let text = text.trim_start();
-    if let Some(quote) = text.chars().next().filter(|value| matches!(value, '\'' | '"')) {
-        if let Some(end) = text[1..].find(quote) {
-            return (&text[1..end + 1], text[end + 2..].trim_start());
-        }
-    }
-    let end = text.find(char::is_whitespace).unwrap_or(text.len());
-    (&text[..end], text[end..].trim_start())
 }
 
 fn decorate_tool_heading(block: &mut BufferBlock, title_rows: usize, kind: &str, failed: bool) {
@@ -693,7 +654,8 @@ mod test {
         let profile = WidthProfile { columns: 90, ..WidthProfile::default() };
         assert_eq!(tool_heading(&profile, "command", r#""C:\Program Files\PowerShell\7\pwsh.exe" -NoProfile -Command 'git status --short'"#, "2s")?, "• 2s git status --short");
         assert_eq!(tool_heading(&profile, "command", "bash -lc 'cargo test'", "2s")?, "• 2s cargo test");
-        assert_eq!(shell_command("pwsh -File build.ps1"), "pwsh -File build.ps1");
+        assert_eq!(crate::permissions::command::display_command("pwsh -File build.ps1",
+            crate::permissions::shell::CommandShell::PowerShell).source, "build.ps1");
         let call = r#"sem.sem_context({"entity_name":"ServiceBusSender","file_path":"service-bus-queue.ts","fresh":true})"#;
         let heading = tool_heading(&profile, "tool_call", call, "2s")?;
         assert!(heading.starts_with("• 2s sem.sem_context({"));

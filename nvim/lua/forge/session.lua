@@ -161,6 +161,7 @@ local function new_harness_state()
   active_wait = nil,
   approval = {},
   approval_open = false,
+  dismissed_approval_id = nil,
   artifact = {},
   timeline = {},
   timeline_revision = 0,

@@ -59,7 +59,11 @@ impl TerminalSnapshot {
             {
                 terminal.push(BackgroundTerminal {
                     id: id.into(),
-                    command: command.into(),
+                    command: crate::permissions::command::display_command(
+                        command,
+                        crate::permissions::shell::CommandShell::default(),
+                    )
+                    .source,
                 });
             }
         }
@@ -74,6 +78,23 @@ impl TerminalSnapshot {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn terminal_inventory_displays_script_payloads_for_each_shell() {
+        for source in [
+            "pwsh -Command 'cargo test'",
+            "bash -lc 'cargo test'",
+            "zsh -ic 'cargo test'",
+            "nu --commands 'cargo test'",
+        ] {
+            let snapshot = TerminalSnapshot::parse(
+                &json!({"data":[{"processId":"1", "command":source}]}),
+                false,
+            )
+            .unwrap();
+            assert_eq!(snapshot.terminal[0].command, "cargo test");
+        }
+    }
 
     #[test]
     fn inventory_excludes_agents_and_finished_shells_and_rejects_invalid_data() {

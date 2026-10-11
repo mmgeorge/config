@@ -212,7 +212,8 @@ impl Exchange {
                 .usage(&address.thread_id, &address.turn_id, update)
             {
                 self.turn[index].record_usage(usage);
-                self.metrics.record_throughput(self.usage().output, self.elapsed(now_ms));
+                self.metrics
+                    .record_throughput(self.usage().output, self.elapsed(now_ms));
             }
             self.metrics.observe_elapsed(self.elapsed(now_ms));
             return Ok(true);
@@ -222,7 +223,8 @@ impl Exchange {
                 self.start_turn(address.clone(), now_ms)?;
             }
             Some(TurnBoundary::Finished { outcome }) => {
-                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address) else {
+                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
+                else {
                     return Ok(false);
                 };
                 turn.finish(outcome, now_ms)?;
@@ -241,7 +243,8 @@ impl Exchange {
                 }
             }
             None => {
-                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address) else {
+                let Some(turn) = self.turn.iter_mut().find(|turn| turn.provider() == address)
+                else {
                     return Ok(false);
                 };
                 if turn.state() != TurnState::Running {
@@ -259,10 +262,11 @@ impl Exchange {
                         self.metrics.timing_complete = false;
                     }
                     let id = format!("tool:{}:{}:{}", address.thread_id, address.turn_id, tool.id);
-                    let elapsed = self.duration_ms.saturating_add(
-                        self.execution_started_at_ms
-                            .map_or(0, |started| event.observed_at_ms(now_ms).saturating_sub(started).max(0) as u64),
-                    );
+                    let elapsed =
+                        self.duration_ms
+                            .saturating_add(self.execution_started_at_ms.map_or(0, |started| {
+                                event.observed_at_ms(now_ms).saturating_sub(started).max(0) as u64
+                            }));
                     self.metrics.block(id, running, elapsed);
                 }
                 if let Some(text) = event.text.as_deref() {
@@ -287,9 +291,8 @@ impl Exchange {
                 let turn_id = turn.id().to_owned();
                 for item in turn.items()[item_count..].to_vec() {
                     let item_id = match &item {
-                        crate::turn::TurnItem::Message { id } | crate::turn::TurnItem::Tool { id } => {
-                            id
-                        }
+                        crate::turn::TurnItem::Message { id }
+                        | crate::turn::TurnItem::Tool { id } => id,
                     };
                     self.node_list.push(ExchangeNode::TurnContent {
                         id: format!("{turn_id}:content:{item_id}"),
@@ -360,7 +363,11 @@ impl Exchange {
             "completed exchange cannot resume"
         );
         self.awaiting_input = self.elicitation.is_some();
-        self.execution_started_at_ms.get_or_insert(now_ms);
+        if self.metrics.awaiting_approval() {
+            self.metrics.approval_resume = true;
+        } else {
+            self.execution_started_at_ms.get_or_insert(now_ms);
+        }
         Ok(())
     }
 
@@ -391,13 +398,31 @@ impl Exchange {
         self.duration_ms.saturating_add(active)
     }
 
-    /// Account for non-model activity without excluding it from total execution time.
+    /// Suspends execution for permissions and accounts for other non-model activity.
     pub(crate) fn observe_blocker(&mut self, id: String, running: bool, now_ms: i64) {
+        let approval = id.starts_with("approval:");
+        if approval && running && !self.metrics.awaiting_approval() {
+            let resume = self.execution_started_at_ms.is_some();
+            self.pause(now_ms);
+            self.metrics.approval_resume = resume;
+        }
         self.metrics.block(id, running, self.elapsed(now_ms));
+        if approval && !running && !self.metrics.awaiting_approval() {
+            let resume = std::mem::take(&mut self.metrics.approval_resume);
+            if resume
+                && self.state == ExchangeState::Running
+                && self.completed_at_ms.is_none()
+                && !self.awaiting_input
+                && self.elicitation.is_none()
+            {
+                self.execution_started_at_ms = Some(now_ms);
+            }
+        }
     }
 
     /// Freeze the active interval before waiting for user input or finalization.
     pub fn pause(&mut self, now_ms: i64) {
+        self.metrics.approval_resume = false;
         if let Some(start) = self.execution_started_at_ms.take() {
             self.duration_ms = self
                 .duration_ms
@@ -558,11 +583,15 @@ impl Exchange {
         question: QuestionInput,
         now_ms: i64,
     ) -> anyhow::Result<()> {
-        anyhow::ensure!(matches!(intent, InputIntent::Clarification | InputIntent::Answer),
-            "question feedback requires clarification or answer intent");
-        anyhow::ensure!(!question.set_id.is_empty()
-            && (intent != InputIntent::Clarification || question.question_id.is_some()),
-            "question clarification requires a durable question target");
+        anyhow::ensure!(
+            matches!(intent, InputIntent::Clarification | InputIntent::Answer),
+            "question feedback requires clarification or answer intent"
+        );
+        anyhow::ensure!(
+            !question.set_id.is_empty()
+                && (intent != InputIntent::Clarification || question.question_id.is_some()),
+            "question clarification requires a durable question target"
+        );
         self.append_input(intent, text, now_ms)?;
         let Some(ExchangeNode::ExchangeInput { prompt }) = self.node_list.last_mut() else {
             unreachable!("input admission appends an input node")
@@ -1143,6 +1172,90 @@ mod test {
                 outcome: crate::turn::TurnOutcome::Cancelled
             }
         );
+    }
+
+    #[test]
+    fn approval_wait_freezes_exchange_and_overlapping_tool_time_until_last_decision() {
+        let mut exchange = interaction();
+        exchange.resume(1000).unwrap();
+        exchange.observe_blocker("tool:first".into(), true, 1500);
+        exchange.observe_blocker("tool:second".into(), true, 2000);
+        exchange.observe_blocker("approval:first".into(), true, 3000);
+        exchange.observe_blocker("approval:first".into(), true, 9000);
+        exchange.observe_blocker("approval:second".into(), true, 10_000);
+        for now_ms in [10_000, 90_000] {
+            assert_eq!(exchange.elapsed(now_ms), 2000);
+            assert_eq!(
+                exchange.metrics.tool_ms(exchange.elapsed(now_ms)),
+                Some(1500)
+            );
+        }
+        exchange.observe_blocker("approval:first".into(), false, 90_000);
+        exchange.observe_blocker("approval:unknown".into(), false, 95_000);
+        assert_eq!(exchange.elapsed(100_000), 2000);
+        exchange.resume(100_000).unwrap();
+        assert_eq!(exchange.elapsed(110_000), 2000);
+        exchange.observe_blocker("approval:second".into(), false, 120_000);
+        assert_eq!(exchange.elapsed(121_000), 3000);
+        assert_eq!(
+            exchange.metrics.tool_ms(exchange.elapsed(121_000)),
+            Some(2500)
+        );
+        exchange.observe_blocker("tool:first".into(), false, 121_000);
+        exchange.observe_blocker("tool:second".into(), false, 122_000);
+        exchange.observe_blocker("approval:second".into(), false, 125_000);
+        assert_eq!(exchange.elapsed(126_000), 8000);
+        assert_eq!(
+            exchange.metrics.tool_ms(exchange.elapsed(126_000)),
+            Some(3500)
+        );
+    }
+
+    #[test]
+    fn approval_resolution_preserves_other_pause_and_terminal_boundaries() {
+        for boundary in [
+            "already_paused",
+            "user_input",
+            "pause",
+            "restart",
+            "finalization",
+            "cancelled",
+        ] {
+            let mut exchange = interaction();
+            exchange.resume(1000).unwrap();
+            if boundary == "already_paused" {
+                exchange.pause(2000);
+            }
+            exchange.observe_blocker("approval:request".into(), true, 3000);
+            match boundary {
+                "user_input" => exchange.awaiting_input = true,
+                "pause" => exchange.pause(4000),
+                "restart" => exchange.pause_for_restart(4000).unwrap(),
+                "finalization" => {
+                    exchange
+                        .begin_finalization(ExchangeState::Complete, 4000)
+                        .unwrap();
+                }
+                "cancelled" => exchange.finish(ExchangeState::Cancelled, 4000).unwrap(),
+                _ => {}
+            }
+            let elapsed = exchange.elapsed(5000);
+            exchange.observe_blocker("approval:request".into(), false, 90_000);
+            assert_eq!(exchange.elapsed(100_000), elapsed, "{boundary}");
+            assert!(exchange.execution_started_at_ms.is_none(), "{boundary}");
+        }
+    }
+
+    #[test]
+    fn approval_resume_intent_does_not_survive_coordinator_restart() {
+        let mut exchange = interaction();
+        exchange.resume(1000).unwrap();
+        exchange.observe_blocker("approval:request".into(), true, 3000);
+        let mut recovered: Exchange =
+            serde_json::from_value(serde_json::to_value(exchange).unwrap()).unwrap();
+        recovered.observe_blocker("approval:request".into(), false, 90_000);
+        assert_eq!(recovered.elapsed(100_000), 2000);
+        assert!(recovered.execution_started_at_ms.is_none());
     }
 
     #[test]

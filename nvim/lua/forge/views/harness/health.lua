@@ -1,17 +1,12 @@
 local M = {}
 local client = require("forge.client")
 
-local function awaiting_user(state)
-  local kind = state.status and state.status.kind
-  return #(state.approval or {}) > 0 or type(state.active_elicitation) == "table"
-    or kind == "awaiting_input" or kind == "awaiting_plan_review"
-end
-
 ---@class HarnessStatusNotice
 ---@field text string
 ---@field animated boolean
 ---@field failed boolean?
 ---@field waiting boolean?
+---@field hint string?
 ---@param state table
 ---@return HarnessStatusNotice?
 function M.notice(state)
@@ -20,10 +15,9 @@ function M.notice(state)
     or state.presentation and state.presentation.section_error
   if failure then return { text = failure, animated = false, failed = failure ~= "Paused" } end
   if #(state.approval or {}) > 0 then
-    return { text = "Waiting for your approval", animated = false, waiting = true }
+    return { text = "Waiting for your approval", animated = false, waiting = true, hint = "permission" }
   end
-  if awaiting_user(state) or not state.busy then return nil end
-  return state.wait_notice and { text = state.wait_notice, animated = true } or nil
+  return nil
 end
 
 ---@param state table
@@ -36,7 +30,6 @@ function M.watch(state, refresh)
   state.health_owner = identity
   local last_response = vim.uv.now()
   local pending = false
-  local resumed_at = 0
   local connection_notice = "Connection unresponsive — task status unknown"
   local function current()
     return state.health_owner == identity and client.host_generation() == generation
@@ -46,16 +39,6 @@ function M.watch(state, refresh)
     if not current() then return end
     if vim.uv.now() - last_response >= 10000 then
       if not state.connection_error then state.connection_error = connection_notice refresh() end
-    end
-    if awaiting_user(state) or not state.busy then
-      resumed_at = vim.uv.now()
-      if state.wait_notice then state.wait_notice = nil refresh() end
-    elseif state.last_provider_progress then
-      local elapsed = vim.uv.now() - math.max(state.last_provider_progress, resumed_at)
-      if elapsed >= 30000 then
-        state.wait_notice = ("Waiting for provider or tool · %ds without update"):format(math.floor(elapsed / 1000))
-        refresh()
-      end
     end
     if not pending then
       pending = true

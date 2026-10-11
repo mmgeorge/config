@@ -1329,6 +1329,7 @@ mod test {
         exchange.id = "waiting".into();
         exchange.ordinal = 2;
         exchange.awaiting_input = true;
+        exchange.duration_ms = 20;
         exchange.execution_started_at_ms = None;
         store.save_exchange(&exchange).unwrap();
         let child = Agent::pending("session", "reviewer", "review", 10);
@@ -1347,7 +1348,8 @@ mod test {
                 .iter()
                 .all(|exchange| exchange.state == ExchangeState::Running)
         );
-        assert_eq!(unchanged[0].execution_started_at_ms, Some(30));
+        assert_eq!(unchanged[0].execution_started_at_ms, None);
+        assert_eq!(unchanged[0].duration_ms, 60);
         store.save_agent_run(&child).unwrap();
         store.interrupt_detached_execution("session").unwrap();
         let recovered = store.list_exchange("session").unwrap();

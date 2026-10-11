@@ -1,0 +1,152 @@
+[
+  {
+    "shell": "powershell",
+    "source": "\"C:\\Program Files\\PowerShell\\7\\pwsh.exe\" -Command 'foreach ($iteration in 1..1) { whoami.exe /groups }'",
+    "expected": "foreach ($iteration in 1..1) { whoami.exe /groups }"
+  },
+  {
+    "shell": "powershell",
+    "source": "pwsh -NoLogo -NoProfile -NonInteractive -Command 'Get-ChildItem -Force'",
+    "expected": "Get-ChildItem -Force"
+  },
+  {
+    "shell": "powershell",
+    "source": "POWERSHELL.EXE -C 'Get-Content README.md'",
+    "expected": "Get-Content README.md"
+  },
+  {
+    "shell": "powershell",
+    "source": "pwsh -c \"Write-Output `\"a;b`\"\"",
+    "expected": "Write-Output \"a;b\""
+  },
+  {
+    "shell": "powershell",
+    "source": "pwsh -Command 'Write-Output ''it''''s data'''",
+    "expected": "Write-Output 'it''s data'"
+  },
+  {
+    "shell": "powershell",
+    "source": "pwsh -Command\n Get-Content README.md\r\n",
+    "expected": "Get-Content README.md"
+  },
+  {
+    "shell": "powershell",
+    "source": "pwsh -File script.ps1 -Flag",
+    "expected": "script.ps1 -Flag"
+  },
+  {
+    "shell": "powershell",
+    "source": "pwsh -Command 'nu --commands \"ls | length\"'",
+    "expected": "ls | length"
+  },
+  {
+    "shell": "bash",
+    "source": "/bin/bash -lc 'for child in *; do printf \"%s\\n\" \"$child\"; done'",
+    "expected": "for child in *; do printf \"%s\\n\" \"$child\"; done"
+  },
+  {
+    "shell": "bash",
+    "source": "sh -c 'printf \"%s\" \"λ\"'",
+    "expected": "printf \"%s\" \"λ\""
+  },
+  {
+    "shell": "bash",
+    "source": "bash -c \"printf \\\"a;b\\\"; echo λ\"",
+    "expected": "printf \"a;b\"; echo λ"
+  },
+  {
+    "shell": "bash",
+    "source": "bash -c 'echo '\\''quoted'\\'''",
+    "expected": "echo 'quoted'"
+  },
+  {
+    "shell": "bash",
+    "source": "/bin/bash -lic 'cargo test'",
+    "expected": "cargo test"
+  },
+  {
+    "shell": "bash",
+    "source": "bash -c 'pwsh -Command \"Write-Output λ\"'",
+    "expected": "Write-Output λ"
+  },
+  {
+    "shell": "zsh",
+    "source": "/bin/zsh -lc 'for child in *; do print -r -- $child; done'",
+    "expected": "for child in *; do print -r -- $child; done"
+  },
+  {
+    "shell": "zsh",
+    "source": "zsh -ic 'repeat 2 print λ'",
+    "expected": "repeat 2 print λ"
+  },
+  {
+    "shell": "zsh",
+    "source": "zsh -lic 'cargo test'",
+    "expected": "cargo test"
+  },
+  {
+    "shell": "nushell",
+    "source": "nu --no-config-file --commands '[1 2] | each {|value| print $value }'",
+    "expected": "[1 2] | each {|value| print $value }"
+  },
+  {
+    "shell": "nushell",
+    "source": "/opt/homebrew/bin/nu -c 'ls | each {|child| print $child.name }'",
+    "expected": "ls | each {|child| print $child.name }"
+  },
+  {
+    "shell": "nushell",
+    "source": "nushell.exe --commands 'get name'",
+    "expected": "get name"
+  },
+  {
+    "shell": "nushell",
+    "source": "nu -c `print 'λ'`",
+    "expected": "print 'λ'"
+  },
+  {
+    "shell": "powershell",
+    "source": "cmd.exe /c \"dir /b\"",
+    "expected": "dir /b"
+  },
+  {
+    "shell": "bash",
+    "source": "fish -c 'printf λ'",
+    "expected": "printf λ"
+  },
+  {
+    "shell": "powershell",
+    "source": "foreach ($iteration in 1..1) { whoami.exe /groups }",
+    "expected": "foreach ($iteration in 1..1) { whoami.exe /groups }"
+  },
+  {
+    "shell": "powershell",
+    "source": "Write-Output 'pwsh -Command fake'",
+    "expected": "Write-Output 'pwsh -Command fake'"
+  },
+  {
+    "shell": "bash",
+    "source": "echo 'bash -c fake'",
+    "expected": "echo 'bash -c fake'"
+  },
+  {
+    "shell": "zsh",
+    "source": "echo /bin/zsh -lc fake",
+    "expected": "echo /bin/zsh -lc fake"
+  },
+  {
+    "shell": "nushell",
+    "source": "print 'nu -c fake'",
+    "expected": "print 'nu -c fake'"
+  },
+  {
+    "shell": "powershell",
+    "source": "Get-Command pwsh",
+    "expected": "Get-Command pwsh"
+  },
+  {
+    "shell": "powershell",
+    "source": "",
+    "expected": ""
+  }
+]

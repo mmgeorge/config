@@ -1432,7 +1432,9 @@ impl TimelineRenderer<'_> {
             let command_start = self.block.len();
             let call_id = check.id.clone();
             let heading = crate::turn::ToolCall {
-                id:call_id.clone(), kind:"check".into(), title:format!("{} · {:?}",check.command,check.state),
+                id:call_id.clone(), kind:"check".into(), title:format!("{} · {:?}",
+                    crate::permissions::command::display_command(&check.command,
+                        crate::permissions::shell::CommandShell::default()).source,check.state),
                 started_at_ms:check.started_at_ms, completed_at_ms:check.completed_at_ms,
                 task_id:None,output:String::new(),status:String::new(),failed:matches!(check.state,crate::plan::checks::CheckState::Failed),change:Default::default(),
             };
@@ -3810,6 +3812,16 @@ mod tests {
             assert!(super::exchange_activity_summary(&exchange, now_ms)
                 .contains(&format!("Tools {aggregate} · 0/1 pass")));
         }
+        let mut permission_wait = exchange.clone();
+        permission_wait.kind = crate::exchange::ExchangeKind::PlanDraft;
+        permission_wait.observe_blocker("approval:command".into(), true, 4500);
+        for now_ms in [90_000, 900_000] {
+            assert_eq!(super::exchange_activity_summary(&permission_wait, now_ms),
+                "● Planning paused 3s │ Tools 2.5s · 0/1 pass");
+        }
+        permission_wait.observe_blocker("approval:command".into(), false, 900_000);
+        assert_eq!(super::exchange_activity_summary(&permission_wait, 902_000),
+            "● Planning 5s │ Tools 4.5s · 0/1 pass");
         event.activity.as_mut().unwrap().status = Some("failed".into());
         exchange.observe_turn(&event, 5000).unwrap();
         let entry = crate::timeline::TimelineEntry::Exchange {

@@ -14,8 +14,15 @@ function PickerRender.apply(buf, frame)
   end
   for _, content in ipairs(frame.content_range) do
     for line = content.first, content.last do
-      vim.api.nvim_buf_add_highlight(buf, namespace, content.group or "ForgePickerText", line - 1, 0, -1)
+      vim.api.nvim_buf_set_extmark(buf, namespace, line - 1, 0, {
+        end_row = line, end_col = 0, hl_group = content.group or "ForgePickerText", priority = 100,
+      })
     end
+  end
+  for _, span in ipairs(frame.content_span_list or {}) do
+    vim.api.nvim_buf_set_extmark(buf, namespace, span.line - 1, span.first, {
+      end_col = span.last, hl_group = span.group, priority = span.priority or 200,
+    })
   end
   for index, range in pairs(frame.primary_range or frame.option_range) do
     local group = index == frame.selected_index and frame.highlight_selected_text ~= false and "ForgePickerSelected"

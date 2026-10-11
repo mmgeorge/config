@@ -1,6 +1,7 @@
 local M = {}
 local buffer = require("forge.buffer")
 local keymaps = require("forge.shared.keymaps")
+local display_text = require("forge.render.display_text")
 local namespace = vim.api.nvim_create_namespace("ForgeHarnessStatusHint")
 local spinner = require("forge.render.harness.timeline_status")
 ---@class HarnessStatusAnimation
@@ -155,17 +156,27 @@ function M.render(transcript, commands, width)
   if notice then
     local text = notice.text:gsub("%s+", " ")
     local capture = notice.failed and "ForgeHarnessToolFailure" or "ForgeStatusHint"
+    local chunks = { { text, capture } }
+    if notice.hint then append_hint(chunks, hint_chunks(commands, notice.hint .. "_status", width)) end
     if row then
-      local rendered = vim.fn.strcharpart(text, 0, math.max(1, width - 1))
-      rendered = rendered .. string.rep(" ", math.max(0, width - vim.fn.strdisplaywidth(rendered)))
-      local options = { id = 1, virt_text = { { rendered, capture } },
+      local available = width
+      local rendered = {}
+      for _, chunk in ipairs(chunks) do
+        local value = display_text.take_prefix(chunk[1], available).prefix
+        rendered[#rendered + 1] = { value, chunk[2] }
+        available = math.max(0, available - vim.fn.strdisplaywidth(value))
+        if available == 0 then break end
+      end
+      if available > 0 then rendered[#rendered + 1] = { string.rep(" ", available), capture } end
+      local options = { id = 1, virt_text = rendered,
         virt_text_win_col = 0, priority = 200, sign_hl_group = capture }
       if notice.waiting then options.sign_text = "◷" end
       if notice.animated then animate(transcript, row, options)
       else vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, options) end
     else
+      if notice.waiting then chunks[1][1] = "◷ " .. chunks[1][1] end
       vim.api.nvim_buf_set_extmark(target_buffer, namespace, last_row, 0, {
-        id = 1, virt_lines = { { { (notice.waiting and "◷ " or "") .. text, capture } } },
+        id = 1, virt_lines = { chunks },
       })
     end
     return

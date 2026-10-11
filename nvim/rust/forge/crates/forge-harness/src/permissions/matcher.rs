@@ -3,20 +3,38 @@ use super::document::{
     CATEGORY_BASH, CATEGORY_EDIT, CATEGORY_ELEVATE, CATEGORY_MCP, CATEGORY_READ, CATEGORY_TOOL,
     CATEGORY_WEBFETCH, PermissionDecision, PermissionDocument,
 };
+use super::shell::CommandShell;
 use crate::session::PermissionMode;
 use serde::{Deserialize, Serialize};
+use std::ops::Range;
 use std::path::{Component, Path, PathBuf};
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum PermissionTarget {
-    Command { command: String },
-    Read { path: String },
-    Write { path: String },
-    Network { target: String },
-    Mcp { target: String },
-    Elevate { target: String },
-    Tool { target: String },
+    Command {
+        command: String,
+        #[serde(default)]
+        shell: Option<CommandShell>,
+    },
+    Read {
+        path: String,
+    },
+    Write {
+        path: String,
+    },
+    Network {
+        target: String,
+    },
+    Mcp {
+        target: String,
+    },
+    Elevate {
+        target: String,
+    },
+    Tool {
+        target: String,
+    },
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -38,6 +56,30 @@ pub struct CompiledPermissionDocument {
 pub struct PermissionEvaluation {
     pub decision: PermissionDecision,
     pub matched_pattern_list: Vec<String>,
+    /// Distinct targets that still require an explicit user decision.
+    pub pending_target_list: Vec<PermissionTarget>,
+    /// Preserves the source occurrences used by the same evaluation that requested approval.
+    pub pending_command_list: Vec<PendingCommand>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+/// Binds one unapproved executable occurrence to its complete original source.
+pub struct PendingCommand {
+    /// Identifies the pending target whose choices cover this occurrence.
+    pub target: PermissionTarget,
+    /// Retains the complete provider command before splitting or launcher decoding.
+    pub source: String,
+    /// Selects the grammar of the original source.
+    pub shell: CommandShell,
+    /// Locates the executable occurrence in original source byte coordinates.
+    pub source_range: Range<usize>,
+}
+
+struct TargetEvaluation {
+    target: PermissionTarget,
+    decision: PermissionDecision,
+    matched_pattern: Option<String>,
+    command: Option<PendingCommand>,
 }
 
 fn normalized_path(path: &Path) -> Option<PathBuf> {
@@ -90,7 +132,7 @@ fn command_pattern_score(pattern: &str, invocation: &CommandInvocation) -> Optio
         .iter()
         .zip(&invocation.token_list)
         .all(|(expected, actual)| {
-            if cfg!(windows) {
+            if invocation.shell == CommandShell::PowerShell {
                 expected.eq_ignore_ascii_case(actual)
             } else {
                 expected == actual
@@ -126,15 +168,15 @@ fn path_pattern_score(pattern: &str, target: &str, workspace: &Path) -> Option<u
     path_starts_with(&target, &root).then_some(root.components().count())
 }
 
-fn combine_decision(result_list: &[(PermissionDecision, Option<String>)]) -> PermissionDecision {
+fn combine_decision(result_list: &[TargetEvaluation]) -> PermissionDecision {
     if result_list
         .iter()
-        .any(|(decision, _)| *decision == PermissionDecision::Deny)
+        .any(|result| result.decision == PermissionDecision::Deny)
     {
         PermissionDecision::Deny
     } else if result_list
         .iter()
-        .any(|(decision, _)| *decision == PermissionDecision::Ask)
+        .any(|result| result.decision == PermissionDecision::Ask)
     {
         PermissionDecision::Ask
     } else {
@@ -181,26 +223,74 @@ impl CompiledPermissionDocument {
             })
     }
 
-    fn evaluate_command(&self, command: &str) -> Vec<(PermissionDecision, Option<String>)> {
+    fn evaluate_command(
+        &self,
+        command: &str,
+        shell: Option<CommandShell>,
+    ) -> Vec<TargetEvaluation> {
         let CommandNormalization {
             invocation_list,
             ambiguous,
-        } = super::command::normalize_command(command);
-        if ambiguous || invocation_list.is_empty() {
-            return vec![(PermissionDecision::Ask, None)];
+        } = super::command::normalize_command_in(command, shell.unwrap_or_default());
+        if ambiguous {
+            return vec![TargetEvaluation {
+                target: PermissionTarget::Command {
+                    command: command.into(),
+                    shell,
+                },
+                decision: PermissionDecision::Ask,
+                matched_pattern: None,
+                command: Some(PendingCommand {
+                    target: PermissionTarget::Command {
+                        command: command.into(),
+                        shell,
+                    },
+                    source: command.into(),
+                    shell: shell.unwrap_or_default(),
+                    source_range: 0..command.len(),
+                }),
+            }];
         }
         invocation_list
             .iter()
             .map(|invocation| {
-                if invocation.token_list.first().is_some_and(|command| {
-                    matches!(
-                        command.to_ascii_lowercase().as_str(),
-                        "read" | "write" | "webfetch" | "mcp" | "elevate" | "tool"
-                    )
-                }) {
-                    return (PermissionDecision::Deny, None);
+                let (decision, matched_pattern) =
+                    if invocation.token_list.first().is_some_and(|command| {
+                        matches!(
+                            command.to_ascii_lowercase().as_str(),
+                            "read" | "write" | "webfetch" | "mcp" | "elevate" | "tool"
+                        )
+                    }) {
+                        (PermissionDecision::Deny, None)
+                    } else {
+                        let (decision, pattern) =
+                            self.best_rule(CATEGORY_BASH, command, Some(invocation));
+                        (
+                            if invocation.structural && decision != PermissionDecision::Deny {
+                                PermissionDecision::Allow
+                            } else {
+                                decision
+                            },
+                            pattern,
+                        )
+                    };
+                TargetEvaluation {
+                    target: PermissionTarget::Command {
+                        command: invocation.source.clone(),
+                        shell: Some(invocation.shell),
+                    },
+                    decision,
+                    matched_pattern,
+                    command: (decision == PermissionDecision::Ask).then(|| PendingCommand {
+                        target: PermissionTarget::Command {
+                            command: invocation.source.clone(),
+                            shell: Some(invocation.shell),
+                        },
+                        source: command.into(),
+                        shell: shell.unwrap_or_default(),
+                        source_range: invocation.source_range.clone(),
+                    }),
                 }
-                self.best_rule(CATEGORY_BASH, command, Some(invocation))
             })
             .collect()
     }
@@ -213,41 +303,66 @@ impl CompiledPermissionDocument {
         let mut result_list = Vec::new();
         for target in &request.target_list {
             if mode == PermissionMode::Yolo {
-                result_list.push((PermissionDecision::Allow, None));
+                result_list.push(TargetEvaluation {
+                    target: target.clone(),
+                    decision: PermissionDecision::Allow,
+                    matched_pattern: None,
+                    command: None,
+                });
                 continue;
             }
-            match target {
-                PermissionTarget::Command { command } => {
-                    result_list.extend(self.evaluate_command(command));
+            let (decision, matched_pattern) = match target {
+                PermissionTarget::Command { command, shell } => {
+                    result_list.extend(self.evaluate_command(command, *shell));
+                    continue;
                 }
-                PermissionTarget::Read { path } => {
-                    result_list.push(self.best_rule(CATEGORY_READ, path, None));
-                }
+                PermissionTarget::Read { path } => self.best_rule(CATEGORY_READ, path, None),
                 PermissionTarget::Write { path } => {
                     let (decision, pattern) = self.best_rule(CATEGORY_EDIT, path, None);
-                    result_list.push((if mode == PermissionMode::Read && decision == PermissionDecision::Allow {
-                        PermissionDecision::Ask
-                    } else { decision }, pattern));
+                    (
+                        if mode == PermissionMode::Read && decision == PermissionDecision::Allow {
+                            PermissionDecision::Ask
+                        } else {
+                            decision
+                        },
+                        pattern,
+                    )
                 }
                 PermissionTarget::Network { target } => {
-                    result_list.push(self.best_rule(CATEGORY_WEBFETCH, target, None));
+                    self.best_rule(CATEGORY_WEBFETCH, target, None)
                 }
-                PermissionTarget::Mcp { target } => {
-                    result_list.push(self.best_rule(CATEGORY_MCP, target, None));
-                }
+                PermissionTarget::Mcp { target } => self.best_rule(CATEGORY_MCP, target, None),
                 PermissionTarget::Elevate { target } => {
-                    result_list.push(self.best_rule(CATEGORY_ELEVATE, target, None));
+                    self.best_rule(CATEGORY_ELEVATE, target, None)
                 }
-                PermissionTarget::Tool { target } => {
-                    result_list.push(self.best_rule(CATEGORY_TOOL, target, None));
-                }
+                PermissionTarget::Tool { target } => self.best_rule(CATEGORY_TOOL, target, None),
+            };
+            result_list.push(TargetEvaluation {
+                target: target.clone(),
+                decision,
+                matched_pattern,
+                command: None,
+            });
+        }
+        let mut pending_target_list = Vec::new();
+        for result in &result_list {
+            if result.decision == PermissionDecision::Ask
+                && !pending_target_list.contains(&result.target)
+            {
+                pending_target_list.push(result.target.clone());
             }
         }
         PermissionEvaluation {
             decision: combine_decision(&result_list),
+            pending_target_list,
+            pending_command_list: result_list
+                .iter()
+                .filter(|result| result.decision == PermissionDecision::Ask)
+                .filter_map(|result| result.command.clone())
+                .collect(),
             matched_pattern_list: result_list
                 .into_iter()
-                .filter_map(|(_, pattern)| pattern)
+                .filter_map(|result| result.matched_pattern)
                 .collect(),
         }
     }
@@ -273,6 +388,7 @@ mod test {
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: "git status && rg foo".into(),
+                shell: None,
             }],
         };
         assert_eq!(
@@ -282,6 +398,7 @@ mod test {
         let denied = PermissionRequest {
             target_list: vec![PermissionTarget::Command {
                 command: "git commit -m test".into(),
+                shell: None,
             }],
             ..allowed
         };
@@ -299,6 +416,7 @@ mod test {
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: "cargo test".into(),
+                shell: None,
             }],
         };
         for (rule, expected) in [
@@ -330,6 +448,7 @@ mod test {
             reason: None,
             target_list: vec![PermissionTarget::Command {
                 command: String::new(),
+                shell: None,
             }],
         };
         for (command, expected) in [
@@ -337,10 +456,11 @@ mod test {
             ("git push origin main", PermissionDecision::Ask),
             ("git status && cargo test", PermissionDecision::Deny),
             ("", PermissionDecision::Ask),
-            ("git $(echo status)", PermissionDecision::Ask),
+            ("git $(echo status)", PermissionDecision::Deny),
         ] {
             request.target_list = vec![PermissionTarget::Command {
                 command: command.into(),
+                shell: None,
             }];
             assert_eq!(
                 permission.evaluate(PermissionMode::Read, &request).decision,
@@ -350,6 +470,7 @@ mod test {
         }
         request.target_list = vec![PermissionTarget::Command {
             command: "git status".into(),
+            shell: None,
         }];
         assert_eq!(
             compiled(r#"{"permission":{"bash":{"*":"allow","git status":"deny"}}}"#)
@@ -389,11 +510,15 @@ mod test {
             ..workspace_write
         };
         assert_eq!(
-            permission.evaluate(PermissionMode::Write, &outside).decision,
+            permission
+                .evaluate(PermissionMode::Write, &outside)
+                .decision,
             PermissionDecision::Allow
         );
         assert_eq!(
-            permission.evaluate(PermissionMode::Write, &outside).decision,
+            permission
+                .evaluate(PermissionMode::Write, &outside)
+                .decision,
             PermissionDecision::Allow
         );
     }

@@ -179,7 +179,10 @@ local function render_view(instance)
     border_footer = vim.trim(table.remove(frame.lines, frame.footer_line))
     frame.footer_line = nil
   end
-  frame = layout.viewport(frame, height, instance.frame and instance.frame.viewport_top)
+  local previous = instance.frame and instance.frame.page_id == page.id and instance.frame or nil
+  frame = layout.viewport(frame, height, previous and previous.viewport_top, instance.content_offset or (previous and previous.content_offset))
+  frame.page_id = page.id
+  instance.content_offset = nil
   instance.frame = frame
   picker_window.resize(instance.win, instance.spec.host, width, height, title_chunks(instance, width), border_footer)
   render.apply(instance.buf, frame)
@@ -198,6 +201,13 @@ local function render_view(instance)
     end)
   end
   notify_selection(instance)
+end
+
+---@param pages integer
+function Picker.scroll_content(pages)
+  if not active or not active.frame.scroll_range then return end
+  active.content_offset = active.frame.content_offset + pages * active.frame.content_page_size
+  render_view(active)
 end
 
 local function finish(instance, result)
