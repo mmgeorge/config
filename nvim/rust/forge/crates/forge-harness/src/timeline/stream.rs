@@ -394,6 +394,7 @@ fn ticking(entry: &TimelineEntry) -> bool {
         TimelineEntry::AgentLifecycle { run,.. } => run.state.is_open(),
         TimelineEntry::Status { status,.. } => matches!(status,
             crate::session::state_machine::SessionPhase::Working { .. }
+            | crate::session::state_machine::SessionPhase::Compacting { .. }
             | crate::session::state_machine::SessionPhase::WaitingForAgent { .. }),
         _ => false,
     }

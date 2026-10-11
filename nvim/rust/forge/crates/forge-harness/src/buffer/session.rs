@@ -2281,6 +2281,35 @@ mod tests {
     }
 
     #[test]
+    fn compaction_counter_refreshes_without_provider_events() -> Result<()> {
+        let started_at_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?.as_millis() as i64;
+        let mut owner = SessionPresentation::new("session".into());
+        owner.initialize(vec![TimelineEntry::Status {
+            id: "session:status".into(), created_at_ms: 0,
+            status: SessionPhase::Compacting { started_at_ms },
+        }])?;
+        let document = DocumentId("transcript:compaction-timer".into());
+        let opened = owner.open(document.clone(), ViewId("view:compaction-timer".into()),
+            WidthProfile::default())?;
+        let before = opened.transcript.block[0].text.row(1).unwrap()
+            .strip_prefix("Compacting · ").unwrap().trim_end_matches('s').parse::<u64>()?;
+        let timeline_revision = owner.revision();
+        std::thread::sleep(std::time::Duration::from_millis(1_100));
+        let update = owner.sync(&document, opened.transcript.revision)?;
+        assert!(!update.patch.is_empty(), "elapsed time did not produce a document patch");
+        let refreshed = owner.snapshot(&document)?;
+        let after = refreshed.block[0].text.row(1).unwrap()
+            .strip_prefix("Compacting · ").unwrap().trim_end_matches('s').parse::<u64>()?;
+        assert!(after > before, "compaction counter did not advance");
+        assert_eq!(owner.revision(), timeline_revision, "timer changed durable timeline state");
+        assert!(refreshed.block[0].metadata.status.as_ref().unwrap().animated);
+        owner.update_live(None, None, SessionPhase::Idle)?;
+        assert!(!owner.snapshot(&document)?.block.iter().any(|block| block.id.0 == "session:status"));
+        Ok(())
+    }
+
+    #[test]
     fn timer_refresh_retains_completed_entry_allocations() -> Result<()> {
         let mut owner = SessionPresentation::new("session".into());
         owner.initialize(vec![

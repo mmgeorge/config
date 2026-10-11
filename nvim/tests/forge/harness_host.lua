@@ -91,7 +91,8 @@ local success, failure = xpcall(function()
   for row, line in ipairs(vim.api.nvim_buf_get_lines(state.transcript_buf, 0, -1, false)) do
     if line:find("Context compacted", 1, true) then
       assert(not compaction_row, "manual compaction created duplicate rows")
-      assert(line:find("manual", 1, true), "manual origin missing from compaction row")
+      assert(not line:find("manual", 1, true) and not line:find("automatic", 1, true),
+        "compaction row exposed the request origin")
       compaction_row = row
     end
   end

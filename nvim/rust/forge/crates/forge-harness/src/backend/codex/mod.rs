@@ -1371,6 +1371,7 @@ impl Backend for CodexBackend {
                 &mut output,
             )
             .await?;
+        output.metrics.context_usage = None;
         process
             .request(
                 "thread/compact/start",

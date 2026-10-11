@@ -285,7 +285,7 @@ buffer.close(details)
 local compacting = buffer.open("compaction-status", {})
 assert(buffer.apply_snapshot(compacting, {
   document = compacting.document, revision = 0, block = { {
-    id = "status", text = { "", "Compacting" },
+    id = "status", text = { "", "Compacting · 12s" },
     metadata = { status = { row = 1, animated = true }, target = {}, decoration = {}, fold = {}, editable_region = {} },
   } },
 }).kind == "Applied")

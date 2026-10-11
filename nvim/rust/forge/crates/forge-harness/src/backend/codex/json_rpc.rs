@@ -1046,7 +1046,7 @@ async fn normalize_event_in_workspace(
             output.metrics.context_usage = Some(context_usage.clone());
             let event = BackendEvent {
             received_at_ms: None,
-                address: None,
+                address: address.clone(),
                 turn_boundary: None,
                 kind: "context_usage".into(),
                 text: None,

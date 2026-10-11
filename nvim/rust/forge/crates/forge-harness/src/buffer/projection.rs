@@ -407,7 +407,10 @@ impl TimelineRenderer<'_> {
                 let text = match status {
                     SessionPhase::Idle => String::new(),
                     SessionPhase::Paused => "Paused".into(),
-                    SessionPhase::Compacting => "Compacting".into(),
+                    SessionPhase::Compacting { started_at_ms } => {
+                        let elapsed_seconds = self.now_ms.saturating_sub(*started_at_ms).max(0) / 1_000;
+                        format!("Compacting · {elapsed_seconds}s")
+                    }
                     SessionPhase::Finalizing { error, .. } => error.as_ref().map_or_else(
                         || "Saving exchange".into(),
                         |error| format!("Saving exchange failed · {error}"),
@@ -457,7 +460,7 @@ impl TimelineRenderer<'_> {
                     block.metadata.status = Some(StatusPresentation {
                         row: 1,
                         animated: matches!(status, SessionPhase::Working { .. }
-                            | SessionPhase::Compacting
+                            | SessionPhase::Compacting { .. }
                             | SessionPhase::RetryingPlanGeneration { .. } | SessionPhase::WaitingForAgent { .. }
                             | SessionPhase::Finalizing { error: None, .. }),
                         hint: match status {
@@ -1333,16 +1336,19 @@ impl TimelineRenderer<'_> {
             CompactionState::Unconfirmed => "Context compaction completion unconfirmed",
         };
         let mut heading = format!("◇ {label}");
-        if compaction.manual { heading.push_str(" · manual"); }
-        if let (Some(before), Some(after)) = (compaction.result.pre_compaction_tokens, compaction.result.post_compaction_tokens) {
+        let context_tokens = compaction.result.context_tokens_before.zip(compaction.result.context_tokens_after)
+            .or_else(|| compaction.result.before_context.as_ref().and_then(|context| context.current_tokens)
+                .zip(compaction.result.context_window.as_ref().and_then(|context| context.current_tokens)));
+        if let Some((before, after)) = context_tokens {
             heading.push_str(&format!(" · {} → {} tokens", token_display(before), token_display(after)));
         }
         if let (Some(started), Some(completed)) = (compaction.started_at_ms, compaction.completed_at_ms) {
             heading.push_str(&format!(" · {}s", completed.saturating_sub(started).max(0) / 1_000));
         }
         self.literal(id, &heading, None)?;
-        let section = self.begin_section(2);
         let mut details = Vec::new();
+        if let Some(count) = compaction.result.pre_compaction_tokens { details.push(format!("Conversation tokens before compaction: {count}")); }
+        if let Some(count) = compaction.result.post_compaction_tokens { details.push(format!("Conversation tokens after compaction: {count}")); }
         if let Some(model) = &compaction.result.model { details.push(format!("Compaction model: `{model}`")); }
         if let Some(instructions) = &compaction.result.custom_instructions { details.push(format!("Focus instructions: {instructions}")); }
         if let Some(status) = compaction.result.status_code { details.push(format!("HTTP status: {status}")); }
@@ -1389,13 +1395,17 @@ impl TimelineRenderer<'_> {
         ] {
             if let Some(count) = count { details.push(format!("{name}: {count}")); }
         }
+        let summary = compaction.result.summary_content.as_deref()
+            .filter(|summary| !summary.trim().is_empty());
+        if details.is_empty() && summary.is_none() {
+            return Ok(());
+        }
+        let section = self.begin_section(2);
         if !details.is_empty() {
             self.markdown(&format!("{id}:metrics"), &details.join("\n\n"), MarkdownRole::Detail)?;
         }
-        if let Some(summary) = &compaction.result.summary_content {
+        if let Some(summary) = summary {
             self.markdown(&format!("{id}:summary"), summary, MarkdownRole::Detail)?;
-        } else {
-            self.literal(&format!("{id}:summary"), "The provider did not expose a compacted summary.", None)?;
         }
         self.finish_section(section, id, true);
         Ok(())
@@ -2018,6 +2028,93 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn compaction_context_usage_survives_event_order_and_reload() -> anyhow::Result<()> {
+        use super::*;
+        use crate::backend::{Compaction, CompactionResult, CompactionState};
+        for usage_before_completion in [false, true] {
+            let mut exchange: Exchange = serde_json::from_value(serde_json::json!({
+                "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "prompt":"Work", "state":"running", "created_at_ms":0,
+                "attributed_matches_checkpoint":false, "node_list":[]
+            }))?;
+            let running = Compaction {
+                id: "operation".into(), thread_id: "provider".into(), state: CompactionState::Running,
+                manual: false, started_at_ms: None, completed_at_ms: None,
+                result: CompactionResult { context_tokens_before: Some(120_000), ..Default::default() },
+            };
+            exchange.observe_compaction(running.clone(), 1_000);
+            assert!(!exchange.observe_compaction_usage("different-provider", 900_000));
+            if usage_before_completion {
+                assert!(exchange.observe_compaction_usage("provider", 32_000));
+            }
+            let mut completed = running.clone();
+            completed.state = CompactionState::Completed;
+            completed.result = CompactionResult::default();
+            exchange.observe_compaction(completed, 16_000);
+            if !usage_before_completion {
+                let waiting = project_at(&TimelineEntry::Exchange {
+                    id: "exchange".into(), created_at_ms: 0,
+                    exchange: exchange.clone(), agent_by_id: HashMap::new(),
+                }, &WidthProfile::default(), 16_000)?;
+                assert!(!waiting.entry.block.iter().flat_map(|block| block.text.wire_rows())
+                    .any(|row| row.contains("→")));
+                assert!(exchange.observe_compaction_usage("provider", 32_000));
+            }
+            assert!(!exchange.observe_compaction_usage("provider", 64_000));
+            exchange.observe_compaction(running, 20_000);
+            let restored: Exchange = serde_json::from_value(serde_json::to_value(exchange)?)?;
+            let projected = project_at(&TimelineEntry::Exchange {
+                id: "exchange".into(), created_at_ms: 0, exchange: restored, agent_by_id: HashMap::new(),
+            }, &WidthProfile::default(), 20_000)?;
+            let header = projected.entry.block.iter().find(|block|
+                block.text.row(0).is_some_and(|row| row.contains("Context compacted"))).unwrap();
+            assert!(header.text.row(0).unwrap().contains("Context compacted · 120.0k → 32.0k tokens · 15s"));
+            assert!(header.metadata.fold.is_empty());
+            assert!(header.metadata.node.is_none());
+            assert_eq!(header.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "◇");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_fold_requires_reported_content() -> anyhow::Result<()> {
+        use super::*;
+        use crate::backend::{Compaction, CompactionResult, CompactionState};
+        for summary in [None, Some(""), Some(" \n\t")] {
+            for messages_removed in [None, Some(0)] {
+                let entry = TimelineEntry::SessionEvent {
+                    id: "compaction".into(), created_at_ms: 1_000,
+                    event: crate::timeline::SessionEventRecord {
+                        id: "compaction".into(), session_id: "session".into(), created_at_ms: 1_000,
+                        detail: SessionEventKind::Compaction { compaction: Compaction {
+                            id: "operation".into(), thread_id: "provider".into(),
+                            state: CompactionState::Completed, manual: true,
+                            started_at_ms: Some(1_000), completed_at_ms: Some(16_000),
+                            result: CompactionResult {
+                                summary_content: summary.map(str::to_owned), messages_removed,
+                                ..Default::default()
+                            },
+                        } },
+                    },
+                };
+                let projected = project_at(&entry, &WidthProfile::default(), 16_000)?;
+                let header = &projected.entry.block[0];
+                assert!(header.text.row(0).unwrap().contains("Context compacted · 15s"));
+                assert!(!header.text.row(0).unwrap().contains("manual"));
+                assert!(!header.text.row(0).unwrap().contains("automatic"));
+                assert_eq!(header.metadata.fold.is_empty(), messages_removed.is_none());
+                if messages_removed.is_none() {
+                    assert_eq!(projected.entry.block.len(), 1);
+                    assert!(header.metadata.node.is_none());
+                    assert_eq!(header.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text, "◇");
+                }
+                assert!(!projected.entry.block.iter().any(|block| block.id.0 == "compaction:summary"));
+            }
+        }
+        Ok(())
+    }
+
     #[test]
     fn compaction_keeps_its_position_summary_and_fold_after_reload() -> anyhow::Result<()> {
         use super::*;
@@ -3577,7 +3674,8 @@ mod tests {
         use forge_buffer::block::StatusHint;
         let cases = [
             (SessionPhase::Paused, "Paused", false, None),
-            (SessionPhase::Compacting, "Compacting", true, None),
+            (SessionPhase::Compacting { started_at_ms: 1_000 }, "Compacting · 2s", true, None),
+            (SessionPhase::Compacting { started_at_ms: 4_000 }, "Compacting · 0s", true, None),
             (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: None }, "Saving exchange", true, None),
             (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: Some("locked".into()) }, "Saving exchange failed · locked", false, None),
             (SessionPhase::WaitingForAgent { agent_count: 2 }, "Waiting for 2 agents", true, Some(StatusHint::Working)),

@@ -202,6 +202,15 @@ impl Exchange {
         }
     }
 
+    /// Retain fresh usage on the latest compaction without changing settled history.
+    pub(crate) fn observe_compaction_usage(&mut self, thread_id: &str, used: u64) -> bool {
+        let Some(compaction) = self.node_list.iter_mut().rev().find_map(|node| match node {
+            ExchangeNode::Compaction { compaction, .. } if compaction.thread_id == thread_id => Some(compaction),
+            _ => None,
+        }) else { return false };
+        compaction.observe_context_usage(used)
+    }
+
     /// Stop active compaction presentation when its provider execution ends without confirmation.
     pub(crate) fn unconfirm_compaction(&mut self, thread_id: &str, now_ms: i64) {
         for node in &mut self.node_list {

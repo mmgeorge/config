@@ -105,8 +105,12 @@ pub struct CompactionContext {
 
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 #[serde(default, rename_all = "camelCase")]
-/// Retains provider-reported results without inventing absent counts or summary text.
+/// Retains provider results and observed context usage without inventing absent values.
 pub struct CompactionResult {
+    /// Context meter tokens captured when compaction starts.
+    pub context_tokens_before: Option<u64>,
+    /// Fresh context meter tokens observed during or after compaction.
+    pub context_tokens_after: Option<u64>,
     /// Compaction model reported at operation start.
     pub model: Option<String>,
     /// Provider-reported context composition at operation start.
@@ -169,6 +173,17 @@ pub struct Compaction {
 }
 
 impl Compaction {
+    /// Record fresh context usage while running or awaiting the first completed reading.
+    pub(crate) fn observe_context_usage(&mut self, used: u64) -> bool {
+        if self.result.context_tokens_before.is_none()
+            || !matches!(self.state, CompactionState::Running | CompactionState::Completed)
+            || (self.state == CompactionState::Completed && self.result.context_tokens_after.is_some()) {
+            return false;
+        }
+        self.result.context_tokens_after = Some(used);
+        true
+    }
+
     /// Merge lifecycle replays without moving the row or reopening terminal history.
     pub(crate) fn observe(&mut self, mut update: Self, now_ms: i64) {
         if !matches!(
@@ -178,11 +193,17 @@ impl Compaction {
             && update.state == CompactionState::Running)
         {
             if self.state == update.state || update.state == CompactionState::Running {
+                update.result.context_tokens_before = self.result.context_tokens_before;
+                update.result.context_tokens_after = self.result.context_tokens_after;
                 self.result.retain_missing(update.result);
             }
             return;
         }
         update.started_at_ms = self.started_at_ms.or(update.started_at_ms);
+        update.result.context_tokens_before = self.result.context_tokens_before
+            .or(update.result.context_tokens_before);
+        update.result.context_tokens_after = update.result.context_tokens_after
+            .or(self.result.context_tokens_after);
         update.result.before_context = self
             .result
             .before_context
@@ -288,5 +309,10 @@ mod tests {
         assert_eq!(start.completed_at_ms, Some(400));
         assert_eq!(start.result.tokens_removed, Some(0));
         assert_eq!(start.result.summary_content.as_deref(), Some("Retained context"));
+        let mut replay = start.clone();
+        replay.state = CompactionState::Running;
+        replay.result.context_tokens_before = Some(800);
+        start.observe(replay, 700);
+        assert_eq!(start.result.context_tokens_before, None);
     }
 }

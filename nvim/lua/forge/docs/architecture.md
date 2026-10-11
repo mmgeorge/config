@@ -2543,10 +2543,19 @@ Completion replaces that node's state without moving it or creating assistant te
 Terminal replays cannot reopen the record. Later notifications can fill missing result fields
 without replacing confirmed evidence. A foreground provider turn ending before compaction
 confirmation records an unconfirmed outcome rather than leaving an active indicator indefinitely.
-While compaction runs, the shared renderer shows `Compacting` with the existing status spinner
-and suppresses its history row. A terminal outcome restores the ordinary workflow status and
-projects a collapsed compaction event whose details expose the actual summary and reported metrics. Absent provider fields remain
-absent, and Codex rows explicitly report unavailable summary text when opened. Exchange headers
+While compaction runs, the shared renderer shows `Compacting · Ns` with the existing status spinner
+and suppresses its history row. The shared activity timer refreshes elapsed whole seconds from
+the recorded compaction start. A terminal outcome restores the ordinary workflow status and
+projects a compaction event. Events with a summary or reported metrics have a collapsed detail fold.
+Events without details use a plain diamond marker and no fold. Event labels omit manual or automatic origin.
+The broker captures context-meter usage at compaction start and retains a fresh usage reading
+from the operation or its next update. Completed headings show the before/after token counts
+only when both readings exist. These readings survive lifecycle replays and session reloads,
+remain separate from provider conversation-token metrics, and stop changing once settled.
+Codex discards resume-time usage before requesting compaction so stale counts cannot become
+the after reading. Usage notifications retain their provider thread address.
+Absent provider fields remain absent
+without a placeholder summary. Exchange headers
 retain compaction counts and active, failed, or unconfirmed counts while activity details are folded.
 
 Copilot's session subscription remains alive after prompt completion through `Backend::compaction_stream`.
