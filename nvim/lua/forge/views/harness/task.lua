@@ -17,7 +17,9 @@ end
 ---@param action table
 ---@param refresh fun()
 ---@param settled fun(failure: string?)
-function M.transition(state, action, refresh, settled, admitted)
+---@param admitted? fun()
+---@param method? string
+function M.transition(state, action, refresh, settled, admitted, method)
   if state.host_error then notifications.error(state.host_error, "Harness task") return end
   local session_id = state.session.id
   local generation = client.host_generation()
@@ -84,7 +86,7 @@ function M.transition(state, action, refresh, settled, admitted)
     end
   end
   operation.receive = receive
-  client.request_for(session_id, "task.transition", action, receive)
+  client.request_for(session_id, method or "task.transition", action, receive)
   local function poll(owner)
     if operation.poll_owner ~= owner then return end
     if not current() or state.host_error then return end

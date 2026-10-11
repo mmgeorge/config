@@ -70,7 +70,8 @@ impl McpDiscovery {
                 return Ok(Vec::new());
             }
             for server in &mut self.servers {
-                if server.enabled {
+                if server.enabled && !matches!(server.status, McpStatus::Failed | McpStatus::NeedsAuthentication)
+                    && !(server.status == McpStatus::Unavailable && server.status_detail.is_some()) {
                     server.status = McpStatus::Loading;
                 }
             }
@@ -97,10 +98,24 @@ mod test {
     struct DiscoveryBackend {
         release: Notify,
         calls: AtomicUsize,
+        unavailable_reason: Option<&'static str>,
     }
 
     #[async_trait::async_trait]
     impl Backend for DiscoveryBackend {
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         fn descriptor(&self) -> BackendDescriptor {
             BackendDescriptor {
                 kind: BackendKind::Mock,
@@ -118,10 +133,9 @@ mod test {
         }
 
         async fn mcp_configuration(&self, _: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
-            Ok(vec![
-                server("working", McpStatus::Unavailable),
-                server("unwired", McpStatus::Unavailable),
-            ])
+            let mut working = server("working", McpStatus::Unavailable);
+            working.status_detail = self.unavailable_reason.map(str::to_owned);
+            Ok(vec![working, server("unwired", McpStatus::Unavailable)])
         }
 
         async fn mcp_list(&self, _: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
@@ -135,6 +149,7 @@ mod test {
 
     fn server(name: &str, status: McpStatus) -> McpDefinition {
         McpDefinition {
+            resource_id:None,
             name: name.into(),
             transport: "stdio".into(),
             enabled: true,
@@ -162,6 +177,7 @@ mod test {
         let backend = Arc::new(DiscoveryBackend {
             release: Notify::new(),
             calls: AtomicUsize::new(0),
+            unavailable_reason: None,
         });
         let mut discovery = McpDiscovery::default();
         discovery.snapshot(backend, request()).await.unwrap();
@@ -173,10 +189,24 @@ mod test {
     }
 
     #[tokio::test]
+    async fn known_credential_failure_stays_unavailable_while_other_servers_load() {
+        let backend = Arc::new(DiscoveryBackend {
+            release: Notify::new(), calls: AtomicUsize::new(0),
+            unavailable_reason: Some("credential reference is unset"),
+        });
+        let mut discovery = McpDiscovery::default();
+        let rows = discovery.snapshot(backend, request()).await.unwrap();
+        assert_eq!(rows[0].status, McpStatus::Unavailable);
+        assert_eq!(rows[0].status_detail.as_deref(), Some("credential reference is unset"));
+        assert_eq!(rows[1].status, McpStatus::Loading);
+    }
+
+    #[tokio::test]
     async fn cold_requests_share_discovery_and_preserve_individual_server_failures() {
         let backend = Arc::new(DiscoveryBackend {
             release: Notify::new(),
             calls: AtomicUsize::new(0),
+            unavailable_reason: None,
         });
         let mut discovery = McpDiscovery::default();
         for _ in 0..3 {

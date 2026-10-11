@@ -329,7 +329,8 @@ fn redact(value: &Value) -> Value {
     match value {
         Value::Object(object) => Value::Object(object.iter().map(|(key, value)| {
             let secret = matches!(key.to_ascii_lowercase().as_str(),
-                "authorization" | "api_key" | "apikey" | "access_token" | "refresh_token" | "password" | "secret");
+                "authorization" | "api_key" | "apikey" | "access_token" | "refresh_token" | "password" | "secret"
+                    | "mcp_servers" | "mcpservers");
             (key.clone(), if secret { Value::String("[redacted]".into()) } else { redact(value) })
         }).collect()),
         Value::Array(array) => Value::Array(array.iter().map(redact).collect()),
@@ -349,11 +350,15 @@ mod test {
         let trace = TraceStore::open(directory.path()).unwrap();
         trace.configure(true).unwrap();
         trace.record("session-a", "model.sent", json!({"params":{"prompt":"full prompt","authorization":"secret"}}));
+        trace.record("session-a", "model.sent", json!({"params":{"config":{"mcp_servers":{
+            "fixture":{"env":{"CUSTOM_NAME":"credential-value"},"http_headers":{"X-Custom":"header-value"}}
+        }}}}));
         trace.record("session-b", "model.received", json!({"text":"other conversation"}));
         let contents = std::fs::read_to_string(trace.session_status("session-a").path).unwrap();
         assert!(contents.contains("full prompt"));
         assert!(contents.contains("[redacted]"));
         assert!(!contents.contains("secret"));
+        assert!(!contents.contains("credential-value") && !contents.contains("header-value"));
         assert!(!contents.contains("other conversation"));
         trace.configure(false).unwrap();
         trace.record("session-a", "model.sent", json!({"text":"disabled"}));

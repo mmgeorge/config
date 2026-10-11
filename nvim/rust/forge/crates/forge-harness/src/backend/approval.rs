@@ -121,19 +121,34 @@ impl PermissionCoordinator {
         address: Option<crate::backend::ProviderAddress>,
         event_sink: Option<&BackendEventSink>,
     ) -> Result<ApprovalResolution> {
-        if execution_mode == PermissionMode::Yolo {
+        self.authorize_callback(execution_mode, false, request, address, event_sink).await
+    }
+
+    /// Preserve mandatory provider prompts even when ordinary approval handling bypasses prompts.
+    pub async fn authorize_callback(
+        &self,
+        execution_mode: PermissionMode,
+        forced: bool,
+        request: PermissionRequest,
+        address: Option<crate::backend::ProviderAddress>,
+        event_sink: Option<&BackendEventSink>,
+    ) -> Result<ApprovalResolution> {
+        if execution_mode == PermissionMode::Yolo && !forced {
             return Ok(ApprovalResolution::AllowOnce);
         }
-        let evaluation = self
+        let mut evaluation = self
             .store
             .read()
             .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
             .compiled()
             .evaluate(execution_mode, &request);
         match evaluation.decision {
-            PermissionDecision::Allow => return Ok(ApprovalResolution::AllowOnce),
+            PermissionDecision::Allow if !forced => return Ok(ApprovalResolution::AllowOnce),
             PermissionDecision::Deny => return Ok(ApprovalResolution::DenyOnce),
-            PermissionDecision::Ask => {}
+            PermissionDecision::Ask | PermissionDecision::Allow => {}
+        }
+        if forced && evaluation.pending_target_list.is_empty() {
+            evaluation.pending_target_list = request.target_list.clone();
         }
         let id = request.id.clone();
         let view = approval_view(&request, &evaluation);
@@ -1165,6 +1180,27 @@ mod test {
                 }]
             );
         }
+    }
+
+    #[tokio::test]
+    async fn mandatory_yolo_callback_retains_an_answerable_target() {
+        let directory = tempfile::tempdir().unwrap();
+        let coordinator = PermissionCoordinator::transient(directory.path()).unwrap();
+        let (sink, mut stream) = crate::backend::events::channel();
+        let waiting_coordinator = coordinator.clone();
+        let waiting = tokio::spawn(async move {
+            waiting_coordinator.authorize_callback(PermissionMode::Yolo, true, PermissionRequest {
+                id:"mandatory-review".into(), provider:"test".into(), reason:None,
+                target_list:vec![PermissionTarget::Write { path:"review.txt".into() }],
+            }, None, Some(&sink)).await.unwrap()
+        });
+        let event = tokio::time::timeout(std::time::Duration::from_secs(1), stream.recv()).await.unwrap().unwrap().unwrap();
+        let approval: ApprovalRequestView = serde_json::from_value(event.data).unwrap();
+        assert_eq!(approval.item_list.len(), 1);
+        coordinator.resolve(&approval.id, &[ApprovalAnswer {
+            item_id:approval.item_list[0].id.clone(),choice_id:"deny_once".into(),
+        }], None).await.unwrap();
+        assert_eq!(waiting.await.unwrap(), ApprovalResolution::DenyOnce);
     }
 
     #[tokio::test]

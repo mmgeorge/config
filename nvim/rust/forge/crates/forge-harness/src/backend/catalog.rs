@@ -67,6 +67,9 @@ impl BackendInput {
 /// Describes one provider skill exposed to Harness callers.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SkillDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Identifies the shared definition when the skill has an explicit source binding.
+    pub resource_id: Option<String>,
     pub name: String,
     pub description: String,
     pub enabled: bool,
@@ -98,6 +101,9 @@ pub struct McpToolDefinition {
 /// Describes one complete provider MCP row and its cached tool inventory.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct McpDefinition {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Identifies the shared definition independently of its provider-visible name.
+    pub resource_id: Option<String>,
     pub name: String,
     pub transport: String,
     pub enabled: bool,

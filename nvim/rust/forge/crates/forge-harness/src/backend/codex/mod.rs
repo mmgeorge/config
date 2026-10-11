@@ -22,11 +22,13 @@ mod json_rpc;
 mod process;
 mod text_generation;
 mod runtime;
+mod resources;
 mod security;
 mod turn_coordinator;
 
 use json_rpc::CodexJsonRpc;
 use runtime::CodexRuntime;
+use resources::CodexResources;
 use security::CodexSecurity;
 
 struct CodexConnection {
@@ -37,6 +39,9 @@ struct CodexConnection {
 /// Owns Codex app-server thread lifecycle, prompting, permission policy, and native fork.
 pub struct CodexBackend {
     runtime: CodexRuntime,
+    command: Vec<String>,
+    settings_root: Option<std::path::PathBuf>,
+    resource_by_session: Mutex<HashMap<String, Arc<CodexResources>>>,
     default_model: Mutex<Option<String>>,
     steering_by_session: Mutex<HashMap<String, SteeringLane>>,
     active_turn_by_session: Mutex<HashMap<String, CodexTurnState>>,
@@ -73,6 +78,7 @@ fn capability() -> BackendCapability {
         fast_mode: true,
         ultrafast_mode: true,
         permission_control: true,
+        background_terminals: true,
         execution_mode_list: vec![
             PermissionMode::Read,
             PermissionMode::Write,
@@ -92,7 +98,7 @@ impl CodexBackend {
     pub fn new(command: Vec<String>) -> Result<Self> {
         let permission_coordinator = PermissionCoordinator::transient(".")?;
         let trace = Arc::new(TraceStore::open(Path::new("."))?);
-        Self::new_with_permission_coordinator(command, permission_coordinator, trace)
+        Self::new_with_permission_coordinator(command, permission_coordinator, trace, None)
     }
 
     /// Return how many Codex app-server process generations this backend launched.
@@ -110,6 +116,7 @@ impl CodexBackend {
         command: Vec<String>,
         permission_coordinator: Arc<PermissionCoordinator>,
         trace: Arc<TraceStore>,
+        settings_root: Option<std::path::PathBuf>,
     ) -> Result<Self> {
         anyhow::ensure!(
             !command.is_empty(),
@@ -119,6 +126,9 @@ impl CodexBackend {
             runtime: CodexRuntime::new(
                 command.clone(),
             ),
+            command,
+            settings_root,
+            resource_by_session: Mutex::new(HashMap::new()),
             default_model: Mutex::new(None),
             steering_by_session: Mutex::new(HashMap::new()),
             active_turn_by_session: Mutex::new(HashMap::new()),
@@ -152,8 +162,9 @@ impl CodexBackend {
         event_sink: Option<BackendEventSink>,
     ) -> Result<CodexConnection> {
         let process_started = Instant::now();
-        let mut process = self
-            .runtime
+        let resources = self.resources(&Self::catalog_from_request(request)).await?;
+        let runtime = resources.as_ref().map(|resources|&resources.runtime).unwrap_or(&self.runtime);
+        let mut process = runtime
             .connect(
                 &request.workspace,
                 request.execution_mode,
@@ -183,6 +194,56 @@ impl CodexBackend {
                 },
             ],
         })
+    }
+
+    fn catalog_from_request(request: &BackendRequest) -> BackendCatalogRequest {
+        BackendCatalogRequest { harness_session_id:request.harness_session_id.clone(),
+            workspace:request.workspace.clone(), access:request.access.clone(), execution_mode:request.execution_mode,
+            backend_session_id:request.backend_session_id.clone() }
+    }
+
+    async fn resources(&self, request: &BackendCatalogRequest) -> Result<Option<Arc<CodexResources>>> {
+        let Some(root) = &self.settings_root else { return Ok(None); };
+        let mut resources = self.resource_by_session.lock().await;
+        if let Some(resources) = resources.get(&request.harness_session_id) { return Ok(Some(resources.clone())); }
+        let configured = Arc::new(CodexResources::new(root, request, self.command.clone())?);
+        resources.insert(request.harness_session_id.clone(), configured.clone());
+        Ok(Some(configured))
+    }
+
+    async fn configured_parameters(&self, mut parameter: Value, request: &BackendRequest,
+        process: &mut CodexJsonRpc, output: &mut BackendOutput) -> Result<Value> {
+        if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? {
+            let mut config = resources.configure(process,output,&request.workspace).await?;
+            if let Some(existing) = parameter.get("config").and_then(Value::as_object) {
+                config.as_object_mut().expect("resource configuration is an object").extend(existing.clone());
+            }
+            parameter["config"] = config;
+        }
+        Ok(parameter)
+    }
+
+    async fn load_thread(&self, process: &mut CodexJsonRpc, output: &mut BackendOutput,
+        request: &BackendRequest, ephemeral: bool, dynamic_tool: Vec<Value>) -> Result<String> {
+        let (method, parameter) = match &request.backend_session_id {
+            Some(thread) => ("thread/resume", json!({"threadId":thread,"cwd":request.workspace,
+                "config":{"model_reasoning_effort":request.effort},
+                "developerInstructions":request.system_message(),"serviceTier":request.service_tier})),
+            None => ("thread/start", json!({"cwd":request.workspace,"ephemeral":ephemeral,
+                "experimentalRawEvents":false,"historyMode":"legacy",
+                "developerInstructions":request.system_message(),"dynamicTools":dynamic_tool,
+                "serviceTier":request.service_tier})),
+        };
+        let parameter = Self::with_model(Self::secure_thread(parameter,request),&request.model);
+        let parameter = self.configured_parameters(parameter,request,process,output).await?;
+        let response = process.request(method,parameter,output).await?;
+        let thread = response.pointer("/thread/id").or_else(||response.get("threadId"))
+            .or_else(||response.get("thread_id")).and_then(Value::as_str).map(str::to_owned)
+            .or(request.backend_session_id.clone()).context("Codex thread response omitted thread id")?;
+        if let Some(resources) = self.resources(&Self::catalog_from_request(request)).await? {
+            resources.retain_thread(&thread).await;
+        }
+        Ok(thread)
     }
 
     async fn persistent_connection(
@@ -305,8 +366,12 @@ impl CodexBackend {
             return Ok(None);
         };
         let (mut process, mut output) = self.catalog_process(&request).await?;
-        Self::load_terminal_thread(&mut process, &mut output, &thread_id, &Self::catalog_backend_request(&request))
-            .await?;
+        let backend_request = Self::catalog_backend_request(&request);
+        if self.settings_root.is_some() {
+            self.load_thread(&mut process,&mut output,&backend_request,false,Vec::new()).await?;
+        } else {
+            Self::load_terminal_thread(&mut process, &mut output, &thread_id, &backend_request).await?;
+        }
         Ok(Some((process, output, thread_id)))
     }
 
@@ -386,6 +451,7 @@ impl CodexBackend {
             })
             .filter_map(|skill| {
                 Some(SkillDefinition {
+                    resource_id:None,
                     name: skill.get("name")?.as_str()?.to_owned(),
                     description: skill
                         .get("description")
@@ -571,6 +637,7 @@ impl CodexBackend {
                     .unwrap_or("unknown")
                     .to_owned();
                 Some(McpDefinition {
+                    resource_id:None,
                     name,
                     transport,
                     enabled,
@@ -864,6 +931,24 @@ impl CodexBackend {
 
 #[async_trait]
 impl Backend for CodexBackend {
+    async fn reconcile_settings(&self, request: BackendCatalogRequest, setting: &crate::settings::PortableSettings) -> Result<()> {
+        if self.settings_root.is_none() {
+            anyhow::ensure!(setting.skill.is_empty() && setting.mcp.is_empty(), "Codex resource configuration requires the Forge settings store");
+            return Ok(());
+        }
+        let next = Arc::new(CodexResources::new(self.settings_root.as_ref().expect("settings root checked"), &request, self.command.clone())?);
+        self.cleanup_execution(&request.harness_session_id).await?;
+        self.connection_by_session.lock().await.remove(&request.harness_session_id);
+        if let Some(resources) = self.resource_by_session.lock().await.remove(&request.harness_session_id) {
+            resources.runtime.shutdown().await?;
+        }
+        self.resource_by_session.lock().await.insert(request.harness_session_id.clone(),next);
+        let backend_request = Self::catalog_backend_request(&request);
+        let (mut process,mut output) = self.catalog_process(&request).await?;
+        self.load_thread(&mut process,&mut output,&backend_request,true,Vec::new()).await?;
+        Ok(())
+    }
+
     async fn generate_text(
         &self,
         request: BackendCatalogRequest,
@@ -959,6 +1044,9 @@ impl Backend for CodexBackend {
     }
 
     async fn shutdown(&self) -> Result<()> {
+        for (_, resources) in self.resource_by_session.lock().await.drain() {
+            resources.runtime.shutdown().await?;
+        }
         self.runtime.shutdown().await?;
         self.connection_by_session.lock().await.clear();
         self.steering_by_session.lock().await.clear();
@@ -1029,56 +1117,7 @@ impl Backend for CodexBackend {
                 })
             })
             .collect::<Vec<_>>();
-        let thread = match &request.backend_session_id {
-            Some(thread_id) => {
-                process
-                    .request(
-                        "thread/resume",
-                        Self::with_model(Self::secure_thread(
-                            json!({
-                                "threadId": thread_id,
-                                "cwd": request.workspace,
-                                "config": { "model_reasoning_effort": request.effort },
-                                "developerInstructions": request.system_message(),
-                                "serviceTier": request.service_tier
-                            }),
-                            &request,
-                        ), &request.model),
-                        &mut output,
-                    )
-                    .await?
-            }
-            None => {
-                process
-                    .request(
-                        "thread/start",
-                        Self::with_model(
-                            Self::secure_thread(
-                                json!({
-                                    "cwd": request.workspace,
-                                    "experimentalRawEvents": false,
-                                    "historyMode": "legacy",
-                                    "developerInstructions": request.system_message(),
-                                    "dynamicTools": dynamic_tool_list,
-                                    "serviceTier": request.service_tier
-                                }),
-                                &request,
-                            ),
-                            &request.model,
-                        ),
-                        &mut output,
-                    )
-                    .await?
-            }
-        };
-        let thread_id = thread
-            .pointer("/thread/id")
-            .or_else(|| thread.get("threadId"))
-            .or_else(|| thread.get("thread_id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned)
-            .or(request.backend_session_id.clone())
-            .context("Codex thread response omitted thread id")?;
+        let thread_id = self.load_thread(process, &mut output, &request, false, dynamic_tool_list).await?;
         output.backend_session_id = Some(thread_id.clone());
         let mut prompt = request_text.clone();
         if request.mode == PromptMode::GoalContinuation {
@@ -1108,9 +1147,10 @@ impl Backend for CodexBackend {
         }
         let mut input = vec![json!({ "type": "text", "text": prompt })];
         if let BackendInput::Skill { name, .. } = &request.input {
-            let skill = Self::skill_catalog(process, &mut output, &request.workspace, true)
-                .await?
-                .into_iter()
+            let catalog = if let Some(resources) = self.resources(&Self::catalog_from_request(&request)).await? {
+                resources.catalog.skill.clone()
+            } else { Self::skill_catalog(process, &mut output, &request.workspace, true).await? };
+            let skill = catalog.into_iter()
                 .find(|skill| skill.name == *name && skill.enabled && skill.user_invocable)
                 .with_context(|| format!("skill ${name} is unavailable or disabled"))?;
             let path = skill
@@ -1214,44 +1254,23 @@ impl Backend for CodexBackend {
     }
 
     async fn fork(&self, request: BackendForkRequest) -> Result<BackendForkResult> {
-        let source_request = request.source;
+        let mut source_request = request.source;
+        source_request.harness_session_id = request.target_harness_session_id.clone();
         let mut output = BackendOutput::default();
         let mut connection = self.connect(&source_request, &mut output, None).await?;
         let fork_started = Instant::now();
-        let result = match (
+        let (method, parameter) = match (
             source_request.backend_session_id.clone(),
             request.checkpoint_id.clone(),
         ) {
-            (Some(source), Some(last_turn_id)) => {
-                connection
-                    .process
-                    .request(
-                        "thread/fork",
-                        Self::fork_parameters(source, last_turn_id, &source_request),
-                        &mut output,
-                    )
-                    .await?
-            }
-            _ => {
-                connection
-                    .process
-                    .request(
-                        "thread/start",
-                        Self::with_model(
-                            Self::secure_thread(
-                                json!({
-                                    "cwd": source_request.workspace,
-                                    "historyMode": "legacy",
-                                }),
-                                &source_request,
-                            ),
-                            &source_request.model,
-                        ),
-                        &mut output,
-                    )
-                    .await?
-            }
+            (Some(source), Some(last_turn_id)) => ("thread/fork",
+                Self::fork_parameters(source, last_turn_id, &source_request)),
+            _ => ("thread/start", Self::with_model(Self::secure_thread(
+                json!({"cwd":source_request.workspace,"historyMode":"legacy"}),
+                &source_request), &source_request.model)),
         };
+        let parameter = self.configured_parameters(parameter,&source_request,&mut connection.process,&mut output).await?;
+        let result = connection.process.request(method,parameter,&mut output).await?;
         connection.timing.push(BackendTimingRecord {
             phase: "codex.thread_fork".into(),
             duration_ms: fork_started.elapsed().as_secs_f64() * 1000.0,
@@ -1263,6 +1282,9 @@ impl Backend for CodexBackend {
             .and_then(Value::as_str)
             .map(str::to_owned)
             .context("Codex fork response omitted thread id")?;
+        if let Some(resources) = self.resources(&Self::catalog_from_request(&source_request)).await? {
+            resources.retain_thread(&backend_session_id).await;
+        }
         let timing = connection.timing.clone();
         self.connection_by_session.lock().await.insert(
             request.target_harness_session_id,
@@ -1334,8 +1356,10 @@ impl Backend for CodexBackend {
             .await
     }
 
-    async fn active_session_id(&self) -> Option<String> {
-        self.active_session_id_for("").await
+    async fn cancel_session(&self, session_id: &str) -> Result<()> {
+        self.steering_lane(session_id).await.cleanup_execution().await?;
+        self.connection_by_session.lock().await.remove(session_id);
+        Ok(())
     }
 
     async fn active_session_id_for(&self, session_id: &str) -> Option<String> {
@@ -1358,19 +1382,7 @@ impl Backend for CodexBackend {
             ..BackendOutput::default()
         };
         let mut process = self.connect(&request, &mut output, None).await?.process;
-        process
-            .request(
-                "thread/resume",
-                Self::secure_thread(
-                    json!({
-                        "threadId": thread_id,
-                        "cwd": request.workspace
-                    }),
-                    &request,
-                ),
-                &mut output,
-            )
-            .await?;
+        self.load_thread(&mut process,&mut output,&request,false,Vec::new()).await?;
         output.metrics.context_usage = None;
         process
             .request(
@@ -1404,6 +1416,7 @@ impl Backend for CodexBackend {
     }
 
     async fn skill_list(&self, request: BackendCatalogRequest) -> Result<Vec<SkillDefinition>> {
+        if let Some(resources) = self.resources(&request).await? { return Ok(resources.catalog.skill.clone()); }
         let (mut process, mut output) = self.catalog_process(&request).await?;
         Self::skill_catalog(&mut process, &mut output, &request.workspace, true).await
     }
@@ -1414,6 +1427,7 @@ impl Backend for CodexBackend {
         name: &str,
         enabled: bool,
     ) -> Result<CatalogMutation> {
+        anyhow::ensure!(self.settings_root.is_none(), "Managed skill selection must use the shared settings operation");
         let (mut process, mut output) = self.catalog_process(&request).await?;
         let result = process
             .request(
@@ -1447,6 +1461,7 @@ impl Backend for CodexBackend {
     }
 
     async fn mcp_configuration(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
+        if let Some(resources) = self.resources(&request).await? { return Ok(resources.catalog.mcp.clone()); }
         let (mut process, mut output) = self.catalog_process(&request).await?;
         let config = process.request(
             "config/read",
@@ -1457,7 +1472,19 @@ impl Backend for CodexBackend {
     }
 
     async fn mcp_list(&self, request: BackendCatalogRequest) -> Result<Vec<McpDefinition>> {
+        let resources = self.resources(&request).await?;
+        let thread = if let Some(resources) = resources.as_ref() {
+            request.backend_session_id.clone().or(resources.thread().await)
+        } else { request.backend_session_id.clone() };
+        if resources.is_some() && thread.is_none() { return self.mcp_configuration(request).await; }
         let (mut process, mut output) = self.catalog_process(&request).await?;
+        if let Some(resources) = resources.as_ref() {
+            if resources.thread().await != thread {
+                let mut backend_request = Self::catalog_backend_request(&request);
+                backend_request.backend_session_id = thread.clone();
+                self.load_thread(&mut process,&mut output,&backend_request,true,Vec::new()).await?;
+            }
+        }
         let mut server_list = Vec::new();
         let mut cursor = None::<String>;
         let mut cursor_set = HashSet::new();
@@ -1465,7 +1492,7 @@ impl Backend for CodexBackend {
             let page = process
                 .request(
                     "mcpServerStatus/list",
-                    json!({ "threadId": request.backend_session_id,
+                    json!({ "threadId": thread,
                         "detail": "toolsAndAuthOnly", "cursor": cursor }),
                     &mut output,
                 )
@@ -1486,17 +1513,20 @@ impl Backend for CodexBackend {
                 "MCP inventory repeated a pagination cursor"
             );
         }
-        let config = process
+        let config = if let Some(resources) = resources.as_ref() {
+            json!({"config":resources.configure(&mut process,&mut output,&request.workspace).await?})
+        } else { process
             .request(
                 "config/read",
                 json!({ "cwd": request.workspace, "includeLayers": false }),
                 &mut output,
             )
-            .await?;
-        Ok(Self::parse_mcp_catalog(
+            .await? };
+        let parsed = Self::parse_mcp_catalog(
             &json!({ "data": server_list }),
             &config,
-        ))
+        );
+        Ok(resources.map(|resources|resources.mcp(parsed.clone())).unwrap_or(parsed))
     }
 
     async fn set_mcp_enabled(
@@ -1505,6 +1535,7 @@ impl Backend for CodexBackend {
         name: &str,
         enabled: bool,
     ) -> Result<CatalogMutation> {
+        anyhow::ensure!(self.settings_root.is_none(), "Managed MCP selection must use the shared settings operation");
         let restart_required = self.has_active_turn(&request.harness_session_id).await;
         let config_name = Self::quoted_config_segment(name);
         let (mut process, mut output) = self.catalog_process(&request).await?;
@@ -1980,6 +2011,7 @@ mod test {
                 vec!["unused".into()],
                 permission.clone(),
                 trace.clone(),
+                            None,
             )?;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -2104,6 +2136,10 @@ mod test {
             if !sends_started {
                 println!("ACKNOWLEDGED_TURN_FIXTURE:{}", serde_json::to_string(&rendered.entry.block)?);
             }
+            backend.cancel_session("another-session").await?;
+            assert!(backend.connection_by_session.lock().await.contains_key("session"));
+            backend.cancel_session("session").await?;
+            assert!(!backend.connection_by_session.lock().await.contains_key("session"));
             drop(backend);
             tokio::time::timeout(std::time::Duration::from_secs(2), server).await??;
         }
@@ -2124,6 +2160,7 @@ mod test {
                 vec!["unused".into()],
                 permission.clone(),
                 trace.clone(),
+                            None,
             )?;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -2269,6 +2306,7 @@ mod test {
             vec!["codex".into(), "app-server".into()],
             PermissionCoordinator::transient(fixture.path())?,
             Arc::new(TraceStore::open(fixture.path())?),
+                    None,
         )?;
         for clear in [false, true] {
             let mut control = Box::pin(backend.stop_goal_session("session", clear));

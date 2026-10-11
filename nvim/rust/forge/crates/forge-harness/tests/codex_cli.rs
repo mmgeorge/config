@@ -451,6 +451,7 @@ async fn broker_runs_the_configured_local_code_explorer_to_parent_completion() {
     )
     .unwrap();
     let mut broker = HarnessBroker::initialize(InitializeRequest {
+        config_dir: None,
         data_root: data_root.path().to_string_lossy().into_owned(),
         permission_file: None,
         workspace: repository.path().to_string_lossy().into_owned(),

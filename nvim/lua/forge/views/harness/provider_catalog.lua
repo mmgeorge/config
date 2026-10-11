@@ -62,26 +62,63 @@ function M.mcp(force, callback)
   request_catalog(mcp_cache, "backend.mcp", force, callback)
 end
 
----@param name string
----@param enabled boolean
----@param callback fun(result: table?, error: string?)
-function M.set_skill_enabled(name, enabled, callback)
+local function mutate(method, cache, name, enabled, callback, resource_id)
   local key = cache_key()
-  client.request("backend.skills.set_enabled", { name = name, enabled = enabled }, function(result, request_error)
-    skill_cache[key] = nil
-    callback(result, request_error)
+  client.request(method, { name = name, enabled = enabled, resource_id = resource_id }, function(result, request_error)
+    cache[key] = nil
+    if request_error or type(result) ~= "table" or not result.id then
+      callback(result, request_error)
+      return
+    end
+    local deadline = vim.uv.now() + 60000
+    local function inspect()
+      if cache_key() ~= key then
+        callback(nil, "The selected session changed. Configuration continues in its original session.")
+        return
+      end
+      client.request("settings.get", {}, function(snapshot, snapshot_error)
+        if snapshot_error then callback(nil, snapshot_error) return end
+        local application = snapshot and snapshot.application or {}
+        if application.operation_id == result.id and application.state == "applied" then
+          cache[key] = nil
+          callback({ id = result.id, name = name, enabled = enabled, restart_required = false }, nil)
+          return
+        end
+        if application.operation_id and application.operation_id ~= result.id then
+          callback(nil, "A newer configuration superseded this selection.")
+          return
+        end
+        if vim.tbl_contains({ "failed", "cancelled", "outcome_unknown", "superseded" }, application.state) then
+          client.request("task.operation", { operation_id = result.id }, function(operation, operation_error)
+            callback(nil, operation_error or (operation and operation.error) or "Configuration " .. application.state)
+          end)
+          return
+        end
+        if vim.uv.now() >= deadline then
+          callback(nil, "Configuration is still pending. Check the timeline for its outcome.")
+          return
+        end
+        vim.defer_fn(inspect, 100)
+      end)
+    end
+    inspect()
   end)
 end
 
 ---@param name string
 ---@param enabled boolean
 ---@param callback fun(result: table?, error: string?)
-function M.set_mcp_enabled(name, enabled, callback)
-  local key = cache_key()
-  client.request("backend.mcp.set_enabled", { name = name, enabled = enabled }, function(result, request_error)
-    mcp_cache[key] = nil
-    callback(result, request_error)
-  end)
+---@param resource_id string?
+function M.set_skill_enabled(name, enabled, callback, resource_id)
+  mutate("backend.skills.set_enabled", skill_cache, name, enabled, callback, resource_id)
+end
+
+---@param name string
+---@param enabled boolean
+---@param callback fun(result: table?, error: string?)
+---@param resource_id string?
+function M.set_mcp_enabled(name, enabled, callback, resource_id)
+  mutate("backend.mcp.set_enabled", mcp_cache, name, enabled, callback, resource_id)
 end
 
 function M.clear()

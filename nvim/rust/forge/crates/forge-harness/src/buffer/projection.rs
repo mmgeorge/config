@@ -1843,6 +1843,11 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
 
 fn session_event_text(event: &SessionEventKind) -> String {
     match event {
+        SessionEventKind::Configuration { state, field, reason, .. } => {
+            let mut text = format!("Settings {state}: {}",field.join(", "));
+            if let Some(reason) = reason { text.push_str(&format!(" — {reason}")); }
+            text
+        }
         SessionEventKind::Compaction { .. } => "Context compaction".into(),
         SessionEventKind::Renamed { name } if name.is_empty() => "Session name cleared".into(),
         SessionEventKind::Renamed { name } => format!("Session renamed to {name}"),

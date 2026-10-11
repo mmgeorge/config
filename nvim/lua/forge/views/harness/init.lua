@@ -145,6 +145,7 @@ function M.switch_backend(backend, destination)
   end
   local previous_backend = state.session.backend
   local previous_session_id = state.session.id
+  local previous_mode = state.session.execution_mode
   if backend == previous_backend then return end
   local initialize_options = destination.kind == "new" and { new_session_name = "" }
     or { session_id = destination.session_id }
@@ -156,6 +157,9 @@ function M.switch_backend(backend, destination)
         open_mode = "current",
         on_ready = function()
           state.switching_backend = false
+          if destination.kind == "new" and previous_mode and previous_mode ~= "read" then
+            controller.set_mode(previous_mode)
+          end
           controller.render()
           local saved, save_error = backend_preference.save(backend)
           if not saved then

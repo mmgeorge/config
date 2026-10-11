@@ -75,5 +75,17 @@ local old_conversation = requests[#requests]
 state.session = { id = "another-conversation" }
 old_conversation.reply({ state = "completed" })
 assert(settled == 5, "old conversation callback must not settle current state")
+state.session = { id = "import-conversation" }
+task.transition(state, { action = "configure", selected = { "import:fixture" } }, function() end,
+  function() settled = settled + 1 end, nil, "settings.import.apply")
+local imported = requests[#requests]
+assert(imported.method == "settings.import.apply", "import bypassed its durable mutation route")
+imported.reply(nil, "acknowledgement unavailable", { code = "outcome_unknown" })
+timers[#timers]()
+local inspection = requests[#requests]
+assert(inspection.method == "task.operation" and inspection.params.operation_id == imported.params.operation_id,
+  "unknown import acknowledgement replayed the settings mutation")
+inspection.reply({ state = "completed" })
+assert(settled == 6 and state.task_operation == nil)
 print("harness_tasks: passed")
 vim.cmd("qa!")

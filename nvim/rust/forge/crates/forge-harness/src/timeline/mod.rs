@@ -16,6 +16,17 @@ mod planning;
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum SessionEventKind {
+    /// Retains one configuration operation at a stable position throughout restart and resumption.
+    Configuration {
+        /// Identifies the durable task transition that owns cleanup and application.
+        operation_id: String,
+        /// Records application and resumption outcomes without creating model prompts.
+        state: String,
+        /// Names changed fields without retaining credentials or raw configuration.
+        field: Vec<String>,
+        /// Explains a failure or interruption when present.
+        reason: Option<String>,
+    },
     /// Retains an explicitly requested compaction without creating a user exchange.
     Compaction { compaction: crate::backend::Compaction },
     Renamed {

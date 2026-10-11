@@ -365,11 +365,18 @@ fn address_event(event: &mut BackendEvent, output: &BackendOutput) {
             .map(str::to_owned)
             .or_else(|| output.backend_session_id.clone());
         if let Some(thread_id) = thread_id {
-            let turn_id = event
-                .data
-                .pointer("/data/turnId")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
+            let native_turn_id = event.data.pointer("/data/turnId").and_then(Value::as_str);
+            let turn_id = native_turn_id.map(|native| {
+                if let Some(interaction) = event.data.pointer("/data/interactionId").and_then(Value::as_str) {
+                    return format!("{interaction}:{native}");
+                }
+                output.event.iter().rev().find(|previous| {
+                    previous.kind == "turn_started"
+                        && previous.data.pointer("/data/turnId").and_then(Value::as_str) == Some(native)
+                        && previous.address.as_ref().is_some_and(|address|address.thread_id == thread_id)
+                }).and_then(|previous|previous.address.as_ref().map(|address|address.turn_id.clone()))
+                    .unwrap_or_else(||native.to_owned())
+            })
                 .or_else(|| {
                     output.event.iter().rev().find_map(|previous| {
                         previous
@@ -654,6 +661,26 @@ fn unsigned_field(value: &Value, field_list: &[&str]) -> Option<u64> {
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn repeated_native_turn_numbers_keep_distinct_interaction_addresses() {
+        let mut address = Vec::new();
+        for interaction in ["first-prompt", "second-prompt"] {
+            let mut output = BackendOutput { backend_session_id:Some("same-session".into()), ..Default::default() };
+            CopilotEventDecoder.decode(&event("assistant.turn_start", serde_json::json!({
+                "turnId":"0", "interactionId":interaction
+            })), &mut output, None).await;
+            CopilotEventDecoder.decode(&event("assistant.message_delta", serde_json::json!({
+                "messageId":interaction, "deltaContent":"visible answer"
+            })), &mut output, None).await;
+            CopilotEventDecoder.decode(&event("assistant.turn_end", serde_json::json!({"turnId":"0"})), &mut output, None).await;
+            let started = output.event.iter().find(|event|event.kind == "turn_started").unwrap().address.clone().unwrap();
+            assert!(output.event.iter().all(|event|event.address.as_ref() == Some(&started)));
+            address.push(started);
+        }
+        assert_eq!(address[0].thread_id, address[1].thread_id);
+        assert_ne!(address[0].turn_id, address[1].turn_id);
+    }
+
     use super::*;
     use serde_json::json;
 

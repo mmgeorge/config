@@ -83,7 +83,7 @@ function M.open_skills(options)
       for _, skill in ipairs(current_skill_list) do
         if skill.user_invocable ~= false then
           option_list[#option_list + 1] = {
-            id = skill.name,
+            id = skill.resource_id or skill.name,
             value = skill,
             label = (skill.enabled and "✓ " or "× ") .. skill.name,
             detail = skill.description,
@@ -125,7 +125,7 @@ function M.open_skills(options)
                   current_skill_list = refreshed or {}
                   if picker.is_open(owner) then picker.update(spec()) end
                 end)
-              end)
+              end, skill.resource_id)
             end,
           },
         },
@@ -241,7 +241,7 @@ function M.open_mcp(options)
       local option_list = {}
       for _, definition in ipairs(current_mcp_list) do
         option_list[#option_list + 1] = {
-          id = definition.name,
+          id = definition.resource_id or definition.name,
           value = definition,
           label = mcp_icon(definition, loading_name, animation_index) .. " " .. definition.name,
           detail = table.concat({
@@ -292,7 +292,7 @@ function M.open_mcp(options)
                 end
                 if options.on_mutation then options.on_mutation(result or {}) end
                 refresh()
-              end)
+              end, definition.resource_id)
             end,
           },
           {

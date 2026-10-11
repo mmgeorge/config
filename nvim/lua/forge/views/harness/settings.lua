@@ -195,11 +195,12 @@ function M.open(state, host)
       if pending or not context.option then return end
       local id = context.option.id
       if id == "sandbox" or id == "write-access" or id == "windows-sandbox" then
-        if active.backend ~= "codex" and active.backend ~= "mock" then
+        local policy = access.policy(active)
+        local supported = active.backend == "codex" or active.backend == "mock"
+        if not supported and (id ~= "sandbox" or not policy.sandbox) then
           notifications.error("This provider does not expose sandbox configuration", "Harness access")
           return
         end
-        local policy = access.policy(active)
         if id == "sandbox" then policy.sandbox = not policy.sandbox
         elseif id == "write-access" then policy.write_access = policy.write_access == "workspace" and "full" or "workspace"
         else
@@ -249,6 +250,10 @@ function M.open(state, host)
     build_spec = function()
       local policy = access.policy(active)
       local supported = active.backend == "codex" or active.backend == "mock"
+      local provider_setup = (active.backend == "claude" or active.backend == "antigravity") and {
+        id = "provider-setup", label = "Provider setup",
+        columns = { "Provider setup", "Install / sign in", "Manage the ACP runtime and OAuth login" },
+      } or nil
       return {
         owner = "harness-config", host = host,
         page_list = { {
@@ -259,13 +264,16 @@ function M.open(state, host)
             { id = "default-write-permission", label = "Default write permission", columns = { "Default write permission", picker_field.render(active.default_write_permission or "write", true), "Applied to new goals and accepted plans" } },
             { id = "plan-permission", label = "Plan permission", columns = { "Plan permission", picker_field.render(type(active.plan_permission) == "string" and active.plan_permission or "Keep current", true), "Applied when starting a planning task" } },
             { id = "plan-revisions", label = "Auto-approve plan revisions", columns = { "Auto-approve plan revisions", picker_field.render(active.plan_auto_approve_revisions ~= false and "On" or "Off", true), "Accept validated execution revisions automatically" } },
-            { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true) or "Unsupported", "OS isolation, independent of approval mode" } },
+            { id = "sandbox", label = "Sandbox", columns = { "Sandbox", supported and picker_field.render(policy.sandbox and "Enabled" or "Disabled", true)
+              or (policy.sandbox and picker_field.render("Disable to connect", true) or "Unsupported"), "OS isolation, independent of approval mode" } },
             { id = "write-access", label = "Write access", columns = { "Write access", picker_field.render(policy.write_access, true), policy.sandbox and "Directories writable inside the sandbox" or "Inactive · sandbox disabled permits full access" } },
             { id = "writable-directories", label = "Additional writable directories", columns = { "Additional writable directories", tostring(#policy.writable_directory), "Enter to add, edit, or remove" } },
             { id = "windows-sandbox", label = "Windows sandbox", columns = { "Windows sandbox", picker_field.render(policy.windows_sandbox, true), "Windows only · MXC requires host support" } },
             { id = "logging", label = "Logging", columns = { "Logging", picker_field.render(status.enabled and "On" or "Off", true), "Save session log" } },
             { id = "provider", label = "Provider", columns = { "Provider", cli or "Unknown",
               require("forge.views.harness").backend_switch_available() and "Choose a new chat or resume a session" or "Finish pending work to switch" } },
+            { id = "native-import", label = "Import native configuration", columns = { "Import native configuration", "Preview / select", "Import skills or MCP definitions into Forge settings" } },
+            provider_setup,
           },
           footer = "←→ change setting  Enter change/select provider  q close",
         } },
@@ -274,6 +282,14 @@ function M.open(state, host)
           { id = "next-value", key = "<Right>", callback = function(context) toggle(context, 1) end },
         },
         on_confirm = function(result)
+          if result.option.id == "native-import" then
+            require("forge.views.harness.native_import").open(state, host)
+            return false
+          end
+          if result.option.id == "provider-setup" then
+            require("forge.views.harness.provider_setup").open({ host = host, session_id = session_id })
+            return false
+          end
           if result.option.id == "provider" then
             require("forge.views.harness.controller").select_backend()
             return false

@@ -15,6 +15,7 @@ pub mod rustdoc;
 pub(crate) mod declaration;
 pub mod service;
 pub mod session;
+pub mod settings;
 pub mod task;
 pub mod storage;
 pub mod timeline;

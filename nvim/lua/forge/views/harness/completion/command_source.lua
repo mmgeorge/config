@@ -13,10 +13,10 @@ local model_pins = require("forge.views.harness.model_pins")
 local provider_catalog = require("forge.views.harness.provider_catalog")
 local session = require("forge.session")
 
-local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
 
 local command_list = {
   { label = "/config", detail = "Configure Harness settings" },
+  { label = "/capabilities", detail = "Inspect supported and unsupported backend capabilities" },
   { label = "/log", detail = "Open the current session debug log" },
   { label = "/log open", detail = "Open the current session debug log" },
   { label = "/log on", detail = "Enable persistent Harness logging" },
@@ -121,7 +121,7 @@ end
 ---@return table[]
 local function effort_completion_list(row, start_character, end_character, allowed_effort_list)
   local result = {}
-  for _, effort in ipairs(allowed_effort_list or effort_list) do
+  for _, effort in ipairs(allowed_effort_list or {}) do
     result[#result + 1] = value_completion(
       effort,
       "Use " .. effort .. " reasoning effort",
@@ -292,7 +292,7 @@ function CommandSource:get_completions(_, callback)
   local model_name, model_effort_start = prefix:match("^%s*/model%s+(%S+)%s+()([^%s]*)$")
   if model_name and model_effort_start then
     self:request_model_list(function(model_list)
-      local allowed_effort_list = effort_list
+      local allowed_effort_list = {}
       for _, model in ipairs(model_list or {}) do
         if model.id == model_name and #(model.reasoning or {}) > 0 then
           allowed_effort_list = model.reasoning
@@ -331,11 +331,19 @@ function CommandSource:get_completions(_, callback)
   end
   local effort_start = prefix:match("^%s*/effort%s+()([^%s]*)$")
   if effort_start then
-    callback({
-      items = effort_completion_list(row, effort_start - 1, cursor_column),
-      is_incomplete_backward = false,
-      is_incomplete_forward = false,
-    })
+    self:request_model_list(function(model_list)
+      local selected = session.harness.session
+      local model_id = selected and (selected.resolved_model or selected.model)
+      local choice = {}
+      for _, model in ipairs(model_list or {}) do
+        if model.id == model_id or (model_id == "default" and model.is_default) then choice = model.reasoning or {} break end
+      end
+      callback({
+        items = effort_completion_list(row, effort_start - 1, cursor_column, choice),
+        is_incomplete_backward = false,
+        is_incomplete_forward = false,
+      })
+    end)
     return
   end
   if prefix:match("^%s*/effort%s+") then

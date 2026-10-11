@@ -18,7 +18,7 @@ use crate::trace::TraceStore;
 use anyhow::{Context, Result};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -27,6 +27,52 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async};
 
 const DYNAMIC_TOOL_RESPONSE_TIMEOUT: Duration = Duration::from_secs(30);
+
+#[derive(Default)]
+struct McpContext {
+    binding: HashMap<String, String>,
+    call: HashMap<String, Value>,
+}
+
+impl McpContext {
+    fn normalize(&mut self, message: &mut Value) {
+        let method = message.get("method").and_then(Value::as_str).unwrap_or_default().to_owned();
+        let Some(params) = message.get_mut("params") else { return; };
+        if params.pointer("/item/type").and_then(Value::as_str) == Some("mcpToolCall") {
+            if let Some(server) = params.pointer_mut("/item/server")
+                && let Some(name) = server.as_str().and_then(|name| self.binding.get(name)) {
+                *server = json!(name);
+            }
+            if let Some(id) = params.pointer("/item/id").and_then(Value::as_str) {
+                if method == "item/started" {
+                    self.call.insert(id.to_owned(), json!({
+                        "thread":params["threadId"], "turn":params["turnId"],
+                        "server":params["item"]["server"], "tool":params["item"]["tool"]
+                    }));
+                } else if method == "item/completed" {
+                    self.call.remove(id);
+                }
+            }
+        }
+        if method != "mcpServer/elicitation/request" { return; }
+        if let Some(server) = params.get_mut("serverName")
+            && let Some(name) = server.as_str().and_then(|name| self.binding.get(name)) {
+            *server = json!(name);
+        }
+        if let Some(meta) = params.get("_meta").cloned() { params["meta"] = meta; }
+        if params.pointer("/meta/codex_approval_kind").and_then(Value::as_str) != Some("mcp_tool_call") {
+            return;
+        }
+        let matching: Vec<_> = self.call.values().filter(|call| {
+            call["thread"] == params["threadId"] && call["turn"] == params["turnId"]
+                && call["server"] == params["serverName"]
+        }).collect();
+        if matching.len() == 1 && params.pointer("/meta/toolName").is_none()
+            && params.pointer("/meta/tool_name").is_none() {
+            params["meta"]["toolName"] = matching[0]["tool"].clone();
+        }
+    }
+}
 
 #[derive(Clone, Debug)]
 struct DynamicToolTraceContext {
@@ -172,6 +218,7 @@ pub struct CodexJsonRpc {
     plan_document: Option<PlanDocument>,
     control_runtime: Option<ControlToolRuntime>,
     accepted_control_invocation_key_set: HashSet<String>,
+    mcp: McpContext,
     permission_coordinator: Arc<PermissionCoordinator>,
     event_sink: Option<BackendEventSink>,
     activity_publication: bool,
@@ -202,6 +249,7 @@ impl CodexJsonRpc {
             plan_document: None,
             control_runtime: None,
             accepted_control_invocation_key_set: HashSet::new(),
+            mcp: McpContext::default(),
             permission_coordinator,
             event_sink,
             activity_publication: true,
@@ -221,12 +269,18 @@ impl CodexJsonRpc {
         self.execution_mode = execution_mode;
         self.event_sink = event_sink;
         self.accepted_control_invocation_key_set.clear();
+        self.mcp.call.clear();
         self.control_runtime = None;
     }
 
     /// Isolate preparation traffic until the current provider turn is admitted.
     pub fn set_activity_publication(&mut self, enabled: bool) {
         self.activity_publication = enabled;
+    }
+
+    /// Keep approval targets and timeline tool names in the shared resource namespace.
+    pub(super) fn set_mcp_bindings(&mut self, binding: HashMap<String, String>) {
+        self.mcp.binding = binding;
     }
 
     /// Seed provider-visible control validation from one broker-owned turn snapshot.
@@ -305,7 +359,7 @@ impl CodexJsonRpc {
             json!({ "bytes": encoded.len() }),
         );
         let message: Value = serde_json::from_str(&encoded)
-            .with_context(|| format!("decode backend JSON-RPC message: {encoded}"))?;
+            .context("decode backend JSON-RPC message")?;
         self.trace
             .record_ref(&self.session_id, "model.received", &message);
         Ok(message)
@@ -314,9 +368,10 @@ impl CodexJsonRpc {
     /// Publishes one consumed frame completely before processing another provider command.
     pub async fn publish_message(
         &mut self,
-        message: Value,
+        mut message: Value,
         output: &mut BackendOutput,
     ) -> Result<Value> {
+        self.mcp.normalize(&mut message);
         let method = message
             .get("method")
             .and_then(Value::as_str)
@@ -394,7 +449,7 @@ impl CodexJsonRpc {
 
     async fn write_encoded_message(&mut self, message: &Value, encoded: String) -> Result<()> {
         self.trace
-            .record_ref(&self.session_id, "model.sent", &message);
+            .record_ref(&self.session_id, "model.sent", message);
         self.socket
             .send(Message::Text(encoded.into()))
             .await
@@ -1929,7 +1984,8 @@ fn mcp_tool_title(item: &Value) -> Option<String> {
         .get("arguments")
         .cloned()
         .unwrap_or_else(|| Value::Object(Default::default()));
-    let arguments = redact_mcp_arguments(&arguments);
+    let mut arguments = redact_mcp_arguments(&arguments);
+    arguments.sort_all_objects();
     let arguments = serde_json::to_string(&arguments).ok()?;
     compact_tool_title(&format!("{server}.{tool}({arguments})"))
 }
@@ -2005,7 +2061,7 @@ fn sensitive_mcp_argument_key(key: &str) -> bool {
 fn format_mcp_text(text: &str) -> String {
     let text = strip_ansi_escapes::strip_str(text);
     serde_json::from_str::<Value>(&text)
-        .and_then(|value| serde_json::to_string_pretty(&value))
+        .and_then(|mut value| { value.sort_all_objects(); serde_json::to_string_pretty(&value) })
         .unwrap_or(text)
 }
 
@@ -2071,6 +2127,35 @@ fn first_text(value: &Value) -> Option<String> {
 
 #[cfg(test)]
 mod test {
+    #[test]
+    fn mcp_approval_uses_current_metadata_and_canonical_tool_identity() {
+        use super::*;
+        let mut context = McpContext::default();
+        context.binding.insert("native_alias".into(), "shared-server".into());
+        let mut started = json!({"method":"item/started", "params":{
+            "threadId":"thread", "turnId":"turn", "item":{
+                "type":"mcpToolCall", "id":"call", "server":"native_alias", "tool":"verify"
+            }
+        }});
+        context.normalize(&mut started);
+        assert_eq!(started["params"]["item"]["server"], "shared-server");
+        let request = json!({"method":"mcpServer/elicitation/request", "params":{
+            "threadId":"thread", "turnId":"turn", "serverName":"native_alias",
+            "_meta":{"codex_approval_kind":"mcp_tool_call"}
+        }});
+        let mut normalized = request.clone();
+        context.normalize(&mut normalized);
+        assert_eq!(normalized["params"]["meta"]["codex_approval_kind"], "mcp_tool_call");
+        assert_eq!(permission_from_provider("mcpServer/elicitation/request", &normalized, ".").target_list,
+            vec![crate::permissions::matcher::PermissionTarget::Mcp { target:"shared-server/verify".into() }]);
+        let mut completed = started.clone();
+        completed["method"] = json!("item/completed");
+        context.normalize(&mut completed);
+        let mut later = request;
+        context.normalize(&mut later);
+        assert!(later.pointer("/params/meta/toolName").is_none(), "completed calls cannot authorize later tools");
+    }
+
     #[tokio::test]
     async fn compaction_lifecycle_is_neither_assistant_text_nor_a_tool() {
         let mut output = super::BackendOutput::default();

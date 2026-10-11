@@ -30,6 +30,26 @@ local success, failure = xpcall(function()
   local source_id = session.harness.session.id
   local source_tab = vim.api.nvim_get_current_tabpage()
   local tab_count = #vim.api.nvim_list_tabpages()
+  local function request(method, params)
+    local result, failure, completed
+    client.request(method, params, function(value, request_error)
+      result, failure, completed = value, request_error, true
+    end)
+    assert(vim.wait(10000, function() return completed end, 10), method .. ' did not complete')
+    assert(not failure, failure)
+    return result
+  end
+  local preference = request('settings.get', {})
+  local operation = request('settings.update', {
+    operation_id = 'provider-transfer', expected_revision = preference.revision, scope = 'global',
+    desired = { shell = 'system', default_write_permission = 'yolo', plan_auto_approve_revisions = false },
+  })
+  assert(vim.wait(10000, function()
+    local observed = request('task.operation', { operation_id = operation.id })
+    return observed.state == 'completed' or observed.state == 'failed'
+  end, 10), 'portable settings did not settle')
+  assert(request('task.operation', { operation_id = operation.id }).state == 'completed')
+  assert(vim.wait(3000, function() return harness.backend_switch_available() end, 10))
   local function settle(backend)
     assert(vim.wait(10000, function()
       local state = session.harness
@@ -38,6 +58,11 @@ local success, failure = xpcall(function()
     assert(#errors == 0, table.concat(errors, '\n'))
     assert(vim.api.nvim_get_current_tabpage() == source_tab and #vim.api.nvim_list_tabpages() == tab_count)
     assert(session.harness_by_id[session.harness.session.id] == session.harness)
+    local transferred = request('settings.get', {})
+    assert(transferred.desired.shell == 'system' and transferred.desired.default_write_permission == 'yolo')
+    assert(transferred.desired.plan_auto_approve_revisions == false)
+    assert(session.harness.session.default_write_permission == 'yolo')
+    assert(session.harness.session.plan_auto_approve_revisions == false)
   end
   require('forge.views.harness.settings').open(session.harness, {
     window_list = { session.harness.transcript_win, session.harness.composer_win },
@@ -45,7 +70,12 @@ local success, failure = xpcall(function()
   })
   assert(vim.wait(3000, function() return picker.is_open('harness-config') end, 10))
   local config_picker = picker._state_for_test()
-  config_picker.spec.on_confirm({ option = config_picker.spec.page_list[1].option_list[2] })
+  local provider_option
+  for _, option in ipairs(config_picker.spec.page_list[1].option_list) do
+    if option.id == 'provider' then provider_option = option break end
+  end
+  assert(provider_option, 'configuration omitted provider selection')
+  config_picker.spec.on_confirm({ option = provider_option })
   local provider_picker = picker._state_for_test()
   for _, option in ipairs(provider_picker.spec.page_list[1].option_list) do
     if option.value == 'copilot' then provider_picker.spec.on_confirm({ option = option }) break end
@@ -70,6 +100,13 @@ local success, failure = xpcall(function()
   harness.switch_backend('copilot', { kind = 'resume', session_id = chosen_id })
   settle('copilot')
   assert(session.harness.session.id == chosen_id, 'resumed latest instead of the selected session')
+  for _, backend in ipairs({ 'claude', 'antigravity' }) do
+    harness.switch_backend(backend, { kind = 'new' })
+    settle(backend)
+    assert(session.harness.session.model == 'default', 'provider switch copied a foreign model')
+  end
+  harness.switch_backend('copilot', { kind = 'resume', session_id = chosen_id })
+  settle('copilot')
   local config = require('forge.infra.config')
   config.options.harness.backends.codex.command = {}
   harness.switch_backend('codex', { kind = 'new' })

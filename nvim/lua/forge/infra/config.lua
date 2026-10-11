@@ -197,6 +197,16 @@ M.defaults = {
         label = "Copilot CLI",
         detail = "GitHub Copilot SDK",
       },
+      claude = {
+        command = { "claude-agent-acp" },
+        label = "Claude Code",
+        detail = "Claude Code through ACP",
+      },
+      antigravity = {
+        command = { "agy_acp_server" },
+        label = "Antigravity",
+        detail = "Standalone Antigravity ACP server",
+      },
       mock = {
         command = { "mock" },
         label = "Mock",

@@ -125,7 +125,7 @@ end
 function PickerState.toggle_selected(state, spec)
   local page = PickerState.page(state, spec)
   local option = PickerState.selected_option(state, spec)
-  if not option then return end
+  if not option or option.disabled_reason or option.action == "submit" then return end
   local selected_set = state.selected_set_by_page[page.id] or {}
   local option_id = tostring(option.id or option.value or PickerState.selected_index(state, spec))
   selected_set[option_id] = not selected_set[option_id]

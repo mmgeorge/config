@@ -83,6 +83,9 @@ impl Clock for SystemClock {
 /// Represents initialization state supplied by the Neovim client.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct InitializeRequest {
+    #[serde(default)]
+    /// Resolves the dotfiles-owned global Rulesync catalog independently of workspace.
+    pub config_dir: Option<String>,
     pub data_root: String,
     #[serde(default)]
     pub permission_file: Option<String>,
@@ -277,6 +280,7 @@ impl BrokerRuntime {
             request.backend.clone(),
             Arc::clone(&permission_coordinator),
             Arc::clone(&trace),
+            data_root.clone(),
         )?);
         Ok(Arc::new(Self {
             repositories,
@@ -591,6 +595,7 @@ impl HarnessBroker {
         let requested_new_session_name = request.new_session_name.as_deref().map(str::trim);
         let force_new_session = requested_new_session_name.is_some()
             || request.lease_conflict_action.as_deref() == Some("new");
+        let mut created_session = false;
         let mut session = match request.session_id.as_deref().filter(|_| !force_new_session) {
             Some(session_id) => {
                 let selected = store
@@ -620,6 +625,7 @@ impl HarnessBroker {
                         store.acquire_session_lease(&session.id, &request.client_id, now_ms)?
                     }
                     None => {
+                        created_session = true;
                         let preference =
                             store.load_preference(&workspace, &request.backend.kind)?;
                         let session_id = Uuid::new_v4().to_string();
@@ -678,6 +684,11 @@ impl HarnessBroker {
             session.resolved_model = Some(session.model.clone());
         }
         session.updated_at_ms = now_ms;
+        let shared = crate::settings::SettingsStore::open(&data_root)?.get(&session.workspace,&session.id,&session.backend)?;
+        shared.desired.apply(&mut session,backend_descriptor.capability.native_compact)?;
+        if created_session {
+            shared.apply_provider_defaults(&mut session)?;
+        }
         store.lock_session(&session.id)?;
         store.save_session(&session)?;
         if store
@@ -1280,6 +1291,14 @@ impl HarnessBroker {
             | HarnessMethod::BackendSkills
             | HarnessMethod::BackendSkillsSetEnabled
             | HarnessMethod::BackendMcp
+            | HarnessMethod::BackendCapabilities
+            | HarnessMethod::BackendAuthenticate
+            | HarnessMethod::BackendSetup
+            | HarnessMethod::SettingsGet
+            | HarnessMethod::SettingsUpdate
+            | HarnessMethod::SettingsImportPreview
+            | HarnessMethod::SettingsImportApply
+            | HarnessMethod::SettingsReset
             | HarnessMethod::BackendMcpSetEnabled => {
                 anyhow::bail!("Harness control method requires the process coordinator")
             }
@@ -1608,10 +1627,28 @@ impl HarnessBroker {
                 let waiting = task.as_ref().is_some_and(|task| task.status == TaskStatus::Waiting);
                 let resume = action.get("resume").and_then(Value::as_bool).unwrap_or(false);
                 self.pause_task(false).await?;
+                if command == "configure" { self.configuration_progress("applying").await?; }
                 match command.as_str() {
                     "configure" => { self.configure_session(action.get("config").cloned().context("configuration is required")?).await?; },
                     "compact" => { self.compact_session().await?; },
                     _ => { self.select_execution_mode(json!({"mode":permission}))?; },
+                }
+                if command == "configure"
+                    && let Some(revision) = action.pointer("/config/settings_revision").and_then(Value::as_u64)
+                    && self.active_operation_id.is_some() {
+                    self.configuration_progress("verifying").await?;
+                    let operation = self.active_operation_id.as_deref().expect("active configuration operation");
+                    let settings = crate::settings::SettingsStore::open(&self.data_root)?;
+                    let snapshot = settings.get(&self.session.workspace, &self.session.id, &self.session.backend)?;
+                    anyhow::ensure!(snapshot.revision == revision, "settings changed before application confirmation");
+                    let mut effective = snapshot.desired;
+                    effective.access = Some(self.session.access.clone());
+                    effective.shell = Some(self.session.shell);
+                    effective.default_write_permission = Some(self.session.default_write_permission);
+                    effective.plan_permission = self.session.plan_permission;
+                    effective.plan_compact = Some(self.session.plan_compact);
+                    effective.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions);
+                    settings.confirm_application(&self.session.id, operation, revision, effective)?;
                 }
                 self.emit_backend_event(BackendEvent {
             received_at_ms: None,
@@ -1631,6 +1668,7 @@ impl HarnessBroker {
                     self.store.save_task(&task)?;
                     self.save_session()?;
                     if resume {
+                        if command == "configure" { self.configuration_progress("resuming").await?; }
                         let reason = match command.as_str() {
                             "permission" => format!("Permission changed to {}", permission.label()),
                             "configure" => "Configuration changed".into(),
@@ -1639,9 +1677,10 @@ impl HarnessBroker {
                         return Box::pin(self.transition_task(json!({"action":"resume","task_id":task.id,"reason":reason}))).await;
                     }
                 } else if resume {
+                    if command == "configure" { self.configuration_progress("resuming").await?; }
                     let previous = self.store.list_exchange(&self.session.id)?.pop().context("interrupted exchange is missing")?;
                     let prompt = format!("Continue the interrupted request using the current repository and completed tool results. Do not repeat completed actions. Original request: {}", previous.prompt);
-                    return self.run_interaction(prompt, PromptMode::Chat, Some(ExchangeAdmission::chat("Continue interrupted request".into()))).await;
+                    return self.resume_exchange(json!({"text":prompt})).await;
                 }
                 Ok((serde_json::to_value(self.snapshot()?)?, Vec::new()))
             }
@@ -2210,8 +2249,8 @@ impl HarnessBroker {
                     )
                     .map(|run| run.id.clone())
             });
-        let can_create =
-            (spawn_operation || activity_operation) && lifecycle.provider_thread_id.is_some();
+        let can_create = (spawn_operation || activity_operation || lifecycle.starts_child)
+            && lifecycle.provider_thread_id.is_some();
         if existing_id.is_none() && !can_create {
             return Ok(None);
         }
@@ -4882,6 +4921,7 @@ Planning continuation: turn {} of {}.",
                 .parent_thread_id
                 .as_deref()
                 .and_then(|thread| self.agent_registry.get_by_thread(thread))
+                .filter(|agent| !agent.is_primary())
                 .map(|agent| agent.id.clone());
             if lifecycle.starts_child
                 && let Some(parent_agent_id) = parent_agent_id
@@ -5254,7 +5294,7 @@ Planning continuation: turn {} of {}.",
         event: &mut Vec<SessionEvent>,
     ) -> Result<()> {
         // Configuration completion belongs to the Rust service. Other forwarded events follow the UI contract.
-        if backend_event.kind != "configuration_applied"
+        if !matches!(backend_event.kind.as_str(), "configuration_applied" | "configuration_progress")
             && !forge_protocol::contract::backend_visible(&backend_event.kind) {
             return Ok(());
         }
@@ -7062,13 +7102,41 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         Ok((serde_json::to_value(session)?, Vec::new()))
     }
 
-    async fn configure_session(&mut self, params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+    async fn configuration_progress(&mut self, state: &str) -> Result<()> {
+        let Some(operation_id) = self.active_operation_id.clone() else { return Ok(()); };
+        self.emit_backend_event(BackendEvent {
+            received_at_ms: None, address: None, turn_boundary: None,
+            kind: "configuration_progress".into(), text: None,
+            data: json!({"operation_id": operation_id, "state": state}),
+            activity: None, summary: None, task_update: None,
+        }, &mut Vec::new()).await
+    }
+
+    async fn configure_session(&mut self, mut params: Value) -> Result<(Value, Vec<SessionEvent>)> {
+        let mut resource_selection = None;
+        if params.get("settings_revision").is_some() {
+            let (root, _, _) = self.lease_identity();
+            let settings = crate::settings::SettingsStore::open(&root)?
+                .get(&self.session.workspace, &self.session.id, &self.session.backend)?;
+            anyhow::ensure!(params["settings_revision"].as_u64() == Some(settings.revision), "settings revision was superseded");
+            params["access"] = serde_json::to_value(settings.desired.access.clone().unwrap_or_default())?;
+            params["shell"] = serde_json::to_value(settings.desired.shell.unwrap_or_default())?;
+            params["default_write_permission"] = serde_json::to_value(settings.desired.default_write_permission.unwrap_or(PermissionMode::Write))?;
+            params["plan_permission"] = serde_json::to_value(settings.desired.plan_permission)?;
+            params["plan_compact"] = json!(settings.desired.plan_compact.unwrap_or(false) && self.capability.native_compact);
+            params["plan_auto_approve_revisions"] = json!(settings.desired.plan_auto_approve_revisions.unwrap_or(true));
+            let desired = serde_json::to_value(&settings.desired)?;
+            for (key, value) in desired.as_object().context("settings must be an object")? {
+                if !value.is_null() && key != "skill" && key != "mcp" && key != "plan_compact" { params[key] = value.clone(); }
+            }
+            resource_selection = Some(settings.desired);
+        }
         let mut configured = self.session.clone();
         let access = params.get("access")
             .map(|value| serde_json::from_value::<crate::session::AccessPolicy>(value.clone()))
             .transpose()?.map(crate::session::AccessPolicy::validate).transpose()?;
-        if access.is_some() {
-            anyhow::ensure!(self.session.backend == "codex" || self.session.backend == "mock",
+        if let Some(access) = &access {
+            anyhow::ensure!(!access.sandbox || self.session.backend == "codex" || self.session.backend == "mock",
                 "current backend does not support sandbox configuration");
         }
         if let Some(value) = params.get("shell") {
@@ -7212,12 +7280,36 @@ resolved decisions. Complete and submit the plan for this request:\n\n{}",
         configured.plan_compact = plan_compact;
         if let Some(enabled) = params.get("plan_auto_approve_revisions").and_then(Value::as_bool) { configured.plan_auto_approve_revisions = enabled; }
         if let Some(access) = access { configured.access = access; }
+        if let Some(selection) = resource_selection {
+            self.backend.reconcile_settings(BackendCatalogRequest {
+                harness_session_id:configured.id.clone(),workspace:configured.workspace.clone(),
+                access:configured.access.clone(),execution_mode:configured.execution_mode,
+                backend_session_id:configured.backend_session_id.clone(),
+            }, &selection).await?;
+        }
         let previous = std::mem::replace(&mut self.session, configured);
         if let Err(error) = self.save_session() { self.session = previous; return Err(error); }
         let update_model_preference = requested_model.is_some()
             || requested_effort.is_some()
             || params.get("context_window").is_some();
         self.save_preference(update_model_preference)?;
+        if params.get("settings_revision").is_none() {
+            let mut settings = crate::settings::SettingsStore::open(&self.data_root)?;
+            let snapshot = settings.get(&self.session.workspace,&self.session.id,&self.session.backend)?;
+            let mut portable = settings.layer_settings(crate::settings::SettingScope::Global,&self.session.workspace,&self.session.id)?;
+            let mut changed = false;
+            if params.get("access").is_some() { portable.access = Some(self.session.access.clone()); changed = true; }
+            if params.get("shell").is_some() { portable.shell = Some(self.session.shell); changed = true; }
+            if params.get("default_write_permission").is_some() { portable.default_write_permission = Some(self.session.default_write_permission); changed = true; }
+            if params.get("plan_permission").is_some() { portable.plan_permission = self.session.plan_permission; changed = true; }
+            if params.get("plan_compact").is_some() { portable.plan_compact = Some(self.session.plan_compact); changed = true; }
+            if params.get("plan_auto_approve_revisions").is_some() { portable.plan_auto_approve_revisions = Some(self.session.plan_auto_approve_revisions); changed = true; }
+            let revision = if changed { settings.update(snapshot.revision,crate::settings::SettingScope::Global,&self.session.workspace,&self.session.id,&portable)? } else { snapshot.revision };
+            if update_model_preference || params.get("service_tier").is_some() || params.get("plan_executor_enabled").is_some() {
+                settings.save_provider(revision,&self.session.backend,&json!({"model":self.session.model,"effort":self.session.effort,
+                    "context_window":self.session.context_window,"service_tier":self.session.service_tier,"plan_executor":self.session.plan_executor}))?;
+            }
+        }
         Ok((
             serde_json::to_value(&self.session)?,
             vec![self.event("session_configured", serde_json::to_value(&self.session)?)?],
@@ -8094,6 +8186,7 @@ mod test {
         std::fs::write(repository.path().join("lib.rs"),"pub struct Existing;\n").unwrap();
         let data = tempfile::tempdir().unwrap();
         let initialize = InitializeRequest {
+            config_dir: None,
             data_root:data.path().to_string_lossy().into_owned(),permission_file:None,
             workspace:repository.path().to_string_lossy().into_owned(),client_id:"design-test".into(),
             backend:BackendLaunch { kind:"mock".into(),command:vec!["mock".into()] },model:"mock-model".into(),effort:"medium".into(),session_id:None,new_session_name:None,goal_max_turns:20,lease_conflict_action:None,
@@ -8145,6 +8238,7 @@ mod test {
         broker.pause_goal().await.unwrap();
         assert_eq!(broker.snapshot().unwrap().goal_execution.unwrap().phase, crate::plan::PlanPhase::Checking);
         let mut resumed = InitializeRequest {
+            config_dir: None,
             data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
             workspace:repository.path().to_string_lossy().into_owned(), client_id:"design-test".into(),
             backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:Some(broker.session.id.clone()), new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
@@ -8232,6 +8326,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for StoppedExecutionBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(&self, _: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             if self.cancelled { return Err(anyhow::Error::new(TurnCancelled)) }
             anyhow::bail!("provider connection lost")
@@ -8249,7 +8361,7 @@ mod test {
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
             broker.backend = Arc::from(crate::backend::build(
                 BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
-                Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace),
+                Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace), broker.data_root.clone(),
             ).unwrap());
             broker.submit_prompt(json!({"text":"/plan add a reusable API"})).await.unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
@@ -8276,6 +8388,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for NoProgressExecutionBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             let context = request.control_context.unwrap();
             let plan_id = context.plan_document.as_ref().unwrap().plan_id.clone();
@@ -8292,6 +8422,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(InitializeRequest {
+            config_dir: None,
             data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
             workspace:repository.path().to_string_lossy().into_owned(), client_id:"guard-test".into(),
             backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:None, new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
@@ -8329,6 +8460,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for RevisionExecutionBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
             let context = request.control_context.context("missing execution context")?;
@@ -8372,6 +8521,7 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = InitializeRequest {
+                config_dir: None,
                 data_root:data.path().to_string_lossy().into_owned(), permission_file:None,
                 workspace:repository.path().to_string_lossy().into_owned(), client_id:"revision-test".into(),
                 backend:BackendLaunch { kind:"mock".into(), command:vec!["mock".into()] }, model:"mock-model".into(), effort:"medium".into(), session_id:None, new_session_name:None, goal_max_turns:20, lease_conflict_action:None,
@@ -8503,7 +8653,7 @@ mod test {
             let mut broker = planning_question_broker(repository.path(), data.path(), false);
             broker.backend = Arc::from(crate::backend::build(
                 BackendLaunch { kind: "mock".into(), command: vec!["mock".into()] },
-                Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace),
+                Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace), broker.data_root.clone(),
             ).unwrap());
             broker.submit_prompt(json!({"text":"/plan add a reusable API"})).await.unwrap();
             let plan = broker.snapshot().unwrap().active_plan.unwrap();
@@ -8550,6 +8700,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for SemanticExecutionBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime};
             let turn = self.turn.fetch_add(1, Ordering::SeqCst);
@@ -8715,6 +8883,22 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for SaturatingBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
@@ -8766,6 +8950,7 @@ mod test {
             let data = tempfile::tempdir().unwrap();
             let mut broker = HarnessBroker::initialize_with_clock(
                 InitializeRequest {
+                    config_dir: None,
                     data_root: data.path().to_string_lossy().into_owned(),
                     permission_file: None,
                     workspace: repository.path().to_string_lossy().into_owned(),
@@ -8819,6 +9004,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -8905,6 +9091,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for RestartBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
@@ -9040,6 +9244,20 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for CleanupRetryBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
@@ -9345,6 +9563,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for FailingBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -9368,6 +9604,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for InvalidControlOutputBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             _request: BackendRequest,
@@ -9412,6 +9666,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for ParentBoundaryBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -9511,6 +9783,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for PlanDiscussionBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(&self, request: BackendRequest, _: Option<BackendEventSink>)
             -> Result<crate::backend::BackendOutput> {
             use crate::control_tools::{ControlToolInvocation, ControlToolRuntime, apply_invocation};
@@ -9603,7 +9893,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = planning_question_broker(repository.path(), data.path(), false);
         broker.backend = crate::backend::build(broker.backend_launch.clone(),
-            Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace)).unwrap().into();
+            Arc::clone(&broker.permission_coordinator), Arc::clone(&broker.trace), broker.data_root.clone()).unwrap().into();
         broker.submit_prompt_inner(json!({"text":"/plan revise the API"})).await.unwrap();
         let before = broker.snapshot().unwrap().active_plan.unwrap();
         let thread = broker.session.backend_session_id.clone();
@@ -9669,6 +9959,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for MutableQuestionBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -9758,6 +10066,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for RepeatedQuestionBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -9815,6 +10141,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for RetryPlanBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -9848,6 +10192,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for RepeatedPlanEditBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -9888,6 +10250,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for PlanningQuestionBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -9967,6 +10347,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for NestedWriteBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -10133,6 +10531,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for TaskUpdateBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(
             &self,
             request: BackendRequest,
@@ -10211,6 +10627,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
@@ -10249,6 +10666,7 @@ mod test {
         drop(broker);
         let next = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
@@ -10372,6 +10790,7 @@ mod test {
     ) -> HarnessBroker {
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data_root.to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.to_string_lossy().into_owned(),
@@ -10441,6 +10860,32 @@ mod test {
 
         assert!(broker.agent_registry.list().is_empty());
         assert!(event.is_empty());
+    }
+
+    #[tokio::test]
+    async fn explicit_native_spawn_flags_create_durable_agent_identity() {
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let lifecycle = AgentLifecycleEvent {
+            operation:"subagent_spawned".into(), starts_child:true,
+            parent_thread_id:Some("root".into()), provider_thread_id:Some("native-child".into()),
+            turn_id:Some("native-child-turn".into()), definition:Some("Reviewer".into()),
+            nickname:Some("Review worker".into()), task:Some("Inspect the selected change".into()),
+            status:AgentExecutionState::Running,
+        };
+        let mut events = Vec::new();
+        let spawned = broker.apply_agent_lifecycle(&BackendEvent { received_at_ms:None,
+            address:None, turn_boundary:None, kind:"agent_lifecycle".into(), text:None,
+            data:serde_json::to_value(lifecycle).unwrap(), activity:None, summary:None, task_update:None },
+            Some("parent-exchange"), &mut events).await.unwrap().unwrap();
+        let saved = broker.store.list_agent_run(&broker.session.id).unwrap();
+        let child = saved.iter().filter(|agent| !agent.is_primary()).collect::<Vec<_>>();
+        assert_eq!(child.len(), 1);
+        assert_eq!(child[0].id, spawned.id);
+        assert_eq!(child[0].provider_thread_id.as_deref(), Some("native-child"));
+        assert_eq!(broker.agent_registry.execution(&spawned.id).unwrap().parent_exchange_id.as_deref(), Some("parent-exchange"));
+        assert!(!events.is_empty());
     }
 
     #[tokio::test]
@@ -11265,6 +11710,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -11463,6 +11909,7 @@ mod test {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let initialize = |client_id: &str, name: &str| InitializeRequest {
+            config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
             permission_file: None,
             workspace: repository.path().to_string_lossy().into_owned(),
@@ -11502,6 +11949,7 @@ mod test {
         let other_workspace = repository();
         let data = tempfile::tempdir().unwrap();
         let mut request = InitializeRequest {
+            config_dir: None,
             data_root: data.path().to_string_lossy().into_owned(),
             permission_file: None,
             workspace: workspace.path().to_string_lossy().into_owned(),
@@ -11551,6 +11999,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let initialize =
             |client_id: &str, lease_conflict_action: Option<String>| InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -11696,6 +12145,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -11798,6 +12248,7 @@ mod test {
         drop(broker);
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -11849,6 +12300,7 @@ mod test {
         let resumed_session_id = session["id"].as_str().expect("new session id").to_owned();
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -11889,11 +12341,61 @@ mod test {
     }
 
     #[tokio::test]
+    async fn canonical_provider_defaults_apply_to_new_conversations_without_changing_resumes() {
+        let other_repository = repository();
+        let repository = repository();
+        let data = tempfile::tempdir().unwrap();
+        let request = InitializeRequest {
+            config_dir: None,
+            data_root: data.path().to_string_lossy().into_owned(),
+            permission_file: None,
+            workspace: repository.path().to_string_lossy().into_owned(),
+            client_id: "provider-default-test".into(),
+            backend: BackendLaunch { kind: "codex".into(), command: vec!["codex".into(), "app-server".into()] },
+            model: "original-model".into(),
+            effort: "medium".into(),
+            session_id: None,
+            new_session_name: None,
+            goal_max_turns: 20,
+            lease_conflict_action: None,
+        };
+        let initial = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(100))).unwrap();
+        let original_id = initial.session.id.clone();
+        let mut settings = crate::settings::SettingsStore::open(data.path()).unwrap();
+        settings.save_provider(0, "codex", &json!({
+            "model": "preferred-model", "effort": "high", "context_window": "long_context", "service_tier": "fast"
+        })).unwrap();
+        drop(initial);
+
+        let mut resumed = HarnessBroker::initialize_with_clock(request.clone(), Box::new(FixedClock(200))).unwrap();
+        assert_eq!(resumed.session.id, original_id);
+        assert_eq!(resumed.session.model, "original-model");
+        let created = resumed.dispatch(Request { id: 1, method: "session.new".into(), params: json!({}) }).await;
+        let child = &created.response.result().unwrap()["session"];
+        assert_eq!(child["model"], "preferred-model");
+        assert_eq!(child["effort"], "high");
+        assert_eq!(child["context_window"], "long_context");
+        assert_eq!(child["service_tier"], "fast");
+        assert_eq!(child["execution_mode"], "read");
+
+        let fresh = HarnessBroker::initialize_with_clock(InitializeRequest {
+            workspace: other_repository.path().to_string_lossy().into_owned(),
+            ..request
+        }, Box::new(FixedClock(300))).unwrap();
+        assert_eq!(fresh.session.model, "preferred-model");
+        assert_eq!(fresh.session.resolved_model.as_deref(), Some("preferred-model"));
+        assert_eq!(fresh.session.effort, "high");
+        assert_eq!(fresh.session.context_window.as_deref(), Some("long_context"));
+        assert_eq!(fresh.session.service_tier, crate::backend::ServiceTier::Fast);
+    }
+
+    #[tokio::test]
     async fn rejects_inline_model_effort_and_mode_values_outside_backend_capabilities() {
         let repository = repository();
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -11950,6 +12452,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12021,6 +12524,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12063,6 +12567,7 @@ mod test {
 
         let restarted = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12870,6 +13375,7 @@ mod test {
         ).unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -12926,6 +13432,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for NativeContinuationBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(&self, _request: BackendRequest, sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             use crate::backend::{ProviderAddress, TurnBoundary};
             use crate::backend::usage::{TokenUsage, UsageUpdate};
@@ -13055,6 +13579,24 @@ mod test {
 
     #[async_trait::async_trait]
     impl Backend for NativeSettlementBackend {
+        fn descriptor(&self) -> crate::backend::BackendDescriptor {
+            crate::backend::BackendDescriptor { kind: crate::backend::BackendKind::Mock, label: "Mock CLI".into(),
+                capability: crate::backend::mock_capability() }
+        }
+
+        async fn shutdown(&self) -> Result<()> { Ok(()) }
+
+        async fn cleanup_execution(&self, _session_id: &str) -> Result<()> {
+            anyhow::bail!("backend cannot confirm execution cleanup")
+        }
+
+        async fn cancel_session(&self, _session_id: &str) -> Result<()> { Ok(()) }
+
+        async fn has_active_turn(&self, _session_id: &str) -> bool { false }
+
+        async fn active_session_id_for(&self, _session_id: &str) -> Option<String> { None }
+
+
         async fn prompt_stream(&self, request: BackendRequest, event_sink: Option<BackendEventSink>) -> Result<crate::backend::BackendOutput> {
             let mut output = self.inner.prompt_stream(request, event_sink).await?;
             output.evidence.native_state = Some(self.state);
@@ -13074,6 +13616,7 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = || InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(), permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
                 client_id: "native-settlement-test".into(),
@@ -13125,6 +13668,7 @@ mod test {
             let repository = repository();
             let data = tempfile::tempdir().unwrap();
             let initialize = || InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13196,6 +13740,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13242,6 +13787,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13284,6 +13830,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13355,6 +13902,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: workspace.path().to_string_lossy().into_owned(),
@@ -13391,6 +13939,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13466,6 +14015,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13540,6 +14090,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),
@@ -13638,6 +14189,7 @@ mod test {
         let data = tempfile::tempdir().unwrap();
         let mut broker = HarnessBroker::initialize_with_clock(
             InitializeRequest {
+                config_dir: None,
                 data_root: data.path().to_string_lossy().into_owned(),
                 permission_file: None,
                 workspace: repository.path().to_string_lossy().into_owned(),

@@ -25,7 +25,7 @@ pub fn prepare_new_session(
     );
     let preference = store.load_preference(&source.workspace, &source.backend)?;
     let session_id = Uuid::new_v4().to_string();
-    let child = HarnessSession {
+    let mut child = HarnessSession {
         primary_agent_id: HarnessSession::primary_agent_id(&session_id),
         id: session_id,
         name: params
@@ -64,6 +64,9 @@ pub fn prepare_new_session(
         native_compact,
         context_usage: None,
     };
+    let shared = crate::settings::SettingsStore::open(data_root)?.get(&child.workspace,&child.id,&child.backend)?;
+    shared.desired.apply(&mut child,native_compact)?;
+    shared.apply_provider_defaults(&mut child)?;
     store.save_session(&child)?;
     Ok(child)
 }

@@ -666,7 +666,7 @@ forge/
 │   ├── builder.lua            Manual build paths and process-owned executable copies
 │   ├── client.lua             Long-lived JSONL process, request correlation, events, generation guards
 │   ├── protocol.lua           JSONL request/message codec
-│   └── backends/              Lua launch descriptors only: Codex app-server, Copilot SDK, and test mock
+│   └── backends/              Lua launch descriptors for Codex, Copilot, ACP agents, and the test mock
 │
 ├── infra/                    Cross-cutting leaves
 │   ├── config.lua             Config schema + defaults + setup merge (keymaps, perf, lookup mode)
@@ -1049,9 +1049,11 @@ same geometry and focus contract without duplicating popup mechanics.
 Configuration pickers never depend on the serialized provider-turn request lane to become visible.
 Harness resolves and caches backend model metadata when the view activates, then `/model` opens from
 that presentation cache even while a provider turn runs. Model, effort, service-tier, backend, and
-execution-mode selections continue through their normal mutation owners. Configuration and backend
-changes queue for the next safe boundary, while execution mode retains its active-turn restart
-contract.
+execution-mode selections continue through their normal mutation owners. Configuration changes
+interrupt active work immediately, collect the current execution, apply and verify the requested
+revision, and resume the same exchange when its task remains active. Durable timeline events report
+interruption, application, verification, and resume. Provider changes require idle work and an
+explicit destination chat. Failed provider startup restores the source backend and session.
 
 `/fast` and `/ultrafast` select mutually exclusive service tiers. Repeating the selected command
 returns to standard processing. The session, workspace preference, fork, and backend request share
@@ -1065,9 +1067,12 @@ retain their normal failure path when a model or account cannot use the requeste
 `/skills` toggles future skill eligibility and inserts enabled `$skill` selectors, while the completion
 source advertises only enabled user-invocable skills at the first non-whitespace token.
 
-`/mcp` renders each complete provider definition with transport, token attribution, lifecycle state,
-and its cached tools. Copilot applies MCP changes to its live SDK session. Codex interrupts an active
-turn, writes effective app-server config, confirms refreshed status, then resumes that interaction.
+`/mcp` renders each provider definition with transport, reported token attribution, lifecycle state,
+and cached tools. Resource toggles identify a canonical shared source and persist a revision before
+task transition admission. The client waits for the applied revision instead of treating admission as
+successful application. Unknown native resources require explicit import before mutation. Resource
+configuration does not write native provider settings. ACP exposes configured selection separately
+from server readiness because the protocol does not provide a server-status inventory.
 
 The `/undo` specialization loads the active session's durable interaction records and lists
 checkpointed complete, failed, or cancelled interactions newest first. Selecting a record opens a
@@ -1967,10 +1972,165 @@ backend turn completes
 The feature-first Rust crate lives at `nvim/rust/forge/crates/forge-harness`. Its directories
 name capabilities rather than layers: `broker`, `session`, `plan`, `goal`, `exchange`, `turn`, `timeline`,
 `checkpoint`, `backend`, `storage`, `workspace`, `protocol`, and `control_tools`. `Backend` defines
-the complete provider contract once, while `CodexBackend` and `CopilotBackend` own their private
+the complete provider contract once, while `CodexBackend`, `CopilotBackend`, and `AcpBackend` own their private
 transports and expose capability values that drive broker and editor behavior. `CodexJsonRpc`
 remains private to the Codex implementation. `CopilotEventDecoder` remains private to the native
 Copilot SDK implementation. Consumer-owned traits stay beside the feature that consumes them.
+
+`AcpBackend` owns one stable ACP v1 connection and collected process tree per Harness root.
+Claude Code uses the published Claude ACP adapter. Antigravity uses its standalone ACP server.
+The official Rust ACP SDK frames transport requests and dispatches permission callbacks independently
+of pending prompts. Harness control tools use a required, private loopback MCP endpoint. Its connection
+tasks share the endpoint lifetime and admit at most 16 connections, with 8 KiB headers and 1 MiB bodies.
+Provider restart retains the native conversation identity and reloads that conversation. Failure to
+load it fails configuration rather than creating replacement history.
+
+ACP tool updates merge by native tool-call identity, so sparse completion notifications retain
+their original title, category, and content. Structured diff content becomes a `ProviderChangeSet`
+with unified diffs from the provider's reported before and after text. A null before value identifies
+a new file. Missing or invalid baselines do not fabricate a file change. Diff matching shares a
+250-millisecond deadline per notification, after which the diff algorithm uses its valid coarse result.
+Completed tool changes enter the existing exchange and timeline projections without reading the
+workspace to reconstruct a provider baseline.
+Antigravity edit tools can report completion without structured diff content, so `/capabilities`
+marks provider file diffs as limited. Forge still records the completed file tool and retains its
+independent workspace checkpoint review.
+Tool output uses explicit text content when available and otherwise retains ACP `rawOutput`.
+Antigravity command results retain their combined output and exit code without changing the
+provider's completed status. Structured results and provider error text enter durable tool history.
+Advertised ACP child sessions enter the shared agent registry through structured spawn and state
+updates. Each native child generation receives one normalized Harness turn identity. Child message,
+reasoning, and tool events route by their ACP session identity into that child's exchange, while
+unknown or completed child content never reaches the root transcript. Nested children retain their
+parent session. Child approval callbacks carry the child's execution address. Child model, command,
+usage, and compaction metadata cannot replace the root session's metadata. A prompt admits at most
+256 child sessions and clears its routing map on the next prompt. When the root prompt returns,
+unclosed children become interrupted, with nested children finalized before their parents.
+`/capabilities` reports child observation as limited because this boundary observes active
+prompts and does not expose independent child control or background observation.
+
+`AcpRuntime` resolves explicit commands and pinned Forge-managed installations. `/config` exposes
+Provider setup for Claude and Antigravity. Installation writes into a temporary directory under
+`provider-runtime`, validates the expected executable, then publishes the version directory atomically.
+An OS file lock excludes concurrent installers. Failed installation preserves existing versions.
+Claude uses its pinned npm package and requires Node.js 22 or newer. Antigravity uses Google's
+platform-specific archive with bounded download and extraction, rejecting escaping paths and symlinks.
+Neither installer changes global CLI installations or shell configuration.
+Setup and authentication hold session execution and cleanup admission, so they reject active work.
+The setup handshake advertises terminal authentication support. Claude OAuth runs the advertised
+CLI in a Neovim terminal, while Antigravity OAuth uses its ACP authentication request. Terminal
+success refreshes the provider connection without creating a model conversation. Login failures and
+cancellation release the editor configuration lock, and sign-in has a 120-second timeout.
+
+Claude sessions use strict MCP configuration and session-scoped native ask rules. Forge evaluates
+callbacks through `PermissionCoordinator` and returns native once-only decisions. Mandatory callbacks
+remain answerable in Yolo. Native provider policy can still reject an action before a callback reaches
+Forge. Antigravity enterprise terminal policy can also execute a command without an ACP callback, so
+its approval capability remains limited even when personal OAuth approval checks pass.
+ACP currently requires explicit sandbox disabling because these adapters do not enforce the
+Forge OS sandbox contract. The configuration picker permits disabling an inherited sandbox requirement
+for ACP while rejecting attempts to enable unsupported isolation.
+
+`SettingsStore` owns revisioned global, workspace, and session layers in `settings.db`. Unspecified
+fields inherit. Resource selections overlay by canonical source identity, and provider tuning remains
+scoped to its backend. One SQLite statement reads the revision and every inherited layer from the
+same committed snapshot. `settings.update` and `settings.reset` require the expected revision and route
+application through task transition admission. `setting_application` distinguishes the desired revision
+from the confirmed applied revision and runtime generation. A failed continuation does not invalidate
+an already confirmed configuration. Configuration timeline records share the durable operation identity
+and contain changed field names rather than settings values. The service persists applying,
+verifying, and resuming phases from ordered broker events before forwarding their task state.
+Confirmation records the applied revision before any interrupted work resumes.
+Settings mutation commits its revision and operation receipt in the same transaction. A retry with
+the same operation ID and request recovers that revision before concurrency validation, including
+after a process restart between preference persistence and task admission. A reused ID with different
+content rejects without changing preferences. Task admission deduplicates the recovered operation,
+so a completed retry does not restart the provider or append another configuration timeline record.
+Only a pending task operation can supply continuation intent. Completed idle configuration does not
+suppress a later active chat, while an explicit pending pause prevents a new setting from resuming it.
+Both startup and `/new` resolve saved provider defaults through `SettingsSnapshot` before persisting
+a new conversation. Resuming an existing conversation preserves its selected model and tuning, even
+when another window has changed the defaults. Configuration admission and completion invalidate MCP
+discovery, including pending jobs, so results from the previous runtime cannot replace the new catalog.
+Native forks copy explicit session overrides into an independent preference layer while retaining
+global and workspace inheritance. Claude's native fork carries the source session's selected MCP,
+skill, and approval bindings. Loading the fork rebuilds its private profile for the new Forge session.
+ACP initialization rejects agents without conversation loading, which the required resume contract
+depends on. Planning selects an advertised plan or architect mode before provider execution.
+Model discovery can create an empty ACP session before a prompt. Forge retains its conversation ID
+for restart recovery only after prompt admission or a successful native history load, because
+Claude cannot load an empty conversation that has never reached its history store.
+
+`/config` exposes an explicit native resource import. `NativeImport` reads JSON or TOML MCP
+definitions and native skill directories, then returns source identities, transport metadata,
+collisions, and validation failures. The preview omits launch values and prompt bodies. Apply
+requires the reviewed fingerprint, explicit selected identities, and the preference revision used
+for conflict inspection. A changed source rejects before persistence and refreshes the preview.
+Native source reads and skill-directory scans run on a blocking worker so filesystem latency does
+not block the async provider control lane.
+Imports support global and workspace scope. `setting_resource` stores definitions in the same
+transaction as their disabled selections, revision, and retry receipt. `SettingsStore::catalog`
+reads bindings and selection intent from one committed snapshot, so concurrent imports never
+appear enabled between separate catalog and preference reads. Every backend uses that catalog.
+Application uses the existing task transition coordinator and durable configuration timeline event.
+
+Imported skills retain their source file and metadata. Imported MCP arguments, URL, environment,
+and headers retain references into the original native file, so Forge does not copy literal
+credentials into its database. Launch reads one bounded snapshot per source, preserves literal
+values, and validates the imported structure before resolving references. Credential rotation
+preserves the binding. Added policy fields or changed launch structure require another explicit
+import. MCP files are limited to 1 MiB, skill definitions to 64 KiB, previews to 256 KiB, and
+each import to 128 resources. Nonportable native options are blocked in the preview, including
+tool restrictions, timeouts, and working directories that ACP cannot preserve. Imports never
+write native configuration, authentication, or Rulesync-generated files.
+
+`ResourceCatalog` reads MCP defaults from `config_dir/rulesync-global/.rulesync/mcp.json` and workspace
+`.rulesync/mcp.json`. Skill catalogs read the corresponding Rulesync skill directories. Catalogs retain
+definition identities and metadata without prompt bodies or launch credentials. Environment references
+resolve only into ephemeral provider launch payloads. Missing credentials mark optional default MCP
+resources unavailable, while explicitly enabled resources fail launch. Claude resource selection uses
+strict MCP configuration and an ephemeral `forge-managed` plugin whose selected skill directories bind
+to canonical sources. Its SDK skill filter admits only those qualified plugin names. Antigravity starts with a private `GEMINI_HOME`
+configuration root. That root binds only selected skill definitions and links its private ACP state
+directory to the native OAuth and conversation store. It does not copy credentials or inherit native
+global MCP configuration. Windows directory bindings use NTFS junctions and Unix bindings use
+directory symlinks. Cleanup removes bindings before the temporary profile and preserves the source.
+`ResourceProfile` owns these bindings across adapters. Copilot receives shared MCP definitions and
+an isolated skill directory through its Rust SDK session options with native configuration discovery
+disabled. It verifies loaded skills, disables unselected runtime resources, and disconnects before
+resuming the same provider conversation when selection changes. `SessionResources` exposes source
+identities and per-server credential failures independently from its ephemeral launch payloads.
+Resource binding rejects names that traverse or alias profile directories before creating links.
+Codex conversations with shared settings own a private app-server runtime. Resource changes collect
+that runtime and reload the same native thread with the newly resolved configuration. Other sessions
+retain their provider processes. The unmanaged SDK constructor retains its shared-runtime behavior.
+Each configured runtime disables inherited MCP definitions and plugin resources in the thread's
+configuration, registers canonical MCP servers under stable private names, and maps runtime status
+back to canonical catalog identities. Selected skill directories use runtime-local extra roots, with
+explicit per-path enablement rules that exclude inherited skills. No native preference file is written.
+MCP launch configuration is redacted from outgoing and incoming protocol traces, including arbitrary
+environment-variable names and HTTP headers. Runtime launch payloads remain separate from catalog
+metadata and saved settings.
+Codex MCP callbacks accept the provider's `_meta` approval envelope. Active tool records supply
+the tool identity when the callback omits it, and server aliases resolve to canonical names before
+permission matching and timeline publication. Completed calls cannot supply identity to a later
+request. Ambiguous concurrent calls retain a server-wide approval target.
+Copilot turn addresses include the provider interaction identity because native turn counters can
+repeat across prompts. Later messages and completion events resolve through the matching turn-start
+record, so a reused counter cannot attach a new response to a completed execution.
+
+`CapabilityManifest` records required and optional operations, support, ownership, application boundary,
+and runtime availability. The `Backend` trait requires explicit identity, streaming, shutdown,
+session cancellation, execution cleanup, active-turn inspection, and retained conversation identity.
+Adapters cannot inherit a synthetic provider identity or silently omit lifecycle ownership. Unsupported
+optional operations return typed unsupported-capability errors. Cancellation and identity queries carry
+the Harness session ID, preventing unscoped operations from affecting a different conversation.
+`/capabilities` displays that manifest in a shared picker. ACP discovery refines
+native fork, steering, session loading, and effort support from the negotiated agent and session catalog.
+The manifest separates MCP selection from connection-status and tool-inventory inspection. ACP can
+run selected MCP servers without exposing either inspection operation. Its configured rows retain
+an unavailable status with that explanation, and live workflow tests verify execution through an
+actual tool result rather than treating configuration as readiness evidence.
 
 `BackendModel` forms the provider-neutral model-picker contract. Each backend supplies the model
 identifier, ordered reasoning choices, context-window tiers, vision capability, and optional
@@ -5467,7 +5627,8 @@ continuation instructions remain separate, including the native goal activation 
 Clearing, switching, or completing the task ends that message association. A resumed plan
 awaiting review still requires explicit acceptance before execution.
 Changing permission while paused does not restart execution. Model changes during execution
-use the same stop-and-resume coordinator. MCP configuration changes require a paused task.
+use the same stop-and-resume coordinator. Shared MCP and skill selection changes immediately
+stop active work, apply the selected revision, and resume through that coordinator.
 
 `task.transition` persists an operation ID on the ordered host input lane before concurrent
 dispatch or acknowledgement. A compare-and-set claim permits one execution of each intent.

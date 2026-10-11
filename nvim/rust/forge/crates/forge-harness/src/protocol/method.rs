@@ -27,6 +27,22 @@ pub enum HarnessMethod {
     TraceSessionClear,
     #[serde(rename = "backend.models")]
     BackendModels,
+    #[serde(rename = "backend.capabilities")]
+    BackendCapabilities,
+    #[serde(rename = "backend.authenticate")]
+    BackendAuthenticate,
+    #[serde(rename = "backend.setup")]
+    BackendSetup,
+    #[serde(rename = "settings.get")]
+    SettingsGet,
+    #[serde(rename = "settings.update")]
+    SettingsUpdate,
+    #[serde(rename = "settings.import.preview")]
+    SettingsImportPreview,
+    #[serde(rename = "settings.import.apply")]
+    SettingsImportApply,
+    #[serde(rename = "settings.reset")]
+    SettingsReset,
     #[serde(rename = "backend.model_pins")]
     BackendModelPins,
     #[serde(rename = "backend.model_pin")]

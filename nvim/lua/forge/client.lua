@@ -152,7 +152,13 @@ end
 local function backend_descriptor()
   local harness_config = config.options.harness
   local backend = harness_config.backend
-  return require("forge.harness.backends." .. backend).descriptor(harness_config)
+  local configured = harness_config.backends[backend]
+  assert(configured, "Unknown Harness backend: " .. tostring(backend))
+  return {
+    kind = backend,
+    command = vim.deepcopy(configured.command or {}),
+    permission_note = "Forge owns approval rules. Provider capabilities describe isolation support.",
+  }
 end
 
 ---@param callback ForgeCallback
@@ -521,6 +527,8 @@ local function send_harness_initialize(callback, initialize_options)
   end
   local params = {
     data_root = vim.fs.joinpath(vim.fn.stdpath("data"), "forge", "harness"),
+    config_dir = harness_config.config_dir or vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(vim.fs.dirname(
+      vim.uv.fs_realpath(debug.getinfo(1, "S").source:sub(2)) or debug.getinfo(1, "S").source:sub(2))))),
     permission_file = vim.fs.joinpath(vim.fn.stdpath("config"), "forge", "permissions.json"),
     workspace = vim.fn.getcwd(),
     client_id = ("nvim-%s-%s"):format(vim.fn.getpid(), vim.uv.hrtime()),

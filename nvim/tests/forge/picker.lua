@@ -391,6 +391,7 @@ local ok, failure = pcall(function()
       option_list = {
         { key = "n", id = "format", label = "Format" },
         { key = "e", id = "test", label = "Test" },
+        { key = "b", id = "blocked", label = "Blocked", disabled_reason = "A native policy prevents selection" },
         { key = "y", action = "submit", label = "Apply selections" },
       },
     } },
@@ -398,6 +399,8 @@ local ok, failure = pcall(function()
   })
   invoke("<CR>")
   invoke("e")
+  invoke("<CR>")
+  invoke("b")
   invoke("<CR>")
   invoke("y")
   assert_equals(multiple_result, nil, "multiple-choice jump keys should not submit")

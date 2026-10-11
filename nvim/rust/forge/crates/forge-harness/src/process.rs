@@ -1,5 +1,84 @@
 use tokio::process::Command;
 
+use std::path::{Path, PathBuf};
+
+/// Resolve platform launch shims without changing process ownership.
+pub(crate) fn command(program: &str, args: &[String]) -> Command {
+    #[cfg(not(windows))]
+    {
+        let mut command = Command::new(program);
+        command.args(args);
+        command
+    }
+
+    #[cfg(windows)]
+    {
+        let resolved = executable(program).unwrap_or_else(|| PathBuf::from(program));
+        let extension = resolved
+            .extension()
+            .and_then(|value| value.to_str())
+            .unwrap_or_default();
+
+        if extension.eq_ignore_ascii_case("cmd") || extension.eq_ignore_ascii_case("bat") {
+            let mut command = Command::new("cmd.exe");
+            command
+                .arg("/d")
+                .arg("/s")
+                .arg("/c")
+                .arg(resolved)
+                .args(args);
+            return command;
+        }
+
+        let mut command = Command::new(resolved);
+        command.args(args);
+        command
+    }
+}
+
+
+
+/// Resolve an installed executable without starting a shell or modifying its search path.
+pub(crate) fn executable(program: &str) -> Option<PathBuf> {
+    let requested = Path::new(program);
+    if requested.is_absolute() || requested.components().count() > 1 {
+        let metadata = requested.metadata().ok()?;
+        if !metadata.is_file() { return None; }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 { return None; }
+        }
+        return Some(requested.to_path_buf());
+    }
+
+    let search_path = std::env::var_os("PATH")?;
+    for directory in std::env::split_paths(&search_path) {
+        #[cfg(windows)]
+        let extensions = ["exe", "com", "cmd", "bat", ""];
+        #[cfg(not(windows))]
+        let extensions = [""];
+        for extension in extensions {
+            let candidate = if extension.is_empty() {
+                directory.join(program)
+            } else {
+                directory.join(format!("{program}.{extension}"))
+            };
+            if candidate.is_file() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    let Ok(metadata) = candidate.metadata() else { continue; };
+                    if metadata.permissions().mode() & 0o111 == 0 { continue; }
+                }
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+
 pub(crate) fn spawn_owned(
     command: Command,
 ) -> std::io::Result<Box<dyn process_wrap::tokio::ChildWrapper>> {

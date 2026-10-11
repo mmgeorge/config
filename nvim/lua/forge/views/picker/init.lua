@@ -338,6 +338,10 @@ local function confirm(instance, with_feedback)
   local page = picker_state.page(instance.state, instance.spec)
   local option = picker_state.selected_option(instance.state, instance.spec)
   if not option then return end
+  if option.disabled_reason then
+    notifications.warn(option.disabled_reason, "Picker")
+    return
+  end
   if page.selection_mode == "multiple" and option.action ~= "submit" then
     picker_state.toggle_selected(instance.state, instance.spec)
     render_view(instance)

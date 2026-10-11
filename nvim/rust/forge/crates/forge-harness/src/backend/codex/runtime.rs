@@ -45,7 +45,7 @@ impl Drop for CodexAppServer {
     }
 }
 
-/// Owns the single Codex app-server shared by every Harness session.
+/// Owns one Codex app-server shared by connections using the same resource configuration.
 pub struct CodexRuntime {
     command: Vec<String>,
     server: Mutex<Option<CodexAppServer>>,

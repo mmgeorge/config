@@ -28,7 +28,6 @@ local begin_request
 local submit_immediate
 local configure_now
 local finish_execution
-local effort_list = { "minimal", "low", "medium", "high", "xhigh" }
 local queue_only_commands = { ["/plan"] = true }
 
 ---@param state table
@@ -67,9 +66,6 @@ local function model_command(text)
   local model, remainder = text:match("^/model%s+(%S+)%s*(.*)$")
   if not model then return nil end
   local effort, prompt = remainder:match("^(%S+)%s*(.*)$")
-  if effort and not vim.tbl_contains(effort_list, effort) then
-    return nil, nil, "Unknown reasoning effort: " .. effort
-  end
   return { model = model, effort = effort }, prompt or ""
 end
 
@@ -1485,6 +1481,11 @@ function M.submit()
     return
   end
   if text == "" then return end
+  if text == "/capabilities" then
+    set_composer_text(state.composer_buf, "")
+    require("forge.views.harness.capability_picker").open(picker_host(state))
+    return
+  end
   if not require("forge.views.harness.completion.command_source").accepts_prompt(text) then return end
   if text == "/task" or text == "/plan" or text == "/execute" then
     set_composer_text(state.composer_buf, "")
@@ -1700,10 +1701,6 @@ function M.submit()
       notifications.warn("The current backend does not support reasoning effort selection", "ForgeHarness")
       return
     end
-    if model_effort and not vim.tbl_contains(effort_list, model_effort) then
-      report_configuration_error("Unknown reasoning effort: " .. model_effort)
-      return
-    end
     M.configure({ model = model, effort = model_effort }, true)
     return
   end
@@ -1712,10 +1709,6 @@ function M.submit()
     set_composer_text(state.composer_buf, "")
     if state.capability.effort_selection ~= true then
       notifications.warn("The current backend does not support reasoning effort selection", "ForgeHarness")
-      return
-    end
-    if not vim.tbl_contains(effort_list, effort) then
-      report_configuration_error("Unknown reasoning effort: " .. effort)
       return
     end
     M.configure({ effort = effort }, true)
@@ -1902,10 +1895,23 @@ end
 function M.change_effort(direction)
   local state = harness_state()
   local current = selected_setting(state, "effort")
-  local index = 3
-  for candidate_index, candidate in ipairs(effort_list) do if candidate == current then index = candidate_index end end
-  index = math.max(1, math.min(#effort_list, index + direction))
-  M.configure({ effort = effort_list[index] })
+  local session_id = state.session and state.session.id
+  client.request("backend.models", {}, function(model_list, failure)
+    if failure then notifications.error(failure, "Harness effort") return end
+    if not state.session or state.session.id ~= session_id then return end
+    local model_id = selected_setting(state, "model")
+    for _, model in ipairs(model_list or {}) do
+      if model.id == model_id or (model_id == "default" and model.is_default) then
+        local choice = model.reasoning or {}
+        if #choice == 0 then return end
+        local index = 1
+        for candidate_index, candidate in ipairs(choice) do if candidate == current then index = candidate_index end end
+        index = math.max(1, math.min(#choice, index + direction))
+        M.configure({ effort = choice[index] }, true)
+        return
+      end
+    end
+  end)
 end
 
 function M.select_effort()
@@ -1921,11 +1927,22 @@ function M.select_effort()
     high = "Deeper reasoning for complex changes.",
     xhigh = "Maximum reasoning for the hardest work.",
   }
-  local options = vim.tbl_map(function(effort)
-    return { label = effort, detail = detail_list[effort], value = effort }
-  end, effort_list)
-  open_choice_picker(harness_state(), "Select Reasoning Effort", nil, options, function(effort)
-    M.configure({ effort = effort })
+  local state = harness_state()
+  local session_id = state.session and state.session.id
+  client.request("backend.models", {}, function(model_list, failure)
+    if failure then notifications.error(failure, "Harness effort") return end
+    if not state.session or state.session.id ~= session_id then return end
+    local model_id = selected_setting(state, "model")
+    local choice = {}
+    for _, model in ipairs(model_list or {}) do
+      if model.id == model_id or (model_id == "default" and model.is_default) then choice = model.reasoning or {} break end
+    end
+    local options = vim.tbl_map(function(effort)
+      return { label = effort, detail = detail_list[effort] or "Provider-advertised reasoning choice", value = effort }
+    end, choice)
+    open_choice_picker(state, "Select Reasoning Effort", nil, options, function(effort)
+      M.configure({ effort = effort }, true)
+    end, "The selected model advertises no reasoning choices.")
   end)
 end
 
@@ -2103,7 +2120,7 @@ function M.resolve_runtime_model()
 end
 
 ---@param mode string
-function M.task_transition(action, submitted_text, completed)
+function M.task_transition(action, submitted_text, completed, method)
   local state = harness_state()
   if state.host_error then notifications.error(state.execution_notice or state.host_error, "Harness task") return end
   if not state.session then notifications.warn("Harness is still initializing", "Harness task") return end
@@ -2142,7 +2159,7 @@ function M.task_transition(action, submitted_text, completed)
     if submitted_text and harness_state() == state and composer_text(state.composer_buf) == submitted_text then
       set_composer_text(state.composer_buf, "")
     end
-  end)
+  end, method)
   M.refresh_winbar()
 end
 

@@ -817,6 +817,7 @@ mod test {
         let trace = Arc::new(TraceStore::open(directory.path())?);
         let backend = CodexBackend::new_with_permission_coordinator(
             vec!["unused".into()], permission.clone(), trace.clone(),
+                    None,
         )?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
@@ -874,7 +875,7 @@ mod test {
         let workspace = directory.path().to_string_lossy().into_owned();
         let permission = PermissionCoordinator::transient(&workspace)?;
         let trace = Arc::new(TraceStore::open(directory.path())?);
-        let backend = CodexBackend::new_with_permission_coordinator(vec!["unused".into()], permission.clone(), trace.clone())?;
+        let backend = CodexBackend::new_with_permission_coordinator(vec!["unused".into()], permission.clone(), trace.clone(), None)?;
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
         let endpoint = format!("ws://{}", listener.local_addr()?);
         let server = tokio::spawn(async move {
@@ -951,6 +952,7 @@ mod test {
                 vec!["unused".into()],
                 Arc::clone(&permission),
                 Arc::clone(&trace),
+                            None,
             )?;
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await?;
             let endpoint = format!("ws://{}", listener.local_addr()?);

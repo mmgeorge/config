@@ -63,6 +63,7 @@ async fn initialize_real_codex_broker(
     prefer_mini_model: bool,
 ) -> HarnessBroker {
     let mut broker = HarnessBroker::initialize(InitializeRequest {
+        config_dir: None,
         data_root: data_root.to_string_lossy().into_owned(),
         permission_file: None,
         workspace: workspace.to_string_lossy().into_owned(),
