@@ -115,6 +115,8 @@
       "cal": "allow",
       "cal *": "allow",
       "cargo --version": "allow",
+      "cargo clippy --version": "allow",
+      "cargo fmt --version": "allow",
       "cat": "allow",
       "cat *": "allow",
       "cd": "allow",
@@ -390,6 +392,7 @@
     },
     "mcp": {
       "*": "ask",
+      "docs/*": "allow",
       "sem/*": "allow"
     },
     "read": {

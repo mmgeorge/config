@@ -769,6 +769,10 @@ the provider's logical id and a canonical digest of the user-visible content, so
 pending again when a provider retries with a different id. The transient `PlanElicitation` therefore contains only
 unresolved questions and never acts as the durable decision owner.
 
+The shared broker input boundary allocates the interaction future on the heap. Task transitions, planning
+continuations, and direct prompts therefore avoid embedding the full provider interaction state in every outer
+async frame.
+
 The broker owns plan generation as one bounded continuation loop across every backend. Each provider turn first
 applies plan creation and edits to the canonical document, then the broker accepts only three forward outcomes: a
 submitted plan, a genuinely new unresolved question, or another bounded generation turn. `ContinuationBudget`

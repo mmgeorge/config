@@ -3577,10 +3577,7 @@ Planning continuation: turn {} of {}.",
         admission: Option<ExchangeAdmission>,
         input: BackendInput,
     ) -> Result<(Value, Vec<SessionEvent>)> {
-        match self
-            .run_interaction_input_inner(text, mode, admission, input)
-            .await
-        {
+        match Box::pin(self.run_interaction_input_inner(text, mode, admission, input)).await {
             Ok(result) => Ok(result),
             Err(error) if self.exchange_runtime.is_some() => {
                 match self.finalize_interaction_after_processing_failure().await {
@@ -8340,6 +8337,22 @@ fn default_goal_max_turns() -> u32 {
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn interaction_future_has_bounded_inline_storage() {
+        let repository = tempfile::tempdir().unwrap();
+        let data = tempfile::tempdir().unwrap();
+        let mut broker = planning_question_broker(repository.path(), data.path(), false);
+        let future = Box::pin(broker.run_interaction_input(
+            "Plan a fixture".into(),
+            PromptMode::Plan,
+            None,
+            BackendInput::from_text("Plan a fixture"),
+        ));
+        let bytes = std::mem::size_of_val(future.as_ref().get_ref());
+        eprintln!("interaction inline bytes: {bytes}");
+        assert!(bytes <= 16 * 1024, "interaction retains {bytes} inline bytes");
+    }
+
     struct CheckpointBackend {
         started: Arc<tokio::sync::Notify>,
         tool_ran: Arc<std::sync::atomic::AtomicBool>,
