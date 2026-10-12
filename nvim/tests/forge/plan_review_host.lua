@@ -27,7 +27,8 @@ local function await(predicate, message)
 end
 local success, failure = xpcall(function()
   vim.api.nvim_set_current_dir(workspace)
-  require("forge").setup({ diff_logging = false, harness_logging = false, harness = { backend = "mock" } })
+  require("forge").setup({ diff_logging = false, harness_logging = true,
+    harness_log_path = data .. "/ui-perf.log", harness = { backend = "mock" } })
   require("forge.views.harness").open()
   await(function() return state.presentation and state.presentation.ready end, "Harness did not open")
   vim.api.nvim_buf_set_text(state.composer_buf, 0, 0, 0, 0, { "/plan build the feature" })
@@ -45,6 +46,63 @@ local success, failure = xpcall(function()
   local comments = require("forge.draft_comments")
   local rendered = table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n")
   assert(rendered:find("src/change.rs", 1, true) and rendered:find("requested_change", 1, true))
+  local owner, window, tab = review.owner, review.win, review.tab
+  local trace_status
+  client.request_for(review.session_id, "trace.configure", { enabled = true }, function(result, failure)
+    assert(not failure, failure)
+    trace_status = result
+  end)
+  await(function() return trace_status ~= nil end, "plan edit trace did not enable")
+  for index, line in ipairs(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false)) do
+    local column = line:find("requested_change", 1, true)
+    if column then vim.api.nvim_win_set_cursor(window, { index, column - 1 }) break end
+  end
+  local popup = require("forge.infra.popup_window")
+  local previous_input = popup.incremental_input
+  popup.incremental_input = function(_, callback) callback("reviewed_change") end
+  review.command_set.action_by_id.rename_entity.run({})
+  await(function() return review.plan.review_digest ~= plan.review_digest end, "native rename did not update the review")
+  popup.incremental_input = previous_input
+  assert(state.plan_review == review and review.owner == owner and review.win == window and review.tab == tab,
+    "native rename reopened the plan")
+  plan = review.plan
+  assert(plan.manual_changes[1] == "Renamed requested_change to reviewed_change")
+  canonical = vim.fn.readfile(plan.working_path, "b")
+  assert(table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("reviewed_change", 1, true))
+  local trace_path
+  client.request_for(review.session_id, "trace.status", {}, function(result, failure)
+    assert(not failure, failure)
+    trace_path = result.path
+  end)
+  await(function() return trace_path ~= nil end, "plan edit trace path did not arrive")
+  local phases, operation_id = {}, nil
+  for _, line in ipairs(vim.fn.readfile(trace_path)) do
+    local record = vim.json.decode(line)
+    if record.event == "plan.edit" and record.payload.method == "plan.entity.rename" then
+      local payload = record.payload
+      operation_id = operation_id or payload.operation_id
+      assert(payload.operation_id == operation_id, "edit trace lost request correlation")
+      if payload.status == "completed" then
+        assert(type(payload.duration_ms) == "number" and payload.duration_ms >= 0)
+        phases[payload.phase] = true
+      end
+    end
+  end
+  for _, phase in ipairs({ "service.total", "service.broker_lock_wait", "rename.reference_index",
+    "rename.semantic_edit", "persist.working_json", "broker.timeline_reconcile",
+    "service.recapture_review", "service.syntax", "review.project", "service.send_response" }) do
+    assert(phases[phase], "missing plan edit phase: " .. phase)
+  end
+  local perf = require("forge.infra.perf")
+  perf.flush("harness")
+  await(function()
+    if vim.fn.filereadable(data .. "/ui-perf.log") ~= 1 then return false end
+    for _, line in ipairs(vim.fn.readfile(data .. "/ui-perf.log")) do
+      local record = vim.json.decode(line)
+      if record.event == "ui.plan.edit" and record.phase == "complete" and record.operation_id == operation_id then return true end
+    end
+    return false
+  end, "plan edit trace did not correlate the UI completion")
   vim.api.nvim_win_set_cursor(review.win, { 2, 0 })
   review.owner.action("comment", function(result, failure) assert(result and not failure, failure) end)
   vim.cmd("stopinsert")

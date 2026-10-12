@@ -12,7 +12,7 @@ use forge_diff::display::RowKind;
 use forge_diff::file_header::FileChange;
 use forge_diff::patch::UnifiedPatch;
 use forge_diff::source::{Representation, SourcePair, SourceVersion};
-use forge_diff::syntax::{DeclarationFolding, DeclarationVisibility};
+use forge_diff::syntax::DeclarationVisibility;
 
 use super::review_annotation::ReviewAnnotation;
 use super::review_source::ReviewTrace;
@@ -31,6 +31,42 @@ pub(super) fn render(document: &PlanDocument) -> Result<RenderedPlan> {
         markdown,
         navigation,
     })
+}
+
+/// Replaces only the test inventory and shifts later canonical source anchors.
+pub(super) fn replace_test_inventory(previous: &RenderedPlan, document: &PlanDocument) -> Result<RenderedPlan> {
+    let (start, end) = test_source_range(previous)?;
+    let design = document.design.as_ref().context("test edits require a declaration plan")?;
+    let (block, mut anchors) = test_inventory(&design.document.tests)?;
+    let rows = block.iter().flat_map(|block| block.text.wire_rows()).collect::<Vec<_>>();
+    let previous_rows = previous.markdown.lines().collect::<Vec<_>>();
+    ensure!(end <= previous_rows.len(), "test inventory exceeds saved source");
+    let mut output = previous_rows[..start].iter().map(|line| (*line).to_owned()).collect::<Vec<_>>();
+    output.extend(rows.iter().map(|row| row.to_string()));
+    output.extend(previous_rows[end..].iter().map(|line| (*line).to_owned()));
+    let shift = rows.len() as i64 - (end - start) as i64;
+    let mut navigation = previous.navigation.clone();
+    navigation.plan_version = document.version;
+    navigation.anchor.retain(|anchor| (anchor.line as usize) <= start || anchor.line as usize > end);
+    for anchor in &mut navigation.anchor {
+        if anchor.line as usize > end { anchor.line = (anchor.line as i64 + shift) as u32; }
+    }
+    for anchor in &mut anchors { anchor.line += start as u32; }
+    navigation.anchor.extend(anchors);
+    navigation.anchor.sort_by_key(|anchor| anchor.line);
+    Ok(RenderedPlan { markdown: output.join("\n") + "\n", navigation })
+}
+
+/// Locates the canonical rows owned by the test section, excluding its separator.
+pub(super) fn test_source_range(rendered: &RenderedPlan) -> Result<(usize, usize)> {
+    let mut lines = rendered.navigation.anchor.iter().filter(|anchor|
+        matches!(anchor.target, PlanReviewTarget::TestCase { .. }
+            | PlanReviewTarget::Section { section: super::PlanSection::Tests }))
+        .map(|anchor| anchor.line as usize);
+    let first = lines.next().context("saved plan has no test section")?;
+    let (mut start, mut end) = (first, first);
+    for line in lines { start = start.min(line); end = end.max(line); }
+    Ok((start - 1, end))
 }
 
 pub(super) fn project(
@@ -176,7 +212,7 @@ fn rows(
     let mut contextual_path = HashSet::new();
     let mut contextual_block = HashSet::new();
     let mut visibility = HashMap::<(String, String), DeclarationVisibility>::new();
-    let mut presentation = HashMap::<(String, String), super::calls::CallPresentation>::new();
+    let mut presentation = HashMap::<(String, String), std::sync::Arc<super::calls::CallPresentation>>::new();
     let started = Instant::now();
     let included = revealed.iter().map(|(path, _)| path.clone()).collect();
     let ordered_files = super::review_file_layout::order(design, &included);
@@ -571,7 +607,7 @@ fn section_header(id: BlockId, title: &str) -> Result<BufferBlock> {
     )?)
 }
 
-fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
+pub(super) fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> Result<(Vec<BufferBlock>, Vec<PlanNavigationAnchor>)> {
     let mut block = vec![section_header(
         BlockId("plan:section:tests".into()),
         &format!("Tests · {}", super::design_tests::summary(files)),
@@ -623,18 +659,18 @@ fn test_inventory(files: &[super::design_tests::DesignTestFile]) -> Result<(Vec<
 fn declaration_folds(
     block: &mut [BufferBlock],
     paths: [Option<&String>; 2],
-    presentation: &HashMap<(String, String), super::calls::CallPresentation>,
+    presentation: &HashMap<(String, String), std::sync::Arc<super::calls::CallPresentation>>,
     display_row: &HashMap<(String, String, usize), usize>,
 ) -> Result<()> {
     let mut candidates = Vec::new();
     for (source_path, side) in [(paths[0], "baseline"), (paths[1], "proposed")] {
         let Some(source_path) = source_path else { continue };
         let Some(source) = presentation.get(&(source_path.clone(), side.into())) else { continue };
-        for declaration in DeclarationFolding::analyze(source_path, &source.plain).map_err(|error| anyhow::anyhow!("{error:?}"))? {
+        for declaration in source.folds(source_path)? {
             let mapped = |line| source.declaration_row.get(&line).and_then(|row| display_row.get(&(source_path.clone(), side.into(), *row)).copied());
             let (Some(opening), Some(closing)) = (mapped(declaration.start), mapped(declaration.end)) else { continue };
             if opening >= closing || !block[opening].text.wire_rows()[0].trim_end().ends_with('{') { continue; }
-            candidates.push((opening, closing, mapped(declaration.heading).unwrap_or(opening), declaration.collapsed_suffix, declaration.closed));
+            candidates.push((opening, closing, mapped(declaration.heading).unwrap_or(opening), declaration.collapsed_suffix.clone(), declaration.closed));
         }
     }
     candidates.sort_by_key(|(opening, closing, _, _, _)| (std::cmp::Reverse(*opening), *closing));
@@ -654,7 +690,7 @@ fn declaration_folds(
     Ok(())
 }
 
-fn call_folds(block: &mut [BufferBlock], paths: [Option<&String>; 2], presentation: &HashMap<(String, String), super::calls::CallPresentation>, display_row: &HashMap<(String, String, usize), usize>) {
+fn call_folds(block: &mut [BufferBlock], paths: [Option<&String>; 2], presentation: &HashMap<(String, String), std::sync::Arc<super::calls::CallPresentation>>, display_row: &HashMap<(String, String, usize), usize>) {
     let mut installed = HashSet::new();
     for (path, side) in [(paths[1], "proposed"), (paths[0], "baseline")] {
         let Some(path) = path else { continue };

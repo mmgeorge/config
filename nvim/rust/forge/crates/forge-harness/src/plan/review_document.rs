@@ -176,6 +176,43 @@ impl PlanReviewStore {
         Ok(opened)
     }
 
+    /// Reuse analysis for unchanged file sides before preparing a newer plan revision.
+    pub(crate) fn prepare_update(&self, id: &DocumentId, source: &mut PlanReviewSource) -> Result<u64> {
+        let store = self.document.lock().map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        let (document, admission) = store.get(id).context("plan review document is closed")?;
+        admission.check()?;
+        ensure!(!document.source.historical && !source.historical, "historical plan revisions are read-only");
+        ensure!(source.document.plan_id == document.source.document.plan_id
+            && source.document.version > document.source.document.version, "plan revision is stale");
+        if let (Some(previous), Some(current)) = (&document.source.document.design, &source.document.design) {
+            for ((path, side), handle) in &document.source.declaration_syntax {
+                let (before, after) = if side == "baseline" {
+                    (previous.baseline.get(path).map(|file| &file.text), current.baseline.get(path).map(|file| &file.text))
+                } else { (previous.proposed.get(path), current.proposed.get(path)) };
+                if before.is_some() && before == after {
+                    source.declaration_syntax.insert((path.clone(), side.clone()), handle.clone());
+                }
+            }
+            if previous.proposed == current.proposed && previous.baseline == current.baseline
+                && previous.proposed_calls == current.proposed_calls && previous.baseline_calls == current.baseline_calls {
+                source.resolver = Arc::clone(&document.source.resolver);
+                source.resolver_sources = Arc::clone(&document.source.resolver_sources);
+            }
+        }
+        Ok(document.source.document.version)
+    }
+
+    /// Publish a prepared revision while retaining the document identity and current view choices.
+    pub(crate) fn update(&self, id: &DocumentId, source: PlanReviewSource, expected_version: u64, trace: Option<&super::edit_trace::PlanEditTrace>) -> Result<serde_json::Value> {
+        let wait = trace.map(|trace| trace.stage("review.lock_wait"));
+        let mut store = self.document.lock().map_err(|_| anyhow::anyhow!("plan review store lock poisoned"))?;
+        if let Some(stage) = wait { stage.complete(serde_json::json!({})); }
+        let (document, admission) = store.get_mut(id).context("plan review document is closed")?;
+        admission.check()?;
+        ensure!(document.source.document.version == expected_version, "plan changed while preparing its projection");
+        document.update(source, trace)
+    }
+
     /// Resolve snapshot declarations before acquiring external evidence for an unresolved jump.
     pub(crate) async fn prepare_declaration_jump(
         &self,
@@ -424,6 +461,87 @@ pub(crate) struct PlanReviewDocument {
 }
 
 impl PlanReviewDocument {
+    fn update(&mut self, mut source: PlanReviewSource, trace: Option<&super::edit_trace::PlanEditTrace>) -> Result<serde_json::Value> {
+        let total = trace.map(|trace| trace.stage("review.update"));
+        ensure!(!self.source.historical && !source.historical, "historical plan revisions are read-only");
+        ensure!(source.document.plan_id == self.source.document.plan_id
+            && source.document.version > self.source.document.version, "plan revision is stale");
+        source.public_only = self.source.public_only;
+        source.revealed = self.source.revealed.clone();
+        source.collapse = self.source.collapse.clone();
+        let annotation_stage = trace.map(|trace| trace.stage("review.load_reanchor_annotations"));
+        let mut annotation = ReviewAnnotationStore::open(source.path.with_extension("json"), source.saved_digest.clone())?;
+        if source.saved_navigation.is_some() { annotation.reanchor(&source.rendered.navigation)?; }
+        self.retain_annotation_revision();
+        if let Some(stage) = annotation_stage { stage.complete(serde_json::json!({"count":annotation.annotation().len()})); }
+        let projection = trace.map(|trace| trace.stage("review.project"));
+        let mut expected = self.source.document.clone();
+        expected.version = source.document.version;
+        let tests_only = match (&mut expected.design, &source.document.design) {
+            (Some(previous), Some(current)) => {
+                previous.document.tests.clone_from(&current.document.tests);
+                expected == source.document
+            }
+            _ => false,
+        };
+        let (block, target) = if tests_only {
+            super::review_projection::update_tests(&source, &self.source.rendered,
+                self.document.snapshot().block, self.target.clone())?
+        } else {
+            super::review_projection::project(&source, &self.width, &[],
+                &self.annotation_revision, self.focused_annotation.as_deref())?
+        };
+        if let Some(stage) = projection { stage.complete(serde_json::json!({"count":block.len(),"cached":tests_only})); }
+        let reanchor = trace.map(|trace| trace.stage("review.retain_annotations"));
+        let previous = self.document.snapshot();
+        let remap = |line| {
+            let anchor = self.source.rendered.navigation.resolve_line(line)?;
+            if let Some(current) = source.rendered.navigation.anchor.iter().find(|current| current.target == anchor.target) {
+                return Some(current.clone());
+            }
+            for previous_block in &previous.block {
+                for previous_range in &previous_block.metadata.target {
+                    if self.target.get(&previous_range.id).is_none_or(|candidate| candidate.line != line) { continue; }
+                    let current_block = block.iter().find(|current| current.id == previous_block.id)?;
+                    let current_range = current_block.metadata.target.iter()
+                        .find(|current| current.range.start.row == previous_range.range.start.row)?;
+                    return target.get(&current_range.id).cloned();
+                }
+            }
+            None
+        };
+        let mut retained = annotation.annotation().to_vec();
+        for original in self.annotation.annotation() {
+            if retained.iter().any(|saved| saved.id == original.id) { continue; }
+            let (Some(start), Some(end)) = (remap(original.source.start_line), remap(original.source.end_line)) else { continue; };
+            if original.parent_id.as_ref().is_some_and(|parent| !retained.iter().any(|saved| &saved.id == parent)) { continue; }
+            let mut saved = original.clone();
+            saved.source.start_line = start.line.min(end.line);
+            saved.source.end_line = start.line.max(end.line);
+            saved.anchor = Some(super::ReviewAnnotationAnchor { start: start.target, end: end.target });
+            retained.push(saved);
+        }
+        if retained.len() != annotation.annotation().len() { annotation.replace(retained)?; }
+        if let Some(stage) = reanchor { stage.complete(serde_json::json!({"count":annotation.annotation().len()})); }
+        let edit = trace.map(|trace| trace.stage("review.edit_document"));
+        let patch = self.document.edit(0..self.document.block_count(), block)?;
+        if let Some(stage) = edit { stage.complete(serde_json::json!({})); }
+        self.source = source;
+        if !tests_only {
+            self.reference = Default::default();
+            self.reference_context = Default::default();
+        }
+        self.target = target;
+        self.annotation = annotation;
+        let response = trace.map(|trace| trace.stage("review.build_snapshot"));
+        let result = serde_json::json!({"patch":patch, "snapshot":self.snapshot(), "source_row":self.source_rows(),
+            "annotation":self.annotation.annotation(), "public_only":self.source.public_only,
+            "saved_source_digest":self.saved_digest(), "version":self.source.document.version});
+        if let Some(stage) = response { stage.complete(serde_json::json!({})); }
+        if let Some(stage) = total { stage.complete(serde_json::json!({"revision":self.source.document.version})); }
+        Ok(result)
+    }
+
     fn rename(
         &mut self,
         anchor: &PlanNavigationAnchor,
@@ -686,12 +804,12 @@ impl PlanReviewDocument {
             }
             .context("declaration file is unavailable")?;
             let calls = if side == "baseline" { &design.baseline_calls } else { &design.proposed_calls };
-            let presentation = super::calls::present(path, text, calls.get(path).map(Vec::as_slice).unwrap_or_default())?.declaration;
+            let presentation = super::calls::present(path, text, calls.get(path).map(Vec::as_slice).unwrap_or_default())?;
             let snapshot = BufferDocument::new(
                 DocumentId(format!("plan:declarations:{}", uuid::Uuid::new_v4())),
                 vec![forge_buffer::block::BufferBlock {
                     id: forge_buffer::identity::BlockId("declarations".into()),
-                    text: forge_buffer::text::BufferText::from_rows(presentation.text.lines())?,
+                    text: forge_buffer::text::BufferText::from_rows(presentation.declaration.text.lines())?,
                     metadata: Default::default(),
                 }],
             )?
@@ -1306,6 +1424,73 @@ impl PlanReviewDocument {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn test_inventory_revision_preserves_document_and_declaration_state() {
+        let temporary = tempfile::tempdir().unwrap();
+        let store = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let mut canonical = crate::plan::document::test_fixture("plan", "Inspect configuration.");
+        let mut design = crate::plan::DeclarationDesign::default();
+        design.document.objective = "Expose configuration.".into();
+        design.document.background = "The fixture contains the declarations under review.".into();
+        design.document.requirements = vec!["Preserve the declared behavior and ownership.".into()];
+        design.document.design = "Reject invalid configuration.".into();
+        design.proposed.insert("src/lib.rs".into(), "pub struct Config { pub count: u32 }\n".into());
+        design.document.tests = serde_json::from_value(serde_json::json!([
+            {"file":"tests/config.rs","cases":[
+                {"name":"first","change":"new","description":"Reject invalid input."},
+                {"name":"keep","change":"new","description":"Accept valid input."}
+            ]}
+        ])).unwrap();
+        canonical.design = Some(design);
+        store.write_working_document("session", "plan", &canonical).unwrap();
+        let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
+        let source = store.capture_review_source("session", "plan", 1, &digest).unwrap();
+        let mut document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()),
+            source, WidthProfile::default(), None).unwrap();
+        let opening = document.snapshot().block.into_iter()
+            .find(|block| block.text.row(0).is_some_and(|row| row.contains("pub struct Config"))).unwrap();
+        document.toggle_declaration(&opening.id).unwrap();
+        document.toggle_public().unwrap();
+        let resolver = Arc::clone(&document.source.resolver);
+        let collapse = document.source.collapse.clone();
+        let revision = document.snapshot().revision;
+        let (_, _, next_digest) = store.remove_tests("session", "plan", 2, 1, &digest,
+            &[crate::plan::DesignTestSelection { file: "tests/config.rs".into(), name: "first".into() }], None).unwrap();
+        let mut source = store.capture_review_source("session", "plan", 2, &next_digest).unwrap();
+        source.resolver = Arc::clone(&resolver);
+        let result = document.update(source, None).unwrap();
+        let rebuilt = super::super::review_projection::project(&document.source, &document.width, &[],
+            &document.annotation_revision, document.focused_annotation.as_deref()).unwrap();
+        assert_eq!(document.snapshot().block, rebuilt.0, "test fast path differs from a full projection");
+        assert_eq!(document.target, rebuilt.1, "test fast path shifted a semantic target incorrectly");
+        assert_eq!(document.source.rendered, super::super::render_plan_at(&document.source.document, temporary.path()).unwrap());
+        assert!(document.snapshot().revision > revision);
+        assert_eq!(document.snapshot().document, DocumentId("review".into()));
+        assert_eq!(document.source.collapse, collapse);
+        assert!(!document.source.public_only);
+        assert!(Arc::ptr_eq(&document.source.resolver, &resolver));
+        assert_eq!(document.source.document.design.as_ref().unwrap().document.tests[0].cases[0].name, "keep");
+        assert_eq!(result["version"], 2);
+        let target = document.document.block(&opening.id).unwrap().metadata.target.first().unwrap();
+        let captured = DocumentInput { document: DocumentId("review".into()), view: ViewId("view".into()),
+            revision: document.snapshot().revision, sequence: InputSequence(1), block: opening.id,
+            position: target.range.start, target: Some(target.id.clone()), action: "delete_tests".into() };
+        document.validate_input(captured).unwrap();
+        let stale = store.capture_review_source("session", "plan", 2, &next_digest).unwrap();
+        assert!(document.update(stale, None).unwrap_err().to_string().contains("stale"));
+        let (_, _, empty_digest) = store.remove_tests("session", "plan", 3, 2, &next_digest,
+            &[crate::plan::DesignTestSelection { file: "tests/config.rs".into(), name: "keep".into() }], None).unwrap();
+        let source = store.capture_review_source("session", "plan", 3, &empty_digest).unwrap();
+        document.update(source, None).unwrap();
+        let rebuilt = super::super::review_projection::project(&document.source, &document.width, &[],
+            &document.annotation_revision, document.focused_annotation.as_deref()).unwrap();
+        assert_eq!(document.snapshot().block, rebuilt.0);
+        assert_eq!(document.target, rebuilt.1);
+        assert!(document.source.rendered.markdown.contains("Tests · None planned"));
+        assert!(!document.snapshot().block.iter().any(|block| block.id.0.starts_with("plan:tests:file:")));
+        assert_eq!(document.source.rendered, super::super::render_plan_at(&document.source.document, temporary.path()).unwrap());
+    }
 
     #[test]
     fn declaration_collapse_preserves_source_and_visibility_choices() {

@@ -113,7 +113,18 @@ local function refresh_winbar(review)
   keymaps.apply_view_winbar(review.win, "PlanReview", "plan_review", review.command_set, detail)
 end
 
+local function adopt_revision(review, result)
+  session.harness.active_plan = result.plan
+  if result.review_error then notice(result.review_error) return false end
+  local updated, failure = review.owner.update(result.plan, result.review)
+  if not updated then notice(failure) return false end
+  review.plan = result.plan
+  refresh_winbar(review)
+  return true
+end
+
 local function action(review, name)
+  if name == "rename_entity" and session.harness.busy then notice("A Harness request is already running") return end
   if name == "rename_entity" and (review.plan.historical_revision or review.plan.state ~= "awaiting_review") then
     notice("Only plans awaiting review can be renamed") return
   end
@@ -148,17 +159,18 @@ local function action(review, name)
     elseif name == "delete" then
       return
     elseif name == "rename_entity" and type(result.rename) == "table" then
-      require("forge.views.plan_review.entity_rename").proposed(review, result.rename, captured, function(name)
-        if session.harness.busy then notice("A Harness request is already running") return end
+      require("forge.views.plan_review.entity_rename").proposed(review, result.rename, captured, function(name, finish)
+        if session.harness.busy then finish() notice("A Harness request is already running") return end
         session.harness.busy = true
-        review.owner.submit("plan.entity.rename", { symbol = result.rename.symbol, name = name,
+        local queued = review.owner.submit("plan.entity.rename", { symbol = result.rename.symbol, name = name,
           expected_version = result.rename.expected_version }, function(renamed, failure)
           session.harness.busy = false
-          if failure then notice(failure) return end
-          session.harness.active_plan = renamed.plan
-          close_review(review)
-          vim.schedule(function() M.open(renamed.plan) end)
+          if failure then finish() notice(failure) return end
+          local applied, update_failure = pcall(adopt_revision, review, renamed)
+          finish()
+          if not applied then notice(tostring(update_failure)) end
         end)
+        if not queued then session.harness.busy = false finish() end
       end)
     elseif name == "references" and type(result.references) == "table" then
       require("forge.views.plan_review.references").open(review, result.references, captured)
@@ -228,9 +240,7 @@ local function delete_tests(review)
     local queued = review.owner.submit("plan.tests.delete", { tests = tests, expected_version = review.owner.version }, function(result, error)
       session.harness.busy = false
       if error then notice(error) return end
-      session.harness.active_plan = result.plan
-      if not close_review(review) then return end
-      vim.schedule(function() M.open(result.plan) end)
+      return adopt_revision(review, result)
     end)
     if not queued then session.harness.busy = false end
   end, nil, { title = "Delete planned tests" })

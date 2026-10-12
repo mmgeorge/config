@@ -3,6 +3,7 @@ local M = {}
 local notifications = require("forge.infra.notifications")
 local popup_window = require("forge.infra.popup_window")
 local entity_info = require("forge.views.plan_review.entity_info")
+local perf = require("forge.infra.perf")
 
 ---@param model ForgePlanTaskModel?
 ---@param buf integer
@@ -41,11 +42,11 @@ end
 ---@field expected_version integer
 ---@field preview ForgePlanRenamePreview[]
 
---- Preview snapshot-bound rename edits and commit only an unchanged review selection.
+--- Retain the semantic preview until the commit callback calls its idempotent finish function.
 ---@param review table
 ---@param selection ForgePlanRenameSelection
 ---@param captured table
----@param commit fun(name: string)
+---@param commit fun(name: string, finish: fun())
 function M.proposed(review, selection, captured, commit)
   local namespace = vim.api.nvim_create_namespace("ForgePlanRename")
   local conceallevel, concealcursor = vim.wo[review.win].conceallevel, vim.wo[review.win].concealcursor
@@ -53,7 +54,21 @@ function M.proposed(review, selection, captured, commit)
   local function clear()
     if vim.api.nvim_buf_is_valid(review.buf) then vim.api.nvim_buf_clear_namespace(review.buf, namespace, 0, -1) end
   end
-  popup_window.incremental_input({ title = "Rename symbol", default = selection.name, on_change = function(value)
+  local finished = false
+  local wipeout
+  local function finish()
+    if finished then return end
+    finished = true
+    if wipeout then pcall(vim.api.nvim_del_autocmd, wipeout) end
+    clear()
+    if vim.api.nvim_win_is_valid(review.win) then
+      vim.wo[review.win].conceallevel, vim.wo[review.win].concealcursor = conceallevel, concealcursor
+    end
+  end
+  wipeout = vim.api.nvim_create_autocmd("BufWipeout", { buffer = review.buf, once = true, callback = finish })
+  local function preview(value)
+    if finished then return end
+    local started = perf.now()
     clear()
     if value == "" or value:find("[\r\n]") or not review.owner.is_current(captured) then return end
     for _, edit in ipairs(selection.preview) do
@@ -66,16 +81,26 @@ function M.proposed(review, selection, captured, commit)
         })
       end
     end
-  end }, function(value)
-    clear()
-    if vim.api.nvim_win_is_valid(review.win) then
-      vim.wo[review.win].conceallevel, vim.wo[review.win].concealcursor = conceallevel, concealcursor
+    perf.event("harness", "ui.plan.rename_preview", { phase = "apply", document = review.owner.document,
+      revision = selection.expected_version, count = #selection.preview, duration_ms = perf.elapsed_ms(started) })
+  end
+  popup_window.incremental_input({ title = "Rename symbol", default = selection.name, on_change = preview }, function(value)
+    local started = perf.now()
+    value = value and vim.trim(value)
+    if not value or value == selection.name then finish() return end
+    if value == "" or value:find("[\r\n]") then
+      finish()
+      notifications.error("Entity name must be a nonempty single line", "ForgePlanReview") return
     end
-    if not value or value == selection.name then return end
     if not review.owner.is_current(captured) then
+      finish()
       notifications.error("Plan changed while the rename popup was open", "ForgePlanReview") return
     end
-    commit(vim.trim(value))
+    preview(value)
+    perf.event("harness", "ui.plan.rename_preview", { phase = "confirmed", document = review.owner.document,
+      revision = selection.expected_version, count = #selection.preview, duration_ms = perf.elapsed_ms(started) })
+    local submitted, failure = pcall(commit, value, finish)
+    if not submitted then finish() notifications.error(tostring(failure), "ForgePlanReview") end
   end)
 end
 

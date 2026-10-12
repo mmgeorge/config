@@ -319,6 +319,7 @@ mod test {
             submitted_version: None,
             accepted_revision: None,
             user_revision: 0,
+            manual_changes: Vec::new(),
             review_digest: None,
             accepted_digest: None,
             elicitation: None,

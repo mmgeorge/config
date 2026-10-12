@@ -374,6 +374,7 @@ function M.preflight(session, patch, options)
 end
 
 local function install_metadata(session, prepared, replace_all)
+  local physical_row = prepared.source_projected and session.physical_row or nil
   node_contract.update(session, prepared, replace_all)
   if replace_all then
     vim.api.nvim_buf_clear_namespace(session.buffer, session.namespace, 0, -1)
@@ -393,12 +394,12 @@ local function install_metadata(session, prepared, replace_all)
       local entry, mark = prepared.block[id], {}
       local start_row = prepared.position[id]
       vim.list_extend(mark, require("forge.content_layout").install(session.buffer, session.namespace,
-        start_row, entry))
+        start_row, entry, physical_row))
       for _, decoration in ipairs(entry.metadata.decoration) do
         local range = decoration.range
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
-          start_row + range.start.row, range.start.column, {
-            end_row = start_row + range["end"].row, end_col = range["end"].column,
+          physical_row and physical_row(start_row + range.start.row) or start_row + range.start.row, range.start.column, {
+            end_row = physical_row and physical_row(start_row + range["end"].row) or start_row + range["end"].row, end_col = range["end"].column,
             hl_group = decoration.capture, hl_eol = decorations.full_width(decoration.capture),
             priority = decoration.priority, strict = true,
           })
@@ -406,8 +407,8 @@ local function install_metadata(session, prepared, replace_all)
       for _, conceal in ipairs(entry.metadata.conceal or {}) do
         local range = conceal.range
         mark[#mark + 1] = vim.api.nvim_buf_set_extmark(session.buffer, session.namespace,
-          start_row + range.start.row, range.start.column, {
-            end_row = start_row + range["end"].row, end_col = range["end"].column,
+          physical_row and physical_row(start_row + range.start.row) or start_row + range.start.row, range.start.column, {
+            end_row = physical_row and physical_row(start_row + range["end"].row) or start_row + range["end"].row, end_col = range["end"].column,
             conceal = conceal.replacement, conceal_lines = conceal.line and "" or nil,
             priority = conceal.priority, strict = true,
           })
@@ -567,7 +568,9 @@ function M.apply_projected_patch(session, patch)
   return commit_patch(session, patch)
 end
 
-function M.apply_projected_snapshot(session, snapshot)
+---@param render_source? fun() Synchronously renders projected text after snapshot validation.
+function M.apply_projected_snapshot(session, snapshot, render_source)
+  assert(not render_source or session.source_projected, "source rendering requires a projected document")
   if session.status == "Closed" then return { kind = "Closed" } end
   if session.expected_changedtick ~= nil and vim.api.nvim_buf_is_valid(session.buffer)
     and vim.api.nvim_buf_get_changedtick(session.buffer) ~= session.expected_changedtick
@@ -635,9 +638,11 @@ function M.apply_projected_snapshot(session, snapshot)
       if not session.physical then
         vim.bo[session.buffer].readonly = false
         vim.bo[session.buffer].modifiable = true
-        vim.api.nvim_buf_set_lines(session.buffer, 0, -1, true, prepared.text)
+        if render_source then render_source()
+        else vim.api.nvim_buf_set_lines(session.buffer, 0, -1, true, prepared.text) end
         vim.bo[session.buffer].modifiable = false
       end
+      prepared.source_projected = render_source ~= nil
       install_metadata(session, prepared, true)
       if not session.physical then vim.bo[session.buffer].modifiable = false end
       attach_regions(session, prepared)
@@ -900,8 +905,9 @@ local function publish_projection(session)
   return result
 end
 
-function M.apply_snapshot(session, snapshot)
-  if session.physical or session.source_projected then return M.apply_projected_snapshot(session, snapshot) end
+---@param render_source? fun() Synchronously renders a source-projected snapshot without replacing the full buffer.
+function M.apply_snapshot(session, snapshot, render_source)
+  if session.physical or session.source_projected then return M.apply_projected_snapshot(session, snapshot, render_source) end
   if editable.suspend_generated_text(session.editable) then return {kind="Deferred"} end
   local nested = session.projection ~= nil
   for _, block in ipairs(snapshot.block) do nested = nested or #(block.metadata.fold or {}) > 0 end

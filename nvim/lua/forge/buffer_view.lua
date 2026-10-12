@@ -47,6 +47,7 @@ end
 ---@field row integer Offset inside the retained block.
 ---@field original_row integer Zero-based native cursor row before the update.
 ---@field column integer Zero-based byte column.
+---@field projection_offset? integer Physical offset within an attached annotation.
 ---@field view table Native winsaveview state.
 
 ---@param session table Native buffer replica.
@@ -58,11 +59,16 @@ function M.capture(session, retained)
   for _, window in ipairs(vim.fn.win_findbuf(session.buffer)) do
     local cursor = vim.api.nvim_win_get_cursor(window)
     local original_row = cursor[1] - 1
-    local node = session.sequence:locate(original_row)
+    local source = session.source_projected and session.locate and session.locate(original_row, cursor[2]) or nil
+    local node = source and session.sequence.node[source.block] or session.sequence:locate(original_row)
     if node then
       local index, start = session.sequence:position(node.id)
-      local block, offset = node.id, original_row - start
+      local canonical_row = source and start + source.position.row or original_row
+      local block, offset = node.id, canonical_row - start
+      local projection_offset = source and session.physical_row
+        and original_row - session.physical_row(canonical_row) or nil
       if not retained(block) then
+        projection_offset = nil
         block, offset = nil, 0
         local ancestor_size
         for _, record in pairs(session.fold and session.fold.record or {}) do
@@ -70,7 +76,7 @@ function M.capture(session, retained)
           local _, last = session.sequence:position(record.fold["end"].block)
           first = first + record.fold.start.row
           last = last + record.fold["end"].position.row
-          if original_row >= first and original_row < last and retained(record.owner)
+          if canonical_row >= first and canonical_row < last and retained(record.owner)
             and (not ancestor_size or last - first < ancestor_size) then
             block, offset, ancestor_size = record.owner, record.fold.start.row, last - first
           end
@@ -83,8 +89,8 @@ function M.capture(session, retained)
             if retained(candidate.id) then
               local _, candidate_start = session.sequence:position(candidate.id)
               local candidate_row = math.max(candidate_start,
-                math.min(original_row, candidate_start + candidate.entry.row_count - 1))
-              local candidate_distance = math.abs(original_row - candidate_row)
+                math.min(canonical_row, candidate_start + candidate.entry.row_count - 1))
+              local candidate_distance = math.abs(canonical_row - candidate_row)
               if not distance or candidate_distance < distance then
                 block, offset, distance = candidate.id, candidate_row - candidate_start, candidate_distance
               end
@@ -96,6 +102,7 @@ function M.capture(session, retained)
       end
       result[#result + 1] = {
         window = window, block = block, row = offset, original_row = original_row, column = cursor[2],
+        projection_offset = projection_offset,
         source_row = block and session.projection and not session.project_source
           and require("forge.node_projection").source_position(session, block, {row=offset,column=0}).row or nil,
         view = vim.api.nvim_win_call(window, vim.fn.winsaveview),
@@ -120,6 +127,11 @@ function M.restore(session, retained)
         end
         row = start + math.min(offset, node.entry.row_count - 1)
       end
+      local row_count = session.row_count
+      if session.source_projected and session.physical_row then
+        row_count = vim.api.nvim_buf_line_count(session.buffer)
+        row = math.min(row_count - 1, session.physical_row(row) + (saved.projection_offset or 0))
+      end
       vim.api.nvim_win_call(saved.window, function()
         local column = saved.column
         local line = vim.api.nvim_buf_get_lines(session.buffer, row, row + 1, true)[1] or ""
@@ -132,7 +144,7 @@ function M.restore(session, retained)
         end
         local view = vim.deepcopy(saved.view)
         view.lnum, view.col = row + 1, column
-        view.topline = math.max(1, math.min(session.row_count,
+        view.topline = math.max(1, math.min(row_count,
           saved.view.topline + row - saved.original_row))
         vim.fn.winrestview(view)
       end)

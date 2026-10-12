@@ -887,6 +887,9 @@ impl PlanReferenceIndex {
             }
         }
         for (path, functions) in &mut design.proposed_calls {
+            if design.proposed.get(path) == document.design.as_ref().unwrap().proposed.get(path) {
+                continue;
+            }
             let before = DeclarationCalls::extract(
                 path,
                 &document.design.as_ref().unwrap().proposed[path],
@@ -908,12 +911,22 @@ impl PlanReferenceIndex {
             }
         }
         design.validation = None;
-        design.validate()?;
+        for (path, text) in &design.proposed {
+            let previous = document.design.as_ref().unwrap();
+            if previous.proposed.get(path) == Some(text)
+                && previous.proposed_calls.get(path) == design.proposed_calls.get(path) { continue; }
+            forge_diff::syntax::DeclarationOverview::parse(path, text)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let functions = design.proposed_calls.get(path).map(Vec::as_slice).unwrap_or_default();
+            let combined = super::calls::combined(path, text, functions)?;
+            let (_, parsed) = super::calls::parse(path, &combined, functions)?;
+            ensure!(parsed.len() == functions.len(), "rename changed callable ownership");
+        }
         output.version = output
             .version
             .checked_add(1)
             .ok_or_else(|| anyhow::anyhow!("plan version overflow"))?;
-        output.validate_for_submission()?;
+        ensure!(serde_json::to_vec(&output)?.len() <= 8 * 1024 * 1024, "renamed plan exceeds 8 MiB");
         Ok(output)
     }
 

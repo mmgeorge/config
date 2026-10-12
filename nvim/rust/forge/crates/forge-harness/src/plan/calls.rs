@@ -1,4 +1,5 @@
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
+use std::sync::{Arc, Mutex, OnceLock};
 
 use anyhow::{Context, Result, ensure};
 use forge_diff::syntax::{
@@ -6,6 +7,10 @@ use forge_diff::syntax::{
 };
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
+
+const PRESENTATION_CACHE_BYTES: usize = 8 * 1024 * 1024;
+const PRESENTATION_CACHE_ENTRIES: usize = 64;
+static PRESENTATION_CACHE: OnceLock<Mutex<VecDeque<CachedPresentation>>> = OnceLock::new();
 
 /// The semantic operation of one saved function-body reference.
 #[derive(
@@ -98,6 +103,8 @@ pub struct ReferenceEvidence {
 
 /// Maps display rows to saved declarations and call identities.
 pub(crate) struct CallPresentation {
+    visibility: [OnceLock<forge_diff::syntax::DeclarationVisibility>; 2],
+    folding: OnceLock<Vec<forge_diff::syntax::DeclarationFold>>,
     /// Signature-only text used by declaration analysis before synthetic bodies are rendered.
     pub plain: String,
     pub declaration: DeclarationPresentation,
@@ -110,6 +117,18 @@ pub(crate) struct CallPresentation {
     pub declaration_row: BTreeMap<usize, usize>,
 }
 
+impl CallPresentation {
+    /// Reuses container analysis for the same immutable declaration presentation.
+    pub(crate) fn folds(&self, path: &str) -> Result<&[forge_diff::syntax::DeclarationFold]> {
+        if self.folding.get().is_none() {
+            let folding = forge_diff::syntax::DeclarationFolding::analyze(path, &self.plain)
+                .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+            let _ = self.folding.set(folding);
+        }
+        Ok(self.folding.get().unwrap())
+    }
+}
+
 /// A rendered function body, from its final signature row through its closing delimiter.
 pub(crate) struct CallBody {
     /// Saved callable identity used to retain fold intent across rendering.
@@ -120,6 +139,12 @@ pub(crate) struct CallBody {
     pub end: usize,
     /// Completes the visible signature when its body is collapsed.
     pub collapsed_suffix: &'static str,
+}
+
+struct CachedPresentation {
+    key: String,
+    bytes: usize,
+    value: Arc<CallPresentation>,
 }
 
 /// Extract source call evidence without capturing unrelated files.
@@ -187,7 +212,18 @@ pub(crate) fn combined(path: &str, text: &str, calls: &[FunctionBody]) -> Result
 }
 
 /// Render function summaries and unique references while preserving saved occurrence order.
-pub(crate) fn present(path: &str, text: &str, calls: &[FunctionBody]) -> Result<CallPresentation> {
+pub(crate) fn present(path: &str, text: &str, calls: &[FunctionBody]) -> Result<Arc<CallPresentation>> {
+    let key = super::digest(&serde_json::to_vec(&(path, text, calls))?);
+    let cache = PRESENTATION_CACHE.get_or_init(Default::default);
+    {
+        let mut entries = cache.lock().map_err(|_| anyhow::anyhow!("call presentation cache lock poisoned"))?;
+        if let Some(index) = entries.iter().position(|entry| entry.key == key) {
+            let entry = entries.remove(index).unwrap();
+            let result = Arc::clone(&entry.value);
+            entries.push_back(entry);
+            return Ok(result);
+        }
+    }
     let presentation =
         DeclarationOverview::present(path, text).map_err(|error| anyhow::anyhow!("{error:?}"))?;
     const SORT_FUNCTION_USES: bool = false;
@@ -199,6 +235,23 @@ pub(crate) fn present(path: &str, text: &str, calls: &[FunctionBody]) -> Result<
             .copied()
             .flatten()
             .unwrap_or(*position);
+    }
+    let bytes = result.plain.capacity() * 3 + result.declaration.text.capacity()
+        + result.plain.lines().count() * 256
+        + result.declaration.source.capacity() * std::mem::size_of::<Option<DeclarationPosition>>()
+        + result.plain_row.capacity() * std::mem::size_of::<usize>()
+        + result.declaration_row.len() * 64
+        + result.call_row.values().map(|(owner, name, _)| owner.capacity() + name.capacity() + 128).sum::<usize>()
+        + result.change_row.values().map(|(owner, _)| owner.capacity() + 96).sum::<usize>()
+        + result.body.values().map(|body| body.owner.capacity() + 128).sum::<usize>();
+    let result = Arc::new(result);
+    if bytes <= PRESENTATION_CACHE_BYTES {
+        let mut entries = cache.lock().map_err(|_| anyhow::anyhow!("call presentation cache lock poisoned"))?;
+        while entries.len() >= PRESENTATION_CACHE_ENTRIES
+            || entries.iter().map(|entry| entry.bytes).sum::<usize>() + bytes > PRESENTATION_CACHE_BYTES {
+            entries.pop_front();
+        }
+        entries.push_back(CachedPresentation { key, bytes, value: Arc::clone(&result) });
     }
     Ok(result)
 }
@@ -212,6 +265,8 @@ pub(crate) fn insert(
 ) -> Result<CallPresentation> {
     if calls.is_empty() {
         return Ok(CallPresentation {
+            visibility: Default::default(),
+            folding: Default::default(),
             plain: text.into(),
             declaration: DeclarationPresentation {
                 text: text.into(),
@@ -358,6 +413,8 @@ pub(crate) fn insert(
         .map(|position| position.unwrap().line as usize - 1)
         .collect();
     Ok(CallPresentation {
+        visibility: Default::default(),
+        folding: Default::default(),
         plain: text.into(),
         declaration: DeclarationPresentation {
             text: output,
@@ -377,10 +434,16 @@ pub(crate) fn visibility(
     presentation: &CallPresentation,
     public_only: bool,
 ) -> Result<forge_diff::syntax::DeclarationVisibility> {
+    let cached = &presentation.visibility[usize::from(public_only)];
+    if let Some(visibility) = cached.get() {
+        return Ok(forge_diff::syntax::DeclarationVisibility {
+            rows: visibility.rows.clone(), replacement: visibility.replacement.clone(),
+        });
+    }
     let visibility =
         forge_diff::syntax::DeclarationVisibility::analyze(path, &presentation.plain, public_only)
             .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-    Ok(forge_diff::syntax::DeclarationVisibility {
+    let result = forge_diff::syntax::DeclarationVisibility {
         rows: presentation
             .plain_row
             .iter()
@@ -396,7 +459,11 @@ pub(crate) fn visibility(
                     .map(|row| (*row, text.clone()))
             })
             .collect(),
-    })
+    };
+    let _ = cached.set(forge_diff::syntax::DeclarationVisibility {
+        rows: result.rows.clone(), replacement: result.replacement.clone(),
+    });
+    Ok(result)
 }
 
 enum BodySection {
@@ -652,6 +719,23 @@ pub(crate) fn parse(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn presentation_cache_tracks_declarations_and_reference_metadata() {
+        let text = "pub fn cache_probe();\n";
+        let body = vec![FunctionBody { evidence: None, owner: "cache_probe".into(),
+            change: Some("Keep the original behavior.".into()), call: None }];
+        let original = present("cache_probe.rs", text, &body).unwrap();
+        assert!(Arc::ptr_eq(&original, &present("cache_probe.rs", text, &body).unwrap()));
+        let mut changed = body.clone();
+        changed[0].change = Some("Use the changed behavior.".into());
+        let revised = present("cache_probe.rs", text, &changed).unwrap();
+        assert!(!Arc::ptr_eq(&original, &revised));
+        assert!(revised.declaration.text.contains("Use the changed behavior."));
+        let renamed = present("cache_probe.rs", "pub fn renamed_probe();\n", &[]).unwrap();
+        assert!(!Arc::ptr_eq(&original, &renamed));
+        assert!(renamed.declaration.text.contains("renamed_probe"));
+    }
 
     #[test]
     fn reference_evidence_distinguishes_omitted_and_empty_categories() {

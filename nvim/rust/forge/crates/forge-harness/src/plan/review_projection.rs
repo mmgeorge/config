@@ -13,6 +13,47 @@ use forge_buffer::width::WidthProfile;
 use std::collections::HashMap;
 use std::time::Instant;
 
+/// Reuses all non-test blocks after a test-only canonical revision.
+pub(super) fn update_tests(
+    source: &PlanReviewSource,
+    previous: &super::RenderedPlan,
+    mut block: Vec<BufferBlock>,
+    mut target: HashMap<TargetId, PlanNavigationAnchor>,
+) -> Result<(Vec<BufferBlock>, HashMap<TargetId, PlanNavigationAnchor>)> {
+    let (old_start, old_end) = super::design_review::test_source_range(previous)?;
+    let (new_start, new_end) = super::design_review::test_source_range(&source.rendered)?;
+    ensure!(old_start == new_start, "test edit changed preceding source rows");
+    let start = block.iter().position(|block| block.id.0 == "plan:section:tests")
+        .context("test section is not projected")?;
+    let end = block.iter().position(|block| block.id.0 == "plan:section:tests:separator")
+        .context("test section separator is not projected")?;
+    ensure!(start < end, "test projection range is invalid");
+    let shift = new_end as i64 - old_end as i64;
+    for anchor in target.values_mut() {
+        if anchor.line as usize > old_end { anchor.line = (anchor.line as i64 + shift) as u32; }
+    }
+    let design = source.document.design.as_ref().context("test edit has no design")?;
+    let (mut replacement, navigation) = super::design_review::test_inventory(&design.document.tests)?;
+    for (index, row) in replacement.iter_mut().enumerate() {
+        if let Some(anchor) = navigation.iter().find(|anchor| anchor.line as usize == index + 1) {
+            let id = TargetId(format!("plan:declaration:{}", row.id.0));
+            row.metadata.target.push(TargetRange { id: id.clone(), range: TextRange {
+                start: TextPosition { row: 0, column: 0 },
+                end: TextPosition { row: row.text.row_count(), column: 0 },
+            }});
+            let mut anchor = anchor.clone();
+            anchor.line += new_start as u32;
+            target.insert(id, anchor);
+        }
+    }
+    block.splice(start..end, replacement);
+    let block = forge_buffer::collapse::project(block, &source.collapse)?;
+    let visible: std::collections::HashSet<_> = block.iter().flat_map(|block| &block.metadata.target)
+        .map(|range| &range.id).collect();
+    target.retain(|id, _| visible.contains(id));
+    Ok((block, target))
+}
+
 pub(crate) fn project(
     source: &PlanReviewSource,
     width: &WidthProfile,

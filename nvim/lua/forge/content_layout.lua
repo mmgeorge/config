@@ -118,21 +118,24 @@ end
 ---@param namespace integer
 ---@param start_row integer
 ---@param entry ForgeLayoutEntry
+---@param physical_row? fun(row: integer): integer Maps source rows into an annotated buffer.
 ---@return integer[]
-function M.install(buffer, namespace, start_row, entry)
+function M.install(buffer, namespace, start_row, entry, physical_row)
   local marks = {}
   for row, row_layout in pairs(entry.row_layout) do
     for _, insertion in ipairs(row_layout.insertion) do
       local chunks = {}
       for _, chunk in ipairs(insertion.chunk) do chunks[#chunks + 1] = { chunk.text, chunk.capture } end
-      marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row + row, insertion.position.column, {
+      marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace,
+        physical_row and physical_row(start_row + row) or start_row + row, insertion.position.column, {
         virt_text = chunks, virt_text_pos = "inline", hl_mode = "combine", priority = insertion.priority,
         right_gravity = true, strict = true,
       })
     end
   end
   for _, sign in ipairs(entry.prefix_sign) do
-    marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row + sign.row, sign.column, {
+    marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace,
+      physical_row and physical_row(start_row + sign.row) or start_row + sign.row, sign.column, {
       sign_text = sign.text, sign_hl_group = sign.capture, priority = sign.priority, right_gravity = true, strict = true,
     })
   end
@@ -146,7 +149,8 @@ function M.install(buffer, namespace, start_row, entry)
       options.virt_text, options.virt_text_win_col = { { marker.text, marker.capture } }, layout.indent - 4
     end
     if options.sign_text or options.virt_text then
-      marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace, start_row, 0, options)
+      marks[#marks + 1] = vim.api.nvim_buf_set_extmark(buffer, namespace,
+        physical_row and physical_row(start_row) or start_row, 0, options)
     end
   end
   return marks

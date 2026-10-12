@@ -34,6 +34,27 @@ distinct cases across the selected rows and opens the shared confirmation dialog
 Confirmation validates the captured view and source revision before `plan.tests.delete`
 creates a new reviewed plan revision. The broker removes only selected inventory entries,
 prunes empty file groups, and rejects stale confirmations. Project files remain unchanged.
+Renames and test deletions return an updated projection to the existing native document.
+The document retains analysis for unchanged declarations, input views, visibility filters,
+and declaration folds. Changed declaration sides receive fresh syntax analysis. Lua applies
+changed text ranges in the same buffer without closing the review or displaying a loading page.
+Lua retains every semantic rename preview span after confirmation until the authoritative
+projection commits. Failed requests remove the preview and restore the original conceal settings.
+Confirmed test deletion immediately projects the remaining rows, count summary, and file headings
+from the captured inventory. The saved revision and source identities remain unchanged until Rust
+accepts the edit. Failure restores those rows through the live comment projection, preserving newer
+feedback and the current cursor. Success replaces the temporary projection directly without
+reintroducing deleted rows. Source projection actions wait while test deletion is pending.
+Test-only revisions replace the test inventory, recompute its count summary, remove empty
+file headings, and shift later navigation anchors while retaining every declaration block.
+Semantic renames preserve canonical formatting and validate only changed declaration and call
+data. A content-keyed cache reuses parsed call presentations for unchanged file sides.
+The file store retains one validated canonical revision and its rendered source, avoiding
+repeated validation and rendering during persistence and review recapture. Every cache hit
+requires identical canonical content, and disk reads still enforce the saved revision checks.
+Late draft edits reanchor to surviving source blocks, and queued submissions use the new revision.
+The plan persists an ordered `manual_changes` history with each rename and each removed test identity.
+Acceptance, rejection, revision feedback, and resumed execution expose that history to the agent.
 Harness analyzes the exact saved Markdown with the shared syntax engine before opening that
 document, after releasing the broker lock. The document retains the syntax handle across
 annotation insertions and view resizes. Native highlights include fenced language injections.
@@ -2267,6 +2288,15 @@ as timestamped events with indented JSON payloads in a reusable read-only tab. `
 the view, and editor focus, buffer entry, and idle events refresh it when the file changes.
 `/log clear` empties only the current session file and removes its three rotated segments.
 It leaves the global trace, other session logs, and logging preference unchanged.
+Plan renames and test deletions carry one `operation_id` through `ui.plan.edit` in
+`harness-perf.log` and `plan.edit` in the session trace. Stage start and completion
+records separate queue and broker waits, semantic edits, declaration formatting,
+individual revision writes, task and transcript reconciliation, review recapture,
+per-file syntax work, projection, response delivery, and the final buffer update.
+Failed and interrupted stages retain elapsed times. `ui.plan.rename_preview` and
+`plan.rename.preview` measure preview preparation separately from confirmed edits.
+These timing records contain identities, work counts, and durations, without plan
+text or comment bodies. `/log on` enables both trace sources before reproduction.
 The Configuration picker displays the provider CLI and exposes an explicit provider-switch action.
 
 The Codex `CodexTurnCoordinator` treats one user request as an exchange that may outlive

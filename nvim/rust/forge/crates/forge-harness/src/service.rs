@@ -179,63 +179,7 @@ impl HarnessService {
                     );
                 }
                 let syntax_started = Instant::now();
-                if let Some(design) = &source.document.design {
-                    for path in design.changed_paths() {
-                        for (side, text) in [
-                            (
-                                "baseline",
-                                design.baseline.get(&path).map(|file| &file.text),
-                            ),
-                            ("proposed", design.proposed.get(&path)),
-                        ] {
-                            let Some(text) = text else { continue };
-                            let presentation =
-                                forge_diff::syntax::DeclarationOverview::present(&path, text)
-                                    .map_err(|error| anyhow::anyhow!("{error:?}"))?;
-                            admission.check()?;
-                            let Some(language) =
-                                forge_diff::syntax::DeclarationOverview::language(&path)
-                            else {
-                                continue;
-                            };
-                            let handle = self
-                                .syntax
-                                .analyze(SyntaxRequest {
-                                    source: forge_diff::source::SourceVersion::new(
-                                        presentation.text.as_bytes().to_vec(),
-                                        forge_diff::source::Representation::DisplayOnly,
-                                    )?,
-                                    language,
-                                    priority: forge_diff::workers::WorkPriority::Visible,
-                                    deadline: Some(Instant::now() + Duration::from_secs(10)),
-                                })
-                                .await
-                                .map_err(|error| {
-                                    anyhow::anyhow!("Declaration syntax analysis failed: {error:?}")
-                                })?;
-                            source
-                                .declaration_syntax
-                                .insert((path.clone(), side.into()), handle);
-                        }
-                    }
-                } else {
-                    source.syntax = Some(
-                        self.syntax
-                            .analyze(SyntaxRequest {
-                                source: forge_diff::source::SourceVersion::new(
-                                    source.rendered.markdown.as_bytes().to_vec(),
-                                    forge_diff::source::Representation::Raw,
-                                )?,
-                                language: SyntaxLanguage::Markdown,
-                                priority: forge_diff::workers::WorkPriority::Visible,
-                                deadline: Some(Instant::now() + Duration::from_secs(10)),
-                            })
-                            .await
-                            .map_err(|error| {
-                                anyhow::anyhow!("PlanReview syntax analysis failed: {error:?}")
-                            })?,
-                    );
-                }
+                analyze_plan_source(&mut source, &self.syntax, || Ok(admission.check()?), None).await?;
                 if let Some(trace) = &source.trace {
                     trace.record(
                         "plan.review.syntax",
@@ -254,6 +198,11 @@ impl HarnessService {
                 return controller.plan_review.insert(document, admission);
             }
             crate::buffer::session::PresentationRequest::PlanAction { input } => {
+                let preview_trace = (input.action == "rename_entity").then(|| crate::plan::edit_trace::PlanEditTrace::new(
+                    registry.runtime.trace(), &session_id, "plan.rename.preview",
+                    &json!({"operation_id":format!("preview:{}:{}", input.document.0, input.sequence.0),
+                        "document":input.document,"expected_version":input.revision})));
+                let preview = preview_trace.as_ref().map(|trace| trace.stage("preview.total"));
                 let trace = if input.action == "jump_entity" {
                     crate::declaration::trace::DeclarationTrace::new(
                         registry.runtime.trace(),
@@ -272,6 +221,7 @@ impl HarnessService {
                 }
                 let stage = trace.as_ref().map(|trace| trace.stage("action", None));
                 let result = controller.plan_review.action(input.clone())?;
+                if let Some(stage) = preview { stage.complete(json!({"count":result.get("rename").and_then(|rename|rename.get("preview")).and_then(Value::as_array).map_or(0,Vec::len)})); }
                 if let Some(stage) = stage {
                     stage.complete(json!({}));
                 }
@@ -410,6 +360,13 @@ impl HarnessService {
         let registry = self.registry().await?;
         let session_id = session_id.unwrap_or_else(|| registry.initial_session_id.clone());
         let mut prompt_admission = None;
+        let edit_trace = if matches!(method, HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete) {
+            let params = request.params.as_object_mut().context("plan edit requires an object")?;
+            params.entry("operation_id").or_insert_with(|| json!(format!("request:{}", request.id)));
+            Some(crate::plan::edit_trace::PlanEditTrace::new(registry.runtime.trace(), &session_id, &request.method, &request.params))
+        } else { None };
+        let edit_total = edit_trace.as_ref().map(|trace| trace.stage("service.total"));
+        let capture_stage = edit_trace.as_ref().map(|trace| trace.stage("service.capture_submission"));
         if matches!(
             method,
             HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete
@@ -418,19 +375,25 @@ impl HarnessService {
                 .params
                 .as_object_mut()
                 .context("plan review submission requires an object")?;
+            params.remove("review_document");
             if let Some(review) = params.remove("review") {
                 let input = serde_json::from_value::<forge_buffer::input::DocumentInput>(review)?;
+                if matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanEntityRename) {
+                    params.insert("review_document".into(), serde_json::to_value(&input.document)?);
+                }
                 let controller = registry.resolve(&session_id).await?;
                 if let Some(annotation) = params.remove("draft_annotation") {
                     let digest = params
                         .remove("draft_source_digest")
                         .and_then(|value| value.as_str().map(str::to_owned))
                         .context("plan annotation capture requires its saved source digest")?;
+                    let annotation_stage = edit_trace.as_ref().map(|trace| trace.stage("service.save_draft_annotations"));
                     controller.plan_review.save_annotations(
                         &input.document,
                         &digest,
                         serde_json::from_value(annotation)?,
                     )?;
+                    if let Some(stage) = annotation_stage { stage.complete(json!({})); }
                 }
                 let captured = controller.plan_review.submission(input)?;
                 for (key, value) in captured
@@ -441,6 +404,7 @@ impl HarnessService {
                 }
             }
         }
+        if let Some(stage) = capture_stage { stage.complete(json!({})); }
         if method == HarnessMethod::PromptSubmit {
             let params = request
                 .params
@@ -479,7 +443,8 @@ impl HarnessService {
                 });
             }
         }
-        let result = route_request(registry, session_id, request, method, sink).await;
+        let result = route_request(registry, session_id, request, method, sink, &self.syntax).await;
+        if let Some(stage) = edit_total { stage.complete(json!({"status":if result.is_ok() { "completed" } else { "failed" }})); }
         drop(prompt_admission);
         result
     }
@@ -892,12 +857,85 @@ impl SessionControllerRegistry {
     }
 }
 
+async fn analyze_plan_source(
+    source: &mut crate::plan::review_source::PlanReviewSource,
+    syntax: &Arc<SyntaxEngine>,
+    check: impl Fn() -> Result<()> + Send + Sync,
+    trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
+) -> Result<()> {
+    if let Some(design) = &source.document.design {
+        for path in design.changed_paths() {
+            for (side, text) in [
+                (
+                    "baseline",
+                    design.baseline.get(&path).map(|file| &file.text),
+                ),
+                ("proposed", design.proposed.get(&path)),
+            ] {
+                let Some(text) = text else { continue };
+                let stage = trace.map(|trace| trace.stage(&format!("syntax.{side}.{path}")));
+                if source.declaration_syntax.contains_key(&(path.clone(), side.into())) {
+                    if let Some(stage) = stage { stage.complete(json!({"cached":true,"source_bytes":text.len()})); }
+                    continue;
+                }
+                let presentation =
+                    forge_diff::syntax::DeclarationOverview::present(&path, text)
+                        .map_err(|error| anyhow::anyhow!("{error:?}"))?;
+                check()?;
+                let Some(language) =
+                    forge_diff::syntax::DeclarationOverview::language(&path)
+                else {
+                    if let Some(stage) = stage { stage.complete(json!({"status":"unsupported"})); }
+                    continue;
+                };
+                let handle = syntax
+                    .analyze(SyntaxRequest {
+                        source: forge_diff::source::SourceVersion::new(
+                            presentation.text.as_bytes().to_vec(),
+                            forge_diff::source::Representation::DisplayOnly,
+                        )?,
+                        language,
+                        priority: forge_diff::workers::WorkPriority::Visible,
+                        deadline: Some(Instant::now() + Duration::from_secs(10)),
+                    })
+                    .await
+                    .map_err(|error| {
+                        anyhow::anyhow!("Declaration syntax analysis failed: {error:?}")
+                    })?;
+                source
+                    .declaration_syntax
+                    .insert((path.clone(), side.into()), handle);
+                if let Some(stage) = stage { stage.complete(json!({"cached":false,"source_bytes":text.len()})); }
+            }
+        }
+    } else {
+        source.syntax = Some(
+            syntax
+                .analyze(SyntaxRequest {
+                    source: forge_diff::source::SourceVersion::new(
+                        source.rendered.markdown.as_bytes().to_vec(),
+                        forge_diff::source::Representation::Raw,
+                    )?,
+                    language: SyntaxLanguage::Markdown,
+                    priority: forge_diff::workers::WorkPriority::Visible,
+                    deadline: Some(Instant::now() + Duration::from_secs(10)),
+                })
+                .await
+                .map_err(|error| {
+                    anyhow::anyhow!("PlanReview syntax analysis failed: {error:?}")
+                })?,
+        );
+    }
+    Ok(())
+}
+
 async fn route_request(
     registry: Arc<SessionControllerRegistry>,
     session_id: String,
     request: Request,
     method: HarnessMethod,
     message_sink: &MessageSender,
+    syntax: &Arc<SyntaxEngine>,
 ) -> Result<()> {
     if matches!(method, HarnessMethod::BackendModelPins | HarnessMethod::BackendModelPin) {
         let data_root = PathBuf::from(&registry.initialize.data_root);
@@ -1140,7 +1178,9 @@ async fn route_request(
             .await_provider_fork(&session_id, &controller)
             .await?;
     }
-    if route_control_request(&controller, &request, method, message_sink).await? {
+    let edit_trace = matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanEntityRename)
+        .then(|| crate::plan::edit_trace::PlanEditTrace::new(registry.runtime.trace(), &session_id, &request.method, &request.params));
+    if route_control_request(&controller, &request, method, message_sink, syntax, edit_trace.as_ref()).await? {
         return Ok(());
     }
 
@@ -1681,7 +1721,60 @@ async fn route_control_request(
     request: &Request,
     method: HarnessMethod,
     message_sink: &MessageSender,
+    syntax: &Arc<SyntaxEngine>,
+    trace: Option<&crate::plan::edit_trace::PlanEditTrace>,
 ) -> Result<bool> {
+    if matches!(method, HarnessMethod::PlanTestsDelete | HarnessMethod::PlanEntityRename) {
+        let dispatch = trace.map(|trace| trace.stage("service.dispatch_edit"));
+        let revision_lane = trace.map(|trace| trace.stage("service.revision_lane"));
+        let (mut response, events) = if let Some((value, events)) = controller.revision_review.decide(method, request.params.clone()).await? {
+            if let Some(stage) = revision_lane { stage.complete(json!({"source":"revision_review"})); }
+            (Response::success(request.id, value)?, events)
+        } else {
+            if let Some(stage) = revision_lane { stage.complete(json!({"source":"broker"})); }
+            let wait = trace.map(|trace| trace.stage("service.broker_lock_wait"));
+            let mut broker = acquire_request_broker(controller, method).await?;
+            if let Some(stage) = wait { stage.complete(json!({})); }
+            let result = broker.dispatch(request.clone()).await;
+            (result.response, result.event)
+        };
+        if let Some(stage) = dispatch { stage.complete(json!({"status":if response.result().is_some() { "completed" } else { "failed" }})); }
+        let event_stage = trace.map(|trace| trace.stage("service.send_events"));
+        let event_count = events.len();
+        for event in events { message_sink.send_event(event).await?; }
+        if let Some(stage) = event_stage { stage.complete(json!({"count":event_count})); }
+        if let (Some(document), Some(mut value)) = (request.params.get("review_document"), response.result().cloned()) {
+            let document = serde_json::from_value(document.clone())?;
+            let update = async {
+                let plan_id = value["plan"]["id"].as_str().context("updated plan identity is missing")?;
+                let digest = value["plan"]["review_digest"].as_str().context("updated plan digest is missing")?;
+                let capture = trace.map(|trace| trace.stage("service.recapture_review"));
+                let mut source = if let Some(source) = controller.revision_review.capture(plan_id, digest, None).await? {
+                    source
+                } else {
+                    let wait = trace.map(|trace| trace.stage("service.recapture_lock_wait"));
+                    let broker = controller.broker.lock().await;
+                    if let Some(stage) = wait { stage.complete(json!({})); }
+                    broker.capture_plan_review(plan_id, digest)?
+                };
+                if let Some(stage) = capture { stage.complete(json!({"count":source.document.design.as_ref().map_or(0, |design|design.proposed.len())})); }
+                let expected_version = crate::plan::edit_trace::measure(trace, "service.reuse_review_caches", || controller.plan_review.prepare_update(&document, &mut source))?;
+                let syntax_stage = trace.map(|trace| trace.stage("service.syntax"));
+                analyze_plan_source(&mut source, syntax, || Ok(()), trace).await?;
+                if let Some(stage) = syntax_stage { stage.complete(json!({"count":source.declaration_syntax.len()})); }
+                controller.plan_review.update(&document, source, expected_version, trace)
+            }.await;
+            match update {
+                Ok(update) => value["review"] = update,
+                Err(error) => value["review_error"] = Value::String(format!("Plan changed, but the open review could not update: {error:#}")),
+            }
+            response = crate::plan::edit_trace::measure(trace, "service.build_response", || Ok(Response::success(request.id, value)?))?;
+        }
+        let send = trace.map(|trace| trace.stage("service.send_response"));
+        message_sink.send_response(response).await?;
+        if let Some(stage) = send { stage.complete(json!({})); }
+        return Ok(true);
+    }
     if matches!(method,HarnessMethod::AgentStart | HarnessMethod::AgentMessage | HarnessMethod::AgentFollowup
         | HarnessMethod::AgentInterrupt | HarnessMethod::AgentInterruptAll) {
         use crate::agent::AgentOperation;
@@ -1705,8 +1798,7 @@ async fn route_control_request(
         message_sink.send_response(Response::success(request.id,result)?).await?;
         return Ok(true);
     }
-    if matches!(method, HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanCancel
-        | HarnessMethod::PlanEntityRename | HarnessMethod::PlanTestsDelete)
+    if matches!(method, HarnessMethod::PlanAcceptanceBegin | HarnessMethod::PlanRequestChanges | HarnessMethod::PlanCancel)
         && let Some((value, events)) = controller.revision_review.decide(method, request.params.clone()).await? {
         for event in events { message_sink.send_event(event).await?; }
         message_sink.send_response(Response::success(request.id, value)?).await?;
@@ -1916,6 +2008,114 @@ async fn run_lease_heartbeat(
 mod tests {
     use super::*;
     use forge_diff::cache::CacheLimits;
+
+    #[tokio::test]
+    async fn manual_plan_edits_retain_projection_and_decision_history() -> Result<()> {
+        let fixture = tempfile::tempdir()?;
+        let service = service();
+        let opened = service.open_session(1, initialize(&fixture, "mock")).await?;
+        let session_id = opened.result().unwrap()["session"]["id"].as_str().unwrap().to_owned();
+        let registry = service.registry().await?;
+        let controller = registry.resolve(&session_id).await?;
+        let mut plan = {
+            let mut broker = controller.broker.lock().await;
+            let generated = broker.dispatch(Request { id: 2, method: "prompt.submit".into(),
+                params: json!({"text":"/plan add test coverage"}) }).await;
+            assert!(generated.response.error().is_none(), "{:?}", generated.response.error());
+            broker.snapshot()?.active_plan.unwrap()
+        };
+        let data = fixture.path().join("data");
+        let file = crate::plan::PlanFileStore::new(data.clone(), fixture.path());
+        let mut canonical = file.read_working_document(&session_id, &plan.id)?;
+        canonical.design.as_mut().unwrap().document.tests = serde_json::from_value(json!([
+            {"file":"tests/config.rs","cases":[
+                {"name":"first","change":"new","description":"Reject invalid input."},
+                {"name":"keep","change":"new","description":"Accept valid input."}
+            ]}
+        ]))?;
+        let (_, _, digest) = file.submit_validated_document_revision(&session_id, &plan.id,
+            plan.model_revision, canonical.version, canonical)?;
+        plan.review_digest = Some(digest.clone());
+        SqliteStore::open(&data)?.save_plan(&plan)?;
+        let mut projection = service.document(Some(session_id.clone()), serde_json::from_value(json!({
+            "operation":"plan_open", "document":"test-review", "view":"test-view",
+            "plan_id":plan.id, "digest":digest,
+            "width":{"columns":100,"tabstop":4}
+        }))?).await?;
+        let (sink, mut output) = forge_protocol::outbound::channel();
+        for (index, name) in ["first", "keep"].into_iter().enumerate() {
+            let row = projection["source_row"].as_array().unwrap().iter()
+                .find(|row| row["test"]["name"] == name).unwrap();
+            let previous_revision = projection["snapshot"]["revision"].as_u64().unwrap();
+            let previous_version = projection["version"].as_u64().unwrap();
+            service.dispatch(Some(session_id.clone()), Request { id: 3, method: "plan.tests.delete".into(),
+                params: json!({"tests":[{"file":"tests/config.rs","name":name}],
+                    "expected_version":projection["version"], "draft_annotation":[],
+                    "draft_source_digest":projection["saved_source_digest"],
+                    "review":{"document":"test-review","view":"test-view","sequence":index + 1,
+                        "revision":previous_revision,"block":row["block"],"position":row["position"],
+                        "target":row["target"],"action":"delete_tests"}}) }, &sink).await?;
+            loop {
+                let frame = output.recv().await?.context("test deletion response is missing")?;
+                let value: Value = serde_json::from_slice(frame.bytes())?;
+                if value["id"] != 3 { continue; }
+                assert!(value.get("error").is_none(), "{value}");
+                assert!(value["result"].get("review_error").is_none(), "{value}");
+                assert_eq!(value["result"]["plan"]["manual_changes"][index], format!("Removed planned tests: tests/config.rs::{name}"));
+                projection = value["result"]["review"].clone();
+                break;
+            }
+            assert_eq!(projection["snapshot"]["document"], "test-review");
+            assert!(projection["snapshot"]["revision"].as_u64().unwrap() > previous_revision);
+            assert_eq!(projection["version"], previous_version + 1);
+            assert!(!projection["source_row"].as_array().unwrap().iter().any(|row| row["test"]["name"] == name));
+        }
+        let row = projection["source_row"].as_array().unwrap().iter()
+            .find(|row| row["text"].as_str().is_some_and(|text| text.trim_start().starts_with("pub fn "))
+                && row["target"].is_string()).context("rename declaration is missing")?;
+        let mut input = json!({"document":"test-review","view":"test-view","sequence":3,
+            "revision":projection["snapshot"]["revision"],"block":row["block"],"position":row["position"],
+            "target":row["target"],"action":"rename_entity"});
+        input["position"]["column"] = json!(row["text"].as_str().unwrap().find("fn ").unwrap() + 3);
+        let selected = service.document(Some(session_id.clone()), serde_json::from_value(json!({
+            "operation":"plan_action","input":input
+        }))?).await?;
+        assert!(selected.get("rename").is_some(), "{selected}");
+        let annotation = json!([{"id":"rename-feedback","source":{"start_line":row["source_line"],
+            "end_line":row["source_line"],"body":"Keep this comment attached after rename."}}]);
+        input["sequence"] = json!(4);
+        service.dispatch(Some(session_id.clone()), Request { id:4, method:"plan.entity.rename".into(),
+            params:json!({"review":input,"symbol":selected["rename"]["symbol"],"name":"reviewed_name",
+                "expected_version":projection["version"],"draft_annotation":annotation,
+                "draft_source_digest":projection["saved_source_digest"]}) }, &sink).await?;
+        let renamed = loop {
+            let frame = output.recv().await?.context("rename response is missing")?;
+            let value: Value = serde_json::from_slice(frame.bytes())?;
+            if value["id"] == 4 { break value; }
+        };
+        assert!(renamed.get("error").is_none(), "{renamed}");
+        assert!(renamed["result"].get("review_error").is_none(), "{renamed}");
+        assert_eq!(renamed["result"]["review"]["snapshot"]["document"], "test-review");
+        assert_eq!(renamed["result"]["review"]["annotation"][0]["source"]["body"],
+            "Keep this comment attached after rename.");
+        assert!(renamed["result"]["review"]["source_row"].as_array().unwrap().iter()
+            .any(|row| row["text"].as_str().is_some_and(|text| text.contains("reviewed_name"))));
+        let changes = renamed["result"]["plan"]["manual_changes"].clone();
+        assert_eq!(changes.as_array().unwrap().len(), 3);
+        service.dispatch(Some(session_id.clone()), Request { id:5, method:"plan.request_changes".into(),
+            params:json!({"plan_id":plan.id,"digest":renamed["result"]["plan"]["review_digest"],
+                "comment":"Retain the manual edits while revising the plan."}) }, &sink).await?;
+        loop {
+            let frame = output.recv().await?.context("review decision response is missing")?;
+            let value: Value = serde_json::from_slice(frame.bytes())?;
+            if value["id"] != 5 { continue; }
+            assert!(value.get("error").is_none(), "{value}");
+            assert_eq!(value["result"]["manual_changes"], changes);
+            break;
+        }
+        service.shutdown(Duration::from_secs(2)).await?;
+        Ok(())
+    }
 
     #[tokio::test]
     async fn input_timeout_settings_do_not_interrupt_a_busy_session() -> Result<()> {
@@ -2128,7 +2328,7 @@ mod tests {
                 response.send(Ok((json!({"reviewed":true}), Vec::new()))).unwrap();
             };
             let (routed, ()) = tokio::time::timeout(Duration::from_secs(1), async {
-                tokio::join!(route_control_request(&controller, &request, method, &sink), respond)
+                tokio::join!(route_control_request(&controller, &request, method, &sink, &service.syntax, None), respond)
             }).await.expect("review controls must not acquire the provider's broker lock");
             assert!(routed.unwrap());
             let frame = output.recv().await.unwrap().unwrap();
@@ -2270,7 +2470,7 @@ mod tests {
         let answers:Vec<_> = requested_view["item_list"].as_array().unwrap().iter()
             .map(|item|json!({"item_id":item["id"],"choice_id":"allow_once"})).collect();
         assert!(route_control_request(&controller,&Request {id:2,method:"approval.resolve".into(),
-            params:json!({"approval_id":approval_id,"answer_list":answers})},HarnessMethod::ApprovalResolve,&sink).await?);
+            params:json!({"approval_id":approval_id,"answer_list":answers})},HarnessMethod::ApprovalResolve,&sink,&service.syntax,None).await?);
         assert_eq!(pending.await??,crate::backend::approval::ApprovalResolution::AllowOnce);
         tokio::time::timeout(Duration::from_secs(2),async {
             loop {

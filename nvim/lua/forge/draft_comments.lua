@@ -73,6 +73,7 @@ local namespace = vim.api.nvim_create_namespace("ForgeDraftComments")
 ---@field annotation_anchor? boolean
 
 ---@class ForgeDraftCommentOptions
+---@field focused_id? integer|string Retains the focused annotation during a source update.
 ---@field readonly? boolean
 ---@field heading? string
 ---@field source_label? fun(annotation: ForgeDraftComment): string
@@ -702,7 +703,7 @@ function M.attach(buf, win, source_lines, annotation_list, opts)
   end
   local next_id = 1
   for _, annotation in ipairs(annotation_list) do
-    annotation.focused = false
+    annotation.focused = opts.focused_id ~= nil and tostring(annotation.id) == tostring(opts.focused_id)
     next_id = math.max(next_id, (tonumber(annotation.id) or 0) + 1)
   end
   local state = {
@@ -873,7 +874,11 @@ function M.update(buf, updates)
   render(state)
   if cursor_mark and win and vim.api.nvim_win_is_valid(win) then
     local position = vim.api.nvim_buf_get_extmark_by_id(buf, cursor_namespace, cursor_mark, {})
-    if #position == 2 then vim.api.nvim_win_set_cursor(win, { position[1] + 1, position[2] }) end
+    if #position == 2 then
+      local row = math.min(position[1], vim.api.nvim_buf_line_count(buf) - 1)
+      local text = vim.api.nvim_buf_get_lines(buf, row, row + 1, false)[1] or ""
+      vim.api.nvim_win_set_cursor(win, { row + 1, math.min(position[2], #text) })
+    end
     vim.api.nvim_buf_del_extmark(buf, cursor_namespace, cursor_mark)
     sync_cursor_modifiable(state, win)
   end

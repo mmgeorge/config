@@ -602,6 +602,7 @@ impl HarnessBroker {
         let mut response = execution.response();
         response["result"] = json!("reviewed");
         response["plan_state"] = serde_json::to_value(plan.state)?;
+        response["manual_changes"] = serde_json::to_value(&plan.manual_changes)?;
         response["document"] = serde_json::to_value(self.plan_file.read_working_document(&self.session.id, &plan.id)?)?;
         Ok(response)
     }
@@ -718,7 +719,9 @@ impl HarnessBroker {
             &plan.id,
             accepted_revision,
         )?;
-        Ok(Some(super::PlanPrompt::execution(&execution, kind, &accepted.execution_json(execution.phase)?)))
+        Ok(Some(super::PlanPrompt::with_manual_changes(
+            super::PlanPrompt::execution(&execution, kind, &accepted.execution_json(execution.phase)?),
+            &plan.manual_changes)))
     }
 
     pub(super) async fn sync_plan_execution(&mut self, goal: &GoalRecord) -> Result<()> {

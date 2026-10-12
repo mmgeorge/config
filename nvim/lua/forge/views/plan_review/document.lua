@@ -5,6 +5,14 @@ local input = require("forge.input")
 local comments = require("forge.draft_comments")
 local perf = require("forge.infra.perf")
 
+---@class ForgePlanReviewUpdate
+---@field snapshot {document: string, revision: integer, block: table[]}
+---@field source_row {block: string, position: {row: integer}, source_line: integer}[]
+---@field annotation {id: string, source: {start_line: integer, end_line: integer, body: string}, kind?: string, parent_id?: string}[]
+---@field public_only boolean
+---@field saved_source_digest string
+---@field version integer
+
 ---@param options table
 ---@param callback fun(owner: table?, failure: string?)
 ---@return table
@@ -56,6 +64,14 @@ function M.attach(options, callback)
       vim.bo[options.buffer].modifiable = editable and not options.plan.historical_revision
     end
   end
+  local function sync_view_capture()
+    for window, view in pairs(owner.views) do
+      if vim.api.nvim_win_is_valid(window) and vim.api.nvim_win_get_buf(window) == options.buffer then
+        view.cursor = vim.api.nvim_win_get_cursor(window)
+        view.changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)
+      end
+    end
+  end
   function owner.recovery()
     if not owner.ready then return nil, "Plan review is not ready" end
     return { annotation = comments.capture(options.buffer), saved_source_digest = owner.saved_source_digest,
@@ -77,6 +93,17 @@ function M.attach(options, callback)
     return true
   end
   local dispatch_operation
+  ---@param operation table
+  ---@param phase string
+  ---@param fields? table
+  local function trace_operation(operation, phase, fields)
+    if not operation.trace_started then return end
+    perf.event("harness", "ui.plan.edit", vim.tbl_extend("force", {
+      operation_id = operation.params.operation_id, method = operation.method, phase = phase,
+      session_id = options.session_id, document = owner.document, revision = owner.version,
+      elapsed_ms = perf.elapsed_ms(operation.trace_started),
+    }, fields or {}))
+  end
   owner.reply_by_id = {}
   owner.pending_reply_by_id = {}
   local function show_answers(annotation)
@@ -103,18 +130,33 @@ function M.attach(options, callback)
     if owner.saving or owner.submission_pending or owner.completing then
       local previous = owner.pending_operation
       owner.pending_operation = operation
+      trace_operation(operation, "queued", { queue_count = 1 })
       if previous and previous.receive then previous.receive(nil, "A newer explicit plan operation replaced this queued operation") end
     else dispatch_operation(operation) end
   end
   dispatch_operation = function(operation)
+    trace_operation(operation, "dispatch")
+    local request_started = perf.now()
     local function complete(result, failure)
+      trace_operation(operation, "response", { duration_ms = perf.elapsed_ms(request_started),
+        status = failure and "failed" or "completed" })
       owner.saving, owner.submission_pending = false, false
-      if not failure then comments.saved(options.buffer, operation.capture) end
+      if not failure then
+        perf.trace("harness", "ui.plan.edit.comments_saved", {
+          operation_id = operation.params and operation.params.operation_id, document = owner.document,
+        }, function() comments.saved(options.buffer, operation.capture) end)
+      end
       owner.completing = true
+      owner.active_edit_operation_id = operation.trace_started and operation.params.operation_id or nil
+      local callback_started = perf.now()
       local received, callback_failure = pcall(function()
         if operation.receive then operation.receive(result, failure)
         elseif failure and options.notice then options.notice(failure) end
       end)
+      owner.active_edit_operation_id = nil
+      trace_operation(operation, "callback", { duration_ms = perf.elapsed_ms(callback_started),
+        status = received and "completed" or "failed" })
+      trace_operation(operation, "complete", { status = not failure and received and "completed" or "failed" })
       owner.completing = false
       local pending = owner.pending_operation
       if pending and alive() then
@@ -164,20 +206,38 @@ function M.attach(options, callback)
   end
   function owner.submit(method, params, receive)
     if not owner.attached() then receive(nil, "Plan review is not ready") return false end
-    local capture = comments.capture(options.buffer)
+    local trace_started = perf.now()
+    params = vim.deepcopy(params or {})
+    local edit = method == "plan.entity.rename" or method == "plan.tests.delete"
+    if edit then params.operation_id = params.operation_id or ("plan-edit:" .. trace_started) end
+    local capture = perf.trace("harness", "ui.plan.edit.capture", {
+      operation_id = params.operation_id, method = method, document = owner.document,
+    }, function() return comments.capture(options.buffer) end)
     local view = owner.current_view()
     local captured, failure = input.capture(owner.replica, view, method)
     if not captured then receive(nil, failure) return false end
-    params = vim.deepcopy(params or {})
     params.review, params.draft_annotation, params.draft_source_digest = captured, capture, owner.saved_source_digest
-    enqueue_operation({ method = method, params = params, capture = capture, receive = receive })
+    local operation = { method = method, params = params, capture = capture, receive = receive,
+      trace_started = edit and trace_started or nil }
+    if method == "plan.tests.delete" then
+      local previewed, settle = pcall(owner.preview_tests, params.tests, params.operation_id)
+      if not previewed then receive(nil, tostring(settle)) return false end
+      operation.receive = function(result, failure)
+        local received, applied = pcall(receive, result, failure)
+        settle(failure ~= nil or not received or applied ~= true)
+        if not received then error(applied, 0) end
+      end
+    end
+    trace_operation(operation, "captured", { count = #capture })
+    enqueue_operation(operation)
     return true
   end
   local function save(capture)
     if not owner.attached() then return end
     enqueue_operation({ capture = capture or comments.capture(options.buffer) })
   end
-  local function attach_projection(opened)
+  local function attach_projection(opened, source_document, focused_id)
+    owner.optimistic_source = nil
     local recovered = options.recovery ~= nil
     local captured = options.recovery and options.recovery.annotation or opened.annotation or {}
     local baseline = {}
@@ -195,7 +255,7 @@ function M.attach(options, callback)
     local source = assert(opened.source_row, "Plan review source rows are missing")
     owner.source = source
     local projection = require("forge.node_projection")
-    local source_document = buffer.fragment(opened.snapshot, true)
+    source_document = source_document or buffer.fragment(opened.snapshot, true)
     local node_owner = owner.replica.projection or projection.new(source_document)
     node_owner.source = source_document
     owner.replica.projection = node_owner
@@ -219,7 +279,7 @@ function M.attach(options, callback)
       vim.api.nvim_buf_clear_namespace(options.buffer, namespace, 0, -1)
       owner.projection = projection
       for _, record in ipairs(projection.source_record_list) do
-        local row = source[record.source_index]
+        local row = (owner.optimistic_source or source)[record.source_index]
         local metadata = row.metadata or {}
         for _, decoration_list in ipairs({ metadata.decoration or {} }) do
           for _, decoration in ipairs(decoration_list) do
@@ -242,13 +302,124 @@ function M.attach(options, callback)
     owner.comment_state = nil
     owner.replica.physical_row = nil
     owner.comment_state = comments.attach(options.buffer, options.window, source_lines, annotation, {
-      source_provider = function() return source end, after_render = paint,
+      source_provider = function() return owner.optimistic_source or source end, after_render = paint,
       baseline = recovered and baseline or nil,
+      focused_id = focused_id,
       readonly = options.plan.historical_revision ~= nil,
       guard_source = true,
     })
     require("forge.draft_source").attach(owner.replica, owner.comment_state, source)
     show_answers(opened.annotation)
+  end
+  ---@param selected ForgePlanTestSelection[]
+  ---@param operation_id string
+  ---@return fun(rollback: boolean)
+  function owner.preview_tests(selected, operation_id)
+    local started = perf.now()
+    local original = owner.source
+    local preview = require("forge.views.plan_review.test_preview").project(original, selected)
+    owner.optimistic_source = preview
+    local settled = false
+    local function settle(rollback)
+      if settled then return end
+      settled = true
+      perf.event("harness", "ui.plan.tests_preview", { operation_id = operation_id, document = owner.document,
+        phase = rollback and "rollback" or "committed", revision = owner.version, count = #selected })
+      if owner.optimistic_source ~= preview then return end
+      owner.optimistic_source = nil
+      if rollback and owner.source == original and vim.api.nvim_buf_is_valid(options.buffer) then
+        comments.update(options.buffer, {})
+        owner.sync_editability()
+        sync_view_capture()
+      end
+    end
+    local applied, failure = pcall(comments.update, options.buffer, {})
+    if not applied then settle(true) error(failure, 0) end
+    owner.sync_editability()
+    sync_view_capture()
+    perf.event("harness", "ui.plan.tests_preview", { operation_id = operation_id, document = owner.document, phase = "apply",
+      revision = owner.version, count = #selected, duration_ms = perf.elapsed_ms(started) })
+    return settle
+  end
+  local function apply_projection(opened, source)
+    return buffer.apply_snapshot(owner.replica, opened.snapshot, function()
+      local focused_id
+      for _, annotation in ipairs(owner.comment_state and owner.comment_state.annotation_list or {}) do
+        if annotation.focused then focused_id = annotation.id break end
+      end
+      comments.detach(options.buffer, false)
+      owner.replica.locate, owner.replica.physical_row = nil, nil
+      owner.replica.prepare_source, owner.replica.decoration_location, owner.replica.fold_location = nil, nil, nil
+      attach_projection(opened, source, focused_id)
+    end)
+  end
+  ---@param plan {id: string, review_digest: string, historical_revision?: integer}
+  ---@param opened ForgePlanReviewUpdate
+  ---@return boolean?, string?
+  function owner.update(plan, opened)
+    local update_started = perf.now()
+    local operation_id = owner.active_edit_operation_id
+    perf.event("harness", "ui.plan.edit.update", { operation_id = operation_id, document = owner.document, phase = "begin" })
+    if not alive() then return nil, "Plan host is unavailable. The local draft remains in its buffer." end
+    if type(opened) ~= "table" or type(opened.snapshot) ~= "table" or type(opened.source_row) ~= "table" then
+      return nil, "Updated plan review is missing"
+    end
+    local valid, source = pcall(buffer.fragment, opened.snapshot, true)
+    if not valid then return nil, tostring(source) end
+    local source_by_position, source_by_target, annotation_by_id, previous_by_line = {}, {}, {}, {}
+    for _, row in ipairs(opened.source_row) do
+      source_by_position[row.block .. ":" .. row.position.row] = row.source_line
+      if type(row.target) == "string" then source_by_target[row.target] = row.source_line end
+    end
+    for _, annotation in ipairs(opened.annotation or {}) do annotation_by_id[tostring(annotation.id)] = annotation.source end
+    for _, row in ipairs(owner.source) do previous_by_line[row.source_line] = row end
+    local function relocated(row)
+      return row and (source_by_position[row.block .. ":" .. row.position.row] or source_by_target[row.target])
+    end
+    local function reanchor(annotation)
+      local retained = {}
+      for _, item in ipairs(annotation) do
+        local first, last = previous_by_line[item.source.start_line], previous_by_line[item.source.end_line]
+        local saved = annotation_by_id[tostring(item.id)]
+        local start_line = relocated(first) or saved and saved.start_line
+        local end_line = relocated(last) or saved and saved.end_line
+        if start_line and end_line then
+          item = vim.deepcopy(item)
+          item.source.start_line, item.source.end_line = start_line, end_line
+          retained[#retained + 1] = item
+        end
+      end
+      return retained
+    end
+    if vim.bo[options.buffer].modified then
+      options.recovery = { annotation = reanchor(comments.capture(options.buffer)) }
+    end
+    local applied = perf.trace("harness", "ui.plan.edit.apply_projection", {
+      operation_id = operation_id, document = owner.document, count = #source,
+    }, function() return apply_projection(opened, source) end)
+    if applied.kind ~= "Applied" then options.recovery = nil return nil, applied.reason or applied.kind end
+    options.plan = plan
+    owner.public_only, owner.saved_source_digest, owner.version = opened.public_only, opened.saved_source_digest, opened.version
+    sync_view_capture()
+    owner.sync_editability()
+    local pending = owner.pending_operation
+    if pending then
+      pending.capture = reanchor(pending.capture)
+      if pending.method then
+        local captured, failure = input.capture(owner.replica, owner.current_view(), pending.method)
+        if not captured then
+          owner.pending_operation = nil
+          if pending.receive then pending.receive(nil, failure) end
+        else
+          pending.params.review, pending.params.draft_annotation = captured, pending.capture
+          pending.params.draft_source_digest = owner.saved_source_digest
+          pending.params.expected_version = owner.version
+        end
+      end
+    end
+    perf.event("harness", "ui.plan.edit.update", { operation_id = operation_id, document = owner.document,
+      phase = "end", elapsed_ms = perf.elapsed_ms(update_started), revision = owner.version })
+    return true
   end
   owner.replica = buffer.open(owner.document, { buffer = options.buffer, filetype = "ForgePlan", generated = true, preserve_view = true, source_projected = true,
     expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer), notice = options.notice })
@@ -287,11 +458,10 @@ function M.attach(options, callback)
       options.recovery = recovered
       owner.replica.expected_changedtick = vim.api.nvim_buf_get_changedtick(options.buffer)
     end
-    local adopted = buffer.apply_snapshot(owner.replica, opened.snapshot)
+    local pending = options.recovery and options.recovery.pending_operation
+    local adopted = apply_projection(opened)
     if adopted.kind ~= "Applied" then callback(nil, adopted.kind) return end
     owner.public_only, owner.saved_source_digest, owner.version = opened.public_only, opened.saved_source_digest, opened.version
-    local pending = options.recovery and options.recovery.pending_operation
-    attach_projection(opened)
     owner.ready = true
     if options.configure_view then options.configure_view(owner.view, owner) end
     vim.bo[options.buffer].buftype = "acwrite"
@@ -333,6 +503,10 @@ function M.attach(options, callback)
       receive({ local_draft = true }, nil) return true
     end
     if action == "delete" then comments.delete_at_cursor(options.buffer) receive({}, nil) return true end
+    if owner.optimistic_source then
+      if options.notice then options.notice("Wait for the planned test deletion to finish") end
+      return false
+    end
     if (action == "toggle_public" or action == "toggle_declaration" or action:find("reveal_reference:", 1, true) == 1) and vim.bo[options.buffer].modified then
       if options.notice then options.notice("Save plan annotations before changing the source projection") end
       return false
@@ -341,7 +515,16 @@ function M.attach(options, callback)
     if not view then receive(nil, "Plan review window is no longer available") return false end
     local captured, failure = input.capture(owner.replica, view, action)
     if not captured then receive(nil, failure) return false end
+    local preview_started = action == "rename_entity" and perf.now() or nil
+    if preview_started then perf.event("harness", "ui.plan.rename_preview", {
+      phase = "request", document = owner.document, revision = owner.version, session_id = options.session_id,
+    }) end
     request({ operation = "plan_action", input = captured }, function(result, error)
+      if preview_started then perf.event("harness", "ui.plan.rename_preview", {
+        phase = "response", document = owner.document, revision = owner.version, session_id = options.session_id,
+        duration_ms = perf.elapsed_ms(preview_started), status = error and "failed" or "completed",
+        count = result and result.rename and #result.rename.preview or 0,
+      }) end
       local reference_preview = action:find("reveal_reference:", 1, true) == 1
       if not owner.is_current(captured, not reference_preview) then
         if reference_preview then receive({ cancelled = true }, nil, captured) end
@@ -356,12 +539,8 @@ function M.attach(options, callback)
               view.window, collapse.opening)
           end
         end
-        comments.detach(options.buffer, false)
-        owner.replica.locate, owner.replica.physical_row = nil, nil
-        owner.replica.prepare_source, owner.replica.decoration_location, owner.replica.fold_location = nil, nil, nil
-        local applied = buffer.apply_snapshot(owner.replica, result.snapshot)
+        local applied = apply_projection(result)
         if applied.kind ~= "Applied" then receive(nil, applied.kind, captured) return end
-        attach_projection(result)
         captured = vim.tbl_extend("force", captured, { revision = owner.replica.revision })
         if view and view.id == captured.view then
           view.cursor = vim.api.nvim_win_get_cursor(view.window)

@@ -14,6 +14,13 @@ pub enum PlanExecutionPromptKind {
 }
 
 impl PlanPrompt {
+    /// Include persisted user edits when a provider accepts, revises, or resumes a reviewed plan.
+    pub(crate) fn with_manual_changes(prompt: String, changes: &[String]) -> String {
+        if changes.is_empty() { return prompt; }
+        format!("{prompt}\n\nManual plan edits recorded during review:\n{}\nThe current canonical plan determines which edits remain after the review decision. When acknowledging the review decision, state these manual changes.",
+            changes.iter().map(|change| format!("- {change}")).collect::<Vec<_>>().join("\n"))
+    }
+
     /// Build a decision-complete planning request for one user objective.
     pub fn draft(request: &str) -> String {
         format!(

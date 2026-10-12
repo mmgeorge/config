@@ -1,4 +1,4 @@
-use super::{PlanDocument, PlanFileStore, RenderedPlan, digest, render_plan_at};
+use super::{PlanDocument, PlanFileStore, RenderedPlan, digest};
 use anyhow::{Context, Result};
 use std::fs::File;
 use std::io::Read;
@@ -60,7 +60,7 @@ impl PlanFileStore {
             .join(format!("submitted-{revision:04}.json"));
         let submitted = read_source(&path)?;
         let document: PlanDocument = serde_json::from_slice(&submitted)?;
-        document.validate_for_submission()?;
+        self.review_cache.validate(&document, true)?;
         anyhow::ensure!(
             document.plan_id == plan_id,
             "submitted plan identity changed"
@@ -71,7 +71,7 @@ impl PlanFileStore {
         };
         let (rendered, saved_navigation) = if document.design.is_some() {
             (
-                render_plan_at(&document, &self.workspace)?,
+                self.render_review(&document)?,
                 Some(saved.navigation),
             )
         } else {
@@ -111,7 +111,7 @@ impl PlanFileStore {
                 .join(format!("submitted-{revision:04}.json")),
         )?;
         let document: PlanDocument = serde_json::from_slice(&submitted)?;
-        document.validate_for_submission()?;
+        self.review_cache.validate(&document, true)?;
         anyhow::ensure!(
             document.plan_id == plan_id,
             "submitted plan identity changed"
@@ -127,7 +127,7 @@ impl PlanFileStore {
             serde_json::to_vec(&saved)? == canonical,
             "working plan changed after the submitted review revision"
         );
-        let rendered = render_plan_at(&document, &self.workspace)?;
+        let rendered = self.render_review(&document)?;
         let physical = read_source(&directory.join("working.md"))?;
         let saved_navigation = if document.design.is_some() {
             let revision = directory
