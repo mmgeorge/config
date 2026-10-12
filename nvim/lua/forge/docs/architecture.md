@@ -3008,8 +3008,11 @@ missing-space recovery only between adjacent literal comma-separated arguments, 
 original command spans and checking each executable independently. Every other missing or error
 node rejects the call. Analysis stops at 64 KiB, 8,192 visited nodes, 64 tree
 levels, 16 nested shell invocations, or the parser's 25 ms progress deadline and returns the same error.
-The picker stages decisions locally, then presents a review page. Submission requires one answer for
-every item and atomically persists the selected rules before releasing the original provider request.
+The picker stages each decision locally and advances to the next unanswered item. Confirming the
+last unanswered item submits all decisions immediately, without a separate review page. Submission
+requires one answer for every item and atomically persists the selected rules before releasing the
+original provider request. Pending submission blocks duplicate confirmations. A failed submission
+keeps the decision pages open for correction or retry.
 Any denial rejects the complete provider operation. Reject all discards staged choices. Conflicting
 rules or incomplete, duplicate, or unknown answers leave the request pending without changing policy.
 In `permission.bash`, `"*"` supplies the lowest-priority decision for a recognized command.

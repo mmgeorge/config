@@ -107,22 +107,40 @@ local ok, failure = pcall(function()
   assert(highlighted > 0, "the real renderer must apply the approval marker")
   assert(base_priority and syntax_priority and base_priority < syntax_priority, "whole-line text cannot override shell syntax colors")
   choose("allow_exact")
+  assert(submitted == 0, "incomplete decisions must not submit")
   assert(picker._state_for_test().state.page_index == 2)
   assert(marked_text(picker._state_for_test(), "ForgePermissionTarget") == "cargo --version", "paging must move the marker to the current command")
   choose("allow_once")
+  assert(submitted == 0, "submission must wait for every decision")
   assert(picker._state_for_test().state.page_index == 3)
   choose("deny_once")
-  assert(submitted == 0, "staged choices must not grant permission")
-  assert(picker._state_for_test().spec.page_list[1].id == "review")
-  choose("revise")
-  assert(picker._state_for_test().state.page_index == 1)
-  choose("allow_exact")
-  assert(picker._state_for_test().spec.page_list[1].id == "review")
-  choose("submit")
-  assert(submitted == 1 and approval.is_open(), "failed submission must remain reviewable")
+  assert(submitted == 1 and approval.is_open(), "the final decision must submit immediately and remain retryable on failure")
+  assert(picker._state_for_test().spec.page_list[3].id == "3", "failed submission must retain the decision pages")
   accepted = true
-  choose("submit")
+  choose("deny_once")
   assert(submitted == 2 and not approval.is_open())
+
+  local single_request = vim.deepcopy(request)
+  single_request.item_list = { single_request.item_list[1] }
+  for _, choice_id in ipairs({ "allow_once", "deny_once", "allow_exact" }) do
+    local pending_callback
+    host.resolve = function(id, answer_list, callback)
+      submitted = submitted + 1
+      assert(id == single_request.id)
+      assert(vim.deep_equal(answer_list, { { item_id = "1", choice_id = choice_id } }))
+      pending_callback = callback
+    end
+    approval.open(single_request, host)
+    local before_submit = submitted
+    choose(choice_id)
+    assert(submitted == before_submit + 1, "a single decision must submit immediately")
+    assert(approval.is_open(), "submission must wait for the host acknowledgement")
+    choose(choice_id)
+    assert(submitted == before_submit + 1, "pending submission must ignore duplicate confirmations")
+    assert(pending_callback)
+    pending_callback(true)
+    assert(not approval.is_open(), "successful submission must close the picker")
+  end
 
   host.resolve = function(_, answer_list, callback)
     assert(#answer_list == 3)

@@ -51,7 +51,6 @@ local command_detail = require("forge.views.harness.command_detail")
 ---@field request ForgeApprovalRequest
 ---@field host ForgeApprovalHost
 ---@field selection table<string, ForgeApprovalChoice>
----@field review boolean
 ---@field page_index integer
 ---@field submitting boolean
 
@@ -150,47 +149,26 @@ local function build_spec(instance)
     }
   end
   local page_list = {}
-  if instance.review then
-    local content_list = {
-      { text = "Any denial rejects the whole request. Saved choices apply only to their listed target.", group = "ForgePickerText" },
-    }
-    if host.owner_label then table.insert(content_list, 1, { text = host.owner_label, group = "ForgePickerText" }) end
-    for _, item in ipairs(request.item_list) do
-      vim.list_extend(content_list, detail_content(item))
-      content_list[#content_list + 1] = { text = choice_label(item, instance.selection[item.id]), group = "ForgePickerAnswer" }
-    end
-    page_list[1] = {
-      id = "review", title = "Review Permission Decisions", content_list = content_list,
-      scroll_content = true,
-      column_headers = { "Action" },
-      option_list = {
-        { key = "y", label = "Submit decisions", value = "submit", confirm_on_key = true },
-        { key = "n", label = "Revise decisions", value = "revise", confirm_on_key = true },
-      },
-      footer = "y submit  n revise  PgUp/PgDn details  q close",
-    }
-  else
-    for _, item in ipairs(request.item_list) do
-      local option_list, selected_index = {}, 1
-      for index, choice in ipairs(item.choice_list) do
-        option_list[#option_list + 1] = {
-          key = config.options.picker.choice_keys[index], value = choice.id,
-          label = choice_label(item, choice), wrap_label = true,
-        }
-        if instance.selection[item.id] == choice then selected_index = index end
-      end
-      local content_list = detail_content(item)
-      if host.owner_label then table.insert(content_list, 1, { text = host.owner_label, group = "ForgePickerText" }) end
-      if request.reason then content_list[#content_list + 1] = { text = "Reason: " .. request.reason, group = "ForgePickerText" } end
-      page_list[#page_list + 1] = {
-        id = item.id, title = "Review Permission", subtitle = item.title ~= "Run command" and item.title or nil,
-        content_list = content_list,
-        scroll_content = true,
-        column_headers = { "Decision" }, option_list = option_list, selected_index = selected_index,
-        footer = "←→ page  ↑↓ select  Enter confirm  PgUp/PgDn details  q close"
-          .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. " interrupt") or ""),
+  for _, item in ipairs(request.item_list) do
+    local option_list, selected_index = {}, 1
+    for index, choice in ipairs(item.choice_list) do
+      option_list[#option_list + 1] = {
+        key = config.options.picker.choice_keys[index], value = choice.id,
+        label = choice_label(item, choice), wrap_label = true,
       }
+      if instance.selection[item.id] == choice then selected_index = index end
     end
+    local content_list = detail_content(item)
+    if host.owner_label then table.insert(content_list, 1, { text = host.owner_label, group = "ForgePickerText" }) end
+    if request.reason then content_list[#content_list + 1] = { text = "Reason: " .. request.reason, group = "ForgePickerText" } end
+    page_list[#page_list + 1] = {
+      id = item.id, title = "Review Permission", subtitle = item.title ~= "Run command" and item.title or nil,
+      content_list = content_list,
+      scroll_content = true,
+      column_headers = { "Decision" }, option_list = option_list, selected_index = selected_index,
+      footer = "←→ page  ↑↓ select  Enter confirm  PgUp/PgDn details  q close"
+        .. (interrupt_keys[1] and ("  " .. interrupt_keys[1] .. " interrupt") or ""),
+    }
   end
   return {
     owner = "approval", action_list = actions,
@@ -199,18 +177,9 @@ local function build_spec(instance)
       window_list = host.window_list or { host.transcript_win },
       control_win = host.control_win or host.transcript_win,
     },
-    page_list = page_list, initial_page = instance.review and 1 or instance.page_index,
+    page_list = page_list, initial_page = instance.page_index,
     on_confirm = function(result)
       if active ~= instance or instance.submitting then return false end
-      if result.page.id == "review" then
-        if result.option.value == "submit" then
-          submit(instance, false)
-        else
-          instance.review, instance.page_index = false, 1
-          picker.update(build_spec(instance))
-        end
-        return false
-      end
       if result.option.value == "cancel" then
         submit(instance, true)
         return false
@@ -222,14 +191,14 @@ local function build_spec(instance)
           end
         end
       end
-      instance.review = true
       for index, item in ipairs(request.item_list) do
         if not instance.selection[item.id] then
-          instance.review, instance.page_index = false, index
-          break
+          instance.page_index = index
+          picker.update(build_spec(instance))
+          return false
         end
       end
-      picker.update(build_spec(instance))
+      submit(instance, false)
       return false
     end,
     on_close = function()
@@ -244,7 +213,7 @@ end
 function Approval.open(request, host)
   picker.close(true)
   local instance = {
-    request = request, host = host, selection = {}, review = false, page_index = 1, submitting = false,
+    request = request, host = host, selection = {}, page_index = 1, submitting = false,
   }
   active = instance
   perf.trace("harness", "ui.approval.open", { request_id = request.id, count = #request.item_list }, function()
