@@ -361,6 +361,20 @@ impl Exchange {
                         item,
                     });
                 }
+                if let Some(reads) = event.data.get("skill_reads") {
+                    let reads: Vec<crate::skill::SkillRead> = serde_json::from_value(reads.clone())?;
+                    for read in reads {
+                        let successful = self.turn.iter().find(|turn|turn.id() == turn_id)
+                            .and_then(|turn|turn.tools().find(|tool|tool.id == read.tool_id))
+                            .is_some_and(|tool|tool.state() == crate::turn::ToolState::Completed && !tool.failed);
+                        if !successful || self.node_list.iter().any(|node|matches!(node,
+                            ExchangeNode::SkillRead {turn_id:owner,read:existing,..}
+                                if owner == &turn_id && existing.resource_id == read.resource_id)) { continue; }
+                        self.node_list.push(ExchangeNode::SkillRead {
+                            id:format!("{turn_id}:skill:{}",read.resource_id),turn_id:turn_id.clone(),read,
+                        });
+                    }
+                }
             }
         }
         self.metrics.observe_elapsed(self.elapsed(now_ms));
@@ -978,6 +992,7 @@ mod test {
             .node_list
             .iter()
             .map(|node| match node {
+                ExchangeNode::SkillRead { .. } => "skill-read",
                 ExchangeNode::Compaction { .. } => "compaction",
                 ExchangeNode::TurnContent { .. } => "content",
                 ExchangeNode::AgentReference { .. } => "agent",

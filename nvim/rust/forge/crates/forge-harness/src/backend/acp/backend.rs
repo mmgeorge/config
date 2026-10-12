@@ -340,6 +340,8 @@ impl Backend for AcpBackend {
     }
 
     async fn prompt_stream(&self, request: BackendRequest, sink: Option<BackendEventSink>) -> Result<BackendOutput> {
+        let skills = self.permission.skills(Some(&self.settings_root), &request, self.kind)?;
+        let sink = skills.sink(sink);
         if self.kind == BackendKind::Claude {
             let existing = self.session.lock().await.get(&request.runtime_key()?).cloned();
             if let Some(existing) = existing
@@ -370,6 +372,7 @@ impl Backend for AcpBackend {
         output.runtime = BackendRuntime { provider: self.descriptor().label,
             model: catalog.pointer("/models/currentModelId").and_then(Value::as_str).map(str::to_owned)
                 .or_else(|| find_option(&catalog,"model").and_then(|option|option["currentValue"].as_str()).map(str::to_owned)) };
+        skills.output(&mut output)?;
         Ok(output)
     }
 

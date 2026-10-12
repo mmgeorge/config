@@ -1089,6 +1089,10 @@ impl TimelineRenderer<'_> {
                 continue;
             }
             match node {
+                ExchangeNode::SkillRead { id, read, .. } => {
+                    self.literal(id, &format!("◇ Read skill · {}", read.name),
+                        Some(TranscriptAction::File { path:read.path.clone(),line:1 }))?;
+                }
                 ExchangeNode::Compaction { id, compaction } => self.compaction(id, compaction)?,
                 ExchangeNode::TurnContent { id, turn_id, item } => {
                     let turn = interaction

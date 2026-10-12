@@ -1085,6 +1085,8 @@ impl Backend for CodexBackend {
         request: BackendRequest,
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
+        let skills = self.permission_coordinator.skills(self.settings_root.as_deref(), &request, super::BackendKind::Codex)?;
+        let event_sink = skills.sink(event_sink);
         let mut active_steering = self
             .activate_turn_control(&request.runtime_key()?, event_sink.clone())
             .await?;
@@ -1278,6 +1280,7 @@ impl Backend for CodexBackend {
                 .insert(request.runtime_key()?, turn_id.clone());
             output.provider_checkpoint_id = Some(turn_id);
         }
+        skills.output(&mut output)?;
         Ok(output)
     }
 

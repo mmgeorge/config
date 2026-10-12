@@ -121,6 +121,7 @@ pub struct PermissionCoordinator {
     store: Arc<RwLock<PermissionStore>>,
     timeout_by_session: Mutex<BTreeMap<String, (InputTimeout, InputTimeout)>>,
     feedback_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, String>>,
+    skill_by_owner: Mutex<HashMap<crate::backend::ExecutionOwner, Arc<crate::skill::SkillAccess>>>,
 }
 
 impl PermissionCoordinator {
@@ -130,6 +131,41 @@ impl PermissionCoordinator {
             store,
             timeout_by_session: Mutex::new(BTreeMap::new()),
             feedback_by_owner: Mutex::new(HashMap::new()),
+            skill_by_owner: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Bind selected bundle access to one provider execution and revoke it when the guard drops.
+    pub(crate) fn skills(self: &Arc<Self>, root: Option<&Path>, request: &crate::backend::BackendRequest,
+        backend: crate::backend::BackendKind) -> Result<crate::skill::SkillExecution> {
+        let (provider, target) = match backend {
+            crate::backend::BackendKind::Codex => ("codex", "codexcli"),
+            crate::backend::BackendKind::Copilot => ("copilot", "copilotcli"),
+            crate::backend::BackendKind::Claude => ("claude", "claudecode"),
+            crate::backend::BackendKind::Antigravity => ("antigravity", "antigravity-cli"),
+            _ => ("mock", "mock"),
+        };
+        let selected = if let Some(root) = root {
+            crate::settings::SessionResources::load(root, &crate::backend::BackendCatalogRequest {
+                execution_owner: request.execution_owner.clone(), harness_session_id:request.harness_session_id.clone(),
+                workspace:request.workspace.clone(), access:request.access.clone(), execution_mode:request.execution_mode,
+                backend_session_id:request.backend_session_id.clone(),
+            }, provider, target)?.selected_skill
+        } else { Vec::new() };
+        let access = Arc::new(crate::skill::SkillAccess::new(&request.workspace, &selected)?);
+        let owner = request.owner()?;
+        let mut scope = self.skill_by_owner.lock().map_err(|_|anyhow::anyhow!("skill permission lock poisoned"))?;
+        anyhow::ensure!(!scope.contains_key(&owner), "skill access already belongs to an active execution");
+        scope.insert(owner.clone(), access.clone());
+        Ok(crate::skill::SkillExecution { observer:Arc::new(Mutex::new(crate::skill::SkillObserver::new(access.clone()))),
+            access, owner, coordinator:self.clone() })
+    }
+
+    /// Revoke only the matching execution generation's temporary bundle grants.
+    pub(crate) fn release_skills(&self, owner: &crate::backend::ExecutionOwner, access: &Arc<crate::skill::SkillAccess>) {
+        if let Ok(mut scope) = self.skill_by_owner.lock()
+            && scope.get(owner).is_some_and(|current| Arc::ptr_eq(current, access)) {
+            scope.remove(owner);
         }
     }
 
@@ -200,6 +236,32 @@ impl PermissionCoordinator {
             .map_err(|_| anyhow::anyhow!("permission store lock poisoned"))?
             .compiled()
             .evaluate(execution_mode, &request)?;
+        if !forced && evaluation.decision != PermissionDecision::Deny {
+            let scopes = self.skill_by_owner.lock().map_err(|_|anyhow::anyhow!("skill permission lock poisoned"))?;
+            let access = address.as_ref().and_then(|address|address.owner.as_ref())
+                .and_then(|owner|scopes.get(owner).cloned());
+            drop(scopes);
+            if let Some(access) = access {
+                let mut granted = Vec::new();
+                let targets = request.target_list.iter().chain(evaluation.pending_target_list.iter());
+                for target in targets {
+                    if !access.approves(target) { continue; }
+                    if matches!(target,PermissionTarget::Command {..}) && evaluation.pending_command_list.iter()
+                        .any(|command| &command.target == target && command.source.contains(['>', '<'])) { continue; }
+                    let canonical = access.permission_paths(target);
+                    let canonical = PermissionRequest { id:request.id.clone(),provider:request.provider.clone(),reason:None,
+                        target_list:canonical.into_iter().map(|path|PermissionTarget::Read {path:path.display().to_string()}).collect() };
+                    if self.store.read().map_err(|_|anyhow::anyhow!("permission store lock poisoned"))?
+                        .compiled().evaluate(execution_mode,&canonical)?.decision == PermissionDecision::Deny {
+                        return Ok(ApprovalResolution::DenyOnce);
+                    }
+                    granted.push(target.clone());
+                }
+                evaluation.pending_target_list.retain(|target|!granted.contains(target));
+                evaluation.pending_command_list.retain(|command|!granted.contains(&command.target));
+                if evaluation.pending_target_list.is_empty() { evaluation.decision = PermissionDecision::Allow; }
+            }
+        }
         match evaluation.decision {
             PermissionDecision::Allow if !forced => return Ok(ApprovalResolution::AllowOnce),
             PermissionDecision::Deny => return Ok(ApprovalResolution::DenyOnce),
@@ -993,6 +1055,82 @@ pub fn protected_target(request: &PermissionRequest, store: &PermissionStore) ->
 
 #[cfg(test)]
 mod test {
+    #[tokio::test]
+    async fn skill_runtime_grants_preserve_denials_selection_compounds_and_revocation() -> Result<()> {
+        use super::*;
+        let directory = tempfile::tempdir()?;
+        let bundle = directory.path().join(".rulesync/skills/fixture");
+        std::fs::create_dir_all(bundle.join("scripts"))?;
+        std::fs::write(bundle.join("SKILL.md"),"---\nname: fixture\ntargets: ['*']\n---\nInstructions")?;
+        std::fs::write(bundle.join("scripts/check.py"),"print('ok')")?;
+        let permission_path = directory.path().join("permissions.json");
+        std::fs::write(&permission_path,r#"{"permission":{"read":{"*":"ask"},"bash":{"*":"ask"}}}"#)?;
+        let store = Arc::new(RwLock::new(PermissionStore::load(&permission_path,directory.path())?));
+        let coordinator = Arc::new(PermissionCoordinator::new(store.clone()));
+        let request = crate::backend::BackendRequest {
+            execution_owner:None,harness_session_id:"session".into(),workspace:directory.path().display().to_string(),
+            input:crate::backend::BackendInput::from_text("Read skill"),mode:crate::backend::PromptMode::Chat,
+            model:"default".into(),effort:"default".into(),context_window:None,
+            service_tier:crate::backend::ServiceTier::Standard,access:crate::session::AccessPolicy::default(),
+            execution_mode:PermissionMode::Read,backend_session_id:None,control_context:None,
+        };
+        let address = Some(crate::backend::ProviderAddress {owner:Some(request.owner()?),thread_id:"provider".into(),turn_id:"turn".into()});
+        let skills = coordinator.skills(Some(directory.path()),&request,crate::backend::BackendKind::Codex)?;
+        let original = store.read().unwrap().open().1;
+        let source = bundle.join("SKILL.md").display().to_string();
+        let script = bundle.join("scripts/check.py").display().to_string();
+        let operation = |target|PermissionRequest {id:"request".into(),provider:"test".into(),reason:None,target_list:vec![target]};
+        let command = |command|PermissionTarget::Command {command,shell:Some(CommandShell::PowerShell)};
+        for target in [PermissionTarget::Read {path:source.clone()},PermissionTarget::Read {path:bundle.display().to_string()},
+            command(format!("Get-Content -LiteralPath '{source}'")),command(format!("python '{script}' --help"))] {
+            let granted = tokio::time::timeout(std::time::Duration::from_secs(1),
+                coordinator.authorize(PermissionMode::Read,operation(target),address.clone(),None)).await??;
+            assert_eq!(granted,ApprovalResolution::AllowOnce);
+        }
+        assert_eq!(store.read().unwrap().open().1,original);
+        for target in [PermissionTarget::Write {path:source.clone()},
+            PermissionTarget::Read {path:directory.path().display().to_string()},
+            command(format!("python '{script}'; Write-Output unrelated")),
+            command(format!("Get-Content '{source}' > outside.txt")),
+            command(format!("python -c \"print('{script}')\""))] {
+            let result = tokio::time::timeout(std::time::Duration::from_millis(20),
+                coordinator.authorize(PermissionMode::Read,operation(target.clone()),address.clone(),None)).await;
+            assert!(!matches!(result,Ok(Ok(ApprovalResolution::AllowOnce | ApprovalResolution::AllowExact | ApprovalResolution::AllowBroad))),
+                "unexpected skill grant for {target:?}: {result:?}");
+            assert!(coordinator.pending_list()?.is_empty());
+        }
+        store.write().unwrap().set_rule_list(&[(CATEGORY_BASH.into(),"python *".into(),PermissionDecision::Deny)])?;
+        assert_eq!(coordinator.authorize(PermissionMode::Read,operation(command(format!("python '{script}'"))),
+            address.clone(),None).await?,ApprovalResolution::DenyOnce);
+        store.write().unwrap().set_rule_list(&[(CATEGORY_READ.into(),source.clone(),PermissionDecision::Deny)])?;
+        assert_eq!(coordinator.authorize(PermissionMode::Read,operation(command(format!("Get-Content '{source}'"))),
+            address.clone(),None).await?,ApprovalResolution::DenyOnce);
+        let alias = directory.path().join("profile-alias");
+        #[cfg(windows)] junction::create(&bundle,&alias)?;
+        #[cfg(unix)] std::os::unix::fs::symlink(&bundle,&alias)?;
+        store.write().unwrap().set_rule_list(&[(CATEGORY_READ.into(),"*".into(),PermissionDecision::Allow)])?;
+        assert_eq!(coordinator.authorize(PermissionMode::Read,
+            operation(PermissionTarget::Read {path:alias.join("SKILL.md").display().to_string()}),
+            address.clone(),None).await?,ApprovalResolution::DenyOnce);
+        #[cfg(windows)] junction::delete(&alias)?;
+        #[cfg(unix)] std::fs::remove_file(&alias)?;
+        drop(skills);
+        assert!(coordinator.skill_by_owner.lock().unwrap().is_empty());
+        store.write().unwrap().save(&original)?;
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20),
+            coordinator.authorize(PermissionMode::Read,operation(PermissionTarget::Read {path:source.clone()}),address.clone(),None)).await.is_err());
+        let mut settings = crate::settings::SettingsStore::open(directory.path())?;
+        let catalog = settings.catalog(&request.workspace,&request.harness_session_id,"codex")?;
+        let mut desired = crate::settings::PortableSettings::default();
+        desired.skill.insert(catalog.skill[0].id.clone(),false);
+        settings.update(0,crate::settings::SettingScope::Global,&request.workspace,&request.harness_session_id,&desired)?;
+        let disabled = coordinator.skills(Some(directory.path()),&request,crate::backend::BackendKind::Codex)?;
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(20),
+            coordinator.authorize(PermissionMode::Read,operation(PermissionTarget::Read {path:source}),address,None)).await.is_err());
+        drop(disabled);
+        Ok(())
+    }
+
     #[tokio::test]
     async fn shell_parse_errors_never_open_approval_or_change_permission_rules() {
         let directory = tempfile::tempdir().unwrap();

@@ -11,6 +11,7 @@ pub struct BackendEventSink {
     owner: Option<super::ExecutionOwner>,
     sender: MessageSender,
     delivery: std::sync::Arc<tokio::sync::Mutex<()>>,
+    skill: Option<std::sync::Arc<std::sync::Mutex<crate::skill::SkillObserver>>>,
 }
 
 pub struct BackendEventStream {
@@ -34,7 +35,7 @@ impl std::error::Error for EventDeliveryFailure {}
 
 pub fn channel() -> (BackendEventSink, BackendEventStream) {
     let (sender, receiver) = outbound::channel();
-    (BackendEventSink { sender, delivery: Default::default(), owner:None }, BackendEventStream {
+    (BackendEventSink { sender, delivery: Default::default(), owner:None, skill:None }, BackendEventStream {
         receiver,
         transfer: None,
         pending: None,
@@ -46,7 +47,11 @@ pub fn channel() -> (BackendEventSink, BackendEventStream) {
 impl BackendEventSink {
     /// Bind transport delivery to its authenticated execution owner.
     pub fn owned(&self, owner: super::ExecutionOwner) -> Self {
-        Self {sender:self.sender.clone(),delivery:self.delivery.clone(),owner:Some(owner)}
+        Self {sender:self.sender.clone(),delivery:self.delivery.clone(),owner:Some(owner),skill:self.skill.clone()}
+    }
+    /// Attach execution-scoped detection without changing transport ownership.
+    pub(crate) fn skills(&self, observer: std::sync::Arc<std::sync::Mutex<crate::skill::SkillObserver>>) -> Self {
+        Self { skill: Some(observer), ..self.clone() }
     }
     /// Waits for bounded queue capacity without treating a burst as delivery failure.
     pub async fn send_wait(&self, mut event: BackendEvent) -> Result<(), EventDeliveryFailure> {
@@ -59,6 +64,10 @@ impl BackendEventSink {
         event.received_at_ms.get_or_insert_with(|| std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH).unwrap_or_default().as_millis() as i64);
         let _delivery = self.delivery.lock().await;
+        if let Some(skill) = &self.skill {
+            skill.lock().map_err(|_| EventDeliveryFailure(io::Error::other("skill observer lock poisoned")))?
+                .observe(&mut event);
+        }
         let transfer = forge_protocol::transfer::JsonTransfer::new(&event).map_err(|error| {
             self.sender.record_failure(&error);
             EventDeliveryFailure(error)

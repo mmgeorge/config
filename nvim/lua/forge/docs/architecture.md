@@ -2102,6 +2102,19 @@ disabled. It verifies loaded skills, disables unselected runtime resources, and 
 resuming the same provider conversation when selection changes. `SessionResources` exposes source
 identities and per-server credential failures independently from its ephemeral launch payloads.
 Resource binding rejects names that traverse or alias profile directories before creating links.
+Selected skills own execution-scoped read and script grants through the shared permission coordinator.
+Each grant covers one canonical skill bundle, including its references and assets, rather than the
+parent skill collection. Provider profile aliases resolve through directory bindings before containment
+checks. Shell grants require absolute bundle paths because permission callbacks do not consistently
+report each command's working directory. Escaped links, disabled bundles, inline interpreter code, and unrelated compound commands
+receive no automatic grant. Explicit denials and native sandbox restrictions still apply. Dropping the
+execution guard revokes the grants without writing the permission document.
+The shared skill observer reconciles tool inputs and successful completions across provider delivery.
+Recognized file reads and shell reads of selected `SKILL.md` files produce one durable skill-read node
+per skill per agent turn. Failed reads, listings, filenames in output, and script execution alone do not.
+The timeline displays `◇ Read skill · <name>` outside tool-output folds and opens the canonical source
+through the existing file action. Original tool history remains available. Internal provider loads that
+emit no observed read remain undetected. Session payload format 43 retains these nodes across reload.
 Codex conversations with shared settings own a private app-server runtime. Resource changes collect
 that runtime and reload the same native thread with the newly resolved configuration. Other sessions
 retain their provider processes. The unmanaged SDK constructor retains its shared-runtime behavior.
@@ -3299,7 +3312,7 @@ Native lifecycle notifications remain diagnostics and cannot create or bind mana
 Cross-provider selection rejects any child provider unable to enforce the root's OS sandbox,
 including Copilot and ACP providers, both at spawn and on later follow-up admission.
 
-Session format 42 hides incompatible session records without deleting them. Preference format 40
+Session format 43 hides incompatible session records without deleting them. Preference format 40
 remains independent of session compatibility. Reopening retains child identities, completed
 outcomes, and provider history, marks unfinished child tasks interrupted, and never replays them
 automatically. Root forking does not transfer live child execution ownership.

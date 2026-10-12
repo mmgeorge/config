@@ -600,6 +600,8 @@ impl Backend for CopilotBackend {
         event_sink: Option<BackendEventSink>,
     ) -> Result<BackendOutput> {
         let turn_event = self.turn_event(&request.runtime_key()?).await;
+        let skills = self.permission_coordinator.skills(self.settings_root.as_deref(), &request, super::BackendKind::Copilot)?;
+        let event_sink = skills.sink(event_sink);
         let _turn_event_guard = turn_event.activate(event_sink.clone())?;
         self.permission_context(&request.runtime_key()?)
             .await
@@ -786,6 +788,7 @@ impl Backend for CopilotBackend {
                 output.control_error = Some(format!("{error:#}"));
             }
         }
+        skills.output(&mut output)?;
         Ok(output)
     }
 
