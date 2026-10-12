@@ -1328,12 +1328,31 @@ mod tests {
             }]
         }))?;
         let mut owner=SessionPresentation::new("session".into());
-        owner.initialize(vec![TimelineEntry::Checks { id:"gate".into(),created_at_ms:1,run }])?;
+        owner.initialize(vec![interaction_entry("implementation"),
+            TimelineEntry::Checks { id:"gate".into(),created_at_ms:1,run }])?;
         let document=DocumentId("check-output".into());
         owner.open(document.clone(),ViewId("view".into()),WidthProfile::default())?;
         assert_eq!(owner.open.as_ref().unwrap().sections.nodes.tool["gate:0"].snapshot()?.retained_bytes(),0);
         expand_sections(&mut owner,"view")?;
         let collapsed=owner.snapshot(&document)?;
+        let checks_position=collapsed.block.iter().position(|block|block.id.0=="gate:checks").unwrap();
+        assert_eq!(collapsed.block[checks_position-1].id.0,"gate:separator");
+        assert_eq!(collapsed.block[checks_position-1].text.wire_rows(),vec![""]);
+        let checks=&collapsed.block[checks_position];
+        assert!(checks.metadata.node.as_ref().unwrap().parent.is_none());
+        for identity in ["gate:declarations","gate:0:tool"] {
+            let child=collapsed.block.iter().find(|block|block.id.0==identity).unwrap();
+            assert_eq!(child.metadata.node.as_ref().unwrap().parent.as_ref().unwrap().0,"gate:checks");
+            assert_eq!(child.metadata.layout.as_ref().unwrap().indent,
+                checks.metadata.layout.as_ref().unwrap().indent+2);
+        }
+        {
+            let open=owner.open.as_mut().unwrap();
+            open.sections.set(&mut open.transcript,ViewId("view".into()),99,"implementation:exchange",false,false,None)?;
+            retain_patches(open,Vec::new())?;
+        }
+        assert!(owner.snapshot(&document)?.block.iter().any(|block|block.id.0=="gate:0:tool"),
+            "collapsing implementation must not hide the separate checks section");
         assert!(!collapsed.block.iter().any(|block|block.text.wire_rows().iter().any(|row|row.contains("saved command output") || row.contains("must not render"))));
         for (sequence,action) in [(100,super::super::nodes::NodeAction::SetExpansion { expanded:true }),
             (101,super::super::nodes::NodeAction::LoadMore),(102,super::super::nodes::NodeAction::SetExpansion { expanded:false })] {

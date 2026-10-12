@@ -1445,7 +1445,7 @@ mod tests {
         canonical.design = Some(design);
         store.write_working_document("session", "plan", &canonical).unwrap();
         let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
-        let source = store.capture_review_source("session", "plan", 1, &digest).unwrap();
+        let source = store.capture_review_source("session", "plan", Some(1), &digest).unwrap();
         let mut document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()),
             source, WidthProfile::default(), None).unwrap();
         let opening = document.snapshot().block.into_iter()
@@ -1455,9 +1455,9 @@ mod tests {
         let resolver = Arc::clone(&document.source.resolver);
         let collapse = document.source.collapse.clone();
         let revision = document.snapshot().revision;
-        let (_, _, next_digest) = store.remove_tests("session", "plan", 2, 1, &digest,
+        let (_, _, next_digest) = store.remove_tests("session", "plan", 1, &digest,
             &[crate::plan::DesignTestSelection { file: "tests/config.rs".into(), name: "first".into() }], None).unwrap();
-        let mut source = store.capture_review_source("session", "plan", 2, &next_digest).unwrap();
+        let mut source = store.capture_review_source("session", "plan", None, &next_digest).unwrap();
         source.resolver = Arc::clone(&resolver);
         let result = document.update(source, None).unwrap();
         let rebuilt = super::super::review_projection::project(&document.source, &document.width, &[],
@@ -1477,11 +1477,11 @@ mod tests {
             revision: document.snapshot().revision, sequence: InputSequence(1), block: opening.id,
             position: target.range.start, target: Some(target.id.clone()), action: "delete_tests".into() };
         document.validate_input(captured).unwrap();
-        let stale = store.capture_review_source("session", "plan", 2, &next_digest).unwrap();
+        let stale = store.capture_review_source("session", "plan", None, &next_digest).unwrap();
         assert!(document.update(stale, None).unwrap_err().to_string().contains("stale"));
-        let (_, _, empty_digest) = store.remove_tests("session", "plan", 3, 2, &next_digest,
+        let (_, _, empty_digest) = store.remove_tests("session", "plan", 2, &next_digest,
             &[crate::plan::DesignTestSelection { file: "tests/config.rs".into(), name: "keep".into() }], None).unwrap();
-        let source = store.capture_review_source("session", "plan", 3, &empty_digest).unwrap();
+        let source = store.capture_review_source("session", "plan", None, &empty_digest).unwrap();
         document.update(source, None).unwrap();
         let rebuilt = super::super::review_projection::project(&document.source, &document.width, &[],
             &document.annotation_revision, document.focused_annotation.as_deref()).unwrap();
@@ -1508,7 +1508,7 @@ mod tests {
         canonical.design = Some(design);
         store.write_working_document("session", "plan", &canonical).unwrap();
         let (_, _, digest) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
-        let source = store.capture_review_source("session", "plan", 1, &digest).unwrap();
+        let source = store.capture_review_source("session", "plan", Some(1), &digest).unwrap();
         let mut document = PlanReviewDocument::new(DocumentId("review".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
         let find = |document: &PlanReviewDocument, needle: &str| {
             document.snapshot().block.into_iter().find(|block| block.text.row(0).is_some_and(|row| row.contains(needle))).unwrap()
@@ -1554,7 +1554,7 @@ mod tests {
         canonical.design = Some(design);
         file.write_working_document("session", "plan", &canonical).unwrap();
         let (_, _, checksum) = file.submit_document_revision("session", "plan", 1, 1).unwrap();
-        let source = file.capture_review_source("session", "plan", 1, &checksum).unwrap();
+        let source = file.capture_review_source("session", "plan", Some(1), &checksum).unwrap();
         let source_path = source.path.with_extension("json");
         let original = std::fs::read(&source_path).unwrap();
         let digest = source.saved_digest.clone();
@@ -1589,7 +1589,7 @@ mod tests {
         let feedback = store.submission(input.clone()).unwrap();
         assert_eq!(feedback["annotations"].as_array().unwrap().len(), 1, "questions became revision instructions");
         assert_eq!(feedback["annotations"][0]["body"], "Keep this interface.");
-        let reopened = file.capture_review_source("session", "plan", 1, &checksum).unwrap();
+        let reopened = file.capture_review_source("session", "plan", Some(1), &checksum).unwrap();
         let reopened = PlanReviewDocument::new(DocumentId("reopened".into()), ViewId("other".into()), reopened, WidthProfile::default(), None).unwrap();
         assert_eq!(reopened.annotation.annotation()[0].reply.as_ref().unwrap().body, "It isolates ownership.");
         assert_eq!(reopened.annotation.annotation()[0].reply.as_ref().unwrap().duration_ms, Some(3210));
@@ -1617,7 +1617,7 @@ mod tests {
             assert!(body.contains(expected), "missing thread entry: {expected}");
         }
         assert!(!body.contains("Keep this interface."), "unrelated feedback entered the thread");
-        let reopened = file.capture_review_source("session", "plan", 1, &checksum).unwrap();
+        let reopened = file.capture_review_source("session", "plan", Some(1), &checksum).unwrap();
         let reopened = PlanReviewDocument::new(DocumentId("thread-reopened".into()), ViewId("thread-view".into()), reopened, WidthProfile::default(), None).unwrap();
         assert_eq!(reopened.annotation.annotation()[3].parent_id.as_deref(), Some("followup"));
         assert_eq!(reopened.annotation.annotation()[2].reply.as_ref().unwrap().body, "Use a getter.");
@@ -1643,7 +1643,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let source = store
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let mut annotation =
             ReviewAnnotationStore::open(source.path.with_extension("json"), source.saved_digest)
@@ -1770,7 +1770,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let mut source = store
-            .capture_review_source("session", "plan", 1, &digest)
+            .capture_review_source("session", "plan", Some(1), &digest)
             .unwrap();
         assert!(source.public_only);
         source.public_only = false;
@@ -1932,7 +1932,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let source = store
-            .capture_review_source("session", "plan", 1, &digest)
+            .capture_review_source("session", "plan", Some(1), &digest)
             .unwrap();
         let captured_design = source.document.design.as_ref().unwrap();
         source
@@ -2050,7 +2050,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let source = store
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let document = PlanReviewDocument::new(
             DocumentId("review".into()),
@@ -2154,7 +2154,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let mut source = file
-            .capture_review_source("session", "plan", 1, &digest)
+            .capture_review_source("session", "plan", Some(1), &digest)
             .unwrap();
         assert!(source.public_only);
         source.public_only = false;
@@ -2246,7 +2246,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let source = file
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let source_path = source.path.with_extension("json");
         let original = std::fs::read(&source_path).unwrap();
@@ -2299,7 +2299,7 @@ mod tests {
         );
         std::fs::write(&source_path, original).unwrap();
         let reopened = file
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let reopened = PlanReviewDocument::new(
             DocumentId("reopened".into()),
@@ -2317,7 +2317,7 @@ mod tests {
             .save_annotations(&document_id, &digest, vec![])
             .unwrap();
         let deleted = file
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let deleted = PlanReviewDocument::new(
             DocumentId("deleted".into()),
@@ -2365,7 +2365,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let source = store
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let mut document = PlanReviewDocument::new(
             DocumentId("review".into()),
@@ -2445,7 +2445,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let source = store
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let document = PlanReviewDocument::new(
             DocumentId("uncaptured".into()),
@@ -2515,7 +2515,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let source = store
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let mut document = PlanReviewDocument::new(
             DocumentId("properties".into()),
@@ -2618,7 +2618,7 @@ mod tests {
         canonical.design = Some(design);
         store.write_working_document("session", "plan", &canonical).unwrap();
         let (_, _, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
-        let source = store.capture_review_source("session", "plan", 1, &checksum).unwrap();
+        let source = store.capture_review_source("session", "plan", Some(1), &checksum).unwrap();
         let mut document = PlanReviewDocument::new(DocumentId("imports".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
         let block = document.snapshot().block.into_iter().find(|block| block.text.row(0).is_some_and(|row| row.contains("pub struct Record"))).unwrap();
         let anchor = block.metadata.target.iter().filter_map(|target| document.target.get(&target.id)).find(|anchor| matches!(&anchor.target, super::super::PlanReviewTarget::Declaration { .. })).unwrap().clone();
@@ -2658,7 +2658,7 @@ mod tests {
         canonical.design = Some(design);
         store.write_working_document("session", "plan", &canonical).unwrap();
         let (_, _, checksum) = store.submit_document_revision("session", "plan", 1, 1).unwrap();
-        let source = store.capture_review_source("session", "plan", 1, &checksum).unwrap();
+        let source = store.capture_review_source("session", "plan", Some(1), &checksum).unwrap();
         let mut document = PlanReviewDocument::new(DocumentId("references".into()), ViewId("view".into()), source, WidthProfile::default(), None).unwrap();
         let saved = serde_json::to_vec(&document.source.document).unwrap();
         assert!(document.source.public_only);

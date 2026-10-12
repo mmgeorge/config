@@ -97,55 +97,51 @@ impl PlanFileStore {
         })
     }
 
+    /// Capture the checked working review, using a submitted baseline or the current draft when absent.
     pub(crate) fn capture_review_source(
         &self,
         session_id: &str,
         plan_id: &str,
-        revision: u32,
+        revision: Option<u32>,
         expected_digest: &str,
     ) -> Result<PlanReviewSource> {
         let directory = self.plan_dir(session_id, plan_id);
-        let submitted = read_source(
-            &directory
-                .join("revisions")
-                .join(format!("submitted-{revision:04}.json")),
-        )?;
-        let document: PlanDocument = serde_json::from_slice(&submitted)?;
+        let working = read_source(&directory.join("working.json"))?;
+        let document: PlanDocument = serde_json::from_slice(&working)?;
         self.review_cache.validate(&document, true)?;
         anyhow::ensure!(
             document.plan_id == plan_id,
-            "submitted plan identity changed"
+            "reviewed plan identity changed"
         );
         let canonical = serde_json::to_vec(&document)?;
         anyhow::ensure!(
             digest(&canonical) == expected_digest,
-            "submitted plan bytes changed after review"
-        );
-        let working = read_source(&directory.join("working.json"))?;
-        let saved: PlanDocument = serde_json::from_slice(&working)?;
-        anyhow::ensure!(
-            serde_json::to_vec(&saved)? == canonical,
-            "working plan changed after the submitted review revision"
+            "working plan changed after review"
         );
         let rendered = self.render_review(&document)?;
         let physical = read_source(&directory.join("working.md"))?;
-        let saved_navigation = if document.design.is_some() {
-            let revision = directory
-                .join("revisions")
-                .join(format!("submitted-{revision:04}.md"));
-            anyhow::ensure!(
-                physical == read_source(&revision)?,
-                "physical plan review changed after the submitted revision"
-            );
-            Some(serde_json::from_slice(&read_source(
-                &revision.with_extension("index.json"),
-            )?)?)
-        } else {
-            anyhow::ensure!(
-                physical == rendered.markdown.as_bytes(),
-                "physical plan review changed after the submitted revision"
-            );
-            None
+        let saved_navigation = match revision {
+            Some(revision) => {
+                let submitted_path = directory.join("revisions").join(format!("submitted-{revision:04}.json"));
+                let submitted: PlanDocument = serde_json::from_slice(&read_source(&submitted_path)?)?;
+                anyhow::ensure!(serde_json::to_vec(&submitted)? == canonical,
+                    "submitted plan bytes changed after review");
+                if document.design.is_some() {
+                    anyhow::ensure!(physical == read_source(&submitted_path.with_extension("md"))?,
+                        "physical plan review changed after the submitted revision");
+                    Some(serde_json::from_slice(&read_source(&submitted_path.with_extension("index.json"))?)?)
+                } else {
+                    anyhow::ensure!(physical == rendered.markdown.as_bytes(), "physical plan review changed after review");
+                    None
+                }
+            }
+            None => {
+                anyhow::ensure!(physical == rendered.markdown.as_bytes(), "physical plan draft changed after review");
+                let navigation: super::PlanNavigationIndex = serde_json::from_slice(&read_source(&directory.join("working.index.json"))?)?;
+                anyhow::ensure!(serde_json::to_vec(&navigation)? == serde_json::to_vec(&rendered.navigation)?,
+                    "plan draft navigation changed after review");
+                document.design.is_some().then_some(navigation)
+            }
         };
         Ok(PlanReviewSource {
             trace: None,
@@ -225,7 +221,7 @@ mod tests {
         std::fs::write(revision.with_extension("md"), projection).unwrap();
         std::fs::write(directory.join("working.md"), projection).unwrap();
         let current = store
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let historical = store.capture_revision_source("session", "plan", 1).unwrap();
         assert!(current.rendered.markdown.contains("  first: u64,"));
@@ -242,7 +238,7 @@ mod tests {
         std::fs::write(directory.join("working.md"), b"Changed after review").unwrap();
         assert!(
             store
-                .capture_review_source("session", "plan", 1, &checksum)
+                .capture_review_source("session", "plan", Some(1), &checksum)
                 .is_err()
         );
     }
@@ -259,7 +255,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let source = store
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         assert_eq!(source.document.overview, "Initial");
         assert!(!source.rendered.markdown.is_empty());
@@ -271,7 +267,7 @@ mod tests {
             .unwrap();
         assert!(
             store
-                .capture_review_source("session", "plan", 1, &checksum)
+                .capture_review_source("session", "plan", Some(1), &checksum)
                 .err()
                 .unwrap()
                 .to_string()
@@ -289,7 +285,7 @@ mod tests {
         .unwrap();
         assert!(
             store
-                .capture_review_source("session", "plan", 1, &checksum)
+                .capture_review_source("session", "plan", Some(1), &checksum)
                 .err()
                 .unwrap()
                 .to_string()

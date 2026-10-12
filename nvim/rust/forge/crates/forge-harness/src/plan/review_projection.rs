@@ -1283,7 +1283,7 @@ mod tests {
             .submit_document_revision("session", "plan", 1, 1)
             .unwrap();
         let source = store
-            .capture_review_source("session", "plan", 1, &checksum)
+            .capture_review_source("session", "plan", Some(1), &checksum)
             .unwrap();
         let anchor = source
             .rendered

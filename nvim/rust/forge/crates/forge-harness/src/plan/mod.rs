@@ -866,7 +866,6 @@ impl PlanFileStore {
         &self,
         session_id: &str,
         plan_id: &str,
-        revision: u32,
         expected_version: u64,
         identity: &str,
         name: &str,
@@ -882,7 +881,7 @@ impl PlanFileStore {
         let renamed = measure(trace, "rename.semantic_edit", || index.renamed(&document, identity, name))?;
         let rendered = measure(trace, "rename.render_changed_plan", || design_review::render(&renamed))?;
         let (document, rendered, digest) =
-            self.persist_rendered_revision(session_id, plan_id, revision, renamed, rendered, trace)?;
+            self.persist_review_draft(session_id, plan_id, renamed, rendered, trace)?;
         Ok((definition.name, document, rendered, digest))
     }
 
@@ -985,7 +984,8 @@ impl PlanFileStore {
         self.persist_rendered_revision(session_id, plan_id, revision, document, rendered, trace)
     }
 
-    fn render_review(&self, document: &PlanDocument) -> Result<RenderedPlan> {
+    /// Render a validated review document while reusing unchanged analysis.
+    pub(crate) fn render_review(&self, document: &PlanDocument) -> Result<RenderedPlan> {
         self.review_cache.validate(document, true)?;
         if let Some(rendered) = self.review_cache.rendered(document)? { return Ok(rendered); }
         let rendered = if document.design.is_some() { design_review::render(document)? }
@@ -998,26 +998,34 @@ impl PlanFileStore {
         &self, session_id: &str, plan_id: &str, revision: u32, document: PlanDocument,
         rendered: RenderedPlan, trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
+        let (document, rendered, checksum) = self.persist_review_draft(session_id, plan_id, document, rendered, trace)?;
+        let revision_directory = self.plan_dir(session_id, plan_id).join("revisions");
+        measure(trace, "persist.revision_directory", || Ok(fs::create_dir_all(&revision_directory)?))?;
+        let stem = format!("submitted-{revision:04}");
+        measure(trace, "persist.submitted_json", || write_json_atomically(&revision_directory.join(format!("{stem}.json")), &document))?;
+        measure(trace, "persist.submitted_markdown", || write_text_atomically(
+            &revision_directory.join(format!("{stem}.md")), &rendered.markdown,
+        ))?;
+        measure(trace, "persist.submitted_navigation", || write_json_atomically(
+            &revision_directory.join(format!("{stem}.index.json")), &rendered.navigation,
+        ))?;
+        Ok((document, rendered, checksum))
+    }
+
+    /// Save the current review draft without creating an immutable submitted revision.
+    pub(crate) fn persist_review_draft(
+        &self, session_id: &str, plan_id: &str, document: PlanDocument,
+        rendered: RenderedPlan, trace: Option<&PlanEditTrace>,
+    ) -> Result<(PlanDocument, RenderedPlan, String)> {
         anyhow::ensure!(document.plan_id == plan_id && rendered.navigation.plan_id == plan_id
             && rendered.navigation.plan_version == document.version, "rendered plan identity changed");
         anyhow::ensure!(serde_json::to_vec(&document)?.len() <= 8 * 1024 * 1024, "plan exceeds 8 MiB");
         let plan_directory = self.plan_dir(session_id, plan_id);
-        let revision_directory = plan_directory.join("revisions");
-        measure(trace, "persist.revision_directory", || Ok(fs::create_dir_all(&revision_directory)?))?;
+        measure(trace, "persist.working_directory", || Ok(fs::create_dir_all(&plan_directory)?))?;
         measure(trace, "persist.working_json", || write_json_atomically(&plan_directory.join("working.json"), &document))?;
         measure(trace, "persist.working_markdown", || write_text_atomically(&plan_directory.join("working.md"), &rendered.markdown))?;
         measure(trace, "persist.working_navigation", || write_json_atomically(
             &plan_directory.join("working.index.json"),
-            &rendered.navigation,
-        ))?;
-        let stem = format!("submitted-{revision:04}");
-        measure(trace, "persist.submitted_json", || write_json_atomically(&revision_directory.join(format!("{stem}.json")), &document))?;
-        measure(trace, "persist.submitted_markdown", || write_text_atomically(
-            &revision_directory.join(format!("{stem}.md")),
-            &rendered.markdown,
-        ))?;
-        measure(trace, "persist.submitted_navigation", || write_json_atomically(
-            &revision_directory.join(format!("{stem}.index.json")),
             &rendered.navigation,
         ))?;
         let checksum = measure(trace, "persist.digest", || Ok(digest(serde_json::to_vec(&document)?.as_slice())))?;
@@ -1025,9 +1033,23 @@ impl PlanFileStore {
         Ok((document, rendered, checksum))
     }
 
+    /// Freeze an unchanged reviewed draft at the final review decision.
+    pub(crate) fn submit_reviewed_revision(
+        &self, session_id: &str, plan_id: &str, revision: u32,
+        reviewed: &review_source::PlanReviewSource,
+    ) -> Result<()> {
+        let checksum = digest(&serde_json::to_vec(&reviewed.document)?);
+        let current = self.capture_review_source(session_id, plan_id, None, &checksum)?;
+        anyhow::ensure!(current.document == reviewed.document && current.saved_digest == reviewed.saved_digest,
+            "working plan changed before the review decision");
+        self.persist_rendered_revision(session_id, plan_id, revision,
+            reviewed.document.clone(), reviewed.rendered.clone(), None)?;
+        Ok(())
+    }
+
     /// Publish a reviewed test-inventory edit without changing declarations or project files.
     pub(crate) fn remove_tests(
-        &self, session_id: &str, plan_id: &str, revision: u32, expected_version: u64,
+        &self, session_id: &str, plan_id: &str, expected_version: u64,
         expected_digest: &str, selected: &[DesignTestSelection],
         trace: Option<&PlanEditTrace>,
     ) -> Result<(PlanDocument, RenderedPlan, String)> {
@@ -1041,7 +1063,7 @@ impl PlanFileStore {
         measure(trace, "delete.semantic_edit", || design_tests::remove(&mut document.design.as_mut().context("test deletion requires a declaration design")?.document.tests, selected))?;
         document.version = document.version.checked_add(1).context("plan version exhausted")?;
         let rendered = measure(trace, "delete.update_test_rows", || design_review::replace_test_inventory(&before, &document))?;
-        let (document, rendered, checksum) = self.persist_rendered_revision(session_id, plan_id, revision, document, rendered, trace)?;
+        let (document, rendered, checksum) = self.persist_review_draft(session_id, plan_id, document, rendered, trace)?;
         let reanchor = trace.map(|trace| trace.stage("delete.reanchor_annotations"));
         let mut retained = Vec::new();
         for mut item in annotation {
@@ -1262,7 +1284,7 @@ mod test {
         let index = references::PlanReferenceIndex::planned(&document, temporary.path()).unwrap();
         let identity = &index.definition[&("src/part_0.rs".into(), 1, 11)].0;
         let started = std::time::Instant::now();
-        let (_, renamed, _, checksum) = store.rename_symbol("session", "fast-review", 2, 1,
+        let (_, renamed, _, checksum) = store.rename_symbol("session", "fast-review", 1,
             identity, "RenamedState", None).unwrap();
         let rename_elapsed = started.elapsed();
         renamed.validate_for_submission().unwrap();
@@ -1271,12 +1293,25 @@ mod test {
         assert_eq!(renamed.design.as_ref().unwrap().proposed["src/part_12.rs"],
             document.design.as_ref().unwrap().proposed["src/part_12.rs"]);
         let started = std::time::Instant::now();
-        let (deleted, rendered, _) = store.remove_tests("session", "fast-review", 3, 2, &checksum,
+        let (deleted, rendered, _) = store.remove_tests("session", "fast-review", 2, &checksum,
             &[DesignTestSelection { file:"tests/state.rs".into(),name:"first".into() }], None).unwrap();
         let delete_elapsed = started.elapsed();
         deleted.validate_for_submission().unwrap();
         assert_eq!(rendered, render_plan_at(&deleted, temporary.path()).unwrap());
         assert!(rendered.markdown.contains("Tests · 1 new"));
+        let directory = store.plan_dir("session", "fast-review");
+        assert_eq!(fs::read_dir(directory.join("revisions")).unwrap().count(), 3);
+        assert_eq!(store.read_submitted_document("session", "fast-review", 1).unwrap(), document);
+        let reopened = PlanFileStore::new(temporary.path().join("data"), temporary.path());
+        let checksum = digest(&serde_json::to_vec(&deleted).unwrap());
+        let reviewed = reopened.capture_review_source("session", "fast-review", None, &checksum).unwrap();
+        assert_eq!(reviewed.document, deleted);
+        assert!(reopened.capture_review_source("session", "fast-review", Some(1), &checksum).is_err());
+        fs::write(directory.join("working.md"), "tampered draft").unwrap();
+        assert!(reopened.capture_review_source("session", "fast-review", None, &checksum).is_err());
+        fs::write(directory.join("working.md"), &rendered.markdown).unwrap();
+        fs::write(directory.join("working.index.json"), "{}").unwrap();
+        assert!(reopened.capture_review_source("session", "fast-review", None, &checksum).is_err());
         eprintln!("warm 13-file review: rename={rename_elapsed:?}, delete={delete_elapsed:?}");
     }
 
@@ -1343,7 +1378,6 @@ mod test {
             .rename_symbol(
                 "session",
                 "rename",
-                2,
                 document.version,
                 identity,
                 "dispatch",
@@ -1377,7 +1411,7 @@ mod test {
         let current = fs::read(store.plan_dir("session", "rename").join("working.json")).unwrap();
         assert!(
             store
-                .rename_symbol("session", "rename", 3, document.version, identity, "stale", None)
+                .rename_symbol("session", "rename", document.version, identity, "stale", None)
                 .is_err()
         );
         let index = references::PlanReferenceIndex::planned(&renamed, temporary.path()).unwrap();
@@ -1387,7 +1421,6 @@ mod test {
                 .rename_symbol(
                     "session",
                     "rename",
-                    3,
                     renamed.version,
                     existing,
                     "forbidden", None
@@ -1460,7 +1493,7 @@ mod test {
         assert!(targets.values().any(|anchor| matches!(&anchor.target, PlanReviewTarget::Declaration { path, side, .. } if path == "Cargo.toml" && side == "proposed")));
         assert_eq!(
             store
-                .capture_review_source("session", "plan", 1, &checksum)
+                .capture_review_source("session", "plan", Some(1), &checksum)
                 .unwrap()
                 .document
                 .design,
@@ -1592,7 +1625,7 @@ mod test {
         }
         assert_eq!(
             store
-                .capture_review_source("session", "plan", 1, &checksum)
+                .capture_review_source("session", "plan", Some(1), &checksum)
                 .unwrap()
                 .document
                 .design,
@@ -1652,7 +1685,7 @@ mod test {
         );
         assert_eq!(
             store
-                .capture_review_source("session", "plan", 1, &checksum)
+                .capture_review_source("session", "plan", Some(1), &checksum)
                 .unwrap()
                 .document
                 .design,

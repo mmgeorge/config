@@ -1063,7 +1063,8 @@ impl HarnessBroker {
         let mut source = self.plan_file.capture_review_source(
             &self.session.id,
             &plan.id,
-            if plan.state == PlanState::Accepted { plan.accepted_revision.unwrap_or(plan.model_revision) } else { plan.model_revision },
+            (plan.submitted_version == Some(plan.document_version)).then_some(
+                if plan.state == PlanState::Accepted { plan.accepted_revision.unwrap_or(plan.model_revision) } else { plan.model_revision }),
             expected_digest,
         )?;
         source.execution_review = self.execution_review(plan_id)?;
@@ -6046,15 +6047,11 @@ Planning continuation: turn {} of {}.",
                 "plan changed after the accept action began"
             );
         }
-        let reviewed = self.plan_file.capture_review_source(
-            &self.session.id,
-            &plan.id,
-            plan.model_revision,
-            &review_digest,
-        )?;
+        let reviewed = self.capture_plan_review(&plan.id, &review_digest)?;
         if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter().find(|execution| execution.plan_id == plan.id) {
             anyhow::ensure!(execution.pending_revision_reason.is_some(), "execution already exists. Use /goal resume to continue it");
             let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
+            self.finalize_review_draft(&mut plan, &reviewed)?;
             plan.accepted_revision = Some(plan.model_revision);
             plan.accepted_digest = plan.review_digest.clone();
             plan.user_revision += 1;
@@ -6129,34 +6126,22 @@ Planning continuation: turn {} of {}.",
         anyhow::ensure!(plan.session_id == self.session.id, "plan belongs to another session");
         anyhow::ensure!(plan.state == PlanState::AwaitingReview, "only plans awaiting review can have tests deleted");
         anyhow::ensure!(plan.review_digest.as_deref() == Some(&expected_digest), "plan changed before test deletion");
-        let revision = plan.model_revision.saturating_add(1);
-        let (document, rendered, checksum) = self.plan_file.remove_tests(&self.session.id, &plan.id, revision,
+        let (document, rendered, checksum) = self.plan_file.remove_tests(&self.session.id, &plan.id,
             expected_version, &expected_digest, &selected, Some(&trace))?;
         let records = trace.stage("delete.persist_records");
-        plan.model_revision = revision;
-        plan.user_revision = plan.user_revision.saturating_add(1);
         plan.document_version = document.version;
-        plan.submitted_version = Some(document.version);
         plan.review_digest = Some(checksum);
         plan.acceptance = None;
         let change = format!("Removed planned tests: {}", selected.iter()
             .map(|test| format!("{}::{}", test.file, test.name)).collect::<Vec<_>>().join(", "));
-        plan.manual_changes.push(change.clone());
+        plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
         self.session.active_plan_id = Some(plan.id.clone());
         self.save_session()?;
-        let lifecycle = PlanLifecycleRecord {
-            title: plan.title.clone(), anchor: Some(self.plan_exchange_anchor(&plan.id)?),
-            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), plan_id: plan.id.clone(),
-            kind: PlanLifecycleKind::RevisionCreated, model_revision: plan.model_revision, user_revision: plan.user_revision,
-            overall_comment: Some(change), annotation: Vec::new(),
-            question: None, answer: None, created_at_ms: self.clock.now_ms(),
-        };
-        self.store.save_plan_lifecycle(&lifecycle)?;
-        records.complete(json!({"count":selected.len(), "revision":revision}));
-        let payload = json!({ "plan": plan, "lifecycle": lifecycle, "content": rendered.markdown, "document": document });
-        mutation.complete(json!({"revision":revision}));
+        records.complete(json!({"count":selected.len(), "version":document.version}));
+        let payload = json!({ "plan": plan, "content": rendered.markdown, "document": document });
+        mutation.complete(json!({"version":document.version}));
         Ok((payload.clone(), vec![self.event("plan_tests_deleted", payload)?]))
     }
 
@@ -6195,63 +6180,63 @@ Planning continuation: turn {} of {}.",
             anyhow::ensure!(plan.review_digest.as_deref() == Some(expected), "plan changed before rename");
             anyhow::ensure!(crate::plan::digest(&serde_json::to_vec(&document)?) == expected, "working plan changed before rename");
         }
-        let revision = plan.model_revision.saturating_add(1);
-        preflight.complete(json!({"revision":revision}));
+        preflight.complete(json!({"version":document.version}));
         let (previous_name, document, rendered, digest) = if let Some(identity) = symbol {
             anyhow::ensure!(params.get("expected_version").and_then(Value::as_u64) == Some(document.version), "rename requires the current plan version");
-            self.plan_file.rename_symbol(&self.session.id, &plan.id, revision, document.version, identity, &new_name, Some(&trace))?
+            self.plan_file.rename_symbol(&self.session.id, &plan.id, document.version, identity, &new_name, Some(&trace))?
         } else {
             let previous = document.entity_changes.iter().find(|entity| entity.name == entity_name)
                 .map(|entity| entity.name.clone()).with_context(|| format!("program entity `{entity_name}` does not exist"))?;
             let result = self.plan_file.rename_added_entity(&self.session.id, &plan.id, &entity_name, new_name.clone())?;
-            let (document, rendered, digest) = self.plan_file.submit_document_revision(&self.session.id, &plan.id, revision, result.version)?;
+            let rendered = self.plan_file.render_review(&result.document)?;
+            let (document, rendered, digest) = self.plan_file.persist_review_draft(&self.session.id, &plan.id, result.document, rendered, Some(&trace))?;
             (previous, document, rendered, digest)
         };
         let records = trace.stage("rename.persist_records");
-        plan.model_revision = revision;
-        plan.user_revision = plan.user_revision.saturating_add(1);
         let version = document.version;
         plan.document_version = version;
-        plan.submitted_version = Some(version);
         plan.title.clone_from(&document.title);
         plan.review_digest = Some(digest);
         plan.acceptance = None;
         let change = format!("Renamed {previous_name} to {new_name}");
-        plan.manual_changes.push(change.clone());
+        plan.manual_changes.push(change);
         plan.updated_at_ms = self.clock.now_ms();
         self.store.save_plan(&plan)?;
         self.session.active_plan_id = Some(plan.id.clone());
         self.save_session()?;
-        let lifecycle = PlanLifecycleRecord {
-            title: plan.title.clone(),
-            anchor: Some(self.plan_exchange_anchor(&plan.id)?),
-            id: Uuid::new_v4().to_string(),
-            session_id: self.session.id.clone(),
-            plan_id: plan.id.clone(),
-            kind: PlanLifecycleKind::RevisionCreated,
-            model_revision: plan.model_revision,
-            user_revision: plan.user_revision,
-            overall_comment: Some(change),
-            annotation: Vec::new(),
-            question: None,
-            answer: None,
-            created_at_ms: self.clock.now_ms(),
-        };
-        self.store.save_plan_lifecycle(&lifecycle)?;
-        records.complete(json!({"revision":revision}));
+        records.complete(json!({"version":version}));
         let payload = json!({
             "plan": &plan,
-            "lifecycle": &lifecycle,
             "content": &rendered.markdown,
             "document": &document,
             "previous_name": previous_name,
             "name": new_name,
         });
-        mutation.complete(json!({"revision":revision}));
+        mutation.complete(json!({"version":version}));
         Ok((
             payload.clone(),
             vec![self.event("plan_entity_renamed", payload)?],
         ))
+    }
+
+    fn finalize_review_draft(&mut self, plan: &mut PlanRecord, reviewed: &crate::plan::review_source::PlanReviewSource) -> Result<()> {
+        if plan.submitted_version == Some(reviewed.document.version) { return Ok(()); }
+        anyhow::ensure!(plan.document_version == reviewed.document.version,
+            "plan version changed before the review decision");
+        let revision = plan.model_revision.checked_add(1).context("plan revision exhausted")?;
+        self.plan_file.submit_reviewed_revision(&self.session.id, &plan.id, revision, reviewed)?;
+        plan.model_revision = revision;
+        plan.submitted_version = Some(reviewed.document.version);
+        plan.updated_at_ms = self.clock.now_ms();
+        self.store.save_plan(plan)?;
+        self.store.save_plan_lifecycle(&PlanLifecycleRecord {
+            title: plan.title.clone(), anchor: Some(self.plan_exchange_anchor(&plan.id)?),
+            id: Uuid::new_v4().to_string(), session_id: self.session.id.clone(), plan_id: plan.id.clone(),
+            kind: PlanLifecycleKind::RevisionCreated, model_revision: revision, user_revision: plan.user_revision + 1,
+            overall_comment: Some(plan.manual_changes.join("\n")), annotation: Vec::new(),
+            question: None, answer: None, created_at_ms: self.clock.now_ms(),
+        })?;
+        Ok(())
     }
 
     async fn continue_plan_acceptance(&mut self) -> Result<(Value, Vec<SessionEvent>)> {
@@ -6316,14 +6301,9 @@ Planning continuation: turn {} of {}.",
                 "plan changed after the accept action began"
             );
         }
-        let reviewed = self.plan_file.capture_review_source(
-            &self.session.id,
-            &plan.id,
-            plan.model_revision,
-            &digest,
-        )?;
-        let accepted_document = reviewed.document;
-        let accepted_render = reviewed.rendered;
+        let reviewed = self.capture_plan_review(&plan.id, &digest)?;
+        let accepted_document = &reviewed.document;
+        let accepted_render = &reviewed.rendered;
         anyhow::ensure!(accepted_document.design.is_some(), "execution requires a semantic plan");
         anyhow::ensure!(!self.store.list_plan_execution(&self.session.id)?.iter().any(|execution| execution.plan_id == plan.id), "execution already exists. Use /goal resume to continue it");
         accepted_document.design.as_ref().unwrap().check_workspace(Path::new(&self.session.workspace))?;
@@ -6346,6 +6326,7 @@ Planning continuation: turn {} of {}.",
         } else {
             Vec::new()
         };
+        self.finalize_review_draft(&mut plan, &reviewed)?;
         plan.user_revision += 1;
         plan.accepted_digest = Some(digest);
         plan.accepted_revision = Some(plan.model_revision);
@@ -6549,9 +6530,8 @@ Planning continuation: turn {} of {}.",
                 "saved plan source changed after the review action"
             );
         }
-        plan.user_revision += 1;
-        let document = reviewed.document;
-        let rendered = reviewed.rendered;
+        let document = &reviewed.document;
+        let rendered = &reviewed.rendered;
         let annotation_input: Vec<crate::plan::PlanAnnotationInput> = serde_json::from_value(
             params
                 .get("annotations")
@@ -6571,10 +6551,13 @@ Planning continuation: turn {} of {}.",
                 .is_none_or(|comment| comment.len() <= 65536),
             "overall plan review comment exceeds 64 KiB"
         );
+        let feedback = crate::plan::render_review_feedback(document, &annotation)?;
+        let document_json = document.model_json()?;
+        self.finalize_review_draft(&mut plan, &reviewed)?;
+        plan.user_revision += 1;
         if let Some(mut execution) = self.store.list_plan_execution(&self.session.id)?.into_iter()
             .find(|execution| execution.plan_id == plan.id && execution.pending_revision_reason.is_some()) {
             let mut goal = self.store.load_goal(&execution.goal_id)?.context("execution goal is missing")?;
-            let feedback = crate::plan::render_review_feedback(&document, &annotation)?;
             execution.findings.push(format!("Revise the pending design using this review feedback: {}\n{}", overall_comment.as_deref().unwrap_or_default(), feedback));
             execution.pending_revision_reason = None;
             plan.state = PlanState::Revising;
@@ -6589,10 +6572,9 @@ Planning continuation: turn {} of {}.",
             if resume { events.push(self.event("goal_continue_requested", serde_json::to_value(goal)?)?); }
             return Ok((serde_json::to_value(self.snapshot()?)?, events));
         }
-        let document_json = document.model_json()?;
         let instruction = PlanPrompt::with_manual_changes(PlanPrompt::revision(
             &document_json,
-            &crate::plan::render_review_feedback(&document, &annotation)?,
+            &feedback,
             overall_comment.as_deref(),
         ), &plan.manual_changes);
         plan.acceptance = None;
@@ -8946,7 +8928,10 @@ mod test {
         assert_eq!(tests[0].cases[0].name, "keep");
         assert_eq!(document.design.as_ref().unwrap().proposed, updated.design.as_ref().unwrap().proposed);
         assert_eq!(updated.version, document.version + 1);
-        assert_eq!(result["plan"]["model_revision"], plan.model_revision + 1);
+        assert_eq!(result["plan"]["model_revision"], plan.model_revision);
+        assert_eq!(result["plan"]["user_revision"], plan.user_revision);
+        assert_eq!(result["plan"]["submitted_version"], serde_json::to_value(plan.submitted_version).unwrap());
+        assert!(result.get("lifecycle").is_none());
         assert!(broker.delete_plan_tests(params).unwrap_err().to_string().contains("plan changed"));
         assert_eq!(broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap(), updated);
         let reopened: PlanRecord = serde_json::from_value(result["plan"].clone()).unwrap();
@@ -8966,6 +8951,31 @@ mod test {
             "expected_version":updated.version,"tests":[{"file":"tests/game.rs","name":"keep"}]})).unwrap();
         assert!(broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap()
             .design.unwrap().document.tests.is_empty());
+        let draft = broker.store.load_plan(&plan.id).unwrap().unwrap();
+        let saved_revision = broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision).unwrap();
+        assert_eq!(saved_revision, document);
+        assert!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1).is_err());
+        broker.capability.execution_mode_list = vec![PermissionMode::Read, PermissionMode::Write, PermissionMode::Yolo];
+        broker.begin_plan_acceptance(json!({"plan_id":plan.id,"digest":draft.review_digest})).unwrap();
+        broker.cancel_plan_acceptance().unwrap();
+        assert!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1).is_err());
+        let invalid = broker.dispatch(Request { id: 2, method: "plan.accept".into(),
+            params: json!({"plan_id":plan.id,"digest":"stale","execution_mode":"write"}) }).await;
+        assert!(invalid.response.error().is_some());
+        assert!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, plan.model_revision + 1).is_err());
+        broker.backend = Arc::new(SemanticExecutionBackend { turn: Default::default(), revision: plan.model_revision + 1 });
+        let accepted = broker.dispatch(Request { id: 3, method: "plan.accept".into(),
+            params: json!({"plan_id":plan.id,"digest":draft.review_digest,"execution_mode":"write"}) }).await;
+        assert!(accepted.response.error().is_none(), "{:?}", accepted.response.error());
+        let finalized = broker.store.load_plan(&plan.id).unwrap().unwrap();
+        assert_eq!(finalized.model_revision, plan.model_revision + 1);
+        assert_eq!(finalized.user_revision, plan.user_revision + 1);
+        assert_eq!(finalized.accepted_digest, draft.review_digest);
+        assert_eq!(finalized.manual_changes, draft.manual_changes);
+        assert_eq!(broker.plan_file.read_submitted_document(&broker.session.id, &plan.id, finalized.model_revision).unwrap(),
+            broker.plan_file.read_working_document(&broker.session.id, &plan.id).unwrap());
+        assert_eq!(broker.store.list_plan_lifecycle(&broker.session.id).unwrap().iter()
+            .filter(|record| record.kind == PlanLifecycleKind::RevisionCreated).count(), 1);
     }
 
     #[tokio::test]
@@ -10702,7 +10712,7 @@ mod test {
         let before = broker.snapshot().unwrap().active_plan.unwrap();
         let thread = broker.session.backend_session_id.clone();
         let source = broker.plan_file.capture_review_source(&broker.session.id, &before.id,
-            before.model_revision, before.review_digest.as_deref().unwrap()).unwrap();
+            Some(before.model_revision), before.review_digest.as_deref().unwrap()).unwrap();
         let line = source.rendered.navigation.anchor.iter()
             .find(|anchor| matches!(anchor.target, crate::plan::PlanReviewTarget::Declaration { .. })).unwrap().line;
         let digest = source.saved_digest.clone();

@@ -2037,6 +2037,8 @@ mod tests {
             plan.model_revision, canonical.version, canonical)?;
         plan.review_digest = Some(digest.clone());
         SqliteStore::open(&data)?.save_plan(&plan)?;
+        let submitted = file.read_submitted_document(&session_id, &plan.id, plan.model_revision)?;
+        let lifecycle_count = SqliteStore::open(&data)?.list_plan_lifecycle(&session_id)?.len();
         let mut projection = service.document(Some(session_id.clone()), serde_json::from_value(json!({
             "operation":"plan_open", "document":"test-review", "view":"test-view",
             "plan_id":plan.id, "digest":digest,
@@ -2062,6 +2064,8 @@ mod tests {
                 assert!(value.get("error").is_none(), "{value}");
                 assert!(value["result"].get("review_error").is_none(), "{value}");
                 assert_eq!(value["result"]["plan"]["manual_changes"][index], format!("Removed planned tests: tests/config.rs::{name}"));
+                assert_eq!(value["result"]["plan"]["model_revision"], plan.model_revision);
+                assert_eq!(value["result"]["plan"]["user_revision"], plan.user_revision);
                 projection = value["result"]["review"].clone();
                 break;
             }
@@ -2102,6 +2106,17 @@ mod tests {
             .any(|row| row["text"].as_str().is_some_and(|text| text.contains("reviewed_name"))));
         let changes = renamed["result"]["plan"]["manual_changes"].clone();
         assert_eq!(changes.as_array().unwrap().len(), 3);
+        assert_eq!(renamed["result"]["plan"]["model_revision"], plan.model_revision);
+        assert_eq!(file.read_submitted_document(&session_id, &plan.id, plan.model_revision)?, submitted);
+        assert!(file.read_submitted_document(&session_id, &plan.id, plan.model_revision + 1).is_err());
+        assert_eq!(SqliteStore::open(&data)?.list_plan_lifecycle(&session_id)?.len(), lifecycle_count);
+        {
+            let mut broker = controller.broker.lock().await;
+            let rejected = broker.dispatch(Request { id: 99, method: "plan.request_changes".into(),
+                params: json!({"plan_id":plan.id,"comment":"x".repeat(65537)}) }).await;
+            assert!(rejected.response.error().is_some());
+            assert!(file.read_submitted_document(&session_id, &plan.id, plan.model_revision + 1).is_err());
+        }
         service.dispatch(Some(session_id.clone()), Request { id:5, method:"plan.request_changes".into(),
             params:json!({"plan_id":plan.id,"digest":renamed["result"]["plan"]["review_digest"],
                 "comment":"Retain the manual edits while revising the plan."}) }, &sink).await?;
@@ -2113,6 +2128,11 @@ mod tests {
             assert_eq!(value["result"]["manual_changes"], changes);
             break;
         }
+        assert_eq!(file.read_submitted_document(&session_id, &plan.id, plan.model_revision)?, submitted);
+        let reviewed = file.read_submitted_document(&session_id, &plan.id, plan.model_revision + 1)?;
+        assert!(reviewed.design.as_ref().unwrap().document.tests.is_empty());
+        assert!(reviewed.design.as_ref().unwrap().proposed.values().any(|text| text.contains("reviewed_name")));
+        assert_eq!(SqliteStore::open(&data)?.load_plan(&plan.id)?.unwrap().model_revision, plan.model_revision + 2);
         service.shutdown(Duration::from_secs(2)).await?;
         Ok(())
     }

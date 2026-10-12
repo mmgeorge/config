@@ -36,6 +36,10 @@ local success, failure = xpcall(function()
   await(function() return not state.busy and state.active_plan end, "mock plan did not arrive")
   local plan = state.active_plan
   local canonical = vim.fn.readfile(plan.working_path, "b")
+  local submitted_revision = plan.model_revision
+  local revision_directory = vim.fs.dirname(plan.working_path) .. "/revisions"
+  local submitted_path = revision_directory .. ("/submitted-%04d.json"):format(submitted_revision)
+  local submitted_content = vim.fn.readfile(submitted_path, "b")
   require("forge.views.plan_review").open(plan)
   await(function() return state.plan_review and state.plan_review.owner and state.plan_review.owner.ready end, "native PlanReview did not open")
   local review = state.plan_review
@@ -66,6 +70,10 @@ local success, failure = xpcall(function()
   assert(state.plan_review == review and review.owner == owner and review.win == window and review.tab == tab,
     "native rename reopened the plan")
   plan = review.plan
+  assert(plan.model_revision == submitted_revision, "manual rename created a submitted revision")
+  assert(vim.fn.filereadable(revision_directory .. ("/submitted-%04d.json"):format(submitted_revision + 1)) == 0,
+    "manual rename wrote an immutable snapshot")
+  assert(vim.deep_equal(vim.fn.readfile(submitted_path, "b"), submitted_content), "manual rename changed its submitted baseline")
   assert(plan.manual_changes[1] == "Renamed requested_change to reviewed_change")
   canonical = vim.fn.readfile(plan.working_path, "b")
   assert(table.concat(vim.api.nvim_buf_get_lines(review.buf, 0, -1, false), "\n"):find("reviewed_change", 1, true))
@@ -92,6 +100,9 @@ local success, failure = xpcall(function()
     "rename.semantic_edit", "persist.working_json", "broker.timeline_reconcile",
     "service.recapture_review", "service.syntax", "review.project", "service.send_response" }) do
     assert(phases[phase], "missing plan edit phase: " .. phase)
+  end
+  for _, phase in ipairs({ "persist.submitted_json", "persist.submitted_markdown", "persist.submitted_navigation" }) do
+    assert(not phases[phase], "draft rename performed a submitted snapshot write: " .. phase)
   end
   local perf = require("forge.infra.perf")
   perf.flush("harness")
@@ -152,6 +163,13 @@ local success, failure = xpcall(function()
   assert(submitted_capture.review.document ~= original_document)
   assert(submitted_capture.draft_annotation[1].source.body == literal .. "\nsecond line\n")
   await(function() return not state.plan_review and not state.busy end, "plan acceptance did not settle")
+  await(function() return state.active_plan and state.active_plan.model_revision == submitted_revision + 1 and not state.busy end,
+    "final acceptance did not publish the reviewed draft")
+  assert(vim.fn.filereadable(revision_directory .. ("/submitted-%04d.json"):format(submitted_revision + 1)) == 1,
+    "final acceptance did not freeze the edited draft")
+  assert(vim.fn.filereadable(revision_directory .. ("/submitted-%04d.json"):format(submitted_revision + 2)) == 0,
+    "final acceptance created more than one review revision")
+  assert(vim.deep_equal(vim.fn.readfile(submitted_path, "b"), submitted_content), "acceptance overwrote the original revision")
   client.request_for = original_request
   assert(vim.deep_equal(vim.fn.readfile(plan.working_path, "b"), canonical))
   require("forge.views.harness.workspace").release(state)

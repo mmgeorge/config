@@ -257,6 +257,7 @@ impl<'profile> TranscriptRenderer<'profile> {
             },
         };
         decorate_tool_heading(&mut block, title_rows, kind, failed);
+        Self::heading_marker(&mut block, "Normal");
         if block.text.row_count() > title_rows {
             block.metadata.decoration.push(Decoration {
                 range: TextRange {
@@ -541,6 +542,37 @@ fn append_decoration(block: &mut BufferBlock, row: usize, start: usize, end: usi
 #[cfg(test)]
 mod test {
     use super::*;
+
+    #[test]
+    fn check_heading_keeps_one_marker_across_expansion_and_refresh() -> Result<()> {
+        let profile = WidthProfile::default();
+        let renderer = TranscriptRenderer::new(&profile)?;
+        for expanded in [false, true] {
+            let mut block = renderer.tool_header(
+                BlockId("check:tool".into()), TargetId("check:tool".into()), "check",
+                Some(102_000), false, "cargo test --locked --lib controls::tests · Running", expanded,
+            )?;
+            TranscriptRenderer::fold_marker(&mut block);
+            for elapsed in [102_000, 103_000] {
+                block = renderer.refresh_tool_heading(&block, "check", Some(elapsed), false,
+                    "cargo test --locked --lib controls::tests · Running", expanded)?;
+                let heading = block.text.row(0).unwrap();
+                let mut visible = heading.to_owned();
+                for conceal in block.metadata.conceal.iter().rev() {
+                    assert_eq!(conceal.range.start.row, 0);
+                    assert_eq!(conceal.range.end.row, 0);
+                    visible.replace_range(conceal.range.start.column..conceal.range.end.column,
+                        &conceal.replacement);
+                }
+                let marker = &block.metadata.layout.as_ref().unwrap().marker.as_ref().unwrap().text;
+                let rendered = format!("{marker} {visible}");
+                assert!(rendered.starts_with("▸ cargo test --locked --lib controls::tests · Running"), "{rendered}");
+                assert_eq!(rendered.matches('▸').count(), 1, "{rendered}");
+                assert!(heading.starts_with("▸ "));
+            }
+        }
+        Ok(())
+    }
 
     #[test]
     fn prompt_preserves_literal_markdown_and_real_marker() -> Result<()> {

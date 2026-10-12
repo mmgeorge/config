@@ -31,8 +31,8 @@ identity through that same public route, while browser fallback remains availabl
 PlanReview retains its Lua controller and projects physical source rows through a native document.
 Each test-inventory source row carries its file and case identity. Visual `j` collects
 distinct cases across the selected rows and opens the shared confirmation dialog.
-Confirmation validates the captured view and source revision before `plan.tests.delete`
-creates a new reviewed plan revision. The broker removes only selected inventory entries,
+Confirmation validates the captured view and source version before `plan.tests.delete`
+updates the saved review draft. The broker removes only selected inventory entries,
 prunes empty file groups, and rejects stale confirmations. Project files remain unchanged.
 Renames and test deletions return an updated projection to the existing native document.
 The document retains analysis for unchanged declarations, input views, visibility filters,
@@ -45,16 +45,23 @@ from the captured inventory. The saved revision and source identities remain unc
 accepts the edit. Failure restores those rows through the live comment projection, preserving newer
 feedback and the current cursor. Success replaces the temporary projection directly without
 reintroducing deleted rows. Source projection actions wait while test deletion is pending.
-Test-only revisions replace the test inventory, recompute its count summary, remove empty
+Test-only edits replace the test inventory, recompute its count summary, remove empty
 file headings, and shift later navigation anchors while retaining every declaration block.
 Semantic renames preserve canonical formatting and validate only changed declaration and call
 data. A content-keyed cache reuses parsed call presentations for unchanged file sides.
 The file store retains one validated canonical revision and its rendered source, avoiding
 repeated validation and rendering during persistence and review recapture. Every cache hit
 requires identical canonical content, and disk reads still enforce the saved revision checks.
-Late draft edits reanchor to surviving source blocks, and queued submissions use the new revision.
+Late draft edits reanchor to surviving source blocks, and queued submissions use the new document version.
 The plan persists an ordered `manual_changes` history with each rename and each removed test identity.
 Acceptance, rejection, revision feedback, and resumed execution expose that history to the agent.
+Each manual edit saves `working.json`, `working.md`, and its navigation index while advancing
+the document version and review digest. Submitted snapshots, the submitted revision counter,
+and revision lifecycle records remain unchanged during editing. Reopening or restarting restores
+the draft through its checked working files. Acceptance or request changes freezes one snapshot
+of the complete edited draft and records one revision before the decision continues. Opening or
+cancelling acceptance options does not finalize the draft. Invalid decisions preserve both the
+draft and the existing revision history. Model submissions retain their own revision boundary.
 Harness analyzes the exact saved Markdown with the shared syntax engine before opening that
 document, after releasing the broker lock. The document retains the syntax handle across
 annotation insertions and view resizes. Native highlights include fenced language injections.
@@ -5972,7 +5979,10 @@ result reports that phase as stopped. Only recorded phase results claim phase co
 
 Activity headings use `Implementing`, `Verifying`, and `Resolving` while a phase runs,
 then `Implemented`, `Verified`, and `Resolved` when its completion is recorded.
-Checking results remain separate from model activity folds. Harness records each accepted command's
+Checking results remain separate from model activity folds. A blank row separates a noninitial
+Checks section from preceding activity. Declaration findings and accepted commands nest beneath its
+heading, and collapsing the implementation exchange leaves the Checks section visible.
+Harness records each accepted command's
 exit status and saves stdout, stderr, and combined output. Fold expansion reads a bounded page from
 that saved file, without provider tool IDs or model-written command summaries. Checking also records
 workspace-wide declaration conformance before manual verification becomes eligible.

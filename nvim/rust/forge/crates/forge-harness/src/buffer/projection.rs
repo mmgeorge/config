@@ -1558,18 +1558,21 @@ impl TimelineRenderer<'_> {
     }
 
     fn checks(&mut self, run: &crate::plan::checks::CheckRun) -> Result<()> {
-        let start = self.block.len();
+        if self.leading_separator {
+            self.literal(&format!("{}:separator", run.id), "", None)?;
+        }
         self.literal(&format!("{}:checks", run.id), &format!("Checks · {:?}", run.state), None)?;
-        let declarations_start=self.block.len();
+        let checks = self.begin_section(2);
         self.literal(&format!("{}:declarations", run.id),
             &format!("Declarations · {}", if run.progress.conforms() { "match" } else { "differ" }), None)?;
+        let declarations = self.begin_section(2);
         for (index, finding) in run.progress.findings().iter().enumerate() {
             self.literal(&format!("{}:finding:{index}",run.id), finding, None)?;
         }
         for (index,change) in run.progress.declaration_changes.iter().enumerate() {
             self.diff(&format!("{}:declaration:{index}",run.id),&change.name,&change.diff,"",Some((&change.path,&change.name)),None)?;
         }
-        self.fold(declarations_start,&format!("{}:declarations",run.id),true,NodeKind::Group);
+        self.finish_section(declarations,&format!("{}:declarations",run.id),true);
         for check in &run.commands {
             let command_start = self.block.len();
             let call_id = check.id.clone();
@@ -1612,7 +1615,7 @@ impl TimelineRenderer<'_> {
                 } }
             self.tool.insert(call_id,output);
         }
-        self.fold(start,&format!("{}:checks",run.id),run.state != crate::plan::checks::CheckState::Running,NodeKind::Group);
+        self.finish_section(checks,&format!("{}:checks",run.id),run.state != crate::plan::checks::CheckState::Running);
         if let Some(title)=&run.completed_plan { self.literal(&format!("{}:complete",run.id), &format!("◇ Plan complete: {title}"),None)?; }
         Ok(())
     }
