@@ -466,6 +466,7 @@ impl CodexBackend {
             })
             .filter_map(|skill| {
                 Some(SkillDefinition {
+                    scope:None,
                     resource_id:None,
                     name: skill.get("name")?.as_str()?.to_owned(),
                     description: skill
@@ -652,6 +653,7 @@ impl CodexBackend {
                     .unwrap_or("unknown")
                     .to_owned();
                 Some(McpDefinition {
+                    scope:None, source_path:None,
                     resource_id:None,
                     name,
                     transport,

@@ -18,7 +18,7 @@ pub mod terminal;
 pub mod usage;
 pub use catalog::{
     BackendCatalogRequest, BackendInput, CatalogCapability, CatalogMutation, McpDefinition,
-    McpStatus, McpToolDefinition, SkillDefinition,
+    McpStatus, McpToolDefinition, ResourceScope, SkillDefinition,
 };
 pub use execution::{ExecutionOwner, ProviderAddress, TurnBoundary};
 pub use steering::{SteerTarget, SteeringInput};

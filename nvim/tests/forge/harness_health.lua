@@ -23,11 +23,10 @@ local success, failure = xpcall(function()
     for _ = 1, count do clock = clock + 2000 tick() end
   end
   advance(30)
-  assert(health.notice(state).text == "Waiting for your approval")
-  assert(health.notice(state).waiting and health.notice(state).hint == "permission")
+  assert(health.notice(state) == nil, "Lua must not replace the native lifecycle with an approval-list inference")
   state.approval_open = false
   advance(15)
-  assert(health.notice(state).text == "Waiting for your approval", "closing the picker resolved the approval")
+  assert(health.notice(state) == nil, "closing the picker must not manufacture a status")
   state.approval = {}
   advance(150)
   assert(health.notice(state) == nil, "provider silence must not replace the native status")

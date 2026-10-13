@@ -37,6 +37,28 @@ pub struct ExecutionPhase {
     pub verification_tools: std::collections::BTreeMap<String, String>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+/// Resolves work and waits independently from the elapsed-time clock.
+pub(crate) enum ExchangeActivity {
+    /// The open exchange owns provider or Harness processing.
+    Active,
+    /// Permission admission waits for a user decision.
+    AwaitingApproval,
+    /// A question waits without an active clarification execution.
+    AwaitingInput,
+    /// Delegated execution owns the parent's pending result.
+    WaitingForAgent,
+    /// An interrupted provider execution awaits explicit resumption.
+    Paused,
+    /// Provider context compaction owns the live status.
+    Compacting {
+        /// Provider receipt time that starts the current compaction interval.
+        started_at_ms: i64,
+    },
+    /// The exchange has no active execution ownership.
+    Settled,
+}
+
 /// Owns one admitted action or plan phase and its backend turns.
 #[derive(Clone, Debug, Deserialize, Serialize)]
 pub struct Exchange {
@@ -471,6 +493,44 @@ impl Exchange {
             0
         };
         self.duration_ms.saturating_add(active)
+    }
+
+    /// Resolves lifecycle ownership without treating a stopped clock as a task pause.
+    pub(crate) fn activity(&self) -> ExchangeActivity {
+        if self.state != ExchangeState::Running || self.completed_at_ms.is_some()
+            || self.execution_phase.as_ref().is_some_and(|phase| phase.outcome.is_some()) {
+            return ExchangeActivity::Settled;
+        }
+        if self.execution_started_at_ms.is_none() && !self.metrics.approval_resume && self.turn.last().is_some_and(|turn| {
+            matches!(turn.state(), crate::turn::TurnState::Finished {
+                outcome: crate::turn::TurnOutcome::Interrupted | crate::turn::TurnOutcome::Cancelled
+            })
+        }) {
+            return ExchangeActivity::Paused;
+        }
+        if self.metrics.awaiting_approval() {
+            return ExchangeActivity::AwaitingApproval;
+        }
+        if self.execution_started_at_ms.is_none() && (self.awaiting_input || self.elicitation.is_some()) {
+            return ExchangeActivity::AwaitingInput;
+        }
+        if let Some(started_at_ms) = self.compaction_started_at_ms() {
+            return ExchangeActivity::Compacting { started_at_ms };
+        }
+        if self.metrics.waiting_for_agent() {
+            return ExchangeActivity::WaitingForAgent;
+        }
+        ExchangeActivity::Active
+    }
+
+    /// Returns the independently active provider compaction, including after exchange completion.
+    pub(crate) fn compaction_started_at_ms(&self) -> Option<i64> {
+        self.node_list.iter().rev().find_map(|node| match node {
+            ExchangeNode::Compaction { compaction, .. }
+                if compaction.state == crate::backend::CompactionState::Running =>
+                    Some(compaction.started_at_ms.unwrap_or(self.created_at_ms)),
+            _ => None,
+        })
     }
 
     /// Suspends execution for permissions and accounts for other non-model activity.

@@ -65,6 +65,7 @@ local ok, failure = pcall(function()
   exchange.metrics.tool_started_ms = 6000
   assert_equals(summary({ now_ms = 12000 }), "▾ Working 8s │ 0/1 tools · 5 s │ 76.0k (90%) -> 4.2k · 1433 tps")
   exchange.execution_started_at_ms = vim.NIL
+  exchange.turn[#exchange.turn].state = { kind = "finished", outcome = "interrupted" }
   assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1433 tps")
   exchange.kind = "plan_draft"
   for _, now_ms in ipairs({ 90000, 900000 }) do
@@ -77,21 +78,21 @@ local ok, failure = pcall(function()
   assert_equals(summary({ now_ms = 90000 }), "▾ Paused 6s │ 0/1 tools · 3 s │ 76.0k (90%) -> 4.2k · 1433 tps")
   exchange.metrics = { timing_complete = true, request_count = 0 }
   exchange.turn = {}
-  assert_equals(summary(), "▾ Paused 6s")
+  assert_equals(summary(), "▾ Working 6s")
   exchange.metrics.request_count = 1
-  assert_equals(summary(), "▾ Paused 6s")
+  assert_equals(summary(), "▾ Working 6s")
   exchange.turn = { { id = "partial", usage = { input = 1000, output = 100 } } }
-  assert_equals(summary(), "▾ Paused 6s │ 1.0k -> 100")
+  assert_equals(summary(), "▾ Working 6s │ 1.0k -> 100")
   exchange.turn[1].usage = { reasoning = 23 }
-  assert_equals(summary(), "▾ Paused 6s")
+  assert_equals(summary(), "▾ Working 6s")
   exchange.turn[1].usage = { input = 1000, cached_input = 0, reasoning = 0, output = 0 }
   exchange.metrics.reported_output_tokens = 0
   exchange.metrics.reported_response_ms = 2000
-  assert_equals(summary(), "▾ Paused 6s │ 1.0k (0%) -> 0")
+  assert_equals(summary(), "▾ Working 6s │ 1.0k (0%) -> 0")
   exchange.turn = {}
   exchange.metrics = { request_count = 0 }
   exchange.node_list = { { kind = "agent_reference", agent = { child_agent_id = "child" } } }
-  assert_equals(summary(), "▾ Paused 6s")
+  assert_equals(summary(), "▾ Working 6s")
   exchange.kind, exchange.state = "plan_draft", "complete"
   exchange.duration_ms, exchange.completed_at_ms = 44000, 44000
   exchange.node_list = {}

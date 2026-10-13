@@ -7,6 +7,20 @@ local owner = "harness-provider-catalog"
 local mcp_generation = 0
 local loading_icon_list = { "○", "◔", "◑", "◕", "●", "◕", "◑", "◔" }
 
+---@alias ForgeResourceScope "global"|"workspace"
+
+---@param scope ForgeResourceScope?
+---@return string
+local function source_label(scope)
+  return ({ global = "Global", workspace = "Workspace" })[scope] or "Provider"
+end
+
+---@param path string?
+---@return string[]
+local function source_details(path)
+  return type(path) == "string" and path ~= "" and { "└ Source: " .. path } or {}
+end
+
 ---@param value integer?
 ---@param estimated boolean?
 ---@return string
@@ -57,14 +71,14 @@ end
 ---@param definition table
 ---@return string[]
 local function tool_line_list(definition)
-  local result = {}
+  local result = source_details(definition.source_path)
   local tool_name_list = vim.tbl_map(function(tool) return tool.name end, definition.tools or {})
   if #tool_name_list > 0 then
-    result[1] = "└ Tools: " .. table.concat(tool_name_list, ", ")
+    result[#result + 1] = "└ Tools: " .. table.concat(tool_name_list, ", ")
   elseif definition.tool_error then
-    result[1] = "└ Tools unavailable: " .. definition.tool_error
+    result[#result + 1] = "└ Tools unavailable: " .. definition.tool_error
   else
-    result[1] = "└ Tools: none advertised"
+    result[#result + 1] = "└ Tools: none advertised"
   end
   return result
 end
@@ -78,6 +92,7 @@ function M.open_skills(options)
     end
     local busy = false
     local current_skill_list = skill_list or {}
+    local expanded_by_id = {}
     local function spec()
       local option_list = {}
       for _, skill in ipairs(current_skill_list) do
@@ -87,6 +102,8 @@ function M.open_skills(options)
             value = skill,
             label = (skill.enabled and "✓ " or "× ") .. skill.name,
             detail = skill.description,
+            columns = { (skill.enabled and "✓ " or "× ") .. skill.name, source_label(skill.scope), skill.description or "" },
+            child_line_list = expanded_by_id[skill.resource_id or skill.name] and source_details(skill.path) or nil,
           }
         end
       end
@@ -97,10 +114,10 @@ function M.open_skills(options)
           {
             id = "provider-skills",
             title = "Manage Skills",
-            column_headers = { "Skill", "Description" },
+            column_headers = { "Skill", "Source", "Description" },
             option_list = option_list,
             empty_text = "The provider advertised no user-invocable skills.",
-            footer = "↑↓ select  Enter insert  Space enable/disable  q close",
+            footer = "↑↓ select  Enter insert  Space enable/disable  Tab source  q close",
           },
         },
         action_list = {
@@ -126,6 +143,18 @@ function M.open_skills(options)
                   if picker.is_open(owner) then picker.update(spec()) end
                 end)
               end, skill.resource_id)
+            end,
+          },
+          {
+            id = "toggle-source",
+            key = "<Tab>",
+            desc = "Fold skill source path",
+            callback = function(context)
+              local skill = context.option and context.option.value
+              if not skill then return end
+              local id = skill.resource_id or skill.name
+              expanded_by_id[id] = not expanded_by_id[id]
+              picker.update(spec())
             end,
           },
         },
@@ -155,7 +184,7 @@ function M.open_mcp(options)
     page_list = { {
       id = "provider-mcp",
       title = "Manage MCP Servers",
-      column_headers = { "Server", "Transport", "Tokens", "Status" },
+      column_headers = { "Server", "Source", "Transport", "Tokens", "Status" },
       option_list = {},
       empty_text = "Loading MCP servers...",
       footer = "q close",
@@ -173,7 +202,7 @@ function M.open_mcp(options)
       return
     end
     local current_mcp_list = mcp_list or {}
-    local expanded_by_name = {}
+    local expanded_by_id = {}
     local loading_name = nil
     local animation_index = 1
     local animation_timer = nil
@@ -251,11 +280,12 @@ function M.open_mcp(options)
           }, "  "),
           columns = {
             mcp_icon(definition, loading_name, animation_index) .. " " .. definition.name,
+            source_label(definition.scope),
             definition.transport or "unknown",
             token_label(definition.token_count, definition.token_estimated),
             definition.name == loading_name and "starting" or mcp_status_label(definition),
           },
-          child_line_list = expanded_by_name[definition.name] and tool_line_list(definition) or nil,
+          child_line_list = expanded_by_id[definition.resource_id or definition.name] and tool_line_list(definition) or nil,
         }
       end
       return {
@@ -265,10 +295,10 @@ function M.open_mcp(options)
           {
             id = "provider-mcp",
             title = "Manage MCP Servers",
-            column_headers = { "Server", "Transport", "Tokens", "Status" },
+            column_headers = { "Server", "Source", "Transport", "Tokens", "Status" },
             option_list = option_list,
             empty_text = "The provider advertised no MCP servers.",
-            footer = "↑↓ select  Space enable/disable  Tab tools  q close",
+            footer = "↑↓ select  Space enable/disable  Tab details  q close",
           },
         },
         action_list = {
@@ -298,11 +328,12 @@ function M.open_mcp(options)
           {
             id = "toggle-tools",
             key = "<Tab>",
-            desc = "Fold MCP tool list",
+            desc = "Fold MCP source and tools",
             callback = function(context)
               local definition = context.option and context.option.value
               if not definition then return end
-              expanded_by_name[definition.name] = not expanded_by_name[definition.name]
+              local id = definition.resource_id or definition.name
+              expanded_by_id[id] = not expanded_by_id[id]
               picker.update(build_spec())
             end,
           },

@@ -175,15 +175,18 @@ impl HarnessBroker {
         status: &mut crate::session::state_machine::SessionPhase,
         execution: &PlanExecutionRecord,
     ) {
-        if matches!(status, crate::session::state_machine::SessionPhase::Compacting { .. }) {
+        if matches!(status, crate::session::state_machine::SessionPhase::Idle)
+            && execution.state == crate::plan::PlanExecutionState::Paused {
+            *status = crate::session::state_machine::SessionPhase::Paused;
+            return;
+        }
+        if !matches!(status, crate::session::state_machine::SessionPhase::Working { .. }
+            | crate::session::state_machine::SessionPhase::Idle) {
             return;
         }
         if execution.phase == crate::plan::PlanPhase::Checking && execution.state == crate::plan::PlanExecutionState::Active {
             if let Some(run) = execution.check_runs.last().filter(|run| run.state == crate::plan::checks::CheckState::Running) {
-                *status = crate::session::state_machine::SessionPhase::Working {
-                    started_at_ms:run.started_at_ms,activity:crate::session::state_machine::WorkflowActivity::Checking,
-                    reasoning_summary:None,execution:None,
-                };
+                *status = run.status();
             }
         }
         if let crate::session::state_machine::SessionPhase::Working {

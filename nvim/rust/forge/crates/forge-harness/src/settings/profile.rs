@@ -139,7 +139,7 @@ mod test {
         std::fs::write(selected.join("SKILL.md"), "selected content").unwrap();
         std::fs::write(unselected.join("SKILL.md"), "unselected content").unwrap();
         let profile = ResourceProfile::copilot(root.path(), &[crate::settings::SkillResource {
-            id:"selected".into(), name:"selected".into(), description:String::new(),
+            id:"selected".into(), name:"selected".into(), description:String::new(), scope:None,
             source:selected.join("SKILL.md").to_string_lossy().into_owned(), targets:Vec::new(), user_invocable:true,
         }]).unwrap();
         let profile_path = profile.path().to_owned();
@@ -159,7 +159,7 @@ mod test {
         std::fs::write(source.join("SKILL.md"), "source content").unwrap();
         for name in ["", ".", "..", "../escape", "..\\escape", "/escape", "C:escape", "trailing."] {
             let result = ResourceProfile::copilot(root.path(), &[crate::settings::SkillResource {
-                id:"invalid".into(), name:name.into(), description:String::new(),
+                id:"invalid".into(), name:name.into(), description:String::new(), scope:None,
                 source:source.join("SKILL.md").to_string_lossy().into_owned(), targets:Vec::new(), user_invocable:true,
             }]);
             assert!(result.is_err(), "accepted invalid skill name {name:?}");

@@ -149,6 +149,7 @@ mod test {
 
     fn server(name: &str, status: McpStatus) -> McpDefinition {
         McpDefinition {
+            scope:None, source_path:None,
             resource_id:None,
             name: name.into(),
             transport: "stdio".into(),

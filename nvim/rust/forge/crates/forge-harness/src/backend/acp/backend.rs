@@ -301,6 +301,7 @@ impl Backend for AcpBackend {
         Ok(catalog.skill
             .into_iter().filter(|skill|crate::settings::ResourceCatalog::supports_target(&skill.targets, target))
             .map(|skill|SkillDefinition {
+                scope:skill.scope,
                 resource_id:Some(skill.id.clone()),
                 enabled:catalog.settings.desired.skill.get(&skill.id) != Some(&false),
                 source:Some(if skill.id.starts_with("import:") { "imported" } else { "rulesync" }.into()),
@@ -318,7 +319,7 @@ impl Backend for AcpBackend {
             .into_iter().filter(|server|crate::settings::ResourceCatalog::supports_target(&server.targets, target))
             .map(|server| {
                 let enabled = catalog.settings.desired.mcp.get(&server.id) != Some(&false);
-                McpDefinition { resource_id:Some(server.id),name:server.name,transport:server.transport,enabled,
+                McpDefinition { resource_id:Some(server.id),scope:server.scope,source_path:Some(server.source),name:server.name,transport:server.transport,enabled,
                     status:if enabled { McpStatus::Unavailable } else { McpStatus::Disabled },
                     status_detail:enabled.then(||"Configured selection. ACP does not expose server readiness".into()),
                     token_count:None,token_estimated:false,tools:Vec::new(),tool_error:None }

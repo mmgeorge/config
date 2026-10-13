@@ -338,7 +338,7 @@ mod test {
         let root = tempfile::tempdir()?;
         let workspace = root.path().join("workspace");
         std::fs::create_dir(&workspace)?;
-        let source = workspace.join("native.json");
+        let source = root.path().join("native.json");
         let original = json!({"mcpServers":{"portable":{"command":"fixture","env":{"TOKEN":"native-token-fixture"}}},
             "apiKey":"provider-authentication-fixture"}).to_string();
         std::fs::write(&source, &original)?;
@@ -356,6 +356,7 @@ mod test {
         for backend in ["codex", "copilot", "claude", "antigravity"] {
             let snapshot = store.catalog(&workspace, "session", backend)?;
             assert_eq!(snapshot.server.len(), 1);
+            assert_eq!(snapshot.server[0].scope, Some(crate::backend::ResourceScope::Workspace));
             assert_eq!(snapshot.settings.desired.mcp.get(&id), Some(&false));
             let request = crate::backend::BackendCatalogRequest { execution_owner: None, harness_session_id:"session".into(), workspace:workspace.clone(),
                 access:Default::default(), execution_mode:crate::session::PermissionMode::Read, backend_session_id:None };
@@ -368,6 +369,8 @@ mod test {
             access:Default::default(), execution_mode:crate::session::PermissionMode::Read, backend_session_id:None };
         let launched = SessionResources::load(root.path(), &request, "antigravity", "test")?;
         assert_eq!(launched.launch[0].1["env"]["TOKEN"], "native-token-fixture");
+        assert_eq!(launched.mcp[0].scope, Some(crate::backend::ResourceScope::Workspace));
+        assert_eq!(launched.mcp[0].source_path.as_deref(), Some(dunce::canonicalize(&source)?.to_string_lossy().as_ref()));
         let connection = rusqlite::Connection::open(root.path().join("settings.db"))?;
         let stored: String = connection.query_row("SELECT payload FROM setting_resource", [], |row| row.get(0))?;
         assert!(!stored.contains("native-token-fixture") && !stored.contains("provider-authentication-fixture"));
@@ -388,9 +391,17 @@ mod test {
         store.import_operation(0, SettingScope::Global, "workspace", "session", &selected, "skill-import", &json!({"fingerprint":preview.fingerprint}))?;
         let snapshot = store.catalog("another-workspace", "another-session", "antigravity")?;
         assert_eq!(snapshot.skill[0].name, "imported-skill");
+        assert_eq!(snapshot.skill[0].scope, Some(crate::backend::ResourceScope::Global));
         assert!(Path::new(&snapshot.skill[0].source).is_file());
         assert_eq!(snapshot.settings.desired.skill.get(&snapshot.skill[0].id), Some(&false));
         assert!(!serde_json::to_string(&selected)?.contains("PROMPT_BODY_FIXTURE"));
+        let preview = store.preview_import(ImportKind::Skills, &source, SettingScope::Workspace, "workspace", "session", "claude")?;
+        let selected = preview.select(&preview.fingerprint, &[preview.candidate[0].id.clone()])?;
+        store.import_operation(1, SettingScope::Workspace, "workspace", "session", &selected, "workspace-skill-import", &json!({"fingerprint":preview.fingerprint}))?;
+        let skill = store.skills("workspace")?;
+        assert_eq!(skill.len(), 2);
+        assert!(skill.iter().any(|skill| skill.scope == Some(crate::backend::ResourceScope::Workspace)));
+        assert!(skill.iter().any(|skill| skill.scope == Some(crate::backend::ResourceScope::Global)));
         Ok(())
     }
 

@@ -537,8 +537,18 @@ end
 local function append_exchange_summary(result, interaction, options)
   local complete = interaction.completed_at_ms ~= nil and interaction.completed_at_ms ~= vim.NIL
     or interaction.state ~= "running" and interaction.state ~= "finalizing" and interaction.state ~= "queued"
-  local paused = interaction.state == "running" and not complete
-    and type(interaction.execution_started_at_ms) ~= "number"
+  local stopped_clock = type(interaction.execution_started_at_ms) ~= "number"
+  local last_turn = (interaction.turn or {})[#(interaction.turn or {})]
+  local turn_state = last_turn and last_turn.state or {}
+  local paused = interaction.state == "running" and not complete and stopped_clock
+    and turn_state.kind == "finished" and (turn_state.outcome == "interrupted" or turn_state.outcome == "cancelled")
+  local approval = false
+  local agent_wait = false
+  for _, blocker in ipairs((interaction.metrics or {}).blocker or {}) do
+    approval = approval or vim.startswith(blocker, "approval:")
+    agent_wait = agent_wait or blocker == "agent_wait"
+  end
+  local waiting_input = stopped_clock and (interaction.awaiting_input or type(interaction.elicitation) == "table")
   local tool_count, passed_count = 0, 0
   for _, turn in ipairs(interaction.turn or {}) do
     for _, tool_id in ipairs((turn.tool and turn.tool.order) or {}) do
@@ -568,7 +578,7 @@ local function append_exchange_summary(result, interaction, options)
   local verb = complete and "Thought" or "Working"
   if interaction.kind == "plan_draft" or interaction.kind == "plan_revision" then
     local activity = interaction.kind == "plan_revision" and "Revising plan" or "Planning"
-    verb = (interaction.awaiting_input or paused) and (activity .. " paused") or complete and "Planned" or activity
+    verb = paused and (activity .. " paused") or complete and "Planned" or activity
   elseif interaction.kind == "plan_execution" then
     local execution_phase = interaction.execution_phase or {}
     local phase = execution_phase.phase or "implement"
@@ -583,6 +593,21 @@ local function append_exchange_summary(result, interaction, options)
     end
   elseif paused then
     verb = "Paused"
+  end
+  if interaction.state == "queued" then
+    verb = "Starting"
+  elseif interaction.state == "running" and not complete and not paused
+    and not ((interaction.execution_phase or {}).outcome and (interaction.execution_phase or {}).outcome ~= vim.NIL) then
+    if approval then verb = "Waiting for your approval"
+    elseif waiting_input then verb = "Waiting for your answer"
+    else
+      local compacting = false
+      for _, node in ipairs(interaction.node_list or {}) do
+        compacting = compacting or node.kind == "compaction" and node.compaction.state == "running"
+      end
+      if compacting then verb = "Compacting"
+      elseif agent_wait then verb = "Waiting for agents" end
+    end
   end
   local outcome = { cancelled = "Cancelled", finalizing = "Saving exchange", interrupted = "Interrupted", failed = "Failed" }
   verb = outcome[interaction.state] or verb

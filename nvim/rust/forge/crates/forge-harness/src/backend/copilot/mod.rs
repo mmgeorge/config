@@ -895,6 +895,7 @@ impl Backend for CopilotBackend {
             .into_iter()
             .filter(|skill| skill.user_invocable)
             .map(|skill| SkillDefinition {
+                scope:None,
                 resource_id:None,
                 name: skill.name,
                 description: skill.description,
@@ -979,6 +980,7 @@ impl Backend for CopilotBackend {
             working_directory: Some(request.workspace),
         }).await.context("discover configured Copilot MCP servers")?;
         let mut servers = discovery.servers.into_iter().map(|server| McpDefinition {
+            scope:None, source_path:None,
             resource_id:None,
             name: server.name,
             enabled: server.enabled,
@@ -1088,6 +1090,7 @@ impl Backend for CopilotBackend {
                 (Vec::new(), None)
             };
             definition_list.push(McpDefinition {
+                scope:discovered.scope, source_path:discovered.source_path,
                 resource_id:discovered.resource_id,
                 token_count: token_by_name.get(&discovered.name).copied(),
                 token_estimated: false,

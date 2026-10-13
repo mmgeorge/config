@@ -311,16 +311,7 @@ impl HarnessBroker {
                 .lock()
                 .map_err(|_| anyhow::anyhow!("presentation lock poisoned"))?;
             let patch = presentation.update_checks(run)?;
-            let status = if run.state == CheckState::Running {
-                crate::session::state_machine::SessionPhase::Working {
-                    started_at_ms: run.started_at_ms,
-                    activity: WorkflowActivity::Checking,
-                    reasoning_summary: None,
-                    execution: None,
-                }
-            } else {
-                crate::session::state_machine::SessionPhase::Idle
-            };
+            let status = run.status();
             (patch, presentation.update_live(None, None, status)?)
         };
         self.emit_timeline_patch(patch, events).await?;

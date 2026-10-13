@@ -2447,7 +2447,7 @@ mod tests {
                 id: "status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
-                    started_at_ms: 0,
+                    duration_ms: 0, started_at_ms: Some(0),
                     activity: crate::session::state_machine::WorkflowActivity::Working,
                     execution: None,
                     reasoning_summary: None,

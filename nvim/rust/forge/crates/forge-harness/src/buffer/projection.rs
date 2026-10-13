@@ -12,7 +12,7 @@ use forge_buffer::width::WidthProfile;
 use forge_buffer::node::{NodeState, NodeKind, NodeDisplay, NodeLifecycle};
 use serde::Serialize;
 
-use crate::exchange::{Exchange, ExchangeKind, ExchangeNode, ExchangeState};
+use crate::exchange::{Exchange, ExchangeActivity, ExchangeKind, ExchangeNode, ExchangeState};
 use crate::session::state_machine::{ExecutionStatus, SessionPhase, WorkflowActivity};
 use crate::timeline::{SessionEventKind, TimelineEntry};
 
@@ -162,16 +162,18 @@ fn reported_changes(exchange: &Exchange, agents: &HashMap<&str, &TimelineEntry>)
 }
 
 fn tool_group_label<'tool>(calls: impl IntoIterator<Item = &'tool crate::turn::ToolCall>,
-    settled: bool, now_ms: i64) -> String {
+    now_ms: i64) -> String {
     let mut count = 0;
     let mut failed = 0;
     let mut elapsed = Some(0_u64);
+    let mut running = false;
     for tool in calls {
         count += 1;
         failed += usize::from(tool.failed);
+        running |= tool.state() == crate::turn::ToolState::Running;
         elapsed = elapsed.zip(tool.elapsed_ms(now_ms)).map(|(total, duration)| total.saturating_add(duration));
     }
-    let mut label = format!("▸ {} {count} {}", if settled { "Ran" } else { "Running" },
+    let mut label = format!("▸ {} {count} {}", if running { "Running" } else { "Ran" },
         if count == 1 { "tool" } else { "tools" });
     if failed > 0 { label.push_str(&format!(" ({failed} failed)")); }
     if let Some(elapsed) = elapsed {
@@ -219,6 +221,20 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
         return Ok(project(ProjectionSource::Entry(entry),width,false,expanded,&HashMap::new())?.entry.block);
     }
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    if let TimelineEntry::Checks { run, .. } = entry {
+        let mut blocks = Vec::new();
+        if run.state == crate::plan::checks::CheckState::Running {
+            for check in run.commands.iter().filter(|check| check.state == crate::plan::checks::CheckState::Running) {
+                let Some(previous) = document.block(&BlockId(format!("{}:tool",check.id))) else { continue; };
+                let mut profile = width.clone();
+                profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
+                    .map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
+                blocks.push(TranscriptRenderer::new(&profile)?.refresh_tool_heading(previous,"check",
+                    check.elapsed_ms(now_ms),false,&check.heading(),expanded.get(&format!("{}:tool",check.id))==Some(&true))?);
+            }
+        }
+        return Ok(blocks);
+    }
     let mut source = Vec::new();
     let mut headings = Vec::new();
     exchanges(entry,&mut source,&mut headings);
@@ -240,8 +256,9 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
         blocks.push(block);
     }
     for exchange in source {
-        if exchange.completed_at_ms.is_some() || exchange.execution_started_at_ms.is_none() { continue; }
-        if let Some(previous) = document.block(&BlockId(format!("{}:summary",exchange.id))) {
+        if exchange.completed_at_ms.is_some() || exchange.state != ExchangeState::Running { continue; }
+        if exchange.execution_started_at_ms.is_some()
+            && let Some(previous) = document.block(&BlockId(format!("{}:summary",exchange.id))) {
             let mut profile = width.clone();
             profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
                 .map_or(0, |layout|layout.indent.saturating_sub(2))).max(1);
@@ -288,7 +305,7 @@ pub(super) fn timing_blocks(entry: &TimelineEntry, width: &WidthProfile,
                 profile.columns = profile.columns.saturating_sub(previous.metadata.layout.as_ref()
                     .map_or(0, |layout| layout.indent.saturating_sub(2))).max(1);
                 let mut block = TranscriptRenderer::new(&profile)?.literal(previous.id.clone(),
-                    &tool_group_label(calls.iter().copied(), false, now_ms), 2)?;
+                    &tool_group_label(calls.iter().copied(), now_ms), 2)?;
                 block.metadata = previous.metadata.clone();
                 for span in &mut block.metadata.decoration {
                     if span.range.end.row == previous.text.row_count() { span.range.end.row = block.text.row_count(); }
@@ -417,8 +434,8 @@ impl TimelineRenderer<'_> {
                 let text = match status {
                     SessionPhase::Idle => String::new(),
                     SessionPhase::Paused => "Paused".into(),
-                    SessionPhase::Compacting { started_at_ms } => {
-                        let elapsed_seconds = self.now_ms.saturating_sub(*started_at_ms).max(0) / 1_000;
+                    SessionPhase::Compacting { .. } => {
+                        let elapsed_seconds = status.elapsed_ms(self.now_ms) / 1_000;
                         format!("Compacting · {elapsed_seconds}s")
                     }
                     SessionPhase::Finalizing { error, .. } => error.as_ref().map_or_else(
@@ -426,13 +443,12 @@ impl TimelineRenderer<'_> {
                         |error| format!("Saving exchange failed · {error}"),
                     ),
                     SessionPhase::Working {
-                        started_at_ms,
                         reasoning_summary,
                         activity,
                         execution,
+                        ..
                     } => {
-                        let elapsed_seconds =
-                            self.now_ms.saturating_sub(*started_at_ms).max(0) / 1_000;
+                        let elapsed_seconds = status.elapsed_ms(self.now_ms) / 1_000;
                         working_status_text(
                             self.width,
                             elapsed_seconds,
@@ -442,16 +458,18 @@ impl TimelineRenderer<'_> {
                         )?
                     }
                     SessionPhase::AwaitingInput { .. } => "Waiting for your answer".into(),
+                    SessionPhase::AwaitingApproval { .. } => "Waiting for your approval".into(),
                     SessionPhase::AwaitingPlanReview { revision, .. } => {
                         format!("Waiting for plan review · revision {revision}")
                     }
-                    SessionPhase::RetryingPlanGeneration { activity, started_at_ms, .. } => {
-                        let elapsed = self.now_ms.saturating_sub(*started_at_ms).max(0) / 1_000;
+                    SessionPhase::RetryingPlanGeneration { activity, .. } => {
+                        let elapsed = status.elapsed_ms(self.now_ms) / 1_000;
                         format!("{} · {elapsed}s", activity.active_label())
                     }
                     SessionPhase::PlanningFailed { reason, .. } => {
                         format!("Planning stopped · {reason}")
                     }
+                    SessionPhase::WaitingForAgent { agent_count: 0 } => "Waiting for agents".into(),
                     SessionPhase::WaitingForAgent { agent_count } => {
                         format!("Waiting for agents · {agent_count} running")
                     }
@@ -472,14 +490,12 @@ impl TimelineRenderer<'_> {
                 if status.visible() {
                     block.metadata.status = Some(StatusPresentation {
                         row: 1,
-                        animated: matches!(status, SessionPhase::Working { .. }
-                            | SessionPhase::Compacting { .. }
-                            | SessionPhase::RetryingPlanGeneration { .. } | SessionPhase::WaitingForAgent { .. }
-                            | SessionPhase::Finalizing { error: None, .. }),
+                        animated: status.animated(),
                         hint: match status {
                             SessionPhase::Working { .. } | SessionPhase::RetryingPlanGeneration { .. }
                                 | SessionPhase::WaitingForAgent { .. } => Some(StatusHint::Working),
                             SessionPhase::AwaitingInput { .. } => Some(StatusHint::Question),
+                            SessionPhase::AwaitingApproval { .. } => Some(StatusHint::Permission),
                             SessionPhase::AwaitingPlanReview { .. } => Some(StatusHint::Review),
                             _ => None,
                         },
@@ -536,8 +552,9 @@ impl TimelineRenderer<'_> {
                     });
                 }
                 self.push(block)?;
-                if let SessionPhase::Working { execution: Some(execution), .. } = status {
-                    self.implementation_details(id, execution)?;
+                if let SessionPhase::Working { execution: Some(execution), activity, .. } = status
+                    && WorkflowActivity::from(execution.phase) == *activity && execution.has_comparison() {
+                    self.declaration_comparison(id, execution)?;
                 }
             }
             TimelineEntry::AgentLifecycle {
@@ -803,9 +820,9 @@ impl TimelineRenderer<'_> {
         Ok(())
     }
 
-    fn implementation_details(&mut self, status_id: &str, execution: &ExecutionStatus) -> Result<()> {
+    fn declaration_comparison(&mut self, status_id: &str, execution: &ExecutionStatus) -> Result<()> {
         let identity = format!("{status_id}:implementation:{}", execution.id);
-        self.literal(&identity, "▸ Implementation details", None)?;
+        self.literal(&identity, "▸ Declaration comparison", None)?;
         let section = self.begin_section(2);
         let progress = &execution.progress;
         let mut file = BTreeMap::<&str, Vec<(&str, &str)>>::new();
@@ -839,9 +856,6 @@ impl TimelineRenderer<'_> {
                 self.literal(&format!("{identity}:{}", crate::plan::digest(path.as_bytes())), path, None)?;
             }
             self.finish_section(matched_section, &matched_id, true);
-        }
-        if file.is_empty() && progress.matched.is_empty() {
-            self.literal(&format!("{identity}:pending"), "Waiting for file comparison", None)?;
         }
         self.finish_section(section, &identity, true);
         Ok(())
@@ -1187,7 +1201,7 @@ impl TimelineRenderer<'_> {
                                 && (followed_in_turn
                                     || turn.state() != crate::turn::TurnState::Running);
                             let group_id = format!("{id}:tools");
-                            let label = tool_group_label(calls.iter().map(|(_, tool)| *tool), settled, self.now_ms);
+                            let label = tool_group_label(calls.iter().map(|(_, tool)| *tool), self.now_ms);
                             self.literal(&group_id, &label, None)?;
                             for (index, (_, tool)) in calls.into_iter().enumerate() {
                                 let tool_start = self.block.len();
@@ -1577,9 +1591,7 @@ impl TimelineRenderer<'_> {
             let command_start = self.block.len();
             let call_id = check.id.clone();
             let heading = crate::turn::ToolCall {
-                id:call_id.clone(), kind:"check".into(), title:format!("{} · {:?}",
-                    crate::permissions::command::display_command(&check.command,
-                        crate::permissions::shell::CommandShell::default()).source,check.state),
+                id:call_id.clone(), kind:"check".into(), title:check.heading(),
                 started_at_ms:check.started_at_ms, completed_at_ms:check.completed_at_ms,
                 task_id:None,output:String::new(),status:String::new(),failed:matches!(check.state,crate::plan::checks::CheckState::Failed),change:Default::default(),
             };
@@ -1592,7 +1604,7 @@ impl TimelineRenderer<'_> {
             let width=self.content_width();
             let renderer=TranscriptRenderer::new(&width)?;
             self.push(renderer.tool_header(BlockId(format!("{call_id}:tool")),TargetId(format!("{call_id}:tool")),
-                "check",heading.elapsed_ms(self.now_ms),heading.failed,&heading.title,expanded)?)?;
+                "check",check.elapsed_ms(self.now_ms),heading.failed,&heading.title,expanded)?)?;
             if expanded {
                 for chunk in 0..output.inline_prefix_chunks(limit)? { self.push(renderer.tool_body(&call_id,&output,true,chunk)?)?; }
                 self.push(renderer.tool_hidden(&call_id,&output,true)?)?;
@@ -1852,7 +1864,11 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
         let lifecycle = if run.state == crate::agent::AgentState::Closing { "Closing" } else {
             match exchange.state {
                 ExchangeState::Queued => "Starting",
-                ExchangeState::Running if exchange.metrics.awaiting_approval() => "Waiting for approval",
+                ExchangeState::Running if exchange.activity() == ExchangeActivity::AwaitingApproval => "Waiting for approval",
+                ExchangeState::Running if exchange.activity() == ExchangeActivity::AwaitingInput => "Waiting for your answer",
+                ExchangeState::Running if exchange.activity() == ExchangeActivity::Paused => "Paused",
+                ExchangeState::Running if exchange.activity() == ExchangeActivity::WaitingForAgent => "Waiting for agents",
+                ExchangeState::Running if matches!(exchange.activity(), ExchangeActivity::Compacting { .. }) => "Compacting",
                 ExchangeState::Running => "Running",
                 ExchangeState::Finalizing => "Saving exchange",
                 ExchangeState::Complete => "Ran",
@@ -1881,12 +1897,9 @@ fn agent_summary(run: &crate::agent::Agent, exchange: Option<&Exchange>, now_ms:
         .max(0)
         / 1_000;
     let lifecycle = match run.state {
-        AgentState::Starting => format!("Starting {elapsed_seconds}s"),
-        AgentState::Ready => {
-            let elapsed_seconds = now_ms.saturating_sub(run.created_at_ms).max(0) / 1_000;
-            format!("Ready {elapsed_seconds}s")
-        }
-        AgentState::Closing => format!("Closing {elapsed_seconds}s"),
+        AgentState::Starting => format!("Starting {}s", now_ms.saturating_sub(run.created_at_ms).max(0) / 1_000),
+        AgentState::Ready => "Ready".into(),
+        AgentState::Closing => format!("Closing {}s", now_ms.saturating_sub(run.updated_at_ms).max(0) / 1_000),
         AgentState::Closed => format!("Closed {elapsed_seconds}s"),
     };
     format!("● {lifecycle} · {}", run.label())
@@ -1928,24 +1941,23 @@ const WORKING_STATUS_RESERVED_CELLS: usize = 28;
 
 fn working_status_text(
     width: &WidthProfile,
-    elapsed_seconds: i64,
+    elapsed_seconds: u64,
     reasoning_summary: Option<&str>,
     activity: WorkflowActivity,
     execution: Option<&ExecutionStatus>,
 ) -> Result<String> {
-    if let Some(execution) = execution {
-        let phase = WorkflowActivity::from(execution.phase).active_label();
+    let phase = activity.active_label();
+    if let Some(execution) = execution.filter(|execution|
+        WorkflowActivity::from(execution.phase) == activity && execution.has_comparison()) {
         let progress = &execution.progress;
         let count = progress.missing.iter().chain(&progress.different).chain(&progress.unverified)
             .map(|finding| finding.split_once(": ").map_or(finding.as_str(), |(path, _)| path))
             .collect::<std::collections::BTreeSet<_>>().len();
         let attention = if count == 1 { "1 file needs attention".into() }
             else if count > 1 { format!("{count} files need attention") }
-            else if progress.matched.is_empty() { "comparing files".into() }
             else { "all files matched".into() };
         return Ok(format!("{phase} · {elapsed_seconds}s · {attention}"));
     }
-    let phase = activity.active_label();
     let prefix = format!("{phase} · {elapsed_seconds}s");
     let Some(reasoning_summary) = reasoning_summary else {
         return Ok(prefix);
@@ -1992,9 +2004,8 @@ fn token_display(tokens: u64) -> String {
 
 fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
     let complete = interaction.completed_at_ms.is_some();
-    let paused = interaction.state == ExchangeState::Running
-        && !complete
-        && interaction.execution_started_at_ms.is_none();
+    let status = interaction.activity();
+    let paused = status == ExchangeActivity::Paused;
     let duration = interaction.elapsed(now_ms) / 1000;
     let activity = if interaction.state == ExchangeState::Cancelled {
         "Cancelled"
@@ -2004,10 +2015,20 @@ fn exchange_activity_summary(interaction: &Exchange, now_ms: i64) -> String {
         "Interrupted"
     } else if interaction.state == ExchangeState::Failed {
         "Failed"
+    } else if interaction.state == ExchangeState::Queued {
+        "Starting"
+    } else if status == ExchangeActivity::AwaitingApproval {
+        "Waiting for your approval"
+    } else if status == ExchangeActivity::AwaitingInput {
+        "Waiting for your answer"
+    } else if status == ExchangeActivity::WaitingForAgent {
+        "Waiting for agents"
+    } else if matches!(status, ExchangeActivity::Compacting { .. }) {
+        "Compacting"
     } else {
         let activity = WorkflowActivity::from_exchange(interaction);
         match interaction.kind {
-            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if interaction.awaiting_input || paused =>
+            ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if paused =>
                 if activity == WorkflowActivity::Revising { "Revising plan paused" } else { "Planning paused" },
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision if complete => activity.completed_label(),
             ExchangeKind::PlanDraft | ExchangeKind::PlanRevision => activity.active_label(),
@@ -3036,15 +3057,15 @@ mod tests {
         second.id = "second".into();
         second.completed_at_ms = None;
         second.status = "running".into();
-        assert_eq!(super::tool_group_label([&first, &second], false, 1500),
+        assert_eq!(super::tool_group_label([&first, &second], 1500),
             "▸ Running 2 tools · 2.6s");
         second.completed_at_ms = Some(2000);
         second.status = "failed".into();
         second.failed = true;
-        assert_eq!(super::tool_group_label([&first, &second], true, 90_000),
+        assert_eq!(super::tool_group_label([&first, &second], 90_000),
             "▸ Ran 2 tools (1 failed) · 3.1s");
         first.started_at_ms = None;
-        assert_eq!(super::tool_group_label([&first, &second], true, 90_000),
+        assert_eq!(super::tool_group_label([&first, &second], 90_000),
             "▸ Ran 2 tools (1 failed)");
     }
 
@@ -3824,10 +3845,10 @@ mod tests {
                 ..Default::default()
             },
         };
-        let render = |execution| project_at(&TimelineEntry::Status { agent_count: 0,
+        let render = |execution: crate::session::state_machine::ExecutionStatus| project_at(&TimelineEntry::Status { agent_count: 0,
             id: "session:status".into(), created_at_ms: 0,
             status: SessionPhase::Working {
-                started_at_ms: 0, activity: WorkflowActivity::Working,
+                duration_ms: 0, started_at_ms: Some(0), activity: execution.phase.into(),
                 reasoning_summary: Some("Checking files".into()), execution: Some(execution),
             },
         }, &WidthProfile::default(), 133_000).unwrap();
@@ -3857,13 +3878,14 @@ mod tests {
         use forge_buffer::block::StatusHint;
         let cases = [
             (SessionPhase::Paused, "Paused", false, None),
+            (SessionPhase::AwaitingApproval { exchange_id: "exchange".into() }, "Waiting for your approval", false, Some(StatusHint::Permission)),
             (SessionPhase::Compacting { started_at_ms: 1_000 }, "Compacting · 2s", true, None),
             (SessionPhase::Compacting { started_at_ms: 4_000 }, "Compacting · 0s", true, None),
             (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: None }, "Saving exchange", true, None),
             (SessionPhase::Finalizing { exchange_id: "exchange".into(), error: Some("locked".into()) }, "Saving exchange failed · locked", false, None),
             (SessionPhase::WaitingForAgent { agent_count: 2 }, "Waiting for agents · 2 running", true, Some(StatusHint::Working)),
-            (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 2, max_turn: 20, started_at_ms: 0, activity: WorkflowActivity::Planning }, "Planning · 3s", true, Some(StatusHint::Working)),
-            (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 3, max_turn: 20, started_at_ms: 0, activity: WorkflowActivity::Revising }, "Revising plan · 3s", true, Some(StatusHint::Working)),
+            (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 2, max_turn: 20, duration_ms: 0, started_at_ms: Some(0), activity: WorkflowActivity::Planning }, "Planning · 3s", true, Some(StatusHint::Working)),
+            (SessionPhase::RetryingPlanGeneration { plan_id: "plan".into(), turn: 3, max_turn: 20, duration_ms: 0, started_at_ms: Some(0), activity: WorkflowActivity::Revising }, "Revising plan · 3s", true, Some(StatusHint::Working)),
             (SessionPhase::PlanningFailed { plan_id: "plan".into(), turn_count: 2, reason: "no progress limit reached".into() }, "Planning stopped · no progress limit reached", false, None),
         ];
         for (phase, expected, animated, hint) in cases {
@@ -3885,7 +3907,7 @@ mod tests {
                 id: "session:status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
-                    started_at_ms: 1_000,
+                    duration_ms: 0, started_at_ms: Some(1_000),
                     activity: WorkflowActivity::Working,
                     execution: None,
                     reasoning_summary: None,
@@ -3912,7 +3934,7 @@ mod tests {
                 id: "session:status".into(),
                 created_at_ms: 0,
                 status: SessionPhase::Working {
-                    started_at_ms: 1_000,
+                    duration_ms: 0, started_at_ms: Some(1_000),
                     activity: WorkflowActivity::Working,
                     execution: None,
                     reasoning_summary: Some(
@@ -4090,6 +4112,129 @@ mod tests {
     }
 
     #[test]
+    fn exchange_and_session_activity_share_waits_and_execution_time() -> anyhow::Result<()> {
+        for (kind, phase) in [
+            ("chat", None), ("plan_draft", None), ("plan_revision", None),
+            ("plan_execution", Some("implement")), ("plan_execution", Some("verify")),
+            ("plan_execution", Some("resolve")),
+        ] {
+            let mut exchange: Exchange = serde_json::from_value(json!({
+                "id":"exchange", "session_id":"session", "agent_id":"primary", "ordinal":1,
+                "kind":kind, "state":"running", "prompt":"Work", "created_at_ms":1000,
+                "node_list":[], "attributed_matches_checkpoint":false,
+                "execution_phase":phase.map(|phase|json!({"phase":phase})),
+            }))?;
+            let activity = WorkflowActivity::from_exchange(&exchange);
+            let assert_working = |exchange: &Exchange, now_ms, seconds| -> anyhow::Result<()> {
+                let status = SessionPhase::resolve(None, None, Some(exchange));
+                assert!(matches!(status, SessionPhase::Working { .. }));
+                let projection = project_at(&TimelineEntry::Status {
+                    id:"status".into(), created_at_ms:1000, status, agent_count:0,
+                }, &WidthProfile::default(), now_ms)?;
+                assert_eq!(projection.entry.block[0].text.row(1),
+                    Some(format!("{} · {seconds}s", activity.active_label()).as_str()));
+                assert_eq!(super::exchange_activity_summary(exchange, now_ms),
+                    format!("● {} {seconds}s", activity.active_label()));
+                Ok(())
+            };
+            exchange.resume(1000)?;
+            assert_working(&exchange, 4000, 3)?;
+            exchange.pause(4000);
+            assert_working(&exchange, 90_000, 3)?;
+            exchange.resume(4000)?;
+            exchange.observe_blocker("approval:command".into(), true, 5000);
+            assert!(matches!(SessionPhase::resolve(None, None, Some(&exchange)), SessionPhase::AwaitingApproval { .. }));
+            assert_eq!(super::exchange_activity_summary(&exchange, 90_000), "● Waiting for your approval 4s");
+            exchange.observe_blocker("approval:command".into(), false, 90_000);
+            assert_working(&exchange, 92_000, 6)?;
+            exchange.awaiting_input = true;
+            exchange.pause(93_000);
+            assert!(matches!(SessionPhase::resolve(None, None, Some(&exchange)), SessionPhase::AwaitingInput { .. }));
+            assert_eq!(super::exchange_activity_summary(&exchange, 100_000), "● Waiting for your answer 7s");
+            exchange.resume(100_000)?;
+            exchange.start_turn(crate::backend::ProviderAddress {
+                owner:None, thread_id:"thread".into(), turn_id:"turn".into(),
+            }, 100_000)?;
+            exchange.pause_for_restart(101_000)?;
+            assert_eq!(SessionPhase::resolve(None, None, Some(&exchange)), SessionPhase::Paused);
+            assert!(!SessionPhase::resolve(None, None, Some(&exchange)).animated());
+            exchange.resume(200_000)?;
+            assert_working(&exchange, 201_000, 9)?;
+            if let Some(phase) = &mut exchange.execution_phase {
+                phase.outcome = Some(crate::plan::execution::VerificationOutcome::Passed);
+                assert_eq!(SessionPhase::resolve(None, None, Some(&exchange)), SessionPhase::Idle);
+                assert!(super::exchange_activity_summary(&exchange, 201_000).contains(activity.completed_label()));
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn silent_checks_refresh_only_the_live_heading_without_reading_output() -> anyhow::Result<()> {
+        let mut run:crate::plan::checks::CheckRun=serde_json::from_value(json!({
+            "id":"check-run","revision":1,"completed_plan":null,"shell":"system","executable":null,
+            "workspace":".","environment_digest":"environment","started_at_ms":0,"completed_at_ms":null,
+            "state":"running","progress":crate::plan::execution::SemanticProgress::default(),
+            "workspace_identity":null,"workspace_digest":{},"commands":[{
+                "id":"check-command","command":"cargo test --locked","state":"running","started_at_ms":0,
+                "completed_at_ms":null,"exit_code":null,"error":null,"stdout":"absent","stderr":"absent",
+                "output":"absent","output_bytes":0,"preview":""
+            }]
+        }))?;
+        let entry=TimelineEntry::Checks {id:run.id.clone(),created_at_ms:0,run:run.clone()};
+        let profile=WidthProfile::default();
+        let projected=project_at(&entry,&profile,1000)?;
+        let document=forge_buffer::document::BufferDocument::new(
+            forge_buffer::identity::DocumentId("check-clock".into()),projected.entry.block)?;
+        let refreshed=super::timing_blocks(&entry,&profile,&document,&Default::default(),&projected.tool)?;
+        assert_eq!(refreshed.len(),1);
+        assert_eq!(refreshed[0].id.0,"check-command:tool");
+        assert_ne!(refreshed[0].text,document.block(&refreshed[0].id).unwrap().text);
+        assert_eq!(projected.tool["check-command"].snapshot()?.retained_bytes(),0);
+        run.state=crate::plan::checks::CheckState::Passed;
+        run.commands[0].state=crate::plan::checks::CheckState::Passed;
+        run.commands[0].completed_at_ms=Some(2000);
+        let mut previous=run.commands[0].clone();
+        previous.id="previous-command".into();
+        run.commands.insert(0,previous);
+        run.state=crate::plan::checks::CheckState::Running;
+        run.commands[1].state=crate::plan::checks::CheckState::Interrupted;
+        assert_eq!(run.status().elapsed_ms(90_000),2000);
+        run.state=crate::plan::checks::CheckState::Interrupted;
+        assert_eq!(run.status(),SessionPhase::Paused);
+        run.state=crate::plan::checks::CheckState::Running;
+        run.commands[1].state=crate::plan::checks::CheckState::Running;
+        run.commands[1].started_at_ms=Some(90_000);
+        run.commands[1].completed_at_ms=None;
+        assert_eq!(run.status().elapsed_ms(93_000),5000);
+        run.state=crate::plan::checks::CheckState::Passed;
+        let finished=TimelineEntry::Checks {id:run.id.clone(),created_at_ms:0,run};
+        assert!(super::timing_blocks(&finished,&profile,&document,&Default::default(),&projected.tool)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn empty_or_stale_comparison_does_not_claim_live_work() -> anyhow::Result<()> {
+        for phase in [crate::plan::PlanPhase::Implement, crate::plan::PlanPhase::Verify] {
+            let projection = project_at(&TimelineEntry::Status {
+                id:"status".into(), created_at_ms:1000, agent_count:0,
+                status:SessionPhase::Working {
+                    duration_ms:3000, started_at_ms:None, activity:WorkflowActivity::Implementing,
+                    reasoning_summary:None, execution:Some(crate::session::state_machine::ExecutionStatus {
+                        id:"execution".into(), phase, progress:crate::plan::execution::SemanticProgress {
+                            matched:if phase == crate::plan::PlanPhase::Verify { vec!["file.rs".into()] } else { vec![] },
+                            ..Default::default()
+                        },
+                    }),
+                },
+            }, &WidthProfile::default(), 90_000)?;
+            assert_eq!(projection.entry.block.len(),1);
+            assert_eq!(projection.entry.block[0].text.row(1),Some("Implementing · 3s"));
+        }
+        Ok(())
+    }
+
+    #[test]
     fn paused_exchange_activity_summary_freezes_until_execution_resumes() {
         for (kind, paused, running) in [
             ("chat", "Paused", "Working"),
@@ -4108,7 +4253,10 @@ mod tests {
             }))
             .unwrap();
             exchange.resume(1000).unwrap();
-            exchange.pause(4000);
+            exchange.start_turn(crate::backend::ProviderAddress {
+                owner: None, thread_id: "thread".into(), turn_id: "turn".into(),
+            }, 1000).unwrap();
+            exchange.pause_for_restart(4000).unwrap();
             for now in [4000, 90_000] {
                 assert_eq!(
                     super::exchange_activity_summary(&exchange, now),
@@ -4264,7 +4412,7 @@ mod tests {
         permission_wait.observe_blocker("approval:command".into(), true, 4500);
         for now_ms in [90_000, 900_000] {
             assert_eq!(super::exchange_activity_summary(&permission_wait, now_ms),
-                "● Planning paused 3s │ 0/1 tools · 2.5 s");
+                "● Waiting for your approval 3s │ 0/1 tools · 2.5 s");
         }
         permission_wait.observe_blocker("approval:command".into(), false, 900_000);
         assert_eq!(super::exchange_activity_summary(&permission_wait, 902_000),
@@ -4431,7 +4579,7 @@ mod tests {
         interaction.awaiting_input = true;
         assert_eq!(
             super::exchange_activity_summary(&interaction, 20000),
-            "● Planning paused 4s │ 1.0k (90%) -> 280"
+            "● Waiting for your answer 4s │ 1.0k (90%) -> 280"
         );
         interaction.kind = ExchangeKind::Chat;
         interaction
@@ -4480,7 +4628,7 @@ mod tests {
 #[test]
 fn agent_counts_preserve_the_primary_status_and_spinner() -> anyhow::Result<()> {
     for (status,label,animated) in [
-        (SessionPhase::Working {started_at_ms:0,reasoning_summary:None,activity:WorkflowActivity::Working,execution:None},"Working",true),
+        (SessionPhase::Working {duration_ms: 0, started_at_ms: Some(0),reasoning_summary:None,activity:WorkflowActivity::Working,execution:None},"Working",true),
         (SessionPhase::Compacting {started_at_ms:0},"Compacting",true),
         (SessionPhase::Paused,"Paused",false),
         (SessionPhase::AwaitingPlanReview {plan_id:"plan".into(),revision:1},"Waiting for plan review",false),

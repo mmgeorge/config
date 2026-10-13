@@ -2119,8 +2119,13 @@ write native configuration, authentication, or Rulesync-generated files.
 
 `ResourceCatalog` reads MCP defaults from `config_dir/rulesync-global/.rulesync/mcp.json` and workspace
 `.rulesync/mcp.json`. Skill catalogs read the corresponding Rulesync skill directories. Catalogs retain
-definition identities and metadata without prompt bodies or launch credentials. Environment references
-resolve only into ephemeral provider launch payloads. Missing credentials mark optional default MCP
+definition identities and metadata without prompt bodies or launch credentials. Catalog entries
+carry explicit `Global` or `Workspace` source scope into `/skills` and `/mcp`, independently of the
+scope of enablement preferences. Native imports recover this scope from their stored owner, even
+when their source path is outside that workspace. Provider-only entries show `Provider` rather than
+inferring a scope. Both pickers expose the source column and expand the definition path with Tab.
+MCP details retain the cached tool list. Runtime status refreshes preserve source metadata.
+Environment references resolve only into ephemeral provider launch payloads. Missing credentials mark optional default MCP
 resources unavailable, while explicitly enabled resources fail launch. Claude resource selection uses
 strict MCP configuration and an ephemeral `forge-managed` plugin whose selected skill directories bind
 to canonical sources. Its SDK skill filter admits only those qualified plugin names. Antigravity starts with a private `GEMINI_HOME`
@@ -2479,12 +2484,11 @@ separated without operating-system provenance, so that path remains attributed w
 checkpoint still preserves the exact rollback boundary.
 
 The Rust `TimelineProjector` combines interactions, plan lifecycle records, and accepted-plan
-executions into one ordered presentation. The Lua controller renders that projection instead of
-replaying raw provider events or maintaining a tail-only checklist. `interaction_tree.lua`
-coordinates the high-level projection, `task_tree.lua` owns provider tasks, and `plan_event.lua`
-owns artifact lifecycle rows. Each completed node owns a stable expansion key, and the renderer materializes
-only the children selected by `session.harness.activity_expanded`. This projection avoids
-overlapping native ranges, which cannot reliably represent wrapped thought and command headings.
+executions into one ordered presentation. The Lua controller applies native blocks instead of
+replaying provider events or deriving workflow state. Rust retains node identities and expansion
+choices and publishes only their visible rows. The retained Lua `interaction_tree.lua` renderer
+supports fixture validation rather than live Harness presentation. Native node projection avoids
+overlapping editor fold ranges, which cannot reliably represent wrapped thought and command headings.
 When a planning-feedback lifecycle answer exactly matches its durable continuation prompt, the
 projection keeps the interaction as the single visible owner and omits the redundant lifecycle row.
 `display_text.lua` wraps prompts and thoughts into real rows using rendered-cell width before row
@@ -2514,7 +2518,7 @@ Prompt submission does not create a Lua-owned interaction. Broker admission emit
 revisioned patch with the durable interaction and a Rust `Working` status, so the first visible
 segment already comes from canonical state. Later node and completion patches replace that stable
 interaction id without a presentation-side merge clock or optimistic shadow record. Lua animates
-the Rust `started_at_ms` timestamp but never creates, extends, or completes an interaction.
+the published status metadata but never creates, extends, or completes an interaction.
 
 Each stored session uses one versioned envelope. Session loading and listing accept only the exact
 current format, leaving older rows invisible without migration or partial decoding. Runtime code
@@ -5979,6 +5983,18 @@ result reports that phase as stopped. Only recorded phase results claim phase co
 
 Activity headings use `Implementing`, `Verifying`, and `Resolving` while a phase runs,
 then `Implemented`, `Verified`, and `Resolved` when its completion is recorded.
+`Exchange::activity` distinguishes active processing, interruption, approval, input, compaction,
+and delegated waits without treating a stopped accounting clock as a task pause. Session status,
+exchange headings, and child headings consume that lifecycle. Terminal exchanges release approval
+and phase activity. Background compaction retains its separate session lifecycle after its owning
+exchange completes, without changing that historical exchange's outcome. Working and planning retry rows
+retain accumulated execution time plus the current optional interval, matching the exchange clock
+across waits and resumption. Rust publishes animation and wait hints with the native row. Lua
+shows permission hints and a stationary wait marker without replacing the phase from an approval list.
+Periodic refresh includes planning retries and live tool clocks, and skips frozen work and idle agents.
+Tool group labels report running calls independently from the group's retained expansion choice.
+Declaration comparison details require recorded evidence for the current phase. Empty progress
+does not claim that comparison is running or that files match.
 Checking results remain separate from model activity folds. A blank row separates a noninitial
 Checks section from preceding activity. Declaration findings and accepted commands nest beneath its
 heading, and collapsing the implementation exchange leaves the Checks section visible.

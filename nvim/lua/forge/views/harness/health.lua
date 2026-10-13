@@ -14,9 +14,6 @@ function M.notice(state)
     or state.host_error or state.connection_error or state.sync_error
     or state.presentation and state.presentation.section_error
   if failure then return { text = failure, animated = false, failed = failure ~= "Paused" } end
-  if #(state.approval or {}) > 0 then
-    return { text = "Waiting for your approval", animated = false, waiting = true, hint = "permission" }
-  end
   return nil
 end
 

@@ -97,6 +97,10 @@ local success, failure = xpcall(function()
   local imported = request("settings.get")
   assert(imported.revision == 1 and #imported.catalog.mcp == 1)
   assert(imported.catalog.mcp[1].id == imported_id and imported.desired.mcp[imported_id] == false)
+  local imported_server = request("backend.mcp")[1]
+  assert(imported_server.scope == "workspace", "native import lost its source scope")
+  assert(vim.fs.normalize(imported_server.source_path):lower() == vim.fs.normalize(source):lower(),
+    "native import lost its source configuration path")
   assert(imported.application.applied_revision == imported.revision, "import did not pass application verification")
   assert(state.session.id == identity, "configuration import replaced the Forge conversation")
   assert(vim.wait(5000, function()
@@ -116,6 +120,9 @@ local success, failure = xpcall(function()
     local transferred = request("settings.get")
     assert(transferred.catalog.mcp[1].id == imported_id and transferred.desired.mcp[imported_id] == false,
       "provider switch lost imported identity or enabled it")
+    local server = request("backend.mcp")[1]
+    assert(server.scope == "workspace" and server.source_path == imported_server.source_path,
+      "provider switch lost source metadata")
   end
 end, debug.traceback)
 if success and vim.g.forge_native_import_inspect then return end

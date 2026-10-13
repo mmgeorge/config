@@ -5,6 +5,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::io::Read;
+use crate::backend::ResourceScope;
 
 #[derive(Clone, Deserialize, Serialize)]
 /// Identifies one skill definition independently of provider installation paths.
@@ -17,6 +18,9 @@ pub(crate) struct SkillResource {
     pub(crate) description: String,
     /// Identifies the exact canonical definition path.
     pub(crate) source: String,
+    #[serde(skip)]
+    /// Carries discovery or import scope without duplicating persisted import ownership.
+    pub(crate) scope: Option<ResourceScope>,
     /// Restricts provider bindings when the source declares targets.
     pub(crate) targets: Vec<String>,
     /// Determines whether the skill appears in explicit invocation menus.
@@ -45,6 +49,8 @@ pub(crate) struct ServerResource {
     pub(crate) name: String,
     /// Records the actual definition source.
     pub(crate) source: String,
+    /// Carries the scope of the source definition.
+    pub(crate) scope: Option<ResourceScope>,
     /// Records which provider targets can express this definition.
     pub(crate) targets: Vec<String>,
     /// Records the configured transport independently of live availability.
@@ -58,7 +64,7 @@ impl ServerResource {
     pub(crate) fn imported(id: String, name: String, source: String, definition: Value) -> Result<Self> {
         let transport = definition["type"].as_str().unwrap_or(if definition["url"].is_string() { "http" } else { "stdio" });
         ensure!(matches!(transport, "stdio" | "http" | "sse"), "unsupported MCP transport {transport}");
-        Ok(Self { id, name, source, transport:transport.into(),
+        Ok(Self { id, name, source, scope:None, transport:transport.into(),
             targets:definition["targets"].as_array().into_iter().flatten().filter_map(|target|target.as_str().map(str::to_owned)).collect(),
             definition })
     }
@@ -141,20 +147,20 @@ impl ResourceCatalog {
     /// Parse bounded global and workspace skill sources without importing generated files.
     pub(crate) fn skills(config_dir: Option<&Path>, workspace: &Path) -> Result<Vec<SkillResource>> {
         let mut pending = Vec::new();
-        if let Some(config_dir) = config_dir { pending.push((config_dir.join("rulesync-global/.rulesync/skills"), 0)); }
-        pending.push((workspace.join(".rulesync/skills"), 0));
+        if let Some(config_dir) = config_dir { pending.push((config_dir.join("rulesync-global/.rulesync/skills"), 0, Some(ResourceScope::Global))); }
+        pending.push((workspace.join(".rulesync/skills"), 0, Some(ResourceScope::Workspace)));
         Self::skill_sources(pending, "rulesync")
     }
 
     /// Inspect native skill metadata without importing it into shared configuration.
     pub(crate) fn native_skills(directory: Vec<std::path::PathBuf>) -> Result<Vec<SkillResource>> {
-        Self::skill_sources(directory.into_iter().map(|path|(path,0)).collect(), "native")
+        Self::skill_sources(directory.into_iter().map(|path|(path,0,None)).collect(), "native")
     }
 
-    fn skill_sources(mut pending: Vec<(std::path::PathBuf, usize)>, namespace: &str) -> Result<Vec<SkillResource>> {
+    fn skill_sources(mut pending: Vec<(std::path::PathBuf, usize, Option<ResourceScope>)>, namespace: &str) -> Result<Vec<SkillResource>> {
         let mut visited = std::collections::HashSet::new();
         let mut resource = Vec::new();
-        while let Some((directory, depth)) = pending.pop() {
+        while let Some((directory, depth, scope)) = pending.pop() {
             if !directory.is_dir() { continue; }
             ensure!(depth <= 8, "skill catalog nesting exceeds 8 directories");
             let directory = dunce::canonicalize(directory)?;
@@ -176,14 +182,14 @@ impl ResourceCatalog {
                 let identity = source.to_string_lossy().replace('\\', "/");
                 let identity = if cfg!(windows) { identity.to_lowercase() } else { identity };
                 resource.push(SkillResource { id:format!("{namespace}:{}", hex::encode(Sha256::digest(identity.as_bytes()))),
-                    name:metadata.name,description:metadata.description,source:source.display().to_string(),
+                    name:metadata.name,description:metadata.description,source:source.display().to_string(),scope,
                     targets:metadata.targets,user_invocable:metadata.user_invocable });
             } else {
                 for entry in std::fs::read_dir(directory)? {
                     let path = entry?.path();
                     if path.is_dir() {
                         ensure!(pending.len() + visited.len() < 4096, "skill catalog exceeds 4096 directories");
-                        pending.push((path, depth + 1));
+                        pending.push((path, depth + 1, scope));
                     }
                 }
             }
@@ -195,10 +201,10 @@ impl ResourceCatalog {
     /// Load global defaults and an explicitly present workspace source with distinct identities.
     pub(crate) fn servers(config_dir: Option<&Path>, workspace: &Path) -> Result<Vec<ServerResource>> {
         let mut source_list = Vec::new();
-        if let Some(config_dir) = config_dir { source_list.push(config_dir.join("rulesync-global/.rulesync/mcp.json")); }
-        source_list.push(workspace.join(".rulesync/mcp.json"));
+        if let Some(config_dir) = config_dir { source_list.push((config_dir.join("rulesync-global/.rulesync/mcp.json"), ResourceScope::Global)); }
+        source_list.push((workspace.join(".rulesync/mcp.json"), ResourceScope::Workspace));
         let mut server_list = Vec::new();
-        for source in source_list {
+        for (source, scope) in source_list {
             if !source.is_file() { continue; }
             let source = dunce::canonicalize(source)?;
             let source_identity = source.to_string_lossy().replace('\\',"/");
@@ -210,7 +216,7 @@ impl ResourceCatalog {
                 let id = format!("rulesync:{}",hex::encode(Sha256::digest(identity.as_bytes())));
                 let transport = definition["type"].as_str().unwrap_or(if definition["url"].is_string() { "http" } else { "stdio" });
                 ensure!(matches!(transport,"stdio" | "http" | "sse"), "unsupported Rulesync MCP transport {transport}");
-                server_list.push(ServerResource { id, name:name.clone(),source:source.display().to_string(),
+                server_list.push(ServerResource { id, name:name.clone(),source:source.display().to_string(),scope:Some(scope),
                     targets:definition["targets"].as_array().into_iter().flatten().filter_map(|target|target.as_str().map(str::to_owned)).collect(),
                     transport:transport.into(),definition:definition.clone() });
             }

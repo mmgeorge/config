@@ -56,6 +56,7 @@ impl SessionResources {
             }
             let source = if definition.id.starts_with("import:") { "imported" } else { "rulesync" };
             skill.push(SkillDefinition {
+                scope: definition.scope,
                 resource_id: Some(definition.id), name: definition.name, description: definition.description,
                 enabled, user_invocable: definition.user_invocable, path: Some(definition.source),
                 source: Some(source.into()), argument_hint: None,
@@ -82,6 +83,7 @@ impl SessionResources {
                 }
             } else { (McpStatus::Disabled, None) };
             mcp.push(McpDefinition {
+                scope: definition.scope, source_path: Some(definition.source),
                 resource_id: Some(definition.id), name: definition.name, transport: definition.transport,
                 enabled, status, status_detail, token_count: None, token_estimated: false,
                 tools: Vec::new(), tool_error: None,
@@ -145,6 +147,16 @@ mod test {
             expected.extend(provider_skill);
             expected.sort_unstable();
             let loaded = SessionResources::load(root.path(), &request, backend, target).unwrap();
+            for skill in &loaded.skill {
+                let scope = if matches!(skill.name.as_str(), "global-wildcard" | "unrestricted") {
+                    crate::backend::ResourceScope::Global
+                } else { crate::backend::ResourceScope::Workspace };
+                assert_eq!(skill.scope, Some(scope));
+                assert!(Path::new(skill.path.as_deref().unwrap()).is_file());
+                let server = loaded.mcp.iter().find(|server| server.name == skill.name).unwrap();
+                assert_eq!(server.scope, Some(scope));
+                assert!(Path::new(server.source_path.as_deref().unwrap()).is_file());
+            }
             let mut skill: Vec<_> = loaded.skill.iter().map(|skill| skill.name.as_str()).collect();
             let mut selected: Vec<_> = loaded.selected_skill.iter().map(|skill| skill.name.as_str()).collect();
             let mut server: Vec<_> = loaded.mcp.iter().map(|server| server.name.as_str()).collect();
@@ -166,6 +178,10 @@ mod test {
             ("claude", "claudecode"), ("antigravity", "antigravity-cli")] {
             let loaded = SessionResources::load(root.path(), &request, backend, target).unwrap();
             assert!(!loaded.skill.iter().find(|skill| skill.name == "local-wildcard").unwrap().enabled);
+            assert_eq!(loaded.skill.iter().find(|skill| skill.name == "local-wildcard").unwrap().scope,
+                Some(crate::backend::ResourceScope::Workspace));
+            assert_eq!(loaded.mcp.iter().find(|server| server.name == "local-wildcard").unwrap().scope,
+                Some(crate::backend::ResourceScope::Workspace));
             assert_eq!(loaded.mcp.iter().find(|server| server.name == "local-wildcard").unwrap().status,
                 McpStatus::Disabled);
             assert!(!loaded.selected_skill.iter().any(|skill| skill.name == "local-wildcard"));

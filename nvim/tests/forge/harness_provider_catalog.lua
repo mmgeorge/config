@@ -29,12 +29,16 @@ client.request = function(method, params, callback)
     callback({
       {
         name = "walkthrough",
+        scope = "workspace",
+        path = "D:/repo/.rulesync/skills/walkthrough/SKILL.md",
         description = "Build a review walkthrough",
         enabled = skill_enabled.walkthrough,
         user_invocable = true,
       },
       {
         name = "imagegen",
+        scope = "global",
+        path = "D:/config/rulesync-global/.rulesync/skills/imagegen/SKILL.md",
         description = "Generate an image",
         enabled = skill_enabled.imagegen,
         user_invocable = true,
@@ -53,6 +57,8 @@ client.request = function(method, params, callback)
     callback({
       {
         name = "github-mcp",
+        scope = "global",
+        source_path = "D:/config/rulesync-global/.rulesync/mcp.json",
         transport = "stdio",
         enabled = mcp_enabled,
         status = mcp_enabled and "connected" or "disabled",
@@ -102,7 +108,7 @@ vim.api.nvim_buf_set_lines(input_buf, 0, -1, false, { "$walkthrough explain" })
 vim.api.nvim_win_set_cursor(0, { 1, 20 })
 assert_true(not command_source:enabled(), "$ completion should stop after the skill selector")
 
-local host = { window_list = { 0 }, control_win = 0 }
+local host = { window_list = { vim.api.nvim_get_current_win() }, control_win = vim.api.nvim_get_current_win() }
 local inserted_text
 provider_picker.open_skills({
   host = host,
@@ -114,6 +120,15 @@ local skill_page = picker_state.page(skill_picker.state, skill_picker.spec)
 assert_true(skill_page.option_list[1].label == "✓ walkthrough", "enabled skills should use the check icon")
 assert_true(skill_page.option_list[2].label == "× imagegen", "disabled skills should use the cross icon")
 assert_true(#skill_page.option_list == 2, "/skills should hide provider-internal skills")
+assert_true(vim.deep_equal(skill_page.column_headers, { "Skill", "Source", "Description" }),
+  "skills should label source separately from description")
+assert_true(skill_page.option_list[1].columns[2] == "Workspace" and skill_page.option_list[2].columns[2] == "Global",
+  "skills should preserve both source scopes")
+skill_picker.spec.action_list[2].callback({ option = skill_page.option_list[1] })
+skill_picker = picker._state_for_test()
+assert_true(vim.iter(skill_picker.frame.lines):any(function(line)
+  return line:find("D:/repo/.rulesync/skills/walkthrough/SKILL.md", 1, true)
+end), "Tab should reveal the skill's source definition")
 skill_picker.spec.on_confirm({ option = skill_page.option_list[1] })
 assert_true(inserted_text == "$walkthrough ", "Enter should insert an enabled skill selector")
 
@@ -141,10 +156,11 @@ provider_picker.open_mcp({
 local mcp_picker = picker._state_for_test()
 assert_true(mcp_picker ~= nil, "/mcp should open the shared picker")
 local mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
-assert_true(vim.deep_equal(mcp_page.column_headers, { "Server", "Transport", "Tokens", "Status" }),
+assert_true(vim.deep_equal(mcp_page.column_headers, { "Server", "Source", "Transport", "Tokens", "Status" }),
   "MCP picker should label each structured column")
-assert_true(mcp_page.option_list[1].columns[2] == "stdio"
-    and mcp_page.option_list[1].columns[3] == "~704 tokens",
+assert_true(mcp_page.option_list[1].columns[2] == "Global"
+    and mcp_page.option_list[1].columns[3] == "stdio"
+    and mcp_page.option_list[1].columns[4] == "~704 tokens",
   "MCP transport and token values should occupy their labeled columns")
 assert_true(mcp_page.option_list[1].label == "○ github-mcp", "disabled MCPs should use the empty-circle icon")
 assert_true(mcp_page.option_list[1].detail:find("stdio", 1, true) ~= nil, "MCP rows should show transport")
@@ -156,6 +172,9 @@ mcp_picker = picker._state_for_test()
 assert_true(vim.iter(mcp_picker.frame.lines):any(function(line)
   return line:find("Tools: actions_list, user_get", 1, true) ~= nil
 end), "Tab should unfold cached tools into real picker lines")
+assert_true(vim.iter(mcp_picker.frame.lines):any(function(line)
+  return line:find("D:/config/rulesync-global/.rulesync/mcp.json", 1, true)
+end), "MCP details should reveal the source configuration")
 
 mcp_page = picker_state.page(mcp_picker.state, mcp_picker.spec)
 mcp_picker.spec.action_list[1].callback({ option = mcp_page.option_list[1] })

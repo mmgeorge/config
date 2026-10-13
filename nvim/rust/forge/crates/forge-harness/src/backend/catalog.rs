@@ -1,6 +1,16 @@
 use crate::session::PermissionMode;
 use serde::{Deserialize, Serialize};
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+/// Identifies the definition's scope independently of its enablement preference.
+pub enum ResourceScope {
+    /// Makes a definition available across workspaces.
+    Global,
+    /// Makes a definition available in its owning workspace.
+    Workspace,
+}
+
 /// Describes provider-owned catalogs and their active-turn mutation behavior.
 #[derive(Clone, Debug, Default, Deserialize, Serialize)]
 pub struct CatalogCapability {
@@ -82,6 +92,9 @@ pub struct SkillDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Identifies the shared definition when the skill has an explicit source binding.
     pub resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Records the definition's scope when Forge owns its source.
+    pub scope: Option<ResourceScope>,
     pub name: String,
     pub description: String,
     pub enabled: bool,
@@ -116,6 +129,12 @@ pub struct McpDefinition {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     /// Identifies the shared definition independently of its provider-visible name.
     pub resource_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Records the definition's scope when Forge owns its source.
+    pub scope: Option<ResourceScope>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Identifies the source configuration without exposing launch credentials.
+    pub source_path: Option<String>,
     pub name: String,
     pub transport: String,
     pub enabled: bool,

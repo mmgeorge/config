@@ -47,6 +47,11 @@ impl ExchangeMetrics {
         self.blocker.iter().any(|id| id.starts_with("approval:"))
     }
 
+    /// Reports a recorded parent wait for delegated execution.
+    pub(crate) fn waiting_for_agent(&self) -> bool {
+        self.blocker.contains("agent_wait")
+    }
+
     /// Retains the latest active elapsed coordinate without counting offline time.
     pub(crate) fn observe_elapsed(&mut self, elapsed_ms: u64) {
         self.observed_elapsed_ms = self.observed_elapsed_ms.max(elapsed_ms);

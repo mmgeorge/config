@@ -2,7 +2,7 @@ use serde::Serialize;
 
 use crate::{
     broker::ElicitationOwner,
-    exchange::{ActiveWait, Exchange, ExchangeKind, ExchangeState},
+    exchange::{ActiveWait, Exchange, ExchangeActivity, ExchangeKind, ExchangeState},
     plan::{PlanPhase, PlanRecord, PlanState, execution::SemanticProgress},
 };
 
@@ -118,7 +118,10 @@ pub enum SessionPhase {
         error: Option<String>,
     },
     Working {
-        started_at_ms: i64,
+        /// Accumulated execution intervals, excluding user waits.
+        duration_ms: u64,
+        /// Current execution interval, absent while processing a settled provider result.
+        started_at_ms: Option<i64>,
         activity: WorkflowActivity,
         reasoning_summary: Option<String>,
         execution: Option<ExecutionStatus>,
@@ -132,11 +135,18 @@ pub enum SessionPhase {
         plan_id: String,
         revision: u32,
     },
+    AwaitingApproval {
+        /// Exchange whose permission request owns the wait.
+        exchange_id: String,
+    },
     RetryingPlanGeneration {
         plan_id: String,
         turn: u32,
         max_turn: u32,
-        started_at_ms: i64,
+        /// Accumulated execution intervals retained across planning continuations.
+        duration_ms: u64,
+        /// Current execution interval, excluding approval and question waits.
+        started_at_ms: Option<i64>,
         activity: WorkflowActivity,
     },
     PlanningFailed {
@@ -160,6 +170,15 @@ pub struct ExecutionStatus {
     pub progress: SemanticProgress,
 }
 
+impl ExecutionStatus {
+    /// Reports recorded comparison evidence without treating an empty result as running work.
+    pub(crate) fn has_comparison(&self) -> bool {
+        !self.progress.matched.is_empty() || !self.progress.missing.is_empty()
+            || !self.progress.different.is_empty() || !self.progress.unverified.is_empty()
+            || !self.progress.declaration_changes.is_empty()
+    }
+}
+
 impl SessionPhase {
     /// Resolve one deterministic workflow phase from the session's durable owners.
     pub fn resolve(
@@ -167,15 +186,22 @@ impl SessionPhase {
         active_wait: Option<&ActiveWait>,
         exchange: Option<&Exchange>,
     ) -> Self {
-        if let Some(started_at_ms) = exchange.and_then(|exchange| {
-            exchange.node_list.iter().rev().find_map(|node| match node {
-                crate::exchange::ExchangeNode::Compaction { compaction, .. }
-                    if compaction.state == crate::backend::CompactionState::Running =>
-                        Some(compaction.started_at_ms.unwrap_or(exchange.created_at_ms)),
-                _ => None,
-            })
-        }) {
+        if let Some(started_at_ms) = exchange.and_then(Exchange::compaction_started_at_ms) {
             return Self::Compacting { started_at_ms };
+        }
+        let active_wait = active_wait.filter(|wait| exchange.is_some_and(|exchange|
+            exchange.id == wait.exchange_id && matches!(exchange.activity(),
+                ExchangeActivity::Active | ExchangeActivity::WaitingForAgent)));
+        match exchange.map(Exchange::activity) {
+            Some(ExchangeActivity::Paused) => return Self::Paused,
+            Some(ExchangeActivity::AwaitingApproval) => return Self::AwaitingApproval {
+                exchange_id: exchange.unwrap().id.clone(),
+            },
+            Some(ExchangeActivity::Compacting { started_at_ms }) => return Self::Compacting { started_at_ms },
+            Some(ExchangeActivity::WaitingForAgent) => return Self::WaitingForAgent {
+                agent_count: active_wait.map_or(0, |wait| wait.agent_count),
+            },
+            _ => {}
         }
         let executing = exchange.is_some_and(|exchange| {
             exchange.state == ExchangeState::Running && exchange.execution_started_at_ms.is_some()
@@ -233,29 +259,13 @@ impl SessionPhase {
                 revision: plan.model_revision,
             };
         }
-        if exchange.is_some_and(|exchange| {
-            exchange.state == ExchangeState::Running
-                && exchange.execution_started_at_ms.is_none()
-                && exchange.turn.last().is_some_and(|turn| {
-                    matches!(
-                        turn.state(),
-                        crate::turn::TurnState::Finished {
-                            outcome: crate::turn::TurnOutcome::Interrupted
-                                | crate::turn::TurnOutcome::Cancelled
-                        }
-                    )
-                })
-        }) {
-            return Self::Paused;
-        }
         let working = exchange
-            .filter(|exchange| exchange.state == ExchangeState::Running)
+            .filter(|exchange| exchange.activity() == ExchangeActivity::Active)
             .map(|exchange| {
                 let activity = WorkflowActivity::from_exchange(exchange);
                 (
-                    exchange
-                        .execution_started_at_ms
-                        .unwrap_or(exchange.created_at_ms),
+                    exchange.execution_started_at_ms,
+                    exchange.duration_ms,
                     activity,
                     exchange.latest_reasoning_summary().map(str::to_owned),
                 )
@@ -265,7 +275,7 @@ impl SessionPhase {
                 agent_count: wait.agent_count,
             };
         }
-        if let (Some(plan), Some((started_at_ms, activity @ (WorkflowActivity::Planning | WorkflowActivity::Revising), _))) = (
+        if let (Some(plan), Some((started_at_ms, duration_ms, activity @ (WorkflowActivity::Planning | WorkflowActivity::Revising), _))) = (
             active_plan.filter(|plan| {
                 matches!(plan.state, PlanState::Generating | PlanState::Revising)
                     && plan.generation.budget.turn_count > 0
@@ -277,12 +287,14 @@ impl SessionPhase {
                 turn: plan.generation.budget.turn_count + 1,
                 max_turn: plan.generation.budget.max_turn_count,
                 started_at_ms: *started_at_ms,
+                duration_ms: *duration_ms,
                 activity: *activity,
             };
         }
-        if let Some((started_at_ms, activity, reasoning_summary)) = working {
+        if let Some((started_at_ms, duration_ms, activity, reasoning_summary)) = working {
             return Self::Working {
                 started_at_ms,
+                duration_ms,
                 activity,
                 reasoning_summary,
                 execution: None,
@@ -294,6 +306,30 @@ impl SessionPhase {
     /// Report whether the structural idle phase should remain invisible.
     pub fn visible(&self) -> bool {
         !matches!(self, Self::Idle)
+    }
+
+    /// Computes elapsed time from recorded intervals without inventing a running clock.
+    pub(crate) fn elapsed_ms(&self, now_ms: i64) -> u64 {
+        match self {
+            Self::Working { duration_ms, started_at_ms, .. }
+            | Self::RetryingPlanGeneration { duration_ms, started_at_ms, .. } =>
+                duration_ms.saturating_add(started_at_ms.map_or(0,
+                    |started| now_ms.saturating_sub(started).max(0) as u64)),
+            Self::Compacting { started_at_ms } => now_ms.saturating_sub(*started_at_ms).max(0) as u64,
+            _ => 0,
+        }
+    }
+
+    /// Selects animation from lifecycle ownership rather than text or clock presence.
+    pub(crate) fn animated(&self) -> bool {
+        matches!(self, Self::Working { .. } | Self::RetryingPlanGeneration { .. }
+            | Self::Compacting { .. } | Self::WaitingForAgent { .. } | Self::Finalizing { error: None, .. })
+    }
+
+    /// Selects periodic text refresh only when elapsed time can advance.
+    pub(crate) fn ticking(&self) -> bool {
+        matches!(self, Self::Working { started_at_ms: Some(_), .. }
+            | Self::RetryingPlanGeneration { started_at_ms: Some(_), .. } | Self::Compacting { .. })
     }
 }
 
@@ -380,7 +416,7 @@ mod test {
         assert_eq!(
             SessionPhase::resolve(None, None, Some(&exchange()),),
             SessionPhase::Working {
-                started_at_ms: 42,
+                duration_ms: 0, started_at_ms: Some(42),
                 activity: WorkflowActivity::Planning,
                 execution: None,
                 reasoning_summary: None,
@@ -434,7 +470,7 @@ mod test {
             assert!(matches!(
                 SessionPhase::resolve(active_plan, None, Some(&exchange)),
                 SessionPhase::Working {
-                    started_at_ms: 60,
+                    started_at_ms: Some(60),
                     ..
                 }
             ));
@@ -488,7 +524,7 @@ mod test {
                 turn: 2,
                 max_turn: 20,
                 activity: WorkflowActivity::Planning,
-                started_at_ms: 42,
+                duration_ms: 0, started_at_ms: Some(42),
             }
         );
     }
@@ -507,7 +543,7 @@ mod test {
         assert_eq!(
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::Working {
-                started_at_ms: 100,
+                duration_ms: 0, started_at_ms: Some(100),
                 activity: WorkflowActivity::Working,
                 execution: None,
                 reasoning_summary: None,
@@ -539,7 +575,7 @@ mod test {
         assert!(matches!(
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::Working {
-                started_at_ms: 42,
+                started_at_ms: None,
                 ..
             }
         ));
@@ -568,5 +604,33 @@ mod test {
             SessionPhase::resolve(None, None, Some(&exchange)),
             SessionPhase::Working { .. }
         ));
+    }
+
+    #[test]
+    fn terminal_exchanges_release_approval_status_without_hiding_background_compaction() {
+        for state in [ExchangeState::Finalizing, ExchangeState::Complete, ExchangeState::Failed,
+            ExchangeState::Cancelled, ExchangeState::Interrupted] {
+            let mut exchange = exchange();
+            exchange.observe_compaction(crate::backend::Compaction {
+                id:"compaction".into(), thread_id:"thread".into(),
+                state:crate::backend::CompactionState::Running, manual:false,
+                started_at_ms:Some(42), completed_at_ms:None, result:Default::default(),
+            }, 42);
+            exchange.observe_blocker("approval:command".into(),true,50);
+            exchange.state = state;
+            assert_eq!(exchange.activity(),crate::exchange::ExchangeActivity::Settled);
+            let status = SessionPhase::resolve(None,None,Some(&exchange));
+            assert_eq!(status,SessionPhase::Compacting {started_at_ms:42});
+            exchange.node_list.clear();
+            let status = SessionPhase::resolve(None,None,Some(&exchange));
+            assert!(matches!(status,SessionPhase::Finalizing { .. } | SessionPhase::Idle),"{state:?}: {status:?}");
+        }
+        let mut exchange = exchange();
+        exchange.start_turn(crate::backend::ProviderAddress {
+            owner:None, thread_id:"thread".into(), turn_id:"turn".into(),
+        },42).unwrap();
+        exchange.observe_blocker("approval:command".into(),true,50);
+        exchange.pause_for_restart(60).unwrap();
+        assert_eq!(SessionPhase::resolve(None,None,Some(&exchange)),SessionPhase::Paused);
     }
 }

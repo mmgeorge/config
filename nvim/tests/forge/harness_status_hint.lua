@@ -100,13 +100,21 @@ vim.wait(150, function() return false end, 25)
 assert(vim.deep_equal(stopped, vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })),
   "stopped host retained its animation timer")
 transcript.status_notice = nil
-transcript.status_notice = require("forge.views.harness.health").notice({ approval = { { id = "pending" } } })
+assert(require("forge.views.harness.health").notice({ approval = { { id = "pending" } } }) == nil,
+  "Lua approval records must not override the native session phase")
+assert(buffer.apply_snapshot(transcript, {
+  document = transcript.document, revision = 3, block = { {
+    id = "status", text = { "", "Waiting for your approval" },
+    metadata = { status = { row = 1, animated = false, hint = "permission" },
+      target = {}, decoration = {}, fold = {}, editable_region = {} },
+  } },
+}).kind == "Applied")
 for _ = 1, 3 do
   hint.render(transcript, command_set, 120)
   local waiting = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1, { details = true })
-  assert(#waiting == 1 and vim.trim(waiting[1][4].sign_text) == "◷", "approval wait retained a working spinner")
-  assert(waiting[1][4].virt_text[1][1]:find("Waiting for your approval", 1, true))
-  assert(waiting[1][4].virt_text[1][2] == "ForgeStatusHint", "approval wait used failure styling")
+  assert(#waiting == 2 and vim.trim(waiting[1][4].sign_text) == "◷", "approval wait retained a working spinner")
+  assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Waiting for your approval")
+  assert(waiting[1][4].sign_hl_group == "ForgeStatusHint", "approval wait used failure styling")
 end
 local permission_key = config.options.keymaps.harness.reopen_question
 for _, key in ipairs({ "oe", "<F8>" }) do
@@ -122,6 +130,13 @@ local failed = vim.api.nvim_buf_get_extmarks(transcript.buffer, namespace, 0, -1
 assert(failed[1][4].virt_text[1][1]:find("Connection lost", 1, true))
 assert(failed[1][4].virt_text[1][2] == "ForgeHarnessToolFailure", "approval hid a connection failure")
 transcript.status_notice = nil
+assert(buffer.apply_snapshot(transcript, {
+  document = transcript.document, revision = 4, block = { {
+    id = "status", text = { "", "Working · 2s · Inspecting repository structure" },
+    metadata = { status = { row = 1, animated = true, hint = "working" },
+      target = {}, decoration = {}, fold = {}, editable_region = {} },
+  } },
+}).kind == "Applied")
 hint.render(transcript, command_set, 120)
 assert(vim.wait(500, function()
   local _, current = working_marks()
@@ -176,7 +191,7 @@ assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working
 for revision, phase in ipairs({ "review-plan", "working" }) do
   local label = phase == "working" and "Working · 1s" or "Waiting for plan review"
   assert(buffer.apply_snapshot(transcript, {
-    document = transcript.document, revision = revision + 2, block = { {
+    document = transcript.document, revision = revision + 4, block = { {
       id = "status", text = { "", label },
       metadata = { status = { row = 1, animated = phase == "working", hint = phase == "working" and "working" or "review" }, target = { { id = "status:" .. phase, range = {
         start = { row = 1, column = 0 }, ["end"] = { row = 2, column = 0 },
@@ -190,7 +205,7 @@ assert(resumed[1][4].sign_text and not resumed[1][4].virt_text,
   "resumed planning inserted its spinner inside the status label")
 assert(vim.api.nvim_buf_get_lines(transcript.buffer, 1, 2, false)[1] == "Working · 1s")
 assert(buffer.apply_snapshot(transcript, {
-  document = transcript.document, revision = 5, block = { {
+  document = transcript.document, revision = 7, block = { {
     id = "finished", text = { "Thought for 2s", "Finished response" },
     metadata = { target = {}, decoration = {}, fold = {}, editable_region = {} },
   } },

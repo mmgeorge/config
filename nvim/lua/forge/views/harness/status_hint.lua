@@ -188,7 +188,7 @@ function M.render(transcript, commands, width)
   local terminal_chunks = terminal_text and { { terminal_text, "ForgeStatusHint" } } or nil
   if terminal_count > 0 then append_hint(terminal_chunks, hint_chunks(commands, "terminal_status", width)) end
   local context = status and status.hint ~= vim.NIL and status.hint or nil
-  if row and status.animated then
+  if row and status and status.animated then
     local session = require("forge.session").harness.session or {}
     local capture = require("forge.infra.highlights").harness_mode(session.execution_mode)
     local text = vim.api.nvim_buf_get_lines(target_buffer, row, row + 1, false)[1]
@@ -197,7 +197,7 @@ function M.render(transcript, commands, width)
       end_row = row, end_col = #text, hl_group = capture, priority = 110,
     })
   end
-  if row and not status.animated and (context == "question" or context == "review") then
+  if row and status and not status.animated and (context == "question" or context == "review" or context == "permission") then
     vim.api.nvim_buf_set_extmark(target_buffer, namespace, row, 0, {
       id = 1, sign_text = "◷", sign_hl_group = "ForgeStatusHint", priority = 110,
     })

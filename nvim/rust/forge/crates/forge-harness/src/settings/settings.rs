@@ -203,8 +203,11 @@ impl SettingsStore {
     /// Resolve shared and explicitly imported skills for one workspace.
     pub(crate) fn skills(&self, workspace: &str) -> Result<Vec<super::SkillResource>> {
         let mut skill = super::ResourceCatalog::skills(self.catalog_root()?.as_deref(), Path::new(workspace))?;
-        for resource in self.imported(workspace)? {
-            if let super::ImportedResource::Skill { resource } = resource { skill.push(resource); }
+        for (scope, resource) in self.imported(workspace)? {
+            if let super::ImportedResource::Skill { mut resource } = resource {
+                resource.scope = Some(scope);
+                skill.push(resource);
+            }
         }
         Ok(skill)
     }
@@ -212,17 +215,28 @@ impl SettingsStore {
     /// Resolve shared and explicitly imported MCP definitions without credential values.
     pub(crate) fn servers(&self, workspace: &str) -> Result<Vec<super::catalog::ServerResource>> {
         let mut server = super::ResourceCatalog::servers(self.catalog_root()?.as_deref(), Path::new(workspace))?;
-        for resource in self.imported(workspace)? {
-            if let Some(resource) = resource.server()? { server.push(resource); }
+        for (scope, resource) in self.imported(workspace)? {
+            if let Some(mut resource) = resource.server()? {
+                resource.scope = Some(scope);
+                server.push(resource);
+            }
         }
         Ok(server)
     }
 
-    fn imported(&self, workspace: &str) -> Result<Vec<super::ImportedResource>> {
-        let mut statement = self.connection.prepare("SELECT payload FROM setting_resource
+    fn imported(&self, workspace: &str) -> Result<Vec<(crate::backend::ResourceScope, super::ImportedResource)>> {
+        let mut statement = self.connection.prepare("SELECT scope, payload FROM setting_resource
             WHERE scope='global' OR (scope='workspace' AND identity=?1) ORDER BY id")?;
-        statement.query_map([workspace], |row| row.get::<_, String>(0))?
-            .map(|payload| Ok(serde_json::from_str(&payload?)?)).collect()
+        statement.query_map([workspace], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))?
+            .map(|entry| {
+                let (scope, payload) = entry?;
+                let scope = match scope.as_str() {
+                    "global" => crate::backend::ResourceScope::Global,
+                    "workspace" => crate::backend::ResourceScope::Workspace,
+                    _ => anyhow::bail!("unsupported resource scope {scope}"),
+                };
+                Ok((scope, serde_json::from_str(&payload)?))
+            }).collect()
     }
 
     /// Preview native definitions and report collisions against the current effective selection.

@@ -80,6 +80,8 @@ impl CodexResources {
             if entry.enabled && let Some(mut observed) = native.remove(&self.binding[&entry.name]) {
                 observed.name = entry.name;
                 observed.resource_id = entry.resource_id;
+                observed.scope = entry.scope;
+                observed.source_path = entry.source_path;
                 entry = observed;
             }
             entry

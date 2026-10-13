@@ -458,6 +458,7 @@ mod tests {
         std::fs::write(bundle.join("SKILL.md"), "Instructions").unwrap();
         std::fs::write(bundle.join("scripts/check.py"), "print('ok')").unwrap();
         let resource = SkillResource {
+            scope: None,
             id: "fixture-id".into(),
             name: "fixture".into(),
             description: String::new(),

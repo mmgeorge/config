@@ -392,13 +392,19 @@ impl TimelineStream {
 fn ticking(entry: &TimelineEntry) -> bool {
     match entry {
         TimelineEntry::Exchange { exchange,agent_by_id,.. } =>
-            exchange.completed_at_ms.is_none() && exchange.execution_started_at_ms.is_some()
+            exchange.completed_at_ms.is_none() && (exchange.execution_started_at_ms.is_some()
+                || exchange.turn.iter().any(|turn| turn.tools().any(|tool| tool.state() == crate::turn::ToolState::Running)))
                 || agent_by_id.values().any(ticking),
-        TimelineEntry::AgentLifecycle { run,.. } => run.state.is_open(),
-        TimelineEntry::Status { status,.. } => matches!(status,
-            crate::session::state_machine::SessionPhase::Working { .. }
-            | crate::session::state_machine::SessionPhase::Compacting { .. }
-            | crate::session::state_machine::SessionPhase::WaitingForAgent { .. }),
+        TimelineEntry::AgentLifecycle { run, exchange, agent, .. } =>
+            matches!(run.state, crate::agent::AgentState::Starting | crate::agent::AgentState::Closing)
+                || exchange.iter().any(|exchange| exchange.completed_at_ms.is_none()
+                    && (exchange.execution_started_at_ms.is_some()
+                        || exchange.turn.iter().any(|turn| turn.tools().any(|tool| tool.state() == crate::turn::ToolState::Running))))
+                || agent.iter().any(ticking),
+        TimelineEntry::Status { status,.. } => status.ticking(),
+        TimelineEntry::Checks { run, .. } => run.state == crate::plan::checks::CheckState::Running
+            && run.commands.iter().any(|check| check.state == crate::plan::checks::CheckState::Running
+                && check.started_at_ms.is_some() && check.completed_at_ms.is_none()),
         _ => false,
     }
 }
@@ -474,7 +480,7 @@ mod test {
         let mut stream = TimelineStream::new("session".into());
         stream
             .initialize(vec![status(SessionPhase::Working {
-                started_at_ms: 10,
+                duration_ms: 0, started_at_ms: Some(10),
                 activity: WorkflowActivity::Working,
                 execution: None,
                 reasoning_summary: None,
@@ -494,6 +500,22 @@ mod test {
             patch.operation.as_slice(),
             [TimelineOperation::Replace { index: 0, .. }]
         ));
+    }
+
+    #[test]
+    fn planning_retry_refreshes_only_its_live_clock_and_stops_for_user_waits() {
+        let mut stream = TimelineStream::new("session".into());
+        stream.initialize(vec![status(SessionPhase::RetryingPlanGeneration {
+            plan_id:"plan".into(),turn:2,max_turn:20,duration_ms:3000,
+            started_at_ms:Some(90_000),activity:WorkflowActivity::Planning,
+        })]).unwrap();
+        assert_eq!(stream.ticking_entries().count(),1);
+        for phase in [SessionPhase::AwaitingApproval {exchange_id:"exchange".into()},SessionPhase::Paused,
+            SessionPhase::Working {duration_ms:3000,started_at_ms:None,activity:WorkflowActivity::Working,
+                reasoning_summary:None,execution:None}] {
+            stream.reconcile(vec![status(phase)]).unwrap();
+            assert_eq!(stream.ticking_entries().count(),0);
+        }
     }
 
     #[test]
@@ -544,7 +566,7 @@ mod test {
 
         let first_patch = first
             .reconcile(vec![status(SessionPhase::Working {
-                started_at_ms: 5,
+                duration_ms: 0, started_at_ms: Some(5),
                 activity: WorkflowActivity::Working,
                 execution: None,
                 reasoning_summary: None,
@@ -574,7 +596,7 @@ mod test {
             })
             .collect::<Vec<_>>();
         history.push(status(SessionPhase::Working {
-            started_at_ms: 1,
+            duration_ms: 0, started_at_ms: Some(1),
             activity: WorkflowActivity::Working,
             execution: None,
             reasoning_summary: None,
@@ -589,7 +611,7 @@ mod test {
                 None,
                 None,
                 SessionPhase::Working {
-                    started_at_ms: 2,
+                    duration_ms: 0, started_at_ms: Some(2),
                     activity: WorkflowActivity::Working,
                     execution: None,
                     reasoning_summary: None,
@@ -613,7 +635,7 @@ mod test {
                     None,
                     None,
                     SessionPhase::Working {
-                        started_at_ms: 2,
+                        duration_ms: 0, started_at_ms: Some(2),
                         activity: WorkflowActivity::Working,
                         execution: None,
                         reasoning_summary: None,
